@@ -38,7 +38,11 @@ impl Env {
         let mock = tmp.path().join("mock");
         copy_dir(&fixtures.join("mock"), &mock);
         let config = tmp.path().join("config.toml");
-        fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        fs::write(
+            &config,
+            "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\n",
+        )
+        .unwrap();
         let log = tmp.path().join("mock.log");
         Env {
             _tmp: tmp,
@@ -57,6 +61,8 @@ impl Env {
             .env_remove("RKG_MOCK_FAIL_AFTER")
             .env_remove("RKG_MOCK_DELAY_MS")
             .env_remove("RKG_MOCK_INVALID_KEY")
+            .env_remove("RKG_MOCK_TIMEOUT_FILES")
+            .env_remove("RKG_MOCK_KEY_REVOKED_AFTER")
             .env("RKG_CONFIG", &self.config)
             .env("RKG_MOCK_DIR", &self.mock)
             .env("RKG_MOCK_LOG", &self.log);
@@ -91,6 +97,37 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+fn paths_in_graph(env: &Env, state: FileState) -> Vec<String> {
+    let mut v: Vec<String> = Store::open_readonly(&env.repo)
+        .unwrap()
+        .files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.state == state)
+        .map(|f| f.path)
+        .collect();
+    v.sort();
+    v
+}
+
+fn logged_paths(env: &Env) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_to_string(&env.log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.split('\t').next().unwrap().to_string())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+fn call_count(env: &Env) -> usize {
+    fs::read_to_string(&env.log)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
 #[test]
 fn req010_ac1_failure_after_two_files_keeps_them_and_leaves_rest_pending() {
     let env = Env::new();
@@ -103,7 +140,11 @@ fn req010_ac1_failure_after_two_files_keeps_them_and_leaves_rest_pending() {
         .filter(|f| f.state == FileState::Indexed)
         .collect();
     assert_eq!(indexed.len(), 2, "{files:?}");
-    assert!(files.len() > 2);
+    assert!(files.len() >= 8);
+    assert_eq!(
+        files.len() - 2,
+        paths_in_graph(&env, FileState::Pending).len()
+    );
     for n in store.nodes().unwrap() {
         if let Some(f) = &n.file {
             assert!(
@@ -116,13 +157,140 @@ fn req010_ac1_failure_after_two_files_keeps_them_and_leaves_rest_pending() {
 }
 
 #[test]
-fn req010_ac1_no_new_file_is_sent_after_first_failure() {
+fn req010_ac1_three_consecutive_network_errors_stop_the_sending() {
     let env = Env::new();
     let out = env.run("build", &[("RKG_MOCK_FAIL_AFTER", "2")]);
     assert!(!out.status.success());
-    let calls = fs::read_to_string(&env.log).unwrap().lines().count();
-    // 2 réussites + au plus un appel en vol par thread de travail.
-    assert!(calls < 9, "{calls} appels : l'envoi n'a pas été arrêté");
+    // 2 réussites + 3 échecs réseau consécutifs, puis arrêt (concurrency = 1).
+    assert_eq!(call_count(&env), 5);
+    assert!(
+        stderr(&out).contains("panne réseau répétée"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn req010_ac1_with_concurrency_at_most_five_plus_n_minus_one_calls() {
+    let env = Env::new();
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 3\n",
+    )
+    .unwrap();
+    let out = env.run("build", &[("RKG_MOCK_FAIL_AFTER", "2")]);
+    assert!(!out.status.success());
+    let calls = call_count(&env);
+    assert!((5..=7).contains(&calls), "{calls} appels");
+}
+
+#[test]
+fn req010_ac4_timeout_file_does_not_stop_the_others() {
+    let env = Env::new();
+    let bad = "README.md";
+    let out = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", bad)]);
+    assert!(!out.status.success());
+    let all = Store::open_readonly(&env.repo).unwrap().files().unwrap();
+    assert_eq!(paths_in_graph(&env, FileState::Pending), vec![bad]);
+    assert_eq!(
+        paths_in_graph(&env, FileState::Indexed).len(),
+        all.len() - 1
+    );
+    assert_eq!(logged_paths(&env).len(), all.len());
+    let err = stderr(&out);
+    assert!(err.contains("avertissement:") && err.contains(bad), "{err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 fichiers en attente"), "{stdout}");
+}
+
+#[test]
+fn req010_ac4_nonconforming_fixture_does_not_stop_the_others() {
+    let env = Env::new();
+    let bad = "README.md";
+    fs::write(env.mock.join("README.md.json"), "pas du json").unwrap();
+    let out = env.run("build", &[]);
+    assert!(!out.status.success());
+    let all = Store::open_readonly(&env.repo).unwrap().files().unwrap();
+    assert_eq!(paths_in_graph(&env, FileState::Pending), vec![bad]);
+    assert_eq!(logged_paths(&env).len(), all.len());
+}
+
+#[test]
+fn req010_ac4_update_behaves_the_same() {
+    let env = Env::new();
+    let ok = env.run("build", &[]);
+    assert!(ok.status.success(), "{}", stderr(&ok));
+    // Trois fichiers modifiés ; celui en échec est traité en premier (concurrency = 1).
+    let indexed = paths_in_graph(&env, FileState::Indexed);
+    let changed: Vec<String> = indexed.iter().take(3).cloned().collect();
+    assert_eq!(changed.len(), 3);
+    let bad = changed[0].as_str();
+    for f in &changed {
+        let mut t = fs::read_to_string(env.repo.join(f)).unwrap();
+        t.push_str("\nmodif\n");
+        fs::write(env.repo.join(f), t).unwrap();
+    }
+    fs::remove_file(&env.log).ok();
+    let out = env.run("update", &[("RKG_MOCK_TIMEOUT_FILES", bad)]);
+    assert!(!out.status.success());
+    assert_eq!(logged_paths(&env), changed);
+    assert_eq!(paths_in_graph(&env, FileState::Pending), vec![bad]);
+    assert_eq!(
+        paths_in_graph(&env, FileState::Indexed).len(),
+        indexed.len() - 1
+    );
+    let err = stderr(&out);
+    assert!(err.contains("avertissement:") && err.contains(bad), "{err}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 fichiers en attente"));
+}
+
+#[test]
+fn req010_ac5_four_timeouts_do_not_stop_the_sending() {
+    let env = Env::new();
+    let all: Vec<String> = {
+        // Premier build réussi pour connaître les fichiers, puis reconstruction avec échecs.
+        let ok = env.run("build", &[]);
+        assert!(ok.status.success());
+        let mut v = paths_in_graph(&env, FileState::Indexed);
+        v.sort();
+        v
+    };
+    assert!(all.len() >= 8);
+    let bad: Vec<String> = all.iter().take(4).cloned().collect();
+    fs::remove_file(&env.log).unwrap();
+    let out = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", &bad.join(","))]);
+    assert!(!out.status.success());
+    assert_eq!(logged_paths(&env), all);
+    assert_eq!(paths_in_graph(&env, FileState::Pending), bad);
+    assert_eq!(
+        paths_in_graph(&env, FileState::Indexed).len(),
+        all.len() - 4
+    );
+}
+
+#[test]
+fn req010_ac6_revoked_key_stops_at_first_refusal() {
+    let env = Env::new();
+    let out = env.run("build", &[("RKG_MOCK_KEY_REVOKED_AFTER", "2")]);
+    assert!(!out.status.success());
+    assert_eq!(call_count(&env), 3);
+    let err = stderr(&out);
+    assert!(err.contains("clé"), "{err}");
+    assert!(!err.contains("panne réseau"), "{err}");
+    assert_eq!(paths_in_graph(&env, FileState::Indexed).len(), 2);
+}
+
+#[test]
+fn req010_ac7_update_after_ac4_sends_only_the_pending_file() {
+    let env = Env::new();
+    let bad = "README.md";
+    let out = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", bad)]);
+    assert!(!out.status.success());
+    fs::remove_file(&env.log).unwrap();
+    let out = env.run("update", &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(logged_paths(&env), vec![bad]);
+    assert!(paths_in_graph(&env, FileState::Pending).is_empty());
 }
 
 #[test]

@@ -24,8 +24,10 @@ pub struct BuildReport {
     pub nodes: usize,
     pub edges: usize,
     pub unresolved: usize,
-    /// Premier échec d'extraction rencontré, s'il y en a un.
-    pub failure: Option<String>,
+    /// Nombre de fichiers dont l'extraction a échoué.
+    pub failed: usize,
+    /// Cause de l'arrêt de l'envoi de nouveaux fichiers (clé refusée, panne réseau répétée).
+    pub stop_cause: Option<String>,
 }
 
 impl BuildReport {
@@ -53,15 +55,19 @@ pub fn run(repo: &Path) -> Result<()> {
     finish(&report, "build")
 }
 
-/// Affiche le bilan ; un échec d'extraction rend une erreur (code non nul).
+/// Affiche le bilan ; un fichier resté en attente ou un arrêt rend une erreur (code non nul).
 pub(crate) fn finish(report: &BuildReport, verb: &str) -> Result<()> {
     println!("{}", report.line_for(verb));
-    match &report.failure {
-        None => Ok(()),
-        Some(msg) => Err(Error::Message(format!(
-            "{} fichier(s) laissé(s) en attente ; premier échec : {msg}",
+    match &report.stop_cause {
+        Some(cause) => Err(Error::Message(format!(
+            "envoi interrompu : {cause} ; {} fichier(s) en attente",
             report.pending
         ))),
+        None if report.pending > 0 => Err(Error::Message(format!(
+            "{} fichier(s) en attente",
+            report.pending
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -152,6 +158,41 @@ fn extract_chunks(
     Ok(chunk::merge(results))
 }
 
+/// Nombre d'erreurs réseau consécutives qui arrête l'envoi (DEC-015).
+const MAX_CONSECUTIVE_NETWORK_ERRORS: usize = 3;
+
+/// Politique d'échec partagée entre les threads de travail (DEC-015).
+#[derive(Default)]
+struct Policy {
+    consecutive_network: usize,
+    stop_cause: Option<String>,
+}
+
+impl Policy {
+    /// Met à jour la politique ; renvoie vrai si l'envoi de nouveaux fichiers doit s'arrêter.
+    fn record(&mut self, result: Option<&Error>) -> bool {
+        match result {
+            None => self.consecutive_network = 0,
+            Some(Error::InvalidKey(_)) => {
+                self.stop_cause
+                    .get_or_insert_with(|| "clé d'API refusée par le fournisseur".to_string());
+            }
+            Some(Error::Network(_)) => {
+                self.consecutive_network += 1;
+                if self.consecutive_network >= MAX_CONSECUTIVE_NETWORK_ERRORS {
+                    self.stop_cause.get_or_insert_with(|| {
+                        format!(
+                            "panne réseau répétée ({MAX_CONSECUTIVE_NETWORK_ERRORS} erreurs réseau consécutives)"
+                        )
+                    });
+                }
+            }
+            Some(_) => {}
+        }
+        self.stop_cause.is_some()
+    }
+}
+
 enum Outcome {
     Done(String, Extraction),
     Failed(String, Error),
@@ -169,6 +210,7 @@ pub(crate) fn extract_all(
 ) -> Result<()> {
     let queue: Mutex<VecDeque<&ScannedFile>> = Mutex::new(files.iter().collect());
     let stop = AtomicBool::new(false);
+    let policy = Mutex::new(Policy::default());
     let (tx, rx) = mpsc::channel::<Outcome>();
     let workers = concurrency.clamp(1, files.len().max(1));
     let mut write_error: Option<Error> = None;
@@ -176,6 +218,7 @@ pub(crate) fn extract_all(
     std::thread::scope(|scope| {
         let queue = &queue;
         let stop = &stop;
+        let policy = &policy;
         for _ in 0..workers {
             let tx = tx.clone();
             scope.spawn(move || loop {
@@ -195,7 +238,15 @@ pub(crate) fn extract_all(
                         Err(e) => Outcome::Failed(file.path.clone(), e),
                     },
                 };
-                if matches!(outcome, Outcome::Failed(..)) {
+                let error = match &outcome {
+                    Outcome::Failed(_, e) => Some(e),
+                    Outcome::Done(..) => None,
+                };
+                let halt = policy
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record(error);
+                if halt {
                     stop.store(true, Ordering::SeqCst);
                 }
                 if tx.send(outcome).is_err() {
@@ -208,9 +259,7 @@ pub(crate) fn extract_all(
             match outcome {
                 Outcome::Failed(path, e) => {
                     warn(&format!("{path} : {e}"));
-                    report
-                        .failure
-                        .get_or_insert_with(|| format!("{path} : {e}"));
+                    report.failed += 1;
                 }
                 Outcome::Done(path, x) => {
                     if write_error.is_some() {
@@ -233,6 +282,10 @@ pub(crate) fn extract_all(
             }
         }
     });
+    report.stop_cause = policy
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner())
+        .stop_cause;
     match write_error {
         Some(e) => Err(e),
         None => Ok(()),

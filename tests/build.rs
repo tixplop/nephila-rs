@@ -547,6 +547,12 @@ fn req006_ac6_broken_file_is_processed_like_others() {
 
 #[test]
 fn req006_ac7_invalid_response_leaves_file_pending_and_graph_intact() {
+    for concurrency in [1, 4] {
+        invalid_response_case(concurrency);
+    }
+}
+
+fn invalid_response_case(concurrency: usize) {
     let env = Env::new();
     let bad = "core/src/main/java/com/acme/core/Broken.java";
     fs::write(
@@ -554,7 +560,11 @@ fn req006_ac7_invalid_response_leaves_file_pending_and_graph_intact() {
         r#"{"version":1,"declares":[{"kind":"bogus","name":"X"}],"references":[]}"#,
     )
     .unwrap();
-    fs::write(&env.config, "provider = \"mock\"\nconcurrency = 1\n").unwrap();
+    fs::write(
+        &env.config,
+        format!("provider = \"mock\"\nconcurrency = {concurrency}\n"),
+    )
+    .unwrap();
     let out = env.build();
     assert!(!out.status.success());
     assert!(stderr(&out).contains("erreur:"), "{}", stderr(&out));
@@ -565,9 +575,16 @@ fn req006_ac7_invalid_response_leaves_file_pending_and_graph_intact() {
     assert_eq!(f.state, FileState::Pending);
     let nodes = store.nodes().unwrap();
     assert!(!nodes.iter().any(|n| n.id.contains("Broken")));
-    // Le graphe reste lisible : les fichiers traités avant l'échec sont indexés.
-    assert!(files.iter().any(|f| f.state == FileState::Indexed));
+    // Le build continue : tous les autres fichiers sont envoyés et indexés.
     assert_eq!(files.len(), SOURCES.len());
+    assert_eq!(
+        files
+            .iter()
+            .filter(|f| f.state == FileState::Indexed)
+            .count(),
+        files.len() - 1
+    );
+    assert_eq!(env.log_lines().len(), files.len());
 }
 
 #[test]
