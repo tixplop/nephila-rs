@@ -4,12 +4,11 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-const TIMEOUT: Duration = Duration::from_secs(120);
-
-pub fn agent() -> ureq::Agent {
+/// Agent HTTP ; `timeout_secs` borne la durée totale d'une requête.
+pub fn agent(timeout_secs: u64) -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
-        .timeout(TIMEOUT)
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
 }
 
@@ -36,17 +35,40 @@ pub fn send(
     match result {
         Ok(resp) => resp
             .into_string()
-            .map_err(|e| Error::Network(format!("{provider} : lecture de la réponse : {e}"))),
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => Error::Timeout(
+                    format!("délai dépassé avec {provider} sur {url} ; augmentez timeout_secs"),
+                ),
+                _ => Error::Network(format!("{provider} : lecture de la réponse : {e}")),
+            }),
         Err(ureq::Error::Status(code @ (401 | 403), _)) => Err(Error::InvalidKey(format!(
             "clé d'API refusée par {provider} (HTTP {code}) ; vérifiez la variable désignée par api_key_env"
         ))),
         Err(ureq::Error::Status(code, _)) => Err(Error::Network(format!(
             "erreur de {provider} (HTTP {code}) sur {url}"
         ))),
+        Err(e) if is_timeout(&e) => Err(Error::Timeout(format!(
+            "délai dépassé avec {provider} sur {url} ({e}) ; augmentez timeout_secs"
+        ))),
         Err(e) => Err(Error::Network(format!(
             "erreur réseau avec {provider} sur {url} : {e}"
         ))),
     }
+}
+
+/// Vrai si une erreur de transport a pour cause un délai (E/S expirée).
+fn is_timeout(e: &ureq::Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(c) = cause {
+        if let Some(io) = c.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            );
+        }
+        cause = c.source();
+    }
+    false
 }
 
 /// Isole l'objet JSON d'un texte de modèle (clôtures ``` ou texte autour tolérés).

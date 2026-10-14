@@ -23,6 +23,11 @@ impl FakeServer {
     /// Démarre sur 127.0.0.1:0 ; chaque requête consomme la réponse suivante
     /// `(statut, corps JSON)` ; file vide : 500.
     pub fn start(responses: Vec<(u16, String)>) -> FakeServer {
+        FakeServer::start_with_delays(responses.into_iter().map(|(s, b)| (s, b, 0)).collect())
+    }
+
+    /// Comme `start`, avec un délai en millisecondes avant chaque réponse.
+    pub fn start_with_delays(responses: Vec<(u16, String, u64)>) -> FakeServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -61,11 +66,15 @@ impl FakeServer {
                     headers,
                     body: String::from_utf8_lossy(&body).into_owned(),
                 });
-                let (status, payload) = queue
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or((500, "{}".into()));
+                let (status, payload, delay_ms) =
+                    queue
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or((500, "{}".into(), 0));
+                if delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
                 let resp = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",

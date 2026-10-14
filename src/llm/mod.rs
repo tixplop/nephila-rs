@@ -32,12 +32,14 @@ pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
                 config.base_url.clone(),
                 config.model.clone(),
                 key,
+                config.timeout_secs,
             )))
         }
         Provider::OpenAi => Ok(Box::new(openai::OpenAiLlm::new(
             config.base_url.clone(),
             config.model.clone(),
             config.api_key()?,
+            config.timeout_secs,
         ))),
     }
 }

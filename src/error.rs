@@ -9,6 +9,8 @@ pub enum Error {
     InvalidKey(String),
     /// Erreur réseau, quota ou erreur serveur du fournisseur.
     Network(String),
+    /// Délai d'appel dépassé (`timeout_secs`).
+    Timeout(String),
     /// Toute autre erreur, avec un message destiné à l'utilisateur.
     Message(String),
 }
@@ -27,7 +29,9 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::InvalidKey(m) | Error::Network(m) | Error::Message(m) => f.write_str(m),
+            Error::InvalidKey(m) | Error::Network(m) | Error::Timeout(m) | Error::Message(m) => {
+                f.write_str(m)
+            }
         }
     }
 }

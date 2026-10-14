@@ -23,6 +23,19 @@ fn req003_build_llm_mock_reads_process_env() {
     assert!(llm.verify_key().is_err());
     std::env::set_var("RKG_MOCK_INVALID_KEY", "0");
     assert!(build_llm(&cfg).unwrap().verify_key().is_ok());
+    std::env::set_var("RKG_MOCK_TIMEOUT_FILES", "A.java, B.java");
+    std::env::set_var("RKG_MOCK_KEY_REVOKED_AFTER", "1");
+    let llm = build_llm(&cfg).unwrap();
+    assert!(matches!(
+        llm.extract("B.java", 1, ""),
+        Err(rkg::error::Error::Timeout(_))
+    ));
+    assert!(matches!(
+        llm.extract("C.java", 1, ""),
+        Err(rkg::error::Error::InvalidKey(_))
+    ));
+    std::env::remove_var("RKG_MOCK_TIMEOUT_FILES");
+    std::env::remove_var("RKG_MOCK_KEY_REVOKED_AFTER");
     std::env::set_var("RKG_MOCK_DELAY_MS", "x");
     assert!(build_llm(&cfg).is_err());
 }

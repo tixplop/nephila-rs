@@ -353,3 +353,54 @@ fn req003_non_numeric_numeric_variables_fail() {
         assert!(e.contains(var), "{e}");
     }
 }
+
+#[test]
+fn req002_ac7_timeout_secs_default_and_value() {
+    assert_eq!(parse("provider='mock'").unwrap().timeout_secs, 300);
+    let c = Config::parse("provider='mock'\ntimeout_secs=7", Path::new("/x")).unwrap();
+    assert_eq!(c.timeout_secs, 7);
+}
+
+#[test]
+fn req002_ac7_timeout_secs_invalid_names_key() {
+    for bad in ["0", "-3", "1.5", "'abc'"] {
+        let m = parse(&format!("provider='mock'\ntimeout_secs={bad}")).unwrap_err();
+        assert!(m.contains("timeout_secs"), "{bad}: {m}");
+    }
+}
+
+#[test]
+fn req003_ac5_timeout_files_fail_with_timeout_and_are_logged() {
+    let d = tempfile::tempdir().unwrap();
+    let m = mock_with(d.path(), |o| {
+        o.timeout_files = vec!["a".into(), "src/b".into()]
+    });
+    assert!(matches!(
+        m.extract("a", 1, ""),
+        Err(rkg::error::Error::Timeout(_))
+    ));
+    assert!(matches!(
+        m.extract("src/b", 1, ""),
+        Err(rkg::error::Error::Timeout(_))
+    ));
+    assert!(m.extract("c", 1, "").is_ok());
+    let log = std::fs::read_to_string(d.path().join("log")).unwrap();
+    assert_eq!(log, "a\t1\nsrc/b\t1\nc\t1\n");
+}
+
+#[test]
+fn req003_ac5_key_revoked_after_n_extractions() {
+    let d = tempfile::tempdir().unwrap();
+    let m = mock_with(d.path(), |o| o.key_revoked_after = Some(2));
+    assert!(m.extract("a", 1, "").is_ok());
+    assert!(m.extract("b", 1, "").is_ok());
+    assert!(matches!(
+        m.extract("c", 1, ""),
+        Err(rkg::error::Error::InvalidKey(_))
+    ));
+    assert!(matches!(
+        m.extract("d", 1, ""),
+        Err(rkg::error::Error::InvalidKey(_))
+    ));
+    assert!(m.verify_key().is_ok());
+}

@@ -1,7 +1,8 @@
 //! Fournisseur `mock` piloté par variables d'environnement (REQ-003).
 //!
 //! Variables : `RKG_MOCK_DIR` (fixtures), `RKG_MOCK_LOG` (journal d'appels),
-//! `RKG_MOCK_FAIL_AFTER`, `RKG_MOCK_INVALID_KEY`, `RKG_MOCK_DELAY_MS`.
+//! `RKG_MOCK_FAIL_AFTER`, `RKG_MOCK_INVALID_KEY`, `RKG_MOCK_DELAY_MS`,
+//! `RKG_MOCK_TIMEOUT_FILES`, `RKG_MOCK_KEY_REVOKED_AFTER`.
 //! Fixture d'un fichier : `<dir>/<chemin>.<n>.json` pour le morceau n (à partir de 1) si
 //! elle existe, sinon `<dir>/<chemin>.json`, sinon réponse vide.
 
@@ -21,12 +22,17 @@ pub struct MockOptions {
     pub fail_after: Option<usize>,
     pub invalid_key: bool,
     pub delay_ms: u64,
+    /// Fichiers (chemins relatifs) dont l'extraction échoue en « délai dépassé ».
+    pub timeout_files: Vec<String>,
+    /// Les appels d'extraction au-delà du N-ième échouent en « clé refusée ».
+    pub key_revoked_after: Option<usize>,
 }
 
 #[derive(Debug)]
 pub struct MockLlm {
     opts: MockOptions,
     calls: AtomicUsize,
+    extractions: AtomicUsize,
 }
 
 type EnvFn<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -51,6 +57,7 @@ impl MockLlm {
         MockLlm {
             opts,
             calls: AtomicUsize::new(0),
+            extractions: AtomicUsize::new(0),
         }
     }
 
@@ -67,6 +74,15 @@ impl MockLlm {
             fail_after: env_number(env, "RKG_MOCK_FAIL_AFTER")?,
             invalid_key: env_nonempty(env, "RKG_MOCK_INVALID_KEY").is_some_and(|v| v != "0"),
             delay_ms: env_number(env, "RKG_MOCK_DELAY_MS")?.unwrap_or(0),
+            timeout_files: env_nonempty(env, "RKG_MOCK_TIMEOUT_FILES")
+                .map(|v| {
+                    v.split(',')
+                        .map(|f| f.trim().to_string())
+                        .filter(|f| !f.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            key_revoked_after: env_number(env, "RKG_MOCK_KEY_REVOKED_AFTER")?,
         }))
     }
 
@@ -142,7 +158,22 @@ impl Llm for MockLlm {
 
     fn extract(&self, file: &str, chunk: usize, _text: &str) -> Result<Extraction> {
         check_relative(file)?;
+        let n = self.extractions.fetch_add(1, Ordering::SeqCst);
         self.begin_call(file, chunk)?;
+        if self.opts.timeout_files.iter().any(|f| f == file) {
+            return Err(Error::Timeout(format!(
+                "délai dépassé (LLM simulé) pour {file} (RKG_MOCK_TIMEOUT_FILES)"
+            )));
+        }
+        if let Some(limit) = self.opts.key_revoked_after {
+            if n >= limit {
+                return Err(Error::InvalidKey(format!(
+                    "clé d'API refusée par le fournisseur (LLM simulé) : appel d'extraction {} \
+                     au-delà de RKG_MOCK_KEY_REVOKED_AFTER={limit}",
+                    n + 1
+                )));
+            }
+        }
         let by_chunk = self.read_fixture(&format!("{file}.{chunk}.json"))?;
         let json = match by_chunk {
             Some(j) => Some(j),

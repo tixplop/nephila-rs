@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 
 pub const DEFAULT_MAX_CHUNK_CHARS: usize = 60_000;
 pub const DEFAULT_CONCURRENCY: usize = 4;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -34,6 +35,8 @@ pub struct Config {
     pub api_key_env: Option<String>,
     pub max_chunk_chars: usize,
     pub concurrency: usize,
+    /// Durée maximale d'un appel LLM HTTP, en secondes.
+    pub timeout_secs: u64,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +48,7 @@ struct RawConfig {
     api_key_env: Option<String>,
     max_chunk_chars: Option<i64>,
     concurrency: Option<i64>,
+    timeout_secs: Option<i64>,
 }
 
 /// Chemin du fichier de configuration : `RKG_CONFIG`, sinon
@@ -171,6 +175,11 @@ impl Config {
                 DEFAULT_MAX_CHUNK_CHARS,
             )?,
             concurrency: positive("concurrency", raw.concurrency, DEFAULT_CONCURRENCY)?,
+            timeout_secs: positive(
+                "timeout_secs",
+                raw.timeout_secs,
+                DEFAULT_TIMEOUT_SECS as usize,
+            )? as u64,
         })
     }
 

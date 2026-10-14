@@ -19,12 +19,17 @@ pub struct AnthropicLlm {
 }
 
 impl AnthropicLlm {
-    pub fn new(base_url: Option<String>, model: String, key: String) -> AnthropicLlm {
+    pub fn new(
+        base_url: Option<String>,
+        model: String,
+        key: String,
+        timeout_secs: u64,
+    ) -> AnthropicLlm {
         AnthropicLlm {
             base_url,
             model,
             key,
-            agent: http::agent(),
+            agent: http::agent(timeout_secs),
         }
     }
 

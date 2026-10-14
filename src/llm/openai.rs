@@ -18,12 +18,17 @@ pub struct OpenAiLlm {
 
 impl OpenAiLlm {
     /// `key` est facultative (modèle local).
-    pub fn new(base_url: Option<String>, model: String, key: Option<String>) -> OpenAiLlm {
+    pub fn new(
+        base_url: Option<String>,
+        model: String,
+        key: Option<String>,
+        timeout_secs: u64,
+    ) -> OpenAiLlm {
         OpenAiLlm {
             base_url,
             model,
             key,
-            agent: http::agent(),
+            agent: http::agent(timeout_secs),
         }
     }
 
