@@ -1,0 +1,28 @@
+# Exemple de configuration de rkg.
+# Emplacement : $RKG_CONFIG, sinon $XDG_CONFIG_HOME/rkg/config.toml,
+# sinon ~/.config/rkg/config.toml.
+# Gardez une seule section `provider` active.
+
+# --- Anthropic ---
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+api_key_env = "ANTHROPIC_API_KEY"   # nom de la variable, jamais la clé elle-même
+# base_url = "https://api.anthropic.com"
+
+# --- Serveur compatible OpenAI (OpenAI, Ollama, llama.cpp, vLLM...) ---
+# provider = "openai"
+# model = "gpt-4o-mini"
+# api_key_env = "OPENAI_API_KEY"
+#
+# Modèle local avec Ollama : pas de clé, et base_url SANS « /v1 » final
+# (rkg ajoute lui-même /v1/chat/completions et /v1/models) :
+# provider = "openai"
+# model = "llama3.1"
+# base_url = "http://localhost:11434"
+
+# --- LLM simulé, pour les tests (voir RKG_MOCK_* dans le README) ---
+# provider = "mock"
+
+# Options communes (valeurs par défaut)
+# max_chunk_chars = 60000   # taille maximale d'un morceau envoyé au LLM
+# concurrency = 4           # appels LLM simultanés
