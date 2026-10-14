@@ -113,6 +113,17 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Query(Query::Search { terme, limit, json }) => {
             return crate::query::search::run(&cli.repo, terme, *limit, json.json)
         }
+        Command::Query(Query::Neighbors {
+            nœud,
+            depth,
+            limit,
+            json,
+        }) => return crate::query::neighbors::run(&cli.repo, nœud, *depth, *limit, json.json),
+        Command::Query(Query::Path {
+            source,
+            cible,
+            json,
+        }) => return crate::query::path::run(&cli.repo, source, cible, json.json),
         _ => {}
     }
     Err(Error::NotImplemented(format!(

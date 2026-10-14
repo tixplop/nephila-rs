@@ -100,7 +100,7 @@ pub fn run(repo: &Path, term: &str, limit: Option<usize>, as_json: bool) -> Resu
             println!("{}", line(n));
         }
         if remaining > 0 {
-            println!("{remaining} résultats supplémentaires");
+            println!("{}", super::remaining_line(remaining));
         }
     }
     Ok(())

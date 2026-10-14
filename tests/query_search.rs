@@ -509,3 +509,11 @@ fn lookup_matches_package_by_trailing_segment() {
         "package:com.acme.other"
     );
 }
+
+#[test]
+fn req013_ac3_single_remaining_result_is_singular() {
+    let env = Env::built();
+    let l = lines(&env.q(&["topic", "--limit", "59"]));
+    assert_eq!(l.len(), 60, "{l:?}");
+    assert_eq!(l[59], "1 résultat supplémentaire");
+}
