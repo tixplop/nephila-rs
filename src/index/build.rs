@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 
+use crate::chunk;
 use crate::config::Config;
 use crate::error::{warn, Error, Result};
 use crate::llm::{build_llm, Extraction, Llm};
@@ -99,6 +100,7 @@ pub fn build(repo: &Path, config: &Config, llm: &dyn Llm) -> Result<BuildReport>
         repo,
         &scanned.files,
         config.concurrency,
+        config.max_chunk_chars,
         llm,
         &mut store,
         &mut report,
@@ -116,6 +118,25 @@ pub fn build(repo: &Path, config: &Config, llm: &dyn Llm) -> Result<BuildReport>
     Ok(report)
 }
 
+/// Extrait un fichier, en plusieurs appels s'il dépasse `max_chunk_chars` ; le premier échec
+/// d'un morceau fait échouer le fichier entier (REQ-007).
+fn extract_chunks(
+    llm: &dyn Llm,
+    path: &str,
+    text: &str,
+    max_chunk_chars: usize,
+) -> Result<Extraction> {
+    let parts = chunk::split(text, max_chunk_chars);
+    if parts.len() == 1 {
+        return llm.extract(path, 1, &parts[0]);
+    }
+    let mut results = Vec::with_capacity(parts.len());
+    for (i, part) in parts.iter().enumerate() {
+        results.push(llm.extract(path, i + 1, part)?);
+    }
+    Ok(chunk::merge(results))
+}
+
 enum Outcome {
     Done(String, Extraction),
     Failed(String, Error),
@@ -126,6 +147,7 @@ fn extract_all(
     repo: &Path,
     files: &[ScannedFile],
     concurrency: usize,
+    max_chunk_chars: usize,
     llm: &dyn Llm,
     store: &mut Store,
     report: &mut BuildReport,
@@ -153,7 +175,7 @@ fn extract_all(
                         file.path.clone(),
                         Error::Message(format!("lecture de {} impossible : {e}", file.path)),
                     ),
-                    Ok(text) => match llm.extract(&file.path, 1, &text) {
+                    Ok(text) => match extract_chunks(llm, &file.path, &text, max_chunk_chars) {
                         Ok(x) => Outcome::Done(file.path.clone(), x),
                         Err(e) => Outcome::Failed(file.path.clone(), e),
                     },
