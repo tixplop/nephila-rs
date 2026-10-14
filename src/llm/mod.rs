@@ -1,7 +1,10 @@
 //! Abstraction du fournisseur LLM (REQ-002, REQ-003, REQ-006).
 
+pub mod anthropic;
 pub mod extract;
+mod http;
 pub mod mock;
+pub mod openai;
 
 use crate::config::{Config, Provider};
 use crate::error::{Error, Result};
@@ -21,9 +24,20 @@ pub trait Llm: Send + Sync {
 pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
     match config.provider {
         Provider::Mock => Ok(Box::new(mock::MockLlm::from_env()?)),
-        Provider::Anthropic | Provider::OpenAi => Err(Error::NotImplemented(format!(
-            "fournisseur {}",
-            config.provider.as_str()
+        Provider::Anthropic => {
+            let key = config.api_key()?.ok_or_else(|| {
+                Error::Message("clé api_key_env manquante pour le fournisseur anthropic".into())
+            })?;
+            Ok(Box::new(anthropic::AnthropicLlm::new(
+                config.base_url.clone(),
+                config.model.clone(),
+                key,
+            )))
+        }
+        Provider::OpenAi => Ok(Box::new(openai::OpenAiLlm::new(
+            config.base_url.clone(),
+            config.model.clone(),
+            config.api_key()?,
         ))),
     }
 }

@@ -1,0 +1,232 @@
+//! Adaptateurs HTTP Anthropic et compatible OpenAI contre un faux serveur (REQ-002).
+
+#[path = "support/fake_server.rs"]
+mod fake_server;
+
+use fake_server::FakeServer;
+use rkg::error::Error;
+use rkg::llm::anthropic::AnthropicLlm;
+use rkg::llm::extract::AskReply;
+use rkg::llm::openai::OpenAiLlm;
+use rkg::llm::Llm;
+
+const EXTRACTION: &str =
+    r#"{"version":1,"declares":[{"kind":"type","name":"A","subkind":"class"}],"references":[]}"#;
+
+fn anthropic_reply(text: &str) -> String {
+    serde_json::json!({"content":[{"type":"text","text":text}]}).to_string()
+}
+
+fn openai_reply(text: &str) -> String {
+    serde_json::json!({"choices":[{"message":{"role":"assistant","content":text}}]}).to_string()
+}
+
+fn anthropic(s: &FakeServer) -> AnthropicLlm {
+    AnthropicLlm::new(
+        Some(s.base_url.clone()),
+        "claude-x".into(),
+        "sk-test".into(),
+    )
+}
+
+fn openai(s: &FakeServer, key: Option<&str>) -> OpenAiLlm {
+    OpenAiLlm::new(
+        Some(s.base_url.clone()),
+        "gpt-x".into(),
+        key.map(String::from),
+    )
+}
+
+// ---- AC-002-3 : 401/403 -> erreur de clé, distincte d'une erreur réseau ----
+
+#[test]
+fn req002_ac3_anthropic_401_is_invalid_key() {
+    let s = FakeServer::start(vec![(401, "{}".into())]);
+    assert!(matches!(
+        anthropic(&s).verify_key(),
+        Err(Error::InvalidKey(_))
+    ));
+}
+
+#[test]
+fn req002_ac3_openai_403_is_invalid_key() {
+    let s = FakeServer::start(vec![(403, "{}".into())]);
+    assert!(matches!(
+        openai(&s, Some("k")).verify_key(),
+        Err(Error::InvalidKey(_))
+    ));
+}
+
+#[test]
+fn req002_ac3_server_error_is_network_not_key() {
+    let s = FakeServer::start(vec![(500, "{}".into()), (429, "{}".into())]);
+    assert!(matches!(anthropic(&s).verify_key(), Err(Error::Network(_))));
+    assert!(matches!(
+        openai(&s, None).verify_key(),
+        Err(Error::Network(_))
+    ));
+}
+
+#[test]
+fn req002_ac3_connection_refused_is_network() {
+    let url = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let llm = AnthropicLlm::new(Some(url), "m".into(), "k".into());
+    assert!(matches!(llm.verify_key(), Err(Error::Network(_))));
+}
+
+#[test]
+fn req002_ac3_extract_401_is_invalid_key() {
+    let s = FakeServer::start(vec![(401, "{}".into())]);
+    assert!(matches!(
+        anthropic(&s).extract("A.java", 1, "class A {}"),
+        Err(Error::InvalidKey(_))
+    ));
+}
+
+// ---- AC-002-5 : requêtes conformes au protocole ----
+
+#[test]
+fn req002_ac5_anthropic_verify_key_request() {
+    let s = FakeServer::start(vec![(200, r#"{"data":[]}"#.into())]);
+    anthropic(&s).verify_key().unwrap();
+    let r = &s.requests()[0];
+    assert_eq!((r.method.as_str(), r.path.as_str()), ("GET", "/v1/models"));
+    assert_eq!(r.headers["x-api-key"], "sk-test");
+    assert!(r.headers.contains_key("anthropic-version"));
+}
+
+#[test]
+fn req002_ac5_anthropic_extract_request_and_response() {
+    let s = FakeServer::start(vec![(200, anthropic_reply(EXTRACTION))]);
+    let ex = anthropic(&s)
+        .extract("src/A.java", 2, "class A {}")
+        .unwrap();
+    assert_eq!(ex.declares.len(), 1);
+    let r = &s.requests()[0];
+    assert_eq!(
+        (r.method.as_str(), r.path.as_str()),
+        ("POST", "/v1/messages")
+    );
+    assert_eq!(r.headers["x-api-key"], "sk-test");
+    assert!(r.headers.contains_key("anthropic-version"));
+    assert!(r.headers["content-type"].starts_with("application/json"));
+    let b: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(b["model"], "claude-x");
+    assert!(b["max_tokens"].as_u64().unwrap() > 0);
+    assert!(b["system"].as_str().unwrap().contains("JSON"));
+    assert_eq!(b["messages"][0]["role"], "user");
+    assert!(b["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("class A {}"));
+}
+
+#[test]
+fn req002_ac5_openai_verify_key_request() {
+    let s = FakeServer::start(vec![(200, r#"{"data":[]}"#.into())]);
+    openai(&s, Some("sk-o")).verify_key().unwrap();
+    let r = &s.requests()[0];
+    assert_eq!((r.method.as_str(), r.path.as_str()), ("GET", "/v1/models"));
+    assert_eq!(r.headers["authorization"], "Bearer sk-o");
+}
+
+#[test]
+fn req002_ac5_openai_extract_request_and_response() {
+    let s = FakeServer::start(vec![(200, openai_reply(EXTRACTION))]);
+    let ex = openai(&s, Some("sk-o"))
+        .extract("A.java", 1, "class A {}")
+        .unwrap();
+    assert_eq!(ex.declares[0].qualified, "A");
+    let r = &s.requests()[0];
+    assert_eq!(
+        (r.method.as_str(), r.path.as_str()),
+        ("POST", "/v1/chat/completions")
+    );
+    assert_eq!(r.headers["authorization"], "Bearer sk-o");
+    let b: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(b["model"], "gpt-x");
+    assert_eq!(b["messages"][0]["role"], "system");
+    assert_eq!(b["messages"][1]["role"], "user");
+    assert!(b["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("class A {}"));
+}
+
+#[test]
+fn req002_ac5_openai_key_is_optional_for_local_model() {
+    let s = FakeServer::start(vec![(200, r#"{"data":[]}"#.into())]);
+    openai(&s, None).verify_key().unwrap();
+    assert!(!s.requests()[0].headers.contains_key("authorization"));
+}
+
+#[test]
+fn req002_ac5_base_url_trailing_slash_is_tolerated() {
+    let s = FakeServer::start(vec![(200, "{}".into())]);
+    let llm = AnthropicLlm::new(Some(format!("{}/", s.base_url)), "m".into(), "k".into());
+    llm.verify_key().unwrap();
+    assert_eq!(s.requests()[0].path, "/v1/models");
+}
+
+#[test]
+fn req002_ac5_json_is_extracted_from_fenced_text() {
+    let fenced = format!("Voici :\n```json\n{EXTRACTION}\n```\n");
+    let s = FakeServer::start(vec![(200, anthropic_reply(&fenced))]);
+    assert_eq!(
+        anthropic(&s)
+            .extract("A.java", 1, "x")
+            .unwrap()
+            .declares
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn req002_ac5_ask_both_providers() {
+    let reply = r#"{"found":true,"answer":"oui","nodes":["type:A"]}"#;
+    let s = FakeServer::start(vec![(200, anthropic_reply(reply))]);
+    let a = anthropic(&s).ask("q ?", "ctx").unwrap();
+    assert_eq!(
+        a,
+        AskReply::Found {
+            answer: "oui".into(),
+            nodes: vec!["type:A".into()]
+        }
+    );
+    let s = FakeServer::start(vec![(200, openai_reply(r#"{"found":false}"#))]);
+    assert_eq!(
+        openai(&s, None).ask("q ?", "ctx").unwrap(),
+        AskReply::NotFound
+    );
+}
+
+// ---- réponses invalides : erreur d'appel, ni clé ni réseau ----
+
+#[test]
+fn req002_invalid_responses_are_message_errors() {
+    let s = FakeServer::start(vec![
+        (200, anthropic_reply("pas du json")),
+        (
+            200,
+            anthropic_reply(r#"{"version":9,"declares":[],"references":[]}"#),
+        ),
+        (200, r#"{"content":[]}"#.into()),
+        (200, "<html>".into()),
+    ]);
+    let llm = anthropic(&s);
+    for _ in 0..4 {
+        assert!(matches!(
+            llm.extract("A.java", 1, "x"),
+            Err(Error::Message(_))
+        ));
+    }
+    let s = FakeServer::start(vec![(200, r#"{"choices":[]}"#.into())]);
+    assert!(matches!(
+        openai(&s, None).extract("A.java", 1, "x"),
+        Err(Error::Message(_))
+    ));
+}

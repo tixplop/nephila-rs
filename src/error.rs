@@ -7,6 +7,10 @@ use std::fmt;
 pub enum Error {
     /// Fonctionnalité pas encore disponible.
     NotImplemented(String),
+    /// Clé d'API refusée par le fournisseur (HTTP 401/403).
+    InvalidKey(String),
+    /// Erreur réseau, quota ou erreur serveur du fournisseur.
+    Network(String),
     /// Toute autre erreur, avec un message destiné à l'utilisateur.
     Message(String),
 }
@@ -26,7 +30,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotImplemented(what) => write!(f, "{what} : non implémenté"),
-            Error::Message(m) => f.write_str(m),
+            Error::InvalidKey(m) | Error::Network(m) | Error::Message(m) => f.write_str(m),
         }
     }
 }

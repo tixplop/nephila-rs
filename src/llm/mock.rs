@@ -91,7 +91,7 @@ impl MockLlm {
         }
         if let Some(limit) = self.opts.fail_after {
             if n >= limit {
-                return Err(Error::Message(format!(
+                return Err(Error::Network(format!(
                     "erreur réseau (LLM simulé) : appel {} au-delà de RKG_MOCK_FAIL_AFTER={limit}",
                     n + 1
                 )));
@@ -132,7 +132,7 @@ fn check_relative(file: &str) -> Result<()> {
 impl Llm for MockLlm {
     fn verify_key(&self) -> Result<()> {
         if self.opts.invalid_key {
-            Err(Error::Message(
+            Err(Error::InvalidKey(
                 "clé d'API refusée par le fournisseur (LLM simulé, RKG_MOCK_INVALID_KEY)".into(),
             ))
         } else {
