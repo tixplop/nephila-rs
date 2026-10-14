@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 assert_cmd = "2"
