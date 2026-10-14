@@ -66,20 +66,3 @@ fn req001_ac2_error_exits_nonzero_with_prefix_on_stderr_only() {
         .unwrap()
         .starts_with("erreur:"));
 }
-
-#[test]
-fn req001_ac2_all_subcommands_parse_and_report_not_implemented() {
-    let cases: Vec<Vec<&str>> = vec![
-        vec!["-C", ".", "query", "ask", "pourquoi ?"],
-        vec!["query", "ask", "pourquoi ?"],
-    ];
-    for args in cases {
-        let out = rkg().args(&args).assert().failure().get_output().clone();
-        let err = String::from_utf8(out.stderr).unwrap();
-        assert!(
-            err.starts_with("erreur:") && err.contains("non implémenté"),
-            "{args:?}: {err}"
-        );
-        assert!(out.stdout.is_empty());
-    }
-}

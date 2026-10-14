@@ -124,6 +124,9 @@ pub fn run(cli: Cli) -> Result<()> {
             cible,
             json,
         }) => return crate::query::path::run(&cli.repo, source, cible, json.json),
+        Command::Query(Query::Ask { question, json }) => {
+            return crate::query::ask::run(&cli.repo, question, json.json)
+        }
         _ => {}
     }
     Err(Error::NotImplemented(format!(
