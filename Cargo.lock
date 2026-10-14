@@ -704,6 +704,7 @@ dependencies = [
  "blake3",
  "clap",
  "ignore",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

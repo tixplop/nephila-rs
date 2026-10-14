@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use crate::chunk;
 use crate::config::Config;
 use crate::error::{warn, Error, Result};
+use crate::index::lock::RepoLock;
 use crate::llm::{build_llm, Extraction, Llm};
 use crate::model::{FileRecord, FileState, Node, NodeKind, Ref};
 use crate::resolve;
@@ -42,7 +43,9 @@ pub fn run(repo: &Path) -> Result<()> {
     let config = Config::load()?;
     let llm = build_llm(&config)?;
     llm.verify_key()?;
-    let report = build(repo, &config, llm.as_ref())?;
+    // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
+    let lock = RepoLock::acquire(repo)?;
+    let report = build(repo, &config, llm.as_ref(), &lock)?;
     println!("{}", report.line());
     match report.failure {
         None => Ok(()),
@@ -69,8 +72,9 @@ fn check_repo(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Construit le graphe de `repo` avec le fournisseur donné (config et clé déjà validées).
-pub fn build(repo: &Path, config: &Config, llm: &dyn Llm) -> Result<BuildReport> {
+/// Construit le graphe de `repo` avec le fournisseur donné (config et clé déjà validées). Le
+/// verrou d'écriture, pris par l'appelant, prouve l'exclusivité avant toute écriture.
+pub fn build(repo: &Path, config: &Config, llm: &dyn Llm, _lock: &RepoLock) -> Result<BuildReport> {
     check_repo(repo)?;
     let mut store = Store::open_or_create(repo)?;
     let known = if db_path(repo).is_file() {
