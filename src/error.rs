@@ -5,8 +5,6 @@ use std::fmt;
 /// Erreur de l'application ; tout `Err` remonté à `main` donne un code non nul.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// Fonctionnalité pas encore disponible.
-    NotImplemented(String),
     /// Clé d'API refusée par le fournisseur (HTTP 401/403).
     InvalidKey(String),
     /// Erreur réseau, quota ou erreur serveur du fournisseur.
@@ -29,7 +27,6 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::NotImplemented(what) => write!(f, "{what} : non implémenté"),
             Error::InvalidKey(m) | Error::Network(m) | Error::Message(m) => f.write_str(m),
         }
     }
