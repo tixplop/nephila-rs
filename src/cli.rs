@@ -96,8 +96,11 @@ impl Command {
     }
 }
 
-/// Exécute la commande (squelette : tout est « non implémenté »).
+/// Exécute la commande ; les commandes pas encore réalisées répondent « non implémenté ».
 pub fn run(cli: Cli) -> Result<()> {
+    if let Command::Build = cli.command {
+        return crate::index::build::run(&cli.repo);
+    }
     Err(Error::NotImplemented(format!(
         "commande `{}`",
         cli.command.name()

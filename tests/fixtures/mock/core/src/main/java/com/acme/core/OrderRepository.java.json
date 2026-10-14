@@ -1,0 +1,1 @@
+{"version":1,"context":"package com.acme.core\nimport com.acme.domain.Order","declares":[{"kind":"package","name":"com.acme.core"},{"kind":"type","name":"com.acme.core.OrderRepository","subkind":"interface"},{"kind":"method","name":"com.acme.core.OrderRepository.save"}],"references":[{"source":"type:com.acme.core.OrderRepository","kind":"imports","target":"Order"}]}

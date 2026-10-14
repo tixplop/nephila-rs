@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod index;
 pub mod llm;
 pub mod model;
 pub mod resolve;

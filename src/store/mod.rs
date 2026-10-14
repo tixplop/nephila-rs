@@ -123,6 +123,30 @@ impl Store {
         tx.commit().map_err(db_err)
     }
 
+    /// Vide le graphe et enregistre `files` « en attente » en une seule transaction : le graphe
+    /// précédent n'est remplacé que si l'ensemble réussit.
+    pub fn reset_with_pending_files(&mut self, files: &[FileRecord]) -> Result<()> {
+        self.ensure_writable()?;
+        let tx = self.conn.transaction().map_err(db_err)?;
+        tx.execute_batch(
+            "DELETE FROM edges; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
+             DELETE FROM summary; DELETE FROM meta WHERE key <> 'schema_version';",
+        )
+        .map_err(db_err)?;
+        {
+            let mut st = tx
+                .prepare("INSERT INTO files(path, hash, size, mtime, state) VALUES (?1, ?2, ?3, ?4, 'pending')")
+                .map_err(db_err)?;
+            for f in files {
+                let size = i64::try_from(f.size)
+                    .map_err(|_| Error::Message(format!("taille invalide pour {}", f.path)))?;
+                st.execute(params![f.path, f.hash, size, f.mtime])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)
+    }
+
     /// Enregistre ou met à jour des fichiers (état d'origine conservé dans chaque enregistrement),
     /// en une seule transaction. Un fichier déjà connu garde ses nœuds.
     pub fn insert_files(&mut self, files: &[FileRecord]) -> Result<()> {

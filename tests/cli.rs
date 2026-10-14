@@ -54,7 +54,13 @@ fn req001_ac3_invalid_option_fails_with_usage_on_stderr() {
 
 #[test]
 fn req001_ac2_error_exits_nonzero_with_prefix_on_stderr_only() {
-    let out = rkg().arg("build").assert().failure().get_output().clone();
+    let out = rkg()
+        .env("RKG_CONFIG", "/nonexistent/rkg-config.toml")
+        .arg("build")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8(out.stderr)
         .unwrap()
@@ -65,6 +71,7 @@ fn req001_ac2_error_exits_nonzero_with_prefix_on_stderr_only() {
 fn req001_ac2_all_subcommands_parse_and_report_not_implemented() {
     let cases: Vec<Vec<&str>> = vec![
         vec!["update"],
+        vec!["-C", ".", "status"],
         vec!["status", "--json"],
         vec!["query", "search", "foo", "--limit", "5", "--json"],
         vec!["query", "neighbors", "foo", "--depth", "2"],
@@ -72,7 +79,6 @@ fn req001_ac2_all_subcommands_parse_and_report_not_implemented() {
         vec!["query", "ask", "pourquoi ?"],
         vec!["export", "--output", "out.json"],
         vec!["summary", "--json"],
-        vec!["-C", ".", "build"],
     ];
     for args in cases {
         let out = rkg().args(&args).assert().failure().get_output().clone();
