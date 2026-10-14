@@ -54,6 +54,8 @@ CREATE INDEX idx_edges_source ON edges(source);
 CREATE INDEX idx_edges_target ON edges(target);
 
 CREATE TABLE summary (
-    id   INTEGER PRIMARY KEY CHECK (id = 1),
-    text TEXT NOT NULL
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    text        TEXT NOT NULL,
+    -- Instant du calcul, en millisecondes depuis l'epoch Unix.
+    computed_at INTEGER NOT NULL
 );

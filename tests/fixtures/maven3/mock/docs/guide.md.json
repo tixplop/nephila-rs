@@ -1,0 +1,1 @@
+{"version":1,"declares":[{"kind":"document","name":"docs/guide.md"},{"kind":"section","name":"docs/guide.md#guide"},{"kind":"concept","name":"idempotence"}],"references":[{"source":"section:docs/guide.md#guide","kind":"mentions","target":"idempotence"}]}

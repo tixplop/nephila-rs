@@ -104,6 +104,11 @@ pub fn run(cli: Cli) -> Result<()> {
     if let Command::Status(j) = &cli.command {
         return crate::status::run(&cli.repo, j.json);
     }
+    match &cli.command {
+        Command::Summary(j) => return crate::summary::run(&cli.repo, j.json),
+        Command::Export { output } => return crate::export::run(&cli.repo, output.as_deref()),
+        _ => {}
+    }
     Err(Error::NotImplemented(format!(
         "commande `{}`",
         cli.command.name()

@@ -1,0 +1,1 @@
+{"version":1,"context":"package com.acme.store\nimport com.acme.core.OrderRepository","declares":[{"kind":"package","name":"com.acme.store"},{"kind":"type","name":"com.acme.store.JdbcOrderRepository","subkind":"class"}],"references":[{"source":"type:com.acme.store.JdbcOrderRepository","kind":"implements","target":"OrderRepository"}]}

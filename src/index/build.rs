@@ -119,6 +119,7 @@ pub fn build(repo: &Path, config: &Config, llm: &dyn Llm, _lock: &RepoLock) -> R
         .iter()
         .filter(|f| f.state == FileState::Pending)
         .count();
+    crate::summary::refresh(&mut store)?;
     Ok(report)
 }
 

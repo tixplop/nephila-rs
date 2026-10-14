@@ -1,0 +1,1 @@
+{"version":1,"declares":[{"kind":"module","name":"store"}],"references":[{"source":"module:store","kind":"depends_on","target":"core"}]}

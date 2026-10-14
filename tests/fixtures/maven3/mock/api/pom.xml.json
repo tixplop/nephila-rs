@@ -1,0 +1,1 @@
+{"version":1,"declares":[{"kind":"module","name":"api"}],"references":[{"source":"module:api","kind":"depends_on","target":"core"}]}

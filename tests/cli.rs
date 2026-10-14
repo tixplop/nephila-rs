@@ -76,8 +76,6 @@ fn req001_ac2_all_subcommands_parse_and_report_not_implemented() {
         vec!["query", "neighbors", "foo", "--depth", "2"],
         vec!["query", "path", "a", "b"],
         vec!["query", "ask", "pourquoi ?"],
-        vec!["export", "--output", "out.json"],
-        vec!["summary", "--json"],
     ];
     for args in cases {
         let out = rkg().args(&args).assert().failure().get_output().clone();

@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::model::{Edge, EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, SubKind};
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
@@ -49,6 +49,8 @@ impl Store {
         match store.user_version()? {
             0 => store.create_schema()?,
             v if v == SCHEMA_VERSION => {}
+            // Schéma plus ancien : build repart de zéro, on le recrée.
+            v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
         }
         Ok(store)
@@ -93,6 +95,29 @@ impl Store {
         self.conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(db_err)
+    }
+
+    /// Supprime toutes les tables de l'ancien schéma puis crée le schéma courant.
+    fn recreate_schema(&self) -> Result<()> {
+        let names: Vec<String> = {
+            let mut st = self
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+                .map_err(db_err)?;
+            let rows = st.query_map([], |r| r.get(0)).map_err(db_err)?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?
+        };
+        let mut sql = String::from("PRAGMA foreign_keys = OFF;\nBEGIN;\n");
+        for n in names {
+            sql.push_str(&format!(
+                "DROP TABLE IF EXISTS \"{}\";\n",
+                n.replace('"', "\"\"")
+            ));
+        }
+        sql.push_str("COMMIT;\nPRAGMA foreign_keys = ON;");
+        self.conn.execute_batch(&sql).map_err(db_err)?;
+        self.create_schema()
     }
 
     fn create_schema(&self) -> Result<()> {
@@ -436,25 +461,26 @@ impl Store {
         self.user_version()
     }
 
-    /// Résumé global du dépôt, s'il existe.
-    pub fn summary(&self) -> Result<Option<String>> {
-        match self
-            .conn
-            .query_row("SELECT text FROM summary WHERE id = 1", [], |r| r.get(0))
-        {
+    /// Résumé global du dépôt et son horodatage (millisecondes Unix), s'il existe.
+    pub fn summary(&self) -> Result<Option<(String, i64)>> {
+        match self.conn.query_row(
+            "SELECT text, computed_at FROM summary WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
             Ok(t) => Ok(Some(t)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(db_err(e)),
         }
     }
 
-    pub fn set_summary(&mut self, text: &str) -> Result<()> {
+    pub fn set_summary(&mut self, text: &str, computed_at: i64) -> Result<()> {
         self.ensure_writable()?;
         self.conn
             .execute(
-                "INSERT INTO summary(id, text) VALUES (1, ?1)
-                 ON CONFLICT(id) DO UPDATE SET text = excluded.text",
-                [text],
+                "INSERT INTO summary(id, text, computed_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET text = excluded.text, computed_at = excluded.computed_at",
+                params![text, computed_at],
             )
             .map_err(db_err)?;
         Ok(())
@@ -634,6 +660,20 @@ mod tests {
     }
 
     #[test]
+    fn older_schema_version_is_recreated_for_build() {
+        let dir = tempdir().unwrap();
+        drop(Store::open_or_create(dir.path()).unwrap());
+        let c = Connection::open(db_path(dir.path())).unwrap();
+        c.execute_batch("DROP TABLE summary; CREATE TABLE summary(x); PRAGMA user_version = 1;")
+            .unwrap();
+        drop(c);
+        assert!(Store::open_readonly(dir.path()).is_err());
+        let st = Store::open_or_create(dir.path()).unwrap();
+        drop(st);
+        assert!(Store::open_readonly(dir.path()).is_ok());
+    }
+
+    #[test]
     fn unsupported_schema_version_is_rejected() {
         let dir = tempdir().unwrap();
         drop(Store::open_or_create(dir.path()).unwrap());
@@ -771,8 +811,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut st = Store::open_or_create(dir.path()).unwrap();
         st.insert_pending_files(&[file("a.md")]).unwrap();
-        st.set_summary("texte").unwrap();
-        assert_eq!(st.summary().unwrap().as_deref(), Some("texte"));
+        st.set_summary("texte", 42).unwrap();
+        assert_eq!(st.summary().unwrap(), Some(("texte".to_string(), 42)));
+        st.set_summary("autre", 43).unwrap();
+        assert_eq!(st.summary().unwrap(), Some(("autre".to_string(), 43)));
         st.reset().unwrap();
         assert!(st.files().unwrap().is_empty());
         assert!(st.nodes().unwrap().is_empty());
