@@ -101,6 +101,9 @@ pub fn run(cli: Cli) -> Result<()> {
     if let Command::Build = cli.command {
         return crate::index::build::run(&cli.repo);
     }
+    if let Command::Status(j) = &cli.command {
+        return crate::status::run(&cli.repo, j.json);
+    }
     Err(Error::NotImplemented(format!(
         "commande `{}`",
         cli.command.name()

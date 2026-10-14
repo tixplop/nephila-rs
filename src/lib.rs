@@ -1,10 +1,12 @@
 pub mod chunk;
 pub mod cli;
 pub mod config;
+pub mod diff;
 pub mod error;
 pub mod index;
 pub mod llm;
 pub mod model;
 pub mod resolve;
 pub mod scan;
+pub mod status;
 pub mod store;
