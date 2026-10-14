@@ -110,6 +110,9 @@ pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         Command::Summary(j) => return crate::summary::run(&cli.repo, j.json),
         Command::Export { output } => return crate::export::run(&cli.repo, output.as_deref()),
+        Command::Query(Query::Search { terme, limit, json }) => {
+            return crate::query::search::run(&cli.repo, terme, *limit, json.json)
+        }
         _ => {}
     }
     Err(Error::NotImplemented(format!(
