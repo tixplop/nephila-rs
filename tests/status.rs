@@ -148,24 +148,29 @@ fn req012_ac3_pending_files_after_failure_are_listed() {
     assert_eq!(l[0], "graphe pas à jour");
     let mut got: Vec<String> = l[1..].to_vec();
     got.sort();
-    let expected: Vec<String> = [
-        "api/src/main/java/com/acme/api/ApiController.java",
-        "core/pom.xml",
-        "core/src/main/java/com/acme/core/Broken.java",
-        "core/src/main/java/com/acme/core/OrderRepository.java",
-        "core/src/main/java/com/acme/core/OrderService.java",
-        "core/src/main/java/com/acme/domain/Order.java",
-        "docs/archi.md",
-        "docs/guide.md",
-    ]
-    .iter()
-    .map(|p| format!("en attente\t{p}"))
-    .collect();
-    assert_eq!(got, expected, "{l:?}");
-    // les deux fichiers traités (README.md, api/pom.xml) ne sont pas en attente
-    assert!(l
+    // L'ordre de traitement dépend de la concurrence : l'ensemble attendu est celui des fichiers
+    // que le graphe ne marque pas indexés.
+    let files = rkg::store::Store::open_readonly(&env.repo)
+        .unwrap()
+        .files()
+        .unwrap();
+    let indexed: Vec<&str> = files
         .iter()
-        .all(|x| !x.ends_with("README.md") && !x.ends_with("api/pom.xml")));
+        .filter(|f| f.state == rkg::model::FileState::Indexed)
+        .map(|f| f.path.as_str())
+        .collect();
+    assert_eq!(indexed.len(), 2, "{indexed:?}");
+    let mut expected: Vec<String> = files
+        .iter()
+        .filter(|f| f.state == rkg::model::FileState::Pending)
+        .map(|f| format!("en attente\t{}", f.path))
+        .collect();
+    expected.sort();
+    assert_eq!(expected.len(), 8);
+    assert_eq!(got, expected, "{l:?}");
+    for p in indexed {
+        assert!(l.iter().all(|x| !x.ends_with(p)), "{l:?}");
+    }
 }
 
 #[test]

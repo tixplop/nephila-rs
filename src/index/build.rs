@@ -30,8 +30,12 @@ pub struct BuildReport {
 
 impl BuildReport {
     pub fn line(&self) -> String {
+        self.line_for("build")
+    }
+
+    pub fn line_for(&self, verb: &str) -> String {
         format!(
-            "build terminé : {} fichiers traités, {} nœuds, {} liens, {} références non résolues, {} fichiers en attente",
+            "{verb} terminé : {} fichiers traités, {} nœuds, {} liens, {} références non résolues, {} fichiers en attente",
             self.processed, self.nodes, self.edges, self.unresolved, self.pending
         )
     }
@@ -46,8 +50,13 @@ pub fn run(repo: &Path) -> Result<()> {
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
     let report = build(repo, &config, llm.as_ref(), &lock)?;
-    println!("{}", report.line());
-    match report.failure {
+    finish(&report, "build")
+}
+
+/// Affiche le bilan ; un échec d'extraction rend une erreur (code non nul).
+pub(crate) fn finish(report: &BuildReport, verb: &str) -> Result<()> {
+    println!("{}", report.line_for(verb));
+    match &report.failure {
         None => Ok(()),
         Some(msg) => Err(Error::Message(format!(
             "{} fichier(s) laissé(s) en attente ; premier échec : {msg}",
@@ -56,7 +65,7 @@ pub fn run(repo: &Path) -> Result<()> {
     }
 }
 
-fn check_repo(repo: &Path) -> Result<()> {
+pub(crate) fn check_repo(repo: &Path) -> Result<()> {
     if !repo.is_dir() {
         return Err(Error::Message(format!(
             "{} n'est pas un dossier lisible",
@@ -91,6 +100,7 @@ pub fn build(repo: &Path, config: &Config, llm: &dyn Llm, _lock: &RepoLock) -> R
             hash: f.hash.clone(),
             size: f.size,
             mtime: f.mtime,
+            recorded_at: 0,
             state: FileState::Pending,
         })
         .collect();
@@ -148,7 +158,7 @@ enum Outcome {
 }
 
 /// Pool de threads LLM ; le thread courant écrit une transaction par fichier.
-fn extract_all(
+pub(crate) fn extract_all(
     repo: &Path,
     files: &[ScannedFile],
     concurrency: usize,

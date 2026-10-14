@@ -7,6 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
+/// Règle « racy-clean » : l'empreinte enregistrée n'est réutilisée que si la date de modification
+/// enregistrée précède l'enregistrement d'au moins ce délai ; sinon une modification de même
+/// taille dans le même pas de date du système de fichiers passerait inaperçue.
+const RACY_WINDOW_MS: i64 = 2_000;
+
 const EXCLUDED_DIRS: [&str; 5] = ["target", "build", ".gradle", ".git", ".rkg"];
 const EXTENSIONS: [&str; 8] = [
     "md", "markdown", "java", "kt", "kts", "groovy", "gradle", "scala",
@@ -138,7 +143,12 @@ pub fn scan(root: &Path, known: &[FileRecord]) -> Result<ScanResult> {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_millis() as i64);
         let (hash, rehashed) = match known.get(rel.as_str()) {
-            Some(k) if k.size == size && k.mtime == mtime && !k.hash.is_empty() => {
+            Some(k)
+                if k.size == size
+                    && k.mtime == mtime
+                    && !k.hash.is_empty()
+                    && k.recorded_at.saturating_sub(k.mtime) >= RACY_WINDOW_MS =>
+            {
                 (k.hash.clone(), false)
             }
             _ => {

@@ -8,6 +8,7 @@ CREATE TABLE files (
     hash  TEXT NOT NULL,
     size  INTEGER NOT NULL,
     mtime INTEGER NOT NULL,
+    recorded_at INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL CHECK (state IN ('indexed', 'pending'))
 );
 

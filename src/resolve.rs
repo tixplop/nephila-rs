@@ -340,6 +340,7 @@ mod tests {
                 hash: "h".into(),
                 size: 1,
                 mtime: 1,
+                recorded_at: 0,
                 state: FileState::Pending,
             })
             .collect();

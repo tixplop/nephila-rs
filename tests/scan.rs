@@ -184,6 +184,7 @@ fn req011_ac6_hash_is_blake3_and_reused_when_size_mtime_unchanged() {
         hash: "sentinelle".into(),
         size: f.size,
         mtime: f.mtime,
+        recorded_at: f.mtime + 10_000,
         state: FileState::Indexed,
     }];
     let second = scan(d.path(), &known).unwrap();
@@ -213,6 +214,7 @@ fn req011_ac6_touch_rehashes_to_same_hash() {
         hash: f.hash.clone(),
         size: f.size,
         mtime: f.mtime - 5_000,
+        recorded_at: f.mtime + 10_000,
         state: FileState::Indexed,
     }];
     let again = scan(d.path(), &known).unwrap();
@@ -251,4 +253,23 @@ fn req004_unreadable_dir_is_warned_and_skipped() {
     let res = res.unwrap();
     assert_eq!(paths(&res), vec!["ok.md"]);
     assert!(res.warnings.iter().any(|w| w.contains("locked")));
+}
+
+#[test]
+fn req011_ac6_racy_record_is_rehashed() {
+    // Enregistrement fait moins de 2 s après la mtime : l'empreinte ne doit pas être réutilisée.
+    let d = tempfile::tempdir().unwrap();
+    put(d.path(), "a.md", b"hello");
+    let f = scan(d.path(), &[]).unwrap().files.remove(0);
+    let known = vec![FileRecord {
+        path: "a.md".into(),
+        hash: "sentinelle".into(),
+        size: f.size,
+        mtime: f.mtime,
+        recorded_at: f.mtime + 1_999,
+        state: FileState::Indexed,
+    }];
+    let res = scan(d.path(), &known).unwrap();
+    assert!(res.files[0].rehashed);
+    assert_eq!(res.files[0].hash, f.hash);
 }

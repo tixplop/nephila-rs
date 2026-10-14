@@ -7,8 +7,15 @@ use rusqlite::{params, Connection, OpenFlags};
 use crate::error::{Error, Result};
 use crate::model::{Edge, EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, SubKind};
 
+/// Instant courant en millisecondes depuis l'epoch.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
@@ -54,6 +61,38 @@ impl Store {
             v => return Err(version_error(v)),
         }
         Ok(store)
+    }
+
+    /// Ouvre en écriture un graphe existant, sans rien créer ni migrer : un schéma d'une autre
+    /// version (ou une base vide) est refusé avec l'invitation à lancer `rkg build`.
+    pub fn open_existing(repo: &Path) -> Result<Store> {
+        let path = db_path(repo);
+        if !path.is_file() {
+            return Err(Error::Message(format!(
+                "aucun graphe dans {} : lancez `rkg build`",
+                repo.display()
+            )));
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(db_err)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(db_err)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(db_err)?;
+        let store = Store {
+            conn,
+            read_only: false,
+        };
+        match store.user_version()? {
+            v if v == SCHEMA_VERSION => Ok(store),
+            v => Err(Error::Message(format!(
+                "graphe de schéma {v} incompatible (attendu {SCHEMA_VERSION}) dans {} : lancez `rkg build`",
+                path.display()
+            ))),
+        }
     }
 
     /// Ouvre le graphe en lecture seule, sans rien créer.
@@ -160,12 +199,12 @@ impl Store {
         .map_err(db_err)?;
         {
             let mut st = tx
-                .prepare("INSERT INTO files(path, hash, size, mtime, state) VALUES (?1, ?2, ?3, ?4, 'pending')")
+                .prepare("INSERT INTO files(path, hash, size, mtime, recorded_at, state) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')")
                 .map_err(db_err)?;
             for f in files {
                 let size = i64::try_from(f.size)
                     .map_err(|_| Error::Message(format!("taille invalide pour {}", f.path)))?;
-                st.execute(params![f.path, f.hash, size, f.mtime])
+                st.execute(params![f.path, f.hash, size, f.mtime, now_ms()])
                     .map_err(db_err)?;
             }
         }
@@ -180,16 +219,24 @@ impl Store {
         {
             let mut st = tx
                 .prepare(
-                    "INSERT INTO files(path, hash, size, mtime, state) VALUES (?1, ?2, ?3, ?4, ?5)
+                    "INSERT INTO files(path, hash, size, mtime, recorded_at, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, size = excluded.size,
-                         mtime = excluded.mtime, state = excluded.state",
+                         mtime = excluded.mtime, recorded_at = excluded.recorded_at,
+                         state = excluded.state",
                 )
                 .map_err(db_err)?;
             for f in files {
                 let size = i64::try_from(f.size)
                     .map_err(|_| Error::Message(format!("taille invalide pour {}", f.path)))?;
-                st.execute(params![f.path, f.hash, size, f.mtime, f.state.as_str()])
-                    .map_err(db_err)?;
+                st.execute(params![
+                    f.path,
+                    f.hash,
+                    size,
+                    f.mtime,
+                    now_ms(),
+                    f.state.as_str()
+                ])
+                .map_err(db_err)?;
             }
         }
         tx.commit().map_err(db_err)
@@ -420,7 +467,7 @@ impl Store {
     pub fn files(&self) -> Result<Vec<FileRecord>> {
         let mut st = self
             .conn
-            .prepare("SELECT path, hash, size, mtime, state FROM files ORDER BY path")
+            .prepare("SELECT path, hash, size, mtime, recorded_at, state FROM files ORDER BY path")
             .map_err(db_err)?;
         let rows = st
             .query_map([], |r| {
@@ -429,18 +476,20 @@ impl Store {
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })
             .map_err(db_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (path, hash, size, mtime, state) = row.map_err(db_err)?;
+            let (path, hash, size, mtime, recorded_at, state) = row.map_err(db_err)?;
             out.push(FileRecord {
                 path,
                 hash,
                 size: size.max(0) as u64,
                 mtime,
+                recorded_at,
                 state: match state.as_str() {
                     "indexed" => FileState::Indexed,
                     _ => FileState::Pending,
@@ -530,6 +579,7 @@ mod tests {
             hash: "h".into(),
             size: 3,
             mtime: 7,
+            recorded_at: 0,
             state: FileState::Indexed,
         }
     }

@@ -70,8 +70,7 @@ fn req001_ac2_error_exits_nonzero_with_prefix_on_stderr_only() {
 #[test]
 fn req001_ac2_all_subcommands_parse_and_report_not_implemented() {
     let cases: Vec<Vec<&str>> = vec![
-        vec!["update"],
-        vec!["-C", ".", "update"],
+        vec!["-C", ".", "query", "ask", "pourquoi ?"],
         vec!["query", "search", "foo", "--limit", "5", "--json"],
         vec!["query", "neighbors", "foo", "--depth", "2"],
         vec!["query", "path", "a", "b"],

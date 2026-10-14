@@ -196,5 +196,8 @@ pub struct FileRecord {
     pub hash: String,
     pub size: u64,
     pub mtime: i64,
+    /// Instant (ms depuis l'epoch) de l'enregistrement, posé par le stockage à l'écriture ;
+    /// la valeur fournie par l'appelant est ignorée.
+    pub recorded_at: i64,
     pub state: FileState,
 }
