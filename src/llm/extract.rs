@@ -177,7 +177,7 @@ pub fn extraction_system_prompt() -> String {
     format!(
         "Tu analyses un fichier d'un dépôt (code Java/Kotlin/Groovy/Scala, build Maven/Gradle/Ivy, \
          ou Markdown) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
-         Schéma (version {SCHEMA_VERSION}) : {{\"version\": {SCHEMA_VERSION}, \"context\": \"package et imports (optionnel)\", \
+         Schéma (version {SCHEMA_VERSION}) : {{\"version\": {SCHEMA_VERSION}, \"context\": \"lignes `package a.b` et `import a.b.C` (optionnel)\", \
          \"declares\": [{{\"kind\": <genre>, \"name\": \"nom.qualifié\", \"subkind\": <sous-genre, type seulement>, \
          \"summary\": \"une phrase (optionnel)\"}}], \
          \"references\": [{{\"source\": \"genre:nom.qualifié\", \"kind\": <lien>, \"target\": \"nom tel qu'écrit\"}}]}}.\n\

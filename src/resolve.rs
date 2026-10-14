@@ -1,0 +1,965 @@
+//! Résolution des liens sans LLM (REQ-008) et liens `contains` dérivés (REQ-005).
+//!
+//! La passe est une fonction pure de `nodes`, `refs` et `declarations` : elle recalcule l'ensemble
+//! des liens en mémoire puis les remplace en une transaction. Le résultat est identique à un
+//! recalcul ciblé (références non résolues ou visant des noms ajoutés/supprimés), qui ne serait
+//! qu'une optimisation.
+//!
+//! Le contexte d'une référence est un texte libre dont les lignes (ou segments séparés par `;`)
+//! `package a.b` et `import a.b.C` / `import a.b.*` sont reconnues.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::error::Result;
+use crate::model::{node_id, parse_node_id, Edge, EdgeKind, Node, NodeKind, Ref};
+use crate::scan::module_of;
+use crate::store::Store;
+
+/// Bilan d'une passe de résolution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolveStats {
+    pub edges: usize,
+    pub unresolved: usize,
+}
+
+/// Résultat du calcul : liens et références non résolues.
+#[derive(Debug, Clone, Default)]
+pub struct Resolution {
+    pub edges: Vec<Edge>,
+    pub unresolved: Vec<Ref>,
+}
+
+/// Recalcule tous les liens du graphe à partir des nœuds et des références.
+pub fn resolve(store: &mut Store) -> Result<ResolveStats> {
+    let r = compute_from(store)?;
+    store.replace_edges(&r.edges)?;
+    // Les liens sont dédupliqués par la clé primaire : on compte ce qui est stocké.
+    Ok(ResolveStats {
+        edges: store.edges()?.len(),
+        unresolved: r.unresolved.len(),
+    })
+}
+
+/// Références qui ne se résolvent vers aucun nœud.
+pub fn unresolved(store: &Store) -> Result<Vec<Ref>> {
+    Ok(compute_from(store)?.unresolved)
+}
+
+fn compute_from(store: &Store) -> Result<Resolution> {
+    Ok(compute(
+        &store.nodes()?,
+        &store.refs()?,
+        &store.declarations()?,
+    ))
+}
+
+#[derive(Default)]
+struct FileContext {
+    package: Option<String>,
+    imports: Vec<String>,
+}
+
+fn parse_context(ctx: Option<&str>) -> FileContext {
+    let mut out = FileContext::default();
+    let Some(ctx) = ctx else { return out };
+    for seg in ctx.split(['\n', ';']) {
+        let seg = seg.trim();
+        if let Some(p) = seg.strip_prefix("package ") {
+            let p = p.trim();
+            if !p.is_empty() {
+                out.package = Some(p.to_string());
+            }
+        } else if let Some(i) = seg.strip_prefix("import ") {
+            let i = i.trim();
+            let i = i.strip_prefix("static ").map_or(i, str::trim);
+            if !i.is_empty() {
+                out.imports.push(i.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Index des nœuds pour la résolution.
+struct Index<'a> {
+    by_qualified: HashMap<&'a str, Vec<&'a Node>>,
+    /// Nom simple (dernier segment) -> nœuds.
+    by_short: HashMap<&'a str, Vec<&'a Node>>,
+}
+
+impl<'a> Index<'a> {
+    fn new(nodes: &'a [Node]) -> Self {
+        let mut by_qualified: HashMap<&str, Vec<&Node>> = HashMap::new();
+        let mut by_short: HashMap<&str, Vec<&Node>> = HashMap::new();
+        for n in nodes {
+            by_qualified.entry(&n.qualified).or_default().push(n);
+            by_short
+                .entry(last_segment(&n.qualified))
+                .or_default()
+                .push(n);
+        }
+        Index {
+            by_qualified,
+            by_short,
+        }
+    }
+
+    /// Nœuds de nom qualifié exact permis par le lien.
+    fn exact(&self, name: &str, ok: &dyn Fn(&Node) -> bool) -> Vec<&'a Node> {
+        self.by_qualified
+            .get(name)
+            .map(|v| v.iter().copied().filter(|n| ok(n)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Nœuds dont le nom qualifié se termine par `name` sur une frontière de segment.
+    fn suffix(&self, name: &str, ok: &dyn Fn(&Node) -> bool) -> Vec<&'a Node> {
+        let Some(cands) = self.by_short.get(last_segment(name)) else {
+            return Vec::new();
+        };
+        cands
+            .iter()
+            .copied()
+            .filter(|n| ok(n) && is_suffix(&n.qualified, name))
+            .collect()
+    }
+}
+
+const SEPARATORS: [char; 5] = ['.', '/', '#', ':', '\\'];
+
+fn last_segment(q: &str) -> &str {
+    q.rsplit(SEPARATORS).next().unwrap_or(q)
+}
+
+fn is_suffix(qualified: &str, name: &str) -> bool {
+    if qualified == name {
+        return true;
+    }
+    qualified
+        .strip_suffix(name)
+        .is_some_and(|rest| rest.ends_with(SEPARATORS))
+}
+
+fn parent_of(q: &str) -> Option<&str> {
+    q.rfind('.').map(|i| &q[..i])
+}
+
+/// Ordre : nom exact, imports, même package, nom simple (ou suffixe qualifié) unique.
+/// Une ambiguïté à une étape laisse la référence non résolue.
+fn resolve_ref(r: &Ref, source_kind: NodeKind, source_q: &str, idx: &Index) -> Option<String> {
+    let ok = |n: &Node| r.kind.allows(source_kind, n.kind);
+    let single = |v: Vec<&Node>| -> Option<Option<String>> {
+        match v.len() {
+            0 => None,
+            1 => Some(Some(v[0].id.clone())),
+            _ => Some(None),
+        }
+    };
+    let name = r.target_name.trim();
+    let ctx = parse_context(r.context.as_deref());
+
+    if let Some(res) = single(idx.exact(name, &ok)) {
+        return res;
+    }
+
+    // Imports du fichier : le premier segment du nom désigne le type importé.
+    let first = name.split('.').next().unwrap_or(name);
+    let rest = &name[first.len()..];
+    let mut imported: Vec<String> = Vec::new();
+    for imp in &ctx.imports {
+        if let Some(pkg) = imp.strip_suffix(".*") {
+            imported.push(format!("{pkg}.{name}"));
+        } else if last_segment(imp) == first {
+            imported.push(format!("{imp}{rest}"));
+        }
+    }
+    imported.sort();
+    imported.dedup();
+    // Un import explicite l'emporte sur un import à joker.
+    let explicit: Vec<&String> = imported
+        .iter()
+        .filter(|c| {
+            ctx.imports
+                .iter()
+                .any(|i| !i.ends_with(".*") && (**c == *i || c.starts_with(&format!("{i}."))))
+        })
+        .collect();
+    for group in [explicit, imported.iter().collect()] {
+        let mut found: Vec<&Node> = Vec::new();
+        for cand in group {
+            found.extend(idx.exact(cand, &ok));
+        }
+        found.sort_by(|a, b| a.id.cmp(&b.id));
+        found.dedup_by(|a, b| a.id == b.id);
+        if let Some(res) = single(found) {
+            return res;
+        }
+    }
+
+    // Même package que la source.
+    let package = ctx
+        .package
+        .clone()
+        .or_else(|| derived_package(source_kind, source_q));
+    if let Some(pkg) = package.filter(|p| !p.is_empty()) {
+        if let Some(res) = single(idx.exact(&format!("{pkg}.{name}"), &ok)) {
+            return res;
+        }
+    }
+
+    single(idx.suffix(name, &ok)).flatten()
+}
+
+fn derived_package(kind: NodeKind, q: &str) -> Option<String> {
+    match kind {
+        NodeKind::Type => parent_of(q).map(str::to_string),
+        NodeKind::Method => parent_of(q).and_then(parent_of).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Calcule les liens résolus, les liens `contains` dérivés et les références non résolues.
+pub fn compute(nodes: &[Node], refs: &[Ref], declarations: &[(String, String)]) -> Resolution {
+    let idx = Index::new(nodes);
+    let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let mut out = Resolution::default();
+
+    for r in refs {
+        let Ok((skind, sq)) = parse_node_id(&r.source) else {
+            out.unresolved.push(r.clone());
+            continue;
+        };
+        if !ids.contains(r.source.as_str()) {
+            continue;
+        }
+        match resolve_ref(r, skind, sq, &idx) {
+            Some(target) => out.edges.push(Edge {
+                source: r.source.clone(),
+                target,
+                kind: r.kind,
+            }),
+            None => out.unresolved.push(r.clone()),
+        }
+    }
+
+    derive_contains(nodes, declarations, &idx, &mut out.edges);
+
+    let mut seen = HashSet::new();
+    out.edges
+        .retain(|e| seen.insert((e.source.clone(), e.target.clone(), e.kind)));
+    out
+}
+
+fn derive_contains(
+    nodes: &[Node],
+    declarations: &[(String, String)],
+    idx: &Index,
+    edges: &mut Vec<Edge>,
+) {
+    let is_kind = |q: &str, k: NodeKind| {
+        idx.by_qualified
+            .get(q)
+            .is_some_and(|v| v.iter().any(|n| n.kind == k))
+    };
+    let mut push = |from: NodeKind, fq: &str, to: NodeKind, tq: &str| {
+        edges.push(Edge {
+            source: node_id(from, fq),
+            target: node_id(to, tq),
+            kind: EdgeKind::Contains,
+        });
+    };
+    for n in nodes {
+        match n.kind {
+            NodeKind::Type => {
+                if let Some(p) = parent_of(&n.qualified).filter(|p| is_kind(p, NodeKind::Package)) {
+                    push(NodeKind::Package, p, NodeKind::Type, &n.qualified);
+                }
+            }
+            NodeKind::Method => {
+                if let Some(t) = parent_of(&n.qualified).filter(|t| is_kind(t, NodeKind::Type)) {
+                    push(NodeKind::Type, t, NodeKind::Method, &n.qualified);
+                }
+            }
+            NodeKind::Section => {
+                if let Some((d, _)) = n.qualified.split_once('#') {
+                    if is_kind(d, NodeKind::Document) {
+                        push(NodeKind::Document, d, NodeKind::Section, &n.qualified);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Module -> package : module du fichier déclarant le package (AC-005-5).
+    let kinds: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut build_dirs: HashMap<String, &Node> = HashMap::new();
+    for n in nodes.iter().filter(|n| n.kind == NodeKind::Module) {
+        if let Some(f) = &n.file {
+            let dir = f.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+            build_dirs.entry(dir).or_insert(n);
+        }
+    }
+    let dirs: HashSet<String> = build_dirs.keys().cloned().collect();
+    for (file, node) in declarations {
+        let Some(n) = kinds
+            .get(node.as_str())
+            .filter(|n| n.kind == NodeKind::Package)
+        else {
+            continue;
+        };
+        if let Some(m) = module_of(file, &dirs).and_then(|d| build_dirs.get(&d)) {
+            push(
+                NodeKind::Module,
+                &m.qualified,
+                NodeKind::Package,
+                &n.qualified,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{node_id, EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, SubKind};
+    use tempfile::TempDir;
+
+    struct Env {
+        _dir: TempDir,
+        store: Store,
+    }
+
+    fn env(files: &[&str]) -> Env {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        let recs: Vec<FileRecord> = files
+            .iter()
+            .map(|p| FileRecord {
+                path: (*p).into(),
+                hash: "h".into(),
+                size: 1,
+                mtime: 1,
+                state: FileState::Pending,
+            })
+            .collect();
+        store.insert_files(&recs).unwrap();
+        Env { _dir: dir, store }
+    }
+
+    fn ty(q: &str, f: &str) -> Node {
+        let short = q.rsplit('.').next().unwrap();
+        Node::new(
+            NodeKind::Type,
+            q,
+            short,
+            Some(f),
+            Some(SubKind::Class),
+            None,
+        )
+    }
+    fn method(q: &str, f: &str) -> Node {
+        let short = q.rsplit('.').next().unwrap();
+        Node::new(NodeKind::Method, q, short, Some(f), None, None)
+    }
+    fn plain(kind: NodeKind, q: &str, f: Option<&str>) -> Node {
+        let short = q.rsplit(['.', '/', '#']).next().unwrap();
+        Node::new(kind, q, short, f, None, None)
+    }
+    fn rf(source: &str, kind: EdgeKind, target: &str, ctx: Option<&str>) -> Ref {
+        Ref {
+            source: source.into(),
+            kind,
+            target_name: target.into(),
+            context: ctx.map(str::to_string),
+        }
+    }
+    fn has_edge(e: &Env, s: &str, k: EdgeKind, t: &str) -> bool {
+        e.store
+            .edges()
+            .unwrap()
+            .iter()
+            .any(|x| x.source == s && x.kind == k && x.target == t)
+    }
+    fn tid(q: &str) -> String {
+        node_id(NodeKind::Type, q)
+    }
+    fn mid(q: &str) -> String {
+        node_id(NodeKind::Method, q)
+    }
+
+    #[test]
+    fn req008_ac1_unknown_name_stays_unresolved() {
+        let mut e = env(&["A.java"]);
+        e.store
+            .replace_file(
+                "A.java",
+                &[ty("A", "A.java"), method("A.run", "A.java")],
+                &[rf(&mid("A.run"), EdgeKind::Calls, "Ghost.foo", None)],
+            )
+            .unwrap();
+        let st = resolve(&mut e.store).unwrap();
+        assert_eq!(st.unresolved, 1);
+        let un = unresolved(&e.store).unwrap();
+        assert_eq!(un.len(), 1);
+        assert_eq!(un[0].target_name, "Ghost.foo");
+        assert!(!e
+            .store
+            .edges()
+            .unwrap()
+            .iter()
+            .any(|x| x.kind == EdgeKind::Calls));
+    }
+
+    #[test]
+    fn req008_ac4_ambiguous_simple_name_unresolved() {
+        let mut e = env(&["a/Order.java", "b/Order.java", "S.java"]);
+        e.store
+            .replace_file("a/Order.java", &[ty("com.a.Order", "a/Order.java")], &[])
+            .unwrap();
+        e.store
+            .replace_file("b/Order.java", &[ty("com.b.Order", "b/Order.java")], &[])
+            .unwrap();
+        e.store
+            .replace_file(
+                "S.java",
+                &[ty("com.c.Svc", "S.java")],
+                &[rf(
+                    &tid("com.c.Svc"),
+                    EdgeKind::Imports,
+                    "Order",
+                    Some("package com.c;"),
+                )],
+            )
+            .unwrap();
+        let st = resolve(&mut e.store).unwrap();
+        assert_eq!(st.unresolved, 1);
+        assert!(!e
+            .store
+            .edges()
+            .unwrap()
+            .iter()
+            .any(|x| x.kind == EdgeKind::Imports));
+    }
+
+    #[test]
+    fn req008_ac5_explicit_import_wins_over_same_simple_name() {
+        let mut e = env(&["a/Order.java", "b/Order.java", "S.java"]);
+        e.store
+            .replace_file("a/Order.java", &[ty("com.a.Order", "a/Order.java")], &[])
+            .unwrap();
+        e.store
+            .replace_file("b/Order.java", &[ty("com.b.Order", "b/Order.java")], &[])
+            .unwrap();
+        e.store
+            .replace_file(
+                "S.java",
+                &[ty("com.c.Svc", "S.java")],
+                &[rf(
+                    &tid("com.c.Svc"),
+                    EdgeKind::Imports,
+                    "Order",
+                    Some("package com.c;\nimport com.b.Order;"),
+                )],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(has_edge(
+            &e,
+            &tid("com.c.Svc"),
+            EdgeKind::Imports,
+            &tid("com.b.Order")
+        ));
+        assert!(!has_edge(
+            &e,
+            &tid("com.c.Svc"),
+            EdgeKind::Imports,
+            &tid("com.a.Order")
+        ));
+    }
+
+    /// Base : types `qs` (un fichier chacun) + une source `com.c.Svc` portant la référence.
+    fn import_case(qs: &[&str], target: &str, ctx: &str) -> Env {
+        let files: Vec<String> = (0..qs.len()).map(|i| format!("t{i}/T.java")).collect();
+        let mut names: Vec<&str> = files.iter().map(String::as_str).collect();
+        names.push("S.java");
+        let mut e = env(&names);
+        for (q, f) in qs.iter().zip(&files) {
+            e.store.replace_file(f, &[ty(q, f)], &[]).unwrap();
+        }
+        e.store
+            .replace_file(
+                "S.java",
+                &[ty("com.c.Svc", "S.java")],
+                &[rf(&tid("com.c.Svc"), EdgeKind::Imports, target, Some(ctx))],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        e
+    }
+    fn imports_any(e: &Env) -> bool {
+        e.store
+            .edges()
+            .unwrap()
+            .iter()
+            .any(|x| x.source == tid("com.c.Svc") && x.kind == EdgeKind::Imports)
+    }
+
+    #[test]
+    fn req008_ac5_wildcard_ambiguity_unresolved() {
+        let e = import_case(
+            &["com.a.Order", "com.b.Order"],
+            "Order",
+            "import com.a.*;\nimport com.b.*;",
+        );
+        assert!(!imports_any(&e));
+    }
+
+    #[test]
+    fn req008_ac5_explicit_beats_wildcard() {
+        let e = import_case(
+            &["com.a.Order", "com.b.Order"],
+            "Order",
+            "import com.b.Order;\nimport com.a.*;",
+        );
+        assert!(has_edge(
+            &e,
+            &tid("com.c.Svc"),
+            EdgeKind::Imports,
+            &tid("com.b.Order")
+        ));
+    }
+
+    #[test]
+    fn req008_ac5_explicit_import_respects_segment_boundary() {
+        // `com.b.Order` explicite ne rend pas `com.b.OrderLine` (joker) prioritaire.
+        let e = import_case(
+            &["com.a.OrderLine", "com.b.OrderLine", "com.b.Order"],
+            "OrderLine",
+            "import com.b.Order;\nimport com.a.*;\nimport com.b.*;",
+        );
+        assert!(!imports_any(&e));
+    }
+
+    #[test]
+    fn wildcard_import_resolves() {
+        let mut e = env(&["b/Order.java", "S.java", "a/Order.java"]);
+        e.store
+            .replace_file("a/Order.java", &[ty("com.a.Order", "a/Order.java")], &[])
+            .unwrap();
+        e.store
+            .replace_file("b/Order.java", &[ty("com.b.Order", "b/Order.java")], &[])
+            .unwrap();
+        e.store
+            .replace_file(
+                "S.java",
+                &[ty("com.c.Svc", "S.java")],
+                &[rf(
+                    &tid("com.c.Svc"),
+                    EdgeKind::Imports,
+                    "Order",
+                    Some("import com.b.*;"),
+                )],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(has_edge(
+            &e,
+            &tid("com.c.Svc"),
+            EdgeKind::Imports,
+            &tid("com.b.Order")
+        ));
+    }
+
+    #[test]
+    fn same_package_beats_other_packages() {
+        let mut e = env(&["a/Order.java", "b/Order.java", "S.java"]);
+        e.store
+            .replace_file("a/Order.java", &[ty("com.a.Order", "a/Order.java")], &[])
+            .unwrap();
+        e.store
+            .replace_file("b/Order.java", &[ty("com.b.Order", "b/Order.java")], &[])
+            .unwrap();
+        e.store
+            .replace_file(
+                "S.java",
+                &[ty("com.a.Svc", "S.java")],
+                &[rf(
+                    &tid("com.a.Svc"),
+                    EdgeKind::Imports,
+                    "Order",
+                    Some("package com.a;"),
+                )],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(has_edge(
+            &e,
+            &tid("com.a.Svc"),
+            EdgeKind::Imports,
+            &tid("com.a.Order")
+        ));
+    }
+
+    #[test]
+    fn exact_qualified_name_and_unique_simple_name() {
+        let mut e = env(&["a/Order.java", "S.java"]);
+        e.store
+            .replace_file("a/Order.java", &[ty("com.a.Order", "a/Order.java")], &[])
+            .unwrap();
+        e.store
+            .replace_file(
+                "S.java",
+                &[ty("com.c.Svc", "S.java")],
+                &[
+                    rf(&tid("com.c.Svc"), EdgeKind::Imports, "com.a.Order", None),
+                    rf(&tid("com.c.Svc"), EdgeKind::Extends, "Order", None),
+                ],
+            )
+            .unwrap();
+        let st = resolve(&mut e.store).unwrap();
+        assert_eq!(st.unresolved, 0);
+        assert!(has_edge(
+            &e,
+            &tid("com.c.Svc"),
+            EdgeKind::Imports,
+            &tid("com.a.Order")
+        ));
+        assert!(has_edge(
+            &e,
+            &tid("com.c.Svc"),
+            EdgeKind::Extends,
+            &tid("com.a.Order")
+        ));
+    }
+
+    #[test]
+    fn method_suffix_and_import_prefix() {
+        let mut e = env(&["R.java", "O.java"]);
+        e.store
+            .replace_file(
+                "R.java",
+                &[
+                    ty("com.acme.OrderRepository", "R.java"),
+                    method("com.acme.OrderRepository.save", "R.java"),
+                ],
+                &[],
+            )
+            .unwrap();
+        e.store
+            .replace_file(
+                "O.java",
+                &[
+                    ty("com.x.OrderService", "O.java"),
+                    method("com.x.OrderService.place", "O.java"),
+                ],
+                &[rf(
+                    &mid("com.x.OrderService.place"),
+                    EdgeKind::Calls,
+                    "OrderRepository.save",
+                    Some("package com.x;\nimport com.acme.OrderRepository;"),
+                )],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(has_edge(
+            &e,
+            &mid("com.x.OrderService.place"),
+            EdgeKind::Calls,
+            &mid("com.acme.OrderRepository.save")
+        ));
+        // sans import : suffixe qualifié unique
+        e.store
+            .replace_file(
+                "O.java",
+                &[
+                    ty("com.x.OrderService", "O.java"),
+                    method("com.x.OrderService.place", "O.java"),
+                ],
+                &[rf(
+                    &mid("com.x.OrderService.place"),
+                    EdgeKind::Calls,
+                    "OrderRepository.save",
+                    None,
+                )],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(has_edge(
+            &e,
+            &mid("com.x.OrderService.place"),
+            EdgeKind::Calls,
+            &mid("com.acme.OrderRepository.save")
+        ));
+    }
+
+    #[test]
+    fn target_kind_must_fit_link_kind() {
+        // un package de même nom qu'un type ne doit pas être la cible d'un imports
+        let mut e = env(&["S.java"]);
+        e.store
+            .replace_file(
+                "S.java",
+                &[
+                    ty("Svc", "S.java"),
+                    plain(NodeKind::Package, "Svc2", Some("S.java")),
+                ],
+                &[rf(&tid("Svc"), EdgeKind::Imports, "Svc2", None)],
+            )
+            .unwrap();
+        let st = resolve(&mut e.store).unwrap();
+        assert_eq!(st.unresolved, 1);
+    }
+
+    #[test]
+    fn req008_repair_when_target_appears_and_unlink_when_renamed() {
+        let mut e = env(&["A.java", "B.java"]);
+        e.store
+            .replace_file(
+                "A.java",
+                &[ty("A", "A.java"), method("A.go", "A.java")],
+                &[rf(&mid("A.go"), EdgeKind::Calls, "B.foo", None)],
+            )
+            .unwrap();
+        e.store
+            .replace_file("B.java", &[ty("B", "B.java")], &[])
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert_eq!(unresolved(&e.store).unwrap().len(), 1);
+
+        // 008-2 : B.foo apparaît, A inchangé
+        e.store
+            .replace_file(
+                "B.java",
+                &[ty("B", "B.java"), method("B.foo", "B.java")],
+                &[],
+            )
+            .unwrap();
+        let st = resolve(&mut e.store).unwrap();
+        assert!(has_edge(&e, &mid("A.go"), EdgeKind::Calls, &mid("B.foo")));
+        assert_eq!(st.unresolved, 0);
+
+        // 008-3 : renommée en bar
+        e.store
+            .replace_file(
+                "B.java",
+                &[ty("B", "B.java"), method("B.bar", "B.java")],
+                &[],
+            )
+            .unwrap();
+        let st = resolve(&mut e.store).unwrap();
+        assert!(!has_edge(&e, &mid("A.go"), EdgeKind::Calls, &mid("B.foo")));
+        assert_eq!(st.unresolved, 1);
+        assert_eq!(unresolved(&e.store).unwrap()[0].target_name, "B.foo");
+    }
+
+    #[test]
+    fn removed_file_unlinks_references() {
+        let mut e = env(&["A.java", "B.java"]);
+        e.store
+            .replace_file(
+                "A.java",
+                &[ty("A", "A.java")],
+                &[rf(&tid("A"), EdgeKind::Extends, "B", None)],
+            )
+            .unwrap();
+        e.store
+            .replace_file("B.java", &[ty("B", "B.java")], &[])
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(has_edge(&e, &tid("A"), EdgeKind::Extends, &tid("B")));
+        e.store.remove_file("B.java").unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(!has_edge(&e, &tid("A"), EdgeKind::Extends, &tid("B")));
+        assert_eq!(unresolved(&e.store).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resolve_is_idempotent_and_returns_counts() {
+        let mut e = env(&["A.java", "B.java"]);
+        e.store
+            .replace_file(
+                "A.java",
+                &[ty("A", "A.java")],
+                &[rf(&tid("A"), EdgeKind::Extends, "B", None)],
+            )
+            .unwrap();
+        e.store
+            .replace_file("B.java", &[ty("B", "B.java")], &[])
+            .unwrap();
+        let s1 = resolve(&mut e.store).unwrap();
+        let before = e.store.edges().unwrap().len();
+        let s2 = resolve(&mut e.store).unwrap();
+        assert_eq!(s1, s2);
+        assert_eq!(before, e.store.edges().unwrap().len());
+        assert_eq!(s1.edges, before);
+    }
+
+    #[test]
+    fn contains_edges_are_derived() {
+        let mut e = env(&["S.java", "d.md"]);
+        e.store
+            .replace_file(
+                "S.java",
+                &[
+                    plain(NodeKind::Package, "com.acme", Some("S.java")),
+                    ty("com.acme.Svc", "S.java"),
+                    method("com.acme.Svc.place", "S.java"),
+                ],
+                &[],
+            )
+            .unwrap();
+        e.store
+            .replace_file(
+                "d.md",
+                &[
+                    plain(NodeKind::Document, "docs/d.md", Some("d.md")),
+                    plain(NodeKind::Section, "docs/d.md#intro", Some("d.md")),
+                ],
+                &[],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        let pk = node_id(NodeKind::Package, "com.acme");
+        assert!(has_edge(&e, &pk, EdgeKind::Contains, &tid("com.acme.Svc")));
+        assert!(has_edge(
+            &e,
+            &tid("com.acme.Svc"),
+            EdgeKind::Contains,
+            &mid("com.acme.Svc.place")
+        ));
+        assert!(has_edge(
+            &e,
+            &node_id(NodeKind::Document, "docs/d.md"),
+            EdgeKind::Contains,
+            &node_id(NodeKind::Section, "docs/d.md#intro")
+        ));
+    }
+
+    #[test]
+    fn req005_ac5_module_is_nearest_build_ancestor() {
+        let mut e = env(&[
+            "pom.xml",
+            "api/pom.xml",
+            "api/src/S.java",
+            "core/pom.xml",
+            "core/src/C.java",
+        ]);
+        let m = |q, f| plain(NodeKind::Module, q, Some(f));
+        e.store
+            .replace_file("pom.xml", &[m("root", "pom.xml")], &[])
+            .unwrap();
+        e.store
+            .replace_file("api/pom.xml", &[m("api", "api/pom.xml")], &[])
+            .unwrap();
+        e.store
+            .replace_file("core/pom.xml", &[m("core", "core/pom.xml")], &[])
+            .unwrap();
+        e.store
+            .replace_file(
+                "api/src/S.java",
+                &[plain(NodeKind::Package, "com.api", Some("api/src/S.java"))],
+                &[],
+            )
+            .unwrap();
+        e.store
+            .replace_file(
+                "core/src/C.java",
+                &[plain(
+                    NodeKind::Package,
+                    "com.core",
+                    Some("core/src/C.java"),
+                )],
+                &[],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        let md = |q| node_id(NodeKind::Module, q);
+        let pk = |q| node_id(NodeKind::Package, q);
+        assert!(has_edge(&e, &md("api"), EdgeKind::Contains, &pk("com.api")));
+        assert!(has_edge(
+            &e,
+            &md("core"),
+            EdgeKind::Contains,
+            &pk("com.core")
+        ));
+        assert!(!has_edge(
+            &e,
+            &md("root"),
+            EdgeKind::Contains,
+            &pk("com.api")
+        ));
+        assert!(!has_edge(
+            &e,
+            &md("api"),
+            EdgeKind::Contains,
+            &pk("com.core")
+        ));
+    }
+
+    #[test]
+    fn req005_ac3_markdown_and_code_in_one_graph() {
+        let mut e = env(&["S.java", "d.md"]);
+        e.store
+            .replace_file("S.java", &[ty("com.acme.OrderService", "S.java")], &[])
+            .unwrap();
+        let sec = node_id(NodeKind::Section, "docs/d.md#archi");
+        e.store
+            .replace_file(
+                "d.md",
+                &[
+                    plain(NodeKind::Document, "docs/d.md", Some("d.md")),
+                    plain(NodeKind::Section, "docs/d.md#archi", Some("d.md")),
+                ],
+                &[rf(&sec, EdgeKind::Mentions, "OrderService", None)],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(has_edge(
+            &e,
+            &sec,
+            EdgeKind::Mentions,
+            &tid("com.acme.OrderService")
+        ));
+    }
+
+    #[test]
+    fn module_depends_on_module_and_dependency() {
+        let mut e = env(&["api/pom.xml", "core/pom.xml"]);
+        let api = node_id(NodeKind::Module, "api");
+        e.store
+            .replace_file(
+                "api/pom.xml",
+                &[
+                    plain(NodeKind::Module, "api", Some("api/pom.xml")),
+                    plain(NodeKind::Dependency, "org.slf4j:slf4j-api", None),
+                ],
+                &[
+                    rf(&api, EdgeKind::DependsOn, "core", None),
+                    rf(&api, EdgeKind::DependsOn, "org.slf4j:slf4j-api", None),
+                ],
+            )
+            .unwrap();
+        e.store
+            .replace_file(
+                "core/pom.xml",
+                &[plain(NodeKind::Module, "core", Some("core/pom.xml"))],
+                &[],
+            )
+            .unwrap();
+        let st = resolve(&mut e.store).unwrap();
+        assert_eq!(st.unresolved, 0);
+        assert!(has_edge(
+            &e,
+            &api,
+            EdgeKind::DependsOn,
+            &node_id(NodeKind::Module, "core")
+        ));
+        assert!(has_edge(
+            &e,
+            &api,
+            EdgeKind::DependsOn,
+            &node_id(NodeKind::Dependency, "org.slf4j:slf4j-api")
+        ));
+    }
+}

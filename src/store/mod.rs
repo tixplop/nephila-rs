@@ -356,6 +356,18 @@ impl Store {
         Ok(out)
     }
 
+    /// Couples (fichier, identifiant de nœud) des déclarations.
+    pub fn declarations(&self) -> Result<Vec<(String, String)>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT file, node FROM declarations ORDER BY file, node")
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db_err)?;
+        rows.map(|r| r.map_err(db_err)).collect()
+    }
+
     pub fn files(&self) -> Result<Vec<FileRecord>> {
         let mut st = self
             .conn
