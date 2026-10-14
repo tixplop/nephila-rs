@@ -1,0 +1,196 @@
+//! Configuration du fournisseur LLM (REQ-002).
+
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::error::{Error, Result};
+
+pub const DEFAULT_MAX_CHUNK_CHARS: usize = 60_000;
+pub const DEFAULT_CONCURRENCY: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Anthropic,
+    OpenAi,
+    Mock,
+}
+
+impl Provider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAi => "openai",
+            Provider::Mock => "mock",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub provider: Provider,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub max_chunk_chars: usize,
+    pub concurrency: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    provider: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    max_chunk_chars: Option<i64>,
+    concurrency: Option<i64>,
+}
+
+/// Chemin du fichier de configuration : `RKG_CONFIG`, sinon
+/// `$XDG_CONFIG_HOME/rkg/config.toml`, sinon `~/.config/rkg/config.toml`.
+pub fn config_path_with(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf> {
+    let non_empty = |k: &str| env(k).filter(|v| !v.is_empty());
+    if let Some(p) = non_empty("RKG_CONFIG") {
+        return Ok(PathBuf::from(p));
+    }
+    if let Some(x) = non_empty("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(x).join("rkg").join("config.toml"));
+    }
+    if let Some(h) = non_empty("HOME") {
+        return Ok(PathBuf::from(h)
+            .join(".config")
+            .join("rkg")
+            .join("config.toml"));
+    }
+    Err(Error::Message(
+        "impossible de déterminer le fichier de configuration : définissez RKG_CONFIG, \
+         XDG_CONFIG_HOME ou HOME"
+            .into(),
+    ))
+}
+
+pub fn config_path() -> Result<PathBuf> {
+    config_path_with(&|k| std::env::var(k).ok())
+}
+
+impl Config {
+    /// Charge et valide la configuration depuis l'environnement du processus.
+    pub fn load() -> Result<Config> {
+        Config::load_with(&|k| std::env::var(k).ok())
+    }
+
+    /// Comme `load`, avec un environnement fourni.
+    pub fn load_with(env: &dyn Fn(&str) -> Option<String>) -> Result<Config> {
+        let path = config_path_with(env)?;
+        let cfg = Config::load_from(&path)?;
+        cfg.api_key_with(env)?;
+        Ok(cfg)
+    }
+
+    /// Lit et valide un fichier de configuration (sans lire la clé d'API).
+    pub fn load_from(path: &Path) -> Result<Config> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Message(format!(
+                    "configuration LLM introuvable : {} ; créez ce fichier TOML avec les clés \
+                     provider (anthropic | openai | mock), model et api_key_env",
+                    path.display()
+                )))
+            }
+            Err(e) => {
+                return Err(Error::Message(format!(
+                    "lecture de la configuration {} impossible : {e}",
+                    path.display()
+                )))
+            }
+        };
+        Config::parse(&text, path)
+    }
+
+    /// Analyse le contenu TOML ; `path` ne sert qu'aux messages.
+    pub fn parse(text: &str, path: &Path) -> Result<Config> {
+        let at = path.display();
+        let raw: RawConfig = toml::from_str(text)
+            .map_err(|e| Error::Message(format!("configuration invalide ({at}) : {e}")))?;
+        let missing = |key: &str| {
+            Error::Message(format!(
+                "configuration invalide ({at}) : clé « {key} » manquante"
+            ))
+        };
+        let nonblank = |key: &str, v: Option<String>| -> Result<Option<String>> {
+            match v {
+                Some(s) if s.trim().is_empty() => Err(Error::Message(format!(
+                    "configuration invalide ({at}) : clé « {key} » vide"
+                ))),
+                other => Ok(other),
+            }
+        };
+        let provider = match raw.provider.as_deref() {
+            None => return Err(missing("provider")),
+            Some("anthropic") => Provider::Anthropic,
+            Some("openai") => Provider::OpenAi,
+            Some("mock") => Provider::Mock,
+            Some(other) => {
+                return Err(Error::Message(format!(
+                    "configuration invalide ({at}) : clé « provider » inconnue : « {other} » \
+                     (attendu : anthropic, openai ou mock)"
+                )))
+            }
+        };
+        let model = nonblank("model", raw.model)?;
+        let model = match (model, provider) {
+            (Some(m), _) => m,
+            (None, Provider::Mock) => "mock".to_string(),
+            (None, _) => return Err(missing("model")),
+        };
+        let api_key_env = nonblank("api_key_env", raw.api_key_env)?;
+        if provider == Provider::Anthropic && api_key_env.is_none() {
+            return Err(missing("api_key_env"));
+        }
+        let base_url = nonblank("base_url", raw.base_url)?;
+        let positive = |key: &str, v: Option<i64>, default: usize| -> Result<usize> {
+            match v {
+                None => Ok(default),
+                Some(n) if n >= 1 => Ok(n as usize),
+                Some(n) => Err(Error::Message(format!(
+                    "configuration invalide ({at}) : clé « {key} » doit être un entier \
+                     strictement positif (reçu : {n})"
+                ))),
+            }
+        };
+        Ok(Config {
+            provider,
+            model,
+            base_url,
+            api_key_env,
+            max_chunk_chars: positive(
+                "max_chunk_chars",
+                raw.max_chunk_chars,
+                DEFAULT_MAX_CHUNK_CHARS,
+            )?,
+            concurrency: positive("concurrency", raw.concurrency, DEFAULT_CONCURRENCY)?,
+        })
+    }
+
+    /// Valeur de la clé d'API lue dans la variable désignée par `api_key_env`
+    /// (`None` si aucune variable n'est configurée). Erreur si elle est absente ou vide.
+    pub fn api_key_with(&self, env: &dyn Fn(&str) -> Option<String>) -> Result<Option<String>> {
+        let Some(var) = &self.api_key_env else {
+            return Ok(None);
+        };
+        match env(var) {
+            Some(v) if !v.is_empty() => Ok(Some(v)),
+            _ => Err(Error::Message(format!(
+                "la variable d'environnement {var} (clé api_key_env) est absente ou vide ; \
+                 définissez-la avec la clé d'API du fournisseur {}",
+                self.provider.as_str()
+            ))),
+        }
+    }
+
+    pub fn api_key(&self) -> Result<Option<String>> {
+        self.api_key_with(&|k| std::env::var(k).ok())
+    }
+}
