@@ -7,6 +7,7 @@ pub mod java;
 pub mod jvm;
 pub mod kotlin;
 pub mod lang;
+pub mod markdown;
 pub mod maven;
 pub mod scala;
 
@@ -49,9 +50,8 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure>
             Some("ivy.xml") => Ok(ivy::extract(path, text)),
             _ => Ok(FileStructure::default()),
         },
-        Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) | Some(Lang::Markdown) | None => {
-            Ok(FileStructure::default())
-        }
+        Some(Lang::Markdown) => Ok(markdown::extract(path, text)),
+        Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) | None => Ok(FileStructure::default()),
     }
 }
 

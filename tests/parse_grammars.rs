@@ -115,7 +115,6 @@ fn extract_renvoie_une_structure_vide_pour_chaque_langage() {
         "build.gradle",
         "build.gradle.kts",
         "pom.xml",
-        "README.md",
     ] {
         let s = extract(Path::new(name), "", &ParseCtx::default()).unwrap();
         assert_eq!(s, FileStructure::default(), "{name}");
