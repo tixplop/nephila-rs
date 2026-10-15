@@ -48,6 +48,24 @@ pub fn clean_type_name(raw: &str) -> String {
     out
 }
 
+/// Nom de fichier sans extension, réduit à des caractères d'identifiant (`_` sinon), pour les
+/// types de fichier (`NomFichier`, `NomFichier$package`).
+pub fn file_stem_ident(path: &std::path::Path) -> Option<String> {
+    let stem: String = path
+        .file_stem()?
+        .to_str()?
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    (!stem.is_empty()).then_some(stem)
+}
+
 impl Builder {
     pub fn new() -> Self {
         Self::default()
@@ -61,6 +79,11 @@ impl Builder {
         }
         self.package = Some(name.to_string());
         self.push_declared(NodeKind::Package, name.to_string(), None);
+    }
+
+    /// Rétablit le package courant à la sortie d'un `package p { … }` (sans rien déclarer).
+    pub fn restore_package(&mut self, package: Option<String>) {
+        self.package = package;
     }
 
     pub fn package(&self) -> Option<&str> {
