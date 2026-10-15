@@ -28,6 +28,7 @@ Un exemple commenté est fourni dans `examples/config.toml`.
 | `base_url` | URL du serveur (facultatif) |
 | `max_chunk_chars` | taille maximale d'un morceau envoyé au LLM (défaut 60000) |
 | `concurrency` | appels simultanés (défaut 4) |
+| `timeout_secs` | durée maximale d'un appel LLM HTTP (extraction, `ask`, vérification de clé), entier > 0 (défaut 300) ; le délai de connexion reste fixe (10 s) ; ignoré par `mock` |
 
 La clé n'est jamais écrite dans le fichier : `api_key_env = "ANTHROPIC_API_KEY"` puis `export ANTHROPIC_API_KEY=...`. Avant tout traitement, `rkg` vérifie la clé par un appel de liste des modèles (sans coût de génération).
 
@@ -84,7 +85,12 @@ Ne retraite que les fichiers ajoutés, modifiés ou supprimés ; même format de
 $ rkg -C repo update
 update terminé : 2 fichiers traités, 2 nœuds, 1 liens, 0 références non résolues, 0 fichiers en attente
 ```
-Si des fichiers échouent (réseau, réponse non conforme), ils restent « en attente », la commande sort avec le code 1 et le message nomme le premier échec ; relancez `rkg update`.
+Échecs (`build` comme `update`) :
+- un fichier en échec (réponse non conforme, délai dépassé, erreur réseau isolée, lecture impossible) reste « en attente » et le traitement des autres fichiers continue ; chaque fichier en échec est nommé sur stderr (`avertissement:`) avec sa cause ;
+- l'envoi s'arrête seulement sur une clé refusée (HTTP 401/403, dès le premier refus) ou sur 3 erreurs réseau consécutives (une réussite remet le compte à zéro ; seuil fixe) ;
+- les appels déjà en cours se terminent et sont enregistrés ; la ligne de bilan est toujours affichée ;
+- s'il reste au moins un fichier en attente, la commande sort avec le code 1 : relancez `rkg update`, qui ne renvoie au LLM que ces fichiers ;
+- une référence dont le genre de lien est inconnu ou non autorisé depuis le genre de son nœud source est écartée avec un `avertissement:` (fichier et nombre de références écartées) ; le fichier est indexé normalement.
 
 ### `rkg status [--json]`
 Compare le dépôt au graphe, sans LLM.
@@ -192,6 +198,8 @@ Avec `provider = "mock"`, le LLM est simulé et piloté par l'environnement :
 | `RKG_MOCK_FAIL_AFTER` | nombre d'appels réussis avant des erreurs réseau simulées |
 | `RKG_MOCK_INVALID_KEY` | si non vide et différent de `0`, la vérification de clé échoue |
 | `RKG_MOCK_DELAY_MS` | délai ajouté à chaque appel |
+| `RKG_MOCK_TIMEOUT_FILES` | chemins relatifs séparés par des virgules : l'extraction de ces fichiers échoue par « délai dépassé » |
+| `RKG_MOCK_KEY_REVOKED_AFTER` | nombre d'appels d'extraction (réussis ou non, un par morceau) avant des refus de clé simulés (arrêt de l'envoi) |
 
 Format d'une fixture d'extraction :
 

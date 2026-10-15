@@ -26,3 +26,4 @@ api_key_env = "ANTHROPIC_API_KEY"   # nom de la variable, jamais la clé elle-m�
 # Options communes (valeurs par défaut)
 # max_chunk_chars = 60000   # taille maximale d'un morceau envoyé au LLM
 # concurrency = 4           # appels LLM simultanés
+# timeout_secs = 300        # durée maximale d'un appel LLM HTTP, en secondes (entier > 0)
