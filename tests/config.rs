@@ -352,3 +352,51 @@ fn req003_ac5_key_revoked_after_n_extractions() {
     ));
     assert!(m.verify_key().is_ok());
 }
+
+// ---- REQ-027 : batch_files
+
+#[test]
+fn req027_ac1_batch_files_default_is_one() {
+    assert_eq!(parse("provider='mock'").unwrap().batch_files, 1);
+    assert_eq!(
+        parse("provider='mock'\nbatch_files=8").unwrap().batch_files,
+        8
+    );
+}
+
+#[test]
+fn req027_ac1_invalid_batch_files_names_key() {
+    for bad in ["0", "-3", "1.5", "'x'"] {
+        let m = parse(&format!("provider='mock'\nbatch_files={bad}")).unwrap_err();
+        assert!(m.contains("batch_files"), "{bad}: {m}");
+    }
+}
+
+#[test]
+fn req027_ac1_build_with_invalid_batch_files_fails_but_no_llm_succeeds() {
+    use assert_cmd::cargo::cargo_bin;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("A.java"), "class A {}\n").unwrap();
+    let cfg = tmp.path().join("config.toml");
+    std::fs::write(&cfg, "provider='mock'\nbatch_files=0\n").unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(cargo_bin("rkg"))
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env("RKG_CONFIG", &cfg)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["build"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("batch_files"));
+    let out = run(&["build", "--no-llm"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -9,6 +9,7 @@ use rkg::llm::anthropic::AnthropicLlm;
 use rkg::llm::openai::OpenAiLlm;
 use rkg::llm::AskReply;
 use rkg::llm::Llm;
+use rkg::llm::LotItem;
 
 const EXTRACTION: &str =
     r#"{"version":2,"summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}"#;
@@ -332,4 +333,95 @@ fn req024_ac5_enrich_version_1_is_non_conforming() {
         anthropic(&s).enrich("A.java", 1, "x", &[]),
         Err(Error::Message(_))
     ));
+}
+
+// ---- AC-027-6 : appel de lot (schéma version 3) au niveau fournisseur ----
+
+const LOT_REPLY: &str = r#"{"version":3,"files":[
+  {"file":"A.java","summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]},
+  {"file":"B.java","summaries":[{"node":"type:B","summary":"Le B."},{"node":"type:A","summary":"x"}],"concepts":[]}]}"#;
+
+fn lot_items() -> Vec<LotItem> {
+    vec![
+        LotItem {
+            file: "A.java".into(),
+            text: "class A {}".into(),
+            node_ids: vec!["type:A".into(), "method:A.f".into()],
+        },
+        LotItem {
+            file: "B.java".into(),
+            text: "class B {}".into(),
+            node_ids: vec!["type:B".into()],
+        },
+    ]
+}
+
+fn check_lot_request(system: &str, user: &str) {
+    for needle in [
+        "A.java",
+        "B.java",
+        "class A {}",
+        "class B {}",
+        "type:A",
+        "method:A.f",
+        "type:B",
+    ] {
+        assert!(user.contains(needle), "{needle} : {user}");
+    }
+    assert!(
+        system.contains("version\": 3") && system.contains("files"),
+        "{system}"
+    );
+}
+
+fn check_lot_result(r: Vec<(String, rkg::error::Result<rkg::llm::Enrichment>)>) {
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0].0, "A.java");
+    let a = r[0].1.as_ref().unwrap();
+    assert_eq!(a.summaries, vec![("type:A".into(), "Le A.".into())]);
+    let b = r[1].1.as_ref().unwrap();
+    assert_eq!(b.summaries, vec![("type:B".into(), "Le B.".into())]);
+    assert_eq!(b.rejected.len(), 1);
+}
+
+#[test]
+fn req027_ac6_anthropic_lot_single_request_applied_per_file() {
+    let s = FakeServer::start(vec![(200, anthropic_reply(LOT_REPLY))]);
+    let r = anthropic(&s).enrich_lot(&lot_items()).unwrap();
+    assert_eq!(s.requests().len(), 1);
+    let b: serde_json::Value = serde_json::from_str(&s.requests()[0].body).unwrap();
+    check_lot_request(
+        b["system"].as_str().unwrap(),
+        b["messages"][0]["content"].as_str().unwrap(),
+    );
+    check_lot_result(r);
+}
+
+#[test]
+fn req027_ac6_openai_lot_single_request_applied_per_file() {
+    let s = FakeServer::start(vec![(200, openai_reply(LOT_REPLY))]);
+    let r = openai(&s, None).enrich_lot(&lot_items()).unwrap();
+    assert_eq!(s.requests().len(), 1);
+    let b: serde_json::Value = serde_json::from_str(&s.requests()[0].body).unwrap();
+    check_lot_request(
+        b["messages"][0]["content"].as_str().unwrap(),
+        b["messages"][1]["content"].as_str().unwrap(),
+    );
+    check_lot_result(r);
+}
+
+#[test]
+fn req027_ac8_lot_version_2_is_non_conforming_and_errors_classified() {
+    let s = FakeServer::start(vec![
+        (200, openai_reply(EXTRACTION)),
+        (401, "{}".into()),
+        (500, "{}".into()),
+    ]);
+    let o = openai(&s, None);
+    assert!(matches!(o.enrich_lot(&lot_items()), Err(Error::Message(_))));
+    assert!(matches!(
+        o.enrich_lot(&lot_items()),
+        Err(Error::InvalidKey(_))
+    ));
+    assert!(matches!(o.enrich_lot(&lot_items()), Err(Error::Network(_))));
 }

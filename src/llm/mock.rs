@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::ask::AskReply;
-use super::{Enrichment, Llm};
+use super::{Enrichment, Llm, LotItem};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Default, Clone)]
@@ -194,6 +194,13 @@ impl Llm for MockLlm {
             Some(j) => Enrichment::parse(&j, file, node_ids),
             None => Ok(Enrichment::default()),
         }
+    }
+
+    fn enrich_lot(&self, _items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+        // Provisoire : remplacé en T-052.
+        Err(Error::Message(
+            "enrich_lot : non implémenté pour le LLM simulé".into(),
+        ))
     }
 
     fn ask(&self, _question: &str, _context: &str) -> Result<AskReply> {

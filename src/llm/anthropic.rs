@@ -1,9 +1,11 @@
 //! Adaptateur Anthropic Messages (REQ-002).
 
 use super::ask::{ask_system_prompt, ask_user_prompt, AskReply};
-use super::enrich::{enrichment_system_prompt, enrichment_user_prompt};
-use super::Enrichment;
+use super::enrich::{
+    enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt, parse_lot,
+};
 use super::{http, Llm};
+use super::{Enrichment, LotItem};
 use crate::error::{Error, Result};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -79,6 +81,11 @@ impl Llm for AnthropicLlm {
             enrichment_user_prompt(file, chunk, text, node_ids),
         )?;
         Enrichment::parse(http::extract_json(&out)?, file, node_ids)
+    }
+
+    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+        let out = self.complete(lot_system_prompt(), lot_user_prompt(items))?;
+        Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {

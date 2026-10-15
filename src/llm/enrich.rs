@@ -52,6 +52,68 @@ struct RawConcept {
     sections: Vec<String>,
 }
 
+/// Filtre les éléments bruts d'un fichier selon sa liste de nœuds (règles version 2, REQ-024).
+fn filter_raw(
+    summaries: Vec<RawSummary>,
+    concepts: Vec<RawConcept>,
+    file: &str,
+    node_ids: &[String],
+) -> Enrichment {
+    let known: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
+    let mut out = Enrichment::default();
+
+    for s in summaries {
+        if s.node.trim().is_empty() {
+            out.rejected.push("résumé sans identifiant de nœud".into());
+            continue;
+        }
+        if !known.contains(s.node.as_str()) {
+            out.rejected
+                .push(format!("résumé pour {} (nœud hors liste)", s.node));
+        } else if !s.summary.trim().is_empty() {
+            out.summaries.push((s.node, s.summary.trim().to_string()));
+        }
+    }
+
+    let markdown = is_markdown(file);
+    for c in concepts {
+        let name = normalize_concept_name(&c.name);
+        if name.is_empty() {
+            out.rejected.push("concept sans nom".into());
+            continue;
+        }
+        if !markdown {
+            out.rejected
+                .push(format!("concept {name} (fichier non Markdown)"));
+            continue;
+        }
+        let mut sections: Vec<String> = Vec::new();
+        let mut dropped = false;
+        for s in c.sections {
+            if !(s.starts_with("section:") && known.contains(s.as_str())) {
+                dropped = true;
+            } else if !sections.contains(&s) {
+                sections.push(s);
+            }
+        }
+        if sections.is_empty() {
+            out.rejected
+                .push(format!("concept {name} (aucune section du fichier citée)"));
+            continue;
+        }
+        if dropped {
+            out.rejected
+                .push(format!("concept {name} : sections hors liste écartées"));
+        }
+        out.concepts.push(Concept {
+            name,
+            summary: c.summary.filter(|s| !s.trim().is_empty()),
+            sections,
+        });
+    }
+    out
+}
+
 fn invalid(msg: impl std::fmt::Display) -> Error {
     Error::Message(format!("réponse LLM non conforme au schéma : {msg}"))
 }
@@ -82,59 +144,7 @@ impl Enrichment {
                 raw.version
             )));
         }
-        let known: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
-        let mut out = Enrichment::default();
-
-        for s in raw.summaries {
-            if s.node.trim().is_empty() {
-                out.rejected.push("résumé sans identifiant de nœud".into());
-                continue;
-            }
-            if !known.contains(s.node.as_str()) {
-                out.rejected
-                    .push(format!("résumé pour {} (nœud hors liste)", s.node));
-            } else if !s.summary.trim().is_empty() {
-                out.summaries.push((s.node, s.summary.trim().to_string()));
-            }
-        }
-
-        let markdown = is_markdown(file);
-        for c in raw.concepts {
-            let name = normalize_concept_name(&c.name);
-            if name.is_empty() {
-                out.rejected.push("concept sans nom".into());
-                continue;
-            }
-            if !markdown {
-                out.rejected
-                    .push(format!("concept {name} (fichier non Markdown)"));
-                continue;
-            }
-            let mut sections: Vec<String> = Vec::new();
-            let mut dropped = false;
-            for s in c.sections {
-                if !(s.starts_with("section:") && known.contains(s.as_str())) {
-                    dropped = true;
-                } else if !sections.contains(&s) {
-                    sections.push(s);
-                }
-            }
-            if sections.is_empty() {
-                out.rejected
-                    .push(format!("concept {name} (aucune section du fichier citée)"));
-                continue;
-            }
-            if dropped {
-                out.rejected
-                    .push(format!("concept {name} : sections hors liste écartées"));
-            }
-            out.concepts.push(Concept {
-                name,
-                summary: c.summary.filter(|s| !s.trim().is_empty()),
-                sections,
-            });
-        }
-        Ok(out)
+        Ok(filter_raw(raw.summaries, raw.concepts, file, node_ids))
     }
 }
 
@@ -158,6 +168,138 @@ pub fn enrichment_system_prompt() -> String {
 pub fn enrichment_user_prompt(file: &str, chunk: usize, text: &str, node_ids: &[String]) -> String {
     let list: String = node_ids.iter().map(|n| format!("- {n}\n")).collect();
     format!("Fichier : {file} (morceau {chunk})\n\nNœuds du fichier :\n{list}\nContenu :\n{text}")
+}
+
+/// Version du schéma de réponse d'un lot de 2 fichiers ou plus (DEC-033).
+pub const ENRICH_LOT_SCHEMA_VERSION: u32 = 3;
+
+/// Un fichier d'un lot : chemin, contenu et identifiants de ses nœuds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LotItem {
+    pub file: String,
+    pub text: String,
+    pub node_ids: Vec<String>,
+}
+
+/// Résultat d'un lot : un résultat par fichier du lot (dans l'ordre du lot) et les éléments
+/// écartés qui ne se rattachent à aucun fichier (entrée hors lot ou en double).
+#[derive(Debug)]
+pub struct LotEnrichment {
+    pub files: Vec<(String, Result<Enrichment>)>,
+    pub rejected: Vec<String>,
+}
+
+impl LotEnrichment {
+    /// Résultats par fichier ; les éléments écartés propres au lot sont rattachés au premier
+    /// fichier enrichi avec succès pour qu'ils soient signalés ; si aucun fichier n'a réussi,
+    /// ils sont reportés dans le message d'erreur de chaque fichier absent.
+    pub fn into_results(self) -> Vec<(String, Result<Enrichment>)> {
+        let LotEnrichment {
+            mut files,
+            rejected,
+        } = self;
+        if let Some(Ok(e)) = files.iter_mut().map(|(_, r)| r).find(|r| r.is_ok()) {
+            e.rejected.extend(rejected);
+        } else if !rejected.is_empty() {
+            let note = format!(" (éléments écartés du lot : {})", rejected.join(" ; "));
+            for (_, r) in files.iter_mut() {
+                if let Err(err) = r {
+                    *r = Err(Error::Message(format!("{err}{note}")));
+                }
+            }
+        }
+        files
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLot {
+    version: u32,
+    files: Vec<RawLotEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLotEntry {
+    file: String,
+    summaries: Vec<RawSummary>,
+    concepts: Vec<RawConcept>,
+}
+
+/// Analyse strictement la réponse version 3 d'un lot puis filtre chaque entrée selon les nœuds
+/// du fichier qu'elle nomme. Une réponse illisible ou d'une autre version rend tout le lot
+/// non conforme (`Err`) ; un fichier du lot sans entrée échoue seul.
+pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
+    let raw: RawLot = serde_json::from_str(json).map_err(invalid)?;
+    if raw.version != ENRICH_LOT_SCHEMA_VERSION {
+        return Err(invalid(format!(
+            "version {} non prise en charge pour un lot (attendu : {ENRICH_LOT_SCHEMA_VERSION})",
+            raw.version
+        )));
+    }
+    let mut rejected = Vec::new();
+    let mut found: Vec<Option<Enrichment>> = vec![None; items.len()];
+    for entry in raw.files {
+        let Some(i) = items.iter().position(|it| it.file == entry.file) else {
+            rejected.push(format!("entrée pour {} (fichier hors du lot)", entry.file));
+            continue;
+        };
+        if found[i].is_some() {
+            rejected.push(format!("entrée en double pour {}", entry.file));
+            continue;
+        }
+        found[i] = Some(filter_raw(
+            entry.summaries,
+            entry.concepts,
+            &entry.file,
+            &items[i].node_ids,
+        ));
+    }
+    let files = items
+        .iter()
+        .zip(found)
+        .map(|(it, e)| {
+            let r = e.ok_or_else(|| {
+                Error::Message(format!("{} : absent de la réponse du lot", it.file))
+            });
+            (it.file.clone(), r)
+        })
+        .collect();
+    Ok(LotEnrichment { files, rejected })
+}
+
+/// Prompt système d'un lot de fichiers (identique pour tous les fournisseurs).
+pub fn lot_system_prompt() -> String {
+    format!(
+        "Tu enrichis le graphe d'un dépôt à partir de plusieurs fichiers (code Java/Kotlin/Groovy/Scala, \
+         build Maven/Gradle/Ivy, ou Markdown) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
+         Chaque fichier est introduit par une ligne `=== FICHIER : <chemin> ===`, suivie de la liste de ses \
+         nœuds puis de son contenu, jusqu'à la ligne `=== FIN DU FICHIER : <chemin> ===`.\n\
+         Schéma (version {ENRICH_LOT_SCHEMA_VERSION}) : {{\"version\": {ENRICH_LOT_SCHEMA_VERSION}, \"files\": \
+         [{{\"file\": \"<chemin exact du fichier>\", \"summaries\": [{{\"node\": \"<identifiant de la liste de ce fichier>\", \
+         \"summary\": \"une phrase\"}}], \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"une phrase (optionnel)\", \
+         \"sections\": [\"<identifiant de section de la liste de ce fichier>\"]}}]}}]}}.\n\
+         Produis exactement une entrée par fichier fourni. Les résumés ne portent que sur les nœuds de la \
+         liste du fichier concerné. Les concepts ne concernent que les fichiers Markdown et ne citent que des \
+         sections de la liste du même fichier. Tu ne crées, ne renomme ni ne supprimes aucun nœud et tu ne \
+         produis aucun autre lien. Sans rien à signaler pour un fichier, donne-lui une entrée avec \
+         \"summaries\": [] et \"concepts\": []."
+    )
+}
+
+/// Message utilisateur d'un lot : pour chaque fichier, chemin, nœuds et contenu, avec séparateurs.
+pub fn lot_user_prompt(items: &[LotItem]) -> String {
+    let mut out = String::new();
+    for it in items {
+        let list: String = it.node_ids.iter().map(|n| format!("- {n}\n")).collect();
+        out.push_str(&format!(
+            "=== FICHIER : {f} ===\nNœuds du fichier :\n{list}\nContenu :\n{t}\n=== FIN DU FICHIER : {f} ===\n\n",
+            f = it.file,
+            t = it.text
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -234,5 +376,100 @@ mod tests {
         let e = Enrichment::parse(json, "a.md", &n).unwrap();
         assert!(e.concepts.is_empty());
         assert_eq!(e.rejected.len(), 1);
+    }
+
+    fn item(file: &str, nodes: &[&str]) -> LotItem {
+        LotItem {
+            file: file.into(),
+            text: String::new(),
+            node_ids: ids(nodes),
+        }
+    }
+
+    #[test]
+    fn req027_ac6_parse_lot_conforming() {
+        let items = [item("A.java", &["type:A"]), item("B.java", &["type:B"])];
+        let json = r#"{"version":3,"files":[
+            {"file":"B.java","summaries":[{"node":"type:B","summary":"b"},{"node":"type:A","summary":"x"}],"concepts":[]},
+            {"file":"A.java","summaries":[{"node":"type:A","summary":"a"}],"concepts":[]}]}"#;
+        let l = parse_lot(json, &items).unwrap();
+        assert!(l.rejected.is_empty());
+        assert_eq!(l.files[0].0, "A.java");
+        let a = l.files[0].1.as_ref().unwrap();
+        assert_eq!(a.summaries, vec![("type:A".into(), "a".into())]);
+        let b = l.files[1].1.as_ref().unwrap();
+        assert_eq!(b.summaries, vec![("type:B".into(), "b".into())]);
+        assert_eq!(b.rejected.len(), 1, "{:?}", b.rejected);
+    }
+
+    #[test]
+    fn req027_ac8_parse_lot_non_conforming() {
+        let items = [item("A.java", &[]), item("B.java", &[])];
+        for bad in [
+            "pas du json",
+            r#"{"version":2,"files":[]}"#,
+            r#"{"version":3,"files":[],"extra":1}"#,
+            r#"{"version":3,"files":[{"file":"A.java","summaries":[],"concepts":[],"x":1}]}"#,
+            r#"{"version":3,"files":[{"file":"A.java","summaries":[]}]}"#,
+        ] {
+            assert!(parse_lot(bad, &items).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn req027_ac7_parse_lot_out_of_lot_duplicate_and_missing() {
+        let items = [item("A.java", &["type:A"]), item("B.java", &["type:B"])];
+        let json = r#"{"version":3,"files":[
+            {"file":"A.java","summaries":[{"node":"type:A","summary":"a"}],"concepts":[]},
+            {"file":"autre/Inconnu.java","summaries":[],"concepts":[]},
+            {"file":"A.java","summaries":[{"node":"type:A","summary":"bis"}],"concepts":[]}]}"#;
+        let l = parse_lot(json, &items).unwrap();
+        assert_eq!(l.rejected.len(), 2, "{:?}", l.rejected);
+        assert!(l.rejected[0].contains("autre/Inconnu.java"));
+        assert!(l.rejected[1].contains("A.java"));
+        let a = l.files[0].1.as_ref().unwrap();
+        assert_eq!(a.summaries, vec![("type:A".into(), "a".into())]);
+        let e = l.files[1].1.as_ref().unwrap_err().to_string();
+        assert!(
+            e.contains("B.java") && e.contains("absent de la réponse du lot"),
+            "{e}"
+        );
+        let r = l.into_results();
+        let a = r[0].1.as_ref().unwrap();
+        assert_eq!(a.rejected.len(), 2);
+    }
+
+    #[test]
+    fn req027_ac4_parse_lot_concept_in_java_entry_is_dropped() {
+        let items = [
+            item("A.java", &["type:A"]),
+            item("d.md", &["section:d.md#s"]),
+        ];
+        let json = r#"{"version":3,"files":[
+            {"file":"A.java","summaries":[],"concepts":[{"name":"X","sections":["type:A"]}]},
+            {"file":"d.md","summaries":[],"concepts":[{"name":"Y","sections":["section:d.md#s"]}]}]}"#;
+        let l = parse_lot(json, &items).unwrap();
+        let a = l.files[0].1.as_ref().unwrap();
+        assert!(a.concepts.is_empty());
+        assert_eq!(a.rejected.len(), 1);
+        assert_eq!(l.files[1].1.as_ref().unwrap().concepts.len(), 1);
+    }
+
+    #[test]
+    fn req027_ac7_parse_lot_all_out_of_lot_reports_rejected_in_errors() {
+        let items = [item("A.java", &["type:A"]), item("B.java", &["type:B"])];
+        let json = r#"{"version":3,"files":[
+            {"file":"X.java","summaries":[],"concepts":[]},
+            {"file":"Y.java","summaries":[],"concepts":[]}]}"#;
+        let r = parse_lot(json, &items).unwrap().into_results();
+        assert_eq!(r.len(), 2);
+        for (f, res) in &r {
+            let e = res.as_ref().unwrap_err().to_string();
+            assert!(
+                e.contains(f) && e.contains("absent de la réponse du lot"),
+                "{e}"
+            );
+            assert!(e.contains("X.java") && e.contains("Y.java"), "{e}");
+        }
     }
 }

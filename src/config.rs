@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 pub const DEFAULT_MAX_CHUNK_CHARS: usize = 60_000;
 pub const DEFAULT_CONCURRENCY: usize = 4;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_BATCH_FILES: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -37,6 +38,8 @@ pub struct Config {
     pub concurrency: usize,
     /// Durée maximale d'un appel LLM HTTP, en secondes.
     pub timeout_secs: u64,
+    /// Nombre maximal de fichiers par appel d'enrichissement (REQ-027).
+    pub batch_files: usize,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +52,7 @@ struct RawConfig {
     max_chunk_chars: Option<i64>,
     concurrency: Option<i64>,
     timeout_secs: Option<i64>,
+    batch_files: Option<i64>,
 }
 
 /// Chemin du fichier de configuration : `RKG_CONFIG`, sinon
@@ -199,6 +203,7 @@ impl Config {
                 raw.timeout_secs,
                 DEFAULT_TIMEOUT_SECS as usize,
             )? as u64,
+            batch_files: positive("batch_files", raw.batch_files, DEFAULT_BATCH_FILES)?,
         })
     }
 
