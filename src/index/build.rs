@@ -165,20 +165,35 @@ const MAX_CONSECUTIVE_NETWORK_ERRORS: usize = 3;
 #[derive(Default)]
 struct Policy {
     consecutive_network: usize,
+    network_total: usize,
     stop_cause: Option<String>,
 }
 
+/// Total des erreurs réseau constatées au départ d'un appel (DEC-022).
+type Ticket = usize;
+
 impl Policy {
+    /// Prend un ticket au départ d'un appel (sous le verrou de la politique).
+    fn dispatch(&self) -> Ticket {
+        self.network_total
+    }
+
     /// Met à jour la politique ; renvoie vrai si l'envoi de nouveaux fichiers doit s'arrêter.
-    fn record(&mut self, result: Option<&Error>) -> bool {
+    /// Une réussite n'efface que les erreurs réseau constatées avant le départ de son appel (DEC-022).
+    fn record(&mut self, ticket: Ticket, result: Option<&Error>) -> bool {
         match result {
-            None => self.consecutive_network = 0,
+            None => {
+                self.consecutive_network = self
+                    .consecutive_network
+                    .min(self.network_total.saturating_sub(ticket));
+            }
             Some(Error::InvalidKey(_)) => {
                 self.stop_cause
                     .get_or_insert_with(|| "clé d'API refusée par le fournisseur".to_string());
             }
             Some(Error::Network(_)) => {
                 self.consecutive_network += 1;
+                self.network_total += 1;
                 if self.consecutive_network >= MAX_CONSECUTIVE_NETWORK_ERRORS {
                     self.stop_cause.get_or_insert_with(|| {
                         format!(
@@ -228,6 +243,7 @@ pub(crate) fn extract_all(
                 let Some(file) = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front() else {
                     break;
                 };
+                let ticket = policy.lock().unwrap_or_else(|p| p.into_inner()).dispatch();
                 let outcome = match std::fs::read_to_string(repo.join(&file.path)) {
                     Err(e) => Outcome::Failed(
                         file.path.clone(),
@@ -245,7 +261,7 @@ pub(crate) fn extract_all(
                 let halt = policy
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .record(error);
+                    .record(ticket, error);
                 if halt {
                     stop.store(true, Ordering::SeqCst);
                 }
@@ -348,4 +364,66 @@ fn to_records(path: &str, x: Extraction) -> (Vec<Node>, Vec<Ref>, usize) {
         });
     }
     (nodes, refs, dropped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn net() -> Error {
+        Error::Network("réseau".into())
+    }
+
+    #[test]
+    fn req010_ac9_success_dispatched_before_errors_keeps_them_counted() {
+        let mut p = Policy::default();
+        let a = p.dispatch();
+        assert!(!p.record(a, None));
+        let (b, c, d) = (p.dispatch(), p.dispatch(), p.dispatch());
+        assert!(!p.record(c, Some(&net())));
+        assert!(!p.record(d, Some(&net())));
+        assert!(!p.record(b, None));
+        let e = p.dispatch();
+        assert!(p.record(e, Some(&net())));
+        assert!(p.stop_cause.unwrap().contains("panne réseau répétée"));
+    }
+
+    #[test]
+    fn req010_ac9_sequential_success_resets_count() {
+        let mut p = Policy::default();
+        for _ in 0..2 {
+            let t = p.dispatch();
+            assert!(!p.record(t, Some(&net())));
+        }
+        let t = p.dispatch();
+        assert!(!p.record(t, None));
+        for _ in 0..2 {
+            let t = p.dispatch();
+            assert!(!p.record(t, Some(&net())));
+        }
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&net())));
+    }
+
+    #[test]
+    fn req010_ac9_timeout_and_invalid_neither_count_nor_reset() {
+        let mut p = Policy::default();
+        for _ in 0..2 {
+            let t = p.dispatch();
+            p.record(t, Some(&net()));
+        }
+        for e in [Error::Timeout("d".into()), Error::Message("x".into())] {
+            let t = p.dispatch();
+            assert!(!p.record(t, Some(&e)));
+        }
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&net())));
+    }
+
+    #[test]
+    fn req010_ac9_invalid_key_stops_at_first() {
+        let mut p = Policy::default();
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&Error::InvalidKey("k".into()))));
+    }
 }
