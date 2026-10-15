@@ -3,6 +3,7 @@
 pub mod calls;
 pub mod java;
 pub mod jvm;
+pub mod kotlin;
 pub mod lang;
 
 use std::path::{Path, PathBuf};
@@ -28,14 +29,14 @@ pub struct ParseCtx {
     pub repo_root: Option<PathBuf>,
 }
 
-/// Extrait la structure de `text`. Java est extrait ; les autres langages renvoient pour
+/// Extrait la structure de `text`. Java et Kotlin sont extraits ; les autres langages renvoient pour
 /// l'instant une structure vide, comme un fichier de type inconnu.
 pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure> {
     let _ = ctx;
     match Lang::from_path(path) {
         Some(Lang::Java) => java::extract(text),
-        Some(Lang::Kotlin)
-        | Some(Lang::KotlinGradle)
+        Some(Lang::Kotlin) => kotlin::extract(path, text),
+        Some(Lang::KotlinGradle)
         | Some(Lang::Scala)
         | Some(Lang::Groovy)
         | Some(Lang::GroovyGradle)
