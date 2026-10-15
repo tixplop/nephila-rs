@@ -2,7 +2,7 @@
 
 `rkg` analyse un dépôt (Java, Kotlin, Groovy, Scala, fichiers de build Maven/Gradle/Ivy, Markdown), stocke le résultat dans un graphe SQLite local (nœuds : modules, types, méthodes, documents... ; liens : `contains`, `calls`...) et permet de l'interroger sans LLM, sauf pour `query ask`.
 
-Depuis la version 0.4.0, `rkg export --format html` produit une page d'exploration autonome, et `rkg export` écrit désormais dans un fichier (voir `rkg export`). La version 0.5.0 ajoute l'option `-v/--verbose` à `build` et `update` (traces sur stderr).
+Depuis la version 0.4.0, `rkg export --format html` produit une page d'exploration autonome, et `rkg export` écrit désormais dans un fichier (voir `rkg export`). La version 0.5.0 ajoute l'option `-v/--verbose` à `build` et `update` (traces sur stderr). La version 0.6.0 ajoute la clé `batch_files` (enrichissement en lots, voir « Enrichissement en lots »).
 
 Depuis la version 0.3.0, la structure du graphe vient d'une analyse syntaxique locale, sans LLM. Le LLM est facultatif : il ne sert qu'à enrichir le graphe (résumés des nœuds, concepts des documents Markdown) et à répondre à `query ask`. Sans configuration, ou avec `--no-llm`, `build` et `update` produisent la structure seule.
 
@@ -34,6 +34,7 @@ Le LLM est actif quand ce fichier existe et que `--no-llm` est absent. Sans fich
 | `base_url` | URL du serveur (facultatif) |
 | `max_chunk_chars` | taille maximale d'un morceau envoyé au LLM (défaut 60000) |
 | `concurrency` | appels simultanés (défaut 4) |
+| `batch_files` | nombre maximal de fichiers par appel d'enrichissement, entier > 0 (défaut 1 = un fichier par appel) ; voir « Enrichissement en lots » |
 | `timeout_secs` | durée maximale d'un appel LLM HTTP (extraction, `ask`, vérification de clé), entier > 0 (défaut 300) ; le délai de connexion reste fixe (10 s) ; ignoré par `mock` |
 
 La clé n'est jamais écrite dans le fichier : `api_key_env = "ANTHROPIC_API_KEY"` puis `export ANTHROPIC_API_KEY=...`. Avant tout traitement, `rkg` vérifie la clé par un appel de liste des modèles (sans coût de génération).
@@ -218,6 +219,18 @@ Les traces ne contiennent jamais de contenu de fichier, de prompt ou de réponse
 
 `status`, `query` (hors `ask`), `summary` et `export` ne font aucun appel LLM et ne demandent aucune configuration. Si le graphe est en retard sur les fichiers, les requêtes l'indiquent par `avertissement: graphe pas à jour : 1 fichier modifié` sur stderr.
 
+### Enrichissement en lots (`batch_files`)
+
+Par défaut (`batch_files = 1`), un appel LLM porte un seul fichier. Pour un dépôt de nombreux petits fichiers, `batch_files = 4` à `8` regroupe plusieurs fichiers dans un même appel (schéma de réponse version 3) et réduit le nombre d'appels.
+
+- Les fichiers à enrichir sont pris dans l'ordre des chemins ; un lot ne dépasse jamais `batch_files` fichiers, ni `max_chunk_chars` octets au total.
+- Un fichier plus gros que `max_chunk_chars` n'entre dans aucun lot : il est envoyé seul, en morceaux successifs.
+- Effet combiné : `concurrency` lots sont en vol en même temps, soit jusqu'à `concurrency` x `batch_files` fichiers traités simultanément.
+- Échec d'un lot (délai dépassé, réseau, réponse non conforme, clé refusée) : tous ses fichiers restent « à enrichir », sont nommés sur stderr, et sont repris par le prochain `rkg update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse d'un lot échoue seul.
+- Limite connue : si la réponse est tronquée par la limite de jetons de sortie du modèle, elle est non conforme et tout le lot échoue ; réduisez alors `batch_files`.
+- Mock : un lot de 2 fichiers ou plus écrit une seule ligne dans `RKG_MOCK_LOG`, `chemin_1;chemin_2;...<TAB>1`.
+- `--verbose` : la ligne `config` contient `batch_files=N` ; un lot de n fichiers produit `llm enrich départ lot <premier chemin> +<n-1> [1/1] <c> car.` puis `llm enrich fin lot <premier chemin> +<n-1> [1/1] ...` ; `<q> fichiers non envoyés` compte des fichiers, pas des lots.
+
 ## Codes de sortie
 
 | Code | Signification |
@@ -268,7 +281,7 @@ Avec `provider = "mock"`, le LLM est simulé et piloté par l'environnement :
 | Variable | Effet |
 |---|---|
 | `RKG_MOCK_DIR` | dossier de fixtures : `<dir>/<chemin relatif>.json` (ou `<chemin>.<n>.json` pour le morceau n, à partir de 1) donne la réponse d'enrichissement ; `_ask.json` donne la réponse de `query ask` ; sans fixture, réponse vide valide |
-| `RKG_MOCK_LOG` | journal des appels, une ligne `chemin<TAB>n°morceau` par appel |
+| `RKG_MOCK_LOG` | journal des appels, une ligne `chemin<TAB>n°morceau` par appel (lot : `chemin_1;chemin_2;...<TAB>1`) |
 | `RKG_MOCK_FAIL_AFTER` | nombre d'appels réussis avant des erreurs réseau simulées |
 | `RKG_MOCK_INVALID_KEY` | si non vide et différent de `0`, la vérification de clé échoue |
 | `RKG_MOCK_DELAY_MS` | délai ajouté à chaque appel |
