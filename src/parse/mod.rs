@@ -2,6 +2,7 @@
 
 pub mod calls;
 pub mod gradle;
+pub mod gradle_lex;
 pub mod groovy;
 pub mod ivy;
 pub mod java;
@@ -54,7 +55,7 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure>
             _ => Ok(FileStructure::default()),
         },
         Some(Lang::Markdown) => Ok(markdown::extract(path, text)),
-        Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) => Ok(gradle::extract(path, ctx)),
+        Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) => Ok(gradle::extract(path, text, ctx)),
         None => Ok(FileStructure::default()),
     }
 }

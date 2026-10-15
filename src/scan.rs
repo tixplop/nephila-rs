@@ -203,11 +203,34 @@ pub fn scan(root: &Path, known: &[FileRecord]) -> Result<ScanResult> {
             )
         })
         .map(|f| {
+            let name = std::fs::read_to_string(root.join(&f.path))
+                .ok()
+                .and_then(|t| crate::parse::gradle::root_project_name(&t));
             (
                 f.path.rsplit_once('/').map_or("", |(d, _)| d).to_string(),
-                None,
+                name,
             )
         })
         .collect();
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_remplit_root_project_name_des_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.gradle"),
+            "rootProject.name = 'app'\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("t")).unwrap();
+        std::fs::write(dir.path().join("t/settings.gradle.kts"), "include(\"x\")\n").unwrap();
+        let res = scan(dir.path(), &[]).unwrap();
+        assert_eq!(res.gradle_settings.get(""), Some(&Some("app".to_string())));
+        assert_eq!(res.gradle_settings.get("t"), Some(&None));
+    }
 }
