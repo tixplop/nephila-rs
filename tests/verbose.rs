@@ -153,6 +153,7 @@ fn req026_ac3_config_parcours_and_phases() {
         lines.iter().any(|l| l.contains("config")
             && l.contains("mock")
             && l.contains("concurrency=4")
+            && l.contains("batch_files=1")
             && l.contains("timeout_secs=")),
         "{lines:?}"
     );

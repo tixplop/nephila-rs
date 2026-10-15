@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Instant;
 
+#[allow(dead_code)]
+#[path = "support/fake_server.rs"]
+mod fake_server;
+use fake_server::FakeServer;
+
 struct Env {
     _tmp: tempfile::TempDir,
     repo: PathBuf,
@@ -342,4 +347,235 @@ fn req027_ac8_non_conforming_fixture_fails_whole_lot_only() {
     }
     assert_eq!(to_enrich(&env), 4);
     assert_eq!(env.summaries().len(), 4);
+}
+
+fn pending(env: &Env) -> Vec<String> {
+    let mut v: Vec<String> = Store::open_readonly(&env.repo)
+        .unwrap()
+        .files_to_enrich()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    v.sort();
+    v
+}
+
+/// Après un échec simulé, `update` sans échec renvoie exactement les fichiers à enrichir.
+fn assert_update_resends_pending(env: &Env) {
+    let before = pending(env);
+    assert!(!before.is_empty());
+    fs::write(&env.log, "").unwrap();
+    let o = env.run("update", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let mut sent: Vec<String> = env.log_lines().iter().flat_map(|l| files_of(l)).collect();
+    sent.sort();
+    assert_eq!(sent, before);
+    assert_eq!(to_enrich(env), 0);
+}
+
+#[test]
+fn req027_ac9_timeout_in_lot_fails_its_two_files_only() {
+    let env = Env::new(6, 2, 1);
+    let o = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", "src/F03.java")]);
+    assert!(!o.status.success());
+    assert_eq!(pending(&env), vec!["src/F02.java", "src/F03.java"]);
+    assert_eq!(env.summaries().len(), 4);
+    let err = stderr(&o);
+    assert!(
+        err.contains("F02.java") && err.contains("F03.java"),
+        "{err}"
+    );
+    assert_update_resends_pending(&env);
+}
+
+#[test]
+fn req027_ac9_fail_after_two_gives_five_calls() {
+    let env = Env::new(12, 2, 1);
+    let o = env.run("build", &[("RKG_MOCK_FAIL_AFTER", "2")]);
+    assert!(!o.status.success());
+    assert_eq!(env.log_lines().len(), 5, "{:?}", env.log_lines());
+    assert_eq!(env.summaries().len(), 4);
+    assert_eq!(to_enrich(&env), 8);
+    assert!(
+        stderr(&o).contains("panne réseau répétée"),
+        "{}",
+        stderr(&o)
+    );
+    assert_update_resends_pending(&env);
+}
+
+#[test]
+fn req027_ac9_key_revoked_after_one_gives_two_calls() {
+    let env = Env::new(12, 2, 1);
+    let o = env.run("build -v", &[("RKG_MOCK_KEY_REVOKED_AFTER", "1")]);
+    assert!(!o.status.success());
+    assert_eq!(env.log_lines().len(), 2, "{:?}", env.log_lines());
+    assert_eq!(env.summaries().len(), 2);
+    assert_eq!(to_enrich(&env), 10);
+    let err = stderr(&o);
+    assert!(
+        err.lines()
+            .any(|l| l.contains("politique: arrêt de l'envoi")
+                && l.contains("clé d'API refusée par le fournisseur")),
+        "{err}"
+    );
+    assert_update_resends_pending(&env);
+}
+
+// ---- AC-027-10 : traces de lot ----
+
+#[test]
+fn req027_ac10_lot_traces_are_paired_and_contain_no_content() {
+    let env = Env::new(10, 4, 1);
+    let o = env.run("build -v", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let err = stderr(&o);
+    let lines: Vec<&str> = err.lines().filter(|l| l.starts_with("trace:")).collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("config") && l.contains("batch_files=4")),
+        "{lines:?}"
+    );
+    for (first, extra) in [
+        ("src/F00.java", 3),
+        ("src/F04.java", 3),
+        ("src/F08.java", 1),
+    ] {
+        let key = format!("lot {first} +{extra} [1/1]");
+        let start = lines
+            .iter()
+            .position(|l| l.contains(&format!("llm enrich départ {key}")) && l.contains(" car."))
+            .unwrap_or_else(|| panic!("{key} : {lines:?}"));
+        let end = lines
+            .iter()
+            .position(|l| l.contains(&format!("llm enrich fin {key} ok (")))
+            .unwrap_or_else(|| panic!("{key} : {lines:?}"));
+        assert!(start < end);
+        let n = extra + 1;
+        assert!(
+            lines[end].contains(&format!("ok ({n} résumés, 0 concepts)")),
+            "{}",
+            lines[end]
+        );
+    }
+    let ends = lines
+        .iter()
+        .filter(|l| l.contains("llm enrich fin"))
+        .count();
+    assert_eq!(ends, env.log_lines().len());
+    assert_eq!(ends, 3);
+    for l in &lines {
+        assert!(
+            !l.contains("public class") && !l.contains("résumé 0"),
+            "{l}"
+        );
+    }
+}
+
+#[test]
+fn req027_ac10_stop_counts_files_not_lots() {
+    let env = Env::new(12, 2, 1);
+    let o = env.run("build -v", &[("RKG_MOCK_FAIL_AFTER", "2")]);
+    let err = stderr(&o);
+    // 5 appels (10 fichiers) envoyés : 2 fichiers restent dans la file.
+    assert!(
+        err.contains("politique: arrêt de l'envoi") && err.contains(", 2 fichiers non envoyés"),
+        "{err}"
+    );
+}
+
+// ---- AC-027-7 / AC-027-8 : faux serveur, de bout en bout ----
+
+fn openai_reply(text: &str) -> String {
+    serde_json::json!({"choices":[{"message":{"role":"assistant","content":text}}]}).to_string()
+}
+
+fn server_env(server: &FakeServer, n: usize) -> Env {
+    let env = Env::new(n, 3, 1);
+    fs::write(
+        &env.config,
+        format!(
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"RKG_T053_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    env
+}
+
+fn run_server(env: &Env, sub: &str) -> Output {
+    env.run(sub, &[("RKG_T053_KEY", "sk-test")])
+}
+
+fn lot_entry(i: usize) -> String {
+    format!(
+        r#"{{"file":"src/F{i:02}.java","summaries":[{{"node":"type:p.F{i:02}","summary":"résumé {i:02}"}}],"concepts":[]}}"#
+    )
+}
+
+#[test]
+fn req027_ac7_omitted_file_stays_pending_and_update_resends_only_it() {
+    let reply = format!(
+        r#"{{"version":3,"files":[{},{},{{"file":"autre/Inconnu.java","summaries":[],"concepts":[]}}]}}"#,
+        lot_entry(0),
+        lot_entry(2)
+    );
+    let single =
+        r#"{"version":2,"summaries":[{"node":"type:p.F01","summary":"résumé 01"}],"concepts":[]}"#;
+    let server = FakeServer::start(vec![
+        (200, "{}".into()),
+        (200, openai_reply(&reply)),
+        (200, "{}".into()),
+        (200, openai_reply(single)),
+    ]);
+    let env = server_env(&server, 3);
+    let o = run_server(&env, "build");
+    let err = stderr(&o);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains("src/F01.java"), "{err}");
+    assert!(err.contains("absent de la réponse du lot"), "{err}");
+    assert!(err.contains("autre/Inconnu.java"), "{err}");
+    assert_eq!(pending(&env), vec!["src/F01.java"]);
+    assert_eq!(env.summaries().len(), 2);
+
+    let o = run_server(&env, "update");
+    assert!(o.status.success(), "{}", stderr(&o));
+    let reqs: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    assert_eq!(reqs.len(), 2);
+    assert!(reqs[1].body.contains("F01") && !reqs[1].body.contains("F02"));
+    assert_eq!(to_enrich(&env), 0);
+}
+
+#[test]
+fn req027_ac8_version_2_reply_for_a_lot_fails_all_its_files() {
+    let wrong = r#"{"version":2,"summaries":[],"concepts":[]}"#;
+    let reply = format!(
+        r#"{{"version":3,"files":[{},{},{}]}}"#,
+        lot_entry(3),
+        lot_entry(4),
+        lot_entry(5)
+    );
+    let server = FakeServer::start(vec![
+        (200, "{}".into()),
+        (200, openai_reply(wrong)),
+        (200, openai_reply(&reply)),
+    ]);
+    let env = server_env(&server, 6);
+    let o = run_server(&env, "build");
+    let err = stderr(&o);
+    assert!(!o.status.success(), "{err}");
+    for i in 0..3 {
+        assert!(err.contains(&format!("F{i:02}.java")), "{err}");
+    }
+    assert_eq!(
+        pending(&env),
+        vec!["src/F00.java", "src/F01.java", "src/F02.java"]
+    );
+    assert_eq!(env.summaries().len(), 3);
 }

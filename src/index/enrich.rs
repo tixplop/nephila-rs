@@ -171,7 +171,7 @@ fn run_unit(
                     node_ids: node_ids(f),
                 })
                 .collect();
-            match llm.enrich_lot(&items) {
+            match traced_lot(llm, &items) {
                 Err(e) => {
                     for (f, _) in &readable {
                         outcomes.push(Outcome::Failed(f.path.clone(), e.clone()));
@@ -234,6 +234,38 @@ fn traced_enrich(
         ),
         Err(e) => trace!(
             "llm enrich fin {path} [{index}/{total}] {} {ms} ms : {}",
+            trace::classify(e),
+            trace::short(&trace_detail(e), trace::MAX_MESSAGE_CHARS)
+        ),
+    }
+    result
+}
+
+/// Un appel `llm.enrich_lot` encadré de ses traces de départ et de fin (jamais de contenu).
+fn traced_lot(llm: &dyn Llm, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+    if !trace::enabled() {
+        return llm.enrich_lot(items);
+    }
+    let label = format!("lot {} +{}", items[0].file, items.len() - 1);
+    trace!(
+        "llm enrich départ {label} [1/1] {} car.",
+        items.iter().map(|i| i.text.chars().count()).sum::<usize>()
+    );
+    let started = Instant::now();
+    let result = llm.enrich_lot(items);
+    let ms = started.elapsed().as_millis();
+    match &result {
+        Ok(results) => {
+            let (r, k) = results
+                .iter()
+                .filter_map(|(_, x)| x.as_ref().ok())
+                .fold((0, 0), |(r, k), x| {
+                    (r + x.summaries.len(), k + x.concepts.len())
+                });
+            trace!("llm enrich fin {label} [1/1] ok ({r} résumés, {k} concepts) {ms} ms")
+        }
+        Err(e) => trace!(
+            "llm enrich fin {label} [1/1] {} {ms} ms : {}",
             trace::classify(e),
             trace::short(&trace_detail(e), trace::MAX_MESSAGE_CHARS)
         ),

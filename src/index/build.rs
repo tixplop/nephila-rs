@@ -88,12 +88,13 @@ pub(crate) fn setup(no_llm: bool) -> Result<Setup> {
         }
         Some(config) => {
             trace!(
-                "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={}",
+                "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={}",
                 config.provider.as_str(),
                 config.model,
                 config.concurrency,
                 config.timeout_secs,
-                config.max_chunk_chars
+                config.max_chunk_chars,
+                config.batch_files
             );
             let llm = build_llm(&config)?;
             let started = Instant::now();
