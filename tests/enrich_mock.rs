@@ -92,3 +92,83 @@ fn req003_enrich_shares_failure_switches_with_extract() {
         Err(Error::Network(_))
     ));
 }
+
+fn lot_item(file: &str) -> rkg::llm::LotItem {
+    rkg::llm::LotItem {
+        file: file.into(),
+        text: String::new(),
+        node_ids: vec![format!("type:{}", file.trim_end_matches(".java"))],
+    }
+}
+
+#[test]
+fn req003_ac7_lot_is_one_call_one_log_line_with_v3_assembled() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join("A.java.json"),
+        r#"{"version":2,"summaries":[{"node":"type:A","summary":"un"}],"concepts":[]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        d.path().join("B.java.1.json"),
+        r#"{"version":2,"summaries":[{"node":"type:B","summary":"deux"}],"concepts":[]}"#,
+    )
+    .unwrap();
+    let log = d.path().join("log");
+    let m = mock(d.path(), Some(&log));
+    let r = m
+        .enrich_lot(&[lot_item("A.java"), lot_item("B.java"), lot_item("C.java")])
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "A.java;B.java;C.java\t1\n"
+    );
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0].1.as_ref().unwrap().summaries[0].1, "un");
+    assert_eq!(r[1].1.as_ref().unwrap().summaries[0].1, "deux");
+    assert!(r[2].1.as_ref().unwrap().summaries.is_empty());
+}
+
+#[test]
+fn req003_ac7_lot_non_conforming_fixture_fails_whole_lot() {
+    for bad in [
+        "pas du json",
+        r#"{"version":1,"declares":[],"references":[]}"#,
+        r#"{"version":2,"summaries":[],"concepts":[],"inconnu":1}"#,
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("B.java.json"), bad).unwrap();
+        let m = mock(d.path(), None);
+        assert!(m
+            .enrich_lot(&[lot_item("A.java"), lot_item("B.java")])
+            .is_err());
+    }
+}
+
+#[test]
+fn req003_ac7_lot_timeout_and_counters() {
+    let d = tempfile::tempdir().unwrap();
+    let m = MockLlm::new(MockOptions {
+        dir: Some(d.path().to_path_buf()),
+        timeout_files: vec!["B.java".into()],
+        fail_after: Some(1),
+        ..Default::default()
+    });
+    let lot = [lot_item("A.java"), lot_item("C.java")];
+    assert!(m.enrich_lot(&lot).is_ok());
+    assert!(matches!(m.enrich_lot(&lot), Err(Error::Network(_))));
+    let m = MockLlm::new(MockOptions {
+        timeout_files: vec!["B.java".into()],
+        ..Default::default()
+    });
+    assert!(matches!(
+        m.enrich_lot(&[lot_item("A.java"), lot_item("B.java")]),
+        Err(Error::Timeout(_))
+    ));
+    let m = MockLlm::new(MockOptions {
+        key_revoked_after: Some(1),
+        ..Default::default()
+    });
+    assert!(m.enrich_lot(&lot).is_ok());
+    assert!(matches!(m.enrich_lot(&lot), Err(Error::InvalidKey(_))));
+}

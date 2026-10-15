@@ -38,6 +38,8 @@ pub struct IndexOptions {
     /// Nombre de fils d'analyse et d'appels LLM simultanés.
     pub concurrency: usize,
     pub max_chunk_chars: usize,
+    /// Nombre maximal de fichiers par appel LLM (REQ-027).
+    pub batch_files: usize,
 }
 
 impl Default for IndexOptions {
@@ -45,6 +47,7 @@ impl Default for IndexOptions {
         IndexOptions {
             concurrency: DEFAULT_CONCURRENCY,
             max_chunk_chars: DEFAULT_MAX_CHUNK_CHARS,
+            batch_files: crate::config::DEFAULT_BATCH_FILES,
         }
     }
 }
@@ -54,6 +57,7 @@ impl From<&Config> for IndexOptions {
         IndexOptions {
             concurrency: c.concurrency,
             max_chunk_chars: c.max_chunk_chars,
+            batch_files: c.batch_files,
         }
     }
 }
@@ -254,15 +258,7 @@ pub(crate) fn finalize(
         let files = store.files_to_enrich()?;
         // Sans fichier à enrichir, le graphe n'a pas changé : pas de seconde résolution.
         if !files.is_empty() {
-            enrich::enrich_all(
-                repo,
-                &files,
-                opts.concurrency,
-                opts.max_chunk_chars,
-                llm,
-                store,
-                report,
-            )?;
+            enrich::enrich_all(repo, &files, opts, llm, store, report)?;
             stats = resolve_pass(store)?;
         }
     }

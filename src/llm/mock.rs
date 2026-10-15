@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::ask::AskReply;
+use super::enrich::parse_lot;
 use super::{Enrichment, Llm, LotItem};
 use crate::error::{Error, Result};
+use serde_json::Value;
 
 #[derive(Debug, Default, Clone)]
 pub struct MockOptions {
@@ -129,12 +131,15 @@ impl MockLlm {
         }
     }
 
-    /// Journalise l'appel, applique les échecs simulés et lit la fixture du morceau.
-    fn fixture_json(&self, file: &str, chunk: usize) -> Result<Option<String>> {
-        check_relative(file)?;
+    /// Journalise l'appel (`label`), temporise et applique les échecs simulés ; `files` = fichiers
+    /// concernés par l'appel (délai dépassé si l'un est dans `RKG_MOCK_TIMEOUT_FILES`).
+    fn gate(&self, label: &str, chunk: usize, files: &[&str]) -> Result<()> {
         let n = self.extractions.fetch_add(1, Ordering::SeqCst);
-        self.begin_call(file, chunk)?;
-        if self.opts.timeout_files.iter().any(|f| f == file) {
+        self.begin_call(label, chunk)?;
+        if let Some(file) = files
+            .iter()
+            .find(|f| self.opts.timeout_files.iter().any(|t| t == *f))
+        {
             return Err(Error::Timeout(format!(
                 "délai dépassé (LLM simulé) pour {file} (RKG_MOCK_TIMEOUT_FILES)"
             )));
@@ -148,6 +153,13 @@ impl MockLlm {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Journalise l'appel, applique les échecs simulés et lit la fixture du morceau.
+    fn fixture_json(&self, file: &str, chunk: usize) -> Result<Option<String>> {
+        check_relative(file)?;
+        self.gate(file, chunk, &[file])?;
         let by_chunk = self.read_fixture(&format!("{file}.{chunk}.json"))?;
         let json = match by_chunk {
             Some(j) => Some(j),
@@ -196,11 +208,38 @@ impl Llm for MockLlm {
         }
     }
 
-    fn enrich_lot(&self, _items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
-        // Provisoire : remplacé en T-052.
-        Err(Error::Message(
-            "enrich_lot : non implémenté pour le LLM simulé".into(),
-        ))
+    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+        for it in items {
+            check_relative(&it.file)?;
+        }
+        let files: Vec<&str> = items.iter().map(|it| it.file.as_str()).collect();
+        self.gate(&files.join(";"), 1, &files)?;
+        let mut entries = Vec::with_capacity(items.len());
+        for it in items {
+            let json = match self.read_fixture(&format!("{}.1.json", it.file))? {
+                Some(j) => Some(j),
+                None => self.read_fixture(&format!("{}.json", it.file))?,
+            };
+            let (summaries, concepts) = match json {
+                None => (Value::Array(vec![]), Value::Array(vec![])),
+                Some(j) => {
+                    // Même analyse stricte que `enrich` (version 2, champs inconnus refusés).
+                    Enrichment::parse(&j, &it.file, &it.node_ids)?;
+                    let v: Value = serde_json::from_str(&j).map_err(|e| {
+                        Error::Message(format!("fixture mock de {} illisible : {e}", it.file))
+                    })?;
+                    (
+                        v.get("summaries").cloned().unwrap_or(Value::Null),
+                        v.get("concepts").cloned().unwrap_or(Value::Null),
+                    )
+                }
+            };
+            entries.push(serde_json::json!({
+                "file": it.file, "summaries": summaries, "concepts": concepts
+            }));
+        }
+        let reply = serde_json::json!({ "version": 3, "files": entries }).to_string();
+        Ok(parse_lot(&reply, items)?.into_results())
     }
 
     fn ask(&self, _question: &str, _context: &str) -> Result<AskReply> {

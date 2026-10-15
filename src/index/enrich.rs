@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use crate::chunk;
 use crate::error::{warn, Error, Result};
-use crate::index::build::BuildReport;
-use crate::llm::{Enrichment, Llm};
+use crate::index::build::{BuildReport, IndexOptions};
+use crate::llm::{Enrichment, Llm, LotItem};
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
 use crate::store::Store;
 use crate::trace;
@@ -69,6 +69,133 @@ impl Policy {
 enum Outcome {
     Done(FileRecord, Enrichment),
     Failed(String, Error),
+}
+
+/// Unité de travail d'un fil : un lot de fichiers envoyés ensemble, ou un gros fichier envoyé
+/// seul en morceaux (REQ-027).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unit<'a> {
+    Lot(Vec<&'a FileRecord>),
+    Big(&'a FileRecord),
+}
+
+impl Unit<'_> {
+    fn file_count(&self) -> usize {
+        match self {
+            Unit::Lot(v) => v.len(),
+            Unit::Big(_) => 1,
+        }
+    }
+}
+
+/// Forme les unités dans l'ordre des fichiers : un lot compte au plus `batch_files` fichiers et
+/// au plus `max_chunk_chars` octets au total ; un fichier plus gros que `max_chunk_chars` forme
+/// une unité `Big` et coupe le lot en cours.
+pub(crate) fn form_units(
+    files: &[FileRecord],
+    batch_files: usize,
+    max_chunk_chars: usize,
+) -> Vec<Unit<'_>> {
+    let batch_files = batch_files.max(1);
+    let mut units = Vec::new();
+    let mut current: Vec<&FileRecord> = Vec::new();
+    let mut total = 0u64;
+    for f in files {
+        if f.size > max_chunk_chars as u64 {
+            if !current.is_empty() {
+                units.push(Unit::Lot(std::mem::take(&mut current)));
+                total = 0;
+            }
+            units.push(Unit::Big(f));
+            continue;
+        }
+        if !current.is_empty()
+            && (current.len() >= batch_files || total + f.size > max_chunk_chars as u64)
+        {
+            units.push(Unit::Lot(std::mem::take(&mut current)));
+            total = 0;
+        }
+        total += f.size;
+        current.push(f);
+    }
+    if !current.is_empty() {
+        units.push(Unit::Lot(current));
+    }
+    units
+}
+
+/// Enrichit une unité : un résultat par fichier, et l'erreur de l'appel (pour la politique) s'il
+/// y a eu un appel. Un fichier illisible échoue seul et sort du lot.
+fn run_unit(
+    unit: &Unit<'_>,
+    repo: &Path,
+    max_chunk_chars: usize,
+    llm: &dyn Llm,
+    ids: &HashMap<String, Vec<String>>,
+) -> (Vec<Outcome>, Option<Option<Error>>) {
+    let files: Vec<&FileRecord> = match unit {
+        Unit::Lot(v) => v.clone(),
+        Unit::Big(f) => vec![*f],
+    };
+    let mut outcomes = Vec::new();
+    let mut readable: Vec<(&FileRecord, String)> = Vec::new();
+    for f in files {
+        match std::fs::read_to_string(repo.join(&f.path)) {
+            Ok(t) => readable.push((f, t)),
+            Err(e) => outcomes.push(Outcome::Failed(
+                f.path.clone(),
+                Error::Message(format!("lecture de {} impossible : {e}", f.path)),
+            )),
+        }
+    }
+    let node_ids =
+        |f: &FileRecord| -> Vec<String> { ids.get(&f.path).cloned().unwrap_or_default() };
+    match readable.len() {
+        0 => (outcomes, None),
+        1 => {
+            let (f, text) = &readable[0];
+            let r = enrich_chunks(llm, &f.path, text, max_chunk_chars, &node_ids(f));
+            let err = r.as_ref().err().cloned();
+            outcomes.push(match r {
+                Ok(x) => Outcome::Done((*f).clone(), x),
+                Err(e) => Outcome::Failed(f.path.clone(), e),
+            });
+            (outcomes, Some(err))
+        }
+        _ => {
+            let items: Vec<LotItem> = readable
+                .iter()
+                .map(|(f, t)| LotItem {
+                    file: f.path.clone(),
+                    text: t.clone(),
+                    node_ids: node_ids(f),
+                })
+                .collect();
+            match llm.enrich_lot(&items) {
+                Err(e) => {
+                    for (f, _) in &readable {
+                        outcomes.push(Outcome::Failed(f.path.clone(), e.clone()));
+                    }
+                    (outcomes, Some(Some(e)))
+                }
+                Ok(results) => {
+                    let mut by_path: HashMap<String, Result<Enrichment>> =
+                        results.into_iter().collect();
+                    for (f, _) in &readable {
+                        outcomes.push(match by_path.remove(&f.path) {
+                            Some(Ok(x)) => Outcome::Done((*f).clone(), x),
+                            Some(Err(e)) => Outcome::Failed(f.path.clone(), e),
+                            None => Outcome::Failed(
+                                f.path.clone(),
+                                Error::Message(format!("{} : absent de la réponse du lot", f.path)),
+                            ),
+                        });
+                    }
+                    (outcomes, Some(None))
+                }
+            }
+        }
+    }
 }
 
 /// Détail d'un échec pour la trace. Pour `Error::Message`, seul le libellé fixe (avant le
@@ -177,25 +304,34 @@ fn concept_records(e: &Enrichment) -> (Vec<Node>, Vec<Ref>) {
     (nodes, refs)
 }
 
+fn queue_len(queue: &Mutex<VecDeque<Unit>>) -> usize {
+    queue.lock().unwrap_or_else(|p| p.into_inner()).len()
+}
+
 /// Pool de threads LLM ; le thread courant écrit une transaction par fichier.
 pub(crate) fn enrich_all(
     repo: &Path,
     files: &[FileRecord],
-    concurrency: usize,
-    max_chunk_chars: usize,
+    opts: &IndexOptions,
     llm: &dyn Llm,
     store: &mut Store,
     report: &mut BuildReport,
 ) -> Result<()> {
+    let IndexOptions {
+        concurrency,
+        max_chunk_chars,
+        batch_files,
+    } = *opts;
     let ids = node_ids_by_file(store)?;
     let started = Instant::now();
     let failed_before = report.failed;
     let mut succeeded = 0usize;
-    let queue: Mutex<VecDeque<&FileRecord>> = Mutex::new(files.iter().collect());
+    let units = form_units(files, batch_files, max_chunk_chars);
+    let queue: Mutex<VecDeque<Unit>> = Mutex::new(units.into());
     let stop = AtomicBool::new(false);
     let policy = Mutex::new(Policy::default());
     let (tx, rx) = mpsc::channel::<Outcome>();
-    let workers = concurrency.clamp(1, files.len().max(1));
+    let workers = concurrency.clamp(1, queue_len(&queue).max(1));
     let mut write_error: Option<Error> = None;
     trace!(
         "enrichissement: début {} fichiers, {workers} fils",
@@ -213,31 +349,19 @@ pub(crate) fn enrich_all(
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let Some(file) = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front() else {
+                let Some(unit) = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front() else {
                     break;
                 };
                 let ticket = policy.lock().unwrap_or_else(|p| p.into_inner()).dispatch();
-                let node_ids: &[String] = ids.get(&file.path).map_or(&[], Vec::as_slice);
-                let outcome = match std::fs::read_to_string(repo.join(&file.path)) {
-                    Err(e) => Outcome::Failed(
-                        file.path.clone(),
-                        Error::Message(format!("lecture de {} impossible : {e}", file.path)),
-                    ),
-                    Ok(text) => {
-                        match enrich_chunks(llm, &file.path, &text, max_chunk_chars, node_ids) {
-                            Ok(x) => Outcome::Done(file.clone(), x),
-                            Err(e) => Outcome::Failed(file.path.clone(), e),
-                        }
-                    }
-                };
-                let error = match &outcome {
-                    Outcome::Failed(_, e) => Some(e),
-                    Outcome::Done(..) => None,
-                };
+                let (outcomes, call) = run_unit(&unit, repo, max_chunk_chars, llm, ids);
+                let error = call.as_ref().and_then(|e| e.as_ref());
                 let halt = {
                     let mut guard = policy.lock().unwrap_or_else(|p| p.into_inner());
                     let was_stopped = guard.stop_cause.is_some();
-                    let halt = guard.record(ticket, error);
+                    let halt = match call {
+                        Some(_) => guard.record(ticket, error),
+                        None => guard.stop_cause.is_some(),
+                    };
                     if trace::enabled() {
                         if matches!(error, Some(Error::Network(_))) {
                             trace!(
@@ -246,7 +370,12 @@ pub(crate) fn enrich_all(
                             );
                         }
                         if halt && !was_stopped {
-                            let left = queue.lock().unwrap_or_else(|p| p.into_inner()).len();
+                            let left: usize = queue
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .iter()
+                                .map(Unit::file_count)
+                                .sum();
                             trace!(
                                 "politique: arrêt de l'envoi ({}), {left} fichiers non envoyés",
                                 guard.stop_cause.as_deref().unwrap_or("")
@@ -258,7 +387,7 @@ pub(crate) fn enrich_all(
                 if halt {
                     stop.store(true, Ordering::SeqCst);
                 }
-                if tx.send(outcome).is_err() {
+                if outcomes.into_iter().any(|o| tx.send(o).is_err()) {
                     break;
                 }
             });
@@ -316,6 +445,64 @@ pub(crate) fn enrich_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(path: &str, size: u64) -> FileRecord {
+        FileRecord {
+            path: path.into(),
+            hash: String::new(),
+            size,
+            mtime: 0,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        }
+    }
+
+    fn shape(units: &[Unit]) -> Vec<String> {
+        units
+            .iter()
+            .map(|u| match u {
+                Unit::Lot(v) => v
+                    .iter()
+                    .map(|f| f.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                Unit::Big(f) => format!("BIG:{}", f.path),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn req027_form_units_count_bound_and_order() {
+        let files: Vec<_> = (0..10).map(|i| rec(&format!("f{i}"), 10)).collect();
+        let u = form_units(&files, 4, 1000);
+        assert_eq!(shape(&u), ["f0,f1,f2,f3", "f4,f5,f6,f7", "f8,f9"]);
+    }
+
+    #[test]
+    fn req027_form_units_size_bound_and_big_isolated() {
+        let files = vec![
+            rec("a", 40),
+            rec("b", 40),
+            rec("c", 40),
+            rec("big", 500),
+            rec("d", 5),
+        ];
+        let u = form_units(&files, 8, 100);
+        assert_eq!(shape(&u), ["a,b", "c", "BIG:big", "d"]);
+    }
+
+    #[test]
+    fn req027_form_units_batch_one_is_one_file_per_unit() {
+        let files: Vec<_> = (0..3).map(|i| rec(&format!("f{i}"), 1)).collect();
+        assert_eq!(shape(&form_units(&files, 1, 100)), ["f0", "f1", "f2"]);
+        assert!(form_units(&[], 4, 100).is_empty());
+    }
+
+    #[test]
+    fn req027_form_units_exact_fit() {
+        let files = vec![rec("a", 50), rec("b", 50), rec("c", 100)];
+        assert_eq!(shape(&form_units(&files, 4, 100)), ["a,b", "c"]);
+    }
 
     fn net() -> Error {
         Error::Network("réseau".into())
