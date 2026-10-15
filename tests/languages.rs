@@ -58,7 +58,7 @@ impl Env {
     }
 
     fn export(&self) -> Value {
-        let out = self.cmd(&["export"]);
+        let out = self.cmd(&["export", "--output", "-"]);
         assert!(out.status.success(), "{}", text(&out.stderr));
         serde_json::from_slice(&out.stdout).unwrap()
     }

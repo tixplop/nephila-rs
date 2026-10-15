@@ -78,6 +78,20 @@ impl Env {
             .unwrap()
     }
 
+    /// Comme `read`, depuis le dossier courant `cwd`.
+    fn read_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        Command::new(cargo_bin("rkg"))
+            .current_dir(cwd)
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("RKG_CONFIG", self.repo.join("absent.toml"))
+            .env_remove("RKG_MOCK_DIR")
+            .env_remove("RKG_MOCK_LOG")
+            .output()
+            .unwrap()
+    }
+
     fn json(&self, args: &[&str]) -> Value {
         let out = self.read(args);
         assert!(out.status.success(), "{}", text(&out.stderr));
@@ -123,7 +137,7 @@ fn req019_ac1_summary_lists_modules_dependencies_nodes_and_themes() {
     assert_eq!(dep("core"), vec!["dependency:org.slf4j:slf4j-api"]);
 
     // Les 10 nœuds de plus haut degré, vérifiés contre l'export.
-    let export = env.json(&["export"]);
+    let export = env.json(&["export", "--output", "-"]);
     let mut degree = std::collections::HashMap::<String, u64>::new();
     for e in export["edges"].as_array().unwrap() {
         *degree
@@ -201,7 +215,7 @@ fn req019_ac4_summary_without_graph_invites_to_build() {
 #[test]
 fn req018_ac1_export_contains_all_nodes_and_edges() {
     let env = Env::built();
-    let v = env.json(&["export"]);
+    let v = env.json(&["export", "--output", "-"]);
     assert_eq!(v["version"], 1);
     let nodes = v["nodes"].as_array().unwrap();
     let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
@@ -233,15 +247,112 @@ fn req018_ac1_export_contains_all_nodes_and_edges() {
 }
 
 #[test]
-fn req018_ac2_output_file_has_same_content_and_stdout_is_empty() {
+fn req018_ac2_output_file_has_same_content_and_stdout_is_its_path() {
     let env = Env::built();
-    let expected = env.json(&["export"]);
-    let target = env.repo.join("out.json");
-    let out = env.read(&["export", "--output", target.to_str().unwrap()]);
+    let expected = env.json(&["export", "--output", "-"]);
+    let cwd = tempfile::tempdir().unwrap();
+    let out = env.read_in(cwd.path(), &["export", "--output", "f.json"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(out.stdout.is_empty());
-    let got: Value = serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+    assert_eq!(text(&out.stdout), "f.json\n");
+    let got: Value = serde_json::from_slice(&fs::read(cwd.path().join("f.json")).unwrap()).unwrap();
     assert_eq!(got, expected);
+}
+
+#[test]
+fn req018_ac1_default_output_is_slug_json_in_current_dir() {
+    let env = Env::built();
+    let expected = env.json(&["export", "--output", "-"]);
+    let cwd = tempfile::tempdir().unwrap();
+    let out = env.read_in(cwd.path(), &["export"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "repo.json\n");
+    let got: Value =
+        serde_json::from_slice(&fs::read(cwd.path().join("repo.json")).unwrap()).unwrap();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn req018_ac5_slug_file_from_another_dir_and_replaced_after_update() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("Repo_Knowledge.Graph");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        repo.join("Main.java"),
+        "package p;\npublic class A { void m() {} }\n",
+    )
+    .unwrap();
+    let rkg = |cwd: &Path, args: &[&str]| {
+        Command::new(cargo_bin("rkg"))
+            .current_dir(cwd)
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env("RKG_CONFIG", tmp.path().join("absent.toml"))
+            .env_remove("RKG_MOCK_DIR")
+            .env_remove("RKG_MOCK_LOG")
+            .output()
+            .unwrap()
+    };
+    let out = rkg(tmp.path(), &["build", "--no-llm"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let before: Vec<_> = fs::read_dir(&repo)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let work = tmp.path().join("out");
+    fs::create_dir_all(&work).unwrap();
+    let out = rkg(&work, &["export"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "repo-knowledge-graph.json\n");
+    let file = work.join("repo-knowledge-graph.json");
+    let stdout = rkg(&work, &["export", "--output", "-"]);
+    assert_eq!(fs::read(&file).unwrap(), stdout.stdout);
+    let after: Vec<_> = fs::read_dir(&repo)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+    // Après un update, le fichier est remplacé.
+    fs::write(repo.join("B.java"), "package p;\npublic class Bee {}\n").unwrap();
+    let out = rkg(&work, &["update", "--no-llm"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!fs::read_to_string(&file).unwrap().contains("Bee"));
+    let out = rkg(&work, &["export"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(fs::read_to_string(&file).unwrap().contains("Bee"));
+}
+
+#[test]
+fn req018_ac6_default_file_without_dash_c_and_from_subdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("monrepo");
+    fs::create_dir_all(repo.join("sub")).unwrap();
+    fs::write(repo.join("A.java"), "package p;\npublic class A {}\n").unwrap();
+    let run = |cwd: &Path, args: &[&str]| {
+        let out = Command::new(cargo_bin("rkg"))
+            .current_dir(cwd)
+            .args(args)
+            .env("RKG_CONFIG", tmp.path().join("absent.toml"))
+            .env_remove("RKG_MOCK_DIR")
+            .env_remove("RKG_MOCK_LOG")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?} {}", text(&out.stderr));
+        out
+    };
+    run(&repo, &["build", "--no-llm"]);
+    let out = run(&repo, &["export"]);
+    assert_eq!(text(&out.stdout), "monrepo.json\n");
+    assert!(repo.join("monrepo.json").is_file());
+    let out = run(&repo.join("sub"), &["-C", "..", "export"]);
+    assert_eq!(text(&out.stdout), "monrepo.json\n");
+    assert!(repo.join("sub/monrepo.json").is_file());
+    let out = run(&repo, &["status"]);
+    assert!(
+        text(&out.stdout).starts_with("graphe à jour"),
+        "{}",
+        text(&out.stdout)
+    );
 }
 
 #[test]
@@ -273,7 +384,7 @@ fn req018_ac3_unresolved_references_are_exported() {
     )
     .unwrap();
     env.build();
-    let v = env.json(&["export"]);
+    let v = env.json(&["export", "--output", "-"]);
     let un = v["unresolved"].as_array().unwrap();
     assert_eq!(un.len(), 1, "{un:?}");
     assert_eq!(un[0]["source"], "method:com.acme.core.OrderService.place");
@@ -284,12 +395,13 @@ fn req018_ac3_unresolved_references_are_exported() {
 #[test]
 fn req018_ac4_export_without_graph_invites_to_build() {
     let env = Env::new();
-    let target = env.repo.join("out.json");
+    let cwd = tempfile::tempdir().unwrap();
     for args in [
         vec!["export"],
-        vec!["export", "--output", target.to_str().unwrap()],
+        vec!["export", "--output", "-"],
+        vec!["export", "--output", "out.json"],
     ] {
-        let out = env.read(&args);
+        let out = env.read_in(cwd.path(), &args);
         assert!(!out.status.success());
         assert!(
             text(&out.stderr).contains("rkg build"),
@@ -298,7 +410,8 @@ fn req018_ac4_export_without_graph_invites_to_build() {
         );
         assert!(out.stdout.is_empty());
     }
-    assert!(!target.exists());
+    assert_eq!(fs::read_dir(cwd.path()).unwrap().count(), 0);
+    assert!(!env.repo.join(".rkg").exists());
 }
 
 #[test]
@@ -308,7 +421,7 @@ fn req001_ac4_summary_and_export_make_no_llm_call() {
     assert!(!before.is_empty());
     assert!(env.read(&["summary"]).status.success());
     assert!(env.read(&["summary", "--json"]).status.success());
-    assert!(env.read(&["export"]).status.success());
+    assert!(env.read(&["export", "--output", "-"]).status.success());
     // Même avec un journal actif et une configuration invalide, aucun appel n'est fait.
     let out = Command::new(cargo_bin("rkg"))
         .arg("-C")
@@ -441,7 +554,7 @@ fn req008_ac7_candidate_mentions_are_not_unresolved_and_link_after_update() {
     env.write(NOTES, "# Notes\n\nVoir `Inexistant` et `config.toml`.\n");
     let out = env.write_cmd(&["build"]);
     let bilan = text(&out.stdout);
-    let v = env.json(&["export"]);
+    let v = env.json(&["export", "--output", "-"]);
     let n = v["unresolved"].as_array().unwrap().len();
     assert!(
         bilan.contains(&format!("{n} références non résolues")),
@@ -470,7 +583,7 @@ fn req008_ac7_candidate_mentions_are_not_unresolved_and_link_after_update() {
         "{}",
         text(&upd.stdout)
     );
-    let v = env.json(&["export"]);
+    let v = env.json(&["export", "--output", "-"]);
     assert!(linked(&v), "lien mentions absent");
     assert!(mentions_in(&v).is_empty());
     let new_log: Vec<String> = env.log().lines().skip(before).map(String::from).collect();
@@ -497,7 +610,7 @@ fn req023_ac4_only_backticked_mentions_outside_code_blocks_after_a_title() {
          OrderService sans backticks.\n\n```\nOrderService\n`OrderService`\n```\n",
     );
     env.write_cmd(&["build", "--no-llm"]);
-    let v = env.json(&["export"]);
+    let v = env.json(&["export", "--output", "-"]);
     assert!(
         v["nodes"]
             .as_array()
@@ -524,7 +637,7 @@ fn req023_ac5_duplicate_titles_get_numbered_section_ids() {
         "# Doc\n\n## Exemple\n\npremier\n\n## Exemple\n\nsecond\n",
     );
     env.write_cmd(&["build", "--no-llm"]);
-    let v = env.json(&["export"]);
+    let v = env.json(&["export", "--output", "-"]);
     let ids: Vec<&str> = v["nodes"]
         .as_array()
         .unwrap()

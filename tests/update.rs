@@ -98,6 +98,17 @@ impl Env {
         out
     }
 
+    /// `export --output -` : le JSON sur stdout.
+    fn export_stdout(&self) -> Output {
+        let out = self
+            .command("export", &[])
+            .args(["--output", "-"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "export : {}", stderr(&out));
+        out
+    }
+
     fn store(&self) -> Store {
         Store::open_readonly(&self.repo).unwrap()
     }
@@ -407,7 +418,7 @@ fn req008_ac3_renamed_method_unlinks_a_and_reference_is_unresolved() {
     env.clear_log();
     env.ok("update");
     assert!(!env.has_edge("method:A.m", EdgeKind::Calls, "method:B.foo"));
-    let out = env.ok("export");
+    let out = env.export_stdout();
     assert!(stdout(&out).contains("B.foo"), "{}", stdout(&out));
     let unresolved = rkg::resolve::unresolved(&env.store()).unwrap();
     assert!(unresolved.iter().any(|r| r.target_name == "B.foo"));
@@ -736,7 +747,7 @@ fn req008_ac6_removed_dependency_node_disappears_after_update() {
     env.write("core/pom.xml", &format!("{}{}", &pom[..start], &pom[end..]));
     env.ok("update");
     assert!(!env.node_ids().contains(dep));
-    let out = env.ok("export");
+    let out = env.export_stdout();
     let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert!(!v["unresolved"].to_string().contains("slf4j"));
 }

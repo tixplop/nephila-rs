@@ -567,7 +567,11 @@ fn req024_ac3_summaries_concepts_visible_and_structure_unchanged() {
         stdout(&out),
         stderr(&out)
     );
-    let ex = env.cmd().arg("export").output().unwrap();
+    let ex = env
+        .cmd()
+        .args(["export", "--output", "-"])
+        .output()
+        .unwrap();
     assert!(stdout(&ex).contains("Place les commandes."));
     let c = env.node("concept:facturation");
     assert_eq!(c.kind, NodeKind::Concept);
@@ -744,7 +748,11 @@ fn req023_ac1_ac2_ac3_sections_links_and_method_mentions_end_to_end() {
         .filter(|e| e.kind == EdgeKind::Mentions && e.source == "section:docs/archi.md#détails")
         .count();
     assert_eq!(mentions, 1);
-    let ex = env.cmd().arg("export").output().unwrap();
+    let ex = env
+        .cmd()
+        .args(["export", "--output", "-"])
+        .output()
+        .unwrap();
     let v: serde_json::Value = serde_json::from_str(&stdout(&ex)).unwrap();
     let unresolved = v["unresolved"].as_array().unwrap();
     assert!(
@@ -776,7 +784,11 @@ fn req022_ac1_ac2_module_dependencies_and_short_name_in_export() {
         EdgeKind::DependsOn,
         "dependency:org.slf4j:slf4j-api"
     ));
-    let ex = env.cmd().arg("export").output().unwrap();
+    let ex = env
+        .cmd()
+        .args(["export", "--output", "-"])
+        .output()
+        .unwrap();
     let v: serde_json::Value = serde_json::from_str(&stdout(&ex)).unwrap();
     let api = v["nodes"]
         .as_array()

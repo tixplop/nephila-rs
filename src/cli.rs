@@ -44,7 +44,7 @@ pub enum Command {
     Query(Query),
     /// Exporte le graphe
     Export {
-        /// Fichier de sortie (stdout par défaut)
+        /// Fichier de sortie (défaut : <slug>.json dans le dossier courant ; - pour stdout)
         #[arg(long)]
         output: Option<PathBuf>,
     },

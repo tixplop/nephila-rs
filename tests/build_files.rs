@@ -61,7 +61,7 @@ impl Env {
     }
 
     fn export(&self) -> Value {
-        serde_json::from_slice(&self.ok(&["export"]).stdout).unwrap()
+        serde_json::from_slice(&self.ok(&["export", "--output", "-"]).stdout).unwrap()
     }
 
     fn write(&self, rel: &str, content: &str) {
@@ -240,7 +240,7 @@ fn req001_ac4_and_req017_on_gradle_repo_without_llm_configuration() {
         vec!["query", "neighbors", "type:com.acme.api.Api"],
         vec!["status"],
         vec!["summary"],
-        vec!["export"],
+        vec!["export", "--output", "-"],
     ] {
         let out = env.ok(&args);
         assert!(!text(&out.stderr).contains("pas à jour"), "{args:?}");
@@ -310,10 +310,10 @@ fn req022_ac10_root_module_named_after_folder_without_dash_c() {
     fs::write(repo.join("build.gradle"), script).unwrap();
 
     rkg_in(&repo, &["build"]);
-    assert_monrepo_module(&repo, &["export"]);
+    assert_monrepo_module(&repo, &["export", "--output", "-"]);
 
     rkg_in(&repo.join("sub"), &["-C", "..", "build"]);
-    assert_monrepo_module(&repo, &["export"]);
+    assert_monrepo_module(&repo, &["export", "--output", "-"]);
 
     fs::write(
         repo.join("build.gradle"),
@@ -321,5 +321,5 @@ fn req022_ac10_root_module_named_after_folder_without_dash_c() {
     )
     .unwrap();
     rkg_in(&repo, &["update"]);
-    assert_monrepo_module(&repo, &["export"]);
+    assert_monrepo_module(&repo, &["export", "--output", "-"]);
 }
