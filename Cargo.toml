@@ -21,6 +21,13 @@ blake3 = "1"
 ignore = "0.4"
 libc = "0.2"
 ureq = "2"
+tree-sitter = "0.27"
+tree-sitter-java = "0.23"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-scala = "0.26"
+pulldown-cmark = { version = "0.13", default-features = false }
+quick-xml = "0.42"
+tree-sitter-groovy = "0.1"
 
 [dev-dependencies]
 assert_cmd = "2"
