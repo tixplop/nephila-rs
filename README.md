@@ -2,7 +2,7 @@
 
 `rkg` analyse un dépôt (Java, Kotlin, Groovy, Scala, fichiers de build Maven/Gradle/Ivy, Markdown), stocke le résultat dans un graphe SQLite local (nœuds : modules, types, méthodes, documents... ; liens : `contains`, `calls`...) et permet de l'interroger sans LLM, sauf pour `query ask`.
 
-Depuis la version 0.4.0, `rkg export --format html` produit une page d'exploration autonome, et `rkg export` écrit désormais dans un fichier (voir `rkg export`).
+Depuis la version 0.4.0, `rkg export --format html` produit une page d'exploration autonome, et `rkg export` écrit désormais dans un fichier (voir `rkg export`). La version 0.5.0 ajoute l'option `-v/--verbose` à `build` et `update` (traces sur stderr).
 
 Depuis la version 0.3.0, la structure du graphe vient d'une analyse syntaxique locale, sans LLM. Le LLM est facultatif : il ne sert qu'à enrichir le graphe (résumés des nœuds, concepts des documents Markdown) et à répondre à `query ask`. Sans configuration, ou avec `--no-llm`, `build` et `update` produisent la structure seule.
 
@@ -202,6 +202,19 @@ Le JSON contient `version`, `nodes`, `edges` et `unresolved`. Le format `html` p
 - **Extension** : double-clic ou bouton « Étendre » ajoute les voisins directs. Plafond de 300 nœuds : les voisins de plus haut degré sont retenus et « N voisins non affichés » est indiqué.
 - **Filtres** : une case par genre de nœud et par genre de lien. Bouton « Vue initiale » pour revenir au départ.
 - Déplacement, zoom, glisser un nœud ; l'en-tête donne le slug et le nombre de nœuds et de liens.
+
+### Option `-v, --verbose` (`build` et `update`)
+Écrit sur stderr des traces synthétiques, une ligne par événement, préfixées `trace:` avec le temps écoulé : `trace: [<s>.<mmm>s] <événement>`. Combinable avec `--no-llm`. stdout est inchangé : `rkg build -v 2>trace.log` garde le bilan lisible. Sans l'option, aucune ligne `trace:`.
+
+Événements : `config` (fournisseur, modèle, concurrency, timeout_secs, max_chunk_chars, ou `llm inactif`), `verify_key` (résultat, durée), `parcours` (nombre de fichiers ; pour `update` : ajoutés, modifiés, supprimés, en attente), début et fin des phases (structure, résolution, enrichissement) avec fils et durée, départ et fin de chaque appel LLM (`llm enrich départ` / `llm enrich fin`, résultat `ok`, `délai dépassé`, `réseau`, `clé refusée` ou `erreur`, durée en ms, message tronqué à 120 caractères), et décisions de politique (erreurs réseau consécutives, arrêt de l'envoi). Exemple de lignes (forme, valeurs indicatives) :
+```
+trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
+trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts) 19 ms
+trace: [1.040s] llm enrich fin docs/guide.md [1/1] délai dépassé 1003 ms : délai dépassé avec openai sur https://api.openai.com/v1/chat/completions ; augmentez timeout_secs
+trace: [1.052s] llm enrich fin src/shop/Cart.java [1/1] clé refusée 11 ms : clé d'API refusée par openai (HTTP 401) ; vérifiez la variable désignée par api_key_env
+trace: [1.053s] politique: arrêt de l'envoi (clé d'API refusée par le fournisseur), 3 fichiers non envoyés
+```
+Les traces ne contiennent jamais de contenu de fichier, de prompt ou de réponse du LLM, ni de clé d'API.
 
 `status`, `query` (hors `ask`), `summary` et `export` ne font aucun appel LLM et ne demandent aucune configuration. Si le graphe est en retard sur les fichiers, les requêtes l'indiquent par `avertissement: graphe pas à jour : 1 fichier modifié` sur stderr.
 
