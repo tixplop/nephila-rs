@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::chunk;
 use crate::error::{warn, Error, Result};
@@ -13,6 +14,7 @@ use crate::index::build::BuildReport;
 use crate::llm::{Enrichment, Llm};
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
 use crate::store::Store;
+use crate::trace;
 
 /// Nombre d'erreurs réseau consécutives qui arrête l'envoi (DEC-015).
 const MAX_CONSECUTIVE_NETWORK_ERRORS: usize = 3;
@@ -69,6 +71,49 @@ enum Outcome {
     Failed(String, Error),
 }
 
+/// Détail d'un échec pour la trace. Pour `Error::Message`, seul le libellé fixe (avant le
+/// premier « : ») est gardé : le détail serde cite des valeurs et des noms de champs de la réponse.
+fn trace_detail(e: &Error) -> String {
+    match e {
+        Error::Message(m) => m.split(" : ").next().unwrap_or("").to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Un appel `llm.enrich` encadré de ses traces de départ et de fin (jamais de contenu).
+fn traced_enrich(
+    llm: &dyn Llm,
+    path: &str,
+    index: usize,
+    total: usize,
+    text: &str,
+    node_ids: &[String],
+) -> Result<Enrichment> {
+    if !trace::enabled() {
+        return llm.enrich(path, index, text, node_ids);
+    }
+    trace!(
+        "llm enrich départ {path} [{index}/{total}] {} car.",
+        text.chars().count()
+    );
+    let started = Instant::now();
+    let result = llm.enrich(path, index, text, node_ids);
+    let ms = started.elapsed().as_millis();
+    match &result {
+        Ok(x) => trace!(
+            "llm enrich fin {path} [{index}/{total}] ok ({} résumés, {} concepts) {ms} ms",
+            x.summaries.len(),
+            x.concepts.len()
+        ),
+        Err(e) => trace!(
+            "llm enrich fin {path} [{index}/{total}] {} {ms} ms : {}",
+            trace::classify(e),
+            trace::short(&trace_detail(e), trace::MAX_MESSAGE_CHARS)
+        ),
+    }
+    result
+}
+
 /// Enrichit un fichier, en plusieurs appels s'il dépasse `max_chunk_chars` ; le premier échec
 /// d'un morceau fait échouer le fichier entier (REQ-007).
 fn enrich_chunks(
@@ -80,11 +125,18 @@ fn enrich_chunks(
 ) -> Result<Enrichment> {
     let parts = chunk::split(text, max_chunk_chars);
     if parts.len() == 1 {
-        return llm.enrich(path, 1, &parts[0], node_ids);
+        return traced_enrich(llm, path, 1, 1, &parts[0], node_ids);
     }
     let mut results = Vec::with_capacity(parts.len());
     for (i, part) in parts.iter().enumerate() {
-        results.push(llm.enrich(path, i + 1, part, node_ids)?);
+        results.push(traced_enrich(
+            llm,
+            path,
+            i + 1,
+            parts.len(),
+            part,
+            node_ids,
+        )?);
     }
     Ok(chunk::merge_enrichments(results))
 }
@@ -136,12 +188,19 @@ pub(crate) fn enrich_all(
     report: &mut BuildReport,
 ) -> Result<()> {
     let ids = node_ids_by_file(store)?;
+    let started = Instant::now();
+    let failed_before = report.failed;
+    let mut succeeded = 0usize;
     let queue: Mutex<VecDeque<&FileRecord>> = Mutex::new(files.iter().collect());
     let stop = AtomicBool::new(false);
     let policy = Mutex::new(Policy::default());
     let (tx, rx) = mpsc::channel::<Outcome>();
     let workers = concurrency.clamp(1, files.len().max(1));
     let mut write_error: Option<Error> = None;
+    trace!(
+        "enrichissement: début {} fichiers, {workers} fils",
+        files.len()
+    );
 
     std::thread::scope(|scope| {
         let queue = &queue;
@@ -175,10 +234,27 @@ pub(crate) fn enrich_all(
                     Outcome::Failed(_, e) => Some(e),
                     Outcome::Done(..) => None,
                 };
-                let halt = policy
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .record(ticket, error);
+                let halt = {
+                    let mut guard = policy.lock().unwrap_or_else(|p| p.into_inner());
+                    let was_stopped = guard.stop_cause.is_some();
+                    let halt = guard.record(ticket, error);
+                    if trace::enabled() {
+                        if matches!(error, Some(Error::Network(_))) {
+                            trace!(
+                                "politique: erreurs réseau consécutives {}/{MAX_CONSECUTIVE_NETWORK_ERRORS}",
+                                guard.consecutive_network
+                            );
+                        }
+                        if halt && !was_stopped {
+                            let left = queue.lock().unwrap_or_else(|p| p.into_inner()).len();
+                            trace!(
+                                "politique: arrêt de l'envoi ({}), {left} fichiers non envoyés",
+                                guard.stop_cause.as_deref().unwrap_or("")
+                            );
+                        }
+                    }
+                    halt
+                };
                 if halt {
                     stop.store(true, Ordering::SeqCst);
                 }
@@ -198,6 +274,7 @@ pub(crate) fn enrich_all(
                     if write_error.is_some() {
                         continue;
                     }
+                    succeeded += 1;
                     if !x.rejected.is_empty() {
                         warn(&format!(
                             "{} : {} élément(s) d'enrichissement écarté(s) : {}",
@@ -221,6 +298,11 @@ pub(crate) fn enrich_all(
             }
         }
     });
+    trace!(
+        "enrichissement: fin {} ms, {succeeded} enrichis, {} en échec",
+        started.elapsed().as_millis(),
+        report.failed - failed_before
+    );
     report.stop_cause = policy
         .into_inner()
         .unwrap_or_else(|p| p.into_inner())
