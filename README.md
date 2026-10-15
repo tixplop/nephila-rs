@@ -2,6 +2,8 @@
 
 `rkg` analyse un dépôt (Java, Kotlin, Groovy, Scala, fichiers de build Maven/Gradle/Ivy, Markdown), stocke le résultat dans un graphe SQLite local (nœuds : modules, types, méthodes, documents... ; liens : `contains`, `calls`...) et permet de l'interroger sans LLM, sauf pour `query ask`.
 
+Depuis la version 0.4.0, `rkg export --format html` produit une page d'exploration autonome, et `rkg export` écrit désormais dans un fichier (voir `rkg export`).
+
 Depuis la version 0.3.0, la structure du graphe vient d'une analyse syntaxique locale, sans LLM. Le LLM est facultatif : il ne sert qu'à enrichir le graphe (résumés des nœuds, concepts des documents Markdown) et à répondre à `query ask`. Sans configuration, ou avec `--no-llm`, `build` et `update` produisent la structure seule.
 
 ## Installation
@@ -179,8 +181,27 @@ Nœuds les plus reliés
   ...
 ```
 
-### `rkg export [--output fichier]`
-Exporte le graphe en JSON (`version`, `nodes`, `edges`, `unresolved`) sur stdout ou dans le fichier.
+### `rkg export [--format json|html] [--output fichier|-]`
+Sans `--output`, l'export est écrit dans le dossier courant (pas dans le dépôt analysé) : `<slug>.json` (format `json`, par défaut) ou `<slug>.html` (format `html`). Le slug est le dernier composant du chemin canonique de `-C`, en minuscules ASCII, chaque suite de caractères hors `[a-z0-9]` devenant un seul `-` (`Mon Dépôt_2` donne `mon-d-p-t-2`) ; s'il est vide, `graphe`. Un fichier existant est remplacé. Quand un fichier est écrit, stdout contient seulement son chemin, ce qui permet `xdg-open "$(rkg export --format html)"`. Les fichiers `.json` et `.html` ne sont pas analysés : un export écrit dans le dépôt ne change ni le graphe ni `status`.
+
+```
+$ rkg -C repo export
+repo.json
+$ rkg export --output graphe.json
+graphe.json
+$ rkg export --output - | jq '.nodes | length'
+```
+
+**Rupture (0.4.0)** : `rkg export` sans option n'écrit plus le JSON sur stdout. Pour l'ancien comportement, utilisez `--output -`.
+
+Le JSON contient `version`, `nodes`, `edges` et `unresolved`. Le format `html` produit une page autonome, utilisable hors ligne (`file://`) : CSS et JS embarqués, aucune ressource externe. Elle n'affiche jamais tout le graphe, mais une vue partielle que l'on étend :
+
+- **Vue initiale** : au plus 100 modules, ceux de plus haut degré (liens entrants et sortants), avec les liens entre eux, et « N modules non affichés » s'il y en a d'écartés ; sans module, les 100 nœuds de plus haut degré.
+- **Recherche** : sous-chaîne du nom court ou qualifié, sans casse, 20 résultats au plus (nom court exact, puis préfixe, puis le reste) ; choisir un résultat affiche le nœud et ses voisins directs.
+- **Détails** : un clic sur un nœud ouvre un panneau (genre, sous-genre, nom qualifié, fichier, résumé, liens sortants et entrants par genre de lien, cliquables). Naviguer vers un nœud non affiché l'ajoute à la vue s'il reste de la place ; si la vue est pleine, elle est remplacée par ce nœud et ses voisins.
+- **Extension** : double-clic ou bouton « Étendre » ajoute les voisins directs. Plafond de 300 nœuds : les voisins de plus haut degré sont retenus et « N voisins non affichés » est indiqué.
+- **Filtres** : une case par genre de nœud et par genre de lien. Bouton « Vue initiale » pour revenir au départ.
+- Déplacement, zoom, glisser un nœud ; l'en-tête donne le slug et le nombre de nœuds et de liens.
 
 `status`, `query` (hors `ask`), `summary` et `export` ne font aucun appel LLM et ne demandent aucune configuration. Si le graphe est en retard sur les fichiers, les requêtes l'indiquent par `avertissement: graphe pas à jour : 1 fichier modifié` sur stderr.
 
@@ -210,7 +231,7 @@ Les sorties `--json` sont stables et sans décoration. Séquence type :
 
 1. `rkg status --json` : `a_jour` vaut `false` ? lancer `rkg update`.
 2. `rkg query search --json <terme>` pour localiser, `rkg query neighbors --json <nœud> --depth 2` pour explorer les dépendances, `rkg query path` pour relier deux éléments.
-3. `rkg summary --json` pour une vue d'ensemble, `rkg export` pour tout charger.
+3. `rkg summary --json` pour une vue d'ensemble, `rkg export --output -` pour tout charger.
 
 Tester le code retour (0, 1, 2) et lire stderr pour les messages.
 
@@ -224,7 +245,10 @@ Le schéma du graphe a changé : lancez `rkg build` pour reconstruire le graphe 
 cargo test -q --color never
 cargo fmt --all -- --check && cargo clippy -q --all-targets --color never -- -D warnings
 cargo test --release -q --color never -- --ignored perf   # performances, 10 000 fichiers
+node --test --test-reporter=dot 'tests/view/*.test.js'     # logique de la vue HTML
 ```
+
+La logique de la vue HTML (module JS pur) est testée par `node --test` : Node ≥ 20 est requis, comme outil de développement seulement (le produit n'en dépend pas), sans npm ni dépendance. Un test Rust compare les données de la vue à la fixture `tests/view/fixtures/maven3.json` ; après un changement volontaire de l'export, la régénérer avec `RKG_UPDATE_VIEW_FIXTURE=1 cargo test view_fixture`. Le rendu et la souris se vérifient à la main.
 
 Avec `provider = "mock"`, le LLM est simulé et piloté par l'environnement :
 
