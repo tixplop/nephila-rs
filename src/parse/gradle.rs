@@ -6,8 +6,8 @@ use std::path::Path;
 
 use super::gradle_lex::{lex, Tok, Token};
 use super::{FileStructure, ParseCtx};
-use crate::llm::extract::{Declared, Reference};
 use crate::model::{EdgeKind, NodeKind};
+use crate::parse::{Declared, Reference};
 
 /// Dossier (séparateur `/`, `""` = racine du dépôt) du fichier `path`.
 fn dir_of(path: &Path) -> String {

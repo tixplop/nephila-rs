@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use super::extract::{AskReply, Extraction};
+use super::ask::AskReply;
 use super::{Enrichment, Llm};
 use crate::error::{Error, Result};
 
@@ -180,13 +180,6 @@ impl Llm for MockLlm {
             ))
         } else {
             Ok(())
-        }
-    }
-
-    fn extract(&self, file: &str, chunk: usize, _text: &str) -> Result<Extraction> {
-        match self.fixture_json(file, chunk)? {
-            Some(j) => Extraction::parse(&j),
-            None => Ok(Extraction::default()),
         }
     }
 

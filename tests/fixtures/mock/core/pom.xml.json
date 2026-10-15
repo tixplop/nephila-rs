@@ -1,1 +1,1 @@
-{"version":1,"declares":[{"kind":"module","name":"core"},{"kind":"dependency","name":"org.slf4j:slf4j-api"}],"references":[{"source":"module:core","kind":"depends_on","target":"org.slf4j:slf4j-api"}]}
+{"version":2,"summaries":[{"node":"module:com.acme:core","summary":"Module du coeur métier."}],"concepts":[]}

@@ -137,53 +137,53 @@ fn req012_ac2_touch_only_is_still_up_to_date() {
     assert_eq!(lines(&env.status(&[])), vec!["graphe à jour"]);
 }
 
+/// Marque « en attente » tous les fichiers sauf un (le premier autre que `JAVA2`, qui est mis en
+/// attente) comme après une interruption de la phase structure ; renvoie les chemins mis en attente.
+fn mark_pending_all_but_one(env: &Env) -> Vec<String> {
+    let mut store = rkg::store::Store::open_existing(&env.repo).unwrap();
+    let files = store.files().unwrap();
+    let mut keep = vec![JAVA2.to_string()];
+    keep.push(
+        files
+            .iter()
+            .map(|f| f.path.clone())
+            .find(|p| p != JAVA2)
+            .unwrap(),
+    );
+    let pending: Vec<_> = files
+        .into_iter()
+        .filter(|f| f.path == JAVA2 || !keep.contains(&f.path))
+        .collect();
+    store.insert_pending_files(&pending).unwrap();
+    pending.into_iter().map(|f| f.path).collect()
+}
+
 #[test]
-fn req012_ac3_pending_files_after_failure_are_listed() {
-    let env = Env::new();
-    let out = env.run(&["build"], &[("RKG_MOCK_FAIL_AFTER", "2")]);
-    assert!(!out.status.success());
+fn req012_ac3_pending_files_are_listed() {
+    let env = Env::built();
+    let pending = mark_pending_all_but_one(&env);
     let out = env.status(&[]);
     assert!(out.status.success());
     let l = lines(&out);
     assert_eq!(l[0], "graphe pas à jour");
     let mut got: Vec<String> = l[1..].to_vec();
     got.sort();
-    // L'ordre de traitement dépend de la concurrence : l'ensemble attendu est celui des fichiers
-    // que le graphe ne marque pas indexés.
-    let files = rkg::store::Store::open_readonly(&env.repo)
-        .unwrap()
-        .files()
-        .unwrap();
-    let indexed: Vec<&str> = files
-        .iter()
-        .filter(|f| f.state == rkg::model::FileState::Indexed)
-        .map(|f| f.path.as_str())
-        .collect();
-    assert_eq!(indexed.len(), 2, "{indexed:?}");
-    let mut expected: Vec<String> = files
-        .iter()
-        .filter(|f| f.state == rkg::model::FileState::Pending)
-        .map(|f| format!("en attente\t{}", f.path))
-        .collect();
+    let mut expected: Vec<String> = pending.iter().map(|p| format!("en attente\t{p}")).collect();
     expected.sort();
-    assert_eq!(expected.len(), 8);
     assert_eq!(got, expected, "{l:?}");
-    for p in indexed {
-        assert!(l.iter().all(|x| !x.ends_with(p)), "{l:?}");
-    }
 }
 
 #[test]
 fn req012_ac3_pending_file_removed_from_disk_is_reported_deleted() {
-    let env = Env::new();
-    let out = env.run(&["build"], &[("RKG_MOCK_FAIL_AFTER", "2")]);
-    assert!(!out.status.success());
+    let env = Env::built();
+    let pending = mark_pending_all_but_one(&env);
+    assert!(pending.contains(&JAVA2.to_string()));
     fs::remove_file(env.repo.join(JAVA2)).unwrap();
     let l = lines(&env.status(&[]));
     assert_eq!(l[0], "graphe pas à jour");
     assert!(l.contains(&format!("supprimé\t{JAVA2}")), "{l:?}");
     assert!(!l.contains(&format!("en attente\t{JAVA2}")), "{l:?}");
-    assert_eq!(l.len(), 9, "{l:?}");
+    assert_eq!(l.len(), 1 + pending.len(), "{l:?}");
 }
 
 #[test]
@@ -251,20 +251,15 @@ fn spawn_slow_build(env: &Env) -> Child {
 }
 
 #[test]
-fn req010_ac3_status_after_killed_build_lists_unprocessed_as_pending() {
+fn req010_ac3_status_after_build_killed_during_enrichment_is_readable_and_up_to_date() {
     let env = Env::new();
     let mut child = spawn_slow_build(&env);
     child.kill().unwrap();
     child.wait().unwrap();
     let out = env.status(&[]);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    let l = lines(&out);
-    assert_eq!(l[0], "graphe pas à jour");
-    assert!(l.len() > 1);
-    assert!(
-        l[1..].iter().all(|x| x.starts_with("en attente\t")),
-        "{l:?}"
-    );
+    // La structure était complète avant l'enrichissement : aucun fichier en attente.
+    assert_eq!(lines(&out), vec!["graphe à jour"]);
 }
 
 #[test]
@@ -282,12 +277,7 @@ fn req020_ac2_status_answers_during_running_build() {
         elapsed < Duration::from_secs(3),
         "status bloqué : {elapsed:?}"
     );
-    let l = lines(&out);
-    assert_eq!(l[0], "graphe pas à jour");
-    assert!(
-        l[1..].iter().any(|x| x.starts_with("en attente\t")),
-        "{l:?}"
-    );
+    assert_eq!(lines(&out)[0], "graphe à jour");
 }
 
 #[test]

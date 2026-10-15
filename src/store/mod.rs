@@ -266,7 +266,7 @@ impl Store {
     /// origines `parse` et `llm`), efface les résumés de ses nœuds et remet `enriched_hash` à
     /// NULL, puis marque le fichier indexé. Le fichier doit être connu. Un nœud peut être déclaré
     /// par plusieurs fichiers (DEC-014) : la ligne du nœud (attributs, fichier de rattachement)
-    /// est celle du premier déclarant, les références restent attachées au fichier qui les a
+    /// est une projection des déclarations (DEC-026 : attributs et fichier de la déclaration de plus petit chemin, résumé de la plus petite déclaration résumée), les références restent attachées au fichier qui les a
     /// émises. Un nœud sans fichier (concept) est déclaré lui aussi par le fichier
     /// qui le mentionne et disparaît avec son dernier déclarant. Les nœuds `dependency` sont
     /// dérivés par la résolution (DEC-020) : ils ne sont jamais supprimés ici, seul
@@ -311,8 +311,7 @@ impl Store {
         for (id, text) in summaries {
             let n = tx
                 .execute(
-                    "UPDATE nodes SET summary = ?2, summary_file = ?3 WHERE id = ?1
-                     AND EXISTS (SELECT 1 FROM declarations WHERE node = ?1 AND file = ?3)",
+                    "UPDATE declarations SET summary = ?2 WHERE node = ?1 AND file = ?3",
                     params![id, text, path],
                 )
                 .map_err(db_err)?;
@@ -322,6 +321,8 @@ impl Store {
                 )));
             }
         }
+        let ids = declared_by(&tx, path)?;
+        refresh_nodes(&tx, &ids)?;
         insert_refs(&tx, path, refs, "llm")?;
         tx.execute(
             "UPDATE files SET enriched_hash = ?2 WHERE path = ?1",
@@ -648,13 +649,50 @@ fn require_known(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
     }
 }
 
-/// Efface les résumés posés par un fichier (ceux d'autres déclarants d'un nœud partagé restent).
+/// Efface les résumés posés par un fichier dans ses déclarations (ceux d'autres déclarants d'un
+/// nœud partagé restent) puis recalcule les lignes des nœuds concernés.
 fn clear_summaries(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
     tx.execute(
-        "UPDATE nodes SET summary = NULL, summary_file = NULL WHERE summary_file = ?1",
+        "UPDATE declarations SET summary = NULL WHERE file = ?1 AND summary IS NOT NULL",
         [path],
     )
     .map_err(db_err)?;
+    let ids = declared_by(tx, path)?;
+    refresh_nodes(tx, &ids)
+}
+
+fn declared_by(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Vec<String>> {
+    let mut st = tx
+        .prepare("SELECT node FROM declarations WHERE file = ?1")
+        .map_err(db_err)?;
+    let rows = st
+        .query_map([path], |r| r.get::<_, String>(0))
+        .map_err(db_err)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(db_err)
+}
+
+/// Recalcule la ligne des nœuds encore déclarés comme projection de leurs déclarations (DEC-026) :
+/// attributs et fichier de la déclaration de plus petit chemin, résumé de la déclaration de plus
+/// petit chemin ayant un résumé. Les nœuds non déclarés sont ignorés.
+fn refresh_nodes<S: AsRef<str>>(tx: &rusqlite::Transaction<'_>, ids: &[S]) -> Result<()> {
+    let mut up = tx
+        .prepare(
+            "UPDATE nodes SET
+               short = (SELECT short FROM declarations WHERE node = nodes.id ORDER BY file LIMIT 1),
+               subkind = (SELECT subkind FROM declarations WHERE node = nodes.id ORDER BY file LIMIT 1),
+               file = (SELECT CASE WHEN located <> 0 THEN file END FROM declarations
+                       WHERE node = nodes.id ORDER BY file LIMIT 1),
+               summary = (SELECT summary FROM declarations
+                          WHERE node = nodes.id AND summary IS NOT NULL ORDER BY file LIMIT 1),
+               summary_file = (SELECT file FROM declarations
+                          WHERE node = nodes.id AND summary IS NOT NULL ORDER BY file LIMIT 1)
+             WHERE id = ?1 AND EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+        )
+        .map_err(db_err)?;
+    for id in ids {
+        up.execute([id.as_ref()]).map_err(db_err)?;
+    }
     Ok(())
 }
 
@@ -665,14 +703,15 @@ fn insert_nodes(
     origin: &str,
 ) -> Result<()> {
     let mut ins = tx
-        .prepare(
-            "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary, summary_file)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CASE WHEN ?7 IS NULL THEN NULL ELSE ?8 END)",
-        )
+        .prepare("INSERT OR IGNORE INTO nodes(id, kind, qualified, short) VALUES (?1, ?2, ?3, ?4)")
         .map_err(db_err)?;
     let mut decl = tx
-        .prepare("INSERT OR IGNORE INTO declarations(file, node, origin) VALUES (?1, ?2, ?3)")
+        .prepare(
+            "INSERT OR IGNORE INTO declarations(file, node, origin, short, subkind, located, summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
         .map_err(db_err)?;
+    let mut ids: Vec<String> = Vec::new();
     for n in nodes {
         if n.file.as_deref().is_some_and(|f| f != path) {
             return Err(Error::Message(format!(
@@ -680,19 +719,21 @@ fn insert_nodes(
                 n.id
             )));
         }
-        ins.execute(params![
+        ins.execute(params![n.id, n.kind.as_str(), n.qualified, n.short])
+            .map_err(db_err)?;
+        decl.execute(params![
+            path,
             n.id,
-            n.kind.as_str(),
-            n.qualified,
+            origin,
             n.short,
-            path_or_null(n, path),
             n.subkind.map(SubKind::as_str),
-            n.summary,
-            path
+            n.file.is_some(),
+            n.summary
         ])
         .map_err(db_err)?;
-        decl.execute(params![path, n.id, origin]).map_err(db_err)?;
+        ids.push(n.id.clone());
     }
+    refresh_nodes(tx, &ids)?;
     Ok(())
 }
 
@@ -754,13 +795,17 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
         params![path, origin],
     )
     .map_err(db_err)?;
-    tx.execute(
-        "UPDATE nodes SET file = (SELECT MIN(file) FROM declarations WHERE node = nodes.id)
-         WHERE file = ?1 AND EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)
-           AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id AND file = ?1)",
-        [path],
-    )
-    .map_err(db_err)?;
+    let released: Vec<String> = {
+        let mut st = tx
+            .prepare("SELECT id FROM released_declared")
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?
+    };
+    refresh_nodes(tx, &released)?;
     tx.execute(
         "DELETE FROM nodes WHERE NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)
          AND (kind <> 'dependency' OR id IN (SELECT id FROM released_declared))",
@@ -770,10 +815,6 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
     tx.execute("DROP TABLE released_declared", [])
         .map_err(db_err)?;
     Ok(())
-}
-
-fn path_or_null<'a>(n: &Node, path: &'a str) -> Option<&'a str> {
-    n.file.as_ref().map(|_| path)
 }
 
 fn version_error(v: i32) -> Error {
@@ -1375,5 +1416,75 @@ mod tests {
         assert!(st
             .apply_enrichment("absent.md", "h", &[], &[], &[])
             .is_err());
+    }
+
+    fn shared(f: &str, short: &str, sub: SubKind, sum: Option<&str>) -> Node {
+        Node::new(NodeKind::Type, "p.A", short, Some(f), Some(sub), sum)
+    }
+
+    fn shared_store(order: [&str; 2]) -> (tempfile::TempDir, Store) {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a"), file("b")]).unwrap();
+        for f in order {
+            let n = if f == "a" {
+                shared("a", "Aa", SubKind::Class, None)
+            } else {
+                shared("b", "Bb", SubKind::Interface, None)
+            };
+            st.replace_structure(f, &[n], &[]).unwrap();
+        }
+        (dir, st)
+    }
+
+    #[test]
+    fn shared_node_row_is_independent_of_insertion_order() {
+        let (_d1, ab) = shared_store(["a", "b"]);
+        let (_d2, ba) = shared_store(["b", "a"]);
+        assert_eq!(ab.nodes().unwrap(), ba.nodes().unwrap());
+        let n = &ab.nodes().unwrap()[0];
+        assert_eq!(n.short, "Aa");
+        assert_eq!(n.subkind, Some(SubKind::Class));
+        assert_eq!(n.file.as_deref(), Some("a"));
+        let (_d3, mut st) = shared_store(["b", "a"]);
+        st.remove_file("a").unwrap();
+        let n = &st.nodes().unwrap()[0];
+        assert_eq!(n.short, "Bb");
+        assert_eq!(n.subkind, Some(SubKind::Interface));
+        assert_eq!(n.file.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn shared_summaries_follow_smallest_path_in_both_orders() {
+        for order in [["a", "b"], ["b", "a"]] {
+            let (_d, mut st) = shared_store(order);
+            for f in order {
+                st.apply_enrichment(f, "h", &[("type:p.A".into(), format!("res-{f}"))], &[], &[])
+                    .unwrap();
+            }
+            let n = &st.nodes().unwrap()[0];
+            assert_eq!(n.summary.as_deref(), Some("res-a"));
+            // Réanalyse de `a` : son résumé disparaît, celui de `b` apparaît.
+            st.replace_structure("a", &[shared("a", "Aa", SubKind::Class, None)], &[])
+                .unwrap();
+            assert_eq!(st.nodes().unwrap()[0].summary.as_deref(), Some("res-b"));
+        }
+    }
+
+    #[test]
+    fn shared_concept_has_no_file_and_smallest_path_summary() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md"), file("b.md")])
+            .unwrap();
+        for f in ["b.md", "a.md"] {
+            st.replace_structure(f, &[], &[]).unwrap();
+            let c = Node::new(NodeKind::Concept, "c", "c", None, None, None);
+            st.apply_enrichment(f, "h", &[("concept:c".into(), format!("r-{f}"))], &[c], &[])
+                .unwrap();
+        }
+        let n = &st.nodes().unwrap()[0];
+        assert_eq!(n.file, None);
+        assert_eq!(n.summary.as_deref(), Some("r-a.md"));
     }
 }

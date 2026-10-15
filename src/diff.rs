@@ -42,6 +42,8 @@ pub struct Diff {
     pub changes: Vec<FileChange>,
     pub scanned: Vec<ScannedFile>,
     pub known: Vec<FileRecord>,
+    /// Dossiers contenant un `settings.gradle(.kts)`, avec `rootProject.name` s'il est connu.
+    pub gradle_settings: HashMap<String, Option<String>>,
 }
 
 impl Diff {
@@ -62,7 +64,11 @@ impl Diff {
 /// « supprimé ».
 pub fn compute(repo: &Path, store: &Store) -> Result<Diff> {
     let known = store.files()?;
-    let scanned = scan::scan(repo, &known)?.files;
+    let scan::ScanResult {
+        files: scanned,
+        gradle_settings,
+        ..
+    } = scan::scan(repo, &known)?;
     let on_disk: HashMap<&str, &ScannedFile> =
         scanned.iter().map(|f| (f.path.as_str(), f)).collect();
     let mut changes = Vec::new();
@@ -95,5 +101,6 @@ pub fn compute(repo: &Path, store: &Store) -> Result<Diff> {
         changes,
         scanned,
         known,
+        gradle_settings,
     })
 }

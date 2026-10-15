@@ -22,10 +22,6 @@ struct Env {
     log: PathBuf,
 }
 
-fn decl(kind: &str, name: &str, extra: &str) -> String {
-    format!("{{\"kind\":\"{kind}\",\"name\":\"{name}\"{extra}}}")
-}
-
 impl Env {
     fn new() -> Env {
         let tmp = tempfile::tempdir().unwrap();
@@ -41,79 +37,52 @@ impl Env {
             config,
             log,
         };
-        let sum = |s: &str| format!(",\"summary\":\"{s}\"");
         env.file(
             SERVICE,
-            "class OrderService {}\n",
-            &[
-                decl("package", "com.acme.core", ""),
-                decl(
-                    "type",
-                    "com.acme.core.OrderService",
-                    &format!(
-                        ",\"subkind\":\"class\"{}",
-                        sum("Valide et enregistre les commandes")
-                    ),
-                ),
-                decl("method", "com.acme.core.OrderService.place", ""),
-            ],
+            "package com.acme.core;\n\npublic class OrderService {\n    public void place() {}\n}\n",
+        );
+        env.fixture(
+            SERVICE,
+            r#"{"version":2,"summaries":[{"node":"type:com.acme.core.OrderService","summary":"Valide et enregistre les commandes"}],"concepts":[]}"#,
         );
         env.file(
             REPO_JAVA,
-            "interface OrderRepository {}\n",
-            &[
-                decl("package", "com.acme.core", ""),
-                decl(
-                    "type",
-                    "com.acme.core.OrderRepository",
-                    ",\"subkind\":\"interface\"",
-                ),
-                decl("method", "com.acme.core.OrderRepository.save", ""),
-            ],
+            "package com.acme.core;\n\npublic interface OrderRepository {\n    void save();\n}\n",
         );
         env.file(
             OTHER,
-            "class Other {}\n",
-            &[
-                decl("package", "com.acme.other", ""),
-                decl("type", "com.acme.other.Order", ",\"subkind\":\"class\""),
-                decl(
-                    "type",
-                    "com.acme.other.PreOrderHook",
-                    ",\"subkind\":\"class\"",
-                ),
-                decl(
-                    "type",
-                    "com.acme.other.Billing",
-                    &format!(
-                        ",\"subkind\":\"class\"{}",
-                        sum("Gère la FACTURATION par lot")
-                    ),
-                ),
-                decl("method", "com.acme.other.Billing.save", ""),
-            ],
+            "package com.acme.other;\n\nclass Order {}\n\nclass PreOrderHook {}\n\nclass Billing {\n    void save() {}\n}\n",
         );
-        let topics: Vec<String> = std::iter::once(decl("document", "docs/many.md", ""))
-            .chain((0..60).map(|i| decl("concept", &format!("topic{i:02}"), "")))
+        env.fixture(
+            OTHER,
+            r#"{"version":2,"summaries":[{"node":"type:com.acme.other.Billing","summary":"Gère la FACTURATION par lot"}],"concepts":[]}"#,
+        );
+        env.file("docs/many.md", "# Many\n");
+        let topics: Vec<String> = (0..60)
+            .map(|i| {
+                format!(r#"{{"name":"topic{i:02}","sections":["section:docs/many.md#many"]}}"#)
+            })
             .collect();
-        env.file("docs/many.md", "# Many\n", &topics);
+        env.fixture(
+            "docs/many.md",
+            &format!(
+                r#"{{"version":2,"summaries":[],"concepts":[{}]}}"#,
+                topics.join(",")
+            ),
+        );
         env
     }
 
-    fn file(&self, path: &str, content: &str, declares: &[String]) {
+    fn file(&self, path: &str, content: &str) {
         let p = self.repo.join(path);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, content).unwrap();
+    }
+
+    fn fixture(&self, path: &str, json: &str) {
         let m = self.mock.join(format!("{path}.json"));
         fs::create_dir_all(m.parent().unwrap()).unwrap();
-        fs::write(
-            m,
-            format!(
-                "{{\"version\":1,\"declares\":[{}],\"references\":[]}}",
-                declares.join(",")
-            ),
-        )
-        .unwrap();
+        fs::write(m, json).unwrap();
     }
 
     fn built() -> Env {
@@ -389,11 +358,7 @@ fn req001_ac2_search_accepts_relative_repo_option() {
 fn req020_ac2_query_search_answers_during_running_build() {
     let env = Env::new();
     for i in 0..12 {
-        env.file(
-            &format!("docs/filler{i}.md"),
-            "# Filler\n",
-            &[decl("document", &format!("docs/filler{i}.md"), "")],
-        );
+        env.file(&format!("docs/filler{i}.md"), "# Filler\n");
     }
     let mut child = env
         .cmd(&["build"], &[("RKG_MOCK_DELAY_MS", "400")])
@@ -425,7 +390,11 @@ fn req020_ac2_query_search_answers_during_running_build() {
         elapsed < Duration::from_secs(3),
         "search bloqué : {elapsed:?}"
     );
-    assert!(text(&out.stderr).contains("graphe pas à jour"));
+    assert!(
+        !text(&out.stderr).contains("erreur:"),
+        "{}",
+        text(&out.stderr)
+    );
 }
 
 fn store_of(env: &Env) -> Store {

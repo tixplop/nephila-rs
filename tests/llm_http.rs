@@ -6,12 +6,18 @@ mod fake_server;
 use fake_server::FakeServer;
 use rkg::error::Error;
 use rkg::llm::anthropic::AnthropicLlm;
-use rkg::llm::extract::AskReply;
 use rkg::llm::openai::OpenAiLlm;
+use rkg::llm::AskReply;
 use rkg::llm::Llm;
 
 const EXTRACTION: &str =
+    r#"{"version":2,"summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}"#;
+const VERSION_1: &str =
     r#"{"version":1,"declares":[{"kind":"type","name":"A","subkind":"class"}],"references":[]}"#;
+
+fn a_ids() -> Vec<String> {
+    vec!["type:A".to_string()]
+}
 
 fn anthropic_reply(text: &str) -> String {
     serde_json::json!({"content":[{"type":"text","text":text}]}).to_string()
@@ -83,7 +89,7 @@ fn req002_ac3_connection_refused_is_network() {
 fn req002_ac3_extract_401_is_invalid_key() {
     let s = FakeServer::start(vec![(401, "{}".into())]);
     assert!(matches!(
-        anthropic(&s).extract("A.java", 1, "class A {}"),
+        anthropic(&s).enrich("A.java", 1, "class A {}", &a_ids()),
         Err(Error::InvalidKey(_))
     ));
 }
@@ -104,9 +110,9 @@ fn req002_ac5_anthropic_verify_key_request() {
 fn req002_ac5_anthropic_extract_request_and_response() {
     let s = FakeServer::start(vec![(200, anthropic_reply(EXTRACTION))]);
     let ex = anthropic(&s)
-        .extract("src/A.java", 2, "class A {}")
+        .enrich("src/A.java", 2, "class A {}", &a_ids())
         .unwrap();
-    assert_eq!(ex.declares.len(), 1);
+    assert_eq!(ex.summaries.len(), 1);
     let r = &s.requests()[0];
     assert_eq!(
         (r.method.as_str(), r.path.as_str()),
@@ -139,9 +145,9 @@ fn req002_ac5_openai_verify_key_request() {
 fn req002_ac5_openai_extract_request_and_response() {
     let s = FakeServer::start(vec![(200, openai_reply(EXTRACTION))]);
     let ex = openai(&s, Some("sk-o"))
-        .extract("A.java", 1, "class A {}")
+        .enrich("A.java", 1, "class A {}", &a_ids())
         .unwrap();
-    assert_eq!(ex.declares[0].qualified, "A");
+    assert_eq!(ex.summaries[0].0, "type:A");
     let r = &s.requests()[0];
     assert_eq!(
         (r.method.as_str(), r.path.as_str()),
@@ -179,9 +185,9 @@ fn req002_ac5_json_is_extracted_from_fenced_text() {
     let s = FakeServer::start(vec![(200, anthropic_reply(&fenced))]);
     assert_eq!(
         anthropic(&s)
-            .extract("A.java", 1, "x")
+            .enrich("A.java", 1, "x", &a_ids())
             .unwrap()
-            .declares
+            .summaries
             .len(),
         1
     );
@@ -222,13 +228,13 @@ fn req002_invalid_responses_are_message_errors() {
     let llm = anthropic(&s);
     for _ in 0..4 {
         assert!(matches!(
-            llm.extract("A.java", 1, "x"),
+            llm.enrich("A.java", 1, "x", &a_ids()),
             Err(Error::Message(_))
         ));
     }
     let s = FakeServer::start(vec![(200, r#"{"choices":[]}"#.into())]);
     assert!(matches!(
-        openai(&s, None).extract("A.java", 1, "x"),
+        openai(&s, None).enrich("A.java", 1, "x", &a_ids()),
         Err(Error::Message(_))
     ));
 }
@@ -240,7 +246,7 @@ fn req002_ac8_slow_server_gives_timeout_error() {
     let s = FakeServer::start_with_delays(vec![(200, anthropic_reply(EXTRACTION), 2000)]);
     let llm = AnthropicLlm::new(Some(s.base_url.clone()), "m".into(), "k".into(), 1);
     let t = std::time::Instant::now();
-    let r = llm.extract("A.java", 1, "class A {}");
+    let r = llm.enrich("A.java", 1, "class A {}", &a_ids());
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
     assert!(t.elapsed() < std::time::Duration::from_millis(2000));
 }
@@ -258,9 +264,9 @@ fn req002_ac8_fast_server_succeeds_within_timeout() {
     let s = FakeServer::start_with_delays(vec![(200, anthropic_reply(EXTRACTION), 500)]);
     let llm = AnthropicLlm::new(Some(s.base_url.clone()), "m".into(), "k".into(), 1);
     assert_eq!(
-        llm.extract("A.java", 1, "class A {}")
+        llm.enrich("A.java", 1, "class A {}", &a_ids())
             .unwrap()
-            .declares
+            .summaries
             .len(),
         1
     );
@@ -321,7 +327,7 @@ fn req024_ac8_openai_enrich_request_carries_content_nodes_and_schema() {
 
 #[test]
 fn req024_ac5_enrich_version_1_is_non_conforming() {
-    let s = FakeServer::start(vec![(200, anthropic_reply(EXTRACTION))]);
+    let s = FakeServer::start(vec![(200, anthropic_reply(VERSION_1))]);
     assert!(matches!(
         anthropic(&s).enrich("A.java", 1, "x", &[]),
         Err(Error::Message(_))

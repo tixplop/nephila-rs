@@ -1,1 +1,1 @@
-{"version":1,"context":"package com.acme.api\nimport com.acme.core.OrderService","declares":[{"kind":"package","name":"com.acme.api"},{"kind":"type","name":"com.acme.api.ApiController","subkind":"class"},{"kind":"method","name":"com.acme.api.ApiController.create"}],"references":[{"source":"method:com.acme.api.ApiController.create","kind":"calls","target":"OrderService.place"}]}
+{"version":2,"summaries":[{"node":"type:com.acme.api.ApiController","summary":"Contrôleur d'entrée de l'API."}],"concepts":[]}

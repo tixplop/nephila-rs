@@ -150,11 +150,8 @@ const ORDER_SERVICE: &str = "core/src/main/java/com/acme/core/OrderService.java"
 const ORDER_REPO: &str = "core/src/main/java/com/acme/core/OrderRepository.java";
 const ORDER: &str = "core/src/main/java/com/acme/domain/Order.java";
 
-fn java_fixture(class: &str) -> String {
-    format!(
-        "{{\"version\":1,\"declares\":[{{\"kind\":\"package\",\"name\":\"p\"}},{{\"kind\":\"type\",\"name\":\"p.{class}\",\"subkind\":\"class\"}}],\"references\":[]}}"
-    )
-}
+/// Chemin d'un fichier de configuration inexistant : LLM inactif.
+const NO_CONFIG: (&str, &str) = ("RKG_CONFIG", "/nonexistent/rkg-absent.toml");
 
 #[test]
 fn req011_ac7_no_graph_runs_full_build() {
@@ -186,11 +183,15 @@ fn req011_ac1_only_modified_file_is_sent_among_500() {
         let class = format!("C{i}");
         let rel = format!("src/p/{class}.java");
         env.write(&rel, &format!("package p;\nclass {class} {{}}\n"));
-        env.fixture(&rel, &java_fixture(&class));
     }
+    env.fixture(
+        "src/p/C7.java",
+        r#"{"version":2,"summaries":[{"node":"type:p.C7","summary":"Résumé de C7."}],"concepts":[]}"#,
+    );
     env.ok("build");
     let before = env.store().nodes().unwrap();
     assert!(before.len() >= 500);
+    assert!(before.iter().any(|n| n.summary.is_some()));
     env.clear_log();
     env.write("src/p/C42.java", "package p;\nclass C42 { int x; }\n");
     env.ok("update");
@@ -228,13 +229,17 @@ fn req011_ac4_rename_is_delete_plus_add() {
     env.ok("build");
     let new = "core/src/main/java/com/acme/domain/Order2.java";
     fs::rename(env.repo.join(ORDER), env.repo.join(new)).unwrap();
-    env.fixture(new, &java_fixture("Order2"));
     env.clear_log();
     env.ok("update");
     assert_eq!(env.logged_paths(), BTreeSet::from([new.to_string()]));
-    let ids = env.node_ids();
-    assert!(!ids.contains("type:com.acme.domain.Order"));
-    assert!(ids.contains("type:p.Order2"));
+    let order = env
+        .store()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.id == "type:com.acme.domain.Order")
+        .unwrap();
+    assert_eq!(order.file.as_deref(), Some(new));
     let files: Vec<String> = env
         .store()
         .files()
@@ -253,13 +258,10 @@ fn req011_ac5_modified_file_replaces_nodes_and_refs() {
     assert!(env
         .node_ids()
         .contains("method:com.acme.core.OrderRepository.save"));
-    env.fixture(
+    env.write(
         ORDER_REPO,
-        r#"{"version":1,"declares":[{"kind":"package","name":"com.acme.core"},{"kind":"type","name":"com.acme.core.OrderRepository","subkind":"interface"},{"kind":"method","name":"com.acme.core.OrderRepository.load"}],"references":[]}"#,
+        "package com.acme.core;\n\nimport com.acme.domain.Order;\n\npublic interface OrderRepository {\n    Order load(long id);\n}\n",
     );
-    let mut text = fs::read_to_string(env.repo.join(ORDER_REPO)).unwrap();
-    text.push_str("\n// modifié\n");
-    env.write(ORDER_REPO, &text);
     env.clear_log();
     env.ok("update");
     assert_eq!(env.logged_paths(), BTreeSet::from([ORDER_REPO.to_string()]));
@@ -294,20 +296,23 @@ fn req011_ac6_touch_only_makes_no_call() {
 #[test]
 fn req011_ac8_pending_files_are_processed_even_if_unchanged() {
     let env = Env::maven();
-    let failed = env.run("build", &[("RKG_MOCK_FAIL_AFTER", "2")]);
-    assert!(!failed.status.success());
-    let pending: BTreeSet<String> = env
-        .store()
+    env.ok("build");
+    let mut store = rkg::store::Store::open_existing(&env.repo).unwrap();
+    let pending: Vec<_> = store
         .files()
         .unwrap()
         .into_iter()
-        .filter(|f| f.state == FileState::Pending)
-        .map(|f| f.path)
+        .filter(|f| f.path == ORDER_SERVICE || f.path == ORDER_REPO)
         .collect();
-    assert_eq!(pending.len(), 8);
+    assert_eq!(pending.len(), 2);
+    store.insert_pending_files(&pending).unwrap();
+    drop(store);
     env.clear_log();
     env.ok("update");
-    assert_eq!(env.logged_paths(), pending);
+    assert_eq!(
+        env.logged_paths(),
+        BTreeSet::from([ORDER_SERVICE.to_string(), ORDER_REPO.to_string()])
+    );
     assert!(env
         .store()
         .files()
@@ -317,26 +322,25 @@ fn req011_ac8_pending_files_are_processed_even_if_unchanged() {
 }
 
 #[test]
-fn req010_ac2_update_after_failure_sends_exactly_the_pending_files() {
+fn req010_ac2_update_after_failure_sends_exactly_the_files_to_enrich() {
     let env = Env::maven();
     env.run("build", &[("RKG_MOCK_FAIL_AFTER", "7")]);
-    let pending: BTreeSet<String> = env
+    let to_enrich: BTreeSet<String> = env
         .store()
-        .files()
+        .files_to_enrich()
         .unwrap()
         .into_iter()
-        .filter(|f| f.state == FileState::Pending)
         .map(|f| f.path)
         .collect();
-    assert_eq!(pending.len(), 3);
+    assert_eq!(to_enrich.len(), 3);
     env.clear_log();
     env.ok("update");
-    assert_eq!(env.logged_paths(), pending);
+    assert_eq!(env.logged_paths(), to_enrich);
     assert_eq!(env.log_lines().len(), 3);
 }
 
 #[test]
-fn req011_failed_update_keeps_failed_file_pending_and_exits_nonzero() {
+fn req011_failed_update_leaves_failed_file_to_enrich_and_exits_nonzero() {
     let env = Env::maven();
     env.ok("build");
     for f in [ORDER, ORDER_REPO] {
@@ -346,27 +350,19 @@ fn req011_failed_update_keeps_failed_file_pending_and_exits_nonzero() {
     }
     let out = env.run("update", &[("RKG_MOCK_FAIL_AFTER", "1")]);
     assert!(!out.status.success());
-    let pending = env
-        .store()
+    let store = env.store();
+    // Les deux fichiers modifiés sont réanalysés ; l'un d'eux n'a pas pu être enrichi.
+    assert!(store
         .files()
         .unwrap()
         .iter()
-        .filter(|f| f.state == FileState::Pending)
-        .count();
-    assert_eq!(pending, 1);
+        .all(|f| f.state == FileState::Indexed));
+    assert_eq!(store.count_files_to_enrich().unwrap(), 1);
 }
 
 fn mini_ab(env: &Env) {
     env.write("A.java", "class A { void m() { B.foo(); } }\n");
     env.write("B.java", "class B { }\n");
-    env.fixture(
-        "A.java",
-        r#"{"version":1,"declares":[{"kind":"type","name":"A","subkind":"class"},{"kind":"method","name":"A.m"}],"references":[{"source":"method:A.m","kind":"calls","target":"B.foo"}]}"#,
-    );
-    env.fixture(
-        "B.java",
-        r#"{"version":1,"declares":[{"kind":"type","name":"B","subkind":"class"}],"references":[]}"#,
-    );
 }
 
 #[test]
@@ -375,10 +371,6 @@ fn req008_ac2_new_method_in_b_links_unchanged_a() {
     mini_ab(&env);
     env.ok("build");
     assert!(!env.has_edge("method:A.m", EdgeKind::Calls, "method:B.foo"));
-    env.fixture(
-        "B.java",
-        r#"{"version":1,"declares":[{"kind":"type","name":"B","subkind":"class"},{"kind":"method","name":"B.foo"}],"references":[]}"#,
-    );
     env.write("B.java", "class B { void foo() {} }\n");
     env.clear_log();
     env.ok("update");
@@ -408,17 +400,9 @@ fn req011_same_size_edit_with_restored_mtime_is_detected() {
 fn req008_ac3_renamed_method_unlinks_a_and_reference_is_unresolved() {
     let env = Env::empty();
     mini_ab(&env);
-    env.fixture(
-        "B.java",
-        r#"{"version":1,"declares":[{"kind":"type","name":"B","subkind":"class"},{"kind":"method","name":"B.foo"}],"references":[]}"#,
-    );
     env.write("B.java", "class B { void foo() {} }\n");
     env.ok("build");
     assert!(env.has_edge("method:A.m", EdgeKind::Calls, "method:B.foo"));
-    env.fixture(
-        "B.java",
-        r#"{"version":1,"declares":[{"kind":"type","name":"B","subkind":"class"},{"kind":"method","name":"B.bar"}],"references":[]}"#,
-    );
     env.write("B.java", "class B { void bar() {} }\n");
     env.clear_log();
     env.ok("update");
@@ -594,4 +578,165 @@ fn req002_update_checks_key_before_touching_anything() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("clé"), "{}", stderr(&out));
     assert!(env.log_lines().is_empty());
+}
+
+#[test]
+fn req011_ac2_up_to_date_without_llm_config_even_with_files_to_enrich() {
+    let env = Env::maven();
+    let out = env.run("build", &[NO_CONFIG]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(env.store().count_files_to_enrich().unwrap(), 10);
+    let before = env.store().summary().unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let out = env.run("update", &[NO_CONFIG]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("graphe à jour"), "{}", stdout(&out));
+    assert_eq!(env.store().summary().unwrap().unwrap(), before);
+}
+
+#[test]
+fn req024_ac1_update_without_config_after_a_modification_is_ok_and_not_enriched() {
+    let env = Env::maven();
+    env.run("build", &[NO_CONFIG]);
+    let mut t = fs::read_to_string(env.repo.join(ORDER)).unwrap();
+    t.push_str("\n// x\n");
+    env.write(ORDER, &t);
+    let out = env.run("update", &[NO_CONFIG]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("enrichissement : désactivé"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(env.log_lines().is_empty());
+    assert!(env
+        .store()
+        .nodes()
+        .unwrap()
+        .iter()
+        .all(|n| n.summary.is_none()));
+}
+
+#[test]
+fn req024_ac6_update_after_no_llm_build_sends_each_file_once_without_reanalysis() {
+    let env = Env::maven();
+    let out = env.command("build", &[]).arg("--no-llm").output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.log_lines().is_empty());
+    // Un fichier réanalysé voit ses références réinsérées (nouveaux identifiants).
+    let max_parse_ref = |env: &Env| -> i64 {
+        rusqlite::Connection::open(env.repo.join(".rkg/graph.db"))
+            .unwrap()
+            .query_row("SELECT MAX(id) FROM refs WHERE origin = 'parse'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let before = max_parse_ref(&env);
+    let out = env.ok("update");
+    assert!(!stdout(&out).contains("graphe à jour"));
+    let lines = env.log_lines();
+    assert_eq!(lines.len(), 10, "{lines:?}");
+    assert_eq!(env.logged_paths().len(), 10);
+    assert_eq!(
+        before,
+        max_parse_ref(&env),
+        "aucun fichier ne doit être réanalysé"
+    );
+    assert_eq!(env.store().count_files_to_enrich().unwrap(), 0);
+    env.clear_log();
+    let out = env.ok("update");
+    assert!(stdout(&out).contains("graphe à jour"));
+    assert!(env.log_lines().is_empty());
+}
+
+#[test]
+fn req024_ac7_update_no_llm_after_modification_drops_stale_summaries_only_for_that_file() {
+    let env = Env::maven();
+    env.ok("build");
+    let summary = |id: &str| {
+        env.store()
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.summary)
+    };
+    assert!(summary("type:com.acme.core.OrderService").is_some());
+    assert!(summary("type:com.acme.core.OrderRepository").is_some());
+    let mut t = fs::read_to_string(env.repo.join(ORDER_SERVICE)).unwrap();
+    t.push_str("\n// modifié\n");
+    env.write(ORDER_SERVICE, &t);
+    env.clear_log();
+    let out = env.command("update", &[]).arg("--no-llm").output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.log_lines().is_empty());
+    assert!(summary("type:com.acme.core.OrderService").is_none());
+    assert!(summary("method:com.acme.core.OrderService.place").is_none());
+    assert!(summary("type:com.acme.core.OrderRepository").is_some());
+    let to_enrich: Vec<String> = env
+        .store()
+        .files_to_enrich()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    assert_eq!(to_enrich, vec![ORDER_SERVICE.to_string()]);
+}
+
+#[test]
+fn req022_modified_settings_reanalyzes_build_scripts_of_its_tree() {
+    let env = Env::empty();
+    env.write(
+        "settings.gradle",
+        "rootProject.name = 'alpha'\ninclude 'api'\n",
+    );
+    env.write("build.gradle", "dependencies {\n}\n");
+    env.write(
+        "api/build.gradle",
+        "dependencies {\n  implementation project(':')\n}\n",
+    );
+    env.write("lib/Util.java", "class Util { }\n");
+    let out = env.run("build", &[NO_CONFIG]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let short = |env: &Env| {
+        env.store()
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == "module::")
+            .map(|n| n.short)
+    };
+    assert_eq!(short(&env).as_deref(), Some("alpha"));
+    // Seul le settings change : le build.gradle racine est réanalysé quand même.
+    env.write(
+        "settings.gradle",
+        "rootProject.name = 'beta'\ninclude 'api'\n",
+    );
+    let out = env.run("update", &[NO_CONFIG]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stdout(&out).contains("graphe à jour"));
+    assert_eq!(short(&env).as_deref(), Some("beta"));
+    // Suppression du settings : les scripts sont réanalysés, la racine reprend le nom du dossier.
+    fs::remove_file(env.repo.join("settings.gradle")).unwrap();
+    let out = env.run("update", &[NO_CONFIG]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_ne!(short(&env).as_deref(), Some("beta"));
+}
+
+#[test]
+fn req008_ac6_removed_dependency_node_disappears_after_update() {
+    let env = Env::maven();
+    env.ok("build");
+    let dep = "dependency:org.slf4j:slf4j-api";
+    assert!(env.node_ids().contains(dep));
+    let pom = fs::read_to_string(env.repo.join("core/pom.xml")).unwrap();
+    let start = pom.find("<dependencies>").unwrap();
+    let end = pom.find("</dependencies>").unwrap() + "</dependencies>".len();
+    env.write("core/pom.xml", &format!("{}{}", &pom[..start], &pom[end..]));
+    env.ok("update");
+    assert!(!env.node_ids().contains(dep));
+    let out = env.ok("export");
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(!v["unresolved"].to_string().contains("slf4j"));
 }

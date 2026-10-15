@@ -355,8 +355,8 @@ impl Ctx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::extract::Declared;
     use crate::model::{node_id, NodeKind};
+    use crate::parse::Declared;
 
     fn fx(name: &str) -> String {
         let p = Path::new(env!("CARGO_MANIFEST_DIR"))

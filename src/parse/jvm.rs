@@ -3,8 +3,8 @@
 
 use std::collections::HashSet;
 
-use crate::llm::extract::{Declared, Reference};
 use crate::model::{node_id, EdgeKind, NodeKind, SubKind};
+use crate::parse::{Declared, Reference};
 
 use super::FileStructure;
 

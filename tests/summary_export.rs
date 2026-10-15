@@ -118,8 +118,8 @@ fn req019_ac1_summary_lists_modules_dependencies_nodes_and_themes() {
         strings(&m["depends_on"])
     };
     assert_eq!(modules.len(), 3, "{s}");
-    assert_eq!(dep("api"), vec!["module:core"]);
-    assert_eq!(dep("store"), vec!["module:core"]);
+    assert_eq!(dep("api"), vec!["module:com.acme:core"]);
+    assert_eq!(dep("store"), vec!["module:com.acme:core"]);
     assert_eq!(dep("core"), vec!["dependency:org.slf4j:slf4j-api"]);
 
     // Les 10 nœuds de plus haut degré, vérifiés contre l'export.
@@ -206,8 +206,8 @@ fn req018_ac1_export_contains_all_nodes_and_edges() {
     let nodes = v["nodes"].as_array().unwrap();
     let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
     for id in [
-        "module:api",
-        "module:store",
+        "module:com.acme:api",
+        "module:com.acme:store",
         "type:com.acme.core.OrderService",
         "method:com.acme.core.OrderService.place",
         "concept:idempotence",
@@ -225,8 +225,8 @@ fn req018_ac1_export_contains_all_nodes_and_edges() {
     assert_eq!(svc["qualified"], "com.acme.core.OrderService");
     assert!(svc["file"].as_str().unwrap().ends_with("OrderService.java"));
     let edges = v["edges"].as_array().unwrap();
-    assert!(edges.iter().any(|e| e["source"] == "module:api"
-        && e["target"] == "module:core"
+    assert!(edges.iter().any(|e| e["source"] == "module:com.acme:api"
+        && e["target"] == "module:com.acme:core"
         && e["kind"] == "depends_on"));
     assert!(edges.iter().any(|e| e["kind"] == "mentions"));
     assert!(v["unresolved"].is_array());
@@ -261,14 +261,17 @@ fn req018_ac2_unwritable_output_is_an_error() {
 fn req018_ac3_unresolved_references_are_exported() {
     let env = Env::new();
     let f = env
-        .mock
-        .join("core/src/main/java/com/acme/core/OrderService.java.json");
-    let s = fs::read_to_string(&f).unwrap();
-    let s = s.replace(
-        r#""references":["#,
-        r#""references":[{"source":"method:com.acme.core.OrderService.place","kind":"calls","target":"Ghost.run"},"#,
-    );
-    fs::write(&f, s).unwrap();
+        .repo
+        .join("core/src/main/java/com/acme/core/OrderService.java");
+    let src = fs::read_to_string(&f).unwrap();
+    fs::write(
+        &f,
+        src.replace(
+            "repo.save(new Order());",
+            "repo.save(new Order());\n        Ghost.run();",
+        ),
+    )
+    .unwrap();
     env.build();
     let v = env.json(&["export"]);
     let un = v["unresolved"].as_array().unwrap();

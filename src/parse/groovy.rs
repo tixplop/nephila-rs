@@ -342,8 +342,8 @@ fn st_q(b: &Builder) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::extract::Declared;
     use crate::model::{node_id, NodeKind};
+    use crate::parse::Declared;
 
     fn fx(name: &str) -> String {
         let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -420,7 +420,7 @@ mod tests {
         }
     }
 
-    fn calls_from(s: &FileStructure) -> Vec<&crate::llm::extract::Reference> {
+    fn calls_from(s: &FileStructure) -> Vec<&crate::parse::Reference> {
         s.references
             .iter()
             .filter(|r| r.kind == EdgeKind::Calls)

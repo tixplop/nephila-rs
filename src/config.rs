@@ -92,6 +92,25 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Comme `load_with`, mais `None` quand aucun fichier de configuration n'existe : le LLM est
+    /// alors inactif (REQ-002). Un fichier présent mais invalide reste une erreur.
+    pub fn load_optional_with(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<Config>> {
+        let Ok(path) = config_path_with(env) else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let cfg = Config::load_from(&path)?;
+        cfg.api_key_with(env)?;
+        Ok(Some(cfg))
+    }
+
+    /// `load_optional_with` sur l'environnement du processus.
+    pub fn load_optional() -> Result<Option<Config>> {
+        Config::load_optional_with(&|k| std::env::var(k).ok())
+    }
+
     /// Lit et valide un fichier de configuration (sans lire la clé d'API).
     pub fn load_from(path: &Path) -> Result<Config> {
         let text = match std::fs::read_to_string(path) {

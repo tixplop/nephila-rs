@@ -1,1 +1,1 @@
-{"version":1,"declares":[{"kind":"document","name":"docs/guide.md"},{"kind":"section","name":"docs/guide.md#guide"},{"kind":"concept","name":"idempotence"}],"references":[{"source":"section:docs/guide.md#guide","kind":"mentions","target":"idempotence"}]}
+{"version":2,"summaries":[{"node":"document:docs/guide.md","summary":"Guide d'utilisation."}],"concepts":[{"name":"Facturation","summary":"Émission des factures.","sections":["section:docs/guide.md#guide"]}]}

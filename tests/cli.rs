@@ -55,7 +55,7 @@ fn req001_ac3_invalid_option_fails_with_usage_on_stderr() {
 #[test]
 fn req001_ac2_error_exits_nonzero_with_prefix_on_stderr_only() {
     let out = rkg()
-        .env("RKG_CONFIG", "/nonexistent/rkg-config.toml")
+        .args(["-C", "/nonexistent/rkg-repo"])
         .arg("build")
         .assert()
         .failure()

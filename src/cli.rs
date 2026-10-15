@@ -24,12 +24,19 @@ pub struct JsonOpt {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct IndexOpts {
+    /// N'appelle pas le LLM (la configuration n'est pas lue) : structure seule, sans enrichissement
+    #[arg(long)]
+    pub no_llm: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Reconstruit entièrement le graphe
-    Build,
+    Build(IndexOpts),
     /// Met à jour le graphe pour les fichiers modifiés
-    Update,
+    Update(IndexOpts),
     /// Affiche l'état de l'index
     Status(JsonOpt),
     /// Interroge le graphe
@@ -83,8 +90,8 @@ pub enum Query {
 /// Exécute la commande.
 pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
-        Command::Build => crate::index::build::run(&cli.repo),
-        Command::Update => crate::index::update::run(&cli.repo),
+        Command::Build(o) => crate::index::build::run(&cli.repo, o.no_llm),
+        Command::Update(o) => crate::index::update::run(&cli.repo, o.no_llm),
         Command::Status(j) => crate::status::run(&cli.repo, j.json),
         Command::Summary(j) => crate::summary::run(&cli.repo, j.json),
         Command::Export { output } => crate::export::run(&cli.repo, output.as_deref()),

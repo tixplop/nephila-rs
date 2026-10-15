@@ -11,7 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-const BILLING_SRC: &str = "class BillingService { String SECRET_SOURCE_BODY = \"x\"; }\n";
+const BILLING_SRC: &str = "package com.acme.billing;\n\npublic class BillingService {\n    String SECRET_SOURCE_BODY = \"x\";\n    private Ledger ledger;\n\n    public void charge() {\n        ledger.record();\n    }\n}\n";
 
 struct Env {
     _tmp: tempfile::TempDir,
@@ -36,42 +36,35 @@ impl Env {
             _tmp: tmp,
         };
         fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
-        env.file(
+        env.file("billing/BillingService.java", BILLING_SRC);
+        env.enrichment(
             "billing/BillingService.java",
-            BILLING_SRC,
-            r#"{"kind":"type","name":"com.acme.billing.BillingService","subkind":"class","summary":"Gère la facturation des commandes"},
-               {"kind":"method","name":"com.acme.billing.BillingService.charge"}"#,
-            r#"{"source":"method:com.acme.billing.BillingService.charge","kind":"calls","target":"Ledger.record"}"#,
+            r#"{"version":2,"summaries":[{"node":"type:com.acme.billing.BillingService","summary":"Gère la facturation des commandes"}],"concepts":[]}"#,
         );
         env.file(
             "billing/Ledger.java",
-            "class Ledger {}\n",
-            r#"{"kind":"type","name":"com.acme.billing.Ledger","subkind":"class"},
-               {"kind":"method","name":"com.acme.billing.Ledger.record"}"#,
-            "",
+            "package com.acme.billing;\n\npublic class Ledger {\n    public void record() {}\n}\n",
         );
         env.file(
             "other/Island.java",
-            "class Island {}\n",
-            r#"{"kind":"type","name":"com.acme.other.Island","subkind":"class"}"#,
-            "",
+            "package com.acme.other;\n\npublic class Island {\n}\n",
         );
         let out = env.cmd(&["build"]).output().unwrap();
         assert!(out.status.success(), "{}", text(&out.stderr));
         env
     }
 
-    fn file(&self, path: &str, content: &str, declares: &str, refs: &str) {
+    fn file(&self, path: &str, content: &str) {
         let p = self.repo.join(path);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, content).unwrap();
+    }
+
+    /// Réponse d'enrichissement (schéma version 2) du LLM simulé pour un fichier.
+    fn enrichment(&self, path: &str, json: &str) {
         let m = self.mock.join(format!("{path}.json"));
         fs::create_dir_all(m.parent().unwrap()).unwrap();
-        fs::write(
-            m,
-            format!("{{\"version\":1,\"declares\":[{declares}],\"references\":[{refs}]}}"),
-        )
-        .unwrap();
+        fs::write(m, json).unwrap();
     }
 
     fn fixture(&self, json: &str) {
@@ -351,9 +344,18 @@ fn req016_ac4_request_contains_only_graph_data() {
 fn req016_ac4_context_is_bounded() {
     let env = Env::new();
     let many: Vec<String> = (0..2000)
-        .map(|i| format!(r#"{{"kind":"concept","name":"facturation{i:04}"}}"#))
+        .map(|i| {
+            format!(r#"{{"name":"facturation{i:04}","sections":["section:docs/big.md#big"]}}"#)
+        })
         .collect();
-    env.file("docs/big.md", "# big\n", &many.join(","), "");
+    env.file("docs/big.md", "# big\n");
+    env.enrichment(
+        "docs/big.md",
+        &format!(
+            r#"{{"version":2,"summaries":[],"concepts":[{}]}}"#,
+            many.join(",")
+        ),
+    );
     let o = env.cmd(&["build"]).output().unwrap();
     assert!(o.status.success(), "{}", text(&o.stderr));
     let reply = r#"{"found":true,"answer":"a","nodes":["BillingService"]}"#;

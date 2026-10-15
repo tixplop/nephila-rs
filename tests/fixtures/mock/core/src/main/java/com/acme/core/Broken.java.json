@@ -1,1 +1,0 @@
-{"version":1,"context":"package com.acme.core","declares":[{"kind":"package","name":"com.acme.core"},{"kind":"type","name":"com.acme.core.Broken","subkind":"class"},{"kind":"method","name":"com.acme.core.Broken.oops"}],"references":[]}

@@ -7,8 +7,8 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
 use super::FileStructure;
-use crate::llm::extract::{Declared, Reference};
 use crate::model::{EdgeKind, NodeKind};
+use crate::parse::{Declared, Reference};
 
 /// Événement XML simplifié : chemin d'éléments (noms locaux) depuis la racine.
 pub(crate) enum XmlEv {

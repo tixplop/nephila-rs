@@ -13,25 +13,6 @@ struct Env {
     config: PathBuf,
 }
 
-fn decl(kind: &str, name: &str, sub: Option<&str>) -> String {
-    match sub {
-        Some(s) => format!("{{\"kind\":\"{kind}\",\"name\":\"{name}\",\"subkind\":\"{s}\"}}"),
-        None => format!("{{\"kind\":\"{kind}\",\"name\":\"{name}\"}}"),
-    }
-}
-
-fn class(name: &str) -> String {
-    decl("type", name, Some("class"))
-}
-
-fn method(name: &str) -> String {
-    decl("method", name, None)
-}
-
-fn rf(source: &str, kind: &str, target: &str) -> String {
-    format!("{{\"source\":\"{source}\",\"kind\":\"{kind}\",\"target\":\"{target}\"}}")
-}
-
 impl Env {
     fn empty() -> Env {
         let tmp = tempfile::tempdir().unwrap();
@@ -47,81 +28,46 @@ impl Env {
         }
     }
 
-    fn file(&self, path: &str, declares: &[String], refs: &[String]) {
+    fn file(&self, path: &str, content: &str) {
         let p = self.repo.join(path);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(&p, "// source\n").unwrap();
-        let m = self.mock.join(format!("{path}.json"));
-        fs::create_dir_all(m.parent().unwrap()).unwrap();
-        fs::write(
-            m,
-            format!(
-                "{{\"version\":1,\"declares\":[{}],\"references\":[{}]}}",
-                declares.join(","),
-                refs.join(",")
-            ),
-        )
-        .unwrap();
+        fs::write(&p, content).unwrap();
     }
 
     fn sources(&self) {
         self.file(
             "core/OrderService.java",
-            &[
-                class("com.acme.core.OrderService"),
-                method("com.acme.core.OrderService.place"),
-            ],
-            &[
-                rf(
-                    "type:com.acme.core.OrderService",
-                    "imports",
-                    "com.acme.core.OrderRepository",
-                ),
-                rf(
-                    "method:com.acme.core.OrderService.place",
-                    "calls",
-                    "OrderRepository.save",
-                ),
-            ],
+            "package com.acme.core;\n\nimport com.acme.core.OrderRepository;\n\npublic class OrderService {\n    private OrderRepository repo;\n\n    public void place() {\n        repo.save();\n    }\n}\n",
         );
         self.file(
             "core/OrderRepository.java",
-            &[
-                decl("type", "com.acme.core.OrderRepository", Some("interface")),
-                method("com.acme.core.OrderRepository.save"),
-            ],
-            &[],
+            "package com.acme.core;\n\npublic interface OrderRepository {\n    void save();\n}\n",
         );
         self.file(
             "api/ApiController.java",
-            &[
-                class("com.acme.api.ApiController"),
-                method("com.acme.api.ApiController.create"),
-            ],
-            &[rf(
-                "method:com.acme.api.ApiController.create",
-                "calls",
-                "OrderService.place",
-            )],
+            "package com.acme.api;\n\npublic class ApiController {\n    private com.acme.core.OrderService service;\n\n    public void create() {\n        service.place();\n    }\n}\n",
         );
-        self.file("iso/Island.java", &[class("com.acme.iso.Island")], &[]);
-        let mut d = Vec::new();
+        self.file("iso/Island.java", "public class Island {\n}\n");
+        let mut many = String::from("package com.acme.many;\n\n");
         for i in 0..12 {
-            d.push(class(&format!("com.acme.many.Repo{i:02}")));
-            d.push(method(&format!("com.acme.many.Repo{i:02}.save")));
-        }
-        self.file("many/Repos.java", &d, &[]);
-        let mut d = vec![class("com.acme.hub.Hub")];
-        let mut r = Vec::new();
-        for i in 0..300 {
-            d.push(class(&format!("com.acme.hub.T{i:03}")));
-            r.push(rf(
-                "type:com.acme.hub.Hub",
-                "imports",
-                &format!("com.acme.hub.T{i:03}"),
+            many.push_str(&format!(
+                "class Repo{i:02} {{\n    void save() {{}}\n}}\n\n"
             ));
         }
-        self.file("hub/Hub.java", &d, &r);
+        self.file("many/Repos.java", &many);
+        let mut hub = String::from("package com.acme.hub;\n\n");
+        for i in 0..300 {
+            hub.push_str(&format!("import com.acme.hub.T{i:03};\n"));
+        }
+        hub.push_str("\npublic class Hub {\n}\n");
+        self.file("hub/Hub.java", &hub);
+        // Chaque type d'un fichier importe tous les imports de ce fichier : un type par fichier.
+        for i in 0..300 {
+            self.file(
+                &format!("hub/T{i:03}.java"),
+                &format!("package com.acme.hub;\n\npublic class T{i:03} {{\n}}\n"),
+            );
+        }
     }
 
     fn built() -> Env {
@@ -214,10 +160,14 @@ fn req014_ac1_neighbors_json_shape() {
     assert!(uses
         .iter()
         .any(|e| e["kind"] == "imports" && e["qualified"] == "com.acme.core.OrderRepository"));
+    // Appelé par ApiController.create et contenu par son package.
     let by = v["used_by"].as_array().unwrap();
-    assert_eq!(by.len(), 1, "{v}");
-    assert_eq!(by[0]["kind"], "calls");
-    assert_eq!(by[0]["qualified"], "com.acme.api.ApiController.create");
+    assert_eq!(by.len(), 2, "{v}");
+    let caller = by.iter().find(|e| e["kind"] == "calls").unwrap();
+    assert_eq!(caller["qualified"], "com.acme.api.ApiController.create");
+    assert!(by
+        .iter()
+        .any(|e| e["kind"] == "contains" && e["qualified"] == "com.acme.core"));
 }
 
 #[test]
@@ -264,17 +214,18 @@ fn req014_ac3_hub_with_300_links_shows_50_and_250_remaining() {
     let l = lines(&out);
     let shown = l.iter().filter(|x| x.contains("com.acme.hub.T")).count();
     assert_eq!(shown, 50, "{l:#?}");
-    assert_eq!(l.last().unwrap(), "250 résultats supplémentaires");
+    // 300 imports + le package qui contient Hub.
+    assert_eq!(l.last().unwrap(), "251 résultats supplémentaires");
 
-    let l = lines(&env.neighbors(&["Hub", "--limit", "299"]));
-    assert_eq!(l.last().unwrap(), "1 résultat supplémentaire");
     let l = lines(&env.neighbors(&["Hub", "--limit", "300"]));
+    assert_eq!(l.last().unwrap(), "1 résultat supplémentaire");
+    let l = lines(&env.neighbors(&["Hub", "--limit", "301"]));
     assert!(!l.iter().any(|x| x.contains("supplémentaire")), "{l:?}");
 
     let out = env.neighbors(&["Hub", "--limit", "7", "--json"]);
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["uses"].as_array().unwrap().len(), 7);
-    assert_eq!(v["remaining"], 293);
+    assert_eq!(v["remaining"], 294);
 }
 
 #[test]
@@ -451,9 +402,9 @@ fn req014_ac3_limit_applies_to_both_sections_together() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["uses"].as_array().unwrap().len(), 2, "{v}");
     assert_eq!(v["used_by"].as_array().unwrap().len(), 0, "{v}");
-    assert_eq!(v["remaining"], 1);
+    assert_eq!(v["remaining"], 2);
     let out = env.neighbors(&["OrderService", "--limit", "3", "--json"]);
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["used_by"].as_array().unwrap().len(), 1, "{v}");
-    assert_eq!(v["remaining"], 0);
+    assert_eq!(v["remaining"], 1);
 }

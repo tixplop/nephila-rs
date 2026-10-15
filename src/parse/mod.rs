@@ -17,11 +17,38 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
-use crate::llm::extract::{Declared, Reference};
+use crate::model::{node_id, EdgeKind, NodeKind, SubKind};
 
 pub use lang::Lang;
 
-/// Structure d'un fichier : même forme que l'ancienne `Extraction`, sans résumés.
+/// Nœud déclaré par le fichier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    pub kind: NodeKind,
+    pub qualified: String,
+    pub subkind: Option<SubKind>,
+    pub summary: Option<String>,
+    /// Nom court fixé par l'extracteur (DEC-024) ; `None` = dérivé du nom qualifié.
+    pub short: Option<String>,
+}
+
+impl Declared {
+    pub fn id(&self) -> String {
+        node_id(self.kind, &self.qualified)
+    }
+}
+
+/// Référence par nom depuis un nœud déclaré.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    /// Identifiant `genre:nom.qualifié` de la source.
+    pub source: String,
+    pub kind: EdgeKind,
+    /// Nom cible tel qu'écrit dans le fichier.
+    pub target: String,
+}
+
+/// Structure d'un fichier : nœuds déclarés, références par nom et contexte de résolution.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FileStructure {
     /// Contexte de résolution (package, imports), au format de `resolve::parse_context`.

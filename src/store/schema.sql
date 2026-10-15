@@ -34,6 +34,11 @@ CREATE TABLE declarations (
     file TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
     node TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     origin TEXT NOT NULL DEFAULT 'parse' CHECK (origin IN ('parse', 'llm')),
+    -- Attributs déclarés ; la ligne du nœud en est une projection (DEC-026).
+    short TEXT NOT NULL,
+    subkind TEXT,
+    located INTEGER NOT NULL,
+    summary TEXT,
     PRIMARY KEY (file, node)
 );
 CREATE INDEX idx_declarations_node ON declarations(node);

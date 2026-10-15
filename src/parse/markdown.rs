@@ -7,8 +7,8 @@ use std::path::Path;
 use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
 
 use super::FileStructure;
-use crate::llm::extract::{Declared, Reference};
 use crate::model::{node_id, EdgeKind, NodeKind};
+use crate::parse::{Declared, Reference};
 
 /// Ancre « à la GitHub » : minuscules, espaces → `-`, ponctuation retirée sauf `-` et `_`.
 fn anchor_of(title: &str) -> String {

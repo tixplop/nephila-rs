@@ -1,1 +1,1 @@
-{"version":1,"declares":[{"kind":"module","name":"api"}],"references":[{"source":"module:api","kind":"depends_on","target":"core"}]}
+{"version":2,"summaries":[{"node":"module:com.acme:api","summary":"Module d'exposition de l'API."}],"concepts":[]}

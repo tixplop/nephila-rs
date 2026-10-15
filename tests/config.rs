@@ -1,10 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use rkg::config::{config_path_with, Config, Provider};
-use rkg::llm::extract::{AskReply, Extraction};
 use rkg::llm::mock::{MockLlm, MockOptions};
 use rkg::llm::Llm;
-use rkg::model::{EdgeKind, NodeKind, SubKind};
+use rkg::llm::{AskReply, Enrichment};
 
 fn parse(t: &str) -> Result<Config, String> {
     Config::parse(t, Path::new("/x/config.toml")).map_err(|e| e.to_string())
@@ -98,61 +97,17 @@ fn req002_ac4_missing_env_var_named() {
     assert_eq!(local.api_key_with(&env_of(&[])).unwrap(), None);
 }
 
-// ---- schéma d'extraction (REQ-006)
+// ---- fixtures d'enrichissement (schéma version 2)
 
-const GOOD: &str = r#"{"version":1,"context":"package a;",
- "declares":[{"kind":"type","name":"OrderService","subkind":"class"},
-             {"kind":"method","name":"OrderService.place","summary":"x"}],
- "references":[{"source":"method:OrderService.place","kind":"calls","target":"OrderRepository.save"},
-               {"source":"type:OrderService","kind":"imports","target":"Order"}]}"#;
+const GOOD: &str = r#"{"version":2,"summaries":[{"node":"type:A","summary":"un"},{"node":"type:Z","summary":"deux"}],"concepts":[]}"#;
 
-#[test]
-fn req006_ac3_valid_extraction_parsed() {
-    let e = Extraction::parse(GOOD).unwrap();
-    assert_eq!(e.declares.len(), 2);
-    assert_eq!(e.declares[0].kind, NodeKind::Type);
-    assert_eq!(e.declares[0].subkind, Some(SubKind::Class));
-    assert_eq!(e.declares[1].id(), "method:OrderService.place");
-    assert_eq!(e.references[0].kind, EdgeKind::Calls);
-    assert_eq!(e.references[0].target, "OrderRepository.save");
-    assert_eq!(e.context.as_deref(), Some("package a;"));
-}
-
-#[test]
-fn req006_ac7_non_conforming_rejected() {
-    let bad = [
+fn ex(m: &MockLlm, file: &str, chunk: usize) -> rkg::error::Result<Enrichment> {
+    m.enrich(
+        file,
+        chunk,
         "",
-        "not json",
-        "[]",
-        r#"{"declares":[],"references":[]}"#,
-        r#"{"version":2,"declares":[],"references":[]}"#,
-        r#"{"version":1,"declares":[]}"#,
-        r#"{"version":1,"declares":[],"references":[],"extra":1}"#,
-        r#"{"version":1,"declares":[{"kind":"bogus","name":"A"}],"references":[]}"#,
-        r#"{"version":1,"declares":[{"kind":"type","name":""}],"references":[]}"#,
-        r#"{"version":1,"declares":[{"kind":"method","name":"A.b","subkind":"class"}],"references":[]}"#,
-        r#"{"version":1,"declares":[{"kind":"type","name":"A","subkind":"zzz"}],"references":[]}"#,
-        r#"{"version":1,"declares":[],"references":[{"source":"A","kind":"calls","target":"B"}]}"#,
-        r#"{"version":1,"declares":[],"references":[{"source":"method:A.m","kind":"calls","target":""}]}"#,
-        r#"{"version":1,"declares":[],"references":[{"source":"method:","kind":"calls","target":"B"}]}"#,
-    ];
-    for b in bad {
-        assert!(Extraction::parse(b).is_err(), "devrait échouer : {b}");
-    }
-    let e = Extraction::parse(
-        r#"{"version":1,"declares":[],"references":[{"source":"method:","kind":"calls","target":"B"}]}"#,
+        &["type:A".to_string(), "type:Z".to_string()],
     )
-    .unwrap_err()
-    .to_string();
-    assert!(e.contains("source vide"), "{e}");
-}
-
-#[test]
-fn req006_prompt_mentions_schema() {
-    let p = rkg::llm::extract::extraction_system_prompt();
-    for w in ["declares", "references", "version", "calls", "method"] {
-        assert!(p.contains(w), "{w}");
-    }
 }
 
 // ---- LLM simulé (REQ-003)
@@ -173,10 +128,10 @@ fn req003_ac1_fixture_and_empty_default() {
     let d = tempfile::tempdir().unwrap();
     let m = mock_with(d.path(), |_| {});
     std::fs::write(d.path().join("fx/src/A.java.json"), GOOD).unwrap();
-    let e = m.extract("src/A.java", 1, "code").unwrap();
-    assert_eq!(e.declares.len(), 2);
-    let e = m.extract("src/B.java", 1, "code").unwrap();
-    assert_eq!(e, Extraction::default());
+    let e = ex(&m, "src/A.java", 1).unwrap();
+    assert_eq!(e.summaries.len(), 2);
+    let e = ex(&m, "src/B.java", 1).unwrap();
+    assert_eq!(e, Enrichment::default());
 }
 
 #[test]
@@ -186,14 +141,11 @@ fn req003_ac1_chunk_fixture_preferred() {
     std::fs::write(d.path().join("fx/src/A.java.json"), GOOD).unwrap();
     std::fs::write(
         d.path().join("fx/src/A.java.2.json"),
-        r#"{"version":1,"declares":[{"kind":"type","name":"Z"}],"references":[]}"#,
+        r#"{"version":2,"summaries":[{"node":"type:Z","summary":"Z"}],"concepts":[]}"#,
     )
     .unwrap();
-    assert_eq!(m.extract("src/A.java", 1, "").unwrap().declares.len(), 2);
-    assert_eq!(
-        m.extract("src/A.java", 2, "").unwrap().declares[0].qualified,
-        "Z"
-    );
+    assert_eq!(ex(&m, "src/A.java", 1).unwrap().summaries.len(), 2);
+    assert_eq!(ex(&m, "src/A.java", 2).unwrap().summaries[0].0, "type:Z");
 }
 
 #[test]
@@ -201,24 +153,24 @@ fn req003_ac1_invalid_fixture_is_call_error() {
     let d = tempfile::tempdir().unwrap();
     let m = mock_with(d.path(), |_| {});
     std::fs::write(d.path().join("fx/src/A.java.json"), "{\"nope\":1}").unwrap();
-    assert!(m.extract("src/A.java", 1, "").is_err());
+    assert!(ex(&m, "src/A.java", 1).is_err());
 }
 
 #[test]
 fn req003_rejects_escaping_paths() {
     let d = tempfile::tempdir().unwrap();
     let m = mock_with(d.path(), |_| {});
-    assert!(m.extract("../x", 1, "").is_err());
-    assert!(m.extract("/etc/passwd", 1, "").is_err());
+    assert!(ex(&m, "../x", 1).is_err());
+    assert!(ex(&m, "/etc/passwd", 1).is_err());
 }
 
 #[test]
 fn req003_ac2_calls_are_logged() {
     let d = tempfile::tempdir().unwrap();
     let m = mock_with(d.path(), |_| {});
-    m.extract("src/A.java", 1, "").unwrap();
-    m.extract("src/A.java", 2, "").unwrap();
-    m.extract("docs/x.md", 1, "").unwrap();
+    ex(&m, "src/A.java", 1).unwrap();
+    ex(&m, "src/A.java", 2).unwrap();
+    ex(&m, "docs/x.md", 1).unwrap();
     let log = std::fs::read_to_string(d.path().join("log")).unwrap();
     assert_eq!(log, "src/A.java\t1\nsrc/A.java\t2\ndocs/x.md\t1\n");
 }
@@ -227,11 +179,11 @@ fn req003_ac2_calls_are_logged() {
 fn req003_ac3_fail_after_and_invalid_key() {
     let d = tempfile::tempdir().unwrap();
     let m = mock_with(d.path(), |o| o.fail_after = Some(2));
-    assert!(m.extract("a", 1, "").is_ok());
-    assert!(m.extract("b", 1, "").is_ok());
-    let e = m.extract("c", 1, "").unwrap_err().to_string();
+    assert!(ex(&m, "a", 1).is_ok());
+    assert!(ex(&m, "b", 1).is_ok());
+    let e = ex(&m, "c", 1).unwrap_err().to_string();
     assert!(e.contains("réseau"), "{e}");
-    assert!(m.extract("d", 1, "").is_err());
+    assert!(ex(&m, "d", 1).is_err());
     assert!(m.verify_key().is_ok());
 
     let m = mock_with(d.path(), |o| o.invalid_key = true);
@@ -243,7 +195,7 @@ fn req003_delay_is_applied() {
     let d = tempfile::tempdir().unwrap();
     let m = mock_with(d.path(), |o| o.delay_ms = 80);
     let t = std::time::Instant::now();
-    m.extract("a", 1, "").unwrap();
+    ex(&m, "a", 1).unwrap();
     assert!(t.elapsed().as_millis() >= 80);
 }
 
@@ -315,7 +267,7 @@ fn req003_from_env_with_reads_all_variables() {
     std::fs::create_dir(d.path().join("fx")).unwrap();
     std::fs::write(
         d.path().join("fx/A.java.json"),
-        r#"{"version":1,"declares":[{"kind":"type","name":"A"}],"references":[]}"#,
+        r#"{"version":2,"summaries":[{"node":"type:A","summary":"s"}],"concepts":[]}"#,
     )
     .unwrap();
     let dir = d.path().join("fx").display().to_string();
@@ -329,10 +281,10 @@ fn req003_from_env_with_reads_all_variables() {
     ]);
     let m = MockLlm::from_env_with(&env).unwrap();
     let t0 = std::time::Instant::now();
-    assert_eq!(m.extract("A.java", 1, "").unwrap().declares.len(), 1);
+    assert_eq!(ex(&m, "A.java", 1).unwrap().summaries.len(), 1);
     assert!(t0.elapsed() >= std::time::Duration::from_millis(50));
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "A.java\t1\n");
-    assert!(m.extract("A.java", 1, "").is_err());
+    assert!(ex(&m, "A.java", 1).is_err());
     assert!(m.verify_key().is_err());
 
     for v in ["0", ""] {
@@ -340,7 +292,7 @@ fn req003_from_env_with_reads_all_variables() {
         assert!(m.verify_key().is_ok(), "INVALID_KEY={v:?}");
     }
     let m = MockLlm::from_env_with(&env_of(&[])).unwrap();
-    assert!(m.extract("A.java", 1, "").unwrap().declares.is_empty());
+    assert!(ex(&m, "A.java", 1).unwrap().summaries.is_empty());
 }
 
 #[test]
@@ -374,15 +326,12 @@ fn req003_ac5_timeout_files_fail_with_timeout_and_are_logged() {
     let m = mock_with(d.path(), |o| {
         o.timeout_files = vec!["a".into(), "src/b".into()]
     });
+    assert!(matches!(ex(&m, "a", 1), Err(rkg::error::Error::Timeout(_))));
     assert!(matches!(
-        m.extract("a", 1, ""),
+        ex(&m, "src/b", 1),
         Err(rkg::error::Error::Timeout(_))
     ));
-    assert!(matches!(
-        m.extract("src/b", 1, ""),
-        Err(rkg::error::Error::Timeout(_))
-    ));
-    assert!(m.extract("c", 1, "").is_ok());
+    assert!(ex(&m, "c", 1).is_ok());
     let log = std::fs::read_to_string(d.path().join("log")).unwrap();
     assert_eq!(log, "a\t1\nsrc/b\t1\nc\t1\n");
 }
@@ -391,25 +340,15 @@ fn req003_ac5_timeout_files_fail_with_timeout_and_are_logged() {
 fn req003_ac5_key_revoked_after_n_extractions() {
     let d = tempfile::tempdir().unwrap();
     let m = mock_with(d.path(), |o| o.key_revoked_after = Some(2));
-    assert!(m.extract("a", 1, "").is_ok());
-    assert!(m.extract("b", 1, "").is_ok());
+    assert!(ex(&m, "a", 1).is_ok());
+    assert!(ex(&m, "b", 1).is_ok());
     assert!(matches!(
-        m.extract("c", 1, ""),
+        ex(&m, "c", 1),
         Err(rkg::error::Error::InvalidKey(_))
     ));
     assert!(matches!(
-        m.extract("d", 1, ""),
+        ex(&m, "d", 1),
         Err(rkg::error::Error::InvalidKey(_))
     ));
     assert!(m.verify_key().is_ok());
-}
-
-#[test]
-fn req006_ac8_disallowed_edge_is_rejected_not_fatal() {
-    let e = Extraction::parse(
-        r#"{"version":1,"declares":[],"references":[{"source":"type:A","kind":"calls","target":"B"}]}"#,
-    )
-    .unwrap();
-    assert!(e.references.is_empty());
-    assert_eq!(e.rejected.len(), 1);
 }

@@ -1,1 +1,0 @@
-{"version":1,"context":"package com.acme.domain","declares":[{"kind":"package","name":"com.acme.domain"},{"kind":"type","name":"com.acme.domain.Order","subkind":"class"}],"references":[]}

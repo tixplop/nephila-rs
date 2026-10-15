@@ -1,8 +1,7 @@
 //! Découpage des gros fichiers (REQ-007).
 
 use assert_cmd::Command;
-use rkg::chunk::{header, merge, split};
-use rkg::llm::Extraction;
+use rkg::chunk::{header, split};
 use rkg::model::{EdgeKind, NodeKind};
 use rkg::store::Store;
 use std::fs;
@@ -44,14 +43,10 @@ impl Env {
         let mock = tmp.path().join("mock");
         let mdir = mock.join("src/main/java/com/acme");
         fs::create_dir_all(&mdir).unwrap();
-        // Une fixture par morceau (jusqu'à 40) : chacun déclare le type et une méthode propre.
+        // Une fixture par morceau (jusqu'à 40) : chacun résume une méthode propre.
         for n in 1..=40 {
             let json = format!(
-                r#"{{"version":1,"context":"package com.acme;","declares":[
-                {{"kind":"package","name":"com.acme"}},
-                {{"kind":"type","name":"com.acme.Big","subkind":"class"}},
-                {{"kind":"method","name":"com.acme.Big.part{n}"}}],
-                "references":[{{"source":"method:com.acme.Big.part{n}","kind":"calls","target":"Other.go"}}]}}"#
+                r#"{{"version":2,"summaries":[{{"node":"method:com.acme.Big.m{n}","summary":"part{n}"}}],"concepts":[]}}"#
             );
             fs::write(mdir.join(format!("Big.java.{n}.json")), json).unwrap();
         }
@@ -120,20 +115,22 @@ fn req007_ac2_merged_into_one_type_with_all_methods_contained() {
     let methods: Vec<_> = nodes
         .iter()
         .filter(|n| n.kind == NodeKind::Method)
-        .map(|n| n.id.clone())
         .collect();
-    assert_eq!(methods.len(), n_calls);
+    assert_eq!(methods.len(), 20_000);
     let edges = store.edges().unwrap();
-    for m in &methods {
+    for m in methods.iter().take(50) {
         assert!(
-            edges
-                .iter()
-                .any(|e| e.kind == EdgeKind::Contains && e.source == types[0].id && &e.target == m),
-            "pas de contains vers {m}"
+            edges.iter().any(|e| e.kind == EdgeKind::Contains
+                && e.source == types[0].id
+                && e.target == m.id),
+            "pas de contains vers {}",
+            m.id
         );
     }
-    // Références dédupliquées : une par méthode (cible identique dans chaque morceau).
-    assert_eq!(store.refs().unwrap().len(), n_calls);
+    // Les résumés de tous les morceaux sont fusionnés : un par morceau.
+    let summarized: Vec<_> = methods.iter().filter(|m| m.summary.is_some()).collect();
+    assert_eq!(summarized.len(), n_calls);
+    assert_eq!(store.count_files_to_enrich().unwrap(), 0);
 }
 
 #[test]
@@ -144,7 +141,7 @@ fn req007_ac3_small_file_is_one_call() {
 }
 
 #[test]
-fn req007_failure_on_a_chunk_leaves_whole_file_pending() {
+fn req007_failure_on_a_chunk_keeps_structure_and_leaves_file_to_enrich() {
     let env = Env::new(100_000, &big_java(20_000));
     let out = env.build(Some("1"));
     assert!(!out.status.success());
@@ -152,12 +149,14 @@ fn req007_failure_on_a_chunk_leaves_whole_file_pending() {
     let files = store.files().unwrap();
     assert!(files
         .iter()
-        .all(|f| f.state == rkg::model::FileState::Pending));
-    assert!(store
-        .nodes()
-        .unwrap()
-        .iter()
-        .all(|n| n.kind != NodeKind::Method));
+        .all(|f| f.state == rkg::model::FileState::Indexed));
+    assert_eq!(store.count_files_to_enrich().unwrap(), 1);
+    let nodes = store.nodes().unwrap();
+    assert_eq!(
+        nodes.iter().filter(|n| n.kind == NodeKind::Method).count(),
+        20_000
+    );
+    assert!(nodes.iter().all(|n| n.summary.is_none()));
 }
 
 #[test]
@@ -216,25 +215,4 @@ fn req007_split_multibyte_counts_characters() {
     let parts = split(&t, 50);
     assert!(parts.len() >= 4);
     assert_eq!(parts.concat(), t);
-}
-
-#[test]
-fn req007_merge_dedups_nodes_and_references() {
-    let a = Extraction::parse(
-        r#"{"version":1,"declares":[{"kind":"type","name":"a.T","subkind":"class"},{"kind":"method","name":"a.T.f"}],
-        "references":[{"source":"method:a.T.f","kind":"calls","target":"X.y"}]}"#,
-    )
-    .unwrap();
-    let b = Extraction::parse(
-        r#"{"version":1,"context":"package a;","declares":[{"kind":"type","name":"a.T","summary":"s"},{"kind":"method","name":"a.T.g"}],
-        "references":[{"source":"method:a.T.f","kind":"calls","target":"X.y"},{"source":"method:a.T.g","kind":"calls","target":"X.y"}]}"#,
-    )
-    .unwrap();
-    let m = merge(vec![a, b]);
-    assert_eq!(m.declares.len(), 3);
-    assert_eq!(m.references.len(), 2);
-    assert_eq!(m.context.as_deref(), Some("package a;"));
-    let t = m.declares.iter().find(|d| d.qualified == "a.T").unwrap();
-    assert!(t.subkind.is_some());
-    assert_eq!(t.summary.as_deref(), Some("s"));
 }

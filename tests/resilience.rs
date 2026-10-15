@@ -1,4 +1,4 @@
-//! Reprise après échec du LLM et verrou d'écriture (REQ-010, REQ-020).
+//! Reprise après échec de l'enrichissement et verrou d'écriture (REQ-010, REQ-020).
 
 use assert_cmd::cargo::cargo_bin;
 use rkg::model::FileState;
@@ -110,6 +110,18 @@ fn paths_in_graph(env: &Env, state: FileState) -> Vec<String> {
     v
 }
 
+fn to_enrich(env: &Env) -> Vec<String> {
+    let mut v: Vec<String> = Store::open_readonly(&env.repo)
+        .unwrap()
+        .files_to_enrich()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    v.sort();
+    v
+}
+
 fn logged_paths(env: &Env) -> Vec<String> {
     let mut v: Vec<String> = fs::read_to_string(&env.log)
         .unwrap_or_default()
@@ -129,30 +141,23 @@ fn call_count(env: &Env) -> usize {
 }
 
 #[test]
-fn req010_ac1_failure_after_two_files_keeps_them_and_leaves_rest_pending() {
+fn req010_ac1_failure_after_two_files_keeps_every_structure_and_leaves_rest_to_enrich() {
     let env = Env::new();
     let out = env.run("build", &[("RKG_MOCK_FAIL_AFTER", "2")]);
     assert!(!out.status.success());
     let store = Store::open_readonly(&env.repo).unwrap();
     let files = store.files().unwrap();
-    let indexed: Vec<_> = files
-        .iter()
-        .filter(|f| f.state == FileState::Indexed)
-        .collect();
-    assert_eq!(indexed.len(), 2, "{files:?}");
     assert!(files.len() >= 8);
-    assert_eq!(
-        files.len() - 2,
-        paths_in_graph(&env, FileState::Pending).len()
-    );
-    for n in store.nodes().unwrap() {
-        if let Some(f) = &n.file {
-            assert!(
-                indexed.iter().any(|i| &i.path == f),
-                "nœud {} d'un fichier non traité",
-                n.id
-            );
-        }
+    assert!(files.iter().all(|f| f.state == FileState::Indexed));
+    assert_eq!(to_enrich(&env).len(), files.len() - 2);
+    // Tous les fichiers ont leurs nœuds dans le graphe.
+    let nodes = store.nodes().unwrap();
+    for f in files.iter().filter(|f| f.path.ends_with(".java")) {
+        assert!(
+            nodes.iter().any(|n| n.file.as_deref() == Some(&f.path)),
+            "aucun nœud pour {}",
+            f.path
+        );
     }
 }
 
@@ -191,16 +196,13 @@ fn req010_ac4_timeout_file_does_not_stop_the_others() {
     let out = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", bad)]);
     assert!(!out.status.success());
     let all = Store::open_readonly(&env.repo).unwrap().files().unwrap();
-    assert_eq!(paths_in_graph(&env, FileState::Pending), vec![bad]);
-    assert_eq!(
-        paths_in_graph(&env, FileState::Indexed).len(),
-        all.len() - 1
-    );
+    assert!(paths_in_graph(&env, FileState::Pending).is_empty());
+    assert_eq!(to_enrich(&env), vec![bad]);
     assert_eq!(logged_paths(&env).len(), all.len());
     let err = stderr(&out);
     assert!(err.contains("avertissement:") && err.contains(bad), "{err}");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("1 fichiers en attente"), "{stdout}");
+    assert!(stdout.contains("1 fichiers à enrichir"), "{stdout}");
 }
 
 #[test]
@@ -211,7 +213,7 @@ fn req010_ac4_nonconforming_fixture_does_not_stop_the_others() {
     let out = env.run("build", &[]);
     assert!(!out.status.success());
     let all = Store::open_readonly(&env.repo).unwrap().files().unwrap();
-    assert_eq!(paths_in_graph(&env, FileState::Pending), vec![bad]);
+    assert_eq!(to_enrich(&env), vec![bad]);
     assert_eq!(logged_paths(&env).len(), all.len());
 }
 
@@ -234,14 +236,11 @@ fn req010_ac4_update_behaves_the_same() {
     let out = env.run("update", &[("RKG_MOCK_TIMEOUT_FILES", bad)]);
     assert!(!out.status.success());
     assert_eq!(logged_paths(&env), changed);
-    assert_eq!(paths_in_graph(&env, FileState::Pending), vec![bad]);
-    assert_eq!(
-        paths_in_graph(&env, FileState::Indexed).len(),
-        indexed.len() - 1
-    );
+    assert!(paths_in_graph(&env, FileState::Pending).is_empty());
+    assert_eq!(to_enrich(&env), vec![bad]);
     let err = stderr(&out);
     assert!(err.contains("avertissement:") && err.contains(bad), "{err}");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("1 fichiers en attente"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 fichiers à enrichir"));
 }
 
 #[test]
@@ -261,11 +260,8 @@ fn req010_ac5_four_timeouts_do_not_stop_the_sending() {
     let out = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", &bad.join(","))]);
     assert!(!out.status.success());
     assert_eq!(logged_paths(&env), all);
-    assert_eq!(paths_in_graph(&env, FileState::Pending), bad);
-    assert_eq!(
-        paths_in_graph(&env, FileState::Indexed).len(),
-        all.len() - 4
-    );
+    assert_eq!(to_enrich(&env), bad);
+    assert_eq!(paths_in_graph(&env, FileState::Indexed).len(), all.len());
 }
 
 #[test]
@@ -277,11 +273,12 @@ fn req010_ac6_revoked_key_stops_at_first_refusal() {
     let err = stderr(&out);
     assert!(err.contains("clé"), "{err}");
     assert!(!err.contains("panne réseau"), "{err}");
-    assert_eq!(paths_in_graph(&env, FileState::Indexed).len(), 2);
+    assert_eq!(paths_in_graph(&env, FileState::Indexed).len(), 10);
+    assert_eq!(to_enrich(&env).len(), 8);
 }
 
 #[test]
-fn req010_ac7_update_after_ac4_sends_only_the_pending_file() {
+fn req010_ac7_update_after_ac4_sends_only_the_file_to_enrich() {
     let env = Env::new();
     let bad = "README.md";
     let out = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", bad)]);
@@ -290,11 +287,11 @@ fn req010_ac7_update_after_ac4_sends_only_the_pending_file() {
     let out = env.run("update", &[]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(logged_paths(&env), vec![bad]);
-    assert!(paths_in_graph(&env, FileState::Pending).is_empty());
+    assert!(to_enrich(&env).is_empty());
 }
 
 #[test]
-fn req010_ac3_killed_build_leaves_readable_graph_with_pending_files() {
+fn req010_ac3_build_killed_during_enrichment_leaves_readable_graph_with_files_to_enrich() {
     let env = Env::new();
     let mut child = env.spawn_slow_build();
     child.kill().unwrap();
@@ -302,7 +299,13 @@ fn req010_ac3_killed_build_leaves_readable_graph_with_pending_files() {
     let store = Store::open_readonly(&env.repo).expect("graphe illisible après kill -9");
     let files = store.files().unwrap();
     assert!(!files.is_empty());
-    assert!(files.iter().any(|f| f.state == FileState::Pending));
+    assert!(files.iter().all(|f| f.state == FileState::Indexed));
+    assert!(!to_enrich(&env).is_empty());
+    assert!(store
+        .nodes()
+        .unwrap()
+        .iter()
+        .any(|n| n.id == "type:com.acme.core.OrderService"));
     store.nodes().unwrap();
     store.edges().unwrap();
 }

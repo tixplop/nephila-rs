@@ -4,8 +4,8 @@ use std::path::Path;
 
 use super::maven::{read_events, warning, XmlEv};
 use super::FileStructure;
-use crate::llm::extract::{Declared, Reference};
 use crate::model::{EdgeKind, NodeKind};
+use crate::parse::{Declared, Reference};
 
 fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
     attrs

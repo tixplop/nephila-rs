@@ -310,8 +310,8 @@ fn receiver_of(o: Node, src: &[u8]) -> Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::extract::Declared;
     use crate::model::{node_id, NodeKind};
+    use crate::parse::Declared;
 
     fn fx(name: &str) -> String {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

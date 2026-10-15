@@ -1,1 +1,0 @@
-{"version":1,"declares":[{"kind":"module","name":"core"},{"kind":"dependency","name":"org.slf4j:slf4j-api"}],"references":[{"source":"module:core","kind":"depends_on","target":"org.slf4j:slf4j-api"}]}

@@ -419,8 +419,8 @@ fn receiver_of(o: Node, src: &[u8], al: &Aliases) -> Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::extract::Declared;
     use crate::model::{node_id, NodeKind};
+    use crate::parse::Declared;
 
     fn run(name: &str, text: &str) -> FileStructure {
         extract(Path::new(name), text).unwrap()

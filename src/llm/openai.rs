@@ -1,10 +1,7 @@
 //! Adaptateur compatible OpenAI Chat Completions (REQ-002) : OpenAI, Ollama, llama.cpp, vLLM.
 
+use super::ask::{ask_system_prompt, ask_user_prompt, AskReply};
 use super::enrich::{enrichment_system_prompt, enrichment_user_prompt};
-use super::extract::{
-    ask_system_prompt, ask_user_prompt, extraction_system_prompt, extraction_user_prompt, AskReply,
-    Extraction,
-};
 use super::Enrichment;
 use super::{http, Llm};
 use crate::error::{Error, Result};
@@ -68,14 +65,6 @@ impl OpenAiLlm {
 impl Llm for OpenAiLlm {
     fn verify_key(&self) -> Result<()> {
         http::send("openai", self.request("GET", "/v1/models"), None).map(|_| ())
-    }
-
-    fn extract(&self, file: &str, chunk: usize, text: &str) -> Result<Extraction> {
-        let out = self.complete(
-            extraction_system_prompt(),
-            extraction_user_prompt(file, chunk, text),
-        )?;
-        Extraction::parse(http::extract_json(&out)?)
     }
 
     fn enrich(

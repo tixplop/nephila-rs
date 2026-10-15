@@ -1,9 +1,6 @@
 //! Découpage des gros fichiers (REQ-007) : coupes sur fins de ligne, en-tête répété et fusion.
 
-use std::collections::HashSet;
-
 use crate::llm::enrich::{Concept, Enrichment};
-use crate::llm::Extraction;
 
 /// Nombre de lignes de tête examinées pour trouver package, imports et type englobant.
 const HEADER_SCAN_LINES: usize = 300;
@@ -97,39 +94,6 @@ pub fn split(text: &str, max_chars: usize) -> Vec<String> {
         parts.push(cur);
     }
     parts
-}
-
-/// Fusionne les extractions des morceaux d'un même fichier : nœuds de même identifiant fusionnés
-/// (les champs absents sont complétés), références dédupliquées, premier contexte conservé.
-pub fn merge(parts: Vec<Extraction>) -> Extraction {
-    let mut out = Extraction::default();
-    let mut refs: HashSet<(String, String, String)> = HashSet::new();
-    for p in parts {
-        if out.context.is_none() {
-            out.context = p.context;
-        }
-        for d in p.declares {
-            let id = d.id();
-            match out.declares.iter_mut().find(|e| e.id() == id) {
-                Some(e) => {
-                    if e.subkind.is_none() {
-                        e.subkind = d.subkind;
-                    }
-                    if e.summary.is_none() {
-                        e.summary = d.summary;
-                    }
-                }
-                None => out.declares.push(d),
-            }
-        }
-        out.rejected.extend(p.rejected);
-        for r in p.references {
-            if refs.insert((r.source.clone(), r.kind.to_string(), r.target.clone())) {
-                out.references.push(r);
-            }
-        }
-    }
-    out
 }
 
 /// Fusionne les enrichissements des morceaux d'un même fichier : premier résumé non vide par
