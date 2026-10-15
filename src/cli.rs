@@ -24,6 +24,14 @@ pub struct JsonOpt {
     pub json: bool,
 }
 
+/// Entier strictement positif (REQ-028).
+fn parse_batch_files(s: &str) -> std::result::Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        _ => Err(format!("`{s}` n'est pas un entier strictement positif")),
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct IndexOpts {
     /// N'appelle pas le LLM (la configuration n'est pas lue) : structure seule, sans enrichissement
@@ -32,6 +40,9 @@ pub struct IndexOpts {
     /// Traces synthétiques des étapes et des appels LLM sur stderr (préfixe `trace:`)
     #[arg(short, long)]
     pub verbose: bool,
+    /// Nombre maximal de fichiers par appel d'enrichissement (remplace `batch_files` de la configuration)
+    #[arg(long, value_name = "N", value_parser = parse_batch_files, allow_hyphen_values = true)]
+    pub batch_files: Option<usize>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -103,8 +114,12 @@ pub enum Query {
 /// Exécute la commande.
 pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
-        Command::Build(o) => crate::index::build::run(&cli.repo, o.no_llm, o.verbose),
-        Command::Update(o) => crate::index::update::run(&cli.repo, o.no_llm, o.verbose),
+        Command::Build(o) => {
+            crate::index::build::run(&cli.repo, o.no_llm, o.verbose, o.batch_files)
+        }
+        Command::Update(o) => {
+            crate::index::update::run(&cli.repo, o.no_llm, o.verbose, o.batch_files)
+        }
         Command::Status(j) => crate::status::run(&cli.repo, j.json),
         Command::Summary(j) => crate::summary::run(&cli.repo, j.json),
         Command::Export { output, format } => {

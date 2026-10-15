@@ -70,7 +70,7 @@ pub(crate) struct Setup {
 
 /// Prépare une commande d'indexation : avec `--no-llm` la configuration n'est pas lue ; sans
 /// fichier de configuration le LLM est inactif ; sinon validation et vérification de la clé.
-pub(crate) fn setup(no_llm: bool) -> Result<Setup> {
+pub(crate) fn setup(no_llm: bool, batch_files: Option<usize>) -> Result<Setup> {
     if no_llm {
         trace!("config: llm inactif (--no-llm)");
         return Ok(Setup {
@@ -86,7 +86,10 @@ pub(crate) fn setup(no_llm: bool) -> Result<Setup> {
                 llm: None,
             })
         }
-        Some(config) => {
+        Some(mut config) => {
+            if let Some(n) = batch_files {
+                config.batch_files = n;
+            }
             trace!(
                 "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={}",
                 config.provider.as_str(),
@@ -135,10 +138,10 @@ impl BuildReport {
 }
 
 /// Point d'entrée de `rkg build` : valide le dépôt, la configuration et la clé, puis construit.
-pub fn run(repo: &Path, no_llm: bool, verbose: bool) -> Result<()> {
+pub fn run(repo: &Path, no_llm: bool, verbose: bool, batch_files: Option<usize>) -> Result<()> {
     trace::init(verbose);
     check_repo(repo)?;
-    let setup = setup(no_llm)?;
+    let setup = setup(no_llm, batch_files)?;
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
     let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock)?;

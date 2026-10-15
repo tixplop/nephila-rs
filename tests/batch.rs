@@ -119,6 +119,10 @@ fn files_of(line: &str) -> Vec<String> {
         .collect()
 }
 
+fn fnames(r: std::ops::Range<usize>) -> Vec<String> {
+    r.map(|i| format!("src/F{i:02}.java")).collect()
+}
+
 fn to_enrich(env: &Env) -> usize {
     Store::open_readonly(&env.repo)
         .unwrap()
@@ -578,4 +582,164 @@ fn req027_ac8_version_2_reply_for_a_lot_fails_all_its_files() {
         vec!["src/F00.java", "src/F01.java", "src/F02.java"]
     );
     assert_eq!(env.summaries().len(), 3);
+}
+
+// ---- REQ-028 : option --batch-files ----
+
+fn config_without_batch(env: &Env) {
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn req028_ac1_help_mentions_batch_files() {
+    for sub in ["build", "update"] {
+        let o = Command::new(cargo_bin("rkg"))
+            .args([sub, "--help"])
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        assert!(String::from_utf8_lossy(&o.stdout).contains("--batch-files"));
+    }
+}
+
+#[test]
+fn req028_ac2_option_overrides_file_and_default() {
+    let env = Env::new(10, 1, 1);
+    let o = env.run("build --batch-files 4", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let batches: Vec<Vec<String>> = env.log_lines().iter().map(|l| files_of(l)).collect();
+    assert_eq!(batches, vec![fnames(0..4), fnames(4..8), fnames(8..10)]);
+
+    let env = Env::new(10, 4, 1);
+    let o = env.run("build --batch-files 1", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(env.log_lines().len(), 10);
+
+    let env = Env::new(10, 4, 1);
+    config_without_batch(&env);
+    let o = env.run("build", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(env.log_lines().len(), 10);
+}
+
+#[test]
+fn req028_ac3_update_uses_option() {
+    let env = Env::new(10, 1, 1);
+    config_without_batch(&env);
+    assert!(env.run("build", &[]).status.success());
+    for i in 0..4 {
+        fs::write(
+            env.repo.join(format!("src/F{i:02}.java")),
+            format!("package p;\npublic class F{i:02} {{ int x; }}\n"),
+        )
+        .unwrap();
+    }
+    fs::remove_file(&env.log).unwrap();
+    let o = env.run("update --batch-files 2", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let batches: Vec<Vec<String>> = env.log_lines().iter().map(|l| files_of(l)).collect();
+    assert_eq!(batches, vec![fnames(0..2), fnames(2..4)]);
+}
+
+fn rkg_tree(repo: &Path) -> Vec<(String, u64)> {
+    fn walk(d: &Path, out: &mut Vec<(String, u64)>) {
+        if let Ok(rd) = fs::read_dir(d) {
+            for e in rd.flatten() {
+                let m = e.metadata().unwrap();
+                out.push((e.path().display().to_string(), m.len()));
+                if m.is_dir() {
+                    walk(&e.path(), out);
+                }
+            }
+        }
+    }
+    let mut v = Vec::new();
+    walk(&repo.join(".rkg"), &mut v);
+    v.sort();
+    v
+}
+
+#[test]
+fn req028_ac4_invalid_values_are_usage_errors_without_side_effects() {
+    for sub in ["build", "update"] {
+        for bad in ["0", "-3", "abc"] {
+            let env = Env::new(3, 1, 1);
+            for form in [
+                format!("--batch-files={bad}"),
+                format!("--batch-files {bad}"),
+            ] {
+                let o = env.run(&format!("{sub} {form}"), &[]);
+                assert!(!o.status.success(), "{sub} {form}");
+                assert!(
+                    stderr(&o).contains("--batch-files"),
+                    "{form}: {}",
+                    stderr(&o)
+                );
+                assert!(!env.log.exists());
+                assert!(rkg_tree(&env.repo).is_empty());
+            }
+        }
+    }
+    // Après un build, un update refusé ne modifie rien sous .rkg/.
+    let env = Env::new(3, 1, 1);
+    assert!(env.run("build", &[]).status.success());
+    let before = rkg_tree(&env.repo);
+    fs::remove_file(&env.log).unwrap();
+    let o = env.run("update --batch-files 0", &[]);
+    assert!(!o.status.success());
+    assert!(!env.log.exists());
+    assert_eq!(rkg_tree(&env.repo), before);
+}
+
+#[test]
+fn req028_ac5_option_ignored_without_llm_but_file_still_validated() {
+    let env = Env::new(3, 1, 1);
+    fs::write(&env.config, "provider = \"nope\"\n").unwrap();
+    let o = env.run("build --no-llm --batch-files 4", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(!env.log.exists());
+
+    let env = Env::new(3, 1, 1);
+    let o = env.run(
+        "build --batch-files 4",
+        &[("RKG_CONFIG", "/nonexistent/c.toml")],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(!env.log.exists());
+
+    let env = Env::new(3, 1, 1);
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nbatch_files = 0\n",
+    )
+    .unwrap();
+    let o = env.run("build --batch-files 4", &[]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("batch_files"), "{}", stderr(&o));
+    assert!(!env.log.exists());
+}
+
+#[test]
+fn req028_ac6_verbose_config_line_shows_effective_value() {
+    let env = Env::new(3, 8, 1);
+    let o = env.run("build --verbose --batch-files 3", &[]);
+    let err = stderr(&o);
+    assert!(
+        err.lines().any(|l| l.starts_with("trace:")
+            && l.contains("config")
+            && l.contains("batch_files=3")),
+        "{err}"
+    );
+    let env = Env::new(3, 8, 1);
+    let err = stderr(&env.run("build --verbose", &[]));
+    assert!(
+        err.lines().any(|l| l.starts_with("trace:")
+            && l.contains("config")
+            && l.contains("batch_files=8")),
+        "{err}"
+    );
 }

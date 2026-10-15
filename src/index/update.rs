@@ -16,10 +16,10 @@ use crate::trace;
 
 /// Point d'entrée de `rkg update` : mêmes contrôles que `build` (dépôt, configuration, clé,
 /// verrou) ; sans graphe, bascule sur un build complet.
-pub fn run(repo: &Path, no_llm: bool, verbose: bool) -> Result<()> {
+pub fn run(repo: &Path, no_llm: bool, verbose: bool, batch_files: Option<usize>) -> Result<()> {
     trace::init(verbose);
     build::check_repo(repo)?;
-    let setup = build::setup(no_llm)?;
+    let setup = build::setup(no_llm, batch_files)?;
     let lock = RepoLock::acquire(repo)?;
     // Le test d'existence se fait sous verrou : aucun build concurrent ne peut le créer entre-temps.
     if !db_path(repo).is_file() {

@@ -2,7 +2,7 @@
 
 `rkg` analyse un dépôt (Java, Kotlin, Groovy, Scala, fichiers de build Maven/Gradle/Ivy, Markdown), stocke le résultat dans un graphe SQLite local (nœuds : modules, types, méthodes, documents... ; liens : `contains`, `calls`...) et permet de l'interroger sans LLM, sauf pour `query ask`.
 
-Depuis la version 0.4.0, `rkg export --format html` produit une page d'exploration autonome, et `rkg export` écrit désormais dans un fichier (voir `rkg export`). La version 0.5.0 ajoute l'option `-v/--verbose` à `build` et `update` (traces sur stderr). La version 0.6.0 ajoute la clé `batch_files` (enrichissement en lots, voir « Enrichissement en lots »).
+Depuis la version 0.4.0, `rkg export --format html` produit une page d'exploration autonome, et `rkg export` écrit désormais dans un fichier (voir `rkg export`). La version 0.5.0 ajoute l'option `-v/--verbose` à `build` et `update` (traces sur stderr). La version 0.6.0 ajoute la clé `batch_files` (enrichissement en lots, voir « Enrichissement en lots »). La version 0.7.0 ajoute l'option `--batch-files <N>` à `build` et `update`.
 
 Depuis la version 0.3.0, la structure du graphe vient d'une analyse syntaxique locale, sans LLM. Le LLM est facultatif : il ne sert qu'à enrichir le graphe (résumés des nœuds, concepts des documents Markdown) et à répondre à `query ask`. Sans configuration, ou avec `--no-llm`, `build` et `update` produisent la structure seule.
 
@@ -105,14 +105,14 @@ Le graphe est stocké dans `<dépôt>/.rkg/` (`graph.db`, fichiers WAL, `lock`).
 Option globale : `-C/--repo <dossier>` (racine du dépôt, défaut : dossier courant). Les exemples ci-dessous viennent d'un petit dépôt avec le fournisseur `mock`.
 
 ### `rkg build`
-Reconstruit entièrement le graphe : analyse locale de chaque fichier, puis, si le LLM est actif, un appel d'enrichissement par fichier (ou morceau). Option `--no-llm` : structure seule, sans lire la configuration.
+Reconstruit entièrement le graphe : analyse locale de chaque fichier, puis, si le LLM est actif, un appel d'enrichissement par fichier (ou morceau). Option `--no-llm` : structure seule, sans lire la configuration. Option `--batch-files <N>` (entier > 0) : taille de lot pour cette commande, voir « Enrichissement en lots ».
 ```
 $ rkg -C repo build
 build terminé : 2 fichiers traités, 4 nœuds, 3 liens, 0 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir
 ```
 
 ### `rkg update`
-Ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus les fichiers en attente ou à enrichir ; même format de sortie et même option `--no-llm` que `build`.
+Ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus les fichiers en attente ou à enrichir ; même format de sortie et mêmes options `--no-llm` et `--batch-files <N>` que `build`.
 ```
 $ rkg -C repo update
 update terminé : 2 fichiers traités, 2 nœuds, 1 liens, 0 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir
@@ -225,6 +225,7 @@ Par défaut (`batch_files = 1`), un appel LLM porte un seul fichier. Pour un dé
 
 - Les fichiers à enrichir sont pris dans l'ordre des chemins ; un lot ne dépasse jamais `batch_files` fichiers, ni `max_chunk_chars` octets au total.
 - Un fichier plus gros que `max_chunk_chars` n'entre dans aucun lot : il est envoyé seul, en morceaux successifs.
+- Option `--batch-files <N>` (`build` et `update`) : priorité option > clé `batch_files` du fichier > défaut 1. Utile pour essayer une taille de lot sans éditer la configuration ; elle ne s'applique qu'à la commande en cours et n'écrit rien. `N` doit être un entier > 0 (sinon erreur d'usage). Sans LLM actif (`--no-llm` ou aucune configuration), elle est acceptée sans effet ; un `batch_files` invalide dans le fichier reste une erreur.
 - Effet combiné : `concurrency` lots sont en vol en même temps, soit jusqu'à `concurrency` x `batch_files` fichiers traités simultanément.
 - Échec d'un lot (délai dépassé, réseau, réponse non conforme, clé refusée) : tous ses fichiers restent « à enrichir », sont nommés sur stderr, et sont repris par le prochain `rkg update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse d'un lot échoue seul.
 - Limite connue : si la réponse est tronquée par la limite de jetons de sortie du modèle, elle est non conforme et tout le lot échoue ; réduisez alors `batch_files`.
