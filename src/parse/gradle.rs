@@ -359,10 +359,12 @@ fn module_structure(path: &Path, ctx: &ParseCtx) -> FileStructure {
         } else {
             base.rsplit('/').next().map(str::to_string)
         };
-        match own.filter(|n| !n.is_empty()).or(folder) {
-            Some(s) => (":".to_string(), s),
-            None => return FileStructure::default(),
-        }
+        // Aucun nom de dossier (racine `/`) : le module est tout de même déclaré, sous le nom `:`.
+        let short = own
+            .filter(|n| !n.is_empty())
+            .or(folder)
+            .unwrap_or_else(|| ":".to_string());
+        (":".to_string(), short)
     } else {
         let last = segments[segments.len() - 1].to_string();
         (format!(":{}", segments.join(":")), last)
@@ -427,6 +429,24 @@ mod tests {
         assert_eq!((q.as_str(), s.as_deref()), (":", Some("monrepo")));
         let (_, s) = decl("build.gradle", &ctx(&[]));
         assert_eq!(s.as_deref(), Some("monrepo"));
+    }
+
+    #[test]
+    fn racine_sans_nom_de_dossier_garde_le_module() {
+        for root in [Some(PathBuf::from("/")), None] {
+            let mut c = ctx(&[]);
+            c.repo_root = root;
+            let f = super::super::extract(
+                Path::new("build.gradle"),
+                "dependencies { implementation 'org.slf4j:slf4j-api:2.0.9' }",
+                &c,
+            )
+            .unwrap();
+            assert_eq!(f.declares.len(), 1);
+            assert_eq!(f.declares[0].qualified, ":");
+            assert_eq!(f.declares[0].short.as_deref(), Some(":"));
+            assert_eq!(f.references.len(), 1, "{:?}", f.references);
+        }
     }
 
     fn build(path: &str, text: &str) -> FileStructure {

@@ -35,7 +35,8 @@ pub(crate) fn analyze(
     report: &mut BuildReport,
 ) -> Result<()> {
     let ctx = ParseCtx {
-        repo_root: Some(repo.to_path_buf()),
+        // Chemin absolu : `.` n'a pas de nom de dossier (module Gradle racine).
+        repo_root: Some(repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf())),
         gradle_settings: gradle_settings.clone(),
     };
     let queue: Mutex<VecDeque<&ScannedFile>> = Mutex::new(files.iter().collect());

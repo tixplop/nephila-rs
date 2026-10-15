@@ -273,3 +273,53 @@ fn req001_ac4_and_req017_on_gradle_repo_without_llm_configuration() {
         assert!(text(&out.stderr).contains("rkg build"), "{args:?}");
     }
 }
+
+fn rkg_in(dir: &Path, args: &[&str]) -> Output {
+    let out = Command::new(cargo_bin("rkg"))
+        .current_dir(dir)
+        .args(args)
+        .env("RKG_CONFIG", dir.join("absent.toml"))
+        .env_remove("RKG_MOCK_DIR")
+        .env_remove("RKG_MOCK_LOG")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{args:?} {}", text(&out.stderr));
+    out
+}
+
+fn assert_monrepo_module(dir: &Path, args: &[&str]) {
+    let v: Value = serde_json::from_slice(&rkg_in(dir, args).stdout).unwrap();
+    assert_eq!(node(&v, "module::").unwrap()["short"], "monrepo", "{v}");
+    assert!(
+        has_edge(
+            &v,
+            "module::",
+            "depends_on",
+            "dependency:org.slf4j:slf4j-api"
+        ),
+        "{v}"
+    );
+}
+
+#[test]
+fn req022_ac10_root_module_named_after_folder_without_dash_c() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("monrepo");
+    fs::create_dir_all(repo.join("sub")).unwrap();
+    let script = "dependencies {\n    implementation 'org.slf4j:slf4j-api:2.0.9'\n}\n";
+    fs::write(repo.join("build.gradle"), script).unwrap();
+
+    rkg_in(&repo, &["build"]);
+    assert_monrepo_module(&repo, &["export"]);
+
+    rkg_in(&repo.join("sub"), &["-C", "..", "build"]);
+    assert_monrepo_module(&repo, &["export"]);
+
+    fs::write(
+        repo.join("build.gradle"),
+        "dependencies {\n    implementation 'org.slf4j:slf4j-api:2.0.9'\n    // modifié\n}\n",
+    )
+    .unwrap();
+    rkg_in(&repo, &["update"]);
+    assert_monrepo_module(&repo, &["export"]);
+}
