@@ -1,5 +1,7 @@
 //! Extraction de la structure d'un fichier par analyse syntaxique (DEC-016 à DEC-020).
 
+pub mod java;
+pub mod jvm;
 pub mod lang;
 
 use std::path::{Path, PathBuf};
@@ -25,13 +27,13 @@ pub struct ParseCtx {
     pub repo_root: Option<PathBuf>,
 }
 
-/// Extrait la structure de `text`. Renvoie pour l'instant une structure vide par langage ;
-/// un fichier de type inconnu donne aussi une structure vide.
+/// Extrait la structure de `text`. Java est extrait ; les autres langages renvoient pour
+/// l'instant une structure vide, comme un fichier de type inconnu.
 pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure> {
-    let _ = (text, ctx);
+    let _ = ctx;
     match Lang::from_path(path) {
-        Some(Lang::Java)
-        | Some(Lang::Kotlin)
+        Some(Lang::Java) => java::extract(text),
+        Some(Lang::Kotlin)
         | Some(Lang::KotlinGradle)
         | Some(Lang::Scala)
         | Some(Lang::Groovy)
