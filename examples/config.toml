@@ -2,6 +2,9 @@
 # Emplacement : $RKG_CONFIG, sinon $XDG_CONFIG_HOME/rkg/config.toml,
 # sinon ~/.config/rkg/config.toml.
 # Gardez une seule section `provider` active.
+#
+# Ce fichier est facultatif : sans lui (ou avec `rkg build --no-llm`), rkg construit la
+# structure du graphe sans LLM. Le LLM sert à enrichir (résumés, concepts) et à `query ask`.
 
 # --- Anthropic ---
 provider = "anthropic"
