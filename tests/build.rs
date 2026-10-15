@@ -327,6 +327,53 @@ fn req006_ac2_reference_from_undeclared_source_is_dropped_with_warning() {
 }
 
 #[test]
+fn req006_ac8_disallowed_edge_kinds_are_dropped_with_one_warning() {
+    for concurrency in [1, 4] {
+        let env = Env::new();
+        let svc = "core/src/main/java/com/acme/core/OrderService.java";
+        fs::write(
+            env.mock.join(format!("{svc}.json")),
+            r#"{"version":1,"declares":[{"kind":"type","name":"com.acme.core.OrderService","subkind":"class"},{"kind":"method","name":"com.acme.core.OrderService.place"}],"references":[{"source":"type:com.acme.core.OrderService","kind":"calls","target":"Foo.bar"},{"source":"type:com.acme.core.OrderService","kind":"uses","target":"Zed"},{"source":"type:com.acme.core.OrderService","kind":"imports","target":"Order"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &env.config,
+            format!("provider = \"mock\"\nconcurrency = {concurrency}\n"),
+        )
+        .unwrap();
+        let out = env.build_ok();
+        let err = stderr(&out);
+        let warns: Vec<&str> = err
+            .lines()
+            .filter(|l| l.starts_with("avertissement:") && l.contains("OrderService.java"))
+            .collect();
+        assert_eq!(warns.len(), 1, "{err}");
+        assert!(warns[0].contains("2 référence(s) écartée(s)"), "{err}");
+        assert!(warns[0].contains("genre de lien non autorisé"), "{err}");
+        let store = env.store();
+        let f = store.files().unwrap();
+        assert_eq!(
+            f.iter().find(|f| f.path == svc).unwrap().state,
+            FileState::Indexed
+        );
+        assert!(store
+            .nodes()
+            .unwrap()
+            .iter()
+            .any(|n| n.id == "method:com.acme.core.OrderService.place"));
+        let refs = store.refs().unwrap();
+        assert!(!refs
+            .iter()
+            .any(|r| r.target_name == "Foo.bar" || r.target_name == "Zed"));
+        assert!(refs
+            .iter()
+            .any(|r| r.source == "type:com.acme.core.OrderService" && r.target_name == "Order"));
+        let ex = env.cmd().arg("export").output().unwrap();
+        assert!(!stdout(&ex).contains("Zed") && !stdout(&ex).contains("Foo.bar"));
+    }
+}
+
+#[test]
 fn req009_ac5_empty_repo_gives_empty_graph_and_warning() {
     let env = Env::empty();
     fs::write(env.repo.join("script.py"), "print(1)").unwrap();

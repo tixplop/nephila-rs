@@ -121,6 +121,7 @@ pub fn merge(parts: Vec<Extraction>) -> Extraction {
                 None => out.declares.push(d),
             }
         }
+        out.rejected.extend(p.rejected);
         for r in p.references {
             if refs.insert((r.source.clone(), r.kind.to_string(), r.target.clone())) {
                 out.references.push(r);

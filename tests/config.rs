@@ -133,7 +133,6 @@ fn req006_ac7_non_conforming_rejected() {
         r#"{"version":1,"declares":[{"kind":"method","name":"A.b","subkind":"class"}],"references":[]}"#,
         r#"{"version":1,"declares":[{"kind":"type","name":"A","subkind":"zzz"}],"references":[]}"#,
         r#"{"version":1,"declares":[],"references":[{"source":"A","kind":"calls","target":"B"}]}"#,
-        r#"{"version":1,"declares":[],"references":[{"source":"type:A","kind":"calls","target":"B"}]}"#,
         r#"{"version":1,"declares":[],"references":[{"source":"method:A.m","kind":"calls","target":""}]}"#,
         r#"{"version":1,"declares":[],"references":[{"source":"method:","kind":"calls","target":"B"}]}"#,
     ];
@@ -403,4 +402,14 @@ fn req003_ac5_key_revoked_after_n_extractions() {
         Err(rkg::error::Error::InvalidKey(_))
     ));
     assert!(m.verify_key().is_ok());
+}
+
+#[test]
+fn req006_ac8_disallowed_edge_is_rejected_not_fatal() {
+    let e = Extraction::parse(
+        r#"{"version":1,"declares":[],"references":[{"source":"type:A","kind":"calls","target":"B"}]}"#,
+    )
+    .unwrap();
+    assert!(e.references.is_empty());
+    assert_eq!(e.rejected.len(), 1);
 }

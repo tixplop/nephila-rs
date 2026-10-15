@@ -265,6 +265,13 @@ pub(crate) fn extract_all(
                     if write_error.is_some() {
                         continue;
                     }
+                    if !x.rejected.is_empty() {
+                        warn(&format!(
+                            "{path} : {} référence(s) écartée(s), genre de lien non autorisé : {}",
+                            x.rejected.len(),
+                            x.rejected.join(" ; ")
+                        ));
+                    }
                     let (nodes, refs, dropped) = to_records(&path, x);
                     if dropped > 0 {
                         warn(&format!(
