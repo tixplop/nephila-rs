@@ -4,15 +4,16 @@
 //! Un type est traité avec les méthodes qu'il contient : leurs liens comptent comme les
 //! siens, et les liens internes au groupe ne sont pas des voisins.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::{json, Value};
 
+use super::graph::Lazy;
 use super::lookup;
 use super::search::DEFAULT_LIMIT;
 use crate::error::{Error, Result};
-use crate::model::{Edge, EdgeKind, Node, NodeKind};
+use crate::model::{EdgeKind, Node, NodeKind};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -27,57 +28,36 @@ struct Found {
 }
 
 /// Un nœud et, pour un type, ses méthodes contenues.
-fn group(
-    id: &str,
-    nodes: &HashMap<&str, &Node>,
-    members: &HashMap<&str, Vec<&str>>,
-) -> Vec<String> {
-    let mut g = vec![id.to_string()];
-    if nodes.get(id).is_some_and(|n| n.kind == NodeKind::Type) {
-        if let Some(ms) = members.get(id) {
-            g.extend(ms.iter().map(|m| m.to_string()));
+fn group(id: &str, g: &Lazy) -> Result<Vec<String>> {
+    let mut out = vec![id.to_string()];
+    if g.node(id)?.is_some_and(|n| n.kind == NodeKind::Type) {
+        for (target, kind) in g.edges_at(id, true)? {
+            if kind == EdgeKind::Contains
+                && g.node(&target)?.is_some_and(|n| n.kind == NodeKind::Method)
+            {
+                out.push(target);
+            }
         }
     }
-    g
+    Ok(out)
 }
 
-fn explore(
-    start: &Node,
-    dir: Direction,
-    depth: usize,
-    edges: &[Edge],
-    nodes: &HashMap<&str, &Node>,
-    members: &HashMap<&str, Vec<&str>>,
-) -> Vec<Found> {
-    let mut visited: HashSet<String> = group(&start.id, nodes, members).into_iter().collect();
-    // Adjacence indexée : nœud proche -> (nœud lointain, genre de lien).
-    let mut adj: HashMap<&str, Vec<(&str, EdgeKind)>> = HashMap::new();
-    for e in edges {
-        let (near, far) = match dir {
-            Direction::Out => (&e.source, &e.target),
-            Direction::In => (&e.target, &e.source),
-        };
-        adj.entry(near.as_str())
-            .or_default()
-            .push((far.as_str(), e.kind));
-    }
+fn explore(start: &Node, dir: Direction, depth: usize, g: &Lazy) -> Result<Vec<Found>> {
+    let outgoing = dir == Direction::Out;
+    let mut visited: HashSet<String> = group(&start.id, g)?.into_iter().collect();
     let mut frontier = vec![start.id.clone()];
     let mut out = Vec::new();
     for level in 1..=depth {
         let mut level_found: Vec<Found> = Vec::new();
-        let mut next = Vec::new();
+        let mut next: Vec<String> = Vec::new();
         for id in &frontier {
-            let g: HashSet<String> = group(id, nodes, members).into_iter().collect();
-            for member in &g {
-                for &(far, kind) in adj
-                    .get(member.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or_default()
-                {
-                    if g.contains(far) {
+            let members: HashSet<String> = group(id, g)?.into_iter().collect();
+            for member in &members {
+                for (far, kind) in g.edges_at(member, outgoing)? {
+                    if members.contains(&far) {
                         continue;
                     }
-                    let Some(node) = nodes.get(far) else {
+                    let Some(node) = g.node(&far)? else {
                         continue;
                     };
                     // Une même cible peut apparaître par plusieurs genres de lien.
@@ -87,16 +67,16 @@ fn explore(
                     {
                         continue;
                     }
-                    if visited.contains(far) && !level_found.iter().any(|f| f.node.id == far) {
+                    if visited.contains(&far) && !level_found.iter().any(|f| f.node.id == far) {
                         continue;
                     }
                     level_found.push(Found {
                         kind,
                         depth: level,
-                        node: (*node).clone(),
+                        node,
                     });
-                    if !next.iter().any(|n| n == far) {
-                        next.push(far.to_string());
+                    if !next.contains(&far) {
+                        next.push(far);
                     }
                 }
             }
@@ -109,9 +89,7 @@ fn explore(
                 .then_with(|| a.node.id.cmp(&b.node.id))
         });
         for id in &next {
-            for m in group(id, nodes, members) {
-                visited.insert(m);
-            }
+            visited.extend(group(id, g)?);
         }
         out.extend(level_found);
         frontier = next;
@@ -119,7 +97,7 @@ fn explore(
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 fn to_json(f: &Found) -> Value {
@@ -149,20 +127,9 @@ pub fn run(
     }
     let store = super::open(repo)?;
     let start = lookup::require(&store, name)?;
-    let all = store.nodes()?;
-    let edges = store.edges()?;
-    let nodes: HashMap<&str, &Node> = all.iter().map(|n| (n.id.as_str(), n)).collect();
-    let mut members: HashMap<&str, Vec<&str>> = HashMap::new();
-    for e in &edges {
-        let method = nodes
-            .get(e.target.as_str())
-            .is_some_and(|n| n.kind == NodeKind::Method);
-        if e.kind == EdgeKind::Contains && method {
-            members.entry(&e.source).or_default().push(&e.target);
-        }
-    }
-    let uses = explore(&start, Direction::Out, depth, &edges, &nodes, &members);
-    let used_by = explore(&start, Direction::In, depth, &edges, &nodes, &members);
+    let graph = Lazy::new(&store);
+    let uses = explore(&start, Direction::Out, depth, &graph)?;
+    let used_by = explore(&start, Direction::In, depth, &graph)?;
 
     let total = uses.len() + used_by.len();
     let remaining = total.saturating_sub(limit);

@@ -126,7 +126,34 @@ fn perf_req021_ac3_update_one_modified_file() {
     let path = f.repo.join(gen_repo::java_path(1234));
     let text = std::fs::read_to_string(&path).unwrap();
     std::fs::write(&path, format!("{text}// modifié\n")).unwrap();
-    let (d, out) = timed(f, &["update"]);
+    let log = f.repo.parent().unwrap().join("mock.log");
+    let _ = std::fs::remove_file(&log);
+    let (d, out) = {
+        let t = Instant::now();
+        let out = cmd(f, &["update"])
+            .env("RKG_MOCK_LOG", &log)
+            .output()
+            .unwrap();
+        let d = t.elapsed();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (d, out)
+    };
+    let logged = std::fs::read_to_string(&log).unwrap();
+    let called: Vec<&str> = logged
+        .lines()
+        .map(|l| l.split('\t').next().unwrap())
+        .collect();
+    assert_eq!(called, vec![gen_repo::java_path(1234)], "{logged}");
+    let (_, found) = timed(f, &["query", "search", gen_repo::SUMMARY_WORD]);
+    assert!(
+        String::from_utf8_lossy(&found.stdout).contains(&gen_repo::class_name(1234)),
+        "{}",
+        String::from_utf8_lossy(&found.stdout)
+    );
     assert_under("update (1 fichier modifié)", d, 3_000);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("terminé : 1 fichiers traités,"), "{stdout}");
@@ -146,4 +173,35 @@ fn perf_req021_ac4_single_native_binary_help() {
     assert!(md.is_file());
     let (d, _) = best(f, &["--help"]);
     assert_under("--help", d, 50);
+}
+
+#[test]
+#[ignore]
+fn perf_req021_ac5_build_no_llm() {
+    let _g = serial();
+    let shared = fixture();
+    // Répertoire à part : la fixture partagée garde son graphe enrichi (indépendance à l'ordre).
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-nollm");
+    let _ = std::fs::remove_dir_all(&root);
+    let repo = root.join("repo");
+    let mock = root.join("mock");
+    gen_repo::generate(&repo, &mock);
+    let f = Fixture {
+        repo,
+        config: shared.config.clone(),
+        mock,
+    };
+    let result = std::panic::catch_unwind(|| {
+        let (d, out) = timed(&f, &["build", "--no-llm"]);
+        assert_under("build --no-llm", d, 30_000);
+        eprintln!("{}", String::from_utf8_lossy(&out.stdout).trim());
+        // Le graphe reconstruit reste exploitable.
+        let name = gen_repo::class_name(4242);
+        let (_, out) = timed(&f, &["query", "search", &name]);
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&name));
+    });
+    let _ = std::fs::remove_dir_all(&root);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
 }

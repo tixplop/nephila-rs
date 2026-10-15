@@ -49,6 +49,10 @@ impl Store {
             .map_err(db_err)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;
+        // En WAL, NORMAL ne perd jamais la cohérence de la base (au pire les dernières
+        // transactions en cas de coupure) et évite un fsync par transaction de fichier.
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(db_err)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(db_err)?;
         let store = Store {
@@ -274,18 +278,26 @@ impl Store {
     /// n'est pas déclarée par le fichier sont rejetées. Déclarations et références nouvelles
     /// ont l'origine `parse`.
     pub fn replace_structure(&mut self, path: &str, nodes: &[Node], refs: &[Ref]) -> Result<()> {
+        self.replace_structures(&[(path.to_string(), nodes.to_vec(), refs.to_vec())])
+    }
+
+    /// Comme `replace_structure` pour plusieurs fichiers en une seule transaction (tout ou rien) :
+    /// évite une validation par fichier lors d'un build de milliers de fichiers.
+    pub fn replace_structures(&mut self, items: &[(String, Vec<Node>, Vec<Ref>)]) -> Result<()> {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
-        require_known(&tx, path)?;
-        clear_summaries(&tx, path)?;
-        release_file(&tx, path, None)?;
-        insert_nodes(&tx, path, nodes, "parse")?;
-        insert_refs(&tx, path, refs, "parse")?;
-        tx.execute(
-            "UPDATE files SET state = 'indexed', enriched_hash = NULL WHERE path = ?1",
-            [path],
-        )
-        .map_err(db_err)?;
+        for (path, nodes, refs) in items {
+            require_known(&tx, path)?;
+            clear_summaries(&tx, path)?;
+            release_file(&tx, path, None)?;
+            insert_nodes(&tx, path, nodes, "parse")?;
+            insert_refs(&tx, path, refs, "parse")?;
+            tx.execute(
+                "UPDATE files SET state = 'indexed', enriched_hash = NULL WHERE path = ?1",
+                [path],
+            )
+            .map_err(db_err)?;
+        }
         tx.commit().map_err(db_err)
     }
 
@@ -385,16 +397,54 @@ impl Store {
     pub fn replace_edges(&mut self, edges: &[Edge]) -> Result<()> {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
-        tx.execute("DELETE FROM edges", []).map_err(db_err)?;
-        {
+        // Seule la différence avec les liens stockés est écrite : après une mise à jour, presque
+        // tous les liens sont inchangés et les réécrire tous coûterait plusieurs secondes.
+        let wanted: std::collections::HashSet<(&str, &str, &str)> = edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str(), e.kind.as_str()))
+            .collect();
+        let stale: Vec<(String, String, String)> = {
             let mut st = tx
+                .prepare("SELECT source, target, kind FROM edges")
+                .map_err(db_err)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(db_err)?;
+            let mut stale = Vec::new();
+            let mut present: std::collections::HashSet<(String, String, String)> =
+                std::collections::HashSet::new();
+            for row in rows {
+                let (s, t, k): (String, String, String) = row.map_err(db_err)?;
+                if wanted.contains(&(s.as_str(), t.as_str(), k.as_str())) {
+                    present.insert((s, t, k));
+                } else {
+                    stale.push((s, t, k));
+                }
+            }
+            drop(st);
+            let mut ins = tx
                 .prepare("INSERT OR IGNORE INTO edges(source, target, kind) VALUES (?1, ?2, ?3)")
                 .map_err(db_err)?;
             for e in edges {
-                st.execute(params![e.source, e.target, e.kind.as_str()])
-                    .map_err(db_err)?;
+                let key = (
+                    e.source.clone(),
+                    e.target.clone(),
+                    e.kind.as_str().to_string(),
+                );
+                if !present.contains(&key) {
+                    ins.execute(params![e.source, e.target, e.kind.as_str()])
+                        .map_err(db_err)?;
+                }
             }
+            stale
+        };
+        let mut del = tx
+            .prepare("DELETE FROM edges WHERE source = ?1 AND target = ?2 AND kind = ?3")
+            .map_err(db_err)?;
+        for (s, t, k) in &stale {
+            del.execute(params![s, t, k]).map_err(db_err)?;
         }
+        drop(del);
         tx.commit().map_err(db_err)
     }
 
@@ -432,6 +482,121 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Nœuds susceptibles de correspondre à un nom saisi : identifiant, nom qualifié ou nom court
+    /// égal à `name`, ou nom qualifié terminé par `name`. Triés par identifiant. L'appelant
+    /// affine (frontière de segment).
+    pub fn nodes_matching(&self, name: &str) -> Result<Vec<Node>> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes
+                 WHERE id = ?1 OR qualified = ?1 OR short = ?1
+                    OR (length(qualified) > length(?1) AND substr(qualified, -length(?1)) = ?1)
+                 ORDER BY id",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([name], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind, qualified, short, file, subkind, summary) = row.map_err(db_err)?;
+            out.push(Node {
+                id,
+                kind: NodeKind::parse(&kind)?,
+                qualified,
+                short,
+                file,
+                subkind: subkind.as_deref().map(SubKind::parse).transpose()?,
+                summary,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Nœud d'identifiant `id`.
+    pub fn node_by_id(&self, id: &str) -> Result<Option<Node>> {
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes WHERE id = ?1",
+            )
+            .map_err(db_err)?;
+        let row = st.query_row([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        });
+        match row {
+            Ok((id, kind, qualified, short, file, subkind, summary)) => Ok(Some(Node {
+                id,
+                kind: NodeKind::parse(&kind)?,
+                qualified,
+                short,
+                file,
+                subkind: subkind.as_deref().map(SubKind::parse).transpose()?,
+                summary,
+            })),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Liens sortants (`outgoing`) ou entrants du nœud `id`, sous la forme (autre extrémité,
+    /// genre), triés par identifiant de l'autre extrémité puis genre.
+    pub fn edges_at(&self, id: &str, outgoing: bool) -> Result<Vec<(String, EdgeKind)>> {
+        let sql = if outgoing {
+            "SELECT target, kind FROM edges WHERE source = ?1 ORDER BY target, kind"
+        } else {
+            "SELECT source, kind FROM edges WHERE target = ?1 ORDER BY source, kind"
+        };
+        let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
+        let rows = st
+            .query_map([id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (other, kind) = row.map_err(db_err)?;
+            out.push((other, EdgeKind::parse(&kind)?));
+        }
+        Ok(out)
+    }
+
+    pub fn count_edges(&self) -> Result<usize> {
+        self.count("edges")
+    }
+
+    pub fn count_nodes(&self) -> Result<usize> {
+        self.count("nodes")
+    }
+
+    fn count(&self, table: &str) -> Result<usize> {
+        self.conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| n as usize)
+            .map_err(db_err)
     }
 
     pub fn edges(&self) -> Result<Vec<Edge>> {
@@ -777,14 +942,18 @@ fn insert_refs(
 fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>) -> Result<()> {
     // Les nœuds `dependency` dérivés (sans déclaration, DEC-020) ne sont nettoyés que par
     // `replace_derived_dependencies` ; seuls ceux que ce fichier déclarait suivent ses déclarations.
-    tx.execute("DROP TABLE IF EXISTS released_declared", [])
-        .map_err(db_err)?;
-    tx.execute(
-        "CREATE TEMP TABLE released_declared AS SELECT node AS id FROM declarations
-         WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
-        params![path, origin],
-    )
-    .map_err(db_err)?;
+    let released: Vec<String> = {
+        let mut st = tx
+            .prepare(
+                "SELECT node FROM declarations WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map(params![path, origin], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?
+    };
     tx.execute(
         "DELETE FROM refs WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
         params![path, origin],
@@ -795,25 +964,16 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
         params![path, origin],
     )
     .map_err(db_err)?;
-    let released: Vec<String> = {
-        let mut st = tx
-            .prepare("SELECT id FROM released_declared")
-            .map_err(db_err)?;
-        let rows = st
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(db_err)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db_err)?
-    };
     refresh_nodes(tx, &released)?;
-    tx.execute(
-        "DELETE FROM nodes WHERE NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)
-         AND (kind <> 'dependency' OR id IN (SELECT id FROM released_declared))",
-        [],
-    )
-    .map_err(db_err)?;
-    tx.execute("DROP TABLE released_declared", [])
+    let mut del = tx
+        .prepare(
+            "DELETE FROM nodes WHERE id = ?1
+             AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+        )
         .map_err(db_err)?;
+    for id in &released {
+        del.execute([id]).map_err(db_err)?;
+    }
     Ok(())
 }
 

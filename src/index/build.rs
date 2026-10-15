@@ -212,19 +212,22 @@ pub(crate) fn finalize(
     report.llm_active = llm.is_some();
     if let Some(llm) = llm {
         let files = store.files_to_enrich()?;
-        enrich::enrich_all(
-            repo,
-            &files,
-            opts.concurrency,
-            opts.max_chunk_chars,
-            llm,
-            store,
-            report,
-        )?;
-        stats = resolve::resolve(store)?;
-        crate::summary::refresh(store)?;
+        // Sans fichier à enrichir, le graphe n'a pas changé : pas de seconde résolution.
+        if !files.is_empty() {
+            enrich::enrich_all(
+                repo,
+                &files,
+                opts.concurrency,
+                opts.max_chunk_chars,
+                llm,
+                store,
+                report,
+            )?;
+            stats = resolve::resolve(store)?;
+            crate::summary::refresh(store)?;
+        }
     }
-    report.nodes = store.nodes()?.len();
+    report.nodes = store.count_nodes()?;
     report.edges = stats.edges;
     report.unresolved = stats.unresolved;
     report.pending = store

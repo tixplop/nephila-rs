@@ -13,6 +13,11 @@ use crate::parse::{self, FileStructure, ParseCtx};
 use crate::scan::ScannedFile;
 use crate::store::Store;
 
+/// Nombre de fichiers enregistrés par transaction.
+const BATCH: usize = 200;
+
+type Batched = (String, Vec<Node>, Vec<Ref>);
+
 enum Outcome {
     Parsed(String, FileStructure),
     Failed(String, Error),
@@ -37,6 +42,7 @@ pub(crate) fn analyze(
     let (tx, rx) = mpsc::channel::<Outcome>();
     let workers = concurrency.clamp(1, files.len().max(1));
     let mut write_error: Option<Error> = None;
+    let mut batch: Vec<Batched> = Vec::new();
 
     std::thread::scope(|scope| {
         let queue = &queue;
@@ -82,22 +88,43 @@ pub(crate) fn analyze(
                             "{path} : {dropped} référence(s) ignorée(s), source non déclarée"
                         ));
                     }
-                    match store.replace_structure(&path, &nodes, &refs) {
-                        Ok(()) => report.processed += 1,
-                        Err(e) => {
-                            // Vide la file : les fils s'arrêtent, les résultats restants sont ignorés.
-                            queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
-                            write_error = Some(e);
-                        }
+                    batch.push((path, nodes, refs));
+                    if batch.len() >= BATCH {
+                        flush(store, &mut batch, queue, report, &mut write_error);
                     }
                 }
             }
+        }
+        if write_error.is_none() {
+            flush(store, &mut batch, queue, report, &mut write_error);
         }
     });
     match write_error {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Enregistre le lot en une transaction. Une erreur vide la file (les fils s'arrêtent, les
+/// résultats restants sont ignorés) et est conservée.
+fn flush(
+    store: &mut Store,
+    batch: &mut Vec<Batched>,
+    queue: &Mutex<VecDeque<&ScannedFile>>,
+    report: &mut BuildReport,
+    write_error: &mut Option<Error>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    match store.replace_structures(batch) {
+        Ok(()) => report.processed += batch.len(),
+        Err(e) => {
+            queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            *write_error = Some(e);
+        }
+    }
+    batch.clear();
 }
 
 /// Nom court d'un nœud, selon son genre.

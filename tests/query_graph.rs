@@ -408,3 +408,32 @@ fn req014_ac3_limit_applies_to_both_sections_together() {
     assert_eq!(v["used_by"].as_array().unwrap().len(), 1, "{v}");
     assert_eq!(v["remaining"], 1);
 }
+
+#[test]
+fn req015_path_equal_length_ties_pick_smallest_junction_id() {
+    let env = Env::empty();
+    // Deux chemins de même longueur entre Src et Dst : par MidB ou par MidA.
+    for (name, imports) in [
+        ("Src", &["MidB", "MidA"][..]),
+        ("MidA", &["Dst"][..]),
+        ("MidB", &["Dst"][..]),
+        ("Dst", &[][..]),
+    ] {
+        // Un paquet par classe : le nœud de paquet ne crée pas de raccourci.
+        let mut s = format!("package com.tie.{};\n\n", name.to_lowercase());
+        for i in imports {
+            s.push_str(&format!("import com.tie.{}.{i};\n", i.to_lowercase()));
+        }
+        s.push_str(&format!("\npublic class {name} {{\n}}\n"));
+        env.file(&format!("tie/{name}.java"), &s);
+    }
+    assert!(env.run(&["build"]).status.success());
+    for _ in 0..3 {
+        let out = env.path(&["Src", "Dst"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let l = lines(&out);
+        assert_eq!(l.len(), 2, "{l:#?}");
+        assert!(l[0].contains("com.tie.mida.MidA"), "{l:#?}");
+        assert!(l[1].contains("com.tie.mida.MidA"), "{l:#?}");
+    }
+}

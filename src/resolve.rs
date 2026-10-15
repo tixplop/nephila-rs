@@ -38,7 +38,7 @@ pub fn resolve(store: &mut Store) -> Result<ResolveStats> {
     store.replace_edges(&r.edges)?;
     // Les liens sont dédupliqués par la clé primaire : on compte ce qui est stocké.
     Ok(ResolveStats {
-        edges: store.edges()?.len(),
+        edges: store.count_edges()?,
         unresolved: r.unresolved.len(),
     })
 }
@@ -88,13 +88,21 @@ struct Index<'a> {
     by_qualified: HashMap<&'a str, Vec<&'a Node>>,
     /// Nom simple (dernier segment) -> nœuds.
     by_short: HashMap<&'a str, Vec<&'a Node>>,
+    /// Deux derniers segments (séparateur compris) -> nœuds : évite de parcourir tous les
+    /// nœuds portant un nom courant (`get`, `run`…) pour une référence `Type.méthode`.
+    by_last_two: HashMap<&'a str, Vec<&'a Node>>,
 }
 
 impl<'a> Index<'a> {
     fn new(nodes: &'a [Node]) -> Self {
         let mut by_qualified: HashMap<&str, Vec<&Node>> = HashMap::new();
         let mut by_short: HashMap<&str, Vec<&Node>> = HashMap::new();
+        let mut by_last_two: HashMap<&str, Vec<&Node>> = HashMap::new();
         for n in nodes {
+            by_last_two
+                .entry(last_two_segments(&n.qualified))
+                .or_default()
+                .push(n);
             by_qualified.entry(&n.qualified).or_default().push(n);
             by_short
                 .entry(last_segment(&n.qualified))
@@ -104,6 +112,7 @@ impl<'a> Index<'a> {
         Index {
             by_qualified,
             by_short,
+            by_last_two,
         }
     }
 
@@ -117,7 +126,12 @@ impl<'a> Index<'a> {
 
     /// Nœuds dont le nom qualifié se termine par `name` sur une frontière de segment.
     fn suffix(&self, name: &str, ok: &dyn Fn(&Node) -> bool) -> Vec<&'a Node> {
-        let Some(cands) = self.by_short.get(last_segment(name)) else {
+        let table = if name.contains(SEPARATORS) {
+            self.by_last_two.get(last_two_segments(name))
+        } else {
+            self.by_short.get(last_segment(name))
+        };
+        let Some(cands) = table else {
             return Vec::new();
         };
         cands
@@ -132,6 +146,18 @@ const SEPARATORS: [char; 5] = ['.', '/', '#', ':', '\\'];
 
 fn last_segment(q: &str) -> &str {
     q.rsplit(SEPARATORS).next().unwrap_or(q)
+}
+
+/// Les deux derniers segments, séparateur compris ; le nom entier s'il n'a qu'un segment.
+fn last_two_segments(q: &str) -> &str {
+    let mut it = q
+        .char_indices()
+        .rev()
+        .filter(|(_, c)| SEPARATORS.contains(c));
+    match (it.next(), it.next()) {
+        (Some(_), Some((i, c))) => &q[i + c.len_utf8()..],
+        _ => q,
+    }
 }
 
 fn is_suffix(qualified: &str, name: &str) -> bool {

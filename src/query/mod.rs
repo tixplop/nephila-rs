@@ -1,6 +1,7 @@
 //! Commandes `query` (lecture seule, sans LLM ni configuration).
 
 pub mod ask;
+pub mod graph;
 pub mod lookup;
 pub mod neighbors;
 pub mod path;

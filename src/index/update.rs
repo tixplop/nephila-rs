@@ -1,5 +1,6 @@
 //! Commande `update` : mise à jour incrémentale du graphe (REQ-011, REQ-010, REQ-008).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::diff::{self, Change};
@@ -64,13 +65,13 @@ pub fn update(
 
     // Fichiers dont seule la date a changé : l'enregistrement est rafraîchi pour ne plus
     // recalculer leur empreinte, sans toucher au graphe.
+    let known: HashMap<&str, &FileRecord> = d.known.iter().map(|k| (k.path.as_str(), k)).collect();
     let touched: Vec<FileRecord> = d
         .scanned
         .iter()
         .filter(|f| {
-            d.known.iter().any(|k| {
-                k.path == f.path
-                    && k.state == FileState::Indexed
+            known.get(f.path.as_str()).is_some_and(|k| {
+                k.state == FileState::Indexed
                     && k.hash == f.hash
                     && (f.rehashed || k.size != f.size || k.mtime != f.mtime)
             })
@@ -97,13 +98,17 @@ pub fn update(
         .filter(|c| is_settings(&c.path))
         .map(|c| c.path.rsplit_once('/').map_or("", |(dir, _)| dir))
         .collect();
+    let changed: std::collections::HashSet<&str> = d
+        .changes
+        .iter()
+        .filter(|c| c.change != Change::Deleted)
+        .map(|c| c.path.as_str())
+        .collect();
     let todo: Vec<ScannedFile> = d
         .scanned
         .iter()
         .filter(|f| {
-            d.changes
-                .iter()
-                .any(|c| c.path == f.path && c.change != Change::Deleted)
+            changed.contains(f.path.as_str())
                 || settings_dirs
                     .iter()
                     .any(|dir| is_build_script_under(&f.path, dir))

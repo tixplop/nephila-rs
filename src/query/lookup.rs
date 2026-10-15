@@ -38,7 +38,7 @@ pub fn resolve(store: &Store, name: &str) -> Result<Lookup> {
     if name.is_empty() {
         return Ok(Lookup::NotFound);
     }
-    let nodes = store.nodes()?;
+    let nodes = store.nodes_matching(name)?;
     if let Some(n) = nodes.iter().find(|n| n.id == name) {
         return Ok(Lookup::Found(n.clone()));
     }
