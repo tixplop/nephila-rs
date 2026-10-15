@@ -112,8 +112,8 @@ fn extract_renvoie_une_structure_vide_pour_chaque_langage() {
         "Sample.kt",
         "Scala3.scala",
         "Sample.groovy",
-        "build.gradle",
-        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
         "pom.xml",
     ] {
         let s = extract(Path::new(name), "", &ParseCtx::default()).unwrap();

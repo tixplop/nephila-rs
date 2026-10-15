@@ -1,6 +1,7 @@
 //! Extraction de la structure d'un fichier par analyse syntaxique (DEC-016 à DEC-020).
 
 pub mod calls;
+pub mod gradle;
 pub mod groovy;
 pub mod ivy;
 pub mod java;
@@ -11,6 +12,7 @@ pub mod markdown;
 pub mod maven;
 pub mod scala;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
@@ -34,12 +36,13 @@ pub struct FileStructure {
 pub struct ParseCtx {
     /// Racine du dépôt, si connue.
     pub repo_root: Option<PathBuf>,
+    /// Dossiers (relatifs, `""` = racine) contenant un `settings.gradle(.kts)` → `rootProject.name` s'il est connu.
+    pub gradle_settings: HashMap<String, Option<String>>,
 }
 
 /// Extrait la structure de `text`. Java, Kotlin, Scala et Groovy sont extraits ; les autres langages renvoient pour
 /// l'instant une structure vide, comme un fichier de type inconnu.
 pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure> {
-    let _ = ctx;
     match Lang::from_path(path) {
         Some(Lang::Java) => java::extract(text),
         Some(Lang::Kotlin) => kotlin::extract(path, text),
@@ -51,7 +54,8 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure>
             _ => Ok(FileStructure::default()),
         },
         Some(Lang::Markdown) => Ok(markdown::extract(path, text)),
-        Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) | None => Ok(FileStructure::default()),
+        Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) => Ok(gradle::extract(path, ctx)),
+        None => Ok(FileStructure::default()),
     }
 }
 

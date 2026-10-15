@@ -44,6 +44,9 @@ pub struct ScannedFile {
 pub struct ScanResult {
     pub files: Vec<ScannedFile>,
     pub warnings: Vec<String>,
+    /// Dossiers (relatifs, `""` = racine) contenant un `settings.gradle(.kts)`, avec `rootProject.name`
+    /// (laissé à `None` par le parcours).
+    pub gradle_settings: HashMap<String, Option<String>>,
 }
 
 fn is_build_file(name: &str) -> bool {
@@ -190,5 +193,21 @@ pub fn scan(root: &Path, known: &[FileRecord]) -> Result<ScanResult> {
     for f in &mut res.files {
         f.module = module_of(&f.path, &build_dirs);
     }
+    res.gradle_settings = res
+        .files
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.path.rsplit('/').next(),
+                Some("settings.gradle" | "settings.gradle.kts")
+            )
+        })
+        .map(|f| {
+            (
+                f.path.rsplit_once('/').map_or("", |(d, _)| d).to_string(),
+                None,
+            )
+        })
+        .collect();
     Ok(res)
 }
