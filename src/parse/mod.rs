@@ -1,5 +1,6 @@
 //! Extraction de la structure d'un fichier par analyse syntaxique (DEC-016 à DEC-020).
 
+pub mod calls;
 pub mod java;
 pub mod jvm;
 pub mod lang;

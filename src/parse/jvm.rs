@@ -107,6 +107,11 @@ impl Builder {
         self.stack.pop();
     }
 
+    /// Pile des types englobants (noms qualifiés), du plus externe au plus interne.
+    pub fn type_stack(&self) -> &[String] {
+        &self.stack
+    }
+
     /// Type englobant courant (nom qualifié).
     pub fn current_type(&self) -> Option<&str> {
         self.stack.last().map(String::as_str)

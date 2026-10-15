@@ -1,11 +1,12 @@
 //! Extracteur Java (REQ-006) : package, imports, types, méthodes, extends / implements.
-//! Les appels sont ajoutés par T-024.
+//! Les appels suivent les heuristiques de DEC-021 (`calls.rs`).
 
 use tree_sitter::Node;
 
 use crate::error::Result;
 use crate::model::{EdgeKind, SubKind};
 
+use super::calls::{Calls, Locals, Receiver};
 use super::jvm::{clean_type_name, Builder, INIT};
 use super::{FileStructure, Lang};
 
@@ -13,6 +14,7 @@ use super::{FileStructure, Lang};
 pub fn extract(text: &str) -> Result<FileStructure> {
     let tree = Lang::Java.parse(text)?;
     let mut b = Builder::new();
+    let mut calls = Calls::new();
     let src = text.as_bytes();
     let root = tree.root_node();
     let mut cur = root.walk();
@@ -24,9 +26,10 @@ pub fn extract(text: &str) -> Result<FileStructure> {
                 }
             }
             "import_declaration" => import(&mut b, child, src),
-            _ => type_declaration(&mut b, child, src),
+            _ => type_declaration(&mut b, &mut calls, child, src),
         }
     }
+    calls.finish(&mut b);
     Ok(b.finish())
 }
 
@@ -72,7 +75,7 @@ fn subkind_of(kind: &str) -> Option<SubKind> {
 }
 
 /// Traite `n` s'il déclare un type ; sinon l'ignore.
-fn type_declaration(b: &mut Builder, n: Node, src: &[u8]) {
+fn type_declaration(b: &mut Builder, calls: &mut Calls, n: Node, src: &[u8]) {
     let Some(sub) = subkind_of(n.kind()) else {
         return;
     };
@@ -108,8 +111,19 @@ fn type_declaration(b: &mut Builder, n: Node, src: &[u8]) {
         }
     }
 
+    // Composantes d'un record : propriétés du type.
+    if let Some(params) = n.child_by_field_name("parameters") {
+        let mut cur = params.walk();
+        for p in params.named_children(&mut cur) {
+            if let (Some(t), Some(name)) =
+                (p.child_by_field_name("type"), p.child_by_field_name("name"))
+            {
+                calls.declare_field(&q, &text_of(name, src), &text_of(t, src));
+            }
+        }
+    }
     if let Some(body) = n.child_by_field_name("body") {
-        members(b, body, src);
+        members(b, calls, body, src);
     }
     b.exit_type();
 }
@@ -128,29 +142,168 @@ fn type_names(n: Node, src: &[u8]) -> Vec<String> {
     out
 }
 
-fn members(b: &mut Builder, body: Node, src: &[u8]) {
+fn members(b: &mut Builder, calls: &mut Calls, body: Node, src: &[u8]) {
     let mut cur = body.walk();
     for m in body.named_children(&mut cur) {
-        member(b, m, src);
+        member(b, calls, m, src);
     }
 }
 
-fn member(b: &mut Builder, m: Node, src: &[u8]) {
+fn member(b: &mut Builder, calls: &mut Calls, m: Node, src: &[u8]) {
     match m.kind() {
         "method_declaration" | "annotation_type_element_declaration" => {
             if let Some(name) = m.child_by_field_name("name") {
-                b.declare_method(&text_of(name, src));
+                let name = text_of(name, src);
+                if let Some(q) = b.declare_method(&name) {
+                    if let Some(t) = b.current_type() {
+                        calls.declare_method(t, &name);
+                    }
+                    method_calls(b, calls, &q, m, src);
+                }
             }
         }
-        "constructor_declaration"
-        | "compact_constructor_declaration"
-        | "static_initializer"
-        | "block" => {
-            b.declare_method(INIT);
+        "constructor_declaration" | "compact_constructor_declaration" => {
+            if let Some(q) = b.declare_method(INIT) {
+                method_calls(b, calls, &q, m, src);
+            }
+        }
+        "static_initializer" | "block" => {
+            if let Some(q) = b.declare_method(INIT) {
+                method_calls(b, calls, &q, m, src);
+            }
+        }
+        "field_declaration" => {
+            let Some(ty) = m.child_by_field_name("type") else {
+                return;
+            };
+            let Some(owner) = b.current_type().map(str::to_string) else {
+                return;
+            };
+            let mut cur = m.walk();
+            for d in m.children_by_field_name("declarator", &mut cur) {
+                if let Some(name) = d.child_by_field_name("name") {
+                    calls.declare_field(&owner, &text_of(name, src), &text_of(ty, src));
+                }
+            }
         }
         // Les constantes d'enum ne déclarent rien ; leurs déclarations sont dans ce conteneur.
-        "enum_body_declarations" => members(b, m, src),
-        _ => type_declaration(b, m, src),
+        "enum_body_declarations" => members(b, calls, m, src),
+        _ => type_declaration(b, calls, m, src),
+    }
+}
+
+/// Collecte les types locaux de `n` (paramètres, variables, boucles, motifs), sans distinguer
+/// les portées : un nom redéclaré garde sa dernière déclaration.
+fn collect_locals(n: Node, src: &[u8], locals: &mut Locals) {
+    let typed = |node: Node, locals: &mut Locals| {
+        if let (Some(t), Some(name)) = (
+            node.child_by_field_name("type"),
+            node.child_by_field_name("name"),
+        ) {
+            locals.declare(&text_of(name, src), &text_of(t, src));
+        }
+    };
+    match n.kind() {
+        "formal_parameter" | "enhanced_for_statement" => typed(n, locals),
+        "resource" => {
+            if let (Some(t), Some(name)) =
+                (n.child_by_field_name("type"), n.child_by_field_name("name"))
+            {
+                let ty = text_of(t, src);
+                locals.declare(
+                    &text_of(name, src),
+                    &initialised_type(&ty, n.child_by_field_name("value"), src),
+                );
+            }
+        }
+        "local_variable_declaration" => {
+            if let Some(t) = n.child_by_field_name("type") {
+                let ty = text_of(t, src);
+                let mut cur = n.walk();
+                for d in n.children_by_field_name("declarator", &mut cur) {
+                    if let Some(name) = d.child_by_field_name("name") {
+                        let ty = initialised_type(&ty, d.child_by_field_name("value"), src);
+                        locals.declare(&text_of(name, src), &ty);
+                    }
+                }
+            }
+        }
+        "type_pattern" => {
+            let mut cur = n.walk();
+            let kids: Vec<Node> = n.named_children(&mut cur).collect();
+            if let [t, name] = kids.as_slice() {
+                if name.kind() == "identifier" {
+                    locals.declare(&text_of(*name, src), &text_of(*t, src));
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cur = n.walk();
+    for c in n.children(&mut cur) {
+        collect_locals(c, src, locals);
+    }
+}
+
+/// Type d'une variable : celui écrit, ou pour `var` celui du constructeur `new T(…)`.
+fn initialised_type(declared: &str, value: Option<Node>, src: &[u8]) -> String {
+    if declared.trim() != "var" {
+        return declared.to_string();
+    }
+    match value {
+        Some(v) if v.kind() == "object_creation_expression" => v
+            .child_by_field_name("type")
+            .map(|t| text_of(t, src))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Enregistre les appels du corps (lambdas et classes anonymes comprises) de `method` (nom
+/// qualifié), paramètres compris dans `decl`.
+fn method_calls(b: &Builder, calls: &mut Calls, method: &str, decl: Node, src: &[u8]) {
+    let mut locals = Locals::new();
+    collect_locals(decl, src, &mut locals);
+    let types = b.type_stack().to_vec();
+    walk_calls(decl, src, method, &types, &locals, calls);
+}
+
+fn walk_calls(
+    n: Node,
+    src: &[u8],
+    method: &str,
+    types: &[String],
+    locals: &Locals,
+    calls: &mut Calls,
+) {
+    if n.kind() == "method_invocation" {
+        if let Some(name) = n.child_by_field_name("name") {
+            let receiver = match n.child_by_field_name("object") {
+                None => Receiver::Implicit,
+                Some(o) => receiver_of(o, src),
+            };
+            calls.record(method, types, locals, receiver, &text_of(name, src));
+        }
+    }
+    let mut cur = n.walk();
+    for c in n.children(&mut cur) {
+        walk_calls(c, src, method, types, locals, calls);
+    }
+}
+
+fn receiver_of(o: Node, src: &[u8]) -> Receiver {
+    match o.kind() {
+        "this" => Receiver::This,
+        "identifier" => Receiver::Name(text_of(o, src)),
+        "field_access" => {
+            let obj = o.child_by_field_name("object");
+            let field = o.child_by_field_name("field");
+            match (obj, field) {
+                (Some(ob), Some(f)) if ob.kind() == "this" => Receiver::ThisField(text_of(f, src)),
+                _ => Receiver::Unknown,
+            }
+        }
+        _ => Receiver::Unknown,
     }
 }
 
@@ -202,8 +355,11 @@ public class OrderService {
         assert!(decl(&s, NodeKind::Package, "com.acme.shop").is_some());
         let src = node_id(NodeKind::Type, "com.acme.shop.OrderService");
         assert!(has_ref(&s, &src, EdgeKind::Imports, "com.acme.model.Order"));
+        // `new Order()` ne donne pas de lien calls ; l'appel sur `repo` en donne un.
+        let place = node_id(NodeKind::Method, "com.acme.shop.OrderService.place");
+        assert!(has_ref(&s, &place, EdgeKind::Calls, "OrderRepository.save"));
         // Le joker ne donne pas de lien mais figure dans le contexte.
-        assert_eq!(s.references.len(), 1);
+        assert_eq!(s.references.len(), 2);
         assert_eq!(
             s.context.as_deref(),
             Some("package com.acme.shop\nimport com.acme.model.Order\nimport java.util.*")
@@ -259,6 +415,86 @@ public class OrderService {
             .as_deref()
             .unwrap()
             .contains("import static java.util.Objects.requireNonNull"));
+    }
+
+    fn calls_of(s: &FileStructure) -> Vec<(String, String)> {
+        s.references
+            .iter()
+            .filter(|r| r.kind == EdgeKind::Calls)
+            .map(|r| (r.source.clone(), r.target.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn req006_ac9_appels_dans_lambda_et_classe_anonyme_attribues_a_la_methode() {
+        let src = r#"package p;
+class S {
+    private Repo repo;
+    void run(List<Order> orders, Mailer mailer) {
+        orders.forEach(o -> repo.save(o));
+        Runnable r = new Runnable() { public void run() { mailer.send(); } };
+        java.util.function.Supplier<Cache> f = () -> Util.make();
+    }
+}
+"#;
+        let c = calls_of(&extract(src).unwrap());
+        let from = "method:p.S.run";
+        for t in ["List.forEach", "Repo.save", "Mailer.send", "Util.make"] {
+            assert!(c.contains(&(from.to_string(), t.to_string())), "{t}: {c:?}");
+        }
+    }
+
+    #[test]
+    fn req006_ac9_fixture_sample21() {
+        let s = extract(&fx("Sample21.java")).unwrap();
+        let c = calls_of(&s);
+        let d = "method:com.acme.shop.Sample21.describe".to_string();
+        assert!(c.contains(&(d.clone(), "A.qty".to_string())), "{c:?}");
+        assert!(c.contains(&(d, "String.join".to_string())));
+        // `System.out.println` est une chaîne : aucune référence.
+        assert!(!c.iter().any(|(_, t)| t.contains("println")));
+    }
+
+    #[test]
+    fn appels_this_implicite_champ_et_constructeur() {
+        let src = r#"class S {
+    Repo r = new Repo();
+    S() { init(); this.helper(); this.r.open(); }
+    void init() {}
+    void helper() { other(); }
+    void t() { var x = new Foo<String>(); x.go(); Foo y = make(); y.stop(); }
+}"#;
+        let c = calls_of(&extract(src).unwrap());
+        let has = |m: &str, t: &str| c.contains(&(format!("method:S.{m}"), t.to_string()));
+        assert!(has("<init>", "S.init"));
+        assert!(has("<init>", "S.helper"));
+        assert!(has("<init>", "Repo.open"));
+        assert!(has("helper", "other"));
+        assert!(has("t", "Foo.go"));
+        assert!(has("t", "Foo.stop"));
+        assert!(has("t", "make"));
+        // Aucun lien calls pour `new`.
+        assert!(!c
+            .iter()
+            .any(|(_, t)| t == "Foo.<init>" || t == "Repo.<init>"));
+    }
+
+    #[test]
+    fn appels_negatifs_chaine_et_var_sans_initialiseur() {
+        let src = r#"class S {
+    void m(Repo repo) {
+        var a = repo.find();
+        a.use();
+        repo.find().use();
+        unknown.call();
+        int[] xs = null;
+        xs.clone();
+        getRepo().save();
+    }
+}"#;
+        let c = calls_of(&extract(src).unwrap());
+        let targets: Vec<&str> = c.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(targets, ["Repo.find", "getRepo"], "{c:?}");
     }
 
     #[test]
