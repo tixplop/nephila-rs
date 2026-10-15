@@ -44,12 +44,22 @@ pub enum Command {
     Query(Query),
     /// Exporte le graphe
     Export {
-        /// Fichier de sortie (défaut : <slug>.json dans le dossier courant ; - pour stdout)
+        /// Fichier de sortie (défaut : <slug>.json ou <slug>.html dans le dossier courant ; - pour stdout)
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Format de sortie
+        #[arg(long, value_enum, default_value_t = ExportFormat::Json)]
+        format: ExportFormat,
     },
     /// Résumé du dépôt
     Summary(JsonOpt),
+}
+
+/// Format de `export`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExportFormat {
+    Json,
+    Html,
 }
 
 #[derive(Debug, Subcommand)]
@@ -94,7 +104,9 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Update(o) => crate::index::update::run(&cli.repo, o.no_llm),
         Command::Status(j) => crate::status::run(&cli.repo, j.json),
         Command::Summary(j) => crate::summary::run(&cli.repo, j.json),
-        Command::Export { output } => crate::export::run(&cli.repo, output.as_deref()),
+        Command::Export { output, format } => {
+            crate::export::run(&cli.repo, output.as_deref(), *format)
+        }
         Command::Query(Query::Search { terme, limit, json }) => {
             crate::query::search::run(&cli.repo, terme, *limit, json.json)
         }

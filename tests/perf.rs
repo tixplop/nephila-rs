@@ -205,3 +205,29 @@ fn perf_req021_ac5_build_no_llm() {
         std::panic::resume_unwind(e);
     }
 }
+
+#[test]
+#[ignore]
+fn perf_req021_ac6_export() {
+    let _g = serial();
+    let f = fixture();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-export");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (format, name) in [("json", "out.json"), ("html", "out.html")] {
+        let out = dir.join(name);
+        let (d, _) = timed(
+            f,
+            &[
+                "export",
+                "--format",
+                format,
+                "--output",
+                out.to_str().unwrap(),
+            ],
+        );
+        assert_under(&format!("export {format}"), d, 5_000);
+        assert!(out.metadata().unwrap().len() > 0);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::cli::ExportFormat;
 use crate::error::{Error, Result};
 use crate::resolve;
 use crate::store::Store;
@@ -79,10 +80,14 @@ pub fn output_path(repo: &Path, output: Option<&Path>, ext: &str) -> Target {
     }
 }
 
-pub fn run(repo: &Path, output: Option<&Path>) -> Result<()> {
+pub fn run(repo: &Path, output: Option<&Path>, format: ExportFormat) -> Result<()> {
     let store = Store::open_readonly(repo)?;
-    let text = build_json(&store)?.to_string();
-    match output_path(repo, output, "json") {
+    let graph = build_json(&store)?;
+    let (text, ext) = match format {
+        ExportFormat::Json => (graph.to_string(), "json"),
+        ExportFormat::Html => (crate::view::render(&slug(repo), &graph), "html"),
+    };
+    match output_path(repo, output, ext) {
         Target::Stdout => println!("{text}"),
         Target::File(path) => {
             std::fs::write(&path, format!("{text}\n")).map_err(|e| {
