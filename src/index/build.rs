@@ -1,6 +1,7 @@
 //! Commande `build` : reconstruction complète du graphe (REQ-009, REQ-006).
 
 use std::path::Path;
+use std::time::Instant;
 
 use crate::config::{Config, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS};
 use crate::error::{warn, Error, Result};
@@ -11,6 +12,7 @@ use crate::model::{FileRecord, FileState};
 use crate::resolve;
 use crate::scan;
 use crate::store::{db_path, Store};
+use crate::trace;
 
 /// Bilan d'un build.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -66,19 +68,42 @@ pub(crate) struct Setup {
 /// fichier de configuration le LLM est inactif ; sinon validation et vérification de la clé.
 pub(crate) fn setup(no_llm: bool) -> Result<Setup> {
     if no_llm {
+        trace!("config: llm inactif (--no-llm)");
         return Ok(Setup {
             opts: IndexOptions::default(),
             llm: None,
         });
     }
     match Config::load_optional()? {
-        None => Ok(Setup {
-            opts: IndexOptions::default(),
-            llm: None,
-        }),
+        None => {
+            trace!("config: llm inactif (aucune configuration)");
+            Ok(Setup {
+                opts: IndexOptions::default(),
+                llm: None,
+            })
+        }
         Some(config) => {
+            trace!(
+                "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={}",
+                config.provider.as_str(),
+                config.model,
+                config.concurrency,
+                config.timeout_secs,
+                config.max_chunk_chars
+            );
             let llm = build_llm(&config)?;
-            llm.verify_key()?;
+            let started = Instant::now();
+            let verified = llm.verify_key();
+            let ms = started.elapsed().as_millis();
+            match &verified {
+                Ok(()) => trace!("verify_key: ok {ms} ms"),
+                Err(e) => trace!(
+                    "verify_key: {} {ms} ms : {}",
+                    trace::classify(e),
+                    trace::short(&e.to_string(), trace::MAX_MESSAGE_CHARS)
+                ),
+            }
+            verified?;
             Ok(Setup {
                 opts: IndexOptions::from(&config),
                 llm: Some(llm),
@@ -105,7 +130,8 @@ impl BuildReport {
 }
 
 /// Point d'entrée de `rkg build` : valide le dépôt, la configuration et la clé, puis construit.
-pub fn run(repo: &Path, no_llm: bool) -> Result<()> {
+pub fn run(repo: &Path, no_llm: bool, verbose: bool) -> Result<()> {
+    trace::init(verbose);
     check_repo(repo)?;
     let setup = setup(no_llm)?;
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
@@ -133,6 +159,20 @@ pub(crate) fn finish(report: &BuildReport, verb: &str) -> Result<()> {
     } else {
         Err(Error::Message(problems.join(" ; ")))
     }
+}
+
+/// Une passe de résolution suivie du rafraîchissement du résumé, tracée.
+fn resolve_pass(store: &mut Store) -> Result<resolve::ResolveStats> {
+    let started = Instant::now();
+    let stats = resolve::resolve(store)?;
+    trace!(
+        "résolution: {} ms, {} liens, {} non résolues",
+        started.elapsed().as_millis(),
+        stats.edges,
+        stats.unresolved
+    );
+    crate::summary::refresh(store)?;
+    Ok(stats)
 }
 
 pub(crate) fn check_repo(repo: &Path) -> Result<()> {
@@ -180,6 +220,7 @@ pub fn build(
             state: FileState::Pending,
         })
         .collect();
+    trace!("parcours: {} fichiers", records.len());
     store.reset_with_pending_files(&records)?;
     if records.is_empty() {
         warn("aucun fichier pris en charge dans le dépôt : graphe vide");
@@ -207,8 +248,7 @@ pub(crate) fn finalize(
     repo: &Path,
     report: &mut BuildReport,
 ) -> Result<()> {
-    let mut stats = resolve::resolve(store)?;
-    crate::summary::refresh(store)?;
+    let mut stats = resolve_pass(store)?;
     report.llm_active = llm.is_some();
     if let Some(llm) = llm {
         let files = store.files_to_enrich()?;
@@ -223,8 +263,7 @@ pub(crate) fn finalize(
                 store,
                 report,
             )?;
-            stats = resolve::resolve(store)?;
-            crate::summary::refresh(store)?;
+            stats = resolve_pass(store)?;
         }
     }
     report.nodes = store.count_nodes()?;

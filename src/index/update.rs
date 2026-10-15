@@ -12,10 +12,12 @@ use crate::llm::Llm;
 use crate::model::{FileRecord, FileState};
 use crate::scan::ScannedFile;
 use crate::store::{db_path, Store};
+use crate::trace;
 
 /// Point d'entrée de `rkg update` : mêmes contrôles que `build` (dépôt, configuration, clé,
 /// verrou) ; sans graphe, bascule sur un build complet.
-pub fn run(repo: &Path, no_llm: bool) -> Result<()> {
+pub fn run(repo: &Path, no_llm: bool, verbose: bool) -> Result<()> {
+    trace::init(verbose);
     build::check_repo(repo)?;
     let setup = build::setup(no_llm)?;
     let lock = RepoLock::acquire(repo)?;
@@ -62,6 +64,13 @@ pub fn update(
     build::check_repo(repo)?;
     let mut store = Store::open_existing(repo)?;
     let d = diff::compute(repo, &store)?;
+    trace!(
+        "parcours: {} ajoutés, {} modifiés, {} supprimés, {} en attente",
+        d.paths(Change::Added).count(),
+        d.paths(Change::Modified).count(),
+        d.paths(Change::Deleted).count(),
+        d.paths(Change::Pending).count()
+    );
 
     // Fichiers dont seule la date a changé : l'enregistrement est rafraîchi pour ne plus
     // recalculer leur empreinte, sans toucher au graphe.

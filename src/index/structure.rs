@@ -12,6 +12,7 @@ use crate::model::{Node, NodeKind, Ref};
 use crate::parse::{self, FileStructure, ParseCtx};
 use crate::scan::ScannedFile;
 use crate::store::Store;
+use crate::trace;
 
 /// Nombre de fichiers enregistrés par transaction.
 const BATCH: usize = 200;
@@ -43,6 +44,9 @@ pub(crate) fn analyze(
     let (tx, rx) = mpsc::channel::<Outcome>();
     let workers = concurrency.clamp(1, files.len().max(1));
     let mut write_error: Option<Error> = None;
+    let started = std::time::Instant::now();
+    let failed_before = report.failed;
+    trace!("structure: début {} fichiers, {workers} fils", files.len());
     let mut batch: Vec<Batched> = Vec::new();
 
     std::thread::scope(|scope| {
@@ -100,6 +104,11 @@ pub(crate) fn analyze(
             flush(store, &mut batch, queue, report, &mut write_error);
         }
     });
+    trace!(
+        "structure: fin {} ms, {} en attente",
+        started.elapsed().as_millis(),
+        report.failed - failed_before
+    );
     match write_error {
         Some(e) => Err(e),
         None => Ok(()),

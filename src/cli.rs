@@ -29,6 +29,9 @@ pub struct IndexOpts {
     /// N'appelle pas le LLM (la configuration n'est pas lue) : structure seule, sans enrichissement
     #[arg(long)]
     pub no_llm: bool,
+    /// Traces synthétiques des étapes et des appels LLM sur stderr (préfixe `trace:`)
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -100,8 +103,8 @@ pub enum Query {
 /// Exécute la commande.
 pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
-        Command::Build(o) => crate::index::build::run(&cli.repo, o.no_llm),
-        Command::Update(o) => crate::index::update::run(&cli.repo, o.no_llm),
+        Command::Build(o) => crate::index::build::run(&cli.repo, o.no_llm, o.verbose),
+        Command::Update(o) => crate::index::update::run(&cli.repo, o.no_llm, o.verbose),
         Command::Status(j) => crate::status::run(&cli.repo, j.json),
         Command::Summary(j) => crate::summary::run(&cli.repo, j.json),
         Command::Export { output, format } => {
