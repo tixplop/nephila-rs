@@ -81,22 +81,24 @@ function load(data) {
   return g;
 }
 
-function initialView(g) {
-  var view = new Set();
+// Vue initiale (DEC-030) : au plus `limite` modules de plus haut degré (identifiant à égalité), sinon les
+// `limite` nœuds de plus haut degré. `hidden` = modules écartés (0 sans module). Retourne { view, hidden }.
+function initialView(g, limite) {
+  if (limite === undefined) limite = INITIAL_LIMIT;
+  if (!Number.isInteger(limite) || limite < 1) throw new RangeError("limite invalide : " + limite);
   var moduleKind = g.nodeKinds.indexOf("module");
+  var pool = [];
+  var i;
   if (moduleKind >= 0) {
-    for (var i = 0; i < g.n; i++) if (g.kind[i] === moduleKind) view.add(i);
-    if (view.size > 0) return view;
+    for (i = 0; i < g.n; i++) if (g.kind[i] === moduleKind) pool.push(i);
   }
-  var order = [];
-  for (var j = 0; j < g.n; j++) order.push(j);
-  order.sort(function (a, b) {
+  var hasModules = pool.length > 0;
+  if (!hasModules) for (i = 0; i < g.n; i++) pool.push(i);
+  pool.sort(function (a, b) {
     return g.degree[b] - g.degree[a] || cmp(g.ids[a], g.ids[b]);
   });
-  order.slice(0, INITIAL_LIMIT).forEach(function (x) {
-    view.add(x);
-  });
-  return view;
+  var kept = pool.slice(0, limite);
+  return { view: new Set(kept), hidden: hasModules ? pool.length - kept.length : 0 };
 }
 
 function search(g, text) {
@@ -197,6 +199,32 @@ function neighborsView(g, i, plafond) {
   return expand(g, new Set(), i, plafond);
 }
 
+// Indice du nœud d'identifiant `id`, -1 s'il est inconnu (index construit à la première demande).
+function indexOf(g, id) {
+  if (!g.idIndex) {
+    g.idIndex = new Map();
+    for (var i = 0; i < g.n; i++) g.idIndex.set(g.ids[i], i);
+  }
+  return g.idIndex.has(id) ? g.idIndex.get(id) : -1;
+}
+
+// Navigation vers le nœud i : ajouté à la vue s'il manque de la place sous le plafond, sinon la vue est
+// recentrée sur i et ses voisins (recentered = true). `hidden` est le compte « non affichés » à montrer
+// (0 hors recentrage : l'ancien message n'a plus de sens). Retourne { view, hidden, recentered }.
+function navigate(g, view, i, plafond) {
+  if (plafond === undefined) plafond = CAP;
+  checkNode(g, i);
+  checkCap(plafond);
+  if (view.has(i)) return { view: new Set(view), hidden: 0, recentered: false };
+  if (view.size < plafond) {
+    var next = new Set(view);
+    next.add(i);
+    return { view: next, hidden: 0, recentered: false };
+  }
+  var r = neighborsView(g, i, plafond);
+  return { view: r.view, hidden: r.hidden, recentered: true };
+}
+
 // Nœuds et liens à dessiner. filtres : { hiddenNodeKinds, hiddenEdgeKinds } (itérables de noms de genres décochés).
 function visible(g, view, filtres) {
   filtres = filtres || {};
@@ -234,6 +262,8 @@ if (typeof module !== "undefined") {
     details: details,
     expand: expand,
     neighborsView: neighborsView,
+    indexOf: indexOf,
+    navigate: navigate,
     visible: visible,
   };
 }

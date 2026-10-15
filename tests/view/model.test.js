@@ -24,7 +24,8 @@ test("load rejette des données invalides", () => {
 
 test("REQ025_AC5 AC-025-5 vue initiale : modules et liens depends_on", () => {
   const g = model.load(helpers.loadMaven3());
-  const view = model.initialView(g);
+  const { view, hidden } = model.initialView(g);
+  assert.equal(hidden, 0);
   assert.deepEqual(idsOf(g, view), ["module:com.acme:api", "module:com.acme:core", "module:com.acme:store"]);
   const dep = g.edgeKinds.indexOf("depends_on");
   const links = [];
@@ -51,14 +52,46 @@ test("REQ025_AC5 vue initiale sans module : 100 nœuds de plus haut degré", () 
   const expected = [...deg.keys()]
     .sort((a, b) => deg[b] - deg[a] || (data.nodes[a][0] < data.nodes[b][0] ? -1 : 1))
     .slice(0, 100);
-  const view = model.initialView(g);
+  const { view, hidden } = model.initialView(g);
+  assert.equal(hidden, 0);
   assert.equal(view.size, 100);
   assert.deepEqual([...view].sort((a, b) => a - b), expected.sort((a, b) => a - b));
 });
 
 test("REQ025_AC5 vue initiale : graphe vide", () => {
   const g = model.load({ nodes: [], edges: [], nodeKinds: [], edgeKinds: [] });
-  assert.equal(model.initialView(g).size, 0);
+  const r = model.initialView(g);
+  assert.equal(r.view.size, 0);
+  assert.equal(r.hidden, 0);
+});
+
+test("REQ025_AC5 600 modules : les 100 de plus haut degré, 500 non affichés, extension possible", () => {
+  const data = helpers.moduleGraph(600);
+  const g = model.load(data);
+  const modules = [];
+  for (let i = 0; i < g.n; i++) if (g.kind[i] === 0) modules.push(i);
+  assert.equal(modules.length, 600);
+  const expected = modules
+    .sort((a, b) => g.degree[b] - g.degree[a] || (g.ids[a] < g.ids[b] ? -1 : 1))
+    .slice(0, 100)
+    .sort((a, b) => a - b);
+  const { view, hidden } = model.initialView(g);
+  assert.equal(view.size, 100);
+  assert.equal(hidden, 500);
+  assert.deepEqual([...view].sort((a, b) => a - b), expected);
+  const m = expected[0];
+  const r = model.expand(g, view, m);
+  assert.ok(r.view.size > 100 && r.view.size <= 300);
+  assert.ok(model.visible(g, view, {}).nodes.every((i) => g.kind[i] === 0));
+  assert.deepEqual([...view].sort((a, b) => a - b), expected, "vue d'origine intacte");
+});
+
+test("REQ025_AC5 limite explicite et égalités par identifiant", () => {
+  const g = model.load(helpers.moduleGraph(30));
+  const a = model.initialView(g, 10);
+  assert.equal(a.view.size, 10);
+  assert.equal(a.hidden, 20);
+  assert.deepEqual([...model.initialView(g, 10).view], [...a.view]);
 });
 
 test("REQ025_AC6 recherche orderserv : OrderService en tête", () => {
@@ -230,4 +263,58 @@ test("REQ025_AC10 AC-025-10 extension d'un nœud de 5000 voisins", () => {
   assert.equal(r.view.size, 300);
   assert.equal(r.hidden, 4701);
   assert.ok(d < 50, "expand " + d);
+});
+
+test("REQ025_AC11 indexOf retrouve l'indice d'un identifiant, -1 si inconnu", () => {
+  const g = model.load(helpers.loadMaven3());
+  assert.equal(model.indexOf(g, ORDER) >= 0, true);
+  assert.equal(g.ids[model.indexOf(g, ORDER)], ORDER);
+  assert.equal(model.indexOf(g, "type:inconnu"), -1);
+});
+
+test("REQ025_AC11 navigate : nœud déjà affiché, vue inchangée et message remis à zéro", () => {
+  const g = model.load(helpers.starGraph(10));
+  const v = new Set([0, 1]);
+  const r = model.navigate(g, v, 1);
+  assert.deepEqual([...r.view].sort(), [0, 1]);
+  assert.equal(r.hidden, 0);
+  assert.equal(r.recentered, false);
+});
+
+test("REQ025_AC11 navigate : nœud absent ajouté à la vue sous le plafond", () => {
+  const g = model.load(helpers.starGraph(10));
+  const v = new Set([0]);
+  const r = model.navigate(g, v, 3);
+  assert.deepEqual([...r.view].sort((a, b) => a - b), [0, 3]);
+  assert.equal(r.hidden, 0);
+  assert.equal(r.recentered, false);
+  assert.equal(v.size, 1, "la vue d'origine n'est pas modifiée");
+  assert.throws(() => model.navigate(g, v, 99), RangeError);
+});
+
+test("REQ025_AC11 navigate : vue pleine, recentrage sur le nœud et ses voisins avec le compte masqué", () => {
+  const g = model.load(helpers.starGraph(500));
+  const full = new Set();
+  for (let k = 1; k <= 300; k++) full.add(k);
+  const r = model.navigate(g, full, 0);
+  assert.equal(r.view.size, 300);
+  assert.ok(r.view.has(0));
+  assert.equal(r.hidden, 201);
+  assert.equal(r.recentered, true);
+  assert.equal(model.navigate(g, full, 0, 400).recentered, false);
+  assert.equal(full.size, 300, "la vue d'origine n'est pas modifiée");
+  assert.ok(!full.has(0));
+});
+
+test("REQ025_AC11 navigate : étoile de 500, vue de 300 feuilles sans le centre", () => {
+  const g = model.load(helpers.starGraph(500));
+  const full = new Set();
+  for (let k = 1; k <= 300; k++) full.add(k);
+  const r = model.navigate(g, full, 0);
+  assert.equal(r.view.size, 300);
+  assert.ok(r.view.has(0));
+  assert.equal(r.hidden, 201);
+  assert.equal(r.recentered, true);
+  assert.throws(() => model.navigate(g, full, -1), RangeError);
+  assert.throws(() => model.navigate(g, full, 1.5), RangeError);
 });

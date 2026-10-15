@@ -24,6 +24,25 @@ function noModuleGraph(n) {
   return { version: 1, name: "synthetic", nodeKinds: ["type"], edgeKinds: ["calls"], nodes, edges };
 }
 
+// n modules ; le module j dépend des (j % 4) suivants et contient (j % 3) + 1 types.
+function moduleGraph(n) {
+  const nodes = [];
+  const edges = [];
+  for (let i = 0; i < n; i++) {
+    const id = "module:g:m" + String(i).padStart(4, "0");
+    nodes.push([id, 0, "m" + i, "g:m" + i, null, null, null]);
+  }
+  for (let j = 0; j < n; j++) {
+    for (let k = 1; k <= j % 4; k++) if (j + k < n) edges.push([j, j + k, 0]);
+    for (let t = 0; t <= j % 3; t++) {
+      const idx = nodes.length;
+      nodes.push(["type:g.T" + j + "x" + t, 1, "T" + j + "x" + t, "g.T" + j + "x" + t, null, null, null]);
+      edges.push([j, idx, 1]);
+    }
+  }
+  return { version: 1, name: "modules", nodeKinds: ["module", "type"], edgeKinds: ["depends_on", "contains"], nodes, edges };
+}
+
 // Nœud 0 au centre, relié à n voisins.
 function starGraph(n) {
   const nodes = [["type:p.Center", 0, "Center", "p.Center", null, null, null]];
@@ -60,4 +79,4 @@ function randomGraph(nodeCount, edgeCount, seed = 42) {
   return { version: 1, name: "random", nodeKinds, edgeKinds: ["calls", "contains"], nodes, edges };
 }
 
-module.exports = { loadMaven3, noModuleGraph, starGraph, randomGraph };
+module.exports = { loadMaven3, noModuleGraph, moduleGraph, starGraph, randomGraph };

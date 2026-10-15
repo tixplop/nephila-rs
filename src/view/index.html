@@ -9,6 +9,27 @@
 </head>
 <body>
 <header id="header"></header>
+<main>
+<aside id="side">
+<section>
+<input id="search" type="search" placeholder="Rechercher un nœud" autocomplete="off">
+<ul id="results"></ul>
+</section>
+<section>
+<button id="reset" type="button">Vue initiale</button>
+<button id="expand" type="button" disabled>Étendre</button>
+<div id="message"></div>
+</section>
+<section>
+<h2>Genres de nœuds</h2>
+<div id="node-filters"></div>
+<h2>Genres de liens</h2>
+<div id="edge-filters"></div>
+</section>
+<section id="details"></section>
+</aside>
+<canvas id="canvas"></canvas>
+</main>
 <script type="application/json" id="rkg-data">{{data}}</script>
 <script>
 {{model}}
