@@ -186,6 +186,7 @@ impl Builder {
                 qualified,
                 subkind,
                 summary: None,
+                short: None,
             });
         }
     }
@@ -226,6 +227,7 @@ impl Builder {
             context: self.context(),
             declares: self.declares,
             references: self.references,
+            warnings: Vec::new(),
         }
     }
 }

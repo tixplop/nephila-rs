@@ -15,6 +15,8 @@ pub struct Declared {
     pub qualified: String,
     pub subkind: Option<SubKind>,
     pub summary: Option<String>,
+    /// Nom court fixé par l'extracteur (DEC-024) ; `None` = dérivé du nom qualifié.
+    pub short: Option<String>,
 }
 
 impl Declared {
@@ -105,6 +107,7 @@ impl Extraction {
                 qualified: d.name,
                 subkind,
                 summary: d.summary,
+                short: None,
             });
         }
         let mut references = Vec::with_capacity(raw.references.len());

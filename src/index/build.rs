@@ -319,7 +319,8 @@ pub(crate) fn extract_all(
 fn short_name(kind: NodeKind, qualified: &str) -> &str {
     let after = |seps: &[char]| qualified.rsplit(seps).next().unwrap_or(qualified);
     match kind {
-        NodeKind::Document | NodeKind::Module => after(&['/']),
+        NodeKind::Document => after(&['/']),
+        NodeKind::Module => after(&[':', '/']),
         NodeKind::Section => after(&['#']),
         NodeKind::Dependency => after(&[':']),
         _ => after(&['.']),
@@ -343,7 +344,9 @@ fn to_records(path: &str, x: Extraction) -> (Vec<Node>, Vec<Ref>, usize) {
         nodes.push(Node::new(
             d.kind,
             &d.qualified,
-            short_name(d.kind, &d.qualified),
+            d.short
+                .as_deref()
+                .unwrap_or_else(|| short_name(d.kind, &d.qualified)),
             file,
             d.subkind,
             d.summary.as_deref(),
@@ -369,6 +372,35 @@ fn to_records(path: &str, x: Extraction) -> (Vec<Node>, Vec<Ref>, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn module(q: &str, short: Option<&str>) -> Extraction {
+        Extraction {
+            declares: vec![crate::llm::extract::Declared {
+                kind: NodeKind::Module,
+                qualified: q.into(),
+                subkind: None,
+                summary: None,
+                short: short.map(str::to_string),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dec024_nom_court_porte_par_la_declaration() {
+        let (n, _, _) = to_records("api/pom.xml", module("com.acme:api", Some("api")));
+        assert_eq!(n[0].short, "api");
+    }
+
+    #[test]
+    fn dec024_nom_court_derive_du_module() {
+        let (n, _, _) = to_records("pom.xml", module("com.acme:core", None));
+        assert_eq!(n[0].short, "core");
+        let (n, _, _) = to_records("pom.xml", module("core", None));
+        assert_eq!(n[0].short, "core");
+        let (n, _, _) = to_records("pom.xml", module("a/b", None));
+        assert_eq!(n[0].short, "b");
+    }
 
     fn net() -> Error {
         Error::Network("réseau".into())
