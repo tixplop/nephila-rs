@@ -11,13 +11,14 @@ use crate::store::Store;
 pub fn run(repo: &Path, as_json: bool) -> Result<()> {
     let store = Store::open_readonly(repo)?;
     let d = diff::compute(repo, &store)?;
+    let to_enrich = store.count_files_to_enrich()?;
     if as_json {
         let files: Vec<_> = d
             .changes
             .iter()
             .map(|c| json!({"chemin": c.path, "état": c.change.label()}))
             .collect();
-        let v = json!({"a_jour": d.is_up_to_date(), "fichiers": files});
+        let v = json!({"a_jour": d.is_up_to_date(), "fichiers": files, "to_enrich": to_enrich});
         println!("{v}");
         return Ok(());
     }
@@ -28,6 +29,9 @@ pub fn run(repo: &Path, as_json: bool) -> Result<()> {
         for c in &d.changes {
             println!("{}\t{}", c.change.label(), c.path);
         }
+    }
+    if to_enrich > 0 {
+        println!("{to_enrich} fichiers à enrichir (résumés et concepts)");
     }
     Ok(())
 }

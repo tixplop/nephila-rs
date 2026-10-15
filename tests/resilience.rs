@@ -122,6 +122,14 @@ fn to_enrich(env: &Env) -> Vec<String> {
     v
 }
 
+fn paths_pending(files: &[rkg::model::FileRecord]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| f.state == FileState::Pending)
+        .map(|f| f.path.clone())
+        .collect()
+}
+
 fn logged_paths(env: &Env) -> Vec<String> {
     let mut v: Vec<String> = fs::read_to_string(&env.log)
         .unwrap_or_default()
@@ -300,14 +308,38 @@ fn req010_ac3_build_killed_during_enrichment_leaves_readable_graph_with_files_to
     let files = store.files().unwrap();
     assert!(!files.is_empty());
     assert!(files.iter().all(|f| f.state == FileState::Indexed));
-    assert!(!to_enrich(&env).is_empty());
-    assert!(store
-        .nodes()
-        .unwrap()
-        .iter()
-        .any(|n| n.id == "type:com.acme.core.OrderService"));
-    store.nodes().unwrap();
+    let pending = to_enrich(&env);
+    assert!(!pending.is_empty());
+    let nodes = store.nodes().unwrap();
     store.edges().unwrap();
+    for f in files.iter().filter(|f| f.path.ends_with(".java")) {
+        assert!(
+            nodes.iter().any(|n| n.file.as_deref() == Some(&f.path)),
+            "aucun nœud pour {}",
+            f.path
+        );
+    }
+    let status = env.run("status", &[]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let text = String::from_utf8_lossy(&status.stdout).into_owned();
+    let expected = format!("{} fichiers à enrichir", pending.len());
+    assert!(
+        text.lines().any(|l| l.contains(&expected)),
+        "{expected} absent de :\n{text}"
+    );
+    for f in files.iter().filter(|f| f.path.ends_with(".java")) {
+        let stem = Path::new(&f.path).file_stem().unwrap().to_string_lossy();
+        let search = env
+            .command("query", &[])
+            .args(["search", &stem])
+            .output()
+            .unwrap();
+        assert!(search.status.success(), "{}", stderr(&search));
+        assert!(
+            String::from_utf8_lossy(&search.stdout).contains(stem.as_ref()),
+            "{stem} introuvable par search"
+        );
+    }
 }
 
 #[test]
@@ -369,4 +401,190 @@ fn req020_lock_is_exclusive_and_released_on_drop() {
     assert!(err.to_string().contains("indexation déjà en cours"));
     drop(first);
     rkg::index::lock::RepoLock::acquire(dir.path()).unwrap();
+}
+
+#[test]
+fn req010_ac3_state_left_by_a_kill_during_structure_lists_pending_files_and_update_completes() {
+    let env = Env::new();
+    let out = env.run("build", &[("RKG_CONFIG", "/nonexistent/absent.toml")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // État qu'un `kill -9` pendant la phase structure laisse : le graphe est réinitialisé avec
+    // tous les fichiers « en attente » (une transaction), puis une partie seulement est analysée
+    // (chaque fichier est une transaction).
+    let pending: Vec<String> = {
+        let mut store = Store::open_existing(&env.repo).unwrap();
+        let files = store.files().unwrap();
+        let nodes = store.nodes().unwrap();
+        let refs = store.refs().unwrap();
+        let declared = store.declarations().unwrap();
+        let java: Vec<String> = {
+            let mut v: Vec<String> = files
+                .iter()
+                .filter(|f| f.path.ends_with(".java"))
+                .map(|f| f.path.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        assert!(java.len() >= 4);
+        let pending: Vec<String> = java.iter().take(2).cloned().collect();
+        store.reset_with_pending_files(&files).unwrap();
+        for f in files.iter().filter(|f| !pending.contains(&f.path)) {
+            let ids: Vec<&String> = declared
+                .iter()
+                .filter(|(p, _)| *p == f.path)
+                .map(|(_, id)| id)
+                .collect();
+            let ns: Vec<_> = nodes
+                .iter()
+                .filter(|n| ids.contains(&&n.id))
+                .cloned()
+                .map(|mut n| {
+                    n.file = n.file.map(|_| f.path.clone());
+                    n
+                })
+                .collect();
+            let rs: Vec<_> = refs
+                .iter()
+                .filter(|r| ids.contains(&&r.source))
+                .cloned()
+                .collect();
+            store.replace_structure(&f.path, &ns, &rs).unwrap();
+        }
+        pending
+    };
+    assert_eq!(paths_in_graph(&env, FileState::Pending), pending);
+    let status = env.run("status", &[("RKG_CONFIG", "/nonexistent/absent.toml")]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let text = String::from_utf8_lossy(&status.stdout).into_owned();
+    for p in &pending {
+        assert!(
+            text.lines()
+                .any(|l| l.contains(p) && l.contains("en attente")),
+            "{text}"
+        );
+    }
+    let search = env
+        .command("query", &[("RKG_CONFIG", "/nonexistent/absent.toml")])
+        .args(["search", "OrderService"])
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{}", stderr(&search));
+    assert!(String::from_utf8_lossy(&search.stdout).contains("OrderService"));
+    let upd = env.run("update", &[("RKG_CONFIG", "/nonexistent/absent.toml")]);
+    assert!(upd.status.success(), "{}", stderr(&upd));
+    assert!(paths_in_graph(&env, FileState::Pending).is_empty());
+}
+
+#[test]
+fn req010_ac3_build_killed_during_structure_phase_leaves_readable_graph() {
+    // Dépôt assez gros pour que la phase structure dure ; tué dès que le graphe est ouvrable.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let dir = repo.join("src/main/java/com/acme");
+    fs::create_dir_all(&dir).unwrap();
+    for i in 0..150 {
+        let mut s = format!("package com.acme;\npublic class C{i} {{\n");
+        for m in 0..100 {
+            s.push_str(&format!("    void m{m}() {{}}\n"));
+        }
+        s.push_str("}\n");
+        fs::write(dir.join(format!("C{i}.java")), s).unwrap();
+    }
+    let absent = tmp.path().join("absent.toml");
+    let rkg = |args: &[&str]| {
+        let mut c = Command::new(cargo_bin("rkg"));
+        c.arg("-C").arg(&repo).args(args).env("RKG_CONFIG", &absent);
+        c
+    };
+    let mut child = rkg(&["build"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Attend qu'au moins un fichier soit « en attente » : la phase structure est en cours.
+    let start = Instant::now();
+    loop {
+        if let Ok(store) = Store::open_readonly(&repo) {
+            if let Ok(files) = store.files() {
+                if files.iter().any(|f| f.state == FileState::Pending) {
+                    break;
+                }
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(30), "build trop lent");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "build déjà terminé : le kill ne tombe pas pendant la phase structure"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let store = Store::open_readonly(&repo).expect("graphe illisible après kill -9");
+    let files = store.files().unwrap();
+    assert_eq!(files.len(), 150);
+    store.nodes().unwrap();
+    store.edges().unwrap();
+    let pending = paths_pending(&files);
+    assert!(
+        !pending.is_empty(),
+        "plus aucun fichier en attente au moment du kill"
+    );
+    let status = rkg(&["status"]).output().unwrap();
+    assert!(status.status.success(), "{}", stderr(&status));
+    let text = String::from_utf8_lossy(&status.stdout).into_owned();
+    for p in &pending {
+        assert!(
+            text.lines()
+                .any(|l| l.contains(p.as_str()) && l.contains("en attente")),
+            "fichier {p} non signalé « en attente » :\n{text}"
+        );
+    }
+    let upd = rkg(&["update"]).output().unwrap();
+    assert!(upd.status.success(), "{}", stderr(&upd));
+    let store = Store::open_readonly(&repo).unwrap();
+    assert!(store
+        .files()
+        .unwrap()
+        .iter()
+        .all(|f| f.state == FileState::Indexed));
+    assert_eq!(
+        store
+            .nodes()
+            .unwrap()
+            .iter()
+            .filter(|n| n.id.starts_with("type:com.acme.C"))
+            .count(),
+        150
+    );
+}
+
+#[test]
+fn req024_ac9_structure_is_searchable_while_enrichment_is_running() {
+    let env = Env::new();
+    let mut child = env.spawn_slow_build();
+    // L'enrichissement a commencé (premier appel journalisé) et dure encore.
+    assert!(child.try_wait().unwrap().is_none(), "build déjà terminé");
+    let out = env
+        .command("query", &[])
+        .args(["search", "OrderService"])
+        .output()
+        .unwrap();
+    let store = Store::open_readonly(&env.repo).unwrap();
+    let files = store.files().unwrap();
+    let nodes = store.nodes().unwrap();
+    let java: Vec<_> = files.iter().filter(|f| f.path.ends_with(".java")).collect();
+    assert!(!java.is_empty());
+    for f in java {
+        assert!(
+            nodes.iter().any(|n| n.file.as_deref() == Some(&f.path)),
+            "aucun nœud pour {}",
+            f.path
+        );
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("OrderService"));
 }

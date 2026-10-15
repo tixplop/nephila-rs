@@ -187,4 +187,74 @@ mod tests {
         let (n, _, _) = to_records("pom.xml", &module("a/b", None));
         assert_eq!(n[0].short, "b");
     }
+
+    /// AC-010-8 : un fichier pris en charge devenu illisible entre le parcours et l'analyse.
+    #[test]
+    fn req010_ac8_unreadable_file_stays_pending_others_analyzed_then_update_fixes() {
+        use crate::index::build::{finalize, finish, IndexOptions};
+        use crate::index::lock::RepoLock;
+        use crate::index::update::update;
+        use crate::model::{FileRecord, FileState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::fs::write(repo.join("A.java"), "package p;\npublic class A {}\n").unwrap();
+        std::fs::write(repo.join("B.java"), "package p;\npublic class B {}\n").unwrap();
+        let scanned = crate::scan::scan(repo, &[]).unwrap();
+        assert_eq!(scanned.files.len(), 2);
+        let mut store = Store::open_or_create(repo).unwrap();
+        let records: Vec<FileRecord> = scanned
+            .files
+            .iter()
+            .map(|f| FileRecord {
+                path: f.path.clone(),
+                hash: f.hash.clone(),
+                size: f.size,
+                mtime: f.mtime,
+                recorded_at: 0,
+                state: FileState::Pending,
+            })
+            .collect();
+        store.reset_with_pending_files(&records).unwrap();
+        // La lecture de B échoue : le fichier disparaît après le parcours.
+        std::fs::remove_file(repo.join("B.java")).unwrap();
+        let mut report = BuildReport::default();
+        analyze(
+            repo,
+            &scanned.files,
+            2,
+            &scanned.gradle_settings,
+            &mut store,
+            &mut report,
+        )
+        .unwrap();
+        let opts = IndexOptions::default();
+        finalize(&mut store, None, &opts, repo, &mut report).unwrap();
+        assert_eq!((report.processed, report.failed, report.pending), (1, 1, 1));
+        let state = |store: &Store, p: &str| {
+            store
+                .files()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.path == p)
+                .unwrap()
+                .state
+        };
+        assert_eq!(state(&store, "A.java"), FileState::Indexed);
+        assert_eq!(state(&store, "B.java"), FileState::Pending);
+        let ids: Vec<String> = store.nodes().unwrap().into_iter().map(|n| n.id).collect();
+        assert!(ids.contains(&"type:p.A".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"type:p.B".to_string()));
+        assert!(finish(&report, "build").is_err());
+
+        // Après correction, un update analyse le fichier.
+        drop(store);
+        std::fs::write(repo.join("B.java"), "package p;\npublic class B {}\n").unwrap();
+        let lock = RepoLock::acquire(repo).unwrap();
+        let report = update(repo, &opts, None, &lock).unwrap().unwrap();
+        assert_eq!(report.pending, 0);
+        assert!(finish(&report, "update").is_ok());
+        let store = Store::open_readonly(repo).unwrap();
+        assert!(store.nodes().unwrap().iter().any(|n| n.id == "type:p.B"));
+    }
 }

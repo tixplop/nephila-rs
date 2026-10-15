@@ -259,7 +259,11 @@ fn req010_ac3_status_after_build_killed_during_enrichment_is_readable_and_up_to_
     let out = env.status(&[]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     // La structure était complète avant l'enrichissement : aucun fichier en attente.
-    assert_eq!(lines(&out), vec!["graphe à jour"]);
+    // Les fichiers non enrichis sont signalés sur une ligne à part, hors état « à jour ».
+    let l = lines(&out);
+    assert_eq!(l.len(), 2, "{l:?}");
+    assert_eq!(l[0], "graphe à jour");
+    assert!(l[1].contains("fichiers à enrichir"), "{l:?}");
 }
 
 #[test]
