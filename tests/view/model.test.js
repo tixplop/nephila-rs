@@ -125,3 +125,109 @@ test("REQ025_AC8 détails : nœud inconnu et champs absents", () => {
   assert.equal(d.summary, null);
   assert.equal(d.file, null);
 });
+
+test("REQ025_AC7 AC-025-7 extension : voisins entrants et sortants", () => {
+  const g = model.load(helpers.loadMaven3());
+  const i = g.ids.indexOf(ORDER);
+  const r = model.expand(g, new Set([i]), i);
+  const d = model.details(g, i);
+  const expected = new Set([ORDER]);
+  for (const o of [d.out, d.in]) for (const k of Object.keys(o)) o[k].forEach((x) => expected.add(x));
+  assert.deepEqual(idsOf(g, r.view), [...expected].sort());
+  assert.equal(r.hidden, 0);
+  const vis = model.visible(g, r.view, {});
+  for (const e of vis.edges) assert.ok(r.view.has(g.src[e]) && r.view.has(g.dst[e]));
+  assert.throws(() => model.expand(g, new Set(), 99999), RangeError);
+  assert.throws(() => model.expand(g, new Set(), i, 0), RangeError);
+});
+
+test("REQ025_AC7 AC-025-7 plafond : 500 voisins, 300 nœuds, 201 non affichés", () => {
+  const data = helpers.starGraph(500);
+  // degré supplémentaire pour S00500 et S00499 : ils doivent être retenus d'abord
+  data.nodes.push(["type:p.X", 0, "X", "p.X", null, null, null]);
+  data.edges.push([500, 501, 0], [499, 501, 0], [499, 501, 0]);
+  const g = model.load(data);
+  const r = model.expand(g, new Set([0]), 0);
+  assert.equal(r.view.size, 300);
+  assert.equal(r.hidden, 201);
+  assert.ok(r.view.has(499) && r.view.has(500));
+  assert.ok(r.view.has(1) && r.view.has(297) && !r.view.has(298));
+  const n = model.neighborsView(g, 0);
+  assert.equal(n.view.size, 300);
+  assert.equal(n.hidden, 201);
+  assert.equal(model.expand(g, new Set([0]), 0, 10).view.size, 10);
+  // vue déjà au plafond : rien n'est ajouté
+  const full = model.expand(g, r.view, 0);
+  assert.equal(full.view.size, 300);
+  assert.equal(full.hidden, 201);
+});
+
+test("REQ025_AC7 AC-025-7 plafond : nœud hors d'une vue pleine", () => {
+  const g = model.load(helpers.starGraph(500));
+  const full = new Set();
+  for (let k = 1; k <= 300; k++) full.add(k);
+  const r = model.expand(g, full, 0);
+  assert.ok(r.view.size <= 300);
+  assert.equal(r.view.size, 300);
+  assert.ok(!r.view.has(0));
+  assert.equal(r.hidden, 200);
+});
+
+test("REQ025_AC9 AC-025-9 filtres par genre de nœud et de lien", () => {
+  const g = model.load(randomGraphSmall());
+  const view = new Set();
+  for (let i = 0; i < g.n; i++) view.add(i);
+  const all = model.visible(g, view, {});
+  assert.equal(all.nodes.length, g.n);
+  assert.equal(all.edges.length, g.m);
+  const noMethod = model.visible(g, view, { hiddenNodeKinds: ["method"] });
+  assert.ok(noMethod.nodes.every((i) => g.nodeKinds[g.kind[i]] !== "method"));
+  assert.ok(noMethod.nodes.length < g.n);
+  const ok = new Set(noMethod.nodes);
+  assert.ok(noMethod.edges.every((e) => ok.has(g.src[e]) && ok.has(g.dst[e])));
+  const expectedEdges = [];
+  for (let e = 0; e < g.m; e++) if (ok.has(g.src[e]) && ok.has(g.dst[e])) expectedEdges.push(e);
+  assert.deepEqual(noMethod.edges, expectedEdges);
+  const noCalls = model.visible(g, view, { hiddenEdgeKinds: ["calls"] });
+  assert.equal(noCalls.nodes.length, g.n);
+  assert.ok(noCalls.edges.length < g.m);
+  assert.ok(noCalls.edges.every((e) => g.edgeKinds[g.ekind[e]] !== "calls"));
+  const back = model.visible(g, view, { hiddenNodeKinds: [], hiddenEdgeKinds: [] });
+  assert.deepEqual(back, all);
+  // liens limités aux nœuds de la vue
+  const sub = model.visible(g, new Set([0, 1]), {});
+  assert.ok(sub.edges.every((e) => g.src[e] <= 1 && g.dst[e] <= 1));
+});
+
+function randomGraphSmall() {
+  return helpers.randomGraph(60, 200);
+}
+
+test("REQ025_AC10 AC-025-10 performances sur 120 000 nœuds et 300 000 liens", () => {
+  const data = helpers.randomGraph(120000, 300000);
+  let t = performance.now();
+  const g = model.load(data);
+  const tLoad = performance.now() - t;
+  t = performance.now();
+  const hits = model.search(g, "c1234");
+  const tSearch = performance.now() - t;
+  assert.ok(hits.length > 0);
+  let hub = 0;
+  for (let i = 1; i < g.n; i++) if (g.degree[i] > g.degree[hub]) hub = i;
+  t = performance.now();
+  model.expand(g, new Set([hub]), hub);
+  const tExpand = performance.now() - t;
+  assert.ok(tLoad < 2000, "load " + tLoad);
+  assert.ok(tSearch < 100, "search " + tSearch);
+  assert.ok(tExpand < 50, "expand " + tExpand);
+});
+
+test("REQ025_AC10 AC-025-10 extension d'un nœud de 5000 voisins", () => {
+  const g = model.load(helpers.starGraph(5000));
+  const t = performance.now();
+  const r = model.expand(g, new Set([0]), 0);
+  const d = performance.now() - t;
+  assert.equal(r.view.size, 300);
+  assert.equal(r.hidden, 4701);
+  assert.ok(d < 50, "expand " + d);
+});

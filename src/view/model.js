@@ -149,6 +149,82 @@ function details(g, i) {
   };
 }
 
+var CAP = 300;
+
+// Voisins directs (entrants et sortants) de i, sans doublon ni i lui-même.
+function neighborSet(g, i) {
+  var set = new Set();
+  var p;
+  for (p = g.out.start[i]; p < g.out.start[i + 1]; p++) set.add(g.dst[g.out.list[p]]);
+  for (p = g.in.start[i]; p < g.in.start[i + 1]; p++) set.add(g.src[g.in.list[p]]);
+  set.delete(i);
+  return set;
+}
+
+function checkNode(g, i) {
+  if (!Number.isInteger(i) || i < 0 || i >= g.n) {
+    throw new RangeError("nœud inconnu : " + i);
+  }
+}
+
+function checkCap(cap) {
+  if (!Number.isInteger(cap) || cap < 1) throw new RangeError("plafond invalide : " + cap);
+}
+
+// Ajoute à `view` les voisins de i, dans la limite du plafond de nœuds affichés
+// (plus haut degré d'abord, identifiant à égalité). Retourne { view, hidden }.
+function expand(g, view, i, plafond) {
+  if (plafond === undefined) plafond = CAP;
+  checkNode(g, i);
+  checkCap(plafond);
+  var next = new Set(view);
+  if (next.size < plafond) next.add(i);
+  var cands = [];
+  neighborSet(g, i).forEach(function (x) {
+    if (!next.has(x)) cands.push(x);
+  });
+  cands.sort(function (a, b) {
+    return g.degree[b] - g.degree[a] || cmp(g.ids[a], g.ids[b]);
+  });
+  var room = next.has(i) ? Math.max(0, plafond - next.size) : 0;
+  var take = Math.min(room, cands.length);
+  for (var k = 0; k < take; k++) next.add(cands[k]);
+  return { view: next, hidden: cands.length - take };
+}
+
+// Vue d'un résultat de recherche : le nœud et ses voisins directs, sous le même plafond.
+function neighborsView(g, i, plafond) {
+  return expand(g, new Set(), i, plafond);
+}
+
+// Nœuds et liens à dessiner. filtres : { hiddenNodeKinds, hiddenEdgeKinds } (itérables de noms de genres décochés).
+function visible(g, view, filtres) {
+  filtres = filtres || {};
+  var hn = new Set(filtres.hiddenNodeKinds || []);
+  var he = new Set(filtres.hiddenEdgeKinds || []);
+  var nodes = [];
+  var keep = new Set();
+  view.forEach(function (x) {
+    if (hn.has(g.nodeKinds[g.kind[x]])) return;
+    keep.add(x);
+    nodes.push(x);
+  });
+  nodes.sort(function (a, b) {
+    return a - b;
+  });
+  var edges = [];
+  nodes.forEach(function (x) {
+    for (var p = g.out.start[x]; p < g.out.start[x + 1]; p++) {
+      var e = g.out.list[p];
+      if (keep.has(g.dst[e]) && !he.has(g.edgeKinds[g.ekind[e]])) edges.push(e);
+    }
+  });
+  edges.sort(function (a, b) {
+    return a - b;
+  });
+  return { nodes: nodes, edges: edges };
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     readData: readData,
@@ -156,5 +232,8 @@ if (typeof module !== "undefined") {
     initialView: initialView,
     search: search,
     details: details,
+    expand: expand,
+    neighborsView: neighborsView,
+    visible: visible,
   };
 }
