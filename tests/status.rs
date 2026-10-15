@@ -292,3 +292,38 @@ fn req001_ac4_status_on_indexed_repo_calls_no_llm() {
     assert!(out.status.success());
     assert_eq!(fs::read_to_string(&env.log).unwrap(), before);
 }
+
+#[test]
+fn req012_ac6_files_to_enrich_are_counted_when_structure_is_up_to_date() {
+    let env = Env::built();
+    // Aucun fichier à enrichir : pas de ligne, `to_enrich` = 0.
+    assert_eq!(lines(&env.status(&[])), vec!["graphe à jour"]);
+    let v: serde_json::Value = serde_json::from_slice(&env.status(&["--json"]).stdout).unwrap();
+    assert_eq!(v["to_enrich"], 0);
+
+    // Trois fichiers modifiés puis `update --no-llm` : structure à jour, 3 fichiers à enrichir.
+    fs::write(env.repo.join(JAVA), "class OrderService { int a; }\n").unwrap();
+    fs::write(env.repo.join(JAVA2), "class Order { int b; }\n").unwrap();
+    fs::write(env.repo.join("README.md"), "# modifié\n").unwrap();
+    let out = env.run(&["update", "--no-llm"], &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = env.status(&[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        lines(&out),
+        vec![
+            "graphe à jour",
+            "3 fichiers à enrichir (résumés et concepts)"
+        ]
+    );
+    let v: serde_json::Value = serde_json::from_slice(&env.status(&["--json"]).stdout).unwrap();
+    assert_eq!(v["a_jour"], true);
+    assert_eq!(v["to_enrich"], 3);
+
+    // Un `update` avec LLM enrichit les trois fichiers : plus de ligne, `to_enrich` = 0.
+    let out = env.run(&["update"], &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(lines(&env.status(&[])), vec!["graphe à jour"]);
+    let v: serde_json::Value = serde_json::from_slice(&env.status(&["--json"]).stdout).unwrap();
+    assert_eq!(v["to_enrich"], 0);
+}

@@ -337,3 +337,200 @@ fn build_on_schema_v1_database_recreates_it() {
     env.build();
     assert!(env.computed_at() > 0);
 }
+
+// ---- T-035 : bout en bout sur le dépôt Maven à 3 modules
+
+impl Env {
+    fn write(&self, rel: &str, content: &str) {
+        let p = self.repo.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, content).unwrap();
+    }
+
+    /// Commande d'écriture avec ou sans configuration LLM.
+    fn write_cmd(&self, args: &[&str]) -> Output {
+        let out = Command::new(cargo_bin("rkg"))
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("RKG_CONFIG", &self.config)
+            .env("RKG_MOCK_DIR", &self.mock)
+            .env("RKG_MOCK_LOG", &self.log)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        out
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+#[test]
+fn req019_ac5_summary_without_llm_has_structure_and_no_themes() {
+    let env = Env::new();
+    env.write_cmd(&["build", "--no-llm"]);
+    let s = env.json(&["summary", "--json"]);
+    assert_eq!(s["themes"], serde_json::json!([]), "{s}");
+    assert_eq!(s["modules"].as_array().unwrap().len(), 3, "{s}");
+    let api = s["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "api")
+        .unwrap();
+    assert_eq!(strings(&api["depends_on"]), vec!["module:com.acme:core"]);
+    assert!(!s["top_nodes"].as_array().unwrap().is_empty());
+    let out = env.read(&["summary"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let t = text(&out.stdout);
+    assert!(t.contains("aucun thème (graphe non enrichi)"), "{t}");
+    assert!(t.contains("core"), "{t}");
+    assert!(t.contains("slf4j-api"), "{t}");
+}
+
+#[test]
+fn req019_ac2_ac3_summary_recomputed_only_on_change() {
+    let env = Env::new();
+    env.write_cmd(&["build", "--no-llm"]);
+    let t0 = env.computed_at();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Aucun changement : résumé non recalculé.
+    env.write_cmd(&["update", "--no-llm"]);
+    assert_eq!(env.computed_at(), t0);
+    // Enrichissement seul (aucun changement de fichier) : résumé recalculé, thèmes présents.
+    env.write_cmd(&["update"]);
+    let t1 = env.computed_at();
+    assert!(t1 > t0);
+    assert!(!env.json(&["summary", "--json"])["themes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Changement de structure : résumé recalculé et stocké.
+    env.write("extra/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>extra</artifactId>\
+         <dependencies><dependency><groupId>com.acme</groupId><artifactId>core</artifactId></dependency></dependencies></project>");
+    env.write_cmd(&["update"]);
+    assert!(env.computed_at() > t1);
+    let s = env.json(&["summary", "--json"]);
+    assert_eq!(s["modules"].as_array().unwrap().len(), 4, "{s}");
+    // Rien ne change plus.
+    let t2 = env.computed_at();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    env.write_cmd(&["update"]);
+    assert_eq!(env.computed_at(), t2);
+}
+
+const NOTES: &str = "docs/notes.md";
+
+fn mentions_in(v: &Value) -> Vec<Value> {
+    v["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["kind"] == "mentions")
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn req008_ac7_candidate_mentions_are_not_unresolved_and_link_after_update() {
+    let env = Env::new();
+    env.write(NOTES, "# Notes\n\nVoir `Inexistant` et `config.toml`.\n");
+    let out = env.write_cmd(&["build"]);
+    let bilan = text(&out.stdout);
+    let v = env.json(&["export"]);
+    let n = v["unresolved"].as_array().unwrap().len();
+    assert!(
+        bilan.contains(&format!("{n} références non résolues")),
+        "{bilan}"
+    );
+    assert!(mentions_in(&v).is_empty(), "{:?}", v["unresolved"]);
+    assert!(!v["unresolved"].to_string().contains("Inexistant"));
+    assert!(!v["unresolved"].to_string().contains("config.toml"));
+    let linked = |v: &Value| {
+        v["edges"].as_array().unwrap().iter().any(|e| {
+            e["kind"] == "mentions"
+                && e["source"] == "section:docs/notes.md#notes"
+                && e["target"] == "type:com.acme.core.Inexistant"
+        })
+    };
+    assert!(!linked(&v));
+
+    env.write(
+        "core/src/main/java/com/acme/core/Inexistant.java",
+        "package com.acme.core;\npublic class Inexistant { }\n",
+    );
+    let before = env.log().lines().count();
+    let upd = env.write_cmd(&["update"]);
+    assert!(
+        text(&upd.stdout).contains("terminé : 1 fichiers traités,"),
+        "{}",
+        text(&upd.stdout)
+    );
+    let v = env.json(&["export"]);
+    assert!(linked(&v), "lien mentions absent");
+    assert!(mentions_in(&v).is_empty());
+    let new_log: Vec<String> = env.log().lines().skip(before).map(String::from).collect();
+    assert!(
+        new_log.iter().all(|l| !l.contains(NOTES)),
+        "le .md a été renvoyé au LLM : {new_log:?}"
+    );
+}
+
+fn has_mention(v: &Value, source: &str) -> bool {
+    v["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "mentions" && e["source"] == source)
+}
+
+#[test]
+fn req023_ac4_only_backticked_mentions_outside_code_blocks_after_a_title() {
+    let env = Env::new();
+    env.write(
+        "docs/plain.md",
+        "OrderService avant le titre, `OrderService` aussi.\n\n# Titre\n\n\
+         OrderService sans backticks.\n\n```\nOrderService\n`OrderService`\n```\n",
+    );
+    env.write_cmd(&["build", "--no-llm"]);
+    let v = env.json(&["export"]);
+    assert!(
+        v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == "section:docs/plain.md#titre"),
+        "section absente"
+    );
+    assert!(!has_mention(&v, "section:docs/plain.md#titre"), "{v}");
+    assert!(!has_mention(&v, "document:docs/plain.md"), "{v}");
+    let to_service = v["edges"].as_array().unwrap().iter().any(|e| {
+        e["kind"] == "mentions"
+            && e["source"].as_str().unwrap_or("").contains("docs/plain.md")
+            && e["target"] == "type:com.acme.core.OrderService"
+    });
+    assert!(!to_service, "lien mentions vers OrderService : {v}");
+}
+
+#[test]
+fn req023_ac5_duplicate_titles_get_numbered_section_ids() {
+    let env = Env::new();
+    env.write(
+        "docs/dup.md",
+        "# Doc\n\n## Exemple\n\npremier\n\n## Exemple\n\nsecond\n",
+    );
+    env.write_cmd(&["build", "--no-llm"]);
+    let v = env.json(&["export"]);
+    let ids: Vec<&str> = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"section:docs/dup.md#exemple"), "{ids:?}");
+    assert!(ids.contains(&"section:docs/dup.md#exemple-1"), "{ids:?}");
+}

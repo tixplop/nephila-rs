@@ -1,0 +1,13 @@
+buildscript {
+    dependencies {
+        classpath 'com.acme:plugin:1'
+    }
+}
+
+dependencies {
+    implementation project(path: ':core')
+    implementation platform('org.springframework.boot:spring-boot-dependencies:3.3.0')
+    implementation libs.foo
+    implementation files('x.jar')
+    implementation "org.slf4j:slf4j-api:$slf4jVersion"
+}

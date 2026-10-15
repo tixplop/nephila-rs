@@ -124,7 +124,11 @@ pub fn run(repo: &Path, as_json: bool) -> Result<()> {
         );
     }
     println!("Thèmes");
-    for t in list("themes") {
+    let themes = list("themes");
+    if themes.is_empty() {
+        println!("  aucun thème (graphe non enrichi)");
+    }
+    for t in themes {
         println!(
             "  {} ({} mentions)",
             t["concept"].as_str().unwrap_or("?"),
