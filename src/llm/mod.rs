@@ -1,6 +1,7 @@
 //! Abstraction du fournisseur LLM (REQ-002, REQ-003, REQ-006).
 
 pub mod anthropic;
+pub mod enrich;
 pub mod extract;
 mod http;
 pub mod mock;
@@ -8,6 +9,7 @@ pub mod openai;
 
 use crate::config::{Config, Provider};
 use crate::error::{Error, Result};
+pub use enrich::Enrichment;
 pub use extract::{AskReply, Extraction};
 
 /// Fournisseur LLM. Les implémentations sont partagées entre threads.
@@ -16,6 +18,14 @@ pub trait Llm: Send + Sync {
     fn verify_key(&self) -> Result<()>;
     /// Extrait nœuds et références d'un morceau (`chunk` numéroté à partir de 1).
     fn extract(&self, file: &str, chunk: usize, text: &str) -> Result<Extraction>;
+    /// Enrichit un morceau : résumés des nœuds `node_ids` et concepts (schéma version 2).
+    fn enrich(
+        &self,
+        file: &str,
+        chunk: usize,
+        text: &str,
+        node_ids: &[String],
+    ) -> Result<Enrichment>;
     /// Répond à une question à partir d'un contexte de graphe.
     fn ask(&self, question: &str, context: &str) -> Result<AskReply>;
 }

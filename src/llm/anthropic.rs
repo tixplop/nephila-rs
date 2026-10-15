@@ -1,9 +1,11 @@
 //! Adaptateur Anthropic Messages (REQ-002).
 
+use super::enrich::{enrichment_system_prompt, enrichment_user_prompt};
 use super::extract::{
     ask_system_prompt, ask_user_prompt, extraction_system_prompt, extraction_user_prompt, AskReply,
     Extraction,
 };
+use super::Enrichment;
 use super::{http, Llm};
 use crate::error::{Error, Result};
 
@@ -74,6 +76,20 @@ impl Llm for AnthropicLlm {
             extraction_user_prompt(file, chunk, text),
         )?;
         Extraction::parse(http::extract_json(&out)?)
+    }
+
+    fn enrich(
+        &self,
+        file: &str,
+        chunk: usize,
+        text: &str,
+        node_ids: &[String],
+    ) -> Result<Enrichment> {
+        let out = self.complete(
+            enrichment_system_prompt(),
+            enrichment_user_prompt(file, chunk, text, node_ids),
+        )?;
+        Enrichment::parse(http::extract_json(&out)?, file, node_ids)
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {

@@ -280,3 +280,50 @@ fn req002_ac8_config_timeout_secs_reaches_http_agent() {
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
     assert!(t.elapsed() < std::time::Duration::from_secs(2));
 }
+
+// ---- AC-024-8 : requête d'enrichissement (schéma version 2) ----
+
+const ENRICHMENT: &str =
+    r#"{"version":2,"summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}"#;
+
+fn check_enrich_request(content: &str) {
+    assert!(content.contains("class A {}"), "{content}");
+    assert!(content.contains("type:A"), "{content}");
+    assert!(content.contains("method:A.f"), "{content}");
+}
+
+#[test]
+fn req024_ac8_anthropic_enrich_request_carries_content_nodes_and_schema() {
+    let s = FakeServer::start(vec![(200, anthropic_reply(ENRICHMENT))]);
+    let ids = vec!["type:A".to_string(), "method:A.f".to_string()];
+    let e = anthropic(&s)
+        .enrich("A.java", 1, "class A {}", &ids)
+        .unwrap();
+    assert_eq!(e.summaries, vec![("type:A".into(), "Le A.".into())]);
+    let b: serde_json::Value = serde_json::from_str(&s.requests()[0].body).unwrap();
+    check_enrich_request(b["messages"][0]["content"].as_str().unwrap());
+    let sys = b["system"].as_str().unwrap();
+    assert!(sys.contains("version\": 2") && sys.contains("summaries") && sys.contains("concepts"));
+}
+
+#[test]
+fn req024_ac8_openai_enrich_request_carries_content_nodes_and_schema() {
+    let s = FakeServer::start(vec![(200, openai_reply(ENRICHMENT))]);
+    let ids = vec!["type:A".to_string(), "method:A.f".to_string()];
+    openai(&s, None)
+        .enrich("A.java", 1, "class A {}", &ids)
+        .unwrap();
+    let b: serde_json::Value = serde_json::from_str(&s.requests()[0].body).unwrap();
+    check_enrich_request(b["messages"][1]["content"].as_str().unwrap());
+    let sys = b["messages"][0]["content"].as_str().unwrap();
+    assert!(sys.contains("version\": 2") && sys.contains("summaries") && sys.contains("concepts"));
+}
+
+#[test]
+fn req024_ac5_enrich_version_1_is_non_conforming() {
+    let s = FakeServer::start(vec![(200, anthropic_reply(EXTRACTION))]);
+    assert!(matches!(
+        anthropic(&s).enrich("A.java", 1, "x", &[]),
+        Err(Error::Message(_))
+    ));
+}

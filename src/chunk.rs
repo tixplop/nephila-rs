@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use crate::llm::enrich::{Concept, Enrichment};
 use crate::llm::Extraction;
 
 /// Nombre de lignes de tête examinées pour trouver package, imports et type englobant.
@@ -129,4 +130,92 @@ pub fn merge(parts: Vec<Extraction>) -> Extraction {
         }
     }
     out
+}
+
+/// Fusionne les enrichissements des morceaux d'un même fichier : premier résumé non vide par
+/// nœud, concepts fusionnés par nom (premier résumé non vide, sections unies), rejets cumulés.
+pub fn merge_enrichments(parts: Vec<Enrichment>) -> Enrichment {
+    let mut out = Enrichment::default();
+    for p in parts {
+        for (node, summary) in p.summaries {
+            if summary.trim().is_empty() {
+                continue;
+            }
+            if !out.summaries.iter().any(|(n, _)| *n == node) {
+                out.summaries.push((node, summary));
+            }
+        }
+        for c in p.concepts {
+            match out.concepts.iter_mut().find(|e| e.name == c.name) {
+                Some(e) => {
+                    if e.summary.is_none() {
+                        e.summary = c.summary;
+                    }
+                    for s in c.sections {
+                        if !e.sections.contains(&s) {
+                            e.sections.push(s);
+                        }
+                    }
+                }
+                None => out.concepts.push(Concept {
+                    name: c.name,
+                    summary: c.summary,
+                    sections: c.sections,
+                }),
+            }
+        }
+        out.rejected.extend(p.rejected);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enr(sum: &[(&str, &str)], concepts: Vec<Concept>) -> Enrichment {
+        Enrichment {
+            summaries: sum
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+            concepts,
+            rejected: vec![],
+        }
+    }
+
+    fn concept(name: &str, summary: Option<&str>, sections: &[&str]) -> Concept {
+        Concept {
+            name: name.into(),
+            summary: summary.map(String::from),
+            sections: sections.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn req007_merge_enrichments_first_summary_and_union_of_sections() {
+        let a = enr(
+            &[("type:A", "premier")],
+            vec![concept("facturation", None, &["section:g#a"])],
+        );
+        let b = enr(
+            &[("type:A", "second"), ("type:B", "bb")],
+            vec![concept(
+                "facturation",
+                Some("def"),
+                &["section:g#a", "section:g#b"],
+            )],
+        );
+        let m = merge_enrichments(vec![a, b]);
+        assert_eq!(
+            m.summaries,
+            vec![
+                ("type:A".into(), "premier".into()),
+                ("type:B".into(), "bb".into())
+            ]
+        );
+        assert_eq!(m.concepts.len(), 1);
+        assert_eq!(m.concepts[0].summary.as_deref(), Some("def"));
+        assert_eq!(m.concepts[0].sections, ["section:g#a", "section:g#b"]);
+    }
 }

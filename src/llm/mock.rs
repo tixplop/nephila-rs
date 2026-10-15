@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::extract::{AskReply, Extraction};
-use super::Llm;
+use super::{Enrichment, Llm};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Default, Clone)]
@@ -128,6 +128,33 @@ impl MockLlm {
             ))),
         }
     }
+
+    /// Journalise l'appel, applique les échecs simulés et lit la fixture du morceau.
+    fn fixture_json(&self, file: &str, chunk: usize) -> Result<Option<String>> {
+        check_relative(file)?;
+        let n = self.extractions.fetch_add(1, Ordering::SeqCst);
+        self.begin_call(file, chunk)?;
+        if self.opts.timeout_files.iter().any(|f| f == file) {
+            return Err(Error::Timeout(format!(
+                "délai dépassé (LLM simulé) pour {file} (RKG_MOCK_TIMEOUT_FILES)"
+            )));
+        }
+        if let Some(limit) = self.opts.key_revoked_after {
+            if n >= limit {
+                return Err(Error::InvalidKey(format!(
+                    "clé d'API refusée par le fournisseur (LLM simulé) : appel {} \
+                     au-delà de RKG_MOCK_KEY_REVOKED_AFTER={limit}",
+                    n + 1
+                )));
+            }
+        }
+        let by_chunk = self.read_fixture(&format!("{file}.{chunk}.json"))?;
+        let json = match by_chunk {
+            Some(j) => Some(j),
+            None => self.read_fixture(&format!("{file}.json"))?,
+        };
+        Ok(json)
+    }
 }
 
 /// Refuse les chemins absolus ou sortant du dossier de fixtures.
@@ -157,31 +184,22 @@ impl Llm for MockLlm {
     }
 
     fn extract(&self, file: &str, chunk: usize, _text: &str) -> Result<Extraction> {
-        check_relative(file)?;
-        let n = self.extractions.fetch_add(1, Ordering::SeqCst);
-        self.begin_call(file, chunk)?;
-        if self.opts.timeout_files.iter().any(|f| f == file) {
-            return Err(Error::Timeout(format!(
-                "délai dépassé (LLM simulé) pour {file} (RKG_MOCK_TIMEOUT_FILES)"
-            )));
-        }
-        if let Some(limit) = self.opts.key_revoked_after {
-            if n >= limit {
-                return Err(Error::InvalidKey(format!(
-                    "clé d'API refusée par le fournisseur (LLM simulé) : appel d'extraction {} \
-                     au-delà de RKG_MOCK_KEY_REVOKED_AFTER={limit}",
-                    n + 1
-                )));
-            }
-        }
-        let by_chunk = self.read_fixture(&format!("{file}.{chunk}.json"))?;
-        let json = match by_chunk {
-            Some(j) => Some(j),
-            None => self.read_fixture(&format!("{file}.json"))?,
-        };
-        match json {
+        match self.fixture_json(file, chunk)? {
             Some(j) => Extraction::parse(&j),
             None => Ok(Extraction::default()),
+        }
+    }
+
+    fn enrich(
+        &self,
+        file: &str,
+        chunk: usize,
+        _text: &str,
+        node_ids: &[String],
+    ) -> Result<Enrichment> {
+        match self.fixture_json(file, chunk)? {
+            Some(j) => Enrichment::parse(&j, file, node_ids),
+            None => Ok(Enrichment::default()),
         }
     }
 
