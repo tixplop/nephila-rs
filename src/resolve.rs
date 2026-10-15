@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::Result;
-use crate::model::{node_id, parse_node_id, Edge, EdgeKind, Node, NodeKind, Ref};
+use crate::model::{node_id, parse_node_id, Edge, EdgeKind, Node, NodeKind, Ref, RefOrigin};
 use crate::scan::module_of;
 use crate::store::Store;
 
@@ -27,11 +27,14 @@ pub struct ResolveStats {
 pub struct Resolution {
     pub edges: Vec<Edge>,
     pub unresolved: Vec<Ref>,
+    /// Nœuds `dependency` dérivés des références depends_on sans module du dépôt (DEC-020).
+    pub dependencies: Vec<Node>,
 }
 
 /// Recalcule tous les liens du graphe à partir des nœuds et des références.
 pub fn resolve(store: &mut Store) -> Result<ResolveStats> {
     let r = compute_from(store)?;
+    store.replace_derived_dependencies(&r.dependencies)?;
     store.replace_edges(&r.edges)?;
     // Les liens sont dédupliqués par la clé primaire : on compte ce qui est stocké.
     Ok(ResolveStats {
@@ -48,7 +51,7 @@ pub fn unresolved(store: &Store) -> Result<Vec<Ref>> {
 fn compute_from(store: &Store) -> Result<Resolution> {
     Ok(compute(
         &store.nodes()?,
-        &store.refs()?,
+        &store.refs_with_origin()?,
         &store.declarations()?,
     ))
 }
@@ -219,17 +222,51 @@ fn derived_package(kind: NodeKind, q: &str) -> Option<String> {
 }
 
 /// Calcule les liens résolus, les liens `contains` dérivés et les références non résolues.
-pub fn compute(nodes: &[Node], refs: &[Ref], declarations: &[(String, String)]) -> Resolution {
+pub fn compute(
+    nodes: &[Node],
+    refs: &[(Ref, RefOrigin)],
+    declarations: &[(String, String)],
+) -> Resolution {
     let idx = Index::new(nodes);
     let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     let mut out = Resolution::default();
 
-    for r in refs {
+    let mut dependencies: HashMap<String, Node> = HashMap::new();
+    for (r, origin) in refs {
         let Ok((skind, sq)) = parse_node_id(&r.source) else {
             out.unresolved.push(r.clone());
             continue;
         };
         if !ids.contains(r.source.as_str()) {
+            continue;
+        }
+        // depends_on vise des coordonnées : module du dépôt, sinon dépendance dérivée (DEC-020).
+        if r.kind == EdgeKind::DependsOn && skind == NodeKind::Module {
+            let name = r.target_name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let module = node_id(NodeKind::Module, name);
+            let target = if ids.contains(module.as_str()) {
+                module
+            } else {
+                let dep = Node::new(
+                    NodeKind::Dependency,
+                    name,
+                    name.rsplit(':').next().unwrap_or(name),
+                    None,
+                    None,
+                    None,
+                );
+                let id = dep.id.clone();
+                dependencies.entry(id.clone()).or_insert(dep);
+                id
+            };
+            out.edges.push(Edge {
+                source: r.source.clone(),
+                target,
+                kind: r.kind,
+            });
             continue;
         }
         match resolve_ref(r, skind, sq, &idx) {
@@ -238,9 +275,13 @@ pub fn compute(nodes: &[Node], refs: &[Ref], declarations: &[(String, String)]) 
                 target,
                 kind: r.kind,
             }),
+            // Une mention issue de l'analyse syntaxique non résolue est normale (texte libre).
+            None if r.kind == EdgeKind::Mentions && *origin == RefOrigin::Parse => {}
             None => out.unresolved.push(r.clone()),
         }
     }
+    out.dependencies = dependencies.into_values().collect();
+    out.dependencies.sort_by(|a, b| a.id.cmp(&b.id));
 
     derive_contains(nodes, declarations, &idx, &mut out.edges);
 
@@ -924,43 +965,250 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn module_depends_on_module_and_dependency() {
-        let mut e = env(&["api/pom.xml", "core/pom.xml"]);
-        let api = node_id(NodeKind::Module, "api");
+    fn has_node(e: &Env, id: &str) -> bool {
+        e.store.nodes().unwrap().iter().any(|n| n.id == id)
+    }
+
+    fn build_module(e: &mut Env, file: &str, q: &str, deps: &[&str]) {
+        let id = node_id(NodeKind::Module, q);
+        let refs: Vec<Ref> = deps
+            .iter()
+            .map(|d| rf(&id, EdgeKind::DependsOn, d, None))
+            .collect();
         e.store
-            .replace_file(
-                "api/pom.xml",
-                &[
-                    plain(NodeKind::Module, "api", Some("api/pom.xml")),
-                    plain(NodeKind::Dependency, "org.slf4j:slf4j-api", None),
-                ],
-                &[
-                    rf(&api, EdgeKind::DependsOn, "core", None),
-                    rf(&api, EdgeKind::DependsOn, "org.slf4j:slf4j-api", None),
-                ],
-            )
+            .replace_file(file, &[plain(NodeKind::Module, q, Some(file))], &refs)
             .unwrap();
+    }
+
+    #[test]
+    fn req008_ac6_module_and_derived_dependency() {
+        let mut e = env(&["api/pom.xml", "core/pom.xml"]);
+        let api = node_id(NodeKind::Module, "com.acme:api");
+        let slf = node_id(NodeKind::Dependency, "org.slf4j:slf4j-api");
+        build_module(
+            &mut e,
+            "api/pom.xml",
+            "com.acme:api",
+            &["com.acme:core", "org.slf4j:slf4j-api"],
+        );
+        build_module(&mut e, "core/pom.xml", "com.acme:core", &[]);
+        let st = resolve(&mut e.store).unwrap();
+        assert_eq!(st.unresolved, 0);
+        assert!(unresolved(&e.store).unwrap().is_empty());
+        let core = node_id(NodeKind::Module, "com.acme:core");
+        assert!(has_edge(&e, &api, EdgeKind::DependsOn, &core));
+        assert!(has_edge(&e, &api, EdgeKind::DependsOn, &slf));
+        assert!(!has_node(
+            &e,
+            &node_id(NodeKind::Dependency, "com.acme:core")
+        ));
+        let dep = e.store.nodes().unwrap().into_iter().find(|n| n.id == slf);
+        let dep = dep.unwrap();
+        assert_eq!((dep.file, dep.short.as_str()), (None, "slf4j-api"));
+        resolve(&mut e.store).unwrap();
+        assert!(has_node(&e, &slf));
+        // La dépendance est retirée du pom : le nœud disparaît.
+        build_module(&mut e, "api/pom.xml", "com.acme:api", &["com.acme:core"]);
+        resolve(&mut e.store).unwrap();
+        assert!(!has_node(&e, &slf));
+        assert!(has_edge(&e, &api, EdgeKind::DependsOn, &core));
+    }
+
+    #[test]
+    fn dependency_node_is_shared_and_kept_while_referenced() {
+        let mut e = env(&["a/pom.xml", "b/pom.xml"]);
+        build_module(&mut e, "a/pom.xml", "g:a", &["org.x:lib"]);
+        build_module(&mut e, "b/pom.xml", "g:b", &["org.x:lib"]);
+        resolve(&mut e.store).unwrap();
+        let count = |e: &Env| {
+            e.store
+                .nodes()
+                .unwrap()
+                .iter()
+                .filter(|n| n.kind == NodeKind::Dependency)
+                .count()
+        };
+        assert_eq!(count(&e), 1);
+        build_module(&mut e, "a/pom.xml", "g:a", &[]);
+        resolve(&mut e.store).unwrap();
+        assert_eq!(count(&e), 1);
+        build_module(&mut e, "b/pom.xml", "g:b", &[]);
+        resolve(&mut e.store).unwrap();
+        assert_eq!(count(&e), 0);
+    }
+
+    #[test]
+    fn unrelated_replace_keeps_derived_dependency_and_link() {
+        let mut e = env(&["a/pom.xml", "b/pom.xml"]);
+        build_module(&mut e, "a/pom.xml", "g:a", &["org.x:lib"]);
+        resolve(&mut e.store).unwrap();
+        let a = node_id(NodeKind::Module, "g:a");
+        let dep = node_id(NodeKind::Dependency, "org.x:lib");
+        build_module(&mut e, "b/pom.xml", "g:b", &[]);
+        e.store.replace_file("b/pom.xml", &[], &[]).unwrap();
+        assert!(has_node(&e, &dep));
+        assert!(has_edge(&e, &a, EdgeKind::DependsOn, &dep));
+    }
+
+    #[test]
+    fn blank_depends_on_target_is_ignored() {
+        let mut e = env(&["a/pom.xml"]);
+        build_module(&mut e, "a/pom.xml", "g:a", &["", "  "]);
+        let st = resolve(&mut e.store).unwrap();
+        assert_eq!(st.unresolved, 0);
+        assert!(e.store.edges().unwrap().is_empty());
+        assert!(!e
+            .store
+            .nodes()
+            .unwrap()
+            .iter()
+            .any(|n| n.kind == NodeKind::Dependency));
+    }
+
+    #[test]
+    fn module_wins_over_dependency_with_same_coordinates() {
+        let mut e = env(&["api/pom.xml", "core/pom.xml"]);
+        build_module(&mut e, "api/pom.xml", "com.acme:api", &["com.acme:core"]);
+        resolve(&mut e.store).unwrap();
+        let dep = node_id(NodeKind::Dependency, "com.acme:core");
+        assert!(has_node(&e, &dep));
+        // Le module du dépôt apparaît : le lien bascule vers lui, la dépendance disparaît.
+        build_module(&mut e, "core/pom.xml", "com.acme:core", &[]);
+        resolve(&mut e.store).unwrap();
+        let api = node_id(NodeKind::Module, "com.acme:api");
+        assert!(!has_node(&e, &dep));
+        assert!(has_edge(
+            &e,
+            &api,
+            EdgeKind::DependsOn,
+            &node_id(NodeKind::Module, "com.acme:core")
+        ));
+        assert!(!has_edge(&e, &api, EdgeKind::DependsOn, &dep));
+    }
+
+    #[test]
+    fn gradle_project_path_resolves_to_module() {
+        let mut e = env(&["api/build.gradle", "core/build.gradle"]);
+        build_module(&mut e, "api/build.gradle", ":api", &[":core", "org.x:lib"]);
+        build_module(&mut e, "core/build.gradle", ":core", &[]);
+        let st = resolve(&mut e.store).unwrap();
+        assert_eq!(st.unresolved, 0);
+        let api = node_id(NodeKind::Module, ":api");
+        assert!(has_edge(
+            &e,
+            &api,
+            EdgeKind::DependsOn,
+            &node_id(NodeKind::Module, ":core")
+        ));
+        assert!(has_edge(
+            &e,
+            &api,
+            EdgeKind::DependsOn,
+            &node_id(NodeKind::Dependency, "org.x:lib")
+        ));
+    }
+
+    #[test]
+    fn req008_ac7_parse_mentions_not_unresolved_and_repaired() {
+        let mut e = env(&["d.md", "I.java"]);
+        let sec = node_id(NodeKind::Section, "docs/d.md#a");
         e.store
             .replace_file(
-                "core/pom.xml",
-                &[plain(NodeKind::Module, "core", Some("core/pom.xml"))],
-                &[],
+                "d.md",
+                &[
+                    plain(NodeKind::Document, "docs/d.md", Some("d.md")),
+                    plain(NodeKind::Section, "docs/d.md#a", Some("d.md")),
+                ],
+                &[
+                    rf(&sec, EdgeKind::Mentions, "Inexistant", None),
+                    rf(&sec, EdgeKind::Mentions, "config.toml", None),
+                ],
             )
             .unwrap();
         let st = resolve(&mut e.store).unwrap();
         assert_eq!(st.unresolved, 0);
+        assert!(unresolved(&e.store).unwrap().is_empty());
+        assert_eq!(e.store.refs().unwrap().len(), 2, "mentions conservées");
+        // La classe apparaît, le .md n'est pas touché : le lien existe.
+        e.store
+            .replace_file("I.java", &[ty("Inexistant", "I.java")], &[])
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(has_edge(&e, &sec, EdgeKind::Mentions, &tid("Inexistant")));
+    }
+
+    #[test]
+    fn llm_mentions_follow_normal_rules() {
+        let mut e = env(&["d.md"]);
+        let sec = node_id(NodeKind::Section, "docs/d.md#a");
+        e.store
+            .replace_file(
+                "d.md",
+                &[
+                    plain(NodeKind::Document, "docs/d.md", Some("d.md")),
+                    plain(NodeKind::Section, "docs/d.md#a", Some("d.md")),
+                ],
+                &[],
+            )
+            .unwrap();
+        e.store
+            .apply_enrichment(
+                "d.md",
+                "h",
+                &[],
+                &[],
+                &[rf(&sec, EdgeKind::Mentions, "concept:Inconnu", None)],
+            )
+            .unwrap();
+        let st = resolve(&mut e.store).unwrap();
+        assert_eq!(st.unresolved, 1);
+        assert_eq!(unresolved(&e.store).unwrap().len(), 1);
+    }
+
+    fn module_package_edge(build_file: &str, module_q: &str, src: &str, pkg: &str) {
+        let mut e = env(&[build_file, src]);
+        e.store
+            .replace_file(
+                build_file,
+                &[plain(NodeKind::Module, module_q, Some(build_file))],
+                &[],
+            )
+            .unwrap();
+        e.store
+            .replace_file(src, &[plain(NodeKind::Package, pkg, Some(src))], &[])
+            .unwrap();
+        resolve(&mut e.store).unwrap();
         assert!(has_edge(
             &e,
-            &api,
-            EdgeKind::DependsOn,
-            &node_id(NodeKind::Module, "core")
+            &node_id(NodeKind::Module, module_q),
+            EdgeKind::Contains,
+            &node_id(NodeKind::Package, pkg)
         ));
-        assert!(has_edge(
-            &e,
-            &api,
-            EdgeKind::DependsOn,
-            &node_id(NodeKind::Dependency, "org.slf4j:slf4j-api")
-        ));
+    }
+
+    #[test]
+    fn req022_ac8_module_contains_package_by_folder_maven() {
+        module_package_edge(
+            "api/pom.xml",
+            "com.acme:api",
+            "api/src/main/java/com/acme/api/A.java",
+            "com.acme.api",
+        );
+    }
+
+    #[test]
+    fn req022_ac8_module_contains_package_by_folder_gradle() {
+        module_package_edge(
+            "api/build.gradle",
+            ":api",
+            "api/src/main/java/com/acme/api/A.java",
+            "com.acme.api",
+        );
+        module_package_edge(
+            "services/api/build.gradle.kts",
+            ":services:api",
+            "services/api/src/main/kotlin/p/A.kt",
+            "p",
+        );
     }
 }

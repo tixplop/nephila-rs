@@ -168,6 +168,13 @@ pub struct Ref {
     pub context: Option<String>,
 }
 
+/// Origine d'une référence stockée : analyse syntaxique ou LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefOrigin {
+    Parse,
+    Llm,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edge {
     pub source: String,

@@ -427,7 +427,7 @@ fn req009_ac6_summary_counts_unresolved_references() {
     let env = Env::new();
     fs::write(
         env.mock.join("docs/guide.md.json"),
-        r#"{"version":1,"declares":[{"kind":"document","name":"docs/guide.md"},{"kind":"section","name":"docs/guide.md#guide"}],"references":[{"source":"section:docs/guide.md#guide","kind":"mentions","target":"Fantome"}]}"#,
+        r#"{"version":1,"declares":[{"kind":"document","name":"docs/guide.md"},{"kind":"section","name":"docs/guide.md#guide"}],"references":[{"source":"document:docs/guide.md","kind":"links_to","target":"Fantome.md"}]}"#,
     )
     .unwrap();
     let out = env.build_ok();

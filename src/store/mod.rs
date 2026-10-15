@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::error::{Error, Result};
-use crate::model::{Edge, EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, SubKind};
+use crate::model::{
+    Edge, EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, RefOrigin, SubKind,
+};
 
 /// Instant courant en millisecondes depuis l'epoch.
 fn now_ms() -> i64 {
@@ -265,8 +267,10 @@ impl Store {
     /// NULL, puis marque le fichier indexé. Le fichier doit être connu. Un nœud peut être déclaré
     /// par plusieurs fichiers (DEC-014) : la ligne du nœud (attributs, fichier de rattachement)
     /// est celle du premier déclarant, les références restent attachées au fichier qui les a
-    /// émises. Un nœud sans fichier (dépendance, concept) est déclaré lui aussi par le fichier
-    /// qui le mentionne et disparaît avec son dernier déclarant. Les références dont la source
+    /// émises. Un nœud sans fichier (concept) est déclaré lui aussi par le fichier
+    /// qui le mentionne et disparaît avec son dernier déclarant. Les nœuds `dependency` sont
+    /// dérivés par la résolution (DEC-020) : ils ne sont jamais supprimés ici, seul
+    /// `replace_derived_dependencies` les nettoie. Les références dont la source
     /// n'est pas déclarée par le fichier sont rejetées. Déclarations et références nouvelles
     /// ont l'origine `parse`.
     pub fn replace_structure(&mut self, path: &str, nodes: &[Node], refs: &[Ref]) -> Result<()> {
@@ -483,6 +487,70 @@ impl Store {
         Ok(out)
     }
 
+    /// Références avec leur origine (`parse` ou `llm`), dans l'ordre d'insertion.
+    pub fn refs_with_origin(&self) -> Result<Vec<(Ref, RefOrigin)>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT source, kind, target_name, context, origin FROM refs ORDER BY id")
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (source, kind, target_name, context, origin) = row.map_err(db_err)?;
+            let origin = if origin == "llm" {
+                RefOrigin::Llm
+            } else {
+                RefOrigin::Parse
+            };
+            out.push((
+                Ref {
+                    source,
+                    kind: EdgeKind::parse(&kind)?,
+                    target_name,
+                    context,
+                },
+                origin,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Remplace les nœuds `dependency` dérivés par la résolution (sans déclaration, DEC-020) :
+    /// ceux qui ne sont plus visés disparaissent, les autres sont créés ou conservés.
+    pub fn replace_derived_dependencies(&mut self, deps: &[Node]) -> Result<()> {
+        self.ensure_writable()?;
+        let tx = self.conn.transaction().map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM nodes WHERE kind = 'dependency'
+             AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+            [],
+        )
+        .map_err(db_err)?;
+        {
+            let mut ins = tx
+                .prepare(
+                    "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary)
+                     VALUES (?1, 'dependency', ?2, ?3, NULL, NULL, NULL)",
+                )
+                .map_err(db_err)?;
+            for n in deps {
+                ins.execute(params![n.id, n.qualified, n.short])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)
+    }
+
     /// Couples (fichier, identifiant de nœud) des déclarations.
     pub fn declarations(&self) -> Result<Vec<(String, String)>> {
         let mut st = self
@@ -664,8 +732,18 @@ fn insert_refs(
 
 /// Retire les déclarations et références d'un fichier (d'une seule origine si `origin` est
 /// donnée), rattache ses nœuds partagés à un autre déclarant, et supprime les nœuds devenus
-/// orphelins (liens attachés compris).
+/// orphelins (liens attachés compris), sauf les dépendances dérivées par la résolution.
 fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>) -> Result<()> {
+    // Les nœuds `dependency` dérivés (sans déclaration, DEC-020) ne sont nettoyés que par
+    // `replace_derived_dependencies` ; seuls ceux que ce fichier déclarait suivent ses déclarations.
+    tx.execute("DROP TABLE IF EXISTS released_declared", [])
+        .map_err(db_err)?;
+    tx.execute(
+        "CREATE TEMP TABLE released_declared AS SELECT node AS id FROM declarations
+         WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
+        params![path, origin],
+    )
+    .map_err(db_err)?;
     tx.execute(
         "DELETE FROM refs WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
         params![path, origin],
@@ -684,10 +762,13 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
     )
     .map_err(db_err)?;
     tx.execute(
-        "DELETE FROM nodes WHERE NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+        "DELETE FROM nodes WHERE NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)
+         AND (kind <> 'dependency' OR id IN (SELECT id FROM released_declared))",
         [],
     )
     .map_err(db_err)?;
+    tx.execute("DROP TABLE released_declared", [])
+        .map_err(db_err)?;
     Ok(())
 }
 
