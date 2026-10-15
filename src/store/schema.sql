@@ -9,7 +9,9 @@ CREATE TABLE files (
     size  INTEGER NOT NULL,
     mtime INTEGER NOT NULL,
     recorded_at INTEGER NOT NULL DEFAULT 0,
-    state TEXT NOT NULL CHECK (state IN ('indexed', 'pending'))
+    state TEXT NOT NULL CHECK (state IN ('indexed', 'pending')),
+    -- Empreinte du contenu au moment du dernier enrichissement LLM ; NULL = jamais enrichi.
+    enriched_hash TEXT
 );
 
 CREATE TABLE nodes (
@@ -19,7 +21,9 @@ CREATE TABLE nodes (
     short     TEXT NOT NULL,
     file      TEXT REFERENCES files(path) ON DELETE SET NULL,
     subkind   TEXT,
-    summary   TEXT
+    summary   TEXT,
+    -- Fichier ayant posé le résumé (un nœud partagé peut avoir plusieurs déclarants).
+    summary_file TEXT
 );
 CREATE INDEX idx_nodes_short ON nodes(short);
 CREATE INDEX idx_nodes_qualified ON nodes(qualified);
@@ -29,6 +33,7 @@ CREATE INDEX idx_nodes_file ON nodes(file);
 CREATE TABLE declarations (
     file TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
     node TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    origin TEXT NOT NULL DEFAULT 'parse' CHECK (origin IN ('parse', 'llm')),
     PRIMARY KEY (file, node)
 );
 CREATE INDEX idx_declarations_node ON declarations(node);
@@ -39,7 +44,8 @@ CREATE TABLE refs (
     file        TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
     kind        TEXT NOT NULL,
     target_name TEXT NOT NULL,
-    context     TEXT
+    context     TEXT,
+    origin      TEXT NOT NULL DEFAULT 'parse' CHECK (origin IN ('parse', 'llm'))
 );
 CREATE INDEX idx_refs_source ON refs(source);
 CREATE INDEX idx_refs_file ON refs(file);

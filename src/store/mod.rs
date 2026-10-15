@@ -15,7 +15,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
@@ -255,89 +255,120 @@ impl Store {
         self.insert_files(&pending)
     }
 
-    /// Remplace en une transaction les déclarations et références d'un fichier, puis le marque
-    /// indexé. Le fichier doit être connu. Un nœud peut être déclaré par plusieurs fichiers
-    /// (DEC-014) : la ligne du nœud (attributs, fichier de rattachement) est celle du premier
-    /// déclarant, les références restent attachées au fichier qui les a émises. Un nœud sans
-    /// fichier (dépendance, concept) est déclaré lui aussi par le fichier qui le mentionne et
-    /// disparaît avec son dernier déclarant. Les références dont la source n'est pas déclarée
-    /// par le fichier sont rejetées.
+    /// Alias de `replace_structure`.
     pub fn replace_file(&mut self, path: &str, nodes: &[Node], refs: &[Ref]) -> Result<()> {
+        self.replace_structure(path, nodes, refs)
+    }
+
+    /// Remplace en une transaction tout ce qui vient d'un fichier (déclarations et références,
+    /// origines `parse` et `llm`), efface les résumés de ses nœuds et remet `enriched_hash` à
+    /// NULL, puis marque le fichier indexé. Le fichier doit être connu. Un nœud peut être déclaré
+    /// par plusieurs fichiers (DEC-014) : la ligne du nœud (attributs, fichier de rattachement)
+    /// est celle du premier déclarant, les références restent attachées au fichier qui les a
+    /// émises. Un nœud sans fichier (dépendance, concept) est déclaré lui aussi par le fichier
+    /// qui le mentionne et disparaît avec son dernier déclarant. Les références dont la source
+    /// n'est pas déclarée par le fichier sont rejetées. Déclarations et références nouvelles
+    /// ont l'origine `parse`.
+    pub fn replace_structure(&mut self, path: &str, nodes: &[Node], refs: &[Ref]) -> Result<()> {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
-        let known: bool = tx
-            .query_row("SELECT 1 FROM files WHERE path = ?1", [path], |_| Ok(true))
-            .unwrap_or(false);
-        if !known {
-            return Err(Error::Message(format!(
-                "fichier inconnu du graphe : {path}"
-            )));
-        }
-        release_file(&tx, path)?;
-        {
-            let mut ins = tx
-                .prepare(
-                    "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )
-                .map_err(db_err)?;
-            let mut decl = tx
-                .prepare("INSERT OR IGNORE INTO declarations(file, node) VALUES (?1, ?2)")
-                .map_err(db_err)?;
-            for n in nodes {
-                if n.file.as_deref().is_some_and(|f| f != path) {
-                    return Err(Error::Message(format!(
-                        "le nœud {} n'appartient pas au fichier {path}",
-                        n.id
-                    )));
-                }
-                ins.execute(params![
-                    n.id,
-                    n.kind.as_str(),
-                    n.qualified,
-                    n.short,
-                    path_or_null(n, path),
-                    n.subkind.map(SubKind::as_str),
-                    n.summary
-                ])
-                .map_err(db_err)?;
-                decl.execute(params![path, n.id]).map_err(db_err)?;
-            }
-            let mut insr = tx
-                .prepare(
-                    "INSERT INTO refs(source, file, kind, target_name, context)
-                     SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS
-                       (SELECT 1 FROM declarations WHERE node = ?1 AND file = ?2)",
-                )
-                .map_err(db_err)?;
-            for r in refs {
-                let n = insr
-                    .execute(params![
-                        r.source,
-                        path,
-                        r.kind.as_str(),
-                        r.target_name,
-                        r.context
-                    ])
-                    .map_err(db_err)?;
-                if n == 0 {
-                    return Err(Error::Message(format!(
-                        "référence dont la source {} n'est pas déclarée dans {path}",
-                        r.source
-                    )));
-                }
-            }
-        }
-        tx.execute("UPDATE files SET state = 'indexed' WHERE path = ?1", [path])
-            .map_err(db_err)?;
+        require_known(&tx, path)?;
+        clear_summaries(&tx, path)?;
+        release_file(&tx, path, None)?;
+        insert_nodes(&tx, path, nodes, "parse")?;
+        insert_refs(&tx, path, refs, "parse")?;
+        tx.execute(
+            "UPDATE files SET state = 'indexed', enriched_hash = NULL WHERE path = ?1",
+            [path],
+        )
+        .map_err(db_err)?;
         tx.commit().map_err(db_err)
+    }
+
+    /// Applique en une transaction le résultat de l'enrichissement d'un fichier : remplace ses
+    /// déclarations et références d'origine `llm` (nœuds concept compris) et les résumés de ses
+    /// nœuds, puis pose `enriched_hash = hash`. `summaries` : couples (identifiant, texte), les
+    /// identifiants devant être déclarés par le fichier. Les références `llm` doivent partir d'un
+    /// nœud déclaré par le fichier.
+    pub fn apply_enrichment(
+        &mut self,
+        path: &str,
+        hash: &str,
+        summaries: &[(String, String)],
+        concept_nodes: &[Node],
+        refs: &[Ref],
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        let tx = self.conn.transaction().map_err(db_err)?;
+        require_known(&tx, path)?;
+        clear_summaries(&tx, path)?;
+        release_file(&tx, path, Some("llm"))?;
+        insert_nodes(&tx, path, concept_nodes, "llm")?;
+        for (id, text) in summaries {
+            let n = tx
+                .execute(
+                    "UPDATE nodes SET summary = ?2, summary_file = ?3 WHERE id = ?1
+                     AND EXISTS (SELECT 1 FROM declarations WHERE node = ?1 AND file = ?3)",
+                    params![id, text, path],
+                )
+                .map_err(db_err)?;
+            if n == 0 {
+                return Err(Error::Message(format!(
+                    "résumé pour le nœud {id}, non déclaré dans {path}"
+                )));
+            }
+        }
+        insert_refs(&tx, path, refs, "llm")?;
+        tx.execute(
+            "UPDATE files SET enriched_hash = ?2 WHERE path = ?1",
+            params![path, hash],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+
+    /// Fichiers indexés à enrichir : `enriched_hash` absent ou différent de `hash`.
+    pub fn files_to_enrich(&self) -> Result<Vec<FileRecord>> {
+        Ok(self
+            .files()?
+            .into_iter()
+            .filter(|f| f.state == FileState::Indexed)
+            .filter(|f| self.enriched_hash(&f.path).ok().flatten().as_deref() != Some(&f.hash))
+            .collect())
+    }
+
+    /// Nombre de fichiers à enrichir.
+    pub fn count_files_to_enrich(&self) -> Result<usize> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE state = 'indexed'
+                 AND (enriched_hash IS NULL OR enriched_hash <> hash)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as usize)
+            .map_err(db_err)
+    }
+
+    /// Empreinte enrichie d'un fichier (`None` : jamais enrichi ou fichier inconnu).
+    pub fn enriched_hash(&self, path: &str) -> Result<Option<String>> {
+        match self.conn.query_row(
+            "SELECT enriched_hash FROM files WHERE path = ?1",
+            [path],
+            |r| r.get::<_, Option<String>>(0),
+        ) {
+            Ok(h) => Ok(h),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
     }
 
     /// Supprime un fichier, ses nœuds, références et les liens attachés. Renvoie `false` si inconnu.
     pub fn remove_file(&mut self, path: &str) -> Result<bool> {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
-        release_file(&tx, path)?;
+        clear_summaries(&tx, path)?;
+        release_file(&tx, path, None)?;
         let n = tx
             .execute("DELETE FROM files WHERE path = ?1", [path])
             .map_err(db_err)?;
@@ -536,16 +567,119 @@ impl Store {
     }
 }
 
-/// Retire les déclarations et références d'un fichier, rattache ses nœuds partagés à un autre
-/// déclarant, et supprime les nœuds devenus orphelins (liens attachés compris).
-fn release_file(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
-    tx.execute("DELETE FROM refs WHERE file = ?1", [path])
+fn require_known(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+    let known: bool = tx
+        .query_row("SELECT 1 FROM files WHERE path = ?1", [path], |_| Ok(true))
+        .unwrap_or(false);
+    if known {
+        Ok(())
+    } else {
+        Err(Error::Message(format!(
+            "fichier inconnu du graphe : {path}"
+        )))
+    }
+}
+
+/// Efface les résumés posés par un fichier (ceux d'autres déclarants d'un nœud partagé restent).
+fn clear_summaries(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE nodes SET summary = NULL, summary_file = NULL WHERE summary_file = ?1",
+        [path],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+fn insert_nodes(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    nodes: &[Node],
+    origin: &str,
+) -> Result<()> {
+    let mut ins = tx
+        .prepare(
+            "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary, summary_file)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CASE WHEN ?7 IS NULL THEN NULL ELSE ?8 END)",
+        )
         .map_err(db_err)?;
-    tx.execute("DELETE FROM declarations WHERE file = ?1", [path])
+    let mut decl = tx
+        .prepare("INSERT OR IGNORE INTO declarations(file, node, origin) VALUES (?1, ?2, ?3)")
         .map_err(db_err)?;
+    for n in nodes {
+        if n.file.as_deref().is_some_and(|f| f != path) {
+            return Err(Error::Message(format!(
+                "le nœud {} n'appartient pas au fichier {path}",
+                n.id
+            )));
+        }
+        ins.execute(params![
+            n.id,
+            n.kind.as_str(),
+            n.qualified,
+            n.short,
+            path_or_null(n, path),
+            n.subkind.map(SubKind::as_str),
+            n.summary,
+            path
+        ])
+        .map_err(db_err)?;
+        decl.execute(params![path, n.id, origin]).map_err(db_err)?;
+    }
+    Ok(())
+}
+
+fn insert_refs(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    refs: &[Ref],
+    origin: &str,
+) -> Result<()> {
+    let mut insr = tx
+        .prepare(
+            "INSERT INTO refs(source, file, kind, target_name, context, origin)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS
+               (SELECT 1 FROM declarations WHERE node = ?1 AND file = ?2)",
+        )
+        .map_err(db_err)?;
+    for r in refs {
+        let n = insr
+            .execute(params![
+                r.source,
+                path,
+                r.kind.as_str(),
+                r.target_name,
+                r.context,
+                origin
+            ])
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err(Error::Message(format!(
+                "référence dont la source {} n'est pas déclarée dans {path}",
+                r.source
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Retire les déclarations et références d'un fichier (d'une seule origine si `origin` est
+/// donnée), rattache ses nœuds partagés à un autre déclarant, et supprime les nœuds devenus
+/// orphelins (liens attachés compris).
+fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>) -> Result<()> {
+    tx.execute(
+        "DELETE FROM refs WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
+        params![path, origin],
+    )
+    .map_err(db_err)?;
+    tx.execute(
+        "DELETE FROM declarations WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
+        params![path, origin],
+    )
+    .map_err(db_err)?;
     tx.execute(
         "UPDATE nodes SET file = (SELECT MIN(file) FROM declarations WHERE node = nodes.id)
-         WHERE file = ?1 AND EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+         WHERE file = ?1 AND EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)
+           AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id AND file = ?1)",
         [path],
     )
     .map_err(db_err)?;
@@ -938,5 +1072,227 @@ mod tests {
             .unwrap();
         assert!(st.remove_file("b/pom.xml").unwrap());
         assert!(st.nodes().unwrap().is_empty());
+    }
+
+    fn concept(name: &str) -> Node {
+        Node::new(NodeKind::Concept, name, name, None, None, None)
+    }
+    fn mention(src: &str, target: &str) -> Ref {
+        Ref {
+            source: src.into(),
+            kind: EdgeKind::Mentions,
+            target_name: target.into(),
+            context: None,
+        }
+    }
+    fn origins(st: &Store, table: &str) -> Vec<String> {
+        let mut q = st
+            .conn
+            .prepare(&format!("SELECT origin FROM {table} ORDER BY origin"))
+            .unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn req009_ac7_older_version_read_error_build_recreates() {
+        let dir = tempdir().unwrap();
+        drop(Store::open_or_create(dir.path()).unwrap());
+        let c = Connection::open(db_path(dir.path())).unwrap();
+        c.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(c);
+        let e = Store::open_readonly(dir.path()).err().unwrap();
+        assert!(e.to_string().contains("rkg build"), "{e}");
+        let st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION);
+        assert!(st.files_to_enrich().unwrap().is_empty());
+    }
+
+    #[test]
+    fn req024_ac7_replace_structure_erases_summaries_and_concepts() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        let a = ty("p.A", "a.md");
+        st.replace_structure("a.md", std::slice::from_ref(&a), &[])
+            .unwrap();
+        assert_eq!(st.files_to_enrich().unwrap().len(), 1);
+        st.apply_enrichment(
+            "a.md",
+            "h",
+            &[("type:p.A".into(), "résumé".into())],
+            &[concept("idée")],
+            &[mention("type:p.A", "idée")],
+        )
+        .unwrap();
+        assert!(st.files_to_enrich().unwrap().is_empty());
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        assert_eq!(origins(&st, "refs"), vec!["llm"]);
+        assert_eq!(origins(&st, "declarations"), vec!["llm", "parse"]);
+        let n = st.nodes().unwrap();
+        assert_eq!(n.len(), 2);
+        assert_eq!(
+            n.iter()
+                .find(|n| n.id == "type:p.A")
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("résumé")
+        );
+        // Le fichier est réanalysé : résumés, concepts, références llm et marque disparaissent.
+        st.replace_structure("a.md", &[a], &[]).unwrap();
+        let n = st.nodes().unwrap();
+        assert_eq!(n.len(), 1);
+        assert!(n[0].summary.is_none());
+        assert!(st.refs().unwrap().is_empty());
+        assert_eq!(st.enriched_hash("a.md").unwrap(), None);
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+    }
+
+    #[test]
+    fn req024_ac7_shared_node_summary_from_other_file_is_kept() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md"), file("b.md")])
+            .unwrap();
+        let shared = concept("pkg");
+        st.replace_structure("a.md", &[shared.clone(), ty("p.A", "a.md")], &[])
+            .unwrap();
+        st.replace_structure("b.md", &[shared, ty("p.B", "b.md")], &[])
+            .unwrap();
+        st.apply_enrichment(
+            "b.md",
+            "h",
+            &[
+                ("concept:pkg".into(), "partagé".into()),
+                ("type:p.B".into(), "propre à b".into()),
+            ],
+            &[],
+            &[],
+        )
+        .unwrap();
+        st.replace_structure("a.md", &[concept("pkg"), ty("p.A", "a.md")], &[])
+            .unwrap();
+        let summary = |id: &str| {
+            st.nodes()
+                .unwrap()
+                .into_iter()
+                .find(|n| n.id == id)
+                .unwrap()
+                .summary
+        };
+        assert_eq!(summary("concept:pkg").as_deref(), Some("partagé"));
+        assert_eq!(summary("type:p.B").as_deref(), Some("propre à b"));
+    }
+
+    #[test]
+    fn req024_ac7_remove_file_clears_summary_of_shared_node() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md"), file("b.md")])
+            .unwrap();
+        let shared = concept("pkg");
+        st.replace_structure("a.md", std::slice::from_ref(&shared), &[])
+            .unwrap();
+        st.replace_structure("b.md", std::slice::from_ref(&shared), &[])
+            .unwrap();
+        st.apply_enrichment(
+            "a.md",
+            "h",
+            &[("concept:pkg".into(), "résumé".into())],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(st.remove_file("a.md").unwrap());
+        let n = st.nodes().unwrap();
+        assert_eq!(n.len(), 1);
+        assert!(n[0].summary.is_none());
+    }
+
+    #[test]
+    fn dec014_shared_concept_removed_with_last_llm_declarer() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md"), file("b.md")])
+            .unwrap();
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        st.replace_structure("b.md", &[ty("p.B", "b.md")], &[])
+            .unwrap();
+        for (f, s) in [("a.md", "type:p.A"), ("b.md", "type:p.B")] {
+            st.apply_enrichment(f, "h", &[], &[concept("c")], &[mention(s, "c")])
+                .unwrap();
+        }
+        assert_eq!(st.nodes().unwrap().len(), 3);
+        // a.md est ré-enrichi sans le concept : b.md le déclare encore.
+        st.apply_enrichment("a.md", "h", &[], &[], &[]).unwrap();
+        assert!(st.nodes().unwrap().iter().any(|n| n.id == "concept:c"));
+        assert_eq!(st.refs().unwrap().len(), 1);
+        st.apply_enrichment("b.md", "h", &[], &[], &[]).unwrap();
+        assert!(!st.nodes().unwrap().iter().any(|n| n.id == "concept:c"));
+        assert_eq!(st.nodes().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn files_to_enrich_iff_enriched_hash_differs() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md"), file("b.md")])
+            .unwrap();
+        // En attente (illisible) : pas à enrichir.
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        let paths = |st: &Store| -> Vec<String> {
+            st.files_to_enrich()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect()
+        };
+        assert_eq!(paths(&st), vec!["a.md"]);
+        st.apply_enrichment("a.md", "autre", &[], &[], &[]).unwrap();
+        assert_eq!(paths(&st), vec!["a.md"]);
+        st.apply_enrichment("a.md", "h", &[], &[], &[]).unwrap();
+        assert!(paths(&st).is_empty());
+        // Contenu modifié : l'empreinte diffère à nouveau.
+        let mut f = file("a.md");
+        f.hash = "h2".into();
+        st.insert_files(&[f]).unwrap();
+        assert_eq!(paths(&st), vec!["a.md"]);
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+    }
+
+    #[test]
+    fn apply_enrichment_rejects_foreign_summary_and_is_atomic() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        st.apply_enrichment(
+            "a.md",
+            "h",
+            &[],
+            &[concept("c")],
+            &[mention("type:p.A", "c")],
+        )
+        .unwrap();
+        let r = st.apply_enrichment(
+            "a.md",
+            "h2",
+            &[("type:inconnu".into(), "x".into())],
+            &[],
+            &[],
+        );
+        assert!(r.is_err());
+        assert_eq!(st.enriched_hash("a.md").unwrap().as_deref(), Some("h"));
+        assert_eq!(st.refs().unwrap().len(), 1);
+        assert!(st
+            .apply_enrichment("absent.md", "h", &[], &[], &[])
+            .is_err());
     }
 }
