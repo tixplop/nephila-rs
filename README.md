@@ -67,7 +67,7 @@ Nœuds les plus reliés
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge.
 
 ```sh
-V=v0.8.0                                       # version voulue
+V=v0.8.1                                       # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -383,6 +383,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.8.1 | Premiers binaires précompilés (Linux musl, macOS) publiés par la CI |
 | 0.8 | Renommage `rkg` → `nephila` (binaire, dossier `.nephila/`, configuration, variables `NEPHILA_*`) |
 | 0.7 | Option `--batch-files <N>` de `build` et `update` |
 | 0.6 | Enrichissement en lots (clé `batch_files`) |
