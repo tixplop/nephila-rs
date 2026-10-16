@@ -4,12 +4,12 @@
 mod fake_server;
 
 use fake_server::FakeServer;
-use rkg::error::Error;
-use rkg::llm::anthropic::AnthropicLlm;
-use rkg::llm::openai::OpenAiLlm;
-use rkg::llm::AskReply;
-use rkg::llm::Llm;
-use rkg::llm::LotItem;
+use nephila::error::Error;
+use nephila::llm::anthropic::AnthropicLlm;
+use nephila::llm::openai::OpenAiLlm;
+use nephila::llm::AskReply;
+use nephila::llm::Llm;
+use nephila::llm::LotItem;
 
 const EXTRACTION: &str =
     r#"{"version":2,"summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}"#;
@@ -280,8 +280,9 @@ fn req002_ac8_config_timeout_secs_reaches_http_agent() {
         "provider='openai'\nmodel='m'\nbase_url='{}'\ntimeout_secs=1\n",
         s.base_url
     );
-    let cfg = rkg::config::Config::parse(&text, std::path::Path::new("/x/config.toml")).unwrap();
-    let llm = rkg::llm::build_llm(&cfg).unwrap();
+    let cfg =
+        nephila::config::Config::parse(&text, std::path::Path::new("/x/config.toml")).unwrap();
+    let llm = nephila::llm::build_llm(&cfg).unwrap();
     let t = std::time::Instant::now();
     let r = llm.verify_key();
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
@@ -374,7 +375,7 @@ fn check_lot_request(system: &str, user: &str) {
     );
 }
 
-fn check_lot_result(r: Vec<(String, rkg::error::Result<rkg::llm::Enrichment>)>) {
+fn check_lot_result(r: Vec<(String, nephila::error::Result<nephila::llm::Enrichment>)>) {
     assert_eq!(r.len(), 2);
     assert_eq!(r[0].0, "A.java");
     let a = r[0].1.as_ref().unwrap();

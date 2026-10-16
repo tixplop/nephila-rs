@@ -36,13 +36,13 @@ impl Env {
 
     /// Toute commande s'exécute sans configuration LLM.
     fn cmd(&self, args: &[&str]) -> Output {
-        Command::new(cargo_bin("rkg"))
+        Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(&self.repo)
             .args(args)
-            .env("RKG_CONFIG", self.repo.join("absent.toml"))
-            .env_remove("RKG_MOCK_DIR")
-            .env_remove("RKG_MOCK_LOG")
+            .env("NEPHILA_CONFIG", self.repo.join("absent.toml"))
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG")
             .output()
             .unwrap()
     }
@@ -270,17 +270,17 @@ fn req001_ac4_and_req017_on_gradle_repo_without_llm_configuration() {
     ] {
         let out = empty.cmd(&args);
         assert!(!out.status.success(), "{args:?}");
-        assert!(text(&out.stderr).contains("rkg build"), "{args:?}");
+        assert!(text(&out.stderr).contains("nephila build"), "{args:?}");
     }
 }
 
-fn rkg_in(dir: &Path, args: &[&str]) -> Output {
-    let out = Command::new(cargo_bin("rkg"))
+fn nephila_in(dir: &Path, args: &[&str]) -> Output {
+    let out = Command::new(cargo_bin("nephila"))
         .current_dir(dir)
         .args(args)
-        .env("RKG_CONFIG", dir.join("absent.toml"))
-        .env_remove("RKG_MOCK_DIR")
-        .env_remove("RKG_MOCK_LOG")
+        .env("NEPHILA_CONFIG", dir.join("absent.toml"))
+        .env_remove("NEPHILA_MOCK_DIR")
+        .env_remove("NEPHILA_MOCK_LOG")
         .output()
         .unwrap();
     assert!(out.status.success(), "{args:?} {}", text(&out.stderr));
@@ -288,7 +288,7 @@ fn rkg_in(dir: &Path, args: &[&str]) -> Output {
 }
 
 fn assert_monrepo_module(dir: &Path, args: &[&str]) {
-    let v: Value = serde_json::from_slice(&rkg_in(dir, args).stdout).unwrap();
+    let v: Value = serde_json::from_slice(&nephila_in(dir, args).stdout).unwrap();
     assert_eq!(node(&v, "module::").unwrap()["short"], "monrepo", "{v}");
     assert!(
         has_edge(
@@ -309,10 +309,10 @@ fn req022_ac10_root_module_named_after_folder_without_dash_c() {
     let script = "dependencies {\n    implementation 'org.slf4j:slf4j-api:2.0.9'\n}\n";
     fs::write(repo.join("build.gradle"), script).unwrap();
 
-    rkg_in(&repo, &["build"]);
+    nephila_in(&repo, &["build"]);
     assert_monrepo_module(&repo, &["export", "--output", "-"]);
 
-    rkg_in(&repo.join("sub"), &["-C", "..", "build"]);
+    nephila_in(&repo.join("sub"), &["-C", "..", "build"]);
     assert_monrepo_module(&repo, &["export", "--output", "-"]);
 
     fs::write(
@@ -320,6 +320,6 @@ fn req022_ac10_root_module_named_after_folder_without_dash_c() {
         "dependencies {\n    implementation 'org.slf4j:slf4j-api:2.0.9'\n    // modifié\n}\n",
     )
     .unwrap();
-    rkg_in(&repo, &["update"]);
+    nephila_in(&repo, &["update"]);
     assert_monrepo_module(&repo, &["export", "--output", "-"]);
 }

@@ -1,12 +1,17 @@
 use assert_cmd::Command;
 
-fn rkg() -> Command {
-    Command::cargo_bin("rkg").unwrap()
+fn nephila() -> Command {
+    Command::cargo_bin("nephila").unwrap()
 }
 
 #[test]
 fn req001_ac1_help_lists_commands() {
-    let out = rkg().arg("--help").assert().success().get_output().clone();
+    let out = nephila()
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
     let text = String::from_utf8(out.stdout).unwrap();
     for c in ["build", "update", "status", "query", "export", "summary"] {
         assert!(text.contains(c), "commande absente de l'aide : {c}");
@@ -16,7 +21,7 @@ fn req001_ac1_help_lists_commands() {
 
 #[test]
 fn req001_ac1_query_help_lists_subcommands() {
-    let out = rkg()
+    let out = nephila()
         .args(["query", "--help"])
         .assert()
         .success()
@@ -30,7 +35,7 @@ fn req001_ac1_query_help_lists_subcommands() {
 
 #[test]
 fn req001_ac3_unknown_command_fails_with_usage_on_stderr() {
-    let out = rkg()
+    let out = nephila()
         .arg("frobnicate")
         .assert()
         .failure()
@@ -42,7 +47,7 @@ fn req001_ac3_unknown_command_fails_with_usage_on_stderr() {
 
 #[test]
 fn req001_ac3_invalid_option_fails_with_usage_on_stderr() {
-    let out = rkg()
+    let out = nephila()
         .args(["status", "--bogus"])
         .assert()
         .failure()
@@ -54,8 +59,8 @@ fn req001_ac3_invalid_option_fails_with_usage_on_stderr() {
 
 #[test]
 fn req001_ac2_error_exits_nonzero_with_prefix_on_stderr_only() {
-    let out = rkg()
-        .args(["-C", "/nonexistent/rkg-repo"])
+    let out = nephila()
+        .args(["-C", "/nonexistent/nephila-repo"])
         .arg("build")
         .assert()
         .failure()

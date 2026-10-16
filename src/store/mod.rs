@@ -1,4 +1,4 @@
-//! Stockage SQLite du graphe dans `<dépôt>/.rkg/graph.db` (DEC-009, DEC-010).
+//! Stockage SQLite du graphe dans `<dépôt>/.nephila/graph.db` (DEC-009, DEC-010).
 
 use std::path::{Path, PathBuf};
 
@@ -27,7 +27,7 @@ fn db_err(e: rusqlite::Error) -> Error {
 
 /// Chemin du fichier de base pour un dépôt.
 pub fn db_path(repo: &Path) -> PathBuf {
-    repo.join(".rkg").join("graph.db")
+    repo.join(".nephila").join("graph.db")
 }
 
 pub struct Store {
@@ -36,7 +36,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// Ouvre le graphe en écriture, en le créant (dossier `.rkg/`, schéma, WAL) si besoin.
+    /// Ouvre le graphe en écriture, en le créant (dossier `.nephila/`, schéma, WAL) si besoin.
     pub fn open_or_create(repo: &Path) -> Result<Store> {
         let path = db_path(repo);
         if let Some(dir) = path.parent() {
@@ -70,12 +70,12 @@ impl Store {
     }
 
     /// Ouvre en écriture un graphe existant, sans rien créer ni migrer : un schéma d'une autre
-    /// version (ou une base vide) est refusé avec l'invitation à lancer `rkg build`.
+    /// version (ou une base vide) est refusé avec l'invitation à lancer `nephila build`.
     pub fn open_existing(repo: &Path) -> Result<Store> {
         let path = db_path(repo);
         if !path.is_file() {
             return Err(Error::Message(format!(
-                "aucun graphe dans {} : lancez `rkg build`",
+                "aucun graphe dans {} : lancez `nephila build`",
                 repo.display()
             )));
         }
@@ -95,7 +95,7 @@ impl Store {
         match store.user_version()? {
             v if v == SCHEMA_VERSION => Ok(store),
             v => Err(Error::Message(format!(
-                "graphe de schéma {v} incompatible (attendu {SCHEMA_VERSION}) dans {} : lancez `rkg build`",
+                "graphe de schéma {v} incompatible (attendu {SCHEMA_VERSION}) dans {} : lancez `nephila build`",
                 path.display()
             ))),
         }
@@ -106,7 +106,7 @@ impl Store {
         let path = db_path(repo);
         if !path.is_file() {
             return Err(Error::Message(format!(
-                "aucun graphe dans {} : lancez `rkg build`",
+                "aucun graphe dans {} : lancez `nephila build`",
                 repo.display()
             )));
         }
@@ -126,7 +126,7 @@ impl Store {
         match store.user_version()? {
             0 => {
                 return Err(Error::Message(format!(
-                    "graphe vide ou illisible dans {} : lancez `rkg build`",
+                    "graphe vide ou illisible dans {} : lancez `nephila build`",
                     path.display()
                 )))
             }
@@ -979,7 +979,7 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
 
 fn version_error(v: i32) -> Error {
     Error::Message(format!(
-        "version de schéma du graphe non prise en charge ({v}, attendue {SCHEMA_VERSION}) : relancez `rkg build`"
+        "version de schéma du graphe non prise en charge ({v}, attendue {SCHEMA_VERSION}) : relancez `nephila build`"
     ))
 }
 
@@ -1090,10 +1090,10 @@ mod tests {
     }
 
     #[test]
-    fn req009_ac2_db_under_rkg_only_wal_and_version() {
+    fn req009_ac2_db_under_nephila_only_wal_and_version() {
         let dir = tempdir().unwrap();
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert!(dir.path().join(".rkg/graph.db").is_file());
+        assert!(dir.path().join(".nephila/graph.db").is_file());
         assert_eq!(st.journal_mode().unwrap(), "wal");
         assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION);
         drop(st);
@@ -1101,7 +1101,7 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(top, [".rkg"]);
+        assert_eq!(top, [".nephila"]);
         // Réouverture d'une base existante.
         Store::open_or_create(dir.path()).unwrap();
     }
@@ -1110,8 +1110,8 @@ mod tests {
     fn req009_ac4_readonly_missing_creates_nothing() {
         let dir = tempdir().unwrap();
         let err = Store::open_readonly(dir.path()).err().unwrap();
-        assert!(err.to_string().contains("rkg build"), "{err}");
-        assert!(!dir.path().join(".rkg").exists());
+        assert!(err.to_string().contains("nephila build"), "{err}");
+        assert!(!dir.path().join(".nephila").exists());
     }
 
     #[test]
@@ -1387,7 +1387,7 @@ mod tests {
             .unwrap();
         drop(c);
         let e = Store::open_readonly(dir.path()).err().unwrap();
-        assert!(e.to_string().contains("rkg build"), "{e}");
+        assert!(e.to_string().contains("nephila build"), "{e}");
         let st = Store::open_or_create(dir.path()).unwrap();
         assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(st.files_to_enrich().unwrap().is_empty());

@@ -51,16 +51,16 @@ impl Env {
     }
 
     fn command(&self, args: &[&str], extra: &[(&str, &str)]) -> Command {
-        let mut c = Command::new(cargo_bin("rkg"));
+        let mut c = Command::new(cargo_bin("nephila"));
         c.arg("-C")
             .arg(&self.repo)
             .args(args)
-            .env_remove("RKG_MOCK_FAIL_AFTER")
-            .env_remove("RKG_MOCK_DELAY_MS")
-            .env_remove("RKG_MOCK_INVALID_KEY")
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log);
+            .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+            .env_remove("NEPHILA_MOCK_DELAY_MS")
+            .env_remove("NEPHILA_MOCK_INVALID_KEY")
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log);
         for (k, v) in extra {
             c.env(k, v);
         }
@@ -75,13 +75,13 @@ impl Env {
     fn status(&self, extra_args: &[&str]) -> Output {
         let mut args = vec!["status"];
         args.extend_from_slice(extra_args);
-        let mut c = Command::new(cargo_bin("rkg"));
+        let mut c = Command::new(cargo_bin("nephila"));
         c.arg("-C")
             .arg(&self.repo)
             .args(&args)
-            .env("RKG_CONFIG", self.repo.join("absent.toml"))
-            .env_remove("RKG_MOCK_DIR")
-            .env_remove("RKG_MOCK_LOG");
+            .env("NEPHILA_CONFIG", self.repo.join("absent.toml"))
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG");
         c.output().unwrap()
     }
 
@@ -140,7 +140,7 @@ fn req012_ac2_touch_only_is_still_up_to_date() {
 /// Marque « en attente » tous les fichiers sauf un (le premier autre que `JAVA2`, qui est mis en
 /// attente) comme après une interruption de la phase structure ; renvoie les chemins mis en attente.
 fn mark_pending_all_but_one(env: &Env) -> Vec<String> {
-    let mut store = rkg::store::Store::open_existing(&env.repo).unwrap();
+    let mut store = nephila::store::Store::open_existing(&env.repo).unwrap();
     let files = store.files().unwrap();
     let mut keep = vec![JAVA2.to_string()];
     keep.push(
@@ -192,12 +192,12 @@ fn req012_ac4_no_graph_invites_to_build_with_nonzero_exit() {
     let out = env.status(&[]);
     assert!(!out.status.success());
     assert!(
-        text(&out.stderr).contains("rkg build"),
+        text(&out.stderr).contains("nephila build"),
         "{}",
         text(&out.stderr)
     );
     assert!(text(&out.stderr).starts_with("erreur:"));
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn req012_ac5_status_makes_no_llm_call_and_needs_no_config() {
     let env = Env::built();
     let before = fs::read_to_string(&env.log).unwrap();
     fs::write(env.repo.join("README.md"), "# modifié\n").unwrap();
-    let mut c = env.command(&["status"], &[("RKG_CONFIG", "/nonexistent/c.toml")]);
+    let mut c = env.command(&["status"], &[("NEPHILA_CONFIG", "/nonexistent/c.toml")]);
     let out = c.output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(fs::read_to_string(&env.log).unwrap(), before);
@@ -237,7 +237,7 @@ fn req012_json_output_lists_state_and_files() {
 
 fn spawn_slow_build(env: &Env) -> Child {
     let child = env
-        .command(&["build"], &[("RKG_MOCK_DELAY_MS", "400")])
+        .command(&["build"], &[("NEPHILA_MOCK_DELAY_MS", "400")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

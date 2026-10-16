@@ -1,297 +1,408 @@
-# rkg - graphe de connaissances d'un dépôt
+# Nephila
 
-`rkg` analyse un dépôt (Java, Kotlin, Groovy, Scala, fichiers de build Maven/Gradle/Ivy, Markdown), stocke le résultat dans un graphe SQLite local (nœuds : modules, types, méthodes, documents... ; liens : `contains`, `calls`...) et permet de l'interroger sans LLM, sauf pour `query ask`.
+**Graphe de connaissances d'un dépôt de code.**
 
-Depuis la version 0.4.0, `rkg export --format html` produit une page d'exploration autonome, et `rkg export` écrit désormais dans un fichier (voir `rkg export`). La version 0.5.0 ajoute l'option `-v/--verbose` à `build` et `update` (traces sur stderr). La version 0.6.0 ajoute la clé `batch_files` (enrichissement en lots, voir « Enrichissement en lots »). La version 0.7.0 ajoute l'option `--batch-files <N>` à `build` et `update`.
+> *Nephila* est le genre des néphiles dorées, des araignées qui tissent de très grandes toiles d'une soie couleur d'or. Cet outil tisse de la même manière les liens entre tous les éléments d'un dépôt.
 
-Depuis la version 0.3.0, la structure du graphe vient d'une analyse syntaxique locale, sans LLM. Le LLM est facultatif : il ne sert qu'à enrichir le graphe (résumés des nœuds, concepts des documents Markdown) et à répondre à `query ask`. Sans configuration, ou avec `--no-llm`, `build` et `update` produisent la structure seule.
+`nephila` (crate `nephila-rs`) analyse un dépôt de code JVM et sa documentation, en tire un graphe de connaissances stocké localement, et permet de l'interroger en ligne de commande, de l'exporter ou de l'explorer dans le navigateur.
+
+- **Analyse locale, sans LLM** : la structure (modules, packages, types, méthodes, documents, sections) et les liens (`imports`, `extends`, `implements`, `calls`, `depends_on`, `links_to`, `mentions`, `contains`) viennent d'une analyse syntaxique. Ni Maven, ni Gradle, ni compilateur ne sont exécutés.
+- **LLM facultatif** : s'il est configuré, il enrichit le graphe (résumés des nœuds, concepts des documents) et répond aux questions en langage naturel. Anthropic, OpenAI et tout serveur compatible OpenAI (Ollama, llama.cpp, vLLM…) sont pris en charge.
+- **Incrémental** : `nephila update` ne retraite que ce qui a changé.
+- **Pensé pour les agents** : sorties `--json` stables, codes de sortie explicites, messages sur stderr.
+- **Exploration visuelle** : `nephila export --format html` produit une page autonome, utilisable hors ligne.
+
+Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, Maven (`pom.xml`), Ivy (`ivy.xml`), Gradle (Groovy et Kotlin DSL), Markdown.
+
+## Sommaire
+
+- [Démarrage rapide](#démarrage-rapide)
+- [Installation](#installation)
+- [Commandes](#commandes)
+- [Export et vue HTML](#export-et-vue-html)
+- [Configuration du LLM](#configuration-du-llm)
+- [Enrichissement en lots](#enrichissement-en-lots)
+- [Ce que l'analyse extrait](#ce-que-lanalyse-extrait)
+- [Fonctionnement](#fonctionnement)
+- [Codes de sortie](#codes-de-sortie)
+- [Usage par un agent](#usage-par-un-agent)
+- [Limites connues](#limites-connues)
+- [Mise à niveau](#mise-à-niveau)
+- [Développement](#développement)
+- [Licence](#licence)
+
+## Démarrage rapide
+
+```sh
+cargo install --path .                      # installe le binaire nephila
+cd /chemin/vers/mon-depot
+echo ".nephila/" >> .gitignore              # le graphe est stocké dans .nephila/
+nephila build --no-llm                      # structure seule, aucun appel réseau
+nephila query search OrderService           # chercher un élément
+nephila query neighbors type:com.acme.core.OrderService
+xdg-open "$(nephila export --format html)"  # explorer le graphe dans le navigateur
+```
+
+Exemple sur un petit dépôt Maven de trois modules :
+
+```
+$ nephila -C demo build --no-llm
+build terminé : 11 fichiers traités, 23 nœuds, 30 liens, 0 références non résolues, 0 fichiers en attente, 11 fichiers à enrichir, enrichissement : désactivé
+
+$ nephila -C demo summary
+Modules (3)
+  api -> module:com.acme:core
+  core -> dependency:org.slf4j:slf4j-api
+  store -> module:com.acme:core
+Nœuds les plus reliés
+  type:com.acme.core.OrderRepository (degré 6)
+  module:com.acme:core (degré 5)
+  ...
+```
 
 ## Installation
 
+Prérequis : une chaîne Rust stable récente (`cargo`). Aucune dépendance système : SQLite est intégré au binaire.
+
 ```sh
-cargo install --path .
+cargo install --path .        # installe nephila dans ~/.cargo/bin
+# ou, sans installation :
+cargo build --release         # binaire dans target/release/nephila
 ```
 
-Cela installe le binaire `rkg`. Sans installation : `cargo build --release`, binaire dans `target/release/rkg`.
-
-## Configuration du LLM (facultative)
-
-`build`, `update` (sauf avec `--no-llm`) et `query ask` lisent un fichier TOML, cherché dans cet ordre :
-
-1. la variable `RKG_CONFIG` ;
-2. `$XDG_CONFIG_HOME/rkg/config.toml` ;
-3. `~/.config/rkg/config.toml`.
-
-Un exemple commenté est fourni dans `examples/config.toml`.
-
-Le LLM est actif quand ce fichier existe et que `--no-llm` est absent. Sans fichier de configuration, `build` et `update` ne font aucun appel, réussissent (code 0) et affichent `enrichissement : désactivé` dans leur bilan ; `query ask` échoue en demandant une configuration. Avec `--no-llm`, la configuration n'est pas lue (même invalide) et aucun appel n'est fait. Si `RKG_CONFIG` pointe vers un fichier absent, le LLM est désactivé sans erreur (comme sans configuration). Un fichier de configuration présent mais invalide fait échouer `build`/`update` (sans `--no-llm`).
-
-| Clé | Rôle |
-|---|---|
-| `provider` | `anthropic`, `openai` (protocole compatible OpenAI) ou `mock` (obligatoire) |
-| `model` | nom du modèle (obligatoire, sauf `mock`) |
-| `api_key_env` | NOM de la variable d'environnement qui contient la clé (obligatoire pour `anthropic`, facultatif sinon) |
-| `base_url` | URL du serveur (facultatif) |
-| `max_chunk_chars` | taille maximale d'un morceau envoyé au LLM (défaut 60000) |
-| `concurrency` | appels simultanés (défaut 4) |
-| `batch_files` | nombre maximal de fichiers par appel d'enrichissement, entier > 0 (défaut 1 = un fichier par appel) ; voir « Enrichissement en lots » |
-| `timeout_secs` | durée maximale d'un appel LLM HTTP (extraction, `ask`, vérification de clé), entier > 0 (défaut 300) ; le délai de connexion reste fixe (10 s) ; ignoré par `mock` |
-
-La clé n'est jamais écrite dans le fichier : `api_key_env = "ANTHROPIC_API_KEY"` puis `export ANTHROPIC_API_KEY=...`. Avant tout traitement, `rkg` vérifie la clé par un appel de liste des modèles (sans coût de génération).
-
-Anthropic :
-
-```toml
-provider = "anthropic"
-model = "claude-sonnet-4-5"
-api_key_env = "ANTHROPIC_API_KEY"
-```
-
-OpenAI :
-
-```toml
-provider = "openai"
-model = "gpt-4o-mini"
-api_key_env = "OPENAI_API_KEY"
-```
-
-Modèle local (Ollama, llama.cpp, vLLM...), sans clé :
-
-```toml
-provider = "openai"
-model = "llama3.1"
-base_url = "http://localhost:11434"
-```
-
-Attention : `base_url` s'écrit SANS `/v1` final. `rkg` ajoute lui-même `/v1/chat/completions` et `/v1/models` ; avec `http://localhost:11434/v1` les requêtes iraient vers `/v1/v1/...`.
-
-Fournisseur simulé (tests, démonstration sans réseau) :
-
-```toml
-provider = "mock"
-```
-
-## Ce que l'analyse extrait
-
-Chaque fichier est analysé localement (tree-sitter pour les langages JVM, lecteur XML, lecteur lexical Gradle, CommonMark), sans exécuter Maven, Gradle ni compilateur.
-
-| Fichier | Nœuds | Références (liens) |
-|---|---|---|
-| `.java`, `.kt`, `.kts` (hors Gradle), `.groovy`, `.scala` | package, types (class, interface, enum, annotation, object, trait Scala ; imbriqués `Externe.Interne`), méthodes (constructeurs `<init>`) ; fonctions de premier niveau rattachées au type de fichier conventionnel (Kotlin `NomFichierKt`, script Groovy/Kotlin `NomFichier`, Scala 3 `NomFichier$package`) | `imports`, `extends`, `implements`, `calls` |
-| `pom.xml`, `ivy.xml` | module `groupId:artifactId` / `organisation:module` | `depends_on` (dépendances ; `dependencyManagement`, plugins et `parent` exclus) |
-| `build.gradle`, `build.gradle.kts`, `settings.gradle(.kts)` | module = chemin de projet (`:services:api`) ; `settings` suivi mais sans nœud | `depends_on` (`project(':core')`, chaînes `g:a[:v]`, notation map) ; seul le bloc `dependencies { }` de premier niveau compte ; catalogues `libs.…` et `files(…)` ignorés |
-| autre `.gradle` (script appliqué) | analysé comme un script Groovy | idem Groovy |
-| `.md`, `.markdown` | document (chemin), sections (titres, ancre à la GitHub) | `links_to` (liens relatifs vers un autre `.md`), `mentions` (spans de code en ligne au format de nom JVM : `Order`, `shop.Order`, `place()`, `Order#place`) |
-
-Les références sont des noms ; elles sont résolues en liens à la fin du traitement, celles qui ne le sont pas sont comptées dans « références non résolues » (les mentions Markdown non résolues ne sont pas listées).
-
-Heuristiques d'appels (DEC-021) : le type du receveur n'est cherché que dans le fichier (paramètre, variable locale, champ de type déclaré ou initialisé par un constructeur) ; un receveur non déclaré qui commence par une majuscule est un appel statique `T.m` ; `this.m()` ou `m()` visent le type englobant s'il déclare `m`. Receveur de type inconnu (chaîne d'appels, `var`/`val`/`def` sans initialiseur reconnaissable) : aucun lien, car un lien manquant coûte moins qu'un lien faux. Les mots du texte courant Markdown ne sont jamais des mentions.
-
-Un fichier mal formé est exploité au mieux (ce qui précède l'erreur), sans échec.
-
-## Fichiers « en attente » et « à enrichir »
-
-- **en attente** : l'analyse (ou, pour un fichier de build, la lecture) du fichier n'a pas abouti ou n'a pas été faite ; la commande sort avec le code 1 ; `rkg update` le retraite.
-- **à enrichir** : la structure du fichier est dans le graphe, mais son contenu actuel n'a pas été enrichi avec succès par le LLM (réponse non conforme, erreur, `--no-llm`, ou fichier modifié depuis). Réanalyser un fichier modifié efface ses résumés et concepts. Avec le LLM actif, un fichier à enrichir fait sortir `build`/`update` en code 1 ; `rkg update` ne renvoie au LLM que ces fichiers. Avec `--no-llm` ou sans configuration, ce n'est pas une erreur (code 0, `enrichissement : désactivé`). `rkg status` indique leur nombre.
-
-Le bilan de `build`/`update` donne les deux compteurs : `... 0 fichiers en attente, 2 fichiers à enrichir`.
-
-## Le dossier `.rkg/`
-
-Le graphe est stocké dans `<dépôt>/.rkg/` (`graph.db`, fichiers WAL, `lock`). Ajoutez `.rkg/` au `.gitignore` du dépôt analysé. Le dossier `.rkg/`, `target/`, `build/`, `.gradle/` et `.git/` ne sont jamais analysés ; le `.gitignore` du dépôt est respecté.
+Vérification : `nephila --version`.
 
 ## Commandes
 
-Option globale : `-C/--repo <dossier>` (racine du dépôt, défaut : dossier courant). Les exemples ci-dessous viennent d'un petit dépôt avec le fournisseur `mock`.
+Option globale : `-C, --repo <dossier>`, la racine du dépôt (défaut : dossier courant). `nephila <commande> --help` détaille chaque commande.
 
-### `rkg build`
-Reconstruit entièrement le graphe : analyse locale de chaque fichier, puis, si le LLM est actif, un appel d'enrichissement par fichier (ou morceau). Option `--no-llm` : structure seule, sans lire la configuration. Option `--batch-files <N>` (entier > 0) : taille de lot pour cette commande, voir « Enrichissement en lots ».
+| Commande | Rôle | LLM |
+|---|---|---|
+| `nephila build` | Reconstruit entièrement le graphe | facultatif |
+| `nephila update` | Retraite les fichiers ajoutés, modifiés, supprimés, en attente ou à enrichir | facultatif |
+| `nephila status [--json]` | Compare le dépôt au graphe | non |
+| `nephila query search <terme>` | Cherche des nœuds par nom | non |
+| `nephila query neighbors <nœud>` | Voisins d'un nœud | non |
+| `nephila query path <source> <cible>` | Plus court chemin entre deux nœuds | non |
+| `nephila query ask "<question>"` | Question en langage naturel | requis |
+| `nephila summary [--json]` | Modules, nœuds les plus reliés, thèmes | non |
+| `nephila export` | Export JSON ou page HTML | non |
+
+Les commandes sans LLM ne lisent aucune configuration. Si le graphe est en retard sur les fichiers, elles le signalent sur stderr (`avertissement: graphe pas à jour : 1 fichier modifié`).
+
+### `nephila build` et `nephila update`
+
 ```
-$ rkg -C repo build
-build terminé : 2 fichiers traités, 4 nœuds, 3 liens, 0 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir
+nephila build  [--no-llm] [-v|--verbose] [--batch-files <N>]
+nephila update [--no-llm] [-v|--verbose] [--batch-files <N>]
 ```
 
-### `rkg update`
-Ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus les fichiers en attente ou à enrichir ; même format de sortie et mêmes options `--no-llm` et `--batch-files <N>` que `build`.
+`build` analyse chaque fichier puis, si le LLM est actif, enrichit le graphe. `update` ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus ceux restés en attente ou à enrichir.
+
+| Option | Effet |
+|---|---|
+| `--no-llm` | Structure seule : la configuration n'est pas lue (même invalide) et aucun appel n'est fait |
+| `-v, --verbose` | Traces sur stderr (voir [Traces](#traces---verbose)) |
+| `--batch-files <N>` | Taille de lot pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
+
 ```
-$ rkg -C repo update
+$ nephila -C repo update
 update terminé : 2 fichiers traités, 2 nœuds, 1 liens, 0 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir
 ```
-Échecs (`build` comme `update`) :
-- un fichier en échec (lecture impossible ; pour l'enrichissement : réponse non conforme, délai dépassé, erreur réseau isolée) reste « en attente » ou « à enrichir » et le traitement des autres fichiers continue ; sa structure, elle, est déjà dans le graphe ; chaque fichier en échec est nommé sur stderr (`avertissement:`) avec sa cause ;
-- l'envoi s'arrête seulement sur une clé refusée (HTTP 401/403, dès le premier refus) ou sur 3 erreurs réseau consécutives (une réussite remet le compte à zéro ; seuil fixe) ;
-- les appels déjà en cours se terminent et sont enregistrés ; la ligne de bilan est toujours affichée ;
-- s'il reste au moins un fichier en attente, ou à enrichir avec le LLM actif, la commande sort avec le code 1 : relancez `rkg update` ;
-- une référence dont le genre de lien est inconnu ou non autorisé depuis le genre de son nœud source est écartée avec un `avertissement:` (fichier et nombre de références écartées) ; le fichier est indexé normalement.
 
-### `rkg status [--json]`
-Compare le dépôt au graphe, sans LLM.
+Le bilan donne deux compteurs :
+
+- **en attente** : l'analyse du fichier n'a pas abouti ou n'a pas été faite. La commande sort avec le code 1 ; `nephila update` le retraite.
+- **à enrichir** : la structure du fichier est dans le graphe, mais son contenu actuel n'a pas été enrichi par le LLM (réponse non conforme, erreur, `--no-llm`, ou fichier modifié depuis). Avec le LLM actif, la commande sort avec le code 1 et `nephila update` ne renvoie au LLM que ces fichiers. Sans LLM, ce n'est pas une erreur (code 0, `enrichissement : désactivé`).
+
+Réanalyser un fichier modifié efface ses résumés et concepts.
+
+**Gestion des échecs** :
+
+- un fichier en échec reste « en attente » ou « à enrichir », est nommé sur stderr avec sa cause, et le traitement des autres continue ;
+- l'envoi au LLM s'arrête sur une clé refusée (HTTP 401/403, dès le premier refus) ou après 3 erreurs réseau consécutives (une réussite remet le compte à zéro) ;
+- les appels déjà en cours se terminent et sont enregistrés, et la ligne de bilan est toujours affichée ;
+- une référence dont le genre de lien est inconnu ou non autorisé pour son nœud source est écartée avec un avertissement ; le fichier est indexé normalement.
+
+### `nephila status`
+
 ```
-$ rkg status
+$ nephila status
 graphe pas à jour
 supprimé	src/Order.java
 ajouté	src/Order2.java
 modifié	src/Payment.java
 
-$ rkg status --json
+$ nephila status --json
 {"a_jour":false,"fichiers":[{"chemin":"src/Order.java","état":"supprimé"},...]}
 ```
+
 Graphe à jour : `graphe à jour`.
 
-### `rkg query search <terme> [--limit N] [--json]`
+### `nephila query`
+
+Un nœud se désigne par son nom (`shop.Order`) ou par son identifiant `genre:nom` (`method:shop.Order.place`). Toutes les requêtes acceptent `--json`.
+
 ```
-$ rkg query search order
+$ nephila query search order [--limit N]
 shop.Order (class, src/Order.java) - Une commande.
 shop.Order.place (method, src/Order.java)
-```
-Sans résultat : `erreur: aucun résultat pour « zzz »` (code 1).
 
-### `rkg query neighbors <nœud> [--depth N] [--limit N] [--json]`
-Le nœud est un nom (`shop.Order`) ou un identifiant `genre:nom` (`method:shop.Order.place`).
-```
-$ rkg query neighbors method:shop.Order.place
+$ nephila query neighbors method:shop.Order.place [--depth N] [--limit N]
 utilise :
   calls shop.Payment.pay (method, src/Payment.java)
 utilisé par :
   contains shop.Order (class, src/Order.java)
-```
 
-### `rkg query path <source> <cible> [--json]`
-```
-$ rkg query path method:shop.Order.place method:shop.Payment.pay
+$ nephila query path method:shop.Order.place method:shop.Payment.pay
 shop.Order.place calls shop.Payment.pay
 ```
 
-### `rkg query ask "<question>" [--json]`
-Seule requête qui appelle le LLM : des nœuds du graphe trouvés par les mots de la question (et leurs voisins) lui servent de contexte, jamais le contenu des fichiers.
+`--depth` vaut 1 par défaut. Une recherche sans résultat sort avec le code 1 (`erreur: aucun résultat pour « zzz »`).
+
+`query ask` est la seule requête qui appelle le LLM. Le contexte qu'il reçoit est fait des nœuds du graphe trouvés par les mots de la question et de leurs voisins, jamais du contenu des fichiers.
+
 ```
-$ rkg query ask "Que fait Order ?"
+$ nephila query ask "Que fait Order ?"
 Order.place appelle Payment.pay.
 Nœuds cités :
 - shop.Order.place (method, src/Order.java)
 ```
+
 Si rien ne correspond : `erreur: pas trouvé dans le graphe` (code 1).
 
-### `rkg summary [--json]`
-Modules, nœuds les plus reliés, thèmes.
+### `nephila summary`
+
 ```
-$ rkg summary
+$ nephila summary
 Modules (0)
 Nœuds les plus reliés
   method:shop.Order.place (degré 2)
   ...
 ```
 
-### `rkg export [--format json|html] [--output fichier|-]`
-Sans `--output`, l'export est écrit dans le dossier courant (pas dans le dépôt analysé) : `<slug>.json` (format `json`, par défaut) ou `<slug>.html` (format `html`). Le slug est le dernier composant du chemin canonique de `-C`, en minuscules ASCII, chaque suite de caractères hors `[a-z0-9]` devenant un seul `-` (`Mon Dépôt_2` donne `mon-d-p-t-2`) ; s'il est vide, `graphe`. Un fichier existant est remplacé. Quand un fichier est écrit, stdout contient seulement son chemin, ce qui permet `xdg-open "$(rkg export --format html)"`. Les fichiers `.json` et `.html` ne sont pas analysés : un export écrit dans le dépôt ne change ni le graphe ni `status`.
+### Traces (`--verbose`)
 
-```
-$ rkg -C repo export
-repo.json
-$ rkg export --output graphe.json
-graphe.json
-$ rkg export --output - | jq '.nodes | length'
-```
+Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, préfixée `trace:` et horodatée depuis le lancement. stdout est inchangé : `nephila build -v 2>trace.log` garde le bilan lisible.
 
-**Rupture (0.4.0)** : `rkg export` sans option n'écrit plus le JSON sur stdout. Pour l'ancien comportement, utilisez `--output -`.
+Événements tracés :
 
-Le JSON contient `version`, `nodes`, `edges` et `unresolved`. Le format `html` produit une page autonome, utilisable hors ligne (`file://`) : CSS et JS embarqués, aucune ressource externe. Elle n'affiche jamais tout le graphe, mais une vue partielle que l'on étend :
+- la configuration (fournisseur, modèle, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, ou `llm inactif`) ;
+- la vérification de la clé ;
+- le parcours des fichiers ;
+- le début et la fin de chaque phase (structure, résolution, enrichissement) ;
+- le départ et la fin de chaque appel LLM, avec son résultat et sa durée ;
+- les décisions d'arrêt.
 
-- **Vue initiale** : au plus 100 modules, ceux de plus haut degré (liens entrants et sortants), avec les liens entre eux, et « N modules non affichés » s'il y en a d'écartés ; sans module, les 100 nœuds de plus haut degré.
-- **Recherche** : sous-chaîne du nom court ou qualifié, sans casse, 20 résultats au plus (nom court exact, puis préfixe, puis le reste) ; choisir un résultat affiche le nœud et ses voisins directs.
-- **Détails** : un clic sur un nœud ouvre un panneau (genre, sous-genre, nom qualifié, fichier, résumé, liens sortants et entrants par genre de lien, cliquables). Naviguer vers un nœud non affiché l'ajoute à la vue s'il reste de la place ; si la vue est pleine, elle est remplacée par ce nœud et ses voisins.
-- **Extension** : double-clic ou bouton « Étendre » ajoute les voisins directs. Plafond de 300 nœuds : les voisins de plus haut degré sont retenus et « N voisins non affichés » est indiqué.
-- **Filtres** : une case par genre de nœud et par genre de lien. Bouton « Vue initiale » pour revenir au départ.
-- Déplacement, zoom, glisser un nœud ; l'en-tête donne le slug et le nombre de nœuds et de liens.
-
-### Option `-v, --verbose` (`build` et `update`)
-Écrit sur stderr des traces synthétiques, une ligne par événement, préfixées `trace:` avec le temps écoulé : `trace: [<s>.<mmm>s] <événement>`. Combinable avec `--no-llm`. stdout est inchangé : `rkg build -v 2>trace.log` garde le bilan lisible. Sans l'option, aucune ligne `trace:`.
-
-Événements : `config` (fournisseur, modèle, concurrency, timeout_secs, max_chunk_chars, ou `llm inactif`), `verify_key` (résultat, durée), `parcours` (nombre de fichiers ; pour `update` : ajoutés, modifiés, supprimés, en attente), début et fin des phases (structure, résolution, enrichissement) avec fils et durée, départ et fin de chaque appel LLM (`llm enrich départ` / `llm enrich fin`, résultat `ok`, `délai dépassé`, `réseau`, `clé refusée` ou `erreur`, durée en ms, message tronqué à 120 caractères), et décisions de politique (erreurs réseau consécutives, arrêt de l'envoi). Exemple de lignes (forme, valeurs indicatives) :
 ```
 trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
 trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts) 19 ms
 trace: [1.040s] llm enrich fin docs/guide.md [1/1] délai dépassé 1003 ms : délai dépassé avec openai sur https://api.openai.com/v1/chat/completions ; augmentez timeout_secs
-trace: [1.052s] llm enrich fin src/shop/Cart.java [1/1] clé refusée 11 ms : clé d'API refusée par openai (HTTP 401) ; vérifiez la variable désignée par api_key_env
 trace: [1.053s] politique: arrêt de l'envoi (clé d'API refusée par le fournisseur), 3 fichiers non envoyés
 ```
-Les traces ne contiennent jamais de contenu de fichier, de prompt ou de réponse du LLM, ni de clé d'API.
 
-`status`, `query` (hors `ask`), `summary` et `export` ne font aucun appel LLM et ne demandent aucune configuration. Si le graphe est en retard sur les fichiers, les requêtes l'indiquent par `avertissement: graphe pas à jour : 1 fichier modifié` sur stderr.
+Les traces ne contiennent jamais de contenu de fichier, de prompt, de réponse du LLM ni de clé d'API.
 
-### Enrichissement en lots (`batch_files`)
+## Export et vue HTML
 
-Par défaut (`batch_files = 1`), un appel LLM porte un seul fichier. Pour un dépôt de nombreux petits fichiers, `batch_files = 4` à `8` regroupe plusieurs fichiers dans un même appel (schéma de réponse version 3) et réduit le nombre d'appels.
+```
+nephila export [--format json|html] [--output <fichier>|-]
+```
 
-- Les fichiers à enrichir sont pris dans l'ordre des chemins ; un lot ne dépasse jamais `batch_files` fichiers, ni `max_chunk_chars` octets au total.
-- Un fichier plus gros que `max_chunk_chars` n'entre dans aucun lot : il est envoyé seul, en morceaux successifs.
-- Option `--batch-files <N>` (`build` et `update`) : priorité option > clé `batch_files` du fichier > défaut 1. Utile pour essayer une taille de lot sans éditer la configuration ; elle ne s'applique qu'à la commande en cours et n'écrit rien. `N` doit être un entier > 0 (sinon erreur d'usage). Sans LLM actif (`--no-llm` ou aucune configuration), elle est acceptée sans effet ; un `batch_files` invalide dans le fichier reste une erreur.
-- Effet combiné : `concurrency` lots sont en vol en même temps, soit jusqu'à `concurrency` x `batch_files` fichiers traités simultanément.
-- Échec d'un lot (délai dépassé, réseau, réponse non conforme, clé refusée) : tous ses fichiers restent « à enrichir », sont nommés sur stderr, et sont repris par le prochain `rkg update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse d'un lot échoue seul.
-- Limite connue : si la réponse est tronquée par la limite de jetons de sortie du modèle, elle est non conforme et tout le lot échoue ; réduisez alors `batch_files`.
-- Mock : un lot de 2 fichiers ou plus écrit une seule ligne dans `RKG_MOCK_LOG`, `chemin_1;chemin_2;...<TAB>1`.
-- `--verbose` : la ligne `config` contient `batch_files=N` ; un lot de n fichiers produit `llm enrich départ lot <premier chemin> +<n-1> [1/1] <c> car.` puis `llm enrich fin lot <premier chemin> +<n-1> [1/1] ...` ; `<q> fichiers non envoyés` compte des fichiers, pas des lots.
+Sans `--output`, l'export est écrit **dans le dossier courant** (pas dans le dépôt analysé), sous le nom `<slug>.json` ou `<slug>.html`, et stdout ne contient que le chemin du fichier écrit. Un fichier existant est remplacé.
+
+```
+$ nephila -C repo export
+repo.json
+$ nephila export --output graphe.json
+graphe.json
+$ nephila export --output - | jq '.nodes | length'
+23
+$ xdg-open "$(nephila export --format html)"
+```
+
+Le slug est le nom du dossier analysé en minuscules ASCII. Chaque suite de caractères hors `[a-z0-9]` y devient un seul `-` : `Mon Dépôt_2` donne `mon-d-p-t-2`. Si le nom est vide, le slug vaut `graphe`. Les fichiers `.json` et `.html` ne sont pas analysés : un export écrit dans le dépôt ne change ni le graphe ni `status`.
+
+**Format JSON** : objet avec `version`, `nodes`, `edges` et `unresolved`.
+
+**Page HTML** : fichier unique, CSS et JS embarqués, sans aucune ressource externe ni requête réseau. Elle s'ouvre en `file://`. Elle n'affiche jamais tout le graphe, mais une vue partielle que l'on étend :
+
+- **Vue initiale** : les 100 modules les plus reliés et les liens entre eux, avec « N modules non affichés » si certains sont écartés. Sans module, ce sont les 100 nœuds les plus reliés.
+- **Recherche** : sur le nom court ou qualifié, sans casse, 20 résultats au plus. Choisir un résultat affiche le nœud et ses voisins.
+- **Détails** : un clic sur un nœud ouvre un panneau (genre, nom qualifié, fichier, résumé, liens par genre). Les liens y sont cliquables.
+- **Extension** : un double-clic ou le bouton « Étendre » ajoute les voisins directs. La vue est plafonnée à 300 nœuds : les voisins les plus reliés sont retenus, et la page indique « N voisins non affichés ». Si la vue est pleine, naviguer vers un nouveau nœud remplace la vue par ce nœud et ses voisins.
+- **Filtres** : une case par genre de nœud et par genre de lien. Le bouton « Vue initiale » ramène à la vue de départ.
+- Déplacement, zoom et glisser d'un nœud à la souris.
+
+## Configuration du LLM
+
+La configuration est facultative. Le LLM est actif quand un fichier de configuration existe et que `--no-llm` est absent. `nephila` cherche ce fichier TOML dans cet ordre :
+
+1. le chemin donné par la variable `NEPHILA_CONFIG` ;
+2. `$XDG_CONFIG_HOME/nephila/config.toml` ;
+3. `~/.config/nephila/config.toml`.
+
+Un exemple commenté est fourni dans [`examples/config.toml`](examples/config.toml).
+
+| Clé | Rôle | Défaut |
+|---|---|---|
+| `provider` | `anthropic`, `openai` (protocole compatible OpenAI) ou `mock` | obligatoire |
+| `model` | Nom du modèle | obligatoire, sauf `mock` |
+| `api_key_env` | **Nom** de la variable d'environnement qui contient la clé | obligatoire pour `anthropic` |
+| `base_url` | URL du serveur, **sans** `/v1` final | celle du fournisseur |
+| `max_chunk_chars` | Taille maximale d'un morceau envoyé au LLM | 60000 |
+| `concurrency` | Appels simultanés | 4 |
+| `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 1 |
+| `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 (la connexion reste limitée à 10 s) | 300 |
+
+La clé d'API n'est jamais écrite dans le fichier. Avant tout traitement, `nephila` la vérifie par un appel qui liste les modèles, sans coût de génération.
+
+<details>
+<summary>Exemples : Anthropic, OpenAI, modèle local, simulé</summary>
+
+```toml
+# Anthropic — puis : export ANTHROPIC_API_KEY=...
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+api_key_env = "ANTHROPIC_API_KEY"
+```
+
+```toml
+# OpenAI — puis : export OPENAI_API_KEY=...
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+```
+
+```toml
+# Modèle local (Ollama, llama.cpp, vLLM…), sans clé
+provider = "openai"
+model = "llama3.1"
+base_url = "http://localhost:11434"   # pas http://localhost:11434/v1
+```
+
+```toml
+# Fournisseur simulé (tests, démonstration sans réseau)
+provider = "mock"
+```
+
+</details>
+
+`nephila` ajoute lui-même `/v1/chat/completions` et `/v1/models` à `base_url`. Avec `http://localhost:11434/v1`, les requêtes partiraient donc vers `/v1/v1/…`.
+
+**Comportement selon la configuration**
+
+| Situation | `build` / `update` | `query ask` |
+|---|---|---|
+| Aucun fichier, ou `NEPHILA_CONFIG` vers un fichier absent | structure seule, code 0, `enrichissement : désactivé` | échoue, demande une configuration |
+| Fichier valide | structure et enrichissement | répond |
+| Fichier invalide | échoue (sauf avec `--no-llm`) | échoue |
+
+## Enrichissement en lots
+
+Par défaut (`batch_files = 1`), un appel LLM porte sur un seul fichier. Pour un dépôt fait de nombreux petits fichiers, `batch_files = 4` à `8` regroupe plusieurs fichiers par appel et réduit le nombre d'appels.
+
+- Les fichiers sont pris dans l'ordre des chemins. Un lot ne dépasse ni `batch_files` fichiers ni `max_chunk_chars` octets au total. Un fichier plus gros que `max_chunk_chars` part seul, en morceaux successifs.
+- `--batch-files <N>` remplace la clé pour la commande en cours, sans rien écrire. Priorité : option, puis clé `batch_files`, puis défaut 1. Sans LLM actif, l'option est acceptée sans effet.
+- Jusqu'à `concurrency` lots sont en vol en même temps, soit `concurrency` × `batch_files` fichiers.
+- Si un lot échoue, tous ses fichiers restent « à enrichir » et sont repris par le prochain `nephila update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse échoue seul.
+- Si la réponse du modèle est tronquée par sa limite de jetons de sortie, tout le lot échoue. Réduisez alors `batch_files`.
+
+## Ce que l'analyse extrait
+
+Chaque fichier est analysé localement : tree-sitter pour les langages JVM, un lecteur XML pour Maven et Ivy, un lecteur lexical pour Gradle, et CommonMark pour Markdown.
+
+| Fichier | Nœuds | Liens |
+|---|---|---|
+| `.java`, `.kt`, `.kts` (hors Gradle), `.groovy`, `.scala` | package, types (class, interface, enum, annotation, object, trait Scala ; imbriqués `Externe.Interne`), méthodes (constructeurs `<init>`) ; fonctions de premier niveau rattachées au type de fichier conventionnel (`NomFichierKt`, `NomFichier`, `NomFichier$package`) | `imports`, `extends`, `implements`, `calls` |
+| `pom.xml`, `ivy.xml` | module `groupId:artifactId` ou `organisation:module` | `depends_on` (hors `dependencyManagement`, plugins et `parent`) |
+| `build.gradle(.kts)`, `settings.gradle(.kts)` | module = chemin de projet (`:services:api`) ; `settings` est suivi mais ne crée pas de nœud | `depends_on` : `project(':core')`, chaînes `g:a[:v]`, notation map ; seul le bloc `dependencies { }` de premier niveau compte |
+| autre `.gradle` | analysé comme un script Groovy | comme Groovy |
+| `.md`, `.markdown` | document, sections (ancres à la GitHub) | `links_to` (liens relatifs vers un `.md`), `mentions` (code en ligne au format de nom JVM : `Order`, `shop.Order`, `place()`, `Order#place`) |
+
+**Résolution des appels.** Le type du receveur est cherché dans le fichier seulement : paramètre, variable locale, ou champ typé ou initialisé par un constructeur. Un receveur non déclaré qui commence par une majuscule est traité comme un appel statique. `this.m()` et `m()` visent le type englobant s'il déclare `m`. Quand le type du receveur est inconnu (chaîne d'appels, `var` sans initialiseur reconnaissable), aucun lien n'est créé : un lien manquant coûte moins cher qu'un lien faux.
+
+Les références qui ne trouvent pas de cible sont comptées dans « références non résolues ». Un fichier mal formé est exploité au mieux, sans faire échouer la commande.
+
+## Fonctionnement
+
+- **Stockage** : le graphe est une base SQLite dans `<dépôt>/.nephila/`. Ajoutez `.nephila/` au `.gitignore` du dépôt analysé.
+- **Fichiers ignorés** : `.nephila/`, `target/`, `build/`, `.gradle/`, `.git/` et tout ce qu'exclut le `.gitignore` du dépôt.
+- **Détection des changements** : par empreinte du contenu. Un fichier modifié moins de 2 secondes avant son enregistrement est relu au passage suivant, pour ne manquer aucune modification. Cela coûte une lecture, jamais un appel LLM.
+- **Concurrence** : un seul `build` ou `update` à la fois par dépôt, grâce au verrou `.nephila/lock`. Une seconde commande échoue aussitôt (`erreur: indexation déjà en cours sur ce dépôt`). Le verrou disparaît avec le processus, même après un arrêt brutal.
 
 ## Codes de sortie
 
 | Code | Signification |
 |---|---|
-| 0 | succès |
-| 1 | erreur d'exécution (configuration, clé refusée, réseau, graphe absent, pas de résultat, fichiers en attente ou à enrichir avec le LLM actif...) |
-| 2 | erreur d'usage (commande ou option inconnue) |
+| 0 | Succès |
+| 1 | Erreur d'exécution : configuration, clé refusée, réseau, graphe absent, aucun résultat, fichiers en attente ou à enrichir avec le LLM actif… |
+| 2 | Erreur d'usage : commande ou option inconnue, valeur invalide |
 
-Les messages sont préfixés `erreur:` ou `avertissement:` et écrits sur stderr ; stdout ne contient que le résultat.
-
-## Limites à connaître
-
-- **Graphe d'une ancienne version** : un graphe de schéma incompatible, en particulier un graphe créé par la version 0.2, est refusé (`... lancez rkg build`) ; reconstruisez-le avec `rkg build`.
-- **`trait` Groovy non géré** (DEC-016) : la grammaire Groovy utilisée ne reconnaît pas `trait`. Un trait ne produit ni nœud ni méthode, sans avertissement ; le reste du fichier est exploité au mieux. Une classe qui l'implémente (`class A implements Greeter`) garde une référence `implements` non résolue tant que rien d'autre ne déclare ce nom.
-- **Premier niveau d'un script Groovy** (DEC-023) : seuls les déclarations de variables et les appels avec parenthèses (`helper(42)`, `new T()`, affectations) sont des instructions de script. Un appel de commande sans parenthèses (`helper 42`, `println "hello"`, `apply plugin: 'java'`) et une fermeture isolée `{ ... }` sont ignorés : pas de lien, et un script qui n'en contient pas d'autres ne produit aucun nœud. Contournement : écrire `helper(42)` pour obtenir le lien `calls`. Dans le corps d'une méthode ou d'une fonction, l'appel de commande reste reconnu (sauf directement dans le bloc d'une méthode de classe, où la grammaire le lit comme une erreur).
-- **`println x` lu comme une déclaration** : un appel de commande dont l'argument est un identifiant seul (`println x`, `helper x`) est lu par la grammaire comme une déclaration de variable (type `println`, variable `x`) : instruction de script sans lien `calls`.
-- **Chemins relatifs Gradle** : `project("core")` (sans `:` initial, chemin relatif) n'est pas pris en compte ; écrire `project(':core')`.
-- **Un seul `build`/`update` à la fois** : un verrou (`.rkg/lock`) protège le dépôt ; une seconde commande échoue aussitôt avec `erreur: indexation déjà en cours sur ce dépôt`. Le verrou disparaît avec le processus, même après un arrêt brutal.
-- **Fenêtre de 2 s après écriture** : un fichier modifié moins de 2 secondes avant son enregistrement dans le graphe est considéré comme « douteux » (même taille et même date possibles). Son empreinte est recalculée à chaque passage jusqu'à ce que cette fenêtre soit passée ; cela coûte une lecture du fichier, pas un appel LLM, et évite de manquer une modification.
+Les messages sont écrits sur stderr, préfixés `erreur:` ou `avertissement:`. stdout ne contient que le résultat.
 
 ## Usage par un agent
 
 Les sorties `--json` sont stables et sans décoration. Séquence type :
 
-1. `rkg status --json` : `a_jour` vaut `false` ? lancer `rkg update`.
-2. `rkg query search --json <terme>` pour localiser, `rkg query neighbors --json <nœud> --depth 2` pour explorer les dépendances, `rkg query path` pour relier deux éléments.
-3. `rkg summary --json` pour une vue d'ensemble, `rkg export --output -` pour tout charger.
+1. `nephila status --json` : si `a_jour` vaut `false`, lancer `nephila update`.
+2. `nephila query search --json <terme>` pour localiser un élément, `nephila query neighbors --json <nœud> --depth 2` pour explorer ses dépendances, `nephila query path --json <a> <b>` pour relier deux éléments.
+3. `nephila summary --json` pour une vue d'ensemble, `nephila export --output -` pour charger tout le graphe.
 
-Tester le code retour (0, 1, 2) et lire stderr pour les messages.
+Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
-## Mise à jour depuis la version 0.2
+## Limites connues
 
-Le schéma du graphe a changé : lancez `rkg build` pour reconstruire le graphe (l'ancien est refusé avec ce message). Les fixtures du fournisseur `mock` changent aussi (schéma version 2, ci-dessous) : une fixture `"version":1` est une réponse non conforme.
+- **`trait` Groovy** : la grammaire utilisée ne reconnaît pas `trait`. Un trait ne produit ni nœud ni méthode, sans avertissement. Une classe qui l'implémente garde une référence `implements` non résolue.
+- **Premier niveau d'un script Groovy** : un appel sans parenthèses (`helper 42`, `println "hello"`, `apply plugin: 'java'`) et une fermeture isolée `{ … }` sont ignorés. Écrivez `helper(42)` pour obtenir le lien `calls`. Dans le corps d'une fonction, l'appel sans parenthèses reste reconnu, sauf directement dans le bloc d'une méthode de classe.
+- **`println x` en Groovy** : un appel sans parenthèses dont l'argument est un identifiant seul est lu comme une déclaration de variable et ne crée pas de lien.
+- **Chemins Gradle relatifs** : `project("core")` (sans `:` initial) est ignoré. Écrivez `project(':core')`.
+- **`query path`** : renvoie le plus court chemin sans tenir compte du sens des liens. Il peut donc passer par un `import` ou un package plutôt que par des appels.
 
-## Tests et LLM simulé
+## Mise à niveau
+
+- **Renommage `rkg` → `nephila`** : le binaire s'appelle `nephila`, le graphe est stocké dans `.nephila/` (au lieu de `.rkg/`), la configuration dans `~/.config/nephila/config.toml` et les variables d'environnement sont préfixées `NEPHILA_` (`NEPHILA_CONFIG`, `NEPHILA_MOCK_DIR`…). Déplacez votre configuration (`mv ~/.config/rkg ~/.config/nephila`), puis reconstruisez le graphe avec `nephila build` et supprimez l'ancien dossier `.rkg/`.
+- **Vers 0.4** : `nephila export` sans option écrit dans un fichier au lieu de stdout. Pour l'ancien comportement, utilisez `nephila export --output -`.
+- **Depuis 0.2** : le schéma du graphe a changé. Un graphe ancien est refusé (`… lancez nephila build`) : reconstruisez-le avec `nephila build`. Les fixtures du fournisseur `mock` passent au schéma version 2.
+
+| Version | Nouveautés |
+|---|---|
+| 0.8 | Renommage `rkg` → `nephila` (binaire, dossier `.nephila/`, configuration, variables `NEPHILA_*`) |
+| 0.7 | Option `--batch-files <N>` de `build` et `update` |
+| 0.6 | Enrichissement en lots (clé `batch_files`) |
+| 0.5 | Option `-v, --verbose` de `build` et `update` |
+| 0.4 | Export dans un fichier, page HTML d'exploration |
+| 0.3 | Structure extraite par analyse syntaxique, sans LLM ; LLM facultatif |
+
+## Développement
 
 ```sh
-cargo test -q --color never
-cargo fmt --all -- --check && cargo clippy -q --all-targets --color never -- -D warnings
-cargo test --release -q --color never -- --ignored perf   # performances, 10 000 fichiers
-node --test --test-reporter=dot 'tests/view/*.test.js'     # logique de la vue HTML
+cargo test -q                                                   # suite complète
+cargo fmt --all -- --check
+cargo clippy -q --all-targets -- -D warnings                    # lint
+cargo test --release -q -- --ignored perf                       # performances (dépôt de 10 000 fichiers)
+node --test --test-reporter=dot 'tests/view/*.test.js'          # logique de la vue HTML
 ```
 
-La logique de la vue HTML (module JS pur) est testée par `node --test` : Node ≥ 20 est requis, comme outil de développement seulement (le produit n'en dépend pas), sans npm ni dépendance. Un test Rust compare les données de la vue à la fixture `tests/view/fixtures/maven3.json` ; après un changement volontaire de l'export, la régénérer avec `RKG_UPDATE_VIEW_FIXTURE=1 cargo test view_fixture`. Le rendu et la souris se vérifient à la main.
+La logique de la vue HTML est un module JS pur, testé par `node --test`. Node 20 ou plus est requis pour ces tests seulement, sans npm ni dépendance : le produit n'en dépend pas. Un test Rust compare les données de la vue à la fixture `tests/view/fixtures/maven3.json`. Après un changement volontaire de l'export, régénérez-la avec `NEPHILA_UPDATE_VIEW_FIXTURE=1 cargo test view_fixture`. Le rendu et les interactions souris se vérifient à la main.
 
-Avec `provider = "mock"`, le LLM est simulé et piloté par l'environnement :
+### LLM simulé (`provider = "mock"`)
+
+Le fournisseur `mock` remplace le LLM par des fixtures et se pilote par l'environnement :
 
 | Variable | Effet |
 |---|---|
-| `RKG_MOCK_DIR` | dossier de fixtures : `<dir>/<chemin relatif>.json` (ou `<chemin>.<n>.json` pour le morceau n, à partir de 1) donne la réponse d'enrichissement ; `_ask.json` donne la réponse de `query ask` ; sans fixture, réponse vide valide |
-| `RKG_MOCK_LOG` | journal des appels, une ligne `chemin<TAB>n°morceau` par appel (lot : `chemin_1;chemin_2;...<TAB>1`) |
-| `RKG_MOCK_FAIL_AFTER` | nombre d'appels réussis avant des erreurs réseau simulées |
-| `RKG_MOCK_INVALID_KEY` | si non vide et différent de `0`, la vérification de clé échoue |
-| `RKG_MOCK_DELAY_MS` | délai ajouté à chaque appel |
-| `RKG_MOCK_TIMEOUT_FILES` | chemins relatifs séparés par des virgules : l'enrichissement de ces fichiers échoue par « délai dépassé » |
-| `RKG_MOCK_KEY_REVOKED_AFTER` | nombre d'appels d'enrichissement (réussis ou non, un par morceau) avant des refus de clé simulés (arrêt de l'envoi) |
+| `NEPHILA_MOCK_DIR` | Dossier de fixtures : `<dir>/<chemin relatif>.json` (ou `<chemin>.<n>.json` pour le morceau n, à partir de 1) est la réponse d'enrichissement ; `_ask.json` est la réponse de `query ask`. Sans fixture, la réponse est vide et valide. |
+| `NEPHILA_MOCK_LOG` | Journal des appels : une ligne `chemin<TAB>n°morceau` par appel, ou `chemin_1;chemin_2;…<TAB>1` pour un lot |
+| `NEPHILA_MOCK_FAIL_AFTER` | Nombre d'appels réussis avant des erreurs réseau simulées |
+| `NEPHILA_MOCK_INVALID_KEY` | Si non vide et différent de `0`, la vérification de clé échoue |
+| `NEPHILA_MOCK_DELAY_MS` | Délai ajouté à chaque appel |
+| `NEPHILA_MOCK_TIMEOUT_FILES` | Chemins relatifs, séparés par des virgules, dont l'enrichissement échoue par délai dépassé |
+| `NEPHILA_MOCK_KEY_REVOKED_AFTER` | Nombre d'appels d'enrichissement avant des refus de clé simulés |
 
-Format d'une fixture d'enrichissement (schéma version 2) : `version`, `summaries` et `concepts` sont tous obligatoires (listes vides au besoin). Les résumés s'appliquent aux nœuds du fichier (identifiants `genre:nom`), les concepts ne sont acceptés que pour un fichier Markdown et citent des sections du fichier par leur identifiant complet, préfixe `section:` compris. Un résumé pour un nœud inconnu, un concept d'un autre type de fichier ou une section hors fichier sont écartés avec un `avertissement:`. Une fixture ne crée aucun nœud de structure.
+Une fixture d'enrichissement (schéma version 2) contient obligatoirement `version`, `summaries` et `concepts`, avec des listes vides au besoin. Les résumés visent des nœuds du fichier par leur identifiant `genre:nom`. Les concepts ne sont acceptés que pour un fichier Markdown et citent ses sections par leur identifiant complet. Tout le reste est écarté avec un avertissement, et une fixture ne crée jamais de nœud de structure.
 
-Une fixture par fichier, dans `RKG_MOCK_DIR` : pour `src/shop/Order.java`, le fichier `<dir>/src/shop/Order.java.json` (résumé, pas de concept) :
+Pour `src/shop/Order.java`, le fichier `<dir>/src/shop/Order.java.json` :
 
 ```json
 {"version":2,
@@ -299,7 +410,7 @@ Une fixture par fichier, dans `RKG_MOCK_DIR` : pour `src/shop/Order.java`, le fi
  "concepts":[]}
 ```
 
-et pour `docs/guide.md`, le fichier `<dir>/docs/guide.md.json` (un concept, pas de résumé) :
+Pour `docs/guide.md`, le fichier `<dir>/docs/guide.md.json` :
 
 ```json
 {"version":2,
@@ -308,3 +419,7 @@ et pour `docs/guide.md`, le fichier `<dir>/docs/guide.md.json` (un concept, pas 
 ```
 
 Format de `_ask.json` : `{"found":true,"answer":"...","nodes":["method:shop.Order.place"]}` ou `{"found":false}`.
+
+## Licence
+
+Aucune licence n'est encore déclarée pour ce projet.

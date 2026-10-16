@@ -55,24 +55,24 @@ struct RawConfig {
     batch_files: Option<i64>,
 }
 
-/// Chemin du fichier de configuration : `RKG_CONFIG`, sinon
-/// `$XDG_CONFIG_HOME/rkg/config.toml`, sinon `~/.config/rkg/config.toml`.
+/// Chemin du fichier de configuration : `NEPHILA_CONFIG`, sinon
+/// `$XDG_CONFIG_HOME/nephila/config.toml`, sinon `~/.config/nephila/config.toml`.
 pub fn config_path_with(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf> {
     let non_empty = |k: &str| env(k).filter(|v| !v.is_empty());
-    if let Some(p) = non_empty("RKG_CONFIG") {
+    if let Some(p) = non_empty("NEPHILA_CONFIG") {
         return Ok(PathBuf::from(p));
     }
     if let Some(x) = non_empty("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(x).join("rkg").join("config.toml"));
+        return Ok(PathBuf::from(x).join("nephila").join("config.toml"));
     }
     if let Some(h) = non_empty("HOME") {
         return Ok(PathBuf::from(h)
             .join(".config")
-            .join("rkg")
+            .join("nephila")
             .join("config.toml"));
     }
     Err(Error::Message(
-        "impossible de déterminer le fichier de configuration : définissez RKG_CONFIG, \
+        "impossible de déterminer le fichier de configuration : définissez NEPHILA_CONFIG, \
          XDG_CONFIG_HOME ou HOME"
             .into(),
     ))

@@ -1,9 +1,9 @@
-//! Commande `rkg update` de bout en bout avec le LLM simulé (REQ-011, REQ-008, REQ-010, REQ-019,
+//! Commande `nephila update` de bout en bout avec le LLM simulé (REQ-011, REQ-008, REQ-010, REQ-019,
 //! REQ-020).
 
 use assert_cmd::cargo::cargo_bin;
-use rkg::model::{EdgeKind, FileState};
-use rkg::store::Store;
+use nephila::model::{EdgeKind, FileState};
+use nephila::store::Store;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,16 +72,16 @@ impl Env {
     }
 
     fn command(&self, sub: &str, extra: &[(&str, &str)]) -> Command {
-        let mut c = Command::new(cargo_bin("rkg"));
+        let mut c = Command::new(cargo_bin("nephila"));
         c.arg("-C")
             .arg(&self.repo)
             .arg(sub)
-            .env_remove("RKG_MOCK_FAIL_AFTER")
-            .env_remove("RKG_MOCK_DELAY_MS")
-            .env_remove("RKG_MOCK_INVALID_KEY")
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log);
+            .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+            .env_remove("NEPHILA_MOCK_DELAY_MS")
+            .env_remove("NEPHILA_MOCK_INVALID_KEY")
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log);
         for (k, v) in extra {
             c.env(k, v);
         }
@@ -162,7 +162,7 @@ const ORDER_REPO: &str = "core/src/main/java/com/acme/core/OrderRepository.java"
 const ORDER: &str = "core/src/main/java/com/acme/domain/Order.java";
 
 /// Chemin d'un fichier de configuration inexistant : LLM inactif.
-const NO_CONFIG: (&str, &str) = ("RKG_CONFIG", "/nonexistent/rkg-absent.toml");
+const NO_CONFIG: (&str, &str) = ("NEPHILA_CONFIG", "/nonexistent/nephila-absent.toml");
 
 #[test]
 fn req011_ac7_no_graph_runs_full_build() {
@@ -308,7 +308,7 @@ fn req011_ac6_touch_only_makes_no_call() {
 fn req011_ac8_pending_files_are_processed_even_if_unchanged() {
     let env = Env::maven();
     env.ok("build");
-    let mut store = rkg::store::Store::open_existing(&env.repo).unwrap();
+    let mut store = nephila::store::Store::open_existing(&env.repo).unwrap();
     let pending: Vec<_> = store
         .files()
         .unwrap()
@@ -335,7 +335,7 @@ fn req011_ac8_pending_files_are_processed_even_if_unchanged() {
 #[test]
 fn req010_ac2_update_after_failure_sends_exactly_the_files_to_enrich() {
     let env = Env::maven();
-    env.run("build", &[("RKG_MOCK_FAIL_AFTER", "7")]);
+    env.run("build", &[("NEPHILA_MOCK_FAIL_AFTER", "7")]);
     let to_enrich: BTreeSet<String> = env
         .store()
         .files_to_enrich()
@@ -359,7 +359,7 @@ fn req011_failed_update_leaves_failed_file_to_enrich_and_exits_nonzero() {
         t.push_str("\n// x\n");
         env.write(f, &t);
     }
-    let out = env.run("update", &[("RKG_MOCK_FAIL_AFTER", "1")]);
+    let out = env.run("update", &[("NEPHILA_MOCK_FAIL_AFTER", "1")]);
     assert!(!out.status.success());
     let store = env.store();
     // Les deux fichiers modifiés sont réanalysés ; l'un d'eux n'a pas pu être enrichi.
@@ -420,7 +420,7 @@ fn req008_ac3_renamed_method_unlinks_a_and_reference_is_unresolved() {
     assert!(!env.has_edge("method:A.m", EdgeKind::Calls, "method:B.foo"));
     let out = env.export_stdout();
     assert!(stdout(&out).contains("B.foo"), "{}", stdout(&out));
-    let unresolved = rkg::resolve::unresolved(&env.store()).unwrap();
+    let unresolved = nephila::resolve::unresolved(&env.store()).unwrap();
     assert!(unresolved.iter().any(|r| r.target_name == "B.foo"));
 }
 
@@ -462,7 +462,7 @@ fn req019_ac3_up_to_date_update_does_not_touch_summary() {
 fn req020_ac1_update_fails_while_build_runs() {
     let env = Env::maven();
     let mut child = env
-        .command("build", &[("RKG_MOCK_DELAY_MS", "400")])
+        .command("build", &[("NEPHILA_MOCK_DELAY_MS", "400")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -489,7 +489,7 @@ fn req020_ac1_update_fails_while_build_runs() {
 fn req020_ac1_update_without_graph_also_takes_lock() {
     let env = Env::maven();
     let mut child = env
-        .command("update", &[("RKG_MOCK_DELAY_MS", "400")])
+        .command("update", &[("NEPHILA_MOCK_DELAY_MS", "400")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -514,15 +514,15 @@ fn req020_ac1_update_without_graph_also_takes_lock() {
 }
 
 #[test]
-fn req009_ac4_update_on_missing_root_fails_without_creating_rkg() {
+fn req009_ac4_update_on_missing_root_fails_without_creating_nephila() {
     let env = Env::maven();
     let missing = env.repo.join("absent");
-    let out = Command::new(cargo_bin("rkg"))
+    let out = Command::new(cargo_bin("nephila"))
         .arg("-C")
         .arg(&missing)
         .arg("update")
-        .env("RKG_CONFIG", &env.config)
-        .env("RKG_MOCK_DIR", &env.mock)
+        .env("NEPHILA_CONFIG", &env.config)
+        .env("NEPHILA_MOCK_DIR", &env.mock)
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -560,7 +560,7 @@ fn req011_update_on_unreadable_root_is_refused() {
 fn req011_update_on_old_schema_asks_for_build_and_keeps_db() {
     let env = Env::maven();
     env.ok("build");
-    let db = env.repo.join(".rkg/graph.db");
+    let db = env.repo.join(".nephila/graph.db");
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
@@ -568,7 +568,7 @@ fn req011_update_on_old_schema_asks_for_build_and_keeps_db() {
     let size = fs::metadata(&db).unwrap().len();
     let out = env.run("update", &[]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("rkg build"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("nephila build"), "{}", stderr(&out));
     assert_eq!(fs::metadata(&db).unwrap().len(), size);
     let conn = rusqlite::Connection::open(&db).unwrap();
     let n: i64 = conn
@@ -585,7 +585,7 @@ fn req002_update_checks_key_before_touching_anything() {
     t.push_str("\n// x\n");
     env.write(ORDER, &t);
     env.clear_log();
-    let out = env.run("update", &[("RKG_MOCK_INVALID_KEY", "1")]);
+    let out = env.run("update", &[("NEPHILA_MOCK_INVALID_KEY", "1")]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("clé"), "{}", stderr(&out));
     assert!(env.log_lines().is_empty());
@@ -636,7 +636,7 @@ fn req024_ac6_update_after_no_llm_build_sends_each_file_once_without_reanalysis(
     assert!(env.log_lines().is_empty());
     // Un fichier réanalysé voit ses références réinsérées (nouveaux identifiants).
     let max_parse_ref = |env: &Env| -> i64 {
-        rusqlite::Connection::open(env.repo.join(".rkg/graph.db"))
+        rusqlite::Connection::open(env.repo.join(".nephila/graph.db"))
             .unwrap()
             .query_row("SELECT MAX(id) FROM refs WHERE origin = 'parse'", [], |r| {
                 r.get(0)

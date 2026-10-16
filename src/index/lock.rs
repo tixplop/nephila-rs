@@ -1,4 +1,4 @@
-//! Verrou d'écriture exclusif sur `<dépôt>/.rkg/lock` (REQ-020, DEC-012).
+//! Verrou d'écriture exclusif sur `<dépôt>/.nephila/lock` (REQ-020, DEC-012).
 //!
 //! Le verrou est un `flock(LOCK_EX | LOCK_NB)` : le noyau le libère à la mort du processus,
 //! un fichier resté sur disque sans détenteur ne bloque donc personne.
@@ -18,7 +18,7 @@ pub struct RepoLock {
 impl RepoLock {
     /// Prend le verrou sans attendre ; échoue immédiatement s'il est déjà tenu.
     pub fn acquire(repo: &Path) -> Result<RepoLock> {
-        let dir = repo.join(".rkg");
+        let dir = repo.join(".nephila");
         std::fs::create_dir_all(&dir)
             .map_err(|e| Error::Message(format!("impossible de créer {} : {e}", dir.display())))?;
         let path = dir.join("lock");

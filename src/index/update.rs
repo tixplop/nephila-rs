@@ -14,7 +14,7 @@ use crate::scan::ScannedFile;
 use crate::store::{db_path, Store};
 use crate::trace;
 
-/// Point d'entrée de `rkg update` : mêmes contrôles que `build` (dépôt, configuration, clé,
+/// Point d'entrée de `nephila update` : mêmes contrôles que `build` (dépôt, configuration, clé,
 /// verrou) ; sans graphe, bascule sur un build complet.
 pub fn run(repo: &Path, no_llm: bool, verbose: bool, batch_files: Option<usize>) -> Result<()> {
     trace::init(verbose);

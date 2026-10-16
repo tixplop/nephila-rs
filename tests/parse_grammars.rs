@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rkg::parse::{extract, FileStructure, Lang, ParseCtx};
+use nephila::parse::{extract, FileStructure, Lang, ParseCtx};
 
 fn fixture(name: &str) -> String {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))

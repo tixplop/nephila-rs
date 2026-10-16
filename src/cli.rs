@@ -7,7 +7,11 @@ use clap::{Args, Parser, Subcommand};
 use crate::error::Result;
 
 #[derive(Debug, Parser)]
-#[command(name = "rkg", version, about = "Graphe de connaissances d'un dépôt")]
+#[command(
+    name = "nephila",
+    version,
+    about = "Graphe de connaissances d'un dépôt"
+)]
 pub struct Cli {
     /// Racine du dépôt à analyser
     #[arg(short = 'C', long = "repo", global = true, default_value = ".")]

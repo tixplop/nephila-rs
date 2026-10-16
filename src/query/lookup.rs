@@ -62,7 +62,7 @@ pub fn require(store: &Store, name: &str) -> Result<Node> {
     match resolve(store, name)? {
         Lookup::Found(n) => Ok(n),
         Lookup::NotFound => Err(Error::Message(format!(
-            "aucun résultat : nœud « {name} » introuvable (essayez `rkg query search`)"
+            "aucun résultat : nœud « {name} » introuvable (essayez `nephila query search`)"
         ))),
         Lookup::Ambiguous(c) => {
             let list: Vec<String> = c.iter().map(|n| format!("  {}", n.id)).collect();

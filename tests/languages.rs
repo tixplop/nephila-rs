@@ -29,13 +29,13 @@ struct Env {
 
 impl Env {
     fn run(repo: &Path, args: &[&str]) -> Output {
-        Command::new(cargo_bin("rkg"))
+        Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(repo)
             .args(args)
-            .env("RKG_CONFIG", repo.join("absent.toml"))
-            .env_remove("RKG_MOCK_DIR")
-            .env_remove("RKG_MOCK_LOG")
+            .env("NEPHILA_CONFIG", repo.join("absent.toml"))
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG")
             .output()
             .unwrap()
     }

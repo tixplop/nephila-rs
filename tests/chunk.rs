@@ -1,9 +1,9 @@
 //! Découpage des gros fichiers (REQ-007).
 
 use assert_cmd::Command;
-use rkg::chunk::{header, split};
-use rkg::model::{EdgeKind, NodeKind};
-use rkg::store::Store;
+use nephila::chunk::{header, split};
+use nephila::model::{EdgeKind, NodeKind};
+use nephila::store::Store;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -61,15 +61,15 @@ impl Env {
     }
 
     fn build(&self, fail_after: Option<&str>) -> std::process::Output {
-        let mut c = Command::cargo_bin("rkg").unwrap();
-        c.env_remove("RKG_MOCK_FAIL_AFTER")
-            .env_remove("RKG_MOCK_INVALID_KEY")
-            .env_remove("RKG_MOCK_DELAY_MS")
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log);
+        let mut c = Command::cargo_bin("nephila").unwrap();
+        c.env_remove("NEPHILA_MOCK_FAIL_AFTER")
+            .env_remove("NEPHILA_MOCK_INVALID_KEY")
+            .env_remove("NEPHILA_MOCK_DELAY_MS")
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log);
         if let Some(f) = fail_after {
-            c.env("RKG_MOCK_FAIL_AFTER", f);
+            c.env("NEPHILA_MOCK_FAIL_AFTER", f);
         }
         c.arg("-C").arg(&self.repo).arg("build").output().unwrap()
     }
@@ -149,7 +149,7 @@ fn req007_failure_on_a_chunk_keeps_structure_and_leaves_file_to_enrich() {
     let files = store.files().unwrap();
     assert!(files
         .iter()
-        .all(|f| f.state == rkg::model::FileState::Indexed));
+        .all(|f| f.state == nephila::model::FileState::Indexed));
     assert_eq!(store.count_files_to_enrich().unwrap(), 1);
     let nodes = store.nodes().unwrap();
     assert_eq!(

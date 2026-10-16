@@ -137,7 +137,7 @@ impl BuildReport {
     }
 }
 
-/// Point d'entrée de `rkg build` : valide le dépôt, la configuration et la clé, puis construit.
+/// Point d'entrée de `nephila build` : valide le dépôt, la configuration et la clé, puis construit.
 pub fn run(repo: &Path, no_llm: bool, verbose: bool, batch_files: Option<usize>) -> Result<()> {
     trace::init(verbose);
     check_repo(repo)?;

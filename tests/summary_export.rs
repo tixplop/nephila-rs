@@ -54,40 +54,40 @@ impl Env {
     }
 
     fn build(&self) {
-        let mut c = Command::new(cargo_bin("rkg"));
+        let mut c = Command::new(cargo_bin("nephila"));
         c.arg("-C")
             .arg(&self.repo)
             .arg("build")
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log);
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log);
         let out = c.output().unwrap();
         assert!(out.status.success(), "{}", text(&out.stderr));
     }
 
     /// Commande de lecture : aucune configuration LLM, aucune fixture.
     fn read(&self, args: &[&str]) -> Output {
-        Command::new(cargo_bin("rkg"))
+        Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(&self.repo)
             .args(args)
-            .env("RKG_CONFIG", self.repo.join("absent.toml"))
-            .env_remove("RKG_MOCK_DIR")
-            .env_remove("RKG_MOCK_LOG")
+            .env("NEPHILA_CONFIG", self.repo.join("absent.toml"))
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG")
             .output()
             .unwrap()
     }
 
     /// Comme `read`, depuis le dossier courant `cwd`.
     fn read_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(cargo_bin("rkg"))
+        Command::new(cargo_bin("nephila"))
             .current_dir(cwd)
             .arg("-C")
             .arg(&self.repo)
             .args(args)
-            .env("RKG_CONFIG", self.repo.join("absent.toml"))
-            .env_remove("RKG_MOCK_DIR")
-            .env_remove("RKG_MOCK_LOG")
+            .env("NEPHILA_CONFIG", self.repo.join("absent.toml"))
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG")
             .output()
             .unwrap()
     }
@@ -99,7 +99,7 @@ impl Env {
     }
 
     fn computed_at(&self) -> i64 {
-        let c = rusqlite::Connection::open(self.repo.join(".rkg/graph.db")).unwrap();
+        let c = rusqlite::Connection::open(self.repo.join(".nephila/graph.db")).unwrap();
         c.query_row("SELECT computed_at FROM summary WHERE id = 1", [], |r| {
             r.get(0)
         })
@@ -204,12 +204,12 @@ fn req019_ac4_summary_without_graph_invites_to_build() {
     let out = env.read(&["summary"]);
     assert!(!out.status.success());
     assert!(
-        text(&out.stderr).contains("rkg build"),
+        text(&out.stderr).contains("nephila build"),
         "{}",
         text(&out.stderr)
     );
     assert!(out.stdout.is_empty());
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
 }
 
 #[test]
@@ -281,19 +281,19 @@ fn req018_ac5_slug_file_from_another_dir_and_replaced_after_update() {
         "package p;\npublic class A { void m() {} }\n",
     )
     .unwrap();
-    let rkg = |cwd: &Path, args: &[&str]| {
-        Command::new(cargo_bin("rkg"))
+    let nephila = |cwd: &Path, args: &[&str]| {
+        Command::new(cargo_bin("nephila"))
             .current_dir(cwd)
             .arg("-C")
             .arg(&repo)
             .args(args)
-            .env("RKG_CONFIG", tmp.path().join("absent.toml"))
-            .env_remove("RKG_MOCK_DIR")
-            .env_remove("RKG_MOCK_LOG")
+            .env("NEPHILA_CONFIG", tmp.path().join("absent.toml"))
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG")
             .output()
             .unwrap()
     };
-    let out = rkg(tmp.path(), &["build", "--no-llm"]);
+    let out = nephila(tmp.path(), &["build", "--no-llm"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     let before: Vec<_> = fs::read_dir(&repo)
         .unwrap()
@@ -301,11 +301,11 @@ fn req018_ac5_slug_file_from_another_dir_and_replaced_after_update() {
         .collect();
     let work = tmp.path().join("out");
     fs::create_dir_all(&work).unwrap();
-    let out = rkg(&work, &["export"]);
+    let out = nephila(&work, &["export"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "repo-knowledge-graph.json\n");
     let file = work.join("repo-knowledge-graph.json");
-    let stdout = rkg(&work, &["export", "--output", "-"]);
+    let stdout = nephila(&work, &["export", "--output", "-"]);
     assert_eq!(fs::read(&file).unwrap(), stdout.stdout);
     let after: Vec<_> = fs::read_dir(&repo)
         .unwrap()
@@ -314,10 +314,10 @@ fn req018_ac5_slug_file_from_another_dir_and_replaced_after_update() {
     assert_eq!(before, after);
     // Après un update, le fichier est remplacé.
     fs::write(repo.join("B.java"), "package p;\npublic class Bee {}\n").unwrap();
-    let out = rkg(&work, &["update", "--no-llm"]);
+    let out = nephila(&work, &["update", "--no-llm"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(!fs::read_to_string(&file).unwrap().contains("Bee"));
-    let out = rkg(&work, &["export"]);
+    let out = nephila(&work, &["export"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(fs::read_to_string(&file).unwrap().contains("Bee"));
 }
@@ -329,12 +329,12 @@ fn req018_ac6_default_file_without_dash_c_and_from_subdir() {
     fs::create_dir_all(repo.join("sub")).unwrap();
     fs::write(repo.join("A.java"), "package p;\npublic class A {}\n").unwrap();
     let run = |cwd: &Path, args: &[&str]| {
-        let out = Command::new(cargo_bin("rkg"))
+        let out = Command::new(cargo_bin("nephila"))
             .current_dir(cwd)
             .args(args)
-            .env("RKG_CONFIG", tmp.path().join("absent.toml"))
-            .env_remove("RKG_MOCK_DIR")
-            .env_remove("RKG_MOCK_LOG")
+            .env("NEPHILA_CONFIG", tmp.path().join("absent.toml"))
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG")
             .output()
             .unwrap();
         assert!(out.status.success(), "{args:?} {}", text(&out.stderr));
@@ -404,14 +404,14 @@ fn req018_ac4_export_without_graph_invites_to_build() {
         let out = env.read_in(cwd.path(), &args);
         assert!(!out.status.success());
         assert!(
-            text(&out.stderr).contains("rkg build"),
+            text(&out.stderr).contains("nephila build"),
             "{}",
             text(&out.stderr)
         );
         assert!(out.stdout.is_empty());
     }
     assert_eq!(fs::read_dir(cwd.path()).unwrap().count(), 0);
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
 }
 
 #[test]
@@ -423,13 +423,13 @@ fn req001_ac4_summary_and_export_make_no_llm_call() {
     assert!(env.read(&["summary", "--json"]).status.success());
     assert!(env.read(&["export", "--output", "-"]).status.success());
     // Même avec un journal actif et une configuration invalide, aucun appel n'est fait.
-    let out = Command::new(cargo_bin("rkg"))
+    let out = Command::new(cargo_bin("nephila"))
         .arg("-C")
         .arg(&env.repo)
         .arg("summary")
-        .env("RKG_CONFIG", env.repo.join("absent.toml"))
-        .env("RKG_MOCK_DIR", &env.mock)
-        .env("RKG_MOCK_LOG", &env.log)
+        .env("NEPHILA_CONFIG", env.repo.join("absent.toml"))
+        .env("NEPHILA_MOCK_DIR", &env.mock)
+        .env("NEPHILA_MOCK_LOG", &env.log)
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -439,7 +439,7 @@ fn req001_ac4_summary_and_export_make_no_llm_call() {
 #[test]
 fn build_on_schema_v1_database_recreates_it() {
     let env = Env::new();
-    let dir = env.repo.join(".rkg");
+    let dir = env.repo.join(".nephila");
     fs::create_dir_all(&dir).unwrap();
     let c = rusqlite::Connection::open(dir.join("graph.db")).unwrap();
     c.execute_batch(
@@ -462,13 +462,13 @@ impl Env {
 
     /// Commande d'écriture avec ou sans configuration LLM.
     fn write_cmd(&self, args: &[&str]) -> Output {
-        let out = Command::new(cargo_bin("rkg"))
+        let out = Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(&self.repo)
             .args(args)
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log)
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", text(&out.stderr));

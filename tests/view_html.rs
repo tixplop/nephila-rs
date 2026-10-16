@@ -51,27 +51,27 @@ impl Env {
     }
 
     fn build(&self) {
-        let out = Command::new(cargo_bin("rkg"))
+        let out = Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(&self.repo)
             .arg("build")
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env_remove("RKG_MOCK_LOG")
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env_remove("NEPHILA_MOCK_LOG")
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", text(&out.stderr));
     }
 
     fn read_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(cargo_bin("rkg"))
+        Command::new(cargo_bin("nephila"))
             .current_dir(cwd)
             .arg("-C")
             .arg(&self.repo)
             .args(args)
-            .env("RKG_CONFIG", self.repo.join("absent.toml"))
-            .env_remove("RKG_MOCK_DIR")
-            .env_remove("RKG_MOCK_LOG")
+            .env("NEPHILA_CONFIG", self.repo.join("absent.toml"))
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG")
             .output()
             .unwrap()
     }
@@ -88,11 +88,11 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-const OPEN: &str = "<script type=\"application/json\" id=\"rkg-data\">";
+const OPEN: &str = "<script type=\"application/json\" id=\"nephila-data\">";
 
 /// Découpe la page : (avant le bloc, contenu brut du bloc, après le bloc).
 fn split_block(html: &str) -> (&str, &str, &str) {
-    let start = html.find(OPEN).expect("bloc rkg-data");
+    let start = html.find(OPEN).expect("bloc nephila-data");
     let body = start + OPEN.len();
     let end = body + html[body..].find("</script>").expect("fin du bloc");
     (&html[..start], &html[body..end], &html[end..])
@@ -241,14 +241,14 @@ fn req018_ac4_html_export_without_graph_invites_to_build() {
         let out = env.read_in(cwd.path(), &args);
         assert!(!out.status.success());
         assert!(
-            text(&out.stderr).contains("rkg build"),
+            text(&out.stderr).contains("nephila build"),
             "{}",
             text(&out.stderr)
         );
         assert!(out.stdout.is_empty());
     }
     assert_eq!(fs::read_dir(cwd.path()).unwrap().count(), 0);
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
 }
 
 /// La fixture des tests JS est le bloc de données décodé du dépôt exemple.
@@ -263,7 +263,7 @@ fn view_fixture_matches_current_export() {
     current["name"] = json!("maven3");
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/view/fixtures/maven3.json");
     let want = format!("{}\n", serde_json::to_string(&current).unwrap());
-    if std::env::var("RKG_UPDATE_VIEW_FIXTURE").as_deref() == Ok("1") {
+    if std::env::var("NEPHILA_UPDATE_VIEW_FIXTURE").as_deref() == Ok("1") {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, &want).unwrap();
         return;
@@ -272,6 +272,6 @@ fn view_fixture_matches_current_export() {
     assert!(
         have == want,
         "fixture tests/view/fixtures/maven3.json obsolète : relancer avec \
-         RKG_UPDATE_VIEW_FIXTURE=1 cargo test view_fixture"
+         NEPHILA_UPDATE_VIEW_FIXTURE=1 cargo test view_fixture"
     );
 }

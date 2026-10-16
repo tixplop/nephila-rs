@@ -1,8 +1,8 @@
 //! Fournisseur simulé : enrichissement par fixtures version 2 (REQ-003, REQ-024).
 
-use rkg::error::Error;
-use rkg::llm::mock::{MockLlm, MockOptions};
-use rkg::llm::Llm;
+use nephila::error::Error;
+use nephila::llm::mock::{MockLlm, MockOptions};
+use nephila::llm::Llm;
 
 fn mock(dir: &std::path::Path, log: Option<&std::path::Path>) -> MockLlm {
     MockLlm::new(MockOptions {
@@ -93,8 +93,8 @@ fn req003_enrich_shares_failure_switches_with_extract() {
     ));
 }
 
-fn lot_item(file: &str) -> rkg::llm::LotItem {
-    rkg::llm::LotItem {
+fn lot_item(file: &str) -> nephila::llm::LotItem {
+    nephila::llm::LotItem {
         file: file.into(),
         text: String::new(),
         node_ids: vec![format!("type:{}", file.trim_end_matches(".java"))],

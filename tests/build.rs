@@ -1,8 +1,8 @@
-//! Commande `rkg build` de bout en bout (REQ-009, REQ-006, REQ-002, REQ-022, REQ-023, REQ-024).
+//! Commande `nephila build` de bout en bout (REQ-009, REQ-006, REQ-002, REQ-022, REQ-023, REQ-024).
 
 use assert_cmd::Command;
-use rkg::model::{EdgeKind, FileState, NodeKind};
-use rkg::store::Store;
+use nephila::model::{EdgeKind, FileState, NodeKind};
+use nephila::store::Store;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,20 +71,20 @@ impl Env {
 
     /// Commande sans option `-C`.
     fn raw(&self) -> Command {
-        let mut c = Command::cargo_bin("rkg").unwrap();
-        c.env_remove("RKG_MOCK_FAIL_AFTER")
-            .env_remove("RKG_MOCK_INVALID_KEY")
-            .env_remove("RKG_MOCK_DELAY_MS")
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log);
+        let mut c = Command::cargo_bin("nephila").unwrap();
+        c.env_remove("NEPHILA_MOCK_FAIL_AFTER")
+            .env_remove("NEPHILA_MOCK_INVALID_KEY")
+            .env_remove("NEPHILA_MOCK_DELAY_MS")
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log);
         c
     }
 
     /// Commande sans fichier de configuration LLM (LLM inactif).
     fn plain(&self) -> Command {
         let mut c = self.cmd();
-        c.env("RKG_CONFIG", self.config.with_file_name("absent.toml"));
+        c.env("NEPHILA_CONFIG", self.config.with_file_name("absent.toml"));
         c
     }
 
@@ -128,7 +128,7 @@ impl Env {
             .collect()
     }
 
-    fn node(&self, id: &str) -> rkg::model::Node {
+    fn node(&self, id: &str) -> nephila::model::Node {
         self.store()
             .nodes()
             .unwrap()
@@ -270,7 +270,7 @@ fn req009_ac1_module_contains_package_contains_type() {
 }
 
 #[test]
-fn req009_ac2_only_rkg_dir_is_written() {
+fn req009_ac2_only_nephila_dir_is_written() {
     let env = Env::new();
     let before = tree(&env.repo);
     env.build_ok();
@@ -279,12 +279,12 @@ fn req009_ac2_only_rkg_dir_is_written() {
     assert!(!added.is_empty());
     for a in added {
         assert!(
-            a == ".rkg" || a.starts_with(".rkg/"),
-            "écrit hors .rkg : {a}"
+            a == ".nephila" || a.starts_with(".nephila/"),
+            "écrit hors .nephila : {a}"
         );
     }
     assert!(before.is_subset(&after));
-    assert!(env.repo.join(".rkg/graph.db").is_file());
+    assert!(env.repo.join(".nephila/graph.db").is_file());
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn req009_ac3_second_build_reanalyzes_resends_every_file_and_drops_deleted_nodes
 }
 
 #[test]
-fn req009_ac4_missing_repo_fails_without_creating_rkg() {
+fn req009_ac4_missing_repo_fails_without_creating_nephila() {
     let env = Env::new();
     let missing = env.repo.join("nope");
     let out = env
@@ -335,12 +335,12 @@ fn req009_ac4_missing_repo_fails_without_creating_rkg() {
     assert!(!out.status.success());
     assert!(stderr(&out).starts_with("erreur:"), "{}", stderr(&out));
     assert!(stdout(&out).is_empty());
-    assert!(!missing.join(".rkg").exists());
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!missing.join(".nephila").exists());
+    assert!(!env.repo.join(".nephila").exists());
 }
 
 #[test]
-fn req009_ac4_repo_is_a_file_fails_without_creating_rkg() {
+fn req009_ac4_repo_is_a_file_fails_without_creating_nephila() {
     let env = Env::new();
     let file = env.repo.join("README.md");
     let out = env
@@ -352,12 +352,12 @@ fn req009_ac4_repo_is_a_file_fails_without_creating_rkg() {
         .unwrap();
     assert!(!out.status.success());
     assert!(stderr(&out).starts_with("erreur:"));
-    assert!(!file.join(".rkg").exists());
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!file.join(".nephila").exists());
+    assert!(!env.repo.join(".nephila").exists());
 }
 
 #[test]
-fn req009_ac4_unreadable_repo_fails_without_creating_rkg() {
+fn req009_ac4_unreadable_repo_fails_without_creating_nephila() {
     use std::os::unix::fs::PermissionsExt;
     let is_root = Command::new("id")
         .arg("-u")
@@ -375,7 +375,7 @@ fn req009_ac4_unreadable_repo_fails_without_creating_rkg() {
     assert!(stderr(&out).starts_with("erreur:"), "{}", stderr(&out));
     assert!(stderr(&out).contains("lisible"), "{}", stderr(&out));
     assert!(stdout(&out).is_empty());
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
 }
 
 #[test]
@@ -464,7 +464,7 @@ fn req009_ac6_summary_line_on_stdout() {
     let store = env.store();
     let n = store.nodes().unwrap().len();
     let e = store.edges().unwrap().len();
-    let u = rkg::resolve::unresolved(&store).unwrap().len();
+    let u = nephila::resolve::unresolved(&store).unwrap().len();
     assert_eq!(u, 1);
     for expected in [
         "10 fichiers traités".to_string(),
@@ -943,9 +943,9 @@ fn req002_ac1_missing_config_builds_without_llm_and_ask_names_the_path() {
     }
 }
 
-fn snapshot_rkg(repo: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
+fn snapshot_nephila(repo: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
     let mut v = Vec::new();
-    for e in fs::read_dir(repo.join(".rkg")).unwrap() {
+    for e in fs::read_dir(repo.join(".nephila")).unwrap() {
         let p = e.unwrap().path();
         v.push((
             p.file_name().unwrap().to_string_lossy().into_owned(),
@@ -964,7 +964,7 @@ fn req002_ac2_unknown_provider_names_faulty_key_unless_no_llm() {
     let out = env.build();
     assert!(!out.status.success());
     assert!(stderr(&out).contains("provider"), "{}", stderr(&out));
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
     let out = env.cmd().args(["build", "--no-llm"]).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
 }
@@ -976,7 +976,7 @@ fn req002_ac2_missing_required_key_names_it() {
     let out = env.build();
     assert!(!out.status.success());
     assert!(stderr(&out).contains("api_key_env"), "{}", stderr(&out));
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
 }
 
 #[test]
@@ -984,25 +984,25 @@ fn req002_ac3_refused_key_stops_before_any_analysis() {
     let env = Env::new();
     let out = env
         .cmd()
-        .env("RKG_MOCK_INVALID_KEY", "1")
+        .env("NEPHILA_MOCK_INVALID_KEY", "1")
         .arg("build")
         .output()
         .unwrap();
     assert!(!out.status.success());
     assert!(stderr(&out).starts_with("erreur:"));
     assert!(env.log_lines().is_empty());
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
     // Graphe existant inchangé.
     env.build_ok();
-    let snapshot = snapshot_rkg(&env.repo);
+    let snapshot = snapshot_nephila(&env.repo);
     let out = env
         .cmd()
-        .env("RKG_MOCK_INVALID_KEY", "1")
+        .env("NEPHILA_MOCK_INVALID_KEY", "1")
         .arg("build")
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert_eq!(snapshot, snapshot_rkg(&env.repo));
+    assert_eq!(snapshot, snapshot_nephila(&env.repo));
 }
 
 #[test]
@@ -1010,22 +1010,22 @@ fn req002_ac4_missing_key_variable_is_named() {
     let env = Env::new();
     fs::write(
         &env.config,
-        "provider = \"mock\"\napi_key_env = \"RKG_TEST_ABSENT_KEY_VAR\"\n",
+        "provider = \"mock\"\napi_key_env = \"NEPHILA_TEST_ABSENT_KEY_VAR\"\n",
     )
     .unwrap();
     let out = env
         .cmd()
-        .env_remove("RKG_TEST_ABSENT_KEY_VAR")
+        .env_remove("NEPHILA_TEST_ABSENT_KEY_VAR")
         .arg("build")
         .output()
         .unwrap();
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("RKG_TEST_ABSENT_KEY_VAR"),
+        stderr(&out).contains("NEPHILA_TEST_ABSENT_KEY_VAR"),
         "{}",
         stderr(&out)
     );
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
     assert!(env.log_lines().is_empty());
 }
 
@@ -1090,7 +1090,7 @@ fn req009_ac8_shared_node_row_is_deterministic_and_follows_declarations() {
     let four = dup_env(4, true);
     four.build_ok();
     let n = one.node("type:com.acme.Dup");
-    assert_eq!(n.subkind, Some(rkg::model::SubKind::Class));
+    assert_eq!(n.subkind, Some(nephila::model::SubKind::Class));
     assert_eq!(n.file.as_deref(), Some(DUP_A));
     let dups = |e: &Env| {
         e.store()
@@ -1107,7 +1107,7 @@ fn req009_ac8_shared_node_row_is_deterministic_and_follows_declarations() {
     let out = one.cmd().arg("update").output().unwrap();
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let n = one.node("type:com.acme.Dup");
-    assert_eq!(n.subkind, Some(rkg::model::SubKind::Interface));
+    assert_eq!(n.subkind, Some(nephila::model::SubKind::Interface));
     assert_eq!(n.file.as_deref(), Some(DUP_B));
     let fresh = dup_env(1, false);
     fresh.build_ok();

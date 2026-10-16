@@ -1,8 +1,8 @@
 //! Fournisseur `mock` piloté par variables d'environnement (REQ-003).
 //!
-//! Variables : `RKG_MOCK_DIR` (fixtures), `RKG_MOCK_LOG` (journal d'appels),
-//! `RKG_MOCK_FAIL_AFTER`, `RKG_MOCK_INVALID_KEY`, `RKG_MOCK_DELAY_MS`,
-//! `RKG_MOCK_TIMEOUT_FILES`, `RKG_MOCK_KEY_REVOKED_AFTER`.
+//! Variables : `NEPHILA_MOCK_DIR` (fixtures), `NEPHILA_MOCK_LOG` (journal d'appels),
+//! `NEPHILA_MOCK_FAIL_AFTER`, `NEPHILA_MOCK_INVALID_KEY`, `NEPHILA_MOCK_DELAY_MS`,
+//! `NEPHILA_MOCK_TIMEOUT_FILES`, `NEPHILA_MOCK_KEY_REVOKED_AFTER`.
 //! Fixture d'un fichier : `<dir>/<chemin>.<n>.json` pour le morceau n (à partir de 1) si
 //! elle existe, sinon `<dir>/<chemin>.json`, sinon réponse vide.
 
@@ -71,12 +71,12 @@ impl MockLlm {
     /// Lit les options via `env` ; une valeur numérique invalide est une erreur.
     pub fn from_env_with(env: EnvFn) -> Result<MockLlm> {
         Ok(MockLlm::new(MockOptions {
-            dir: env_nonempty(env, "RKG_MOCK_DIR").map(PathBuf::from),
-            log: env_nonempty(env, "RKG_MOCK_LOG").map(PathBuf::from),
-            fail_after: env_number(env, "RKG_MOCK_FAIL_AFTER")?,
-            invalid_key: env_nonempty(env, "RKG_MOCK_INVALID_KEY").is_some_and(|v| v != "0"),
-            delay_ms: env_number(env, "RKG_MOCK_DELAY_MS")?.unwrap_or(0),
-            timeout_files: env_nonempty(env, "RKG_MOCK_TIMEOUT_FILES")
+            dir: env_nonempty(env, "NEPHILA_MOCK_DIR").map(PathBuf::from),
+            log: env_nonempty(env, "NEPHILA_MOCK_LOG").map(PathBuf::from),
+            fail_after: env_number(env, "NEPHILA_MOCK_FAIL_AFTER")?,
+            invalid_key: env_nonempty(env, "NEPHILA_MOCK_INVALID_KEY").is_some_and(|v| v != "0"),
+            delay_ms: env_number(env, "NEPHILA_MOCK_DELAY_MS")?.unwrap_or(0),
+            timeout_files: env_nonempty(env, "NEPHILA_MOCK_TIMEOUT_FILES")
                 .map(|v| {
                     v.split(',')
                         .map(|f| f.trim().to_string())
@@ -84,7 +84,7 @@ impl MockLlm {
                         .collect()
                 })
                 .unwrap_or_default(),
-            key_revoked_after: env_number(env, "RKG_MOCK_KEY_REVOKED_AFTER")?,
+            key_revoked_after: env_number(env, "NEPHILA_MOCK_KEY_REVOKED_AFTER")?,
         }))
     }
 
@@ -110,7 +110,7 @@ impl MockLlm {
         if let Some(limit) = self.opts.fail_after {
             if n >= limit {
                 return Err(Error::Network(format!(
-                    "erreur réseau (LLM simulé) : appel {} au-delà de RKG_MOCK_FAIL_AFTER={limit}",
+                    "erreur réseau (LLM simulé) : appel {} au-delà de NEPHILA_MOCK_FAIL_AFTER={limit}",
                     n + 1
                 )));
             }
@@ -132,7 +132,7 @@ impl MockLlm {
     }
 
     /// Journalise l'appel (`label`), temporise et applique les échecs simulés ; `files` = fichiers
-    /// concernés par l'appel (délai dépassé si l'un est dans `RKG_MOCK_TIMEOUT_FILES`).
+    /// concernés par l'appel (délai dépassé si l'un est dans `NEPHILA_MOCK_TIMEOUT_FILES`).
     fn gate(&self, label: &str, chunk: usize, files: &[&str]) -> Result<()> {
         let n = self.extractions.fetch_add(1, Ordering::SeqCst);
         self.begin_call(label, chunk)?;
@@ -141,14 +141,14 @@ impl MockLlm {
             .find(|f| self.opts.timeout_files.iter().any(|t| t == *f))
         {
             return Err(Error::Timeout(format!(
-                "délai dépassé (LLM simulé) pour {file} (RKG_MOCK_TIMEOUT_FILES)"
+                "délai dépassé (LLM simulé) pour {file} (NEPHILA_MOCK_TIMEOUT_FILES)"
             )));
         }
         if let Some(limit) = self.opts.key_revoked_after {
             if n >= limit {
                 return Err(Error::InvalidKey(format!(
                     "clé d'API refusée par le fournisseur (LLM simulé) : appel {} \
-                     au-delà de RKG_MOCK_KEY_REVOKED_AFTER={limit}",
+                     au-delà de NEPHILA_MOCK_KEY_REVOKED_AFTER={limit}",
                     n + 1
                 )));
             }
@@ -188,7 +188,8 @@ impl Llm for MockLlm {
     fn verify_key(&self) -> Result<()> {
         if self.opts.invalid_key {
             Err(Error::InvalidKey(
-                "clé d'API refusée par le fournisseur (LLM simulé, RKG_MOCK_INVALID_KEY)".into(),
+                "clé d'API refusée par le fournisseur (LLM simulé, NEPHILA_MOCK_INVALID_KEY)"
+                    .into(),
             ))
         } else {
             Ok(())

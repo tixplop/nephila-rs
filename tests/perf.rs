@@ -17,16 +17,16 @@ struct Fixture {
 }
 
 fn cmd(f: &Fixture, args: &[&str]) -> Command {
-    let mut c = Command::new(cargo_bin("rkg"));
+    let mut c = Command::new(cargo_bin("nephila"));
     c.arg("-C")
         .arg(&f.repo)
         .args(args)
-        .env("RKG_CONFIG", &f.config)
-        .env("RKG_MOCK_DIR", &f.mock)
-        .env_remove("RKG_MOCK_LOG")
-        .env_remove("RKG_MOCK_FAIL_AFTER")
-        .env_remove("RKG_MOCK_DELAY_MS")
-        .env_remove("RKG_MOCK_INVALID_KEY");
+        .env("NEPHILA_CONFIG", &f.config)
+        .env("NEPHILA_MOCK_DIR", &f.mock)
+        .env_remove("NEPHILA_MOCK_LOG")
+        .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+        .env_remove("NEPHILA_MOCK_DELAY_MS")
+        .env_remove("NEPHILA_MOCK_INVALID_KEY");
     c
 }
 
@@ -131,7 +131,7 @@ fn perf_req021_ac3_update_one_modified_file() {
     let (d, out) = {
         let t = Instant::now();
         let out = cmd(f, &["update"])
-            .env("RKG_MOCK_LOG", &log)
+            .env("NEPHILA_MOCK_LOG", &log)
             .output()
             .unwrap();
         let d = t.elapsed();
@@ -168,7 +168,7 @@ fn perf_req021_ac3_update_one_modified_file() {
 fn perf_req021_ac4_single_native_binary_help() {
     let _g = serial();
     let f = fixture();
-    let bin = cargo_bin("rkg");
+    let bin = cargo_bin("nephila");
     let md = std::fs::metadata(&bin).unwrap();
     assert!(md.is_file());
     let (d, _) = best(f, &["--help"]);

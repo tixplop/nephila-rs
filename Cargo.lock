@@ -596,6 +596,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "nephila-rs"
+version = "0.8.0"
+dependencies = [
+ "assert_cmd",
+ "blake3",
+ "clap",
+ "ignore",
+ "libc",
+ "pulldown-cmark",
+ "quick-xml",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-groovy",
+ "tree-sitter-java",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-scala",
+ "ureq",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -727,30 +751,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "repo-knowledge-graph"
-version = "0.7.0"
-dependencies = [
- "assert_cmd",
- "blake3",
- "clap",
- "ignore",
- "libc",
- "pulldown-cmark",
- "quick-xml",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
- "tree-sitter",
- "tree-sitter-groovy",
- "tree-sitter-java",
- "tree-sitter-kotlin-ng",
- "tree-sitter-scala",
- "ureq",
-]
 
 [[package]]
 name = "ring"

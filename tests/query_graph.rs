@@ -79,15 +79,15 @@ impl Env {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(cargo_bin("rkg"))
+        Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(&self.repo)
             .args(args)
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env_remove("RKG_MOCK_LOG")
-            .env_remove("RKG_MOCK_DELAY_MS")
-            .env_remove("RKG_MOCK_FAIL_AFTER")
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env_remove("NEPHILA_MOCK_LOG")
+            .env_remove("NEPHILA_MOCK_DELAY_MS")
+            .env_remove("NEPHILA_MOCK_FAIL_AFTER")
             .output()
             .unwrap()
     }
@@ -375,11 +375,11 @@ fn req017_ac3_no_graph_invites_to_build_for_neighbors_and_path() {
         assert!(out.stdout.is_empty());
         let err = text(&out.stderr);
         assert!(
-            err.starts_with("erreur:") && err.contains("rkg build"),
+            err.starts_with("erreur:") && err.contains("nephila build"),
             "{err}"
         );
     }
-    assert!(!env.repo.join(".rkg").exists());
+    assert!(!env.repo.join(".nephila").exists());
 }
 
 #[test]

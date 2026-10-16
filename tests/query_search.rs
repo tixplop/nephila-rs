@@ -2,8 +2,8 @@
 //! (REQ-013, REQ-017, AC-001-4, AC-020-2).
 
 use assert_cmd::cargo::cargo_bin;
-use rkg::query::lookup::{self, Lookup};
-use rkg::store::Store;
+use nephila::query::lookup::{self, Lookup};
+use nephila::store::Store;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -93,15 +93,15 @@ impl Env {
     }
 
     fn cmd(&self, args: &[&str], extra: &[(&str, &str)]) -> Command {
-        let mut c = Command::new(cargo_bin("rkg"));
+        let mut c = Command::new(cargo_bin("nephila"));
         c.arg("-C")
             .arg(&self.repo)
             .args(args)
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log)
-            .env_remove("RKG_MOCK_DELAY_MS")
-            .env_remove("RKG_MOCK_FAIL_AFTER");
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log)
+            .env_remove("NEPHILA_MOCK_DELAY_MS")
+            .env_remove("NEPHILA_MOCK_FAIL_AFTER");
         for (k, v) in extra {
             c.env(k, v);
         }
@@ -319,23 +319,26 @@ fn req017_ac3_no_graph_invites_to_build() {
     assert!(out.stdout.is_empty());
     let err = text(&out.stderr);
     assert!(
-        err.starts_with("erreur:") && err.contains("rkg build"),
+        err.starts_with("erreur:") && err.contains("nephila build"),
         "{err}"
     );
-    assert!(!env.repo.join(".rkg").exists(), "la requête a créé .rkg");
+    assert!(
+        !env.repo.join(".nephila").exists(),
+        "la requête a créé .nephila"
+    );
 }
 
 #[test]
 fn req001_ac4_search_calls_no_llm_and_needs_no_config() {
     let env = Env::built();
     let before = fs::read_to_string(&env.log).unwrap();
-    let out = Command::new(cargo_bin("rkg"))
+    let out = Command::new(cargo_bin("nephila"))
         .arg("-C")
         .arg(&env.repo)
         .args(["query", "search", "Order"])
-        .env("RKG_CONFIG", env.repo.join("absent.toml"))
-        .env_remove("RKG_MOCK_DIR")
-        .env_remove("RKG_MOCK_LOG")
+        .env("NEPHILA_CONFIG", env.repo.join("absent.toml"))
+        .env_remove("NEPHILA_MOCK_DIR")
+        .env_remove("NEPHILA_MOCK_LOG")
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -345,7 +348,7 @@ fn req001_ac4_search_calls_no_llm_and_needs_no_config() {
 #[test]
 fn req001_ac2_search_accepts_relative_repo_option() {
     let env = Env::built();
-    let out = Command::new(cargo_bin("rkg"))
+    let out = Command::new(cargo_bin("nephila"))
         .current_dir(env.tmp.path())
         .args(["-C", "repo", "query", "search", "OrderService"])
         .output()
@@ -361,7 +364,7 @@ fn req020_ac2_query_search_answers_during_running_build() {
         env.file(&format!("docs/filler{i}.md"), "# Filler\n");
     }
     let mut child = env
-        .cmd(&["build"], &[("RKG_MOCK_DELAY_MS", "400")])
+        .cmd(&["build"], &[("NEPHILA_MOCK_DELAY_MS", "400")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

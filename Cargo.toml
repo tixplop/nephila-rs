@@ -1,14 +1,14 @@
 [package]
-name = "repo-knowledge-graph"
-version = "0.7.0"
+name = "nephila-rs"
+version = "0.8.0"
 edition = "2021"
 
 [lib]
-name = "rkg"
+name = "nephila"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rkg"
+name = "nephila"
 path = "src/main.rs"
 
 [dependencies]

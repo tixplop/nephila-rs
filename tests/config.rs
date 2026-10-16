@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use rkg::config::{config_path_with, Config, Provider};
-use rkg::llm::mock::{MockLlm, MockOptions};
-use rkg::llm::Llm;
-use rkg::llm::{AskReply, Enrichment};
+use nephila::config::{config_path_with, Config, Provider};
+use nephila::llm::mock::{MockLlm, MockOptions};
+use nephila::llm::Llm;
+use nephila::llm::{AskReply, Enrichment};
 
 fn parse(t: &str) -> Result<Config, String> {
     Config::parse(t, Path::new("/x/config.toml")).map_err(|e| e.to_string())
@@ -31,14 +31,14 @@ fn req002_ac1_missing_file_cites_path_and_keys() {
 #[test]
 fn req002_config_path_precedence() {
     let p = config_path_with(&env_of(&[
-        ("RKG_CONFIG", "/a.toml"),
+        ("NEPHILA_CONFIG", "/a.toml"),
         ("XDG_CONFIG_HOME", "/xdg"),
     ]));
     assert_eq!(p.unwrap(), PathBuf::from("/a.toml"));
     let p = config_path_with(&env_of(&[("XDG_CONFIG_HOME", "/xdg"), ("HOME", "/h")]));
-    assert_eq!(p.unwrap(), PathBuf::from("/xdg/rkg/config.toml"));
+    assert_eq!(p.unwrap(), PathBuf::from("/xdg/nephila/config.toml"));
     let p = config_path_with(&env_of(&[("HOME", "/h")]));
-    assert_eq!(p.unwrap(), PathBuf::from("/h/.config/rkg/config.toml"));
+    assert_eq!(p.unwrap(), PathBuf::from("/h/.config/nephila/config.toml"));
     assert!(config_path_with(&env_of(&[])).is_err());
 }
 
@@ -101,7 +101,7 @@ fn req002_ac4_missing_env_var_named() {
 
 const GOOD: &str = r#"{"version":2,"summaries":[{"node":"type:A","summary":"un"},{"node":"type:Z","summary":"deux"}],"concepts":[]}"#;
 
-fn ex(m: &MockLlm, file: &str, chunk: usize) -> rkg::error::Result<Enrichment> {
+fn ex(m: &MockLlm, file: &str, chunk: usize) -> nephila::error::Result<Enrichment> {
     m.enrich(
         file,
         chunk,
@@ -241,7 +241,7 @@ fn req002_ac2_ac4_load_with_env() {
     let d = tempfile::tempdir().unwrap();
     let missing = d.path().join("absent.toml");
     let missing_s = missing.display().to_string();
-    let e = Config::load_with(&env_of(&[("RKG_CONFIG", &missing_s)]))
+    let e = Config::load_with(&env_of(&[("NEPHILA_CONFIG", &missing_s)]))
         .unwrap_err()
         .to_string();
     assert!(e.contains(&missing_s), "{e}");
@@ -249,15 +249,15 @@ fn req002_ac2_ac4_load_with_env() {
     let f = d.path().join("c.toml");
     std::fs::write(&f, "provider='anthropic'\nmodel='m'\napi_key_env='MY_KEY'").unwrap();
     let fs = f.display().to_string();
-    let e = Config::load_with(&env_of(&[("RKG_CONFIG", &fs)]))
+    let e = Config::load_with(&env_of(&[("NEPHILA_CONFIG", &fs)]))
         .unwrap_err()
         .to_string();
     assert!(e.contains("MY_KEY"), "{e}");
-    let e = Config::load_with(&env_of(&[("RKG_CONFIG", &fs), ("MY_KEY", "")]))
+    let e = Config::load_with(&env_of(&[("NEPHILA_CONFIG", &fs), ("MY_KEY", "")]))
         .unwrap_err()
         .to_string();
     assert!(e.contains("MY_KEY"), "{e}");
-    let c = Config::load_with(&env_of(&[("RKG_CONFIG", &fs), ("MY_KEY", "secret")])).unwrap();
+    let c = Config::load_with(&env_of(&[("NEPHILA_CONFIG", &fs), ("MY_KEY", "secret")])).unwrap();
     assert_eq!(c.provider, Provider::Anthropic);
 }
 
@@ -273,11 +273,11 @@ fn req003_from_env_with_reads_all_variables() {
     let dir = d.path().join("fx").display().to_string();
     let log = d.path().join("log.txt").display().to_string();
     let env = env_of(&[
-        ("RKG_MOCK_DIR", &dir),
-        ("RKG_MOCK_LOG", &log),
-        ("RKG_MOCK_FAIL_AFTER", "1"),
-        ("RKG_MOCK_INVALID_KEY", "1"),
-        ("RKG_MOCK_DELAY_MS", "50"),
+        ("NEPHILA_MOCK_DIR", &dir),
+        ("NEPHILA_MOCK_LOG", &log),
+        ("NEPHILA_MOCK_FAIL_AFTER", "1"),
+        ("NEPHILA_MOCK_INVALID_KEY", "1"),
+        ("NEPHILA_MOCK_DELAY_MS", "50"),
     ]);
     let m = MockLlm::from_env_with(&env).unwrap();
     let t0 = std::time::Instant::now();
@@ -288,7 +288,7 @@ fn req003_from_env_with_reads_all_variables() {
     assert!(m.verify_key().is_err());
 
     for v in ["0", ""] {
-        let m = MockLlm::from_env_with(&env_of(&[("RKG_MOCK_INVALID_KEY", v)])).unwrap();
+        let m = MockLlm::from_env_with(&env_of(&[("NEPHILA_MOCK_INVALID_KEY", v)])).unwrap();
         assert!(m.verify_key().is_ok(), "INVALID_KEY={v:?}");
     }
     let m = MockLlm::from_env_with(&env_of(&[])).unwrap();
@@ -297,7 +297,7 @@ fn req003_from_env_with_reads_all_variables() {
 
 #[test]
 fn req003_non_numeric_numeric_variables_fail() {
-    for var in ["RKG_MOCK_FAIL_AFTER", "RKG_MOCK_DELAY_MS"] {
+    for var in ["NEPHILA_MOCK_FAIL_AFTER", "NEPHILA_MOCK_DELAY_MS"] {
         let e = MockLlm::from_env_with(&env_of(&[(var, "abc")]))
             .unwrap_err()
             .to_string();
@@ -326,10 +326,13 @@ fn req003_ac5_timeout_files_fail_with_timeout_and_are_logged() {
     let m = mock_with(d.path(), |o| {
         o.timeout_files = vec!["a".into(), "src/b".into()]
     });
-    assert!(matches!(ex(&m, "a", 1), Err(rkg::error::Error::Timeout(_))));
+    assert!(matches!(
+        ex(&m, "a", 1),
+        Err(nephila::error::Error::Timeout(_))
+    ));
     assert!(matches!(
         ex(&m, "src/b", 1),
-        Err(rkg::error::Error::Timeout(_))
+        Err(nephila::error::Error::Timeout(_))
     ));
     assert!(ex(&m, "c", 1).is_ok());
     let log = std::fs::read_to_string(d.path().join("log")).unwrap();
@@ -344,11 +347,11 @@ fn req003_ac5_key_revoked_after_n_extractions() {
     assert!(ex(&m, "b", 1).is_ok());
     assert!(matches!(
         ex(&m, "c", 1),
-        Err(rkg::error::Error::InvalidKey(_))
+        Err(nephila::error::Error::InvalidKey(_))
     ));
     assert!(matches!(
         ex(&m, "d", 1),
-        Err(rkg::error::Error::InvalidKey(_))
+        Err(nephila::error::Error::InvalidKey(_))
     ));
     assert!(m.verify_key().is_ok());
 }
@@ -382,11 +385,11 @@ fn req027_ac1_build_with_invalid_batch_files_fails_but_no_llm_succeeds() {
     let cfg = tmp.path().join("config.toml");
     std::fs::write(&cfg, "provider='mock'\nbatch_files=0\n").unwrap();
     let run = |args: &[&str]| {
-        std::process::Command::new(cargo_bin("rkg"))
+        std::process::Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(&repo)
             .args(args)
-            .env("RKG_CONFIG", &cfg)
+            .env("NEPHILA_CONFIG", &cfg)
             .output()
             .unwrap()
     };

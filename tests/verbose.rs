@@ -58,20 +58,20 @@ impl Env {
     }
 
     fn cmd_with(&self, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
-        let mut c = Command::cargo_bin("rkg").unwrap();
+        let mut c = Command::cargo_bin("nephila").unwrap();
         for k in [
-            "RKG_MOCK_FAIL_AFTER",
-            "RKG_MOCK_INVALID_KEY",
-            "RKG_MOCK_DELAY_MS",
-            "RKG_MOCK_TIMEOUT_FILES",
-            "RKG_MOCK_KEY_REVOKED_AFTER",
+            "NEPHILA_MOCK_FAIL_AFTER",
+            "NEPHILA_MOCK_INVALID_KEY",
+            "NEPHILA_MOCK_DELAY_MS",
+            "NEPHILA_MOCK_TIMEOUT_FILES",
+            "NEPHILA_MOCK_KEY_REVOKED_AFTER",
         ] {
             c.env_remove(k);
         }
         c.envs(envs.iter().copied());
-        c.env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log)
+        c.env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log)
             .arg("-C")
             .arg(&self.repo)
             .args(args)
@@ -255,7 +255,7 @@ fn req026_ac4_timeout_file() {
     let env = Env::mock();
     let o = env.cmd_with(
         &["build", "-v"],
-        &[("RKG_MOCK_TIMEOUT_FILES", "core/pom.xml")],
+        &[("NEPHILA_MOCK_TIMEOUT_FILES", "core/pom.xml")],
     );
     let lines = trace_lines(&o);
     let timeouts: Vec<_> = enrich_ends(&lines)
@@ -269,7 +269,7 @@ fn req026_ac4_timeout_file() {
 #[test]
 fn req026_ac4_network_policy_trace() {
     let env = Env::new("provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\n");
-    let o = env.cmd_with(&["build", "-v"], &[("RKG_MOCK_FAIL_AFTER", "2")]);
+    let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_MOCK_FAIL_AFTER", "2")]);
     let lines = trace_lines(&o);
     let pos = |n: &str| {
         lines
@@ -292,7 +292,7 @@ fn req026_ac4_network_policy_trace() {
 #[test]
 fn req026_ac4_key_revoked() {
     let env = Env::new("provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\n");
-    let o = env.cmd_with(&["build", "-v"], &[("RKG_MOCK_KEY_REVOKED_AFTER", "2")]);
+    let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_MOCK_KEY_REVOKED_AFTER", "2")]);
     let lines = trace_lines(&o);
     let r = lines
         .iter()
@@ -307,7 +307,7 @@ fn req026_ac4_key_revoked() {
 
 fn openai_env(server: &FakeServer, timeout: u32, source: &str) -> Env {
     let env = Env::new(&format!(
-        "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"RKG_T049_KEY\"\n\
+        "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T049_KEY\"\n\
          concurrency = 1\ntimeout_secs = {timeout}\n",
         server.base_url
     ));
@@ -326,7 +326,7 @@ fn req026_ac5_openai_timeout_duration() {
     let server =
         FakeServer::start_with_delays(vec![(200, "{}".into(), 0), (200, openai_reply("{}"), 2000)]);
     let env = openai_env(&server, 1, "class A {}\n");
-    let o = env.cmd_with(&["build", "-v"], &[("RKG_T049_KEY", "sk-x")]);
+    let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-x")]);
     let lines = trace_lines(&o);
     let ends = enrich_ends(&lines);
     assert_eq!(ends.len(), 1, "{lines:?}");
@@ -347,7 +347,7 @@ fn req026_ac5_openai_timeout_duration() {
 fn req026_ac5_openai_key_refused_at_verification() {
     let server = FakeServer::start(vec![(401, "{}".into())]);
     let env = openai_env(&server, 5, "class A {}\n");
-    let o = env.cmd_with(&["build", "-v"], &[("RKG_T049_KEY", "sk-x")]);
+    let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-x")]);
     assert!(!o.status.success());
     let lines = trace_lines(&o);
     assert!(
@@ -362,7 +362,7 @@ fn req026_ac5_openai_key_refused_at_verification() {
 fn assert_no_secret_in_failed_call(reply_text: &str) {
     let server = FakeServer::start(vec![(200, "{}".into()), (200, openai_reply(reply_text))]);
     let env = openai_env(&server, 5, "class A {}\n");
-    let o = env.cmd_with(&["build", "-v"], &[("RKG_T049_KEY", "sk-test-SECRET")]);
+    let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-test-SECRET")]);
     let lines = trace_lines(&o);
     assert!(has(&lines, "llm enrich fin"), "{lines:?}");
     for l in &lines {
@@ -393,7 +393,7 @@ fn req026_ac6_no_secret_in_traces() {
         5,
         "class A { String s = \"SECRET_CONTENU_42\"; }\n",
     );
-    let o = env.cmd_with(&["build", "-v"], &[("RKG_T049_KEY", "sk-test-SECRET")]);
+    let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-test-SECRET")]);
     let lines = trace_lines(&o);
     assert!(has(&lines, "llm enrich fin"), "{lines:?}");
     for l in &lines {

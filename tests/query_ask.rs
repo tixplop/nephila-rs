@@ -72,16 +72,16 @@ impl Env {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(cargo_bin("rkg"));
+        let mut c = Command::new(cargo_bin("nephila"));
         c.arg("-C")
             .arg(&self.repo)
             .args(args)
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log)
-            .env_remove("RKG_MOCK_INVALID_KEY")
-            .env_remove("RKG_MOCK_DELAY_MS")
-            .env_remove("RKG_MOCK_FAIL_AFTER");
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log)
+            .env_remove("NEPHILA_MOCK_INVALID_KEY")
+            .env_remove("NEPHILA_MOCK_DELAY_MS")
+            .env_remove("NEPHILA_MOCK_FAIL_AFTER");
         c
     }
 
@@ -213,11 +213,15 @@ fn req016_stale_graph_warns_and_still_answers() {
 #[test]
 fn req016_without_graph_asks_for_build() {
     let env = Env::new();
-    fs::remove_dir_all(env.repo.join(".rkg")).unwrap();
+    fs::remove_dir_all(env.repo.join(".nephila")).unwrap();
     let o = env.ask(Q, &[]);
     assert!(!o.status.success());
     assert!(o.stdout.is_empty());
-    assert!(text(&o.stderr).contains("rkg build"), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("nephila build"),
+        "{}",
+        text(&o.stderr)
+    );
     assert_eq!(env.llm_calls(), 0);
 }
 
@@ -225,11 +229,11 @@ fn req016_without_graph_asks_for_build() {
 fn req016_relative_repo_option_works() {
     let env = Env::new();
     env.fixture(r#"{"found":true,"answer":"ok","nodes":["Ledger"]}"#);
-    let o = Command::new(cargo_bin("rkg"))
+    let o = Command::new(cargo_bin("nephila"))
         .current_dir(&env.repo)
         .args(["-C", ".", "query", "ask", Q])
-        .env("RKG_CONFIG", &env.config)
-        .env("RKG_MOCK_DIR", &env.mock)
+        .env("NEPHILA_CONFIG", &env.config)
+        .env("NEPHILA_MOCK_DIR", &env.mock)
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", text(&o.stderr));
@@ -247,7 +251,7 @@ fn req002_ac6_ask_requires_valid_configuration() {
     let missing = env.config.with_file_name("absent.toml");
     let o = env
         .cmd(&["query", "ask", Q])
-        .env("RKG_CONFIG", &missing)
+        .env("NEPHILA_CONFIG", &missing)
         .output()
         .unwrap();
     assert!(!o.status.success() && o.stdout.is_empty());
@@ -264,17 +268,17 @@ fn req002_ac6_ask_requires_valid_configuration() {
     // Variable de clé absente.
     fs::write(
         &env.config,
-        "provider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"RKG_TEST_ASK_NO_SUCH_KEY\"\n",
+        "provider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"NEPHILA_TEST_ASK_NO_SUCH_KEY\"\n",
     )
     .unwrap();
     let o = env
         .cmd(&["query", "ask", Q])
-        .env_remove("RKG_TEST_ASK_NO_SUCH_KEY")
+        .env_remove("NEPHILA_TEST_ASK_NO_SUCH_KEY")
         .output()
         .unwrap();
     assert!(!o.status.success() && o.stdout.is_empty());
     assert!(
-        text(&o.stderr).contains("RKG_TEST_ASK_NO_SUCH_KEY"),
+        text(&o.stderr).contains("NEPHILA_TEST_ASK_NO_SUCH_KEY"),
         "{}",
         text(&o.stderr)
     );
@@ -282,7 +286,7 @@ fn req002_ac6_ask_requires_valid_configuration() {
     fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
     let o = env
         .cmd(&["query", "ask", Q])
-        .env("RKG_MOCK_INVALID_KEY", "1")
+        .env("NEPHILA_MOCK_INVALID_KEY", "1")
         .output()
         .unwrap();
     assert!(!o.status.success() && o.stdout.is_empty());
@@ -292,7 +296,7 @@ fn http_env(env: &Env, server: &FakeServer) {
     fs::write(
         &env.config,
         format!(
-            "provider = \"anthropic\"\nmodel = \"claude-x\"\napi_key_env = \"RKG_TEST_ASK_KEY\"\nbase_url = \"{}\"\n",
+            "provider = \"anthropic\"\nmodel = \"claude-x\"\napi_key_env = \"NEPHILA_TEST_ASK_KEY\"\nbase_url = \"{}\"\n",
             server.base_url
         ),
     )
@@ -313,7 +317,7 @@ fn req016_ac4_request_contains_only_graph_data() {
     http_env(&env, &server);
     let o = env
         .cmd(&["query", "ask", Q])
-        .env("RKG_TEST_ASK_KEY", "sk-test")
+        .env("NEPHILA_TEST_ASK_KEY", "sk-test")
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", text(&o.stderr));
@@ -369,7 +373,7 @@ fn req016_ac4_context_is_bounded() {
     http_env(&env, &server);
     let o = env
         .cmd(&["query", "ask", Q])
-        .env("RKG_TEST_ASK_KEY", "sk-test")
+        .env("NEPHILA_TEST_ASK_KEY", "sk-test")
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", text(&o.stderr));

@@ -1,5 +1,5 @@
-use rkg::model::{FileRecord, FileState};
-use rkg::scan::{scan, ScanResult};
+use nephila::model::{FileRecord, FileState};
+use nephila::scan::{scan, ScanResult};
 use std::fs;
 use std::path::Path;
 
@@ -33,7 +33,7 @@ fn req004_ac2_forced_exclusions() {
     let d = tempfile::tempdir().unwrap();
     let r = d.path();
     for dir in [
-        "target", "build", ".gradle", ".git", ".rkg", "m/target", "m/build",
+        "target", "build", ".gradle", ".git", ".nephila", "m/target", "m/build",
     ] {
         put(r, &format!("{dir}/x.java"), b"x");
     }
@@ -230,7 +230,7 @@ fn req004_empty_repo_gives_empty_scan() {
 
 #[test]
 fn req004_missing_root_is_error() {
-    assert!(scan(Path::new("/nonexistent/rkg-xyz"), &[]).is_err());
+    assert!(scan(Path::new("/nonexistent/nephila-xyz"), &[]).is_err());
 }
 
 #[cfg(unix)]

@@ -13,7 +13,7 @@ use crate::diff;
 use crate::error::{self, Result};
 use crate::store::Store;
 
-/// Ouvre le graphe pour une requête. Sans graphe : erreur invitant à lancer `rkg build`.
+/// Ouvre le graphe pour une requête. Sans graphe : erreur invitant à lancer `nephila build`.
 /// Si des fichiers ont changé depuis l'indexation, avertit sur stderr (REQ-017) ; la requête
 /// continue sur le dernier état enregistré.
 pub fn open(repo: &Path) -> Result<Store> {

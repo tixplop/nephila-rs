@@ -1,8 +1,8 @@
 //! Reprise après échec de l'enrichissement et verrou d'écriture (REQ-010, REQ-020).
 
 use assert_cmd::cargo::cargo_bin;
-use rkg::model::FileState;
-use rkg::store::Store;
+use nephila::model::FileState;
+use nephila::store::Store;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -54,18 +54,18 @@ impl Env {
     }
 
     fn command(&self, sub: &str, extra: &[(&str, &str)]) -> Command {
-        let mut c = Command::new(cargo_bin("rkg"));
+        let mut c = Command::new(cargo_bin("nephila"));
         c.arg("-C")
             .arg(&self.repo)
             .arg(sub)
-            .env_remove("RKG_MOCK_FAIL_AFTER")
-            .env_remove("RKG_MOCK_DELAY_MS")
-            .env_remove("RKG_MOCK_INVALID_KEY")
-            .env_remove("RKG_MOCK_TIMEOUT_FILES")
-            .env_remove("RKG_MOCK_KEY_REVOKED_AFTER")
-            .env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log);
+            .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+            .env_remove("NEPHILA_MOCK_DELAY_MS")
+            .env_remove("NEPHILA_MOCK_INVALID_KEY")
+            .env_remove("NEPHILA_MOCK_TIMEOUT_FILES")
+            .env_remove("NEPHILA_MOCK_KEY_REVOKED_AFTER")
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log);
         for (k, v) in extra {
             c.env(k, v);
         }
@@ -79,7 +79,7 @@ impl Env {
     /// Lance un build ralenti et attend qu'il ait commencé à appeler le LLM.
     fn spawn_slow_build(&self) -> Child {
         let child = self
-            .command("build", &[("RKG_MOCK_DELAY_MS", "400")])
+            .command("build", &[("NEPHILA_MOCK_DELAY_MS", "400")])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -122,7 +122,7 @@ fn to_enrich(env: &Env) -> Vec<String> {
     v
 }
 
-fn paths_pending(files: &[rkg::model::FileRecord]) -> Vec<String> {
+fn paths_pending(files: &[nephila::model::FileRecord]) -> Vec<String> {
     files
         .iter()
         .filter(|f| f.state == FileState::Pending)
@@ -151,7 +151,7 @@ fn call_count(env: &Env) -> usize {
 #[test]
 fn req010_ac1_failure_after_two_files_keeps_every_structure_and_leaves_rest_to_enrich() {
     let env = Env::new();
-    let out = env.run("build", &[("RKG_MOCK_FAIL_AFTER", "2")]);
+    let out = env.run("build", &[("NEPHILA_MOCK_FAIL_AFTER", "2")]);
     assert!(!out.status.success());
     let store = Store::open_readonly(&env.repo).unwrap();
     let files = store.files().unwrap();
@@ -172,7 +172,7 @@ fn req010_ac1_failure_after_two_files_keeps_every_structure_and_leaves_rest_to_e
 #[test]
 fn req010_ac1_three_consecutive_network_errors_stop_the_sending() {
     let env = Env::new();
-    let out = env.run("build", &[("RKG_MOCK_FAIL_AFTER", "2")]);
+    let out = env.run("build", &[("NEPHILA_MOCK_FAIL_AFTER", "2")]);
     assert!(!out.status.success());
     // 2 réussites + 3 échecs réseau consécutifs, puis arrêt (concurrency = 1).
     assert_eq!(call_count(&env), 5);
@@ -191,7 +191,7 @@ fn req010_ac1_with_concurrency_at_most_five_plus_n_minus_one_calls() {
         "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 3\n",
     )
     .unwrap();
-    let out = env.run("build", &[("RKG_MOCK_FAIL_AFTER", "2")]);
+    let out = env.run("build", &[("NEPHILA_MOCK_FAIL_AFTER", "2")]);
     assert!(!out.status.success());
     let calls = call_count(&env);
     assert!((5..=7).contains(&calls), "{calls} appels");
@@ -201,7 +201,7 @@ fn req010_ac1_with_concurrency_at_most_five_plus_n_minus_one_calls() {
 fn req010_ac4_timeout_file_does_not_stop_the_others() {
     let env = Env::new();
     let bad = "README.md";
-    let out = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", bad)]);
+    let out = env.run("build", &[("NEPHILA_MOCK_TIMEOUT_FILES", bad)]);
     assert!(!out.status.success());
     let all = Store::open_readonly(&env.repo).unwrap().files().unwrap();
     assert!(paths_in_graph(&env, FileState::Pending).is_empty());
@@ -241,7 +241,7 @@ fn req010_ac4_update_behaves_the_same() {
         fs::write(env.repo.join(f), t).unwrap();
     }
     fs::remove_file(&env.log).ok();
-    let out = env.run("update", &[("RKG_MOCK_TIMEOUT_FILES", bad)]);
+    let out = env.run("update", &[("NEPHILA_MOCK_TIMEOUT_FILES", bad)]);
     assert!(!out.status.success());
     assert_eq!(logged_paths(&env), changed);
     assert!(paths_in_graph(&env, FileState::Pending).is_empty());
@@ -265,7 +265,7 @@ fn req010_ac5_four_timeouts_do_not_stop_the_sending() {
     assert!(all.len() >= 8);
     let bad: Vec<String> = all.iter().take(4).cloned().collect();
     fs::remove_file(&env.log).unwrap();
-    let out = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", &bad.join(","))]);
+    let out = env.run("build", &[("NEPHILA_MOCK_TIMEOUT_FILES", &bad.join(","))]);
     assert!(!out.status.success());
     assert_eq!(logged_paths(&env), all);
     assert_eq!(to_enrich(&env), bad);
@@ -275,7 +275,7 @@ fn req010_ac5_four_timeouts_do_not_stop_the_sending() {
 #[test]
 fn req010_ac6_revoked_key_stops_at_first_refusal() {
     let env = Env::new();
-    let out = env.run("build", &[("RKG_MOCK_KEY_REVOKED_AFTER", "2")]);
+    let out = env.run("build", &[("NEPHILA_MOCK_KEY_REVOKED_AFTER", "2")]);
     assert!(!out.status.success());
     assert_eq!(call_count(&env), 3);
     let err = stderr(&out);
@@ -289,7 +289,7 @@ fn req010_ac6_revoked_key_stops_at_first_refusal() {
 fn req010_ac7_update_after_ac4_sends_only_the_file_to_enrich() {
     let env = Env::new();
     let bad = "README.md";
-    let out = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", bad)]);
+    let out = env.run("build", &[("NEPHILA_MOCK_TIMEOUT_FILES", bad)]);
     assert!(!out.status.success());
     fs::remove_file(&env.log).unwrap();
     let out = env.run("update", &[]);
@@ -387,8 +387,8 @@ fn req020_ac3_lock_of_dead_process_does_not_block_build() {
 #[test]
 fn req020_ac3_stale_lock_file_without_holder_is_ignored() {
     let env = Env::new();
-    fs::create_dir_all(env.repo.join(".rkg")).unwrap();
-    fs::write(env.repo.join(".rkg/lock"), "12345\n").unwrap();
+    fs::create_dir_all(env.repo.join(".nephila")).unwrap();
+    fs::write(env.repo.join(".nephila/lock"), "12345\n").unwrap();
     let out = env.run("build", &[]);
     assert!(out.status.success(), "{}", stderr(&out));
 }
@@ -396,17 +396,17 @@ fn req020_ac3_stale_lock_file_without_holder_is_ignored() {
 #[test]
 fn req020_lock_is_exclusive_and_released_on_drop() {
     let dir = tempfile::tempdir().unwrap();
-    let first = rkg::index::lock::RepoLock::acquire(dir.path()).unwrap();
-    let err = rkg::index::lock::RepoLock::acquire(dir.path()).unwrap_err();
+    let first = nephila::index::lock::RepoLock::acquire(dir.path()).unwrap();
+    let err = nephila::index::lock::RepoLock::acquire(dir.path()).unwrap_err();
     assert!(err.to_string().contains("indexation déjà en cours"));
     drop(first);
-    rkg::index::lock::RepoLock::acquire(dir.path()).unwrap();
+    nephila::index::lock::RepoLock::acquire(dir.path()).unwrap();
 }
 
 #[test]
 fn req010_ac3_state_left_by_a_kill_during_structure_lists_pending_files_and_update_completes() {
     let env = Env::new();
-    let out = env.run("build", &[("RKG_CONFIG", "/nonexistent/absent.toml")]);
+    let out = env.run("build", &[("NEPHILA_CONFIG", "/nonexistent/absent.toml")]);
     assert!(out.status.success(), "{}", stderr(&out));
     // État qu'un `kill -9` pendant la phase structure laisse : le graphe est réinitialisé avec
     // tous les fichiers « en attente » (une transaction), puis une partie seulement est analysée
@@ -454,7 +454,7 @@ fn req010_ac3_state_left_by_a_kill_during_structure_lists_pending_files_and_upda
         pending
     };
     assert_eq!(paths_in_graph(&env, FileState::Pending), pending);
-    let status = env.run("status", &[("RKG_CONFIG", "/nonexistent/absent.toml")]);
+    let status = env.run("status", &[("NEPHILA_CONFIG", "/nonexistent/absent.toml")]);
     assert!(status.status.success(), "{}", stderr(&status));
     let text = String::from_utf8_lossy(&status.stdout).into_owned();
     for p in &pending {
@@ -465,13 +465,13 @@ fn req010_ac3_state_left_by_a_kill_during_structure_lists_pending_files_and_upda
         );
     }
     let search = env
-        .command("query", &[("RKG_CONFIG", "/nonexistent/absent.toml")])
+        .command("query", &[("NEPHILA_CONFIG", "/nonexistent/absent.toml")])
         .args(["search", "OrderService"])
         .output()
         .unwrap();
     assert!(search.status.success(), "{}", stderr(&search));
     assert!(String::from_utf8_lossy(&search.stdout).contains("OrderService"));
-    let upd = env.run("update", &[("RKG_CONFIG", "/nonexistent/absent.toml")]);
+    let upd = env.run("update", &[("NEPHILA_CONFIG", "/nonexistent/absent.toml")]);
     assert!(upd.status.success(), "{}", stderr(&upd));
     assert!(paths_in_graph(&env, FileState::Pending).is_empty());
 }
@@ -492,12 +492,15 @@ fn req010_ac3_build_killed_during_structure_phase_leaves_readable_graph() {
         fs::write(dir.join(format!("C{i}.java")), s).unwrap();
     }
     let absent = tmp.path().join("absent.toml");
-    let rkg = |args: &[&str]| {
-        let mut c = Command::new(cargo_bin("rkg"));
-        c.arg("-C").arg(&repo).args(args).env("RKG_CONFIG", &absent);
+    let nephila = |args: &[&str]| {
+        let mut c = Command::new(cargo_bin("nephila"));
+        c.arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &absent);
         c
     };
-    let mut child = rkg(&["build"])
+    let mut child = nephila(&["build"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -531,7 +534,7 @@ fn req010_ac3_build_killed_during_structure_phase_leaves_readable_graph() {
         !pending.is_empty(),
         "plus aucun fichier en attente au moment du kill"
     );
-    let status = rkg(&["status"]).output().unwrap();
+    let status = nephila(&["status"]).output().unwrap();
     assert!(status.status.success(), "{}", stderr(&status));
     let text = String::from_utf8_lossy(&status.stdout).into_owned();
     for p in &pending {
@@ -541,7 +544,7 @@ fn req010_ac3_build_killed_during_structure_phase_leaves_readable_graph() {
             "fichier {p} non signalé « en attente » :\n{text}"
         );
     }
-    let upd = rkg(&["update"]).output().unwrap();
+    let upd = nephila(&["update"]).output().unwrap();
     assert!(upd.status.success(), "{}", stderr(&upd));
     let store = Store::open_readonly(&repo).unwrap();
     assert!(store

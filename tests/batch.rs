@@ -1,7 +1,7 @@
 //! Enrichissement en lots avec le fournisseur simulé (REQ-027, REQ-003, REQ-024).
 
 use assert_cmd::cargo::cargo_bin;
-use rkg::store::Store;
+use nephila::store::Store;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -65,20 +65,20 @@ impl Env {
     }
 
     fn run(&self, sub: &str, extra: &[(&str, &str)]) -> Output {
-        let mut c = Command::new(cargo_bin("rkg"));
+        let mut c = Command::new(cargo_bin("nephila"));
         c.arg("-C").arg(&self.repo).args(sub.split_whitespace());
         for v in [
-            "RKG_MOCK_FAIL_AFTER",
-            "RKG_MOCK_DELAY_MS",
-            "RKG_MOCK_INVALID_KEY",
-            "RKG_MOCK_TIMEOUT_FILES",
-            "RKG_MOCK_KEY_REVOKED_AFTER",
+            "NEPHILA_MOCK_FAIL_AFTER",
+            "NEPHILA_MOCK_DELAY_MS",
+            "NEPHILA_MOCK_INVALID_KEY",
+            "NEPHILA_MOCK_TIMEOUT_FILES",
+            "NEPHILA_MOCK_KEY_REVOKED_AFTER",
         ] {
             c.env_remove(v);
         }
-        c.env("RKG_CONFIG", &self.config)
-            .env("RKG_MOCK_DIR", &self.mock)
-            .env("RKG_MOCK_LOG", &self.log);
+        c.env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log);
         for (k, v) in extra {
             c.env(k, v);
         }
@@ -256,12 +256,12 @@ fn graph_and_warnings(batch: usize, concurrency: usize) -> (String, Vec<String>)
     )
     .unwrap();
     let run = |args: &[&str]| {
-        let o = Command::new(cargo_bin("rkg"))
+        let o = Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(&repo)
             .args(args)
-            .env("RKG_CONFIG", &cfg)
-            .env("RKG_MOCK_DIR", &mock)
+            .env("NEPHILA_CONFIG", &cfg)
+            .env("NEPHILA_MOCK_DIR", &mock)
             .output()
             .unwrap();
         (
@@ -308,14 +308,14 @@ fn req027_ac4_same_graph_and_warnings_for_any_batch_and_concurrency() {
 #[test]
 fn req027_ac5_lots_run_in_parallel() {
     let env = Env::new(16, 4, 4);
-    let mut c = Command::new(cargo_bin("rkg"));
+    let mut c = Command::new(cargo_bin("nephila"));
     c.arg("-C")
         .arg(&env.repo)
         .args(["build", "--verbose"])
-        .env("RKG_CONFIG", &env.config)
-        .env("RKG_MOCK_DIR", &env.mock)
-        .env("RKG_MOCK_LOG", &env.log)
-        .env("RKG_MOCK_DELAY_MS", "400");
+        .env("NEPHILA_CONFIG", &env.config)
+        .env("NEPHILA_MOCK_DIR", &env.mock)
+        .env("NEPHILA_MOCK_LOG", &env.log)
+        .env("NEPHILA_MOCK_DELAY_MS", "400");
     let started = Instant::now();
     let out = c.output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
@@ -381,7 +381,7 @@ fn assert_update_resends_pending(env: &Env) {
 #[test]
 fn req027_ac9_timeout_in_lot_fails_its_two_files_only() {
     let env = Env::new(6, 2, 1);
-    let o = env.run("build", &[("RKG_MOCK_TIMEOUT_FILES", "src/F03.java")]);
+    let o = env.run("build", &[("NEPHILA_MOCK_TIMEOUT_FILES", "src/F03.java")]);
     assert!(!o.status.success());
     assert_eq!(pending(&env), vec!["src/F02.java", "src/F03.java"]);
     assert_eq!(env.summaries().len(), 4);
@@ -396,7 +396,7 @@ fn req027_ac9_timeout_in_lot_fails_its_two_files_only() {
 #[test]
 fn req027_ac9_fail_after_two_gives_five_calls() {
     let env = Env::new(12, 2, 1);
-    let o = env.run("build", &[("RKG_MOCK_FAIL_AFTER", "2")]);
+    let o = env.run("build", &[("NEPHILA_MOCK_FAIL_AFTER", "2")]);
     assert!(!o.status.success());
     assert_eq!(env.log_lines().len(), 5, "{:?}", env.log_lines());
     assert_eq!(env.summaries().len(), 4);
@@ -412,7 +412,7 @@ fn req027_ac9_fail_after_two_gives_five_calls() {
 #[test]
 fn req027_ac9_key_revoked_after_one_gives_two_calls() {
     let env = Env::new(12, 2, 1);
-    let o = env.run("build -v", &[("RKG_MOCK_KEY_REVOKED_AFTER", "1")]);
+    let o = env.run("build -v", &[("NEPHILA_MOCK_KEY_REVOKED_AFTER", "1")]);
     assert!(!o.status.success());
     assert_eq!(env.log_lines().len(), 2, "{:?}", env.log_lines());
     assert_eq!(env.summaries().len(), 2);
@@ -481,7 +481,7 @@ fn req027_ac10_lot_traces_are_paired_and_contain_no_content() {
 #[test]
 fn req027_ac10_stop_counts_files_not_lots() {
     let env = Env::new(12, 2, 1);
-    let o = env.run("build -v", &[("RKG_MOCK_FAIL_AFTER", "2")]);
+    let o = env.run("build -v", &[("NEPHILA_MOCK_FAIL_AFTER", "2")]);
     let err = stderr(&o);
     // 5 appels (10 fichiers) envoyés : 2 fichiers restent dans la file.
     assert!(
@@ -501,7 +501,7 @@ fn server_env(server: &FakeServer, n: usize) -> Env {
     fs::write(
         &env.config,
         format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"RKG_T053_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T053_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
             server.base_url
         ),
     )
@@ -510,7 +510,7 @@ fn server_env(server: &FakeServer, n: usize) -> Env {
 }
 
 fn run_server(env: &Env, sub: &str) -> Output {
-    env.run(sub, &[("RKG_T053_KEY", "sk-test")])
+    env.run(sub, &[("NEPHILA_T053_KEY", "sk-test")])
 }
 
 fn lot_entry(i: usize) -> String {
@@ -597,7 +597,7 @@ fn config_without_batch(env: &Env) {
 #[test]
 fn req028_ac1_help_mentions_batch_files() {
     for sub in ["build", "update"] {
-        let o = Command::new(cargo_bin("rkg"))
+        let o = Command::new(cargo_bin("nephila"))
             .args([sub, "--help"])
             .output()
             .unwrap();
@@ -645,7 +645,7 @@ fn req028_ac3_update_uses_option() {
     assert_eq!(batches, vec![fnames(0..2), fnames(2..4)]);
 }
 
-fn rkg_tree(repo: &Path) -> Vec<(String, u64)> {
+fn nephila_tree(repo: &Path) -> Vec<(String, u64)> {
     fn walk(d: &Path, out: &mut Vec<(String, u64)>) {
         if let Ok(rd) = fs::read_dir(d) {
             for e in rd.flatten() {
@@ -658,7 +658,7 @@ fn rkg_tree(repo: &Path) -> Vec<(String, u64)> {
         }
     }
     let mut v = Vec::new();
-    walk(&repo.join(".rkg"), &mut v);
+    walk(&repo.join(".nephila"), &mut v);
     v.sort();
     v
 }
@@ -680,19 +680,19 @@ fn req028_ac4_invalid_values_are_usage_errors_without_side_effects() {
                     stderr(&o)
                 );
                 assert!(!env.log.exists());
-                assert!(rkg_tree(&env.repo).is_empty());
+                assert!(nephila_tree(&env.repo).is_empty());
             }
         }
     }
-    // Après un build, un update refusé ne modifie rien sous .rkg/.
+    // Après un build, un update refusé ne modifie rien sous .nephila/.
     let env = Env::new(3, 1, 1);
     assert!(env.run("build", &[]).status.success());
-    let before = rkg_tree(&env.repo);
+    let before = nephila_tree(&env.repo);
     fs::remove_file(&env.log).unwrap();
     let o = env.run("update --batch-files 0", &[]);
     assert!(!o.status.success());
     assert!(!env.log.exists());
-    assert_eq!(rkg_tree(&env.repo), before);
+    assert_eq!(nephila_tree(&env.repo), before);
 }
 
 #[test]
@@ -706,7 +706,7 @@ fn req028_ac5_option_ignored_without_llm_but_file_still_validated() {
     let env = Env::new(3, 1, 1);
     let o = env.run(
         "build --batch-files 4",
-        &[("RKG_CONFIG", "/nonexistent/c.toml")],
+        &[("NEPHILA_CONFIG", "/nonexistent/c.toml")],
     );
     assert!(o.status.success(), "{}", stderr(&o));
     assert!(!env.log.exists());

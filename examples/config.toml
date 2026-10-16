@@ -1,9 +1,9 @@
-# Exemple de configuration de rkg.
-# Emplacement : $RKG_CONFIG, sinon $XDG_CONFIG_HOME/rkg/config.toml,
-# sinon ~/.config/rkg/config.toml.
+# Exemple de configuration de nephila.
+# Emplacement : $NEPHILA_CONFIG, sinon $XDG_CONFIG_HOME/nephila/config.toml,
+# sinon ~/.config/nephila/config.toml.
 # Gardez une seule section `provider` active.
 #
-# Ce fichier est facultatif : sans lui (ou avec `rkg build --no-llm`), rkg construit la
+# Ce fichier est facultatif : sans lui (ou avec `nephila build --no-llm`), nephila construit la
 # structure du graphe sans LLM. Le LLM sert à enrichir (résumés, concepts) et à `query ask`.
 
 # --- Anthropic ---
@@ -18,12 +18,12 @@ api_key_env = "ANTHROPIC_API_KEY"   # nom de la variable, jamais la clé elle-m�
 # api_key_env = "OPENAI_API_KEY"
 #
 # Modèle local avec Ollama : pas de clé, et base_url SANS « /v1 » final
-# (rkg ajoute lui-même /v1/chat/completions et /v1/models) :
+# (nephila ajoute lui-même /v1/chat/completions et /v1/models) :
 # provider = "openai"
 # model = "llama3.1"
 # base_url = "http://localhost:11434"
 
-# --- LLM simulé, pour les tests (voir RKG_MOCK_* dans le README) ---
+# --- LLM simulé, pour les tests (voir NEPHILA_MOCK_* dans le README) ---
 # provider = "mock"
 
 # Options communes (valeurs par défaut)

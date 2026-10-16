@@ -1,7 +1,7 @@
 "use strict";
 // Rendu canvas 2D et interactions. Toute décision de contenu vient de model.js.
 (function () {
-  var data = readData(document.getElementById("rkg-data").textContent);
+  var data = readData(document.getElementById("nephila-data").textContent);
   var g = load(data);
   var $ = function (id) {
     return document.getElementById(id);

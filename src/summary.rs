@@ -81,18 +81,18 @@ pub fn refresh(store: &mut Store) -> Result<()> {
 /// Résumé stocké, avec `computed_at`.
 fn load(store: &Store) -> Result<Value> {
     let (text, at) = store.summary()?.ok_or_else(|| {
-        Error::Message("aucun résumé enregistré : lancez `rkg build`".to_string())
+        Error::Message("aucun résumé enregistré : lancez `nephila build`".to_string())
     })?;
     let mut v: Value = serde_json::from_str(&text).map_err(|e| {
         Error::Message(format!(
-            "résumé enregistré illisible ({e}) : lancez `rkg build`"
+            "résumé enregistré illisible ({e}) : lancez `nephila build`"
         ))
     })?;
     v["computed_at"] = json!(at);
     Ok(v)
 }
 
-/// Commande `rkg summary` : lecture seule, sans LLM ni configuration.
+/// Commande `nephila summary` : lecture seule, sans LLM ni configuration.
 pub fn run(repo: &Path, as_json: bool) -> Result<()> {
     let store = Store::open_readonly(repo)?;
     let v = load(&store)?;

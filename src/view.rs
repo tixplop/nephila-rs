@@ -170,7 +170,7 @@ mod tests {
     fn req025_ac1_render_is_a_standalone_page() {
         let h = render("p", &graph());
         assert!(h.starts_with("<!DOCTYPE html>"));
-        assert!(h.contains("<style>") && h.contains("id=\"rkg-data\""));
+        assert!(h.contains("<style>") && h.contains("id=\"nephila-data\""));
         assert!(!h.contains("{{"));
     }
 }

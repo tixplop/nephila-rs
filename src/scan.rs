@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 /// taille dans le même pas de date du système de fichiers passerait inaperçue.
 const RACY_WINDOW_MS: i64 = 2_000;
 
-const EXCLUDED_DIRS: [&str; 5] = ["target", "build", ".gradle", ".git", ".rkg"];
+const EXCLUDED_DIRS: [&str; 5] = ["target", "build", ".gradle", ".git", ".nephila"];
 const EXTENSIONS: [&str; 8] = [
     "md", "markdown", "java", "kt", "kts", "groovy", "gradle", "scala",
 ];
