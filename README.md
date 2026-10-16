@@ -62,6 +62,22 @@ Nœuds les plus reliés
 
 ## Installation
 
+### Binaires précompilés
+
+Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge.
+
+```sh
+V=v0.8.0                                       # version voulue
+T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
+curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
+curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS       # macOS : shasum -a 256 --ignore-missing -c SHA256SUMS
+tar xzf nephila-$V-$T.tar.gz
+install nephila-$V-$T/nephila ~/.local/bin/
+```
+
+### Depuis les sources
+
 Prérequis : une chaîne Rust stable récente (`cargo`). Aucune dépendance système : SQLite est intégré au binaire.
 
 ```sh
@@ -375,6 +391,14 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 | 0.3 | Structure extraite par analyse syntaxique, sans LLM ; LLM facultatif |
 
 ## Développement
+
+L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests sur Linux et macOS, et les tests de la vue à chaque push sur `master` et à chaque pull request.
+
+**Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
+
+```sh
+git tag v0.8.1 && git push origin v0.8.1
+```
 
 ```sh
 cargo test -q                                                   # suite complète
