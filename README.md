@@ -6,13 +6,13 @@
 
 `nephila` (crate `nephila-rs`) analyse un dépôt de code JVM et sa documentation, en tire un graphe de connaissances stocké localement, et permet de l'interroger en ligne de commande, de l'exporter ou de l'explorer dans le navigateur.
 
-- **Analyse locale, sans LLM** : la structure (modules, packages, types, méthodes, documents, sections) et les liens (`imports`, `extends`, `implements`, `calls`, `depends_on`, `links_to`, `mentions`, `contains`) viennent d'une analyse syntaxique. Ni Maven, ni Gradle, ni compilateur ne sont exécutés.
+- **Analyse locale, sans LLM** : la structure (modules, packages, types, méthodes, documents, sections) et les liens (`imports`, `extends`, `implements`, `calls`, `depends_on`, `links_to`, `mentions`, `references`, `contains`) viennent d'une analyse syntaxique. Ni Maven, ni Gradle, ni compilateur ne sont exécutés.
 - **LLM facultatif** : s'il est configuré, il enrichit le graphe (résumés des nœuds, concepts des documents) et répond aux questions en langage naturel. Anthropic, OpenAI et tout serveur compatible OpenAI (Ollama, llama.cpp, vLLM…) sont pris en charge.
 - **Incrémental** : `nephila update` ne retraite que ce qui a changé.
 - **Pensé pour les agents** : sorties `--json` stables, codes de sortie explicites, messages sur stderr.
 - **Exploration visuelle** : `nephila export --format html` produit une page autonome, utilisable hors ligne.
 
-Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, Maven (`pom.xml`), Ivy (`ivy.xml`), Gradle (Groovy et Kotlin DSL), Markdown.
+Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, Maven (`pom.xml`), Ivy (`ivy.xml`), Gradle (Groovy et Kotlin DSL), Markdown, et les fichiers de données SQL, XML, JSON et YAML.
 
 ## Sommaire
 
@@ -67,7 +67,7 @@ Nœuds les plus reliés
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge.
 
 ```sh
-V=v0.8.1                                       # version voulue
+V=v0.9.0                                       # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -326,7 +326,7 @@ Par défaut (`batch_files = 1`), un appel LLM porte sur un seul fichier. Pour un
 
 ## Ce que l'analyse extrait
 
-Chaque fichier est analysé localement : tree-sitter pour les langages JVM, un lecteur XML pour Maven et Ivy, un lecteur lexical pour Gradle, et CommonMark pour Markdown.
+Chaque fichier est analysé localement : tree-sitter pour les langages JVM, un lecteur XML pour Maven et Ivy, un lecteur lexical pour Gradle et pour SQL, `serde_json` pour JSON, un analyseur à événements pour YAML, et CommonMark pour Markdown.
 
 | Fichier | Nœuds | Liens |
 |---|---|---|
@@ -335,6 +335,31 @@ Chaque fichier est analysé localement : tree-sitter pour les langages JVM, un l
 | `build.gradle(.kts)`, `settings.gradle(.kts)` | module = chemin de projet (`:services:api`) ; `settings` est suivi mais ne crée pas de nœud | `depends_on` : `project(':core')`, chaînes `g:a[:v]`, notation map ; seul le bloc `dependencies { }` de premier niveau compte |
 | autre `.gradle` | analysé comme un script Groovy | comme Groovy |
 | `.md`, `.markdown` | document, sections (ancres à la GitHub) | `links_to` (liens relatifs vers un `.md`), `mentions` (code en ligne au format de nom JVM : `Order`, `shop.Order`, `place()`, `Order#place`) |
+| `.sql` | document (sous-genre `sql`), `table` (sous-genre `table` ou `view`) | `references` (clé étrangère, ou table lue par une vue) |
+| `.xml` autre que `pom.xml` et `ivy.xml` | document (sous-genre `xml`), sans nœud par élément | `mentions` (noms JVM cités) |
+| `.json` | document (sous-genre `json`), `key` par clé feuille | `mentions` (noms JVM cités) |
+| `.yaml`, `.yml` | document (sous-genre `yaml`), `key` par clé feuille | `mentions` (noms JVM cités) |
+
+**Fichiers SQL.** Le lecteur est indépendant du dialecte : il n'exécute rien et ne se connecte à aucune base. Il reconnaît `CREATE [modificateurs] TABLE`, `CREATE [modificateurs] VIEW` (dont `MATERIALIZED`) et `ALTER TABLE`, avec identifiants entre `"…"`, `` `…` `` ou `[…]` ; les noms sont mis en minuscules (`"Orders"` donne `orders`, `shop.products` reste qualifié). Une table déclarée par plusieurs fichiers (création, puis `ALTER TABLE` d'une migration) est un seul nœud. Les liens `references` viennent de `REFERENCES <table>` dans un `CREATE TABLE` ou un `ALTER TABLE`, et de chaque table qui suit `FROM` ou `JOIN` dans une vue (ni fonctions, ni sous-requêtes, ni noms de CTE). Hors périmètre : colonnes, index, séquences, fonctions, procédures, triggers, `INSERT`/`UPDATE`/`DELETE`, `DROP` (le graphe décrit les déclarations des fichiers, pas l'état de la base après migrations), `CREATE TABLE … AS SELECT` (table sans référence) et changelogs Liquibase.
+
+**Fichiers XML.** Hors `pom.xml` et `ivy.xml`, un fichier XML donne son document seul, sans nœud par élément. Les noms JVM cités dans les valeurs d'attributs et dans les textes ou CDATA d'éléments donnent des `mentions` depuis le document.
+
+**Fichiers JSON et YAML.** Chaque clé feuille (valeur scalaire, `null`, tableau ou objet vide) donne un nœud `key` d'identifiant `key:<fichier>#a.b.c` (nom court `a.b.c`), contenu par le document ; les objets non vides sont parcourus, pas les tableaux. Les noms JVM cités dans les valeurs, y compris dans les tableaux, donnent des `mentions` depuis la clé. Un fichier est limité à 1 000 clés (les premières par ordre lexicographique de chemin ; `avertissement:` indiquant le nombre non retenu). Un YAML de plusieurs documents (`---`) réunit leurs clés (un chemin = un nœud) ; la clé de fusion `<<` est ignorée et un alias `*a` n'est pas développé (clé feuille, sans candidat).
+
+**Noms JVM cités.** Dans les fichiers XML, JSON et YAML, chaque valeur est découpée sur les blancs, `,` et `;`. Un morceau est un candidat s'il a au moins deux segments séparés par `.` ou `$` (chaque segment : lettre ASCII ou `_`, puis lettres, chiffres ou `_`), éventuellement suivi de `()` ou de `#segment`. Exemples : `com.acme.Outer$Inner` vise `com.acme.Outer.Inner`, `com.acme.Repo#save` vise `com.acme.Repo.save`, `com.acme.A, com.acme.B;com.acme.C` donne trois candidats ; `orderService`, `1.0`, `v1.2`, `${db.url}`, `http://x.org/a.b`, `classpath:com.acme` et `a..b` n'en sont pas. Les candidats sont des `mentions` non résolues tant que le nom est absent du graphe, sans figurer dans les références non résolues ; au plus 1 000 par fichier (`avertissement:` indiquant le nombre ignoré).
+
+Exemples sur un dépôt contenant `application.yml` et `db/V1__init.sql` :
+
+```
+$ nephila query search spring.datasource.url
+src/main/resources/application.yml#spring.datasource.url (key, src/main/resources/application.yml)
+
+$ nephila query neighbors orders
+utilise :
+  references customers (table, db/V1__init.sql)
+utilisé par :
+  contains db/V1__init.sql (sql, db/V1__init.sql)
+```
 
 **Résolution des appels.** Le type du receveur est cherché dans le fichier seulement : paramètre, variable locale, ou champ typé ou initialisé par un constructeur. Un receveur non déclaré qui commence par une majuscule est traité comme un appel statique. `this.m()` et `m()` visent le type englobant s'il déclare `m`. Quand le type du receveur est inconnu (chaîne d'appels, `var` sans initialiseur reconnaissable), aucun lien n'est créé : un lien manquant coûte moins cher qu'un lien faux.
 
@@ -373,16 +398,23 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 - **Premier niveau d'un script Groovy** : un appel sans parenthèses (`helper 42`, `println "hello"`, `apply plugin: 'java'`) et une fermeture isolée `{ … }` sont ignorés. Écrivez `helper(42)` pour obtenir le lien `calls`. Dans le corps d'une fonction, l'appel sans parenthèses reste reconnu, sauf directement dans le bloc d'une méthode de classe.
 - **`println x` en Groovy** : un appel sans parenthèses dont l'argument est un identifiant seul est lu comme une déclaration de variable et ne crée pas de lien.
 - **Chemins Gradle relatifs** : `project("core")` (sans `:` initial) est ignoré. Écrivez `project(':core')`.
+- **JSONC et JSON5** : non pris en charge. Un JSON à commentaires, à virgule finale ou tronqué donne le document seul, sans clé ni candidat, avec un `avertissement:`.
+- **Nom SQL qualifié** : `public.orders` ne trouve pas une table déclarée `orders` (l'inverse fonctionne si `public.orders` est seul).
+- **Pas de lecture propre à Spring ou Kubernetes** : `application.yml`, manifestes et workflows CI sont des YAML comme les autres.
+- **Gros JSON de données** (`package-lock.json`, fixtures) : indexés dans la limite de 1 000 clés ; excluez-les par `.gitignore`.
+- **Export dans le dépôt** : un export écrit dans le dépôt sous un autre nom que `<slug>.json` est indexé comme n'importe quel JSON ; excluez-le par `.gitignore`.
 - **`query path`** : renvoie le plus court chemin sans tenir compte du sens des liens. Il peut donc passer par un `import` ou un package plutôt que par des appels.
 
 ## Mise à niveau
 
 - **Renommage `rkg` → `nephila`** : le binaire s'appelle `nephila`, le graphe est stocké dans `.nephila/` (au lieu de `.rkg/`), la configuration dans `~/.config/nephila/config.toml` et les variables d'environnement sont préfixées `NEPHILA_` (`NEPHILA_CONFIG`, `NEPHILA_MOCK_DIR`…). Déplacez votre configuration (`mv ~/.config/rkg ~/.config/nephila`), puis reconstruisez le graphe avec `nephila build` et supprimez l'ancien dossier `.rkg/`.
+- **Vers 0.9** : un graphe 0.8 est complété par `nephila update` : les fichiers `.sql`, `.xml`, `.json`, `.yaml` et `.yml`, nouvellement pris en charge, sont ajoutés sans reconstruction.
 - **Vers 0.4** : `nephila export` sans option écrit dans un fichier au lieu de stdout. Pour l'ancien comportement, utilisez `nephila export --output -`.
 - **Depuis 0.2** : le schéma du graphe a changé. Un graphe ancien est refusé (`… lancez nephila build`) : reconstruisez-le avec `nephila build`. Les fixtures du fournisseur `mock` passent au schéma version 2.
 
 | Version | Nouveautés |
 |---|---|
+| 0.9.0 | Fichiers de données : SQL (tables, vues, `references`), XML, JSON et YAML (clés, noms JVM cités) ; genres `table` et `key` |
 | 0.8.1 | Premiers binaires précompilés (Linux musl, macOS) publiés par la CI |
 | 0.8 | Renommage `rkg` → `nephila` (binaire, dossier `.nephila/`, configuration, variables `NEPHILA_*`) |
 | 0.7 | Option `--batch-files <N>` de `build` et `update` |
@@ -398,7 +430,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.8.1 && git push origin v0.8.1
+git tag v0.9.0 && git push origin v0.9.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
