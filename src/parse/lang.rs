@@ -15,8 +15,14 @@ pub enum Lang {
     Groovy,
     /// Script Gradle Groovy (`build.gradle`, `settings.gradle`).
     GroovyGradle,
+    /// `pom.xml` et `ivy.xml`.
     Xml,
     Markdown,
+    Sql,
+    /// XML hors build : le document seul pour l'instant (DEC-038).
+    DataXml,
+    Json,
+    Yaml,
 }
 
 impl Lang {
@@ -36,6 +42,10 @@ impl Lang {
             "scala" => Some(Lang::Scala),
             "groovy" | "gradle" => Some(Lang::Groovy),
             "md" | "markdown" => Some(Lang::Markdown),
+            "sql" => Some(Lang::Sql),
+            "xml" => Some(Lang::DataXml),
+            "json" => Some(Lang::Json),
+            "yaml" | "yml" => Some(Lang::Yaml),
             _ => None,
         }
     }
@@ -47,7 +57,9 @@ impl Lang {
             Lang::Kotlin | Lang::KotlinGradle => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
             Lang::Scala => Some(tree_sitter_scala::LANGUAGE.into()),
             Lang::Groovy | Lang::GroovyGradle => Some(tree_sitter_groovy::LANGUAGE.into()),
-            Lang::Xml | Lang::Markdown => None,
+            Lang::Xml | Lang::Markdown | Lang::Sql | Lang::DataXml | Lang::Json | Lang::Yaml => {
+                None
+            }
         }
     }
 
@@ -90,7 +102,14 @@ mod tests {
         assert_eq!(l("A.kt"), Some(Lang::Kotlin));
         assert_eq!(l("A.scala"), Some(Lang::Scala));
         assert_eq!(l("A.groovy"), Some(Lang::Groovy));
-        assert_eq!(l("other.xml"), None);
+        assert_eq!(l("other.xml"), Some(Lang::DataXml));
+        assert_eq!(l("src/main/resources/beans.xml"), Some(Lang::DataXml));
+        assert_eq!(l("db/V1.sql"), Some(Lang::Sql));
+        assert_eq!(l("c.json"), Some(Lang::Json));
+        assert_eq!(l("a.yaml"), Some(Lang::Yaml));
+        assert_eq!(l("a.yml"), Some(Lang::Yaml));
+        assert_eq!(l("a.properties"), None);
+        assert_eq!(l("a.jsonc"), None);
         assert_eq!(l("noext"), None);
     }
 }

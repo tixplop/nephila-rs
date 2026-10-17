@@ -145,6 +145,9 @@ fn short_name(kind: NodeKind, qualified: &str) -> &str {
         NodeKind::Module => after(&[':', '/']),
         NodeKind::Section => after(&['#']),
         NodeKind::Dependency => after(&[':']),
+        // Chemin de clé : tout ce qui suit le premier `#` (un nom de membre peut en contenir).
+        NodeKind::Key => qualified.split_once('#').map_or(qualified, |(_, k)| k),
+        NodeKind::Table => after(&['.']),
         _ => after(&['.']),
     }
 }
@@ -213,6 +216,21 @@ mod tests {
     fn dec024_nom_court_porte_par_la_declaration() {
         let (n, _, _) = to_records("api/pom.xml", &module("com.acme:api", Some("api")));
         assert_eq!(n[0].short, "api");
+    }
+
+    #[test]
+    fn short_name_key_et_table() {
+        assert_eq!(
+            short_name(NodeKind::Key, "app/application.yml#spring.datasource.url"),
+            "spring.datasource.url"
+        );
+        assert_eq!(short_name(NodeKind::Key, "c.json#a#b.c"), "a#b.c");
+        assert_eq!(short_name(NodeKind::Table, "shop.products"), "products");
+        assert_eq!(short_name(NodeKind::Table, "orders"), "orders");
+        assert_eq!(
+            short_name(NodeKind::Document, "db/V1__init.sql"),
+            "V1__init.sql"
+        );
     }
 
     #[test]

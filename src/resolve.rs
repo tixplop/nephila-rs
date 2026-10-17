@@ -358,6 +358,19 @@ fn derive_contains(
         }
     }
 
+    // Document de données -> table | clé : le fichier déclarant est le document (son nom qualifié
+    // est son chemin) ; une table partagée est contenue par chacun de ses fichiers. Le nom
+    // qualifié d'une clé n'est pas découpé (un nom de membre peut contenir `#`).
+    for (file, node) in declarations {
+        let to = match crate::model::parse_node_id(node) {
+            Ok((k @ (NodeKind::Table | NodeKind::Key), q)) => (k, q),
+            _ => continue,
+        };
+        if is_kind(file, NodeKind::Document) {
+            push(NodeKind::Document, file, to.0, to.1);
+        }
+    }
+
     // Module -> package : module du fichier déclarant le package (AC-005-5).
     let kinds: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let mut build_dirs: HashMap<String, &Node> = HashMap::new();
@@ -861,6 +874,44 @@ mod tests {
         assert_eq!(s1, s2);
         assert_eq!(before, e.store.edges().unwrap().len());
         assert_eq!(s1.edges, before);
+    }
+
+    /// REQ-005 AC-005-2 : document -> table | key, d'après les déclarations ; une table partagée
+    /// est contenue par chacun de ses fichiers ; le nom d'une clé n'est pas découpé.
+    #[test]
+    fn contains_document_table_et_key() {
+        let mut e = env(&["db/V1.sql", "db/V2.sql", "c.json"]);
+        let table = |f: &str| plain(NodeKind::Table, "orders", Some(f));
+        let doc = |f: &str| plain(NodeKind::Document, f, Some(f));
+        e.store
+            .replace_file("db/V1.sql", &[doc("db/V1.sql"), table("db/V1.sql")], &[])
+            .unwrap();
+        e.store
+            .replace_file("db/V2.sql", &[doc("db/V2.sql"), table("db/V2.sql")], &[])
+            .unwrap();
+        let key = Node::new(
+            NodeKind::Key,
+            "c.json#a.b#c",
+            "a.b#c",
+            Some("c.json"),
+            None,
+            None,
+        );
+        e.store
+            .replace_file("c.json", &[doc("c.json"), key], &[])
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        let d = |f: &str| node_id(NodeKind::Document, f);
+        let t = node_id(NodeKind::Table, "orders");
+        assert!(has_edge(&e, &d("db/V1.sql"), EdgeKind::Contains, &t));
+        assert!(has_edge(&e, &d("db/V2.sql"), EdgeKind::Contains, &t));
+        assert!(has_edge(
+            &e,
+            &d("c.json"),
+            EdgeKind::Contains,
+            "key:c.json#a.b#c"
+        ));
+        assert!(!has_edge(&e, &d("c.json"), EdgeKind::Contains, &t));
     }
 
     #[test]

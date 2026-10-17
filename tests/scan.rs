@@ -50,7 +50,6 @@ fn req004_ac3_unsupported_extensions() {
     put(r, "b.txt", b"x");
     put(r, "noext", b"x");
     put(r, "pom.xml.bak", b"x");
-    put(r, "other.xml", b"x");
     put(r, "a.sbt", b"x");
     assert!(scan(r, &[]).unwrap().files.is_empty());
 }
@@ -60,6 +59,42 @@ fn check_type(name: &str) {
     put(d.path(), name, b"contenu");
     let res = scan(d.path(), &[]).unwrap();
     assert_eq!(paths(&res), vec![name.to_string()], "{name}");
+}
+
+#[test]
+fn req004_ac4_sql() {
+    check_type("db/V1__init.sql");
+}
+#[test]
+fn req004_ac4_xml_hors_build() {
+    check_type("src/main/resources/beans.xml");
+}
+#[test]
+fn req004_ac4_json() {
+    check_type("config.json");
+}
+#[test]
+fn req004_ac4_yaml() {
+    check_type("application.yaml");
+}
+#[test]
+fn req004_ac4_yml() {
+    check_type("application.yml");
+}
+
+#[test]
+fn req004_ac5_export_du_depot_jamais_indexe() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path().join("monrepo");
+    put(&r, "monrepo.json", b"{}");
+    put(&r, "sub/monrepo.json", b"{}");
+    put(&r, "config.json", b"{}");
+    put(&r, "vue.json", b"{}");
+    put(&r, "monrepo.jsonx", b"{}");
+    assert_eq!(
+        paths(&scan(&r, &[]).unwrap()),
+        vec!["config.json", "vue.json"]
+    );
 }
 
 #[test]

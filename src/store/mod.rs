@@ -1024,7 +1024,9 @@ mod tests {
                 "method",
                 "document",
                 "section",
-                "concept"
+                "concept",
+                "table",
+                "key"
             ]
         );
         for k in NodeKind::ALL {
@@ -1044,7 +1046,7 @@ mod tests {
     fn req005_ac2_edge_kinds_and_rules() {
         use EdgeKind as E;
         use NodeKind as N;
-        assert_eq!(EdgeKind::ALL.len(), 8);
+        assert_eq!(EdgeKind::ALL.len(), 9);
         assert!(E::DependsOn.allows(N::Module, N::Dependency));
         assert!(E::DependsOn.allows(N::Module, N::Module));
         assert!(!E::DependsOn.allows(N::Type, N::Module));
@@ -1060,9 +1062,39 @@ mod tests {
         assert!(E::Mentions.allows(N::Section, N::Type));
         assert!(E::Mentions.allows(N::Section, N::Concept));
         assert!(!E::Mentions.allows(N::Section, N::Section));
-        assert!(!E::Mentions.allows(N::Document, N::Type));
+        // AC-005-2 (2026-10-17) : document de données et key → nœud de code, section → table.
+        assert!(E::Mentions.allows(N::Document, N::Type));
+        assert!(E::Mentions.allows(N::Document, N::Method));
+        assert!(E::Mentions.allows(N::Key, N::Type));
+        assert!(E::Mentions.allows(N::Section, N::Table));
+        assert!(!E::Mentions.allows(N::Document, N::Table));
+        assert!(!E::Mentions.allows(N::Document, N::Concept));
+        assert!(!E::Mentions.allows(N::Key, N::Key));
+        assert!(!E::Mentions.allows(N::Table, N::Type));
+        assert!(E::Contains.allows(N::Document, N::Table));
+        assert!(E::Contains.allows(N::Document, N::Key));
+        assert!(!E::Contains.allows(N::Section, N::Key));
+        assert!(!E::Contains.allows(N::Table, N::Key));
+        assert!(E::References.allows(N::Table, N::Table));
+        assert!(!E::References.allows(N::Table, N::Type));
+        assert!(!E::References.allows(N::Type, N::Table));
         assert!(E::Calls.allows(N::Method, N::Method));
         assert!(!E::Calls.allows(N::Type, N::Method));
+    }
+
+    #[test]
+    fn req005_ac1_genres_table_et_key() {
+        assert_eq!(NodeKind::parse("table").unwrap(), NodeKind::Table);
+        assert_eq!(NodeKind::parse("key").unwrap(), NodeKind::Key);
+        assert!(!NodeKind::Table.is_code() && !NodeKind::Key.is_code());
+        assert_eq!(NodeKind::ALL.len(), 10);
+    }
+
+    #[test]
+    fn req005_ac4_subkinds_donnees() {
+        for s in ["table", "view", "sql", "xml", "json", "yaml"] {
+            assert_eq!(SubKind::parse(s).unwrap().as_str(), s);
+        }
     }
 
     #[test]

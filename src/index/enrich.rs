@@ -300,11 +300,12 @@ fn enrich_chunks(
     Ok(chunk::merge_enrichments(results))
 }
 
-/// Identifiants des nœuds déclarés par chaque fichier, hors packages (REQ-024).
+/// Identifiants des nœuds déclarés par chaque fichier, hors packages et clés de configuration
+/// (REQ-024).
 fn node_ids_by_file(store: &Store) -> Result<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for (file, node) in store.declarations()? {
-        if !node.starts_with("package:") {
+        if !node.starts_with("package:") && !node.starts_with("key:") {
             map.entry(file).or_default().push(node);
         }
     }

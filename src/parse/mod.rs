@@ -1,6 +1,7 @@
 //! Extraction de la structure d'un fichier par analyse syntaxique (DEC-016 à DEC-020).
 
 pub mod calls;
+pub mod data;
 pub mod gradle;
 pub mod gradle_lex;
 pub mod groovy;
@@ -82,8 +83,20 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure>
             _ => Ok(FileStructure::default()),
         },
         Some(Lang::Markdown) => Ok(markdown::extract(path, text)),
+        // Extracteurs provisoires : le document seul (remplacés format par format, DEC-038).
+        Some(Lang::Sql) => Ok(data_document(path, data::Format::Sql)),
+        Some(Lang::DataXml) => Ok(data_document(path, data::Format::Xml)),
+        Some(Lang::Json) => Ok(data_document(path, data::Format::Json)),
+        Some(Lang::Yaml) => Ok(data_document(path, data::Format::Yaml)),
         Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) => Ok(gradle::extract(path, text, ctx)),
         None => Ok(FileStructure::default()),
+    }
+}
+
+fn data_document(path: &Path, format: data::Format) -> FileStructure {
+    FileStructure {
+        declares: vec![data::document(path, format)],
+        ..Default::default()
     }
 }
 
@@ -100,7 +113,28 @@ mod tests {
         let ivy = r#"<ivy-module><info organisation="o" module="m"/></ivy-module>"#;
         let f = extract(Path::new("x/ivy.xml"), ivy, &ctx).unwrap();
         assert_eq!(f.declares[0].id(), "module:o:m");
+        // XML hors build : le document seul.
         let f = extract(Path::new("x/other.xml"), pom, &ctx).unwrap();
-        assert!(f.declares.is_empty());
+        assert_eq!(f.declares.len(), 1);
+        assert_eq!(f.declares[0].id(), "document:x/other.xml");
+        assert_eq!(f.declares[0].subkind, Some(SubKind::Xml));
+        assert!(f.references.is_empty());
+    }
+
+    #[test]
+    fn extract_aiguille_les_formats_de_donnees_vers_un_document() {
+        let ctx = ParseCtx::default();
+        for (p, sub) in [
+            ("db/a.sql", SubKind::Sql),
+            ("a.json", SubKind::Json),
+            ("a.yaml", SubKind::Yaml),
+            ("a.yml", SubKind::Yaml),
+        ] {
+            let f = extract(Path::new(p), "", &ctx).unwrap();
+            assert_eq!(f.declares.len(), 1, "{p}");
+            assert_eq!(f.declares[0].id(), format!("document:{p}"));
+            assert_eq!(f.declares[0].subkind, Some(sub));
+            assert!(f.warnings.is_empty());
+        }
     }
 }

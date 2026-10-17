@@ -44,6 +44,8 @@ string_enum! {
         Document => "document",
         Section => "section",
         Concept => "concept",
+        Table => "table",
+        Key => "key",
     }
 }
 
@@ -58,11 +60,12 @@ string_enum! {
         LinksTo => "links_to",
         Mentions => "mentions",
         Calls => "calls",
+        References => "references",
     }
 }
 
 string_enum! {
-    /// Sous-genre d'un nœud de genre `type` (AC-005-4).
+    /// Sous-genre d'un nœud (AC-005-4) : `type`, `table` (`table`, `view`) ou `document` (`sql`, `xml`, `json`, `yaml`).
     SubKind {
         Class => "class",
         Interface => "interface",
@@ -71,6 +74,12 @@ string_enum! {
         Annotation => "annotation",
         Object => "object",
         Trait => "trait",
+        Table => "table",
+        View => "view",
+        Sql => "sql",
+        Xml => "xml",
+        Json => "json",
+        Yaml => "yaml",
     }
 }
 
@@ -103,10 +112,17 @@ impl EdgeKind {
                     | (N::Package, N::Type)
                     | (N::Module, N::Package)
                     | (N::Document, N::Section)
+                    | (N::Document, N::Table)
+                    | (N::Document, N::Key)
             ),
             EdgeKind::LinksTo => from == N::Document && to == N::Document,
-            EdgeKind::Mentions => from == N::Section && (to.is_code() || to == N::Concept),
+            EdgeKind::Mentions => match from {
+                N::Section => to.is_code() || to == N::Concept || to == N::Table,
+                N::Document | N::Key => to.is_code(),
+                _ => false,
+            },
             EdgeKind::Calls => from == N::Method && to == N::Method,
+            EdgeKind::References => from == N::Table && to == N::Table,
         }
     }
 }

@@ -31,6 +31,7 @@ fn passive(kind: EdgeKind) -> &'static str {
         EdgeKind::LinksTo => "cible du lien de",
         EdgeKind::Mentions => "mentionné par",
         EdgeKind::Calls => "appelé par",
+        EdgeKind::References => "référencé par",
     }
 }
 

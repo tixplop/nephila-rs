@@ -13,8 +13,9 @@ use std::time::UNIX_EPOCH;
 const RACY_WINDOW_MS: i64 = 2_000;
 
 const EXCLUDED_DIRS: [&str; 5] = ["target", "build", ".gradle", ".git", ".nephila"];
-const EXTENSIONS: [&str; 8] = [
-    "md", "markdown", "java", "kt", "kts", "groovy", "gradle", "scala",
+const EXTENSIONS: [&str; 13] = [
+    "md", "markdown", "java", "kt", "kts", "groovy", "gradle", "scala", "sql", "xml", "json",
+    "yaml", "yml",
 ];
 const BUILD_FILES: [&str; 6] = [
     "pom.xml",
@@ -87,6 +88,8 @@ pub fn scan(root: &Path, known: &[FileRecord]) -> Result<ScanResult> {
             root.display()
         )));
     }
+    // L'export par défaut (`<slug>.json`) peut être écrit dans le dépôt : jamais indexé (AC-004-5).
+    let export_name = format!("{}.json", crate::export::slug(root));
     let known: HashMap<&str, &FileRecord> = known.iter().map(|r| (r.path.as_str(), r)).collect();
     let walker = WalkBuilder::new(root)
         .hidden(false)
@@ -119,7 +122,7 @@ pub fn scan(root: &Path, known: &[FileRecord]) -> Result<ScanResult> {
             continue;
         }
         let name = entry.file_name().to_string_lossy();
-        if !is_supported(&name) {
+        if !is_supported(&name) || name == export_name {
             continue;
         }
         let rel = entry
