@@ -1,0 +1,3 @@
+<beans>
+  <bean id="orderService" class="com.acme.core.OrderService"/>
+</beans>

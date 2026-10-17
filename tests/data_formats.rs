@@ -598,3 +598,201 @@ fn req008_ac8_mention_xml_non_resolue_puis_reparee() {
         "beans.xml renvoyé au LLM : {new_log:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T-061 : un seul graphe, requêtes, export, vue et enrichissement
+// ---------------------------------------------------------------------------
+
+const DATA_APP_YML: &str = "src/main/resources/application.yml";
+
+impl Env {
+    /// Dépôt exemple complété des fichiers de données ; fixtures du mock copiées.
+    fn data() -> Env {
+        let env = Env::new();
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/data");
+        copy_dir(&fx.join("repo"), &env.repo);
+        copy_dir(&fx.join("mock"), &env.mock);
+        env
+    }
+
+    fn query(&self, args: &[&str]) -> String {
+        let mut a = vec!["query"];
+        a.extend_from_slice(args);
+        text(&self.ok(false, &a).stdout)
+    }
+}
+
+fn html_parts(html: &str) -> (String, serde_json::Value, String) {
+    let open = "<script type=\"application/json\" id=\"nephila-data\">";
+    let start = html.find(open).expect("bloc nephila-data");
+    let body = start + open.len();
+    let end = body + html[body..].find("</script>").expect("fin du bloc");
+    (
+        html[..start].to_string(),
+        serde_json::from_str(&html[body..end]).expect("bloc JSON"),
+        html[end..].to_string(),
+    )
+}
+
+/// AC-005-6
+#[test]
+fn req005_ac6_un_seul_graphe_pour_les_cinq_familles() {
+    let env = Env::data();
+    env.ok(false, &["build"]);
+    assert!(env.has_edge(
+        "section:docs/schema.md#commandes",
+        "mentions",
+        "table:orders"
+    ));
+    assert!(env.has_edge(
+        "document:src/main/resources/beans.xml",
+        "mentions",
+        "type:com.acme.core.OrderService"
+    ));
+    assert!(env.has_edge(
+        &format!("key:{DATA_APP_YML}#nephila.listener"),
+        "mentions",
+        "type:com.acme.core.OrderService"
+    ));
+
+    let out = env.ok(false, &["export", "--output", "-"]);
+    let v: serde_json::Value = serde_json::from_str(&text(&out.stdout)).unwrap();
+    let kinds: Vec<&str> = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"table") && kinds.contains(&"key"));
+    assert!(v["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "references"));
+}
+
+/// AC-005-6 : la vue HTML
+#[test]
+fn req005_ac6_vue_html_identique_hors_donnees() {
+    let with = Env::data();
+    with.ok(false, &["build"]);
+    let without = Env::maven();
+    without.ok(false, &["build"]);
+    let page = |e: &Env| {
+        let out = e.ok(false, &["export", "--format", "html", "--output", "-"]);
+        html_parts(&text(&out.stdout))
+    };
+    let (before_w, data_w, after_w) = page(&with);
+    let (before_o, data_o, after_o) = page(&without);
+    assert_eq!(before_w, before_o);
+    assert_eq!(after_w, after_o);
+
+    let node_kinds = |d: &serde_json::Value| -> Vec<String> {
+        d["nodeKinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect()
+    };
+    let edge_kinds = |d: &serde_json::Value| -> Vec<String> {
+        d["edgeKinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect()
+    };
+    let nk = node_kinds(&data_w);
+    assert!(nk.contains(&"table".to_string()) && nk.contains(&"key".to_string()));
+    assert!(edge_kinds(&data_w).contains(&"references".to_string()));
+    let nk_o = node_kinds(&data_o);
+    assert!(!nk_o.contains(&"table".to_string()) && !nk_o.contains(&"key".to_string()));
+    assert!(!edge_kinds(&data_o).contains(&"references".to_string()));
+}
+
+/// AC-030-6
+#[test]
+fn req030_ac6_neighbors_orders_et_search_products() {
+    let env = Env::data();
+    env.ok(false, &["build"]);
+    let out = env.query(&["neighbors", "orders"]);
+    let (uses, used_by) = out.split_once("utilisé par :").expect(&out);
+    assert!(uses.contains("references customers (table"), "{out}");
+    assert!(uses.contains("references shop.products (table"), "{out}");
+    assert!(used_by.contains("contains db/V1__init.sql (sql"), "{out}");
+    let out = env.query(&["search", "products"]);
+    assert!(out.contains("shop.products (table"), "{out}");
+}
+
+/// AC-030-6 : chemin entre deux tables
+#[test]
+fn req030_ac6_path_entre_deux_tables() {
+    let env = Env::data();
+    env.ok(false, &["build"]);
+    let out = env.query(&["path", "customers", "shop.products"]);
+    assert!(out.contains("customers référencé par orders"), "{out}");
+    assert!(out.contains("orders references shop.products"), "{out}");
+}
+
+/// AC-032-5
+#[test]
+fn req032_ac5_search_et_neighbors_sur_une_cle() {
+    let env = Env::data();
+    env.ok(false, &["build"]);
+    let out = env.query(&["search", "server.port"]);
+    assert!(out.contains("config/app.json#server.port (key"), "{out}");
+    let out = env.query(&["neighbors", "server.handler"]);
+    let (uses, used_by) = out.split_once("utilisé par :").expect(&out);
+    assert!(
+        uses.contains("mentions com.acme.core.OrderService"),
+        "{out}"
+    );
+    assert!(used_by.contains("contains config/app.json"), "{out}");
+}
+
+/// `summary` sur le dépôt complété
+#[test]
+fn req019_summary_du_depot_avec_fichiers_de_donnees() {
+    let env = Env::data();
+    env.ok(false, &["build"]);
+    let out = env.ok(false, &["summary"]);
+    assert!(text(&out.stderr).is_empty(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("table:orders"));
+}
+
+/// AC-024-10 avec `mock`
+#[test]
+fn req024_ac10_enrichissement_mock_des_fichiers_de_donnees() {
+    let env = Env::data();
+    let out = env.ok(true, &["build"]);
+    let err = text(&out.stderr);
+    let warn: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("avertissement:") && l.contains("config/app.json"))
+        .collect();
+    assert_eq!(warn.len(), 1, "{err}");
+    assert!(warn[0].contains("key:config/app.json#server.port"), "{err}");
+
+    let out = env.query(&["search", "Configuration JSON"]);
+    assert!(out.contains("config/app.json"), "{out}");
+    let out = env.query(&["search", "commandes"]);
+    assert!(out.contains("orders"), "{out}");
+    let st = Store::open_readonly(&env.repo).unwrap();
+    let with_summary = |id: &str| {
+        st.nodes()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.summary.clone())
+    };
+    assert_eq!(
+        with_summary("document:config/app.json").as_deref(),
+        Some("Configuration JSON de l'application.")
+    );
+    assert_eq!(
+        with_summary("table:orders").as_deref(),
+        Some("Table des commandes.")
+    );
+    assert_eq!(with_summary("key:config/app.json#server.port"), None);
+}

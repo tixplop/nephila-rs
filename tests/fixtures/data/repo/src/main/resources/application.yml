@@ -1,0 +1,2 @@
+nephila:
+  listener: com.acme.core.OrderService

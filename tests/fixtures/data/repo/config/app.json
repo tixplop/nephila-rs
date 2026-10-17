@@ -1,0 +1,1 @@
+{"server": {"port": 8080, "handler": "com.acme.core.OrderService"}}

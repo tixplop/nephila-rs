@@ -426,3 +426,49 @@ fn req027_ac8_lot_version_2_is_non_conforming_and_errors_classified() {
     ));
     assert!(matches!(o.enrich_lot(&lot_items()), Err(Error::Network(_))));
 }
+
+// ---- AC-024-10 : liste de nœuds d'un fichier de données, faux serveur openai ----
+
+#[test]
+fn req024_ac10_openai_node_list_of_json_document_has_no_key() {
+    let reply = r#"{"version":2,"summaries":[{"node":"document:config/app.json","summary":"Configuration."}],"concepts":[]}"#;
+    let s = FakeServer::start(vec![(200, "{}".into()), (200, openai_reply(reply))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("config")).unwrap();
+    std::fs::write(
+        repo.join("config/app.json"),
+        r#"{"server": {"port": 8080, "handler": "com.acme.core.OrderService"}}"#,
+    )
+    .unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T061_KEY\"\nconcurrency = 1\n",
+            s.base_url
+        ),
+    )
+    .unwrap();
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+        .arg("-C")
+        .arg(&repo)
+        .arg("build")
+        .env("NEPHILA_CONFIG", &config)
+        .env("NEPHILA_T061_KEY", "sk-test")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let posts: Vec<_> = s
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 1);
+    assert!(posts[0].body.contains("document:config/app.json"));
+    assert!(!posts[0].body.contains("key:"), "{}", posts[0].body);
+}
