@@ -401,15 +401,17 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 git tag v0.8.1 && git push origin v0.8.1
 ```
 
+Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
+
 ```sh
-cargo test -q                                                   # suite complète
+cargo nextest run --cargo-quiet --color never --test-threads 1 --no-fail-fast --status-level fail --final-status-level fail   # suite complète
 cargo fmt --all -- --check
-cargo clippy -q --all-targets -- -D warnings                    # lint
-cargo test --release -q -- --ignored perf                       # performances (dépôt de 10 000 fichiers)
-node --test --test-reporter=dot 'tests/view/*.test.js'          # logique de la vue HTML
+cargo clippy -q --all-targets --color never -- -D warnings      # lint
+cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf       # performances (dépôt de 10 000 fichiers)
+node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests/view/*.test.js'   # logique de la vue HTML
 ```
 
-La logique de la vue HTML est un module JS pur, testé par `node --test`. Node 20 ou plus est requis pour ces tests seulement, sans npm ni dépendance : le produit n'en dépend pas. Un test Rust compare les données de la vue à la fixture `tests/view/fixtures/maven3.json`. Après un changement volontaire de l'export, régénérez-la avec `NEPHILA_UPDATE_VIEW_FIXTURE=1 cargo test view_fixture`. Le rendu et les interactions souris se vérifient à la main.
+La logique de la vue HTML est un module JS pur, testé par `node --test`. Node 20 ou plus est requis pour ces tests seulement, sans npm ni dépendance : le produit n'en dépend pas. Un test Rust compare les données de la vue à la fixture `tests/view/fixtures/maven3.json`. Après un changement volontaire de l'export, régénérez-la avec `NEPHILA_UPDATE_VIEW_FIXTURE=1 cargo nextest run view_fixture`. Le rendu et les interactions souris se vérifient à la main.
 
 ### LLM simulé (`provider = "mock"`)
 

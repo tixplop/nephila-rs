@@ -37,18 +37,23 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --locked --color never --test-threads 1 --no-fail-fast
 
   view:
     name: tests de la vue HTML (node)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node --test --test-reporter=dot 'tests/view/*.test.js'
+      - run: node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests/view/*.test.js'
