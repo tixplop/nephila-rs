@@ -8,11 +8,13 @@ pub mod groovy;
 pub mod ivy;
 pub mod java;
 pub mod jvm;
+pub mod keys;
 pub mod kotlin;
 pub mod lang;
 pub mod markdown;
 pub mod maven;
 pub mod scala;
+pub mod yaml;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -87,7 +89,7 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure>
         Some(Lang::Sql) => Ok(data_document(path, data::Format::Sql)),
         Some(Lang::DataXml) => Ok(data_document(path, data::Format::Xml)),
         Some(Lang::Json) => Ok(data_document(path, data::Format::Json)),
-        Some(Lang::Yaml) => Ok(data_document(path, data::Format::Yaml)),
+        Some(Lang::Yaml) => Ok(yaml::extract(path, text)),
         Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) => Ok(gradle::extract(path, text, ctx)),
         None => Ok(FileStructure::default()),
     }

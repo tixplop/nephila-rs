@@ -184,3 +184,164 @@ fn req004_ac5_export_du_depot_jamais_indexe() {
     let (nodes, _) = env.structure();
     assert_eq!(nodes.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// YAML (REQ-033)
+// ---------------------------------------------------------------------------
+
+const APP_YML: &str = "src/main/resources/application.yml";
+
+const APP_YML_TEXT: &str = "spring:\n  datasource:\n    url: jdbc:postgresql://db/app\n    driver-class-name: org.postgresql.Driver\nnephila:\n  listener: com.acme.core.OrderService\n  handlers:\n    - com.acme.core.OrderRepository\n    - name: x\n      impl: com.acme.core.OrderService\n";
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &dest);
+        } else {
+            fs::copy(e.path(), dest).unwrap();
+        }
+    }
+}
+
+impl Env {
+    /// Dépôt Maven exemple.
+    fn maven() -> Env {
+        let env = Env::new();
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/maven3/repo"),
+            &env.repo,
+        );
+        env
+    }
+
+    fn has_edge(&self, s: &str, k: &str, t: &str) -> bool {
+        self.structure().1.contains(&format!("{s} {k} {t}"))
+    }
+
+    fn key_ids(&self, file: &str) -> Vec<String> {
+        let prefix = format!("key:{file}#");
+        let mut v: Vec<String> = self
+            .structure()
+            .0
+            .iter()
+            .map(|n| n.split('|').next().unwrap().to_string())
+            .filter(|id| id.starts_with(&prefix))
+            .map(|id| id[prefix.len()..].to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn parse_ref_ids(&self, file: &str) -> Vec<i64> {
+        let conn = rusqlite::Connection::open(self.repo.join(".nephila/graph.db")).unwrap();
+        let mut st = conn
+            .prepare("SELECT id FROM refs WHERE file = ?1 AND origin = 'parse' ORDER BY id")
+            .unwrap();
+        let rows = st.query_map([file], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+}
+
+/// AC-033-1 de bout en bout
+#[test]
+fn req033_ac1_application_yml_de_bout_en_bout() {
+    let env = Env::maven();
+    env.put(APP_YML, APP_YML_TEXT);
+    env.ok(false, &["build"]);
+    assert_eq!(
+        env.key_ids(APP_YML),
+        [
+            "nephila.handlers",
+            "nephila.listener",
+            "spring.datasource.driver-class-name",
+            "spring.datasource.url"
+        ]
+    );
+    let k = |p: &str| format!("key:{APP_YML}#{p}");
+    assert!(env.has_edge(
+        &k("nephila.listener"),
+        "mentions",
+        "type:com.acme.core.OrderService"
+    ));
+    assert!(env.has_edge(
+        &k("nephila.handlers"),
+        "mentions",
+        "type:com.acme.core.OrderRepository"
+    ));
+    assert!(env.has_edge(
+        &k("nephila.handlers"),
+        "mentions",
+        "type:com.acme.core.OrderService"
+    ));
+    let doc = format!("document:{APP_YML}");
+    assert!(env.has_edge(&doc, "contains", &k("nephila.listener")));
+
+    let out = env.ok(false, &["export", "--output", "-"]);
+    let v: serde_json::Value = serde_json::from_str(&text(&out.stdout)).unwrap();
+    let unresolved = v["unresolved"].as_array().unwrap();
+    assert!(
+        !unresolved
+            .iter()
+            .any(|u| u.to_string().contains("org.postgresql.Driver")),
+        "{unresolved:?}"
+    );
+}
+
+/// AC-029-4
+#[test]
+fn req029_ac4_application_yml_modifie_puis_update() {
+    let env = Env::maven();
+    env.put(APP_YML, APP_YML_TEXT);
+    env.ok(false, &["build"]);
+    let other = "core/src/main/java/com/acme/core/OrderService.java";
+    let other_before = env.parse_ref_ids(other);
+    let yml_before = env.parse_ref_ids(APP_YML);
+    assert!(!other_before.is_empty() && !yml_before.is_empty());
+
+    env.put(
+        APP_YML,
+        "spring:\n  datasource:\n    url: jdbc:postgresql://db/app\nnephila:\n  listener: com.acme.core.OrderService\n  nouvelle: 1\n",
+    );
+    let status = text(&env.ok(false, &["status"]).stdout);
+    assert!(
+        status.lines().any(|l| l == format!("modifié\t{APP_YML}")),
+        "{status}"
+    );
+    env.ok(false, &["update"]);
+    assert_eq!(env.parse_ref_ids(other), other_before);
+    assert_ne!(env.parse_ref_ids(APP_YML), yml_before);
+    let keys = env.key_ids(APP_YML);
+    assert!(keys.contains(&"nephila.nouvelle".to_string()), "{keys:?}");
+    assert!(!keys.contains(&"nephila.handlers".to_string()), "{keys:?}");
+    assert!(
+        !keys.contains(&"spring.datasource.driver-class-name".to_string()),
+        "{keys:?}"
+    );
+}
+
+/// AC-029-5 (partie `t.yaml`) : vide puis mal formé
+#[test]
+fn req029_ac5_yaml_vide_puis_mal_forme() {
+    let env = Env::new();
+    env.put("t.yaml", "");
+    let out = env.ok(false, &["build"]);
+    assert!(
+        !text(&out.stderr).contains("avertissement:"),
+        "{}",
+        text(&out.stderr)
+    );
+    let (nodes, _) = env.structure();
+    assert_eq!(nodes, ["document:t.yaml|t.yaml|yaml"]);
+
+    env.put("t.yaml", "a: [1");
+    let out = env.ok(false, &["update"]);
+    let err = text(&out.stderr);
+    assert_eq!(err.matches("avertissement:").count(), 1, "{err}");
+    assert!(err.contains("t.yaml"), "{err}");
+    let status = text(&env.ok(false, &["status"]).stdout);
+    assert!(status.contains("graphe à jour"), "{status}");
+    assert!(env.key_ids("t.yaml").contains(&"a".to_string()));
+}
