@@ -345,3 +345,116 @@ fn req029_ac5_yaml_vide_puis_mal_forme() {
     assert!(status.contains("graphe à jour"), "{status}");
     assert!(env.key_ids("t.yaml").contains(&"a".to_string()));
 }
+
+// ---------------------------------------------------------------------------
+// SQL (REQ-030)
+// ---------------------------------------------------------------------------
+
+const V1: &str = "CREATE TABLE customers (id INT PRIMARY KEY);\nCREATE TABLE IF NOT EXISTS \"Orders\" (id INT, customer_id INT REFERENCES customers(id))";
+const V2: &str = "ALTER TABLE orders ADD CONSTRAINT fk_p FOREIGN KEY (product_id) REFERENCES shop.products (id);\n";
+const V3: &str = "CREATE TABLE shop.products (id INT);\n";
+
+/// AC-030-1 de bout en bout
+#[test]
+fn req030_ac1_tables_et_lien_references() {
+    let env = Env::new();
+    env.put("db/V1__init.sql", V1);
+    let out = env.ok(false, &["build"]);
+    assert!(
+        !text(&out.stderr).contains("avertissement:"),
+        "{}",
+        text(&out.stderr)
+    );
+    let (nodes, _) = env.structure();
+    assert!(nodes.contains(&"table:customers|customers|table".to_string()));
+    assert!(nodes.contains(&"table:orders|orders|table".to_string()));
+    assert!(env.has_edge("table:orders", "references", "table:customers"));
+    assert!(env.has_edge("document:db/V1__init.sql", "contains", "table:orders"));
+}
+
+/// AC-030-2 : nœud partagé, puis suppression de V2 et `update`
+#[test]
+fn req030_ac2_noeud_partage_et_suppression() {
+    let env = Env::new();
+    env.put("db/V1__init.sql", V1);
+    env.put("db/V2__fk.sql", V2);
+    env.put("db/V3__products.sql", V3);
+    env.ok(false, &["build"]);
+    let (nodes, _) = env.structure();
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|n| n.starts_with("table:orders|"))
+            .count(),
+        1
+    );
+    let st = Store::open_readonly(&env.repo).unwrap();
+    let orders = st
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.id == "table:orders")
+        .unwrap();
+    assert_eq!(orders.file.as_deref(), Some("db/V1__init.sql"));
+    drop(st);
+    assert!(env.has_edge("table:orders", "references", "table:shop.products"));
+
+    fs::remove_file(env.repo.join("db/V2__fk.sql")).unwrap();
+    env.ok(false, &["update"]);
+    assert!(!env.has_edge("table:orders", "references", "table:shop.products"));
+    assert!(env
+        .structure()
+        .0
+        .contains(&"table:orders|orders|table".to_string()));
+
+    let fresh = Env::new();
+    fresh.put("db/V1__init.sql", V1);
+    fresh.put("db/V3__products.sql", V3);
+    fresh.ok(false, &["build"]);
+    assert_eq!(fresh.structure(), env.structure());
+}
+
+/// AC-008-9
+#[test]
+fn req008_ac9_reference_sql_non_resolue_puis_reparee() {
+    let env = Env::new();
+    env.put(
+        "db/a.sql",
+        "CREATE TABLE orders (c INT REFERENCES absente(id));\n",
+    );
+    let out = env.ok(false, &["build"]);
+    assert!(
+        text(&out.stdout).contains("1 références non résolues"),
+        "{}",
+        text(&out.stdout)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&text(&env.ok(false, &["export", "--output", "-"]).stdout)).unwrap();
+    let un = v["unresolved"].as_array().unwrap();
+    assert!(
+        un.iter().any(|u| u["source"] == "table:orders"
+            && u["kind"] == "references"
+            && u["target"] == "absente"),
+        "{un:?}"
+    );
+
+    let before = env.parse_ref_ids("db/a.sql");
+    env.put("db/b.sql", "CREATE TABLE absente (id INT);\n");
+    env.ok(false, &["update"]);
+    assert!(env.has_edge("table:orders", "references", "table:absente"));
+    assert_eq!(env.parse_ref_ids("db/a.sql"), before);
+}
+
+/// AC-030-5 et AC-029-5 (partie `t.sql`) : tronqué
+#[test]
+fn req030_ac5_sql_tronque() {
+    let env = Env::new();
+    env.put("t.sql", "CREATE TABLE a (id INT, b_id INT REFERENCES b(id)");
+    let out = env.ok(false, &["build"]);
+    let err = text(&out.stderr);
+    assert_eq!(err.matches("avertissement:").count(), 1, "{err}");
+    assert!(err.contains("t.sql"), "{err}");
+    assert!(env.structure().0.contains(&"table:a|a|table".to_string()));
+    let status = text(&env.ok(false, &["status"]).stdout);
+    assert!(status.contains("graphe à jour"), "{status}");
+}

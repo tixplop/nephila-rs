@@ -14,6 +14,7 @@ pub mod lang;
 pub mod markdown;
 pub mod maven;
 pub mod scala;
+pub mod sql;
 pub mod yaml;
 
 use std::collections::HashMap;
@@ -86,7 +87,7 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure>
         },
         Some(Lang::Markdown) => Ok(markdown::extract(path, text)),
         // Extracteurs provisoires : le document seul (remplacés format par format, DEC-038).
-        Some(Lang::Sql) => Ok(data_document(path, data::Format::Sql)),
+        Some(Lang::Sql) => Ok(sql::extract(path, text)),
         Some(Lang::DataXml) => Ok(data_document(path, data::Format::Xml)),
         Some(Lang::Json) => Ok(data_document(path, data::Format::Json)),
         Some(Lang::Yaml) => Ok(yaml::extract(path, text)),
