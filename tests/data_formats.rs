@@ -162,7 +162,7 @@ fn req004_ac5_export_du_depot_jamais_indexe() {
     let env = Env::new();
     env.put("monrepo.json", "{\"nodes\": []}");
     env.put("sub/monrepo.json", "{\"a\": 1}");
-    env.put("config.json", "{\"a\": 1}");
+    env.put("config.json", "{}");
     env.ok(false, &["build"]);
     let (nodes, _) = env.structure();
     let ids: Vec<&str> = nodes.iter().map(|n| n.split('|').next().unwrap()).collect();
@@ -212,6 +212,16 @@ impl Env {
         let env = Env::new();
         copy_dir(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/maven3/repo"),
+            &env.repo,
+        );
+        env
+    }
+
+    /// Dépôt Ivy exemple.
+    fn ivy() -> Env {
+        let env = Env::new();
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ivy"),
             &env.repo,
         );
         env
@@ -457,4 +467,134 @@ fn req030_ac5_sql_tronque() {
     assert!(env.structure().0.contains(&"table:a|a|table".to_string()));
     let status = text(&env.ok(false, &["status"]).stdout);
     assert!(status.contains("graphe à jour"), "{status}");
+}
+
+// ---------------------------------------------------------------------------
+// XML et JSON (REQ-031, REQ-032)
+// ---------------------------------------------------------------------------
+
+/// AC-029-5 : quatre fichiers vides, aucun avertissement
+#[test]
+fn req029_ac5_quatre_fichiers_vides() {
+    let env = Env::new();
+    for f in ["t.sql", "t.xml", "t.json", "t.yaml"] {
+        env.put(f, "");
+    }
+    let out = env.ok(false, &["build"]);
+    assert!(
+        !text(&out.stderr).contains("avertissement:"),
+        "{}",
+        text(&out.stderr)
+    );
+    let (nodes, edges) = env.structure();
+    assert_eq!(nodes.len(), 4, "{nodes:?}");
+    assert!(edges.is_empty());
+}
+
+/// AC-029-5 : quatre fichiers mal formés
+#[test]
+fn req029_ac5_quatre_fichiers_mal_formes() {
+    let env = Env::new();
+    env.put("t.sql", "CREATE TABLE a (");
+    env.put("t.xml", "<a><b>");
+    env.put("t.json", "{\"a\":");
+    env.put("t.yaml", "a: [1");
+    let out = env.ok(false, &["build"]);
+    let err = text(&out.stderr);
+    for f in ["t.sql", "t.xml", "t.json", "t.yaml"] {
+        let n = err
+            .lines()
+            .filter(|l| l.starts_with("avertissement:") && l.contains(f))
+            .count();
+        assert_eq!(n, 1, "{f} : {err}");
+    }
+    assert_eq!(err.matches("avertissement:").count(), 4, "{err}");
+    let status = text(&env.ok(false, &["status"]).stdout);
+    assert!(status.contains("graphe à jour"), "{status}");
+}
+
+/// AC-032-3 de bout en bout
+#[test]
+fn req032_ac3_json_corrige_puis_update() {
+    let env = Env::new();
+    env.put("c.json", "{\"a\": 1,");
+    let out = env.ok(false, &["build"]);
+    let err = text(&out.stderr);
+    assert_eq!(err.matches("avertissement:").count(), 1, "{err}");
+    assert!(err.contains("c.json"), "{err}");
+    assert!(env.key_ids("c.json").is_empty());
+    let status = text(&env.ok(false, &["status"]).stdout);
+    assert!(status.contains("graphe à jour"), "{status}");
+
+    env.put("c.json", "{\"a\": 1}");
+    env.ok(false, &["update"]);
+    assert_eq!(env.key_ids("c.json"), ["a"]);
+}
+
+/// AC-031-3 : `pom.xml` et `ivy.xml` ne donnent pas de nœud document
+#[test]
+fn req031_ac3_pom_et_ivy_sans_noeud_document() {
+    let env = Env::maven();
+    env.ok(false, &["build"]);
+    let (nodes, _) = env.structure();
+    assert!(
+        !nodes
+            .iter()
+            .any(|n| n.starts_with("document:") && (n.contains("pom.xml") || n.contains("ivy.xml"))),
+        "{nodes:?}"
+    );
+    assert!(nodes.iter().any(|n| n.starts_with("module:")));
+}
+
+/// AC-031-3, côté Ivy : `ivy.xml` présent, aiguillé vers `ivy`
+#[test]
+fn req031_ac3_ivy_sans_noeud_document() {
+    let env = Env::ivy();
+    assert!(env.repo.join("ivy.xml").is_file());
+    env.ok(false, &["build"]);
+    let (nodes, _) = env.structure();
+    assert!(
+        !nodes
+            .iter()
+            .any(|n| n.starts_with("document:") && n.contains("ivy.xml")),
+        "{nodes:?}"
+    );
+    assert!(nodes.iter().any(|n| n.starts_with("module:")), "{nodes:?}");
+}
+
+/// AC-008-8
+#[test]
+fn req008_ac8_mention_xml_non_resolue_puis_reparee() {
+    let env = Env::new();
+    env.put(
+        "beans.xml",
+        "<beans><bean class=\"com.acme.Later\"/></beans>",
+    );
+    let out = env.ok(true, &["build"]);
+    assert!(
+        text(&out.stdout).contains(" 0 références non résolues"),
+        "{}",
+        text(&out.stdout)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&text(&env.ok(true, &["export", "--output", "-"]).stdout)).unwrap();
+    assert!(
+        !v["unresolved"].to_string().contains("com.acme.Later"),
+        "{}",
+        v["unresolved"]
+    );
+
+    env.put(
+        "com/acme/Later.java",
+        "package com.acme;\npublic class Later {}\n",
+    );
+    let before = env.log_lines();
+    env.ok(true, &["update"]);
+    assert!(env.has_edge("document:beans.xml", "mentions", "type:com.acme.Later"));
+    let log = fs::read_to_string(&env.log).unwrap_or_default();
+    let new_log: Vec<&str> = log.lines().skip(before).collect();
+    assert!(
+        new_log.iter().all(|l| !l.contains("beans.xml")),
+        "beans.xml renvoyé au LLM : {new_log:?}"
+    );
 }

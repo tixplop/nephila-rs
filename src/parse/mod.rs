@@ -7,6 +7,7 @@ pub mod gradle_lex;
 pub mod groovy;
 pub mod ivy;
 pub mod java;
+pub mod json;
 pub mod jvm;
 pub mod keys;
 pub mod kotlin;
@@ -15,6 +16,7 @@ pub mod markdown;
 pub mod maven;
 pub mod scala;
 pub mod sql;
+pub mod xml_data;
 pub mod yaml;
 
 use std::collections::HashMap;
@@ -86,20 +88,13 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure>
             _ => Ok(FileStructure::default()),
         },
         Some(Lang::Markdown) => Ok(markdown::extract(path, text)),
-        // Extracteurs provisoires : le document seul (remplacés format par format, DEC-038).
+        // Fichiers de données (DEC-038).
         Some(Lang::Sql) => Ok(sql::extract(path, text)),
-        Some(Lang::DataXml) => Ok(data_document(path, data::Format::Xml)),
-        Some(Lang::Json) => Ok(data_document(path, data::Format::Json)),
+        Some(Lang::DataXml) => Ok(xml_data::extract(path, text)),
+        Some(Lang::Json) => Ok(json::extract(path, text)),
         Some(Lang::Yaml) => Ok(yaml::extract(path, text)),
         Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) => Ok(gradle::extract(path, text, ctx)),
         None => Ok(FileStructure::default()),
-    }
-}
-
-fn data_document(path: &Path, format: data::Format) -> FileStructure {
-    FileStructure {
-        declares: vec![data::document(path, format)],
-        ..Default::default()
     }
 }
 
