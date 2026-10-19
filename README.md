@@ -21,6 +21,7 @@ Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, JavaScript et 
 - [Commandes](#commandes)
 - [Export et vue HTML](#export-et-vue-html)
 - [Configuration du LLM](#configuration-du-llm)
+- [Proxy d'entreprise et certificats auto-signés](#proxy-dentreprise-et-certificats-auto-signés)
 - [Enrichissement en lots](#enrichissement-en-lots)
 - [Ce que l'analyse extrait](#ce-que-lanalyse-extrait)
 - [Fonctionnement](#fonctionnement)
@@ -69,7 +70,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge.
 
 ```sh
-V=v0.10.0                                      # version voulue
+V=v0.11.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -205,7 +206,7 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 
 Événements tracés :
 
-- la configuration (fournisseur, modèle, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, ou `llm inactif`) ;
+- la configuration (fournisseur, modèle, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ;
 - la vérification de la clé ;
 - le parcours des fichiers ;
 - le début et la fin de chaque phase (structure, résolution, enrichissement) ;
@@ -272,6 +273,8 @@ Un exemple commenté est fourni dans [`examples/config.toml`](examples/config.to
 | `concurrency` | Appels simultanés | 4 |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 1 |
 | `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 (la connexion reste limitée à 10 s) | 300 |
+| `tls_ca_cert` | Chemin d'un fichier PEM d'autorités de certification, **ajoutées** aux autorités publiques embarquées. Absolu, `~/…`, ou relatif au dossier du fichier de configuration. Le magasin du système n'est pas lu (pour s'y fier : `/etc/ssl/certs/ca-certificates.crt`) | aucun |
+| `tls_insecure` | Booléen. `true` désactive tout contrôle du certificat du serveur, comme `curl -k` ; un avertissement est écrit à chaque commande | `false` |
 
 La clé d'API n'est jamais écrite dans le fichier. Avant tout traitement, `nephila` la vérifie par un appel qui liste les modèles, sans coût de génération.
 
@@ -315,6 +318,21 @@ provider = "mock"
 | Aucun fichier, ou `NEPHILA_CONFIG` vers un fichier absent | structure seule, code 0, `enrichissement : désactivé` | échoue, demande une configuration |
 | Fichier valide | structure et enrichissement | répond |
 | Fichier invalide | échoue (sauf avec `--no-llm`) | échoue |
+
+## Proxy d'entreprise et certificats auto-signés
+
+Si le serveur (proxy d'entreprise, serveur local) présente un certificat signé par une autorité privée, donnez le PEM de cette autorité :
+
+```toml
+provider = "openai"
+model = "llama3.1"
+base_url = "https://127.0.0.1:8443"
+tls_ca_cert = "certs/ca.pem"   # relatif au fichier de configuration
+```
+
+Les autorités publiques restent reconnues. En dernier recours, `tls_insecure = true` désactive le contrôle (chaîne, dates, nom d'hôte) ; la connexion reste chiffrée. À éviter hors d'un poste de développement.
+
+Un certificat refusé produit une erreur contenant « certificat » et nommant `tls_ca_cert` et `tls_insecure` : ajoutez l'autorité avec `tls_ca_cert`, ou, faute de mieux, activez `tls_insecure`. Ces clés n'ont aucun effet avec `provider = "mock"` ni avec une `base_url` en `http://`. Le TLS mutuel (certificat client) n'est pas pris en charge.
 
 ## Enrichissement en lots
 
@@ -440,6 +458,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.11.0 | Certificats d'autorité et désactivation du contrôle TLS (clés `tls_ca_cert`, `tls_insecure`) |
 | 0.10.0 | JavaScript et TypeScript (modules ES, imports, appels, JSX), `package.json` comme fichier de build ; sous-genres `alias` et `object` ; modules désignés par leur nom qualifié |
 | 0.9.0 | Fichiers de données : SQL (tables, vues, `references`), XML, JSON et YAML (clés, noms JVM cités) ; genres `table` et `key` |
 | 0.8.1 | Premiers binaires précompilés (Linux musl, macOS) publiés par la CI |
@@ -457,7 +476,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.10.0 && git push origin v0.10.0
+git tag v0.11.0 && git push origin v0.11.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
@@ -469,6 +488,8 @@ cargo clippy -q --all-targets --color never -- -D warnings      # lint
 cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf       # performances (dépôt de 10 000 fichiers)
 node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests/view/*.test.js'   # logique de la vue HTML
 ```
+
+Les certificats de test TLS (`tests/fixtures/tls/`) se régénèrent par `tests/fixtures/tls/gen.sh` (nécessite `openssl`).
 
 La logique de la vue HTML est un module JS pur, testé par `node --test`. Node 20 ou plus est requis pour ces tests seulement, sans npm ni dépendance : le produit n'en dépend pas. Un test Rust compare les données de la vue à la fixture `tests/view/fixtures/maven3.json`. Après un changement volontaire de l'export, régénérez-la avec `NEPHILA_UPDATE_VIEW_FIXTURE=1 cargo nextest run view_fixture`. Le rendu et les interactions souris se vérifient à la main.
 
