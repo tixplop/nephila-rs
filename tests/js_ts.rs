@@ -772,3 +772,391 @@ fn req005_ac5_modules_jvm_et_npm_ne_se_melangent_pas() {
         .count();
     assert_eq!(n, 2);
 }
+
+// ---- un seul graphe, requêtes, export, vue, enrichissement (T-068) ----
+
+use std::path::PathBuf;
+
+fn fixtures_js() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/js")
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &dest);
+        } else {
+            fs::copy(e.path(), dest).unwrap();
+        }
+    }
+}
+
+/// Dépôt, configuration `mock`, fixtures et journal du mock.
+struct Env {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    config: PathBuf,
+    mock: PathBuf,
+    log: PathBuf,
+}
+
+impl Env {
+    fn empty() -> Env {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("monrepo");
+        fs::create_dir_all(&repo).unwrap();
+        let mock = tmp.path().join("mock");
+        fs::create_dir_all(&mock).unwrap();
+        let config = tmp.path().join("config.toml");
+        fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        let log = tmp.path().join("mock.log");
+        Env {
+            _tmp: tmp,
+            repo,
+            config,
+            mock,
+            log,
+        }
+    }
+
+    /// Dépôt Maven exemple complété de `web/` ; fixtures du mock copiées.
+    fn mixed() -> Env {
+        let env = Env::empty();
+        copy_dir(&fixtures_js().join("mixed"), &env.repo);
+        copy_dir(&fixtures_js().join("mock"), &env.mock);
+        env
+    }
+
+    fn put(&self, rel: &str, text: &str) {
+        write(&self.repo, rel, text);
+    }
+
+    fn run(&self, llm: bool, args: &[&str]) -> std::process::Output {
+        let config = if llm {
+            self.config.clone()
+        } else {
+            self.config.with_file_name("absent.toml")
+        };
+        Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log)
+            .output()
+            .unwrap()
+    }
+
+    fn ok(&self, llm: bool, args: &[&str]) -> std::process::Output {
+        let o = self.run(llm, args);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        o
+    }
+
+    fn query(&self, args: &[&str]) -> String {
+        let mut a = vec!["query"];
+        a.extend_from_slice(args);
+        stdout(&self.ok(false, &a))
+    }
+
+    fn export(&self) -> Value {
+        serde_json::from_slice(&self.ok(false, &["export", "--output", "-"]).stdout).unwrap()
+    }
+
+    fn logged_paths(&self) -> std::collections::BTreeSet<String> {
+        fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect()
+    }
+}
+
+/// AC-005-7 : mentions et export
+#[test]
+fn req005_ac7_un_seul_graphe_jvm_js_ts_markdown() {
+    let env = Env::mixed();
+    env.ok(false, &["build"]);
+    let v = env.export();
+    let section = "section:docs/web.md#client-web";
+    assert!(has_edge(
+        &v,
+        section,
+        "mentions",
+        "type:web/src/api/client.ApiClient"
+    ));
+    assert!(has_edge(
+        &v,
+        section,
+        "mentions",
+        "type:com.acme.core.OrderService"
+    ));
+    assert!(!has_node(&v, "type:web/src/api/client.OrderService"));
+    let alias = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "type:web/src/api/types.Id")
+        .expect("alias");
+    assert_eq!(alias["subkind"], "alias");
+    let pkg = "package:web/src/api/client";
+    assert!(has_edge(&v, pkg, "imports", "type:web/src/api/types.Id"));
+    assert!(has_edge(
+        &v,
+        "package:web/src/api/types",
+        "contains",
+        "method:web/src/api/types.toId"
+    ));
+    assert!(has_edge(
+        &v,
+        "module:@acme/web",
+        "contains",
+        "package:web/src/api/client"
+    ));
+    assert_eq!(unresolved(&v), "[]");
+}
+
+fn html_parts(html: &str) -> (String, Value, String) {
+    let open = "<script type=\"application/json\" id=\"nephila-data\">";
+    let start = html.find(open).expect("bloc nephila-data");
+    let body = start + open.len();
+    let end = body + html[body..].find("</script>").expect("fin du bloc");
+    (
+        html[..start].to_string(),
+        serde_json::from_str(&html[body..end]).expect("bloc JSON"),
+        html[end..].to_string(),
+    )
+}
+
+/// AC-005-7 : la vue HTML
+#[test]
+fn req005_ac7_vue_html_identique_hors_donnees() {
+    let with = Env::mixed();
+    with.ok(false, &["build"]);
+    let without = Env::empty();
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/maven3/repo"),
+        &without.repo,
+    );
+    without.ok(false, &["build"]);
+    let page = |e: &Env| {
+        let o = e.ok(false, &["export", "--format", "html", "--output", "-"]);
+        html_parts(&stdout(&o))
+    };
+    let (before_w, data_w, after_w) = page(&with);
+    let (before_o, data_o, after_o) = page(&without);
+    assert_eq!(before_w, before_o);
+    assert_eq!(after_w, after_o);
+    let data = data_w.to_string();
+    assert!(data.contains("type:web/src/api/types.Id"));
+    assert!(data.contains("\"alias\""), "sous-genre alias");
+    assert!(data.contains("package:web/src/api/client"));
+    assert!(!data_o.to_string().contains("\"alias\""));
+}
+
+/// AC-034-10 sur le dépôt d'AC-034-1
+fn web_repo(env: &Env) {
+    env.put("web/src/model/order.ts", "export interface Order {}\n");
+    env.put(
+        "web/src/services/order.repository.ts",
+        "export class OrderRepository { save(o: Order) {} }\n",
+    );
+    env.put(
+        "web/src/services/order.service.ts",
+        "import { Order } from '../model/order';\nimport { OrderRepository } from './order.repository';\n\
+         export class OrderService { constructor(private repo: OrderRepository) {} place(o: Order) { return this.repo.save(o); } }\n",
+    );
+}
+
+#[test]
+fn req034_ac10_search_neighbors_et_path() {
+    let env = Env::empty();
+    web_repo(&env);
+    env.ok(false, &["build"]);
+    let out = env.query(&["search", "OrderService"]);
+    assert!(
+        out.lines().any(|l| l.contains("OrderService")
+            && l.contains("class")
+            && l.contains("web/src/services/order.service.ts")),
+        "{out}"
+    );
+    // Un type est traité avec ses méthodes (REQ-014) : l'appel de `place` est le sien.
+    let out = env.query(&["neighbors", "OrderService"]);
+    let (uses, used_by) = out.split_once("utilisé par :").expect(&out);
+    let lines = |t: &str| {
+        t.lines()
+            .filter(|l| {
+                l.contains(" calls ") || l.contains(" contains ") || l.contains(" imports ")
+            })
+            .count()
+    };
+    assert_eq!(lines(uses), 1, "{out}");
+    assert_eq!(lines(used_by), 1, "{out}");
+    assert!(
+        uses.contains("calls web/src/services/order.repository.OrderRepository.save"),
+        "{out}"
+    );
+    assert!(
+        used_by.contains("contains web/src/services/order.service (package"),
+        "{out}"
+    );
+    assert!(
+        !used_by.contains("OrderService.place") && !used_by.contains("<init>"),
+        "{out}"
+    );
+    let out = env.query(&["neighbors", "place"]);
+    assert!(out.contains("OrderRepository.save"), "{out}");
+    // Chemin le plus court : le type, son package, puis l'import du dépôt.
+    let out = env.query(&["path", "OrderService", "OrderRepository"]);
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "web/src/services/order.service.OrderService contenu par web/src/services/order.service",
+            "web/src/services/order.service imports web/src/services/order.repository.OrderRepository"
+        ],
+        "{out}"
+    );
+}
+
+/// AC-034-8 : incrémental
+#[test]
+fn req034_ac8_update_reanalyse_seul_le_fichier_modifie() {
+    let env = Env::empty();
+    env.put(
+        "src/a.ts",
+        "import { foo } from './b';\nexport function run() { foo(); }\n",
+    );
+    env.put("src/b.ts", "export function other() {}\n");
+    env.ok(true, &["build"]);
+    let v = env.export();
+    assert!(unresolved(&v).contains("foo"), "{}", unresolved(&v));
+
+    let _ = fs::remove_file(&env.log);
+    env.put("src/b.ts", "export function foo() {}\n");
+    env.ok(true, &["update"]);
+    let v = env.export();
+    assert!(has_edge(
+        &v,
+        "method:src/a.run",
+        "calls",
+        "method:src/b.foo"
+    ));
+    assert_eq!(unresolved(&v), "[]");
+    assert_eq!(
+        env.logged_paths().into_iter().collect::<Vec<_>>(),
+        vec!["src/b.ts".to_string()]
+    );
+
+    let _ = fs::remove_file(&env.log);
+    env.put("src/b.ts", "export function bar() {}\n");
+    env.ok(true, &["update"]);
+    let v = env.export();
+    assert!(!has_edge(
+        &v,
+        "method:src/a.run",
+        "calls",
+        "method:src/b.foo"
+    ));
+    assert!(unresolved(&v).contains("foo"), "{}", unresolved(&v));
+    assert_eq!(
+        env.logged_paths().into_iter().collect::<Vec<_>>(),
+        vec!["src/b.ts".to_string()]
+    );
+}
+
+/// AC-034-9 : fichiers mal formés, y compris une fonction imbriquée dans un corps cassé
+#[test]
+fn req034_ac9_fichiers_mal_formes_de_bout_en_bout() {
+    let env = Env::empty();
+    env.put(
+        "Broken.ts",
+        "export class Before { ok() {} }\nexport function top() {\n  function inner() {}\n  const x = {\n",
+    );
+    env.put(
+        "broken.jsx",
+        "export function Before() { return <div/>; }\nexport function Broken() {\n  function nested() { }\n  if (x) {\n",
+    );
+    env.put(
+        "c.ts",
+        "export function good() {}\nexport function bad( {\n  function nestedInBad() {}\n  class InnerK { m() {} }\n}\nexport function after() {}\n",
+    );
+    let o = env.ok(false, &["build"]);
+    assert!(
+        stdout(&o).contains("0 fichiers en attente"),
+        "{}",
+        stdout(&o)
+    );
+    let v = env.export();
+    for id in [
+        "method:Broken.Before.ok",
+        "type:Broken.Before",
+        "method:broken.Before",
+        "method:c.good",
+        "method:c.after",
+    ] {
+        assert!(has_node(&v, id), "{id}");
+    }
+    for id in [
+        "method:Broken.inner",
+        "method:broken.nested",
+        "method:c.nestedInBad",
+        "type:c.InnerK",
+        "method:c.InnerK.m",
+    ] {
+        assert!(!has_node(&v, id), "{id} ne doit pas être un nœud");
+    }
+}
+
+/// AC-024-11 avec `mock`
+#[test]
+fn req024_ac11_enrichissement_mock_du_code_typescript() {
+    let env = Env::mixed();
+    let o = env.ok(true, &["build"]);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    let warn: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("avertissement:") && l.contains("web/src/api/client.ts"))
+        .collect();
+    assert_eq!(warn.len(), 1, "{err}");
+    assert!(warn[0].contains("package:web/src/api/client"), "{err}");
+    let out = env.query(&["search", "ApiClient"]);
+    assert!(out.contains("Client HTTP des commandes."), "{out}");
+    let v = env.export();
+    let summary = |id: &str| {
+        v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == id)
+            .map(|n| n["summary"].clone())
+    };
+    assert_eq!(
+        summary("package:web/src/api/client"),
+        Some(Value::Null),
+        "résumé du package écarté"
+    );
+    assert_eq!(
+        summary("type:web/src/api/client.ApiClient"),
+        Some(Value::String("Client HTTP des commandes.".into()))
+    );
+}
+
+/// `summary` : modules des deux écosystèmes
+#[test]
+fn req019_summary_du_depot_mixte() {
+    let env = Env::mixed();
+    env.ok(false, &["build"]);
+    let o = env.ok(false, &["summary"]);
+    assert!(String::from_utf8_lossy(&o.stderr).is_empty());
+    let out = stdout(&o);
+    assert!(out.contains("Modules (4)"), "{out}");
+    assert!(out.contains("@acme/web -> dependency:react"), "{out}");
+    assert!(
+        out.contains("com.acme:core -> dependency:org.slf4j:slf4j-api"),
+        "{out}"
+    );
+}

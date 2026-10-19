@@ -472,3 +472,75 @@ fn req024_ac10_openai_node_list_of_json_document_has_no_key() {
     assert!(posts[0].body.contains("document:config/app.json"));
     assert!(!posts[0].body.contains("key:"), "{}", posts[0].body);
 }
+
+// ---- AC-024-11 : code TypeScript et package.json, faux serveur openai ----
+
+/// Construit un dépôt à un fichier, lance `build` contre le faux serveur et rend la requête POST.
+fn openai_build_one_file(rel: &str, text: &str, reply: &str) -> String {
+    let s = FakeServer::start(vec![(200, "{}".into()), (200, openai_reply(reply))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let p = repo.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, text).unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T068_KEY\"\nconcurrency = 1\n",
+            s.base_url
+        ),
+    )
+    .unwrap();
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+        .arg("-C")
+        .arg(&repo)
+        .arg("build")
+        .env("NEPHILA_CONFIG", &config)
+        .env("NEPHILA_T068_KEY", "sk-test")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let posts: Vec<_> = s
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 1);
+    posts[0].body.clone()
+}
+
+#[test]
+fn req024_ac11_openai_node_list_of_typescript_has_class_not_package() {
+    let reply = r#"{"version":2,"summaries":[{"node":"type:web/src/api/client.ApiClient","summary":"Client."}],"concepts":[]}"#;
+    let body = openai_build_one_file(
+        "web/src/api/client.ts",
+        "export class ApiClient { fetchOrder() {} }\n",
+        reply,
+    );
+    assert!(body.contains("type:web/src/api/client.ApiClient"), "{body}");
+    assert!(
+        body.contains("method:web/src/api/client.ApiClient.fetchOrder"),
+        "{body}"
+    );
+    assert!(!body.contains("package:"), "{body}");
+    assert!(body.contains("TypeScript"), "{body}");
+    assert!(body.contains("JavaScript"), "{body}");
+}
+
+#[test]
+fn req024_ac11_openai_node_list_of_package_json_is_its_module() {
+    let reply = r#"{"version":2,"summaries":[{"node":"module:@acme/web","summary":"Module web."}],"concepts":[]}"#;
+    let body = openai_build_one_file(
+        "web/package.json",
+        r#"{"name": "@acme/web", "dependencies": {"react": "^18"}}"#,
+        reply,
+    );
+    assert!(body.contains("module:@acme/web"), "{body}");
+    assert!(!body.contains("dependency:"), "{body}");
+    assert!(!body.contains("package:"), "{body}");
+}

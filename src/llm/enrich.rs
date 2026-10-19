@@ -151,7 +151,7 @@ impl Enrichment {
 /// Prompt système d'enrichissement (identique pour tous les fournisseurs).
 pub fn enrichment_system_prompt() -> String {
     format!(
-        "Tu enrichis le graphe d'un dépôt à partir d'un fichier (code Java/Kotlin/Groovy/Scala, \
+        "Tu enrichis le graphe d'un dépôt à partir d'un fichier (code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, \
          build Maven/Gradle/Ivy, ou Markdown) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
          Schéma (version {ENRICH_SCHEMA_VERSION}) : {{\"version\": {ENRICH_SCHEMA_VERSION}, \
          \"summaries\": [{{\"node\": \"<identifiant de la liste>\", \"summary\": \"une phrase\"}}], \
@@ -272,7 +272,7 @@ pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
 /// Prompt système d'un lot de fichiers (identique pour tous les fournisseurs).
 pub fn lot_system_prompt() -> String {
     format!(
-        "Tu enrichis le graphe d'un dépôt à partir de plusieurs fichiers (code Java/Kotlin/Groovy/Scala, \
+        "Tu enrichis le graphe d'un dépôt à partir de plusieurs fichiers (code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, \
          build Maven/Gradle/Ivy, ou Markdown) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
          Chaque fichier est introduit par une ligne `=== FICHIER : <chemin> ===`, suivie de la liste de ses \
          nœuds puis de son contenu, jusqu'à la ligne `=== FIN DU FICHIER : <chemin> ===`.\n\

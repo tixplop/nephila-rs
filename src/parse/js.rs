@@ -134,6 +134,23 @@ impl Extractor<'_> {
         }
     }
 
+    /// Reprise dans un nœud `ERROR` : une accolade ouverte et non refermée est un corps cassé
+    /// (fonction, classe, bloc) ; ce qu'elle contient n'est pas de premier niveau.
+    fn recover(&mut self, n: Node, owner: &str, depth: &mut i32) {
+        let mut cur = n.walk();
+        for c in n.children(&mut cur) {
+            match c.kind() {
+                "{" => *depth += 1,
+                "}" => *depth = (*depth - 1).max(0),
+                "ERROR" => self.recover(c, owner, depth),
+                _ if c.is_named() && *depth == 0 && !matches!(c.kind(), "comment") => {
+                    self.statement(c, owner)
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn statement(&mut self, n: Node, owner: &str) {
         match n.kind() {
             "export_statement" => {
@@ -156,7 +173,7 @@ impl Extractor<'_> {
                 }
             }
             // Reprise sur erreur : les déclarations qui suivent un morceau illisible comptent.
-            "ERROR" => self.statements(n, owner),
+            "ERROR" => self.recover(n, owner, &mut 0),
             "class_declaration" | "abstract_class_declaration" | "class" => {
                 let name = self.name_of(n).unwrap_or_else(|| "default".to_string());
                 self.type_decl(n, owner, &name, SubKind::Class);
@@ -404,6 +421,19 @@ mod tests {
 
     fn sub(s: &FileStructure, id: &str) -> Option<SubKind> {
         s.declares.iter().find(|d| d.id() == id).unwrap().subkind
+    }
+
+    #[test]
+    fn req034_ac9_corps_casse_ne_declare_que_le_premier_niveau() {
+        let src = "export function good() {}\nexport function bad( {\n  function nestedInBad() {}\n  class InnerK { m() {} }\n}\nexport function after() {}\n";
+        let s = ex(Lang::TypeScript, "c.ts", src);
+        let got = ids(&s);
+        for want in ["method:c.good", "method:c.after"] {
+            assert!(got.iter().any(|i| i == want), "{want} absent : {got:?}");
+        }
+        for no in ["method:c.nestedInBad", "type:c.InnerK", "method:c.InnerK.m"] {
+            assert!(!got.iter().any(|i| i == no), "{no} déclaré : {got:?}");
+        }
     }
 
     #[test]
