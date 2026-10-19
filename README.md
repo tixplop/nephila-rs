@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge.
 
 ```sh
-V=v0.12.0                                      # version voulue
+V=v0.13.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -113,8 +113,8 @@ Les commandes sans LLM ne lisent aucune configuration. Si le graphe est en retar
 ### `nephila build` et `nephila update`
 
 ```
-nephila build  [--no-llm] [-v|--verbose] [--batch-files <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
-nephila update [--no-llm] [-v|--verbose] [--batch-files <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
+nephila build  [--no-llm] [-v|--verbose] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
+nephila update [--no-llm] [-v|--verbose] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
 ```
 
 `build` analyse chaque fichier puis, si le LLM est actif, enrichit le graphe. `update` ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus ceux restés en attente ou à enrichir.
@@ -124,6 +124,7 @@ nephila update [--no-llm] [-v|--verbose] [--batch-files <N>] [--exclude <MOTIF>]
 | `--no-llm` | Structure seule : la configuration n'est pas lue (même invalide) et aucun appel n'est fait |
 | `-v, --verbose` | Traces sur stderr (voir [Traces](#traces---verbose)) |
 | `--batch-files <N>` | Taille de lot pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
+| `--format-retries <N>` | Nombre de nouveaux essais d'un appel dont la réponse est non conforme, pour cette commande seulement (voir [Réponses non conformes et nouveaux essais](#réponses-non-conformes-et-nouveaux-essais)) |
 | `--exclude <MOTIF>` | Exclut de l'analyse les fichiers qui correspondent au motif ; répétable (voir [Filtrer l'analyse](#filtrer-lanalyse)) |
 | `--exclude-type <TYPES>` | Exclut un ou plusieurs types de fichiers, séparés par des virgules ; répétable |
 
@@ -193,6 +194,8 @@ Nœuds cités :
 
 Si rien ne correspond : `erreur: pas trouvé dans le graphe` (code 1).
 
+`query ask` accepte `--format-retries <N>` : une réponse non conforme est renvoyée aussitôt, jusqu'à `N` fois (voir [Réponses non conformes et nouveaux essais](#réponses-non-conformes-et-nouveaux-essais)). Si la dernière réponse est encore non conforme, stdout reste vide et stderr porte une ligne `erreur: … (<k> essais sur <t>)`.
+
 ### `nephila summary`
 
 ```
@@ -209,16 +212,21 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 
 Événements tracés :
 
-- la configuration (fournisseur, modèle, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ;
+- la configuration (fournisseur, modèle, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ;
 - la vérification de la clé ;
 - le parcours des fichiers ;
 - le début et la fin de chaque phase (structure, résolution, enrichissement) ;
-- le départ et la fin de chaque appel LLM, avec son résultat et sa durée ;
+- le départ et la fin de chaque appel LLM, avec son résultat et sa durée ; le départ d'un nouvel essai porte la marque ` (essai <e>/<t>)`, où `<t>` vaut `format_retries` + 1 (le premier essai n'a pas de marque) ;
 - les décisions d'arrêt.
 
 ```
 trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
 trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts) 19 ms
+trace: [0.003s] llm enrich fin src/A.java [1/1] erreur 0 ms : réponse LLM non conforme au schéma
+trace: [0.003s] llm enrich départ src/A.java [1/1] 24 car. (essai 2/3)
+trace: [0.003s] llm enrich fin src/A.java [1/1] erreur 0 ms : réponse LLM non conforme au schéma
+trace: [0.003s] llm enrich départ src/A.java [1/1] 24 car. (essai 3/3)
+trace: [0.003s] llm enrich fin src/A.java [1/1] ok (0 résumés, 0 concepts) 0 ms
 trace: [1.040s] llm enrich fin docs/guide.md [1/1] délai dépassé 1003 ms : délai dépassé avec openai sur https://api.openai.com/v1/chat/completions ; augmentez timeout_secs
 trace: [1.053s] politique: arrêt de l'envoi (clé d'API refusée par le fournisseur), 3 fichiers non envoyés
 ```
@@ -359,6 +367,7 @@ Un exemple commenté est fourni dans [`examples/config.toml`](examples/config.to
 | `max_chunk_chars` | Taille maximale d'un morceau envoyé au LLM | 60000 |
 | `concurrency` | Appels simultanés | 4 |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 1 |
+| `format_retries` | Nouveaux essais d'un appel dont la réponse est non conforme, entier ≥ 0 (2 = au plus 3 appels pour une même requête ; 0 = aucun nouvel essai, comme en 0.12.0) | 2 |
 | `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 (la connexion reste limitée à 10 s) | 300 |
 | `tls_ca_cert` | Chemin d'un fichier PEM d'autorités de certification, **ajoutées** aux autorités publiques embarquées. Absolu, `~/…`, ou relatif au dossier du fichier de configuration. Le magasin du système n'est pas lu (pour s'y fier : `/etc/ssl/certs/ca-certificates.crt`) | aucun |
 | `tls_insecure` | Booléen. `true` désactive tout contrôle du certificat du serveur, comme `curl -k` ; un avertissement est écrit à chaque commande | `false` |
@@ -430,6 +439,25 @@ Par défaut (`batch_files = 1`), un appel LLM porte sur un seul fichier. Pour un
 - Jusqu'à `concurrency` lots sont en vol en même temps, soit `concurrency` × `batch_files` fichiers.
 - Si un lot échoue, tous ses fichiers restent « à enrichir » et sont repris par le prochain `nephila update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse échoue seul.
 - Si la réponse du modèle est tronquée par sa limite de jetons de sortie, tout le lot échoue. Réduisez alors `batch_files`.
+
+## Réponses non conformes et nouveaux essais
+
+Un modèle, surtout local, rate parfois son JSON. Quand un appel aboutit mais que la réponse est inexploitable, `nephila` renvoie aussitôt la même requête, à l'identique, jusqu'à `format_retries` fois (défaut 2, soit au plus 3 appels).
+
+- **Retenté** : réponse reçue mais inexploitable (JSON illisible, aucun objet JSON dans le texte, schéma non respecté, réponse tronquée par la limite de jetons de sortie).
+- **Jamais retenté** : délai dépassé, erreur réseau, clé refusée (ils relèvent de la politique d'arrêt), fichier illisible, éléments écartés d'une réponse conforme, fichier absent d'une réponse de lot conforme (il reste « à enrichir » pour le prochain `update`).
+- **Unité d'essai** : l'appel. Un morceau d'un gros fichier est retenté seul ; un lot est retenté en entier.
+- **Un essai réussi ne laisse aucune trace** : ni avertissement, ni changement du bilan ; seul `--verbose` montre les essais.
+- **Échec final** : le fichier reste « à enrichir » et une ligne le nomme, avec le nombre d'essais faits :
+
+```
+avertissement: src/A.java : réponse LLM non conforme au schéma : JSON illisible (NEPHILA_MOCK_MALFORMED) (3 essais sur 3)
+```
+
+- Toute la suite d'essais d'un appel compte pour **un seul appel** dans la politique d'arrêt.
+- `--format-retries <N>` de `build`, `update` et `query ask` remplace la clé pour la commande seulement, sans rien écrire. Priorité : option, puis clé `format_retries`, puis défaut 2. Sans LLM actif, l'option est acceptée sans effet.
+
+Un modèle qui échoue souvent au format se règle mieux en changeant de modèle ou en réduisant `batch_files` qu'en augmentant les essais.
 
 ## Ce que l'analyse extrait
 
@@ -545,6 +573,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.13 | Nouveaux essais des réponses LLM non conformes (`format_retries`, `--format-retries`) |
 | 0.12.0 | Filtres d'analyse (`--exclude`, `--exclude-type`, `.nephila.toml`) |
 | 0.11.0 | Certificats d'autorité et désactivation du contrôle TLS (clés `tls_ca_cert`, `tls_insecure`) |
 | 0.10.0 | JavaScript et TypeScript (modules ES, imports, appels, JSX), `package.json` comme fichier de build ; sous-genres `alias` et `object` ; modules désignés par leur nom qualifié |
@@ -564,7 +593,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.12.0 && git push origin v0.12.0
+git tag v0.13.0 && git push origin v0.13.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
@@ -594,6 +623,7 @@ Le fournisseur `mock` remplace le LLM par des fixtures et se pilote par l'enviro
 | `NEPHILA_MOCK_DELAY_MS` | Délai ajouté à chaque appel |
 | `NEPHILA_MOCK_TIMEOUT_FILES` | Chemins relatifs, séparés par des virgules, dont l'enrichissement échoue par délai dépassé |
 | `NEPHILA_MOCK_KEY_REVOKED_AFTER` | Nombre d'appels d'enrichissement avant des refus de clé simulés |
+| `NEPHILA_MOCK_MALFORMED` | `<chemin>:<k>[,<chemin>:<k>…]` (`_ask` pour `query ask`, k entier > 0) : les k premiers appels qui portent ce fichier (un morceau, ou un lot qui le contient) reçoivent une réponse non conforme, les suivants la réponse habituelle |
 
 Une fixture d'enrichissement (schéma version 2) contient obligatoirement `version`, `summaries` et `concepts`, avec des listes vides au besoin. Les résumés visent des nœuds du fichier par leur identifiant `genre:nom`. Les concepts ne sont acceptés que pour un fichier Markdown et citent ses sections par leur identifiant complet. Tout le reste est écarté avec un avertissement, et une fixture ne crée jamais de nœud de structure.
 
