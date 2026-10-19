@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge.
 
 ```sh
-V=v0.13.0                                      # version voulue
+V=v0.14.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -344,9 +344,10 @@ Le slug est le nom du dossier analysé en minuscules ASCII. Chaque suite de cara
 - **Vue initiale** : les 100 modules les plus reliés et les liens entre eux, avec « N modules non affichés » si certains sont écartés. Sans module, ce sont les 100 nœuds les plus reliés.
 - **Recherche** : sur le nom court ou qualifié, sans casse, 20 résultats au plus. Choisir un résultat affiche le nœud et ses voisins.
 - **Détails** : un clic sur un nœud ouvre un panneau (genre, nom qualifié, fichier, résumé, liens par genre). Les liens y sont cliquables.
-- **Extension** : un double-clic ou le bouton « Étendre » ajoute les voisins directs. La vue est plafonnée à 300 nœuds : les voisins les plus reliés sont retenus, et la page indique « N voisins non affichés ». Si la vue est pleine, naviguer vers un nouveau nœud remplace la vue par ce nœud et ses voisins.
+- **Extension** : un double-clic ou le bouton « Étendre » ajoute les voisins directs. Hors « Tout étendre », la vue est plafonnée à 300 nœuds : les voisins les plus reliés sont retenus, et la page indique « N voisins non affichés ». Si la vue est pleine, naviguer vers un nouveau nœud remplace la vue par ce nœud et ses voisins.
 - **Filtres** : une case par genre de nœud et par genre de lien. Le bouton « Vue initiale » ramène à la vue de départ.
-- Déplacement, zoom et glisser d'un nœud à la souris.
+- **Tout étendre** : affiche tout le graphe jusqu'à 5000 nœuds. Au-delà, les 5000 nœuds les plus reliés sont retenus et la page indique « N nœuds non affichés ». « Étendre » et les liens du panneau travaillent ensuite avec ce plafond de 5000 ; « Vue initiale » ou un résultat de recherche ramène au plafond de 300.
+- Déplacement, zoom et glisser d'un nœud à la souris. Les liens ne sont pas dessinés pendant la molette et le déplacement du fond ; ils reviennent 150 ms après le dernier cran ou au relâchement. Glisser un nœud garde ses liens.
 
 ## Configuration du LLM
 
@@ -573,6 +574,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.14 | Vue HTML : bouton « Tout étendre », liens masqués pendant le zoom et le déplacement |
 | 0.13 | Nouveaux essais des réponses LLM non conformes (`format_retries`, `--format-retries`) |
 | 0.12.0 | Filtres d'analyse (`--exclude`, `--exclude-type`, `.nephila.toml`) |
 | 0.11.0 | Certificats d'autorité et désactivation du contrôle TLS (clés `tls_ca_cert`, `tls_insecure`) |
@@ -593,7 +595,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.13.0 && git push origin v0.13.0
+git tag v0.14.0 && git push origin v0.14.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
@@ -608,7 +610,7 @@ node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests
 
 Les certificats de test TLS (`tests/fixtures/tls/`) se régénèrent par `tests/fixtures/tls/gen.sh` (nécessite `openssl`).
 
-La logique de la vue HTML est un module JS pur, testé par `node --test`. Node 20 ou plus est requis pour ces tests seulement, sans npm ni dépendance : le produit n'en dépend pas. Un test Rust compare les données de la vue à la fixture `tests/view/fixtures/maven3.json`. Après un changement volontaire de l'export, régénérez-la avec `NEPHILA_UPDATE_VIEW_FIXTURE=1 cargo nextest run view_fixture`. Le rendu et les interactions souris se vérifient à la main.
+La logique de la vue HTML est un module JS pur, testé par `node --test`. Node 20 ou plus est requis pour ces tests seulement, sans npm ni dépendance : le produit n'en dépend pas. Un test Rust compare les données de la vue à la fixture `tests/view/fixtures/maven3.json`. Après un changement volontaire de l'export, régénérez-la avec `NEPHILA_UPDATE_VIEW_FIXTURE=1 cargo nextest run view_fixture`. Le rendu et les interactions souris se vérifient à la main ; `node tests/view/synthetic_page.js <page exportée> <n> <sortie>` remplace les données d'une page exportée par un graphe synthétique de n nœuds (sortie sous `target/view-check/`) pour ces contrôles.
 
 ### LLM simulé (`provider = "mock"`)
 
