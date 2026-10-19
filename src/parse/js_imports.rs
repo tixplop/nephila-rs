@@ -9,10 +9,10 @@ use tree_sitter::Node;
 const CODE_EXT: [&str; 8] = ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"];
 const DECL_EXT: [&str; 3] = [".d.ts", ".d.mts", ".d.cts"];
 /// Extensions de ressource : le spécifieur est ignoré (liste de planification de REQ-034).
-const RESOURCE_EXT: [&str; 25] = [
+const RESOURCE_EXT: [&str; 26] = [
     "css", "scss", "sass", "less", "json", "svg", "png", "jpg", "jpeg", "gif", "webp", "ico",
     "woff", "woff2", "ttf", "html", "md", "txt", "yaml", "yml", "wasm", "vue", "svelte", "astro",
-    "graphql",
+    "graphql", "gql",
 ];
 
 /// Cible d'un spécifieur.
@@ -370,6 +370,8 @@ mod tests {
         assert_eq!(specifier("src/a.ts", "./styles.css"), Cible::Ignore);
         assert_eq!(specifier("src/a.ts", "./data.json"), Cible::Ignore);
         assert_eq!(specifier("src/a.ts", "./logo.svg"), Cible::Ignore);
+        assert_eq!(specifier("src/a.ts", "./q.graphql"), Cible::Ignore);
+        assert_eq!(specifier("src/a.ts", "./q.gql"), Cible::Ignore);
     }
 
     #[test]

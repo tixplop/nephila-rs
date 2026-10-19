@@ -599,6 +599,27 @@ fn req008_ac8_mention_xml_non_resolue_puis_reparee() {
     );
 }
 
+/// AC-008-10 (partie JVM) : un import à joker ne rend pas `Foo.bar` ambigu.
+#[test]
+fn req008_ac10_jvm_joker_garde_le_meme_package() {
+    let env = Env::new();
+    env.put(
+        "com/a/User.java",
+        "package com.a;\nimport java.util.*;\npublic class User { void m() { Foo.bar(); } }\n",
+    );
+    env.put(
+        "com/a/Foo.java",
+        "package com.a;\npublic class Foo { static void bar() {} }\n",
+    );
+    env.put(
+        "com/b/Foo.java",
+        "package com.b;\npublic class Foo { static void bar() {} }\n",
+    );
+    env.ok(false, &["build", "--no-llm"]);
+    assert!(env.has_edge("method:com.a.User.m", "calls", "method:com.a.Foo.bar"));
+    assert!(!env.has_edge("method:com.a.User.m", "calls", "method:com.b.Foo.bar"));
+}
+
 // ---------------------------------------------------------------------------
 // T-061 : un seul graphe, requêtes, export, vue et enrichissement
 // ---------------------------------------------------------------------------

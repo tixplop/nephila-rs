@@ -9,6 +9,7 @@ use tree_sitter::Node;
 use crate::error::Result;
 use crate::model::{node_id, EdgeKind, NodeKind, SubKind};
 
+use super::js_calls;
 use super::js_imports::Imports;
 use super::jvm::INIT;
 use super::{Declared, FileStructure, Lang, Reference};
@@ -68,6 +69,16 @@ pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
         x.add_ref(&package, EdgeKind::Imports, name);
     }
     x.statements(tree.root_node(), &module);
+    let calls = js_calls::collect(
+        tree.root_node(),
+        text.as_bytes(),
+        &module,
+        &x.imports,
+        &x.declares,
+    );
+    for (caller, target) in calls {
+        x.add_ref(&node_id(NodeKind::Method, &caller), EdgeKind::Calls, target);
+    }
     Ok(FileStructure {
         context: Some(x.imports.context(&module)),
         declares: x.declares,
@@ -318,21 +329,26 @@ impl Extractor<'_> {
     }
 
     fn member_name(&self, n: Node) -> Option<String> {
-        let t = self.text(n);
-        match n.kind() {
-            "property_identifier" if t == "constructor" => Some(INIT.to_string()),
-            "property_identifier" | "number" => Some(t),
-            "private_property_identifier" => Some(t.trim_start_matches('#').to_string()),
-            "string" => {
-                let s = t.trim_matches(|c| c == '"' || c == '\'' || c == '`');
-                (!s.is_empty()).then(|| s.to_string())
-            }
-            _ => None,
-        }
+        member_name(self.src, n)
     }
 }
 
-fn is_function_value(n: Node) -> bool {
+/// Nom d'un membre de classe ou d'interface (`constructor` → `<init>`, `#m` → `m`).
+pub(super) fn member_name(src: &[u8], n: Node) -> Option<String> {
+    let t = String::from_utf8_lossy(&src[n.byte_range()]).into_owned();
+    match n.kind() {
+        "property_identifier" if t == "constructor" => Some(INIT.to_string()),
+        "property_identifier" | "number" => Some(t),
+        "private_property_identifier" => Some(t.trim_start_matches('#').to_string()),
+        "string" => {
+            let s = t.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn is_function_value(n: Node) -> bool {
     matches!(
         n.kind(),
         "arrow_function" | "function_expression" | "function" | "generator_function"
@@ -452,7 +468,8 @@ mod tests {
                 "method:src/util/format.fe",
             ]
         );
-        assert!(s.references.is_empty());
+        // Les appels sont couverts par js_calls.rs.
+        assert!(s.references.iter().all(|r| r.kind == EdgeKind::Calls));
     }
 
     #[test]

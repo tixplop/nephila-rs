@@ -225,6 +225,22 @@ fn resolve_ref(r: &Ref, source_kind: NodeKind, source_q: &str, idx: &Index) -> O
         }
     }
 
+    // Membre d'un type importé (`T.m`) que les imports n'ont pas résolu : si le nom du type
+    // désigne plusieurs types du dépôt, le receveur est ambigu, donc la référence reste non
+    // résolue (un lien manquant plutôt qu'un lien faux, DEC-021).
+    if !rest.is_empty()
+        && ctx
+            .imports
+            .iter()
+            .any(|i| !i.ends_with(".*") && last_segment(i) == first)
+        && idx
+            .suffix(first, &|n: &Node| n.kind == NodeKind::Type)
+            .len()
+            > 1
+    {
+        return None;
+    }
+
     // Même package que la source.
     let package = ctx
         .package
@@ -1321,5 +1337,86 @@ mod tests {
             "services/api/src/main/kotlin/p/A.kt",
             "p",
         );
+    }
+
+    fn calls_target(
+        source: Node,
+        ctx: &str,
+        target: &str,
+        others: Vec<Node>,
+    ) -> (Resolution, String) {
+        let src_id = source.id.clone();
+        let mut nodes = vec![source];
+        nodes.extend(others);
+        let refs = vec![(
+            rf(&src_id, EdgeKind::Calls, target, Some(ctx)),
+            RefOrigin::Parse,
+        )];
+        (compute(&nodes, &refs, &[]), src_id)
+    }
+    fn calls_of(r: &Resolution, src: &str) -> Vec<String> {
+        r.edges
+            .iter()
+            .filter(|e| e.source == src && e.kind == EdgeKind::Calls)
+            .map(|e| e.target.clone())
+            .collect()
+    }
+
+    fn js_nodes(with_other: bool) -> (Node, Vec<Node>) {
+        let mut v = vec![
+            ty("src/services/x.X", "src/services/x.ts"),
+            method("src/services/x.X.run", "src/services/x.ts"),
+        ];
+        if with_other {
+            v.push(ty("src/other/x.X", "src/other/x.ts"));
+        }
+        (method("src/user.f", "src/user.ts"), v)
+    }
+    const JS_CTX: &str = "package src/user\nimport src/services.X\nimport src/services/index.X";
+
+    #[test]
+    fn req008_ac10_js_ambiguous_imported_receiver_unresolved() {
+        let (src, others) = js_nodes(true);
+        let (r, id) = calls_target(src, JS_CTX, "X.run", others);
+        assert!(calls_of(&r, &id).is_empty());
+        assert_eq!(r.unresolved.len(), 1);
+    }
+
+    #[test]
+    fn req008_ac10_js_unique_imported_receiver_resolved() {
+        let (src, others) = js_nodes(false);
+        let (r, id) = calls_target(src, JS_CTX, "X.run", others);
+        assert_eq!(calls_of(&r, &id), vec![mid("src/services/x.X.run")]);
+    }
+
+    fn jvm_nodes() -> Vec<Node> {
+        vec![
+            ty("com.a.Foo", "a/Foo.java"),
+            method("com.a.Foo.bar", "a/Foo.java"),
+            ty("com.b.Foo", "b/Foo.java"),
+            method("com.b.Foo.bar", "b/Foo.java"),
+        ]
+    }
+
+    #[test]
+    fn req008_ac10_jvm_wildcard_import_keeps_same_package() {
+        let (r, id) = calls_target(
+            method("com.a.User.m", "a/User.java"),
+            "package com.a\nimport java.util.*",
+            "Foo.bar",
+            jvm_nodes(),
+        );
+        assert_eq!(calls_of(&r, &id), vec![mid("com.a.Foo.bar")]);
+    }
+
+    #[test]
+    fn req008_ac5_explicit_import_resolves_despite_namesake_member() {
+        let (r, id) = calls_target(
+            method("com.a.User.m", "a/User.java"),
+            "package com.a\nimport com.b.Foo",
+            "Foo.bar",
+            jvm_nodes(),
+        );
+        assert_eq!(calls_of(&r, &id), vec![mid("com.b.Foo.bar")]);
     }
 }

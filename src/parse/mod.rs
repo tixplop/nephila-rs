@@ -8,6 +8,7 @@ pub mod groovy;
 pub mod ivy;
 pub mod java;
 pub mod js;
+pub mod js_calls;
 pub mod js_imports;
 pub mod json;
 pub mod jvm;
