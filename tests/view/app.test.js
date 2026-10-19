@@ -18,3 +18,11 @@ test("REQ025_app_js_sans_ressource_externe", () => {
     assert.ok(!src.includes(bad), bad);
   }
 });
+
+test("REQ039_app_js_utilise_le_modele", () => {
+  const src = fs.readFileSync(path.join(dir, "app.js"), "utf8");
+  for (const name of ["allView", "layoutStep", "linksShown", "onWheel", "onPanStart", "onPanEnd"]) {
+    assert.ok(src.includes(name + "("), name);
+  }
+  assert.ok(!src.includes("d2 > 90000"), "double boucle de répulsion");
+});

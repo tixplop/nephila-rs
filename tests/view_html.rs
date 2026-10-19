@@ -275,3 +275,53 @@ fn view_fixture_matches_current_export() {
          NEPHILA_UPDATE_VIEW_FIXTURE=1 cargo test view_fixture"
     );
 }
+
+fn exported_page() -> String {
+    let env = Env::built();
+    let cwd = tempfile::tempdir().unwrap();
+    let out = env.read_in(cwd.path(), &["export", "--format", "html"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    fs::read_to_string(cwd.path().join("repo.html")).unwrap()
+}
+
+#[test]
+fn req039_ac6_page_has_expand_all_button() {
+    let html = exported_page();
+    assert!(html.contains("<button id=\"expand-all\" type=\"button\""));
+    assert!(html.contains(">Tout étendre</button>"));
+}
+
+#[test]
+fn req039_ac7_button_row_order_and_attributes() {
+    let html = exported_page();
+    let (before, _, after) = split_block(&html);
+    let page = format!("{before}{after}");
+    let pos = |needle: &str| {
+        page.find(needle)
+            .unwrap_or_else(|| panic!("{needle} absent"))
+    };
+    let (r, x, e, m) = (
+        pos("id=\"reset\""),
+        pos("id=\"expand-all\""),
+        pos("id=\"expand\""),
+        pos("id=\"message\""),
+    );
+    assert!(r < x && x < e && e < m, "ordre des éléments");
+    let between = &page[r..m];
+    assert!(!between.contains("<section") && !between.contains("</section>"));
+    let start = page[..x].rfind('<').unwrap();
+    let tag = &page[start..start + page[start..].find('>').unwrap() + 1];
+    assert!(tag.starts_with("<button"));
+    assert!(tag.contains("id=\"expand-all\""));
+    assert!(tag.contains("type=\"button\""));
+    assert!(tag.contains(
+        "title=\"Affiche tout le graphe, au plus 5000 nœuds (ceux de plus haut degré)\""
+    ));
+    assert!(!tag.contains("disabled") && !tag.contains("aria-pressed"));
+    let ms = page[..m].rfind('<').unwrap();
+    let mtag = &page[ms..ms + page[ms..].find('>').unwrap() + 1];
+    assert!(mtag.contains("aria-live=\"polite\""));
+    let css = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/view/style.css"))
+        .unwrap();
+    assert!(!css.contains("outline: none") && !css.contains("outline:none"));
+}

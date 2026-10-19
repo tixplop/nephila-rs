@@ -15,6 +15,9 @@
   var view = init.view;
   var hidden = init.hidden;
   var hiddenLabel = "modules";
+  var cap = 300; // plafond de nœuds affichés pour « Étendre » et la navigation (ALL_LIMIT après « Tout étendre »)
+  var motion = motionState();
+  var linksTimer = null;
   var selected = -1;
   var hiddenNodeKinds = new Set();
   var hiddenEdgeKinds = new Set();
@@ -76,7 +79,11 @@
     renderDetails();
     alpha = Math.max(alpha, 0.3);
     if (opts.fit) {
-      for (var s = 0; s < 80 && vis.nodes.length > 1; s++) tick();
+      var t0 = performance.now();
+    for (var s = 0; s < 80 && vis.nodes.length > 1; s++) {
+      tick();
+      if (performance.now() - t0 >= 200) break;
+    }
       alpha = Math.max(alpha, 0.3);
       autoFit = true;
       keepSelected = false;
@@ -127,59 +134,22 @@
     keepSelected = false;
   }
 
-  // Disposition par forces : répulsion, ressorts, gravité vers le centre, refroidissement.
+  // Disposition par forces (layoutStep de model.js) sur les nœuds affichés.
   function tick() {
     var nodes = vis.nodes;
-    var n = nodes.length;
-    var p = nodes.map(function (i) {
+    var slot = new Map();
+    var p = nodes.map(function (i, k) {
+      slot.set(i, k);
       return pos.get(i);
     });
-    var slot = new Map();
-    nodes.forEach(function (i, s) {
-      slot.set(i, s);
-    });
-    var a, b, dx, dy, d2, d, f;
-    for (a = 0; a < n; a++) {
-      for (b = a + 1; b < n; b++) {
-        dx = p[a].x - p[b].x;
-        dy = p[a].y - p[b].y;
-        d2 = dx * dx + dy * dy + 0.01;
-        if (d2 > 90000) continue;
-        f = (2000 * alpha) / d2;
-        d = Math.sqrt(d2);
-        p[a].vx += (dx / d) * f * d;
-        p[a].vy += (dy / d) * f * d;
-        p[b].vx -= (dx / d) * f * d;
-        p[b].vy -= (dy / d) * f * d;
-      }
-    }
+    var pairs = [];
     vis.edges.forEach(function (e) {
-      var s = pos.get(g.src[e]);
-      var t = pos.get(g.dst[e]);
-      dx = t.x - s.x;
-      dy = t.y - s.y;
-      d = Math.sqrt(dx * dx + dy * dy) + 0.01;
-      f = (d - 70) * 0.05 * alpha;
-      s.vx += (dx / d) * f;
-      s.vy += (dy / d) * f;
-      t.vx -= (dx / d) * f;
-      t.vy -= (dy / d) * f;
+      var s = slot.get(g.src[e]);
+      var t = slot.get(g.dst[e]);
+      if (s !== undefined && t !== undefined) pairs.push([s, t]);
     });
-    for (a = 0; a < n; a++) {
-      p[a].vx -= p[a].x * 0.01 * alpha;
-      p[a].vy -= p[a].y * 0.01 * alpha;
-      if (ptr && ptr.node === nodes[a]) {
-        p[a].vx = 0;
-        p[a].vy = 0;
-        continue;
-      }
-      p[a].vx *= 0.6;
-      p[a].vy *= 0.6;
-      p[a].x += p[a].vx;
-      p[a].y += p[a].vy;
-    }
-    alpha *= 0.985;
-    if (alpha < 0.005) alpha = 0;
+    var pinned = ptr && ptr.node >= 0 && slot.has(ptr.node) ? slot.get(ptr.node) : -1;
+    alpha = layoutStep(p, pairs, alpha, pinned);
   }
 
   function resize() {
@@ -205,14 +175,16 @@
     ctx.clearRect(0, 0, cw, ch);
     ctx.lineWidth = 1;
     ctx.strokeStyle = "#aab";
-    ctx.beginPath();
-    vis.edges.forEach(function (e) {
-      var s = toScreen(pos.get(g.src[e]));
-      var t = toScreen(pos.get(g.dst[e]));
-      ctx.moveTo(s.x, s.y);
-      ctx.lineTo(t.x, t.y);
-    });
-    ctx.stroke();
+    if (linksShown(motion, performance.now())) {
+      ctx.beginPath();
+      vis.edges.forEach(function (e) {
+        var s = toScreen(pos.get(g.src[e]));
+        var t = toScreen(pos.get(g.dst[e]));
+        ctx.moveTo(s.x, s.y);
+        ctx.lineTo(t.x, t.y);
+      });
+      ctx.stroke();
+    }
     vis.nodes.forEach(function (i) {
       var q = toScreen(pos.get(i));
       ctx.beginPath();
@@ -270,10 +242,27 @@
 
   // Glisser : suivi sur window, avec capture du pointeur ; il se termine au relâchement, à la perte du
   // focus ou si un mouvement arrive sans bouton enfoncé (relâchement manqué hors de la fenêtre).
+  // Redessine la vue quand les liens redeviennent visibles (une vue immobile ne se redessine pas seule).
+  function scheduleLinks() {
+    clearTimeout(linksTimer);
+    linksTimer = null;
+    var due = linksDueAt(motion);
+    if (due === null) return;
+    linksTimer = setTimeout(function () {
+      linksTimer = null;
+      dirty = true;
+    }, Math.max(0, due - performance.now()));
+  }
+
   function endDrag(select_) {
     if (!ptr) return;
     var p = ptr;
     ptr = null;
+    if (p.panning) {
+      motion = onPanEnd(motion);
+      dirty = true;
+      scheduleLinks();
+    }
     if (select_ && !p.moved) select(p.node);
   }
 
@@ -293,7 +282,7 @@
   canvas.addEventListener("mousedown", function (ev) {
     if (ev.button !== 0) return;
     var m = mouse(ev);
-    ptr = { node: nodeAt(m.x, m.y), sx: m.x, sy: m.y, moved: false };
+    ptr = { node: nodeAt(m.x, m.y), sx: m.x, sy: m.y, moved: false, panning: false };
   });
   window.addEventListener("mousemove", function (ev) {
     if (!ptr) return;
@@ -306,6 +295,12 @@
     if (!ptr.moved) return;
     userMoved();
     dirty = true;
+    if (ptr.node < 0 && !ptr.panning) {
+      ptr.panning = true;
+      motion = onPanStart(motion);
+      clearTimeout(linksTimer);
+      linksTimer = null;
+    }
     if (ptr.node >= 0) {
       var w = toWorld(m.x, m.y);
       var q = pos.get(ptr.node);
@@ -336,6 +331,8 @@
       ev.preventDefault();
       userMoved();
       dirty = true;
+      motion = onWheel(motion, performance.now());
+      scheduleLinks();
       var m = mouse(ev);
       var before = toWorld(m.x, m.y);
       cam.k = Math.min(8, Math.max(0.02, cam.k * (ev.deltaY < 0 ? 1.15 : 1 / 1.15)));
@@ -354,7 +351,7 @@
 
   function extend() {
     if (selected < 0) return;
-    var r = expand(g, view, selected);
+    var r = expand(g, view, selected, cap);
     view = r.view;
     hidden = r.hidden;
     hiddenLabel = "voisins";
@@ -366,7 +363,7 @@
     var i = indexOf(g, id);
     if (i < 0) return;
     var anchor = selected;
-    var r = navigate(g, view, i);
+    var r = navigate(g, view, i, cap);
     view = r.view;
     hidden = r.hidden;
     hiddenLabel = "voisins";
@@ -425,7 +422,8 @@
       var li = el("li", g.ids[i]);
       li.title = g.ids[i];
       li.addEventListener("click", function () {
-        var r = neighborsView(g, i);
+        cap = 300;
+        var r = neighborsView(g, i, cap);
         view = r.view;
         hidden = r.hidden;
         hiddenLabel = "voisins";
@@ -465,11 +463,21 @@
     renderResults(ev.target.value);
   });
   $("expand").addEventListener("click", extend);
+  $("expand-all").addEventListener("click", function () {
+    var r = allView(g);
+    view = r.view;
+    hidden = r.hidden;
+    hiddenLabel = "nœuds";
+    cap = ALL_LIMIT;
+    if (selected >= 0 && !view.has(selected)) selected = -1;
+    refresh(undefined, { fit: true });
+  });
   $("reset").addEventListener("click", function () {
     var r = initialView(g);
     view = r.view;
     hidden = r.hidden;
     hiddenLabel = "modules";
+    cap = 300;
     selected = -1;
     pos.clear();
     cam = { k: 1, x: 0, y: 0 };
