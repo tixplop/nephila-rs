@@ -108,7 +108,18 @@ pub fn run(repo: &Path, as_json: bool) -> Result<()> {
             .as_array()
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        let name = m["name"].as_str().unwrap_or("?");
+        // Nom qualifié (identifiant sans le préfixe de genre) : `@acme/web`, pas `web`.
+        // Suivi du nom court entre parenthèses s'il n'est pas déjà la fin du nom qualifié.
+        let short = m["name"].as_str();
+        let qualified = m["id"]
+            .as_str()
+            .map(|id| id.strip_prefix("module:").unwrap_or(id))
+            .or(short)
+            .unwrap_or("?");
+        let name = match short {
+            Some(sh) if !qualified.ends_with(sh) => format!("{qualified} ({sh})"),
+            _ => qualified.to_string(),
+        };
         if deps.is_empty() {
             println!("  {name}");
         } else {

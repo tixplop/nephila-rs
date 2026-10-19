@@ -394,14 +394,23 @@ fn derive_contains(
 
     // Module -> package : module du fichier déclarant le package (AC-005-5).
     let kinds: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    let mut build_dirs: HashMap<String, &Node> = HashMap::new();
+    // Deux écosystèmes : modules déclarés par un `package.json` (modules ES) et par un fichier de
+    // build JVM (le reste), chacun rattaché à son fichier de build le plus proche.
+    let mut jvm_dirs: HashMap<String, &Node> = HashMap::new();
+    let mut npm_dirs: HashMap<String, &Node> = HashMap::new();
     for n in nodes.iter().filter(|n| n.kind == NodeKind::Module) {
         if let Some(f) = &n.file {
-            let dir = f.rsplit_once('/').map_or("", |(d, _)| d).to_string();
-            build_dirs.entry(dir).or_insert(n);
+            let (dir, name) = f.rsplit_once('/').unwrap_or(("", f.as_str()));
+            let table = if name == "package.json" {
+                &mut npm_dirs
+            } else {
+                &mut jvm_dirs
+            };
+            table.entry(dir.to_string()).or_insert(n);
         }
     }
-    let dirs: HashSet<String> = build_dirs.keys().cloned().collect();
+    let jvm_set: HashSet<String> = jvm_dirs.keys().cloned().collect();
+    let npm_set: HashSet<String> = npm_dirs.keys().cloned().collect();
     for (file, node) in declarations {
         let Some(n) = kinds
             .get(node.as_str())
@@ -409,7 +418,14 @@ fn derive_contains(
         else {
             continue;
         };
-        if let Some(m) = module_of(file, &dirs).and_then(|d| build_dirs.get(&d)) {
+        let js =
+            crate::parse::Lang::from_path(std::path::Path::new(file)).is_some_and(|l| l.is_js_ts());
+        let (set, table) = if js {
+            (&npm_set, &npm_dirs)
+        } else {
+            (&jvm_set, &jvm_dirs)
+        };
+        if let Some(m) = module_of(file, set).and_then(|d| table.get(&d)) {
             push(
                 NodeKind::Module,
                 &m.qualified,
@@ -1002,6 +1018,59 @@ mod tests {
             &node_id(NodeKind::Document, "docs/d.md"),
             EdgeKind::Contains,
             &node_id(NodeKind::Section, "docs/d.md#intro")
+        ));
+    }
+
+    #[test]
+    fn req005_ac5_modules_par_ecosysteme() {
+        let mut e = env(&["pom.xml", "package.json", "src/A.java", "web/src/main.ts"]);
+        let m = |q, f| plain(NodeKind::Module, q, Some(f));
+        e.store
+            .replace_file("pom.xml", &[m("com.acme:app", "pom.xml")], &[])
+            .unwrap();
+        e.store
+            .replace_file("package.json", &[m("app-front", "package.json")], &[])
+            .unwrap();
+        e.store
+            .replace_file(
+                "src/A.java",
+                &[plain(NodeKind::Package, "com.acme", Some("src/A.java"))],
+                &[],
+            )
+            .unwrap();
+        e.store
+            .replace_file(
+                "web/src/main.ts",
+                &[plain(
+                    NodeKind::Package,
+                    "web/src/main",
+                    Some("web/src/main.ts"),
+                )],
+                &[],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        let md = |q| node_id(NodeKind::Module, q);
+        let pk = |q| node_id(NodeKind::Package, q);
+        let contains: Vec<_> = e
+            .store
+            .edges()
+            .unwrap()
+            .into_iter()
+            .filter(|x| x.kind == EdgeKind::Contains && x.source.starts_with("module:"))
+            .collect();
+        assert_eq!(contains.len(), 2, "{contains:?}");
+        assert!(has_edge(
+            &e,
+            &md("com.acme:app"),
+            EdgeKind::Contains,
+            &pk("com.acme")
+        ));
+        assert!(has_edge(
+            &e,
+            &md("app-front"),
+            EdgeKind::Contains,
+            &pk("web/src/main")
         ));
     }
 

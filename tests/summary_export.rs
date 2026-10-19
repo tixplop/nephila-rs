@@ -184,6 +184,14 @@ fn req019_ac1_summary_text_output() {
     ] {
         assert!(t.contains(needle), "{needle} absent de :\n{t}");
     }
+    // AC-019-6 : noms qualifiés, lignes exactes.
+    for line in [
+        "  com.acme:api -> module:com.acme:core",
+        "  com.acme:core -> dependency:org.slf4j:slf4j-api",
+        "  com.acme:store -> module:com.acme:core",
+    ] {
+        assert!(t.lines().any(|l| l == line), "{line:?} absent de :\n{t}");
+    }
 }
 
 #[test]

@@ -232,6 +232,16 @@ fn req022_modified_settings_then_update_renames_root() {
 }
 
 #[test]
+fn req019_ac6_gradle_summary_uses_qualified_module_names() {
+    let env = Env::built("gradle/groovy");
+    let out = env.ok(&["summary"]);
+    let t = text(&out.stdout);
+    for line in ["  : (shop)", "  :core -> dependency:com.google.guava:guava"] {
+        assert!(t.lines().any(|l| l == line), "{line:?} absent de :\n{t}");
+    }
+}
+
+#[test]
 fn req001_ac4_and_req017_on_gradle_repo_without_llm_configuration() {
     let env = Env::built("gradle/groovy");
     // AC-017-2 : graphe à jour, aucun avertissement.

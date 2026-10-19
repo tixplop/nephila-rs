@@ -729,6 +729,25 @@ impl Store {
         rows.map(|r| r.map_err(db_err)).collect()
     }
 
+    /// Parmi `files`, ceux qui déclarent encore le nœud `document:<chemin>` (requête ciblée
+    /// par clé primaire, sans charger toute la table des déclarations).
+    pub fn files_declaring_document(&self, files: &[&str]) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT 1 FROM declarations WHERE file = ?1 AND node = ?2")
+            .map_err(db_err)?;
+        let mut found = Vec::new();
+        for f in files {
+            if st
+                .exists(rusqlite::params![f, format!("document:{f}")])
+                .map_err(db_err)?
+            {
+                found.push((*f).to_string());
+            }
+        }
+        Ok(found)
+    }
+
     pub fn files(&self) -> Result<Vec<FileRecord>> {
         let mut st = self
             .conn

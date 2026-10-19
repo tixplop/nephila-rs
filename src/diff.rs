@@ -1,7 +1,7 @@
 //! Comparaison du parcours du dépôt avec la table `files` (REQ-012, réutilisée par update
 //! et par l'avertissement « pas à jour » des requêtes).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::Result;
@@ -71,14 +71,29 @@ pub fn compute(repo: &Path, store: &Store) -> Result<Diff> {
     } = scan::scan(repo, &known)?;
     let on_disk: HashMap<&str, &ScannedFile> =
         scanned.iter().map(|f| (f.path.as_str(), f)).collect();
+    // Mise à niveau 0.9 -> 0.10 : un `package.json` enregistré comme document de données doit
+    // être réanalysé comme fichier de build même si son contenu n'a pas changé (AC-035-6).
+    let is_pkg = |p: &str| p.rsplit('/').next() == Some("package.json");
+    let pkgs: Vec<&str> = known
+        .iter()
+        .filter(|k| k.state == FileState::Indexed && is_pkg(&k.path))
+        .map(|k| k.path.as_str())
+        .collect();
+    let legacy_pkg: HashSet<String> = if pkgs.is_empty() {
+        HashSet::new()
+    } else {
+        store.files_declaring_document(&pkgs)?.into_iter().collect()
+    };
     let mut changes = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for k in &known {
         seen.insert(k.path.as_str());
         let change = match (on_disk.get(k.path.as_str()), k.state) {
             (None, _) => Some(Change::Deleted),
             (Some(_), FileState::Pending) => Some(Change::Pending),
-            (Some(f), FileState::Indexed) if f.hash != k.hash => Some(Change::Modified),
+            (Some(f), FileState::Indexed) if f.hash != k.hash || legacy_pkg.contains(&k.path) => {
+                Some(Change::Modified)
+            }
             _ => None,
         };
         if let Some(change) = change {

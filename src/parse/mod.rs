@@ -98,7 +98,7 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure>
         Some(Lang::Json) => Ok(json::extract(path, text)),
         Some(Lang::Yaml) => Ok(yaml::extract(path, text)),
         Some(l @ (Lang::JavaScript | Lang::TypeScript | Lang::Tsx)) => js::extract(l, path, text),
-        Some(Lang::PackageJson) => Ok(npm::extract(path, text)),
+        Some(Lang::PackageJson) => Ok(npm::extract(path, text, ctx)),
         Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) => Ok(gradle::extract(path, text, ctx)),
         None => Ok(FileStructure::default()),
     }
