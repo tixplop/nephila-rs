@@ -886,7 +886,7 @@ fn req024_ac5_invalid_response_keeps_structure_and_leaves_file_to_enrich() {
         fs::write(env.mock.join(format!("{bad}.json")), bad_json).unwrap();
         fs::write(
             &env.config,
-            format!("provider = \"mock\"\nconcurrency = {concurrency}\n"),
+            format!("provider = \"mock\"\nconcurrency = {concurrency}\nformat_retries = 0\n"),
         )
         .unwrap();
         let out = env.build();

@@ -43,6 +43,8 @@ pub struct IndexOptions {
     pub max_chunk_chars: usize,
     /// Nombre maximal de fichiers par appel LLM (REQ-027).
     pub batch_files: usize,
+    /// Nouveaux essais d'un appel LLM dont la réponse est non conforme (REQ-038).
+    pub format_retries: u32,
 }
 
 impl Default for IndexOptions {
@@ -51,6 +53,7 @@ impl Default for IndexOptions {
             concurrency: DEFAULT_CONCURRENCY,
             max_chunk_chars: DEFAULT_MAX_CHUNK_CHARS,
             batch_files: crate::config::DEFAULT_BATCH_FILES,
+            format_retries: crate::config::DEFAULT_FORMAT_RETRIES,
         }
     }
 }
@@ -61,6 +64,7 @@ impl From<&Config> for IndexOptions {
             concurrency: c.concurrency,
             max_chunk_chars: c.max_chunk_chars,
             batch_files: c.batch_files,
+            format_retries: c.format_retries,
         }
     }
 }
@@ -101,13 +105,14 @@ pub(crate) fn setup(no_llm: bool, batch_files: Option<usize>) -> Result<Setup> {
                 tls_trace.push_str(" tls_insecure");
             }
             trace!(
-                "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={}{}",
+                "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}",
                 config.provider.as_str(),
                 config.model,
                 config.concurrency,
                 config.timeout_secs,
                 config.max_chunk_chars,
                 config.batch_files,
+                config.format_retries,
                 tls_trace
             );
             let llm = build_llm(&config)?;

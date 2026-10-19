@@ -388,5 +388,9 @@ fn req036_ac8_verbose_config_line() {
     let s = FakeServer::start(script("openai"));
     env.config("openai", &s.base_url, "");
     let o = env.run(&["build", "--verbose"]);
-    assert!(line(&o).ends_with("batch_files=1"), "{}", line(&o));
+    assert!(
+        line(&o).ends_with("batch_files=1 format_retries=2"),
+        "{}",
+        line(&o)
+    );
 }

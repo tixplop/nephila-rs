@@ -11,7 +11,7 @@ use std::time::Instant;
 use crate::chunk;
 use crate::error::{warn, Error, Result};
 use crate::index::build::{BuildReport, IndexOptions};
-use crate::llm::{Enrichment, Llm, LotItem};
+use crate::llm::{with_format_retries, Enrichment, Llm, LotItem};
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
 use crate::store::Store;
 use crate::trace;
@@ -132,6 +132,8 @@ fn run_unit(
     max_chunk_chars: usize,
     llm: &dyn Llm,
     ids: &HashMap<String, Vec<String>>,
+    retries: u32,
+    stop: &AtomicBool,
 ) -> (Vec<Outcome>, Option<Option<Error>>) {
     let files: Vec<&FileRecord> = match unit {
         Unit::Lot(v) => v.clone(),
@@ -154,7 +156,15 @@ fn run_unit(
         0 => (outcomes, None),
         1 => {
             let (f, text) = &readable[0];
-            let r = enrich_chunks(llm, &f.path, text, max_chunk_chars, &node_ids(f));
+            let r = enrich_chunks(
+                llm,
+                &f.path,
+                text,
+                max_chunk_chars,
+                &node_ids(f),
+                retries,
+                stop,
+            );
             let err = r.as_ref().err().cloned();
             outcomes.push(match r {
                 Ok(x) => Outcome::Done((*f).clone(), x),
@@ -171,7 +181,7 @@ fn run_unit(
                     node_ids: node_ids(f),
                 })
                 .collect();
-            match traced_lot(llm, &items) {
+            match traced_lot(llm, &items, retries, stop) {
                 Err(e) => {
                     for (f, _) in &readable {
                         outcomes.push(Outcome::Failed(f.path.clone(), e.clone()));
@@ -207,6 +217,24 @@ fn trace_detail(e: &Error) -> String {
     }
 }
 
+/// Numéro d'essai `current` sur `total` d'un même appel (REQ-038).
+#[derive(Clone, Copy)]
+struct Attempt {
+    current: u32,
+    total: u32,
+}
+
+impl Attempt {
+    /// Marque de la ligne de départ d'un essai à partir du deuxième.
+    fn mark(self) -> String {
+        if self.current >= 2 {
+            format!(" (essai {}/{})", self.current, self.total)
+        } else {
+            String::new()
+        }
+    }
+}
+
 /// Un appel `llm.enrich` encadré de ses traces de départ et de fin (jamais de contenu).
 fn traced_enrich(
     llm: &dyn Llm,
@@ -215,13 +243,15 @@ fn traced_enrich(
     total: usize,
     text: &str,
     node_ids: &[String],
+    attempt: Attempt,
 ) -> Result<Enrichment> {
     if !trace::enabled() {
         return llm.enrich(path, index, text, node_ids);
     }
     trace!(
-        "llm enrich départ {path} [{index}/{total}] {} car.",
-        text.chars().count()
+        "llm enrich départ {path} [{index}/{total}] {} car.{}",
+        text.chars().count(),
+        attempt.mark()
     );
     let started = Instant::now();
     let result = llm.enrich(path, index, text, node_ids);
@@ -242,14 +272,31 @@ fn traced_enrich(
 }
 
 /// Un appel `llm.enrich_lot` encadré de ses traces de départ et de fin (jamais de contenu).
-fn traced_lot(llm: &dyn Llm, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+fn traced_lot(
+    llm: &dyn Llm,
+    items: &[LotItem],
+    retries: u32,
+    stop: &AtomicBool,
+) -> Result<Vec<(String, Result<Enrichment>)>> {
+    let total = retries.saturating_add(1);
+    with_format_retries(retries, stop, |current| {
+        traced_lot_once(llm, items, Attempt { current, total })
+    })
+}
+
+fn traced_lot_once(
+    llm: &dyn Llm,
+    items: &[LotItem],
+    attempt: Attempt,
+) -> Result<Vec<(String, Result<Enrichment>)>> {
     if !trace::enabled() {
         return llm.enrich_lot(items);
     }
     let label = format!("lot {} +{}", items[0].file, items.len() - 1);
     trace!(
-        "llm enrich départ {label} [1/1] {} car.",
-        items.iter().map(|i| i.text.chars().count()).sum::<usize>()
+        "llm enrich départ {label} [1/1] {} car.{}",
+        items.iter().map(|i| i.text.chars().count()).sum::<usize>(),
+        attempt.mark()
     );
     let started = Instant::now();
     let result = llm.enrich_lot(items);
@@ -281,21 +328,31 @@ fn enrich_chunks(
     text: &str,
     max_chunk_chars: usize,
     node_ids: &[String],
+    retries: u32,
+    stop: &AtomicBool,
 ) -> Result<Enrichment> {
+    let total = retries.saturating_add(1);
+    // Le compte d'essais repart à 1 pour chaque morceau ; seul le morceau fautif est renvoyé.
+    let one = |index: usize, count: usize, part: &str| {
+        with_format_retries(retries, stop, |current| {
+            traced_enrich(
+                llm,
+                path,
+                index,
+                count,
+                part,
+                node_ids,
+                Attempt { current, total },
+            )
+        })
+    };
     let parts = chunk::split(text, max_chunk_chars);
     if parts.len() == 1 {
-        return traced_enrich(llm, path, 1, 1, &parts[0], node_ids);
+        return one(1, 1, &parts[0]);
     }
     let mut results = Vec::with_capacity(parts.len());
     for (i, part) in parts.iter().enumerate() {
-        results.push(traced_enrich(
-            llm,
-            path,
-            i + 1,
-            parts.len(),
-            part,
-            node_ids,
-        )?);
+        results.push(one(i + 1, parts.len(), part)?);
     }
     Ok(chunk::merge_enrichments(results))
 }
@@ -350,10 +407,33 @@ pub(crate) fn enrich_all(
     store: &mut Store,
     report: &mut BuildReport,
 ) -> Result<()> {
+    enrich_with_stop(
+        repo,
+        files,
+        opts,
+        llm,
+        store,
+        report,
+        &AtomicBool::new(false),
+    )
+    .map(|_| ())
+}
+
+/// Corps d'`enrich_all` avec le drapeau d'arrêt injecté (DEC-047) ; rend les fichiers en échec.
+pub(crate) fn enrich_with_stop(
+    repo: &Path,
+    files: &[FileRecord],
+    opts: &IndexOptions,
+    llm: &dyn Llm,
+    store: &mut Store,
+    report: &mut BuildReport,
+    stop: &AtomicBool,
+) -> Result<Vec<(String, Error)>> {
     let IndexOptions {
         concurrency,
         max_chunk_chars,
         batch_files,
+        format_retries,
     } = *opts;
     let ids = node_ids_by_file(store)?;
     let started = Instant::now();
@@ -361,11 +441,11 @@ pub(crate) fn enrich_all(
     let mut succeeded = 0usize;
     let units = form_units(files, batch_files, max_chunk_chars);
     let queue: Mutex<VecDeque<Unit>> = Mutex::new(units.into());
-    let stop = AtomicBool::new(false);
     let policy = Mutex::new(Policy::default());
     let (tx, rx) = mpsc::channel::<Outcome>();
     let workers = concurrency.clamp(1, queue_len(&queue).max(1));
     let mut write_error: Option<Error> = None;
+    let mut failures: Vec<(String, Error)> = Vec::new();
     trace!(
         "enrichissement: début {} fichiers, {workers} fils",
         files.len()
@@ -373,7 +453,6 @@ pub(crate) fn enrich_all(
 
     std::thread::scope(|scope| {
         let queue = &queue;
-        let stop = &stop;
         let policy = &policy;
         let ids = &ids;
         for _ in 0..workers {
@@ -386,7 +465,15 @@ pub(crate) fn enrich_all(
                     break;
                 };
                 let ticket = policy.lock().unwrap_or_else(|p| p.into_inner()).dispatch();
-                let (outcomes, call) = run_unit(&unit, repo, max_chunk_chars, llm, ids);
+                let (outcomes, call) = run_unit(
+                    &unit,
+                    repo,
+                    max_chunk_chars,
+                    llm,
+                    ids,
+                    format_retries,
+                    stop,
+                );
                 let error = call.as_ref().and_then(|e| e.as_ref());
                 let halt = {
                     let mut guard = policy.lock().unwrap_or_else(|p| p.into_inner());
@@ -431,6 +518,7 @@ pub(crate) fn enrich_all(
                 Outcome::Failed(path, e) => {
                     warn(&format!("{path} : {e}"));
                     report.failed += 1;
+                    failures.push((path, e));
                 }
                 Outcome::Done(file, x) => {
                     if write_error.is_some() {
@@ -471,7 +559,7 @@ pub(crate) fn enrich_all(
         .stop_cause;
     match write_error {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => Ok(failures),
     }
 }
 
@@ -592,5 +680,119 @@ mod tests {
         let mut p = Policy::default();
         let t = p.dispatch();
         assert!(p.record(t, Some(&Error::InvalidKey("k".into()))));
+    }
+
+    #[test]
+    fn req038_ac7_final_format_result_does_not_touch_network_count() {
+        let mut p = Policy::default();
+        for _ in 0..2 {
+            let t = p.dispatch();
+            assert!(!p.record(t, Some(&net())));
+        }
+        let fmt = Error::Format("non conforme (3 essais sur 3)".into());
+        let t = p.dispatch();
+        assert!(!p.record(t, Some(&fmt)));
+        assert_eq!((p.consecutive_network, p.network_total), (2, 2));
+        // Une suite d'essais terminée par une erreur réseau compte pour une seule erreur.
+        let t = p.dispatch();
+        let r: Result<()> = with_format_retries(2, &AtomicBool::new(false), |n| {
+            if n < 3 {
+                Err(Error::Format("f".into()))
+            } else {
+                Err(net())
+            }
+        });
+        assert!(matches!(r, Err(Error::Network(_))));
+        assert!(p.record(t, r.as_ref().err()));
+        assert_eq!((p.consecutive_network, p.network_total), (3, 3));
+    }
+
+    /// Une clé invalide sur un autre fil pose l'arrêt pendant que A boucle sur ses essais :
+    /// A garde son erreur `Format` et n'est pas réessayé.
+    #[test]
+    fn req038_ac10_invalid_key_on_other_thread_stops_retries() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc::{Receiver, Sender};
+        use std::time::Duration;
+
+        struct Fake<'a> {
+            stop: &'a AtomicBool,
+            rx: Mutex<Receiver<()>>,
+            tx: Mutex<Sender<()>>,
+            calls_a: AtomicUsize,
+        }
+        impl Llm for Fake<'_> {
+            fn verify_key(&self) -> Result<()> {
+                Ok(())
+            }
+            fn enrich(&self, path: &str, _: usize, _: &str, _: &[String]) -> Result<Enrichment> {
+                if path.ends_with("B.java") {
+                    self.tx.lock().unwrap().send(()).unwrap();
+                    return Err(Error::InvalidKey("clé refusée".into()));
+                }
+                if self.calls_a.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("B jamais envoyé pendant l'appel de A");
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !self.stop.load(Ordering::SeqCst) {
+                        assert!(Instant::now() < deadline, "arrêt jamais posé après B");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(Error::Format("réponse non conforme".into()))
+            }
+            fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+                Err(Error::Message("inutilisé".into()))
+            }
+            fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+                Err(Error::Message("inutilisé".into()))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["A.java", "B.java"] {
+            std::fs::write(dir.path().join(n), "package p;\npublic class X {}\n").unwrap();
+        }
+        let files = [rec("A.java", 30), rec("B.java", 30)];
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        let mut report = BuildReport::default();
+        let opts = IndexOptions {
+            concurrency: 2,
+            max_chunk_chars: 1000,
+            batch_files: 1,
+            format_retries: u32::MAX,
+        };
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let llm = Fake {
+            stop: &stop,
+            rx: Mutex::new(rx),
+            tx: Mutex::new(tx),
+            calls_a: AtomicUsize::new(0),
+        };
+        let mut failures = enrich_with_stop(
+            dir.path(),
+            &files,
+            &opts,
+            &llm,
+            &mut store,
+            &mut report,
+            &stop,
+        )
+        .unwrap();
+        failures.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(llm.calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].0, "A.java");
+        match &failures[0].1 {
+            Error::Format(m) => assert!(m.contains("non conforme"), "{m}"),
+            e => panic!("attendu Format, obtenu {e:?}"),
+        }
+        assert_eq!(failures[1].0, "B.java");
+        assert!(matches!(failures[1].1, Error::InvalidKey(_)));
+        assert!(report.stop_cause.is_some());
     }
 }

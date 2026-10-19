@@ -571,6 +571,8 @@ fn req027_ac8_version_2_reply_for_a_lot_fails_all_its_files() {
         (200, openai_reply(&reply)),
     ]);
     let env = server_env(&server, 6);
+    let cfg = fs::read_to_string(&env.config).unwrap();
+    fs::write(&env.config, format!("{cfg}format_retries = 0\n")).unwrap();
     let o = run_server(&env, "build");
     let err = stderr(&o);
     assert!(!o.status.success(), "{err}");

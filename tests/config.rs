@@ -569,6 +569,37 @@ fn req038_ac1_invalid_format_retries_fails_before_any_work() {
 }
 
 #[test]
+fn req038_ac1_invalid_format_retries_leaves_existing_index_untouched() {
+    for bad in ["-1", "1.5", "\"2\""] {
+        let (_tmp, repo, cfg) = format_retries_repo();
+        std::fs::write(&cfg, "provider='mock'\n").unwrap();
+        let out = run_nephila(&repo, &cfg, &["build", "--no-llm"]);
+        assert!(out.status.success());
+        let snapshot = |repo: &Path| -> Vec<(String, Vec<u8>)> {
+            let mut v: Vec<_> = std::fs::read_dir(repo.join(".nephila"))
+                .unwrap()
+                .map(|e| {
+                    let p = e.unwrap().path();
+                    (
+                        p.file_name().unwrap().to_string_lossy().into_owned(),
+                        std::fs::read(&p).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = snapshot(&repo);
+        assert!(!before.is_empty());
+        std::fs::write(&cfg, format!("provider='mock'\nformat_retries={bad}\n")).unwrap();
+        let out = run_nephila(&repo, &cfg, &["build"]);
+        assert!(!out.status.success(), "{bad}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("format_retries"));
+        assert_eq!(before, snapshot(&repo), "{bad}");
+    }
+}
+
+#[test]
 fn req038_ac16_invalid_format_retries_single_line_on_build_and_ask() {
     for bad in ["-1", "1.5", "\"2\""] {
         let (_tmp, repo, cfg) = format_retries_repo();
