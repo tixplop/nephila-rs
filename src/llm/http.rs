@@ -185,7 +185,7 @@ fn is_timeout(e: &ureq::Error) -> bool {
 pub fn extract_json(text: &str) -> Result<&str> {
     match (text.find('{'), text.rfind('}')) {
         (Some(a), Some(b)) if a < b => Ok(&text[a..=b]),
-        _ => Err(Error::Message(
+        _ => Err(Error::Format(
             "réponse LLM non conforme : aucun objet JSON dans le texte".into(),
         )),
     }
@@ -194,5 +194,5 @@ pub fn extract_json(text: &str) -> Result<&str> {
 /// Lit `body` en JSON, avec un message d'erreur d'appel (ni clé ni réseau).
 pub fn parse_body(provider: &str, body: &str) -> Result<serde_json::Value> {
     serde_json::from_str(body)
-        .map_err(|e| Error::Message(format!("réponse de {provider} illisible : {e}")))
+        .map_err(|e| Error::Format(format!("réponse de {provider} illisible : {e}")))
 }

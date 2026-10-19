@@ -7,11 +7,13 @@ mod http;
 pub use http::Tls;
 pub mod mock;
 pub mod openai;
+pub mod retry;
 
 use crate::config::{Config, Provider};
 use crate::error::{Error, Result};
 pub use ask::AskReply;
 pub use enrich::{Enrichment, LotItem};
+pub use retry::with_format_retries;
 
 /// Fournisseur LLM. Les implémentations sont partagées entre threads.
 pub trait Llm: Send + Sync {

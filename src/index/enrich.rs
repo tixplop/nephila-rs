@@ -202,7 +202,7 @@ fn run_unit(
 /// premier « : ») est gardé : le détail serde cite des valeurs et des noms de champs de la réponse.
 fn trace_detail(e: &Error) -> String {
     match e {
-        Error::Message(m) => m.split(" : ").next().unwrap_or("").to_string(),
+        Error::Message(m) | Error::Format(m) => m.split(" : ").next().unwrap_or("").to_string(),
         other => other.to_string(),
     }
 }

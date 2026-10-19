@@ -61,7 +61,7 @@ impl OpenAiLlm {
         v["choices"][0]["message"]["content"]
             .as_str()
             .map(String::from)
-            .ok_or_else(|| Error::Message("réponse de openai sans message".into()))
+            .ok_or_else(|| Error::Format("réponse de openai sans message".into()))
     }
 }
 

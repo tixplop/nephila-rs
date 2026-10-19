@@ -13,6 +13,9 @@ pub enum Error {
     Timeout(String),
     /// Toute autre erreur, avec un message destiné à l'utilisateur.
     Message(String),
+    /// Réponse reçue du LLM jugée inexploitable (illisible, hors schéma) ; seule erreur
+    /// qui justifie un nouvel essai (REQ-038). S'affiche comme `Message`.
+    Format(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -29,9 +32,11 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::InvalidKey(m) | Error::Network(m) | Error::Timeout(m) | Error::Message(m) => {
-                f.write_str(m)
-            }
+            Error::InvalidKey(m)
+            | Error::Network(m)
+            | Error::Timeout(m)
+            | Error::Message(m)
+            | Error::Format(m) => f.write_str(m),
         }
     }
 }

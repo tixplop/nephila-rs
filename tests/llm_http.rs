@@ -239,13 +239,13 @@ fn req002_invalid_responses_are_message_errors() {
     for _ in 0..4 {
         assert!(matches!(
             llm.enrich("A.java", 1, "x", &a_ids()),
-            Err(Error::Message(_))
+            Err(Error::Format(_))
         ));
     }
     let s = FakeServer::start(vec![(200, r#"{"choices":[]}"#.into())]);
     assert!(matches!(
         openai(&s, None).enrich("A.java", 1, "x", &a_ids()),
-        Err(Error::Message(_))
+        Err(Error::Format(_))
     ));
 }
 
@@ -359,7 +359,7 @@ fn req024_ac5_enrich_version_1_is_non_conforming() {
     let s = FakeServer::start(vec![(200, anthropic_reply(VERSION_1))]);
     assert!(matches!(
         anthropic(&s).enrich("A.java", 1, "x", &[]),
-        Err(Error::Message(_))
+        Err(Error::Format(_))
     ));
 }
 
@@ -446,7 +446,7 @@ fn req027_ac8_lot_version_2_is_non_conforming_and_errors_classified() {
         (500, "{}".into()),
     ]);
     let o = openai(&s, None);
-    assert!(matches!(o.enrich_lot(&lot_items()), Err(Error::Message(_))));
+    assert!(matches!(o.enrich_lot(&lot_items()), Err(Error::Format(_))));
     assert!(matches!(
         o.enrich_lot(&lot_items()),
         Err(Error::InvalidKey(_))

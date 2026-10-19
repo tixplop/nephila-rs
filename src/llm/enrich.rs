@@ -115,7 +115,7 @@ fn filter_raw(
 }
 
 fn invalid(msg: impl std::fmt::Display) -> Error {
-    Error::Message(format!("réponse LLM non conforme au schéma : {msg}"))
+    Error::Format(format!("réponse LLM non conforme au schéma : {msg}"))
 }
 
 /// Minuscules, espaces réduits à un seul.
@@ -204,7 +204,13 @@ impl LotEnrichment {
             let note = format!(" (éléments écartés du lot : {})", rejected.join(" ; "));
             for (_, r) in files.iter_mut() {
                 if let Err(err) = r {
-                    *r = Err(Error::Message(format!("{err}{note}")));
+                    let text = format!("{err}{note}");
+                    let is_format = matches!(err, Error::Format(_));
+                    *r = Err(if is_format {
+                        Error::Format(text)
+                    } else {
+                        Error::Message(text)
+                    });
                 }
             }
         }

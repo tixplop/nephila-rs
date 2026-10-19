@@ -13,6 +13,7 @@ pub const DEFAULT_MAX_CHUNK_CHARS: usize = 60_000;
 pub const DEFAULT_CONCURRENCY: usize = 4;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_BATCH_FILES: usize = 1;
+pub const DEFAULT_FORMAT_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -43,6 +44,8 @@ pub struct Config {
     pub timeout_secs: u64,
     /// Nombre maximal de fichiers par appel d'enrichissement (REQ-027).
     pub batch_files: usize,
+    /// Nouveaux essais d'un appel dont la réponse est non conforme (REQ-038).
+    pub format_retries: u32,
     /// Chemin résolu du PEM d'autorités ajoutées aux autorités publiques (REQ-036).
     pub tls_ca_cert: Option<PathBuf>,
     /// Certificats d'autorité (DER) lus dans `tls_ca_cert`, déjà validés.
@@ -62,6 +65,7 @@ struct RawConfig {
     concurrency: Option<i64>,
     timeout_secs: Option<i64>,
     batch_files: Option<i64>,
+    format_retries: Option<toml::Value>,
     tls_ca_cert: Option<String>,
     tls_insecure: Option<bool>,
 }
@@ -222,6 +226,16 @@ impl Config {
                 ))),
             }
         };
+        let format_retries = match &raw.format_retries {
+            None => DEFAULT_FORMAT_RETRIES,
+            Some(toml::Value::Integer(n)) if (0..=i64::from(u32::MAX)).contains(n) => *n as u32,
+            Some(v) => {
+                return Err(Error::Message(format!(
+                    "configuration invalide ({at}) : clé « format_retries » doit être un entier \
+                     positif ou nul (reçu : {v})"
+                )))
+            }
+        };
         Ok(Config {
             provider,
             model,
@@ -239,6 +253,7 @@ impl Config {
                 DEFAULT_TIMEOUT_SECS as usize,
             )? as u64,
             batch_files: positive("batch_files", raw.batch_files, DEFAULT_BATCH_FILES)?,
+            format_retries,
             tls_ca_cert,
             tls_ca_certs,
             tls_insecure: raw.tls_insecure.unwrap_or(false),

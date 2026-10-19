@@ -492,3 +492,96 @@ fn req036_ac5_ca_errors_and_type_errors() {
         assert!(e.contains("tls_insecure"), "{e}");
     }
 }
+
+// ---- REQ-038 : format_retries ----
+
+#[test]
+fn req038_format_retries_default_and_zero() {
+    assert_eq!(parse("provider='mock'").unwrap().format_retries, 2);
+    assert_eq!(
+        parse("provider='mock'\nformat_retries=0")
+            .unwrap()
+            .format_retries,
+        0
+    );
+    assert_eq!(
+        parse("provider='mock'\nformat_retries=7")
+            .unwrap()
+            .format_retries,
+        7
+    );
+}
+
+#[test]
+fn req038_format_retries_invalid_values_exact_message() {
+    for bad in ["-1", "1.5", "\"2\"", "4294967296"] {
+        let m = parse(&format!("provider='mock'\nformat_retries={bad}")).unwrap_err();
+        assert_eq!(
+            m,
+            format!(
+                "configuration invalide (/x/config.toml) : clé « format_retries » doit être un \
+                 entier positif ou nul (reçu : {bad})"
+            )
+        );
+        assert!(!m.contains('\n'));
+    }
+}
+
+fn format_retries_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("A.java"), "class A {}\n").unwrap();
+    (tmp, repo.clone(), tmp_cfg(&repo))
+}
+
+fn tmp_cfg(repo: &Path) -> PathBuf {
+    repo.parent().unwrap().join("config.toml")
+}
+
+fn run_nephila(repo: &Path, cfg: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("NEPHILA_CONFIG", cfg)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn req038_ac1_invalid_format_retries_fails_before_any_work() {
+    for bad in ["-1", "1.5", "\"2\""] {
+        let (_tmp, repo, cfg) = format_retries_repo();
+        std::fs::write(&cfg, format!("provider='mock'\nformat_retries={bad}\n")).unwrap();
+        let out = run_nephila(&repo, &cfg, &["build"]);
+        assert!(!out.status.success(), "{bad}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("format_retries"), "{bad}: {err}");
+        assert!(!repo.join(".nephila").exists(), "{bad}");
+        let out = run_nephila(&repo, &cfg, &["build", "--no-llm"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn req038_ac16_invalid_format_retries_single_line_on_build_and_ask() {
+    for bad in ["-1", "1.5", "\"2\""] {
+        let (_tmp, repo, cfg) = format_retries_repo();
+        std::fs::write(&cfg, format!("provider='mock'\nformat_retries={bad}\n")).unwrap();
+        let expected = format!(
+            "erreur: configuration invalide ({}) : clé « format_retries » doit être un entier \
+             positif ou nul (reçu : {bad})\n",
+            cfg.display()
+        );
+        for args in [&["build"][..], &["query", "ask", "x"][..]] {
+            let out = run_nephila(&repo, &cfg, args);
+            assert!(!out.status.success());
+            assert_eq!(String::from_utf8_lossy(&out.stderr), expected, "{args:?}");
+        }
+    }
+}

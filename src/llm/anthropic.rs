@@ -61,7 +61,7 @@ impl AnthropicLlm {
             .and_then(|blocks| blocks.iter().find(|b| b["type"] == "text"))
             .and_then(|b| b["text"].as_str())
             .map(String::from)
-            .ok_or_else(|| Error::Message("réponse de anthropic sans bloc texte".into()))
+            .ok_or_else(|| Error::Format("réponse de anthropic sans bloc texte".into()))
     }
 }
 

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 
 fn invalid(msg: impl std::fmt::Display) -> Error {
-    Error::Message(format!("réponse LLM non conforme au schéma : {msg}"))
+    Error::Format(format!("réponse LLM non conforme au schéma : {msg}"))
 }
 
 /// Réponse à `query ask`.
