@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::error::Result;
+use crate::filter::{compile_pattern, FileType, Filters, TYPE_LIST};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -36,7 +37,37 @@ fn parse_batch_files(s: &str) -> std::result::Result<usize, String> {
     }
 }
 
+/// Motif `--exclude` : compilé seul, pour que l'erreur d'usage le nomme (REQ-037).
+fn parse_exclude(s: &str) -> std::result::Result<String, String> {
+    compile_pattern(std::path::Path::new("/"), s)?;
+    Ok(s.to_string())
+}
+
+/// Valeur de `--exclude-type` : types séparés par des virgules, découpés ici pour que clap
+/// nomme la valeur reçue entière (REQ-037).
+fn parse_exclude_types(s: &str) -> std::result::Result<Vec<FileType>, String> {
+    s.split(',')
+        .map(|item| {
+            if item.is_empty() {
+                Err("type vide dans la liste (séparer les types par une seule virgule, ex. json,yaml)"
+                    .to_string())
+            } else {
+                FileType::parse(item)
+                    .ok_or_else(|| format!("type inconnu `{item}` (types valides : {TYPE_LIST})"))
+            }
+        })
+        .collect()
+}
+
+const FILTERS_HELP: &str =
+    "Filtres : --exclude et --exclude-type valent pour cette commande seulement.
+Filtres durables (lus aussi par status et query) : fichier .nephila.toml à la racine du dépôt
+  exclude = [\"docs/legacy/\", \"*.min.js\"]
+  exclude_types = [\"json\"]
+Exemple : nephila build --exclude '*.min.js' --exclude-type json,yaml";
+
 #[derive(Debug, Args)]
+#[command(after_help = FILTERS_HELP)]
 pub struct IndexOpts {
     /// N'appelle pas le LLM (la configuration n'est pas lue) : structure seule, sans enrichissement
     #[arg(long)]
@@ -47,6 +78,22 @@ pub struct IndexOpts {
     /// Nombre maximal de fichiers par appel d'enrichissement (remplace `batch_files` de la configuration)
     #[arg(long, value_name = "N", value_parser = parse_batch_files, allow_hyphen_values = true)]
     pub batch_files: Option<usize>,
+    /// Exclut de l'analyse les fichiers qui correspondent au motif (syntaxe .gitignore, relatif à la racine du dépôt ; répétable ; !motif réinclut un fichier exclu par un motif précédent)
+    #[arg(long, value_name = "MOTIF", action = clap::ArgAction::Append, value_parser = parse_exclude)]
+    pub exclude: Vec<String>,
+    /// Exclut de l'analyse un ou plusieurs types de fichiers, séparés par des virgules (répétable). Types : markdown, java, kotlin, groovy, scala, javascript, typescript, sql, xml, json, yaml, maven, ivy, gradle, npm
+    #[arg(long, value_name = "TYPES", action = clap::ArgAction::Append, value_parser = parse_exclude_types)]
+    pub exclude_type: Vec<Vec<FileType>>,
+}
+
+impl IndexOpts {
+    /// Filtres donnés en ligne de commande.
+    pub fn filters(&self) -> Filters {
+        Filters {
+            patterns: self.exclude.clone(),
+            types: self.exclude_type.iter().flatten().copied().collect(),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,10 +166,10 @@ pub enum Query {
 pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         Command::Build(o) => {
-            crate::index::build::run(&cli.repo, o.no_llm, o.verbose, o.batch_files)
+            crate::index::build::run(&cli.repo, o.no_llm, o.verbose, o.batch_files, o.filters())
         }
         Command::Update(o) => {
-            crate::index::update::run(&cli.repo, o.no_llm, o.verbose, o.batch_files)
+            crate::index::update::run(&cli.repo, o.no_llm, o.verbose, o.batch_files, o.filters())
         }
         Command::Status(j) => crate::status::run(&cli.repo, j.json),
         Command::Summary(j) => crate::summary::run(&cli.repo, j.json),

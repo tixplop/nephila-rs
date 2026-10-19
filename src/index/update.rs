@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::diff::{self, Change};
 use crate::error::Result;
-use crate::filter::{Matcher, ProjectFilters};
+use crate::filter::{Filters, Matcher};
 use crate::index::build::{self, BuildReport, IndexOptions};
 use crate::index::lock::RepoLock;
 use crate::index::structure;
@@ -17,25 +17,35 @@ use crate::trace;
 
 /// Point d'entrée de `nephila update` : mêmes contrôles que `build` (dépôt, configuration, clé,
 /// verrou) ; sans graphe, bascule sur un build complet.
-pub fn run(repo: &Path, no_llm: bool, verbose: bool, batch_files: Option<usize>) -> Result<()> {
+pub fn run(
+    repo: &Path,
+    no_llm: bool,
+    verbose: bool,
+    batch_files: Option<usize>,
+    cli_filters: Filters,
+) -> Result<()> {
     trace::init(verbose);
     build::check_repo(repo)?;
-    let matcher = ProjectFilters::load_matcher(repo)?;
+    let matcher = build::effective_matcher(repo, &cli_filters)?;
     let setup = build::setup(no_llm, batch_files)?;
     let lock = RepoLock::acquire(repo)?;
     // Le test d'existence se fait sous verrou : aucun build concurrent ne peut le créer entre-temps.
     if !db_path(repo).is_file() {
         eprintln!("aucun graphe : build complet");
         let report = build::build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
-        return build::finish(&report, "build");
+        let done = build::finish(&report, "build");
+        build::warn_transient(&cli_filters);
+        return done;
     }
-    match update(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)? {
+    let done = match update(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)? {
         None => {
             println!("graphe à jour");
             Ok(())
         }
         Some(report) => build::finish(&report, "update"),
-    }
+    };
+    build::warn_transient(&cli_filters);
+    done
 }
 
 /// Vrai pour un fichier `settings.gradle(.kts)`.

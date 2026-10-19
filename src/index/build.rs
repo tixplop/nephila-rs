@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::config::{Config, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS};
 use crate::error::{warn, Error, Result};
-use crate::filter::{Matcher, ProjectFilters};
+use crate::filter::{Filters, Matcher, ProjectFilters};
 use crate::index::lock::RepoLock;
 use crate::index::{enrich, structure};
 use crate::llm::{build_llm, Llm};
@@ -152,16 +152,39 @@ impl BuildReport {
 }
 
 /// Point d'entrée de `nephila build` : valide le dépôt, la configuration et la clé, puis construit.
-pub fn run(repo: &Path, no_llm: bool, verbose: bool, batch_files: Option<usize>) -> Result<()> {
+pub fn run(
+    repo: &Path,
+    no_llm: bool,
+    verbose: bool,
+    batch_files: Option<usize>,
+    cli_filters: Filters,
+) -> Result<()> {
     trace::init(verbose);
     check_repo(repo)?;
     // Le fichier de projet est lu avant la configuration LLM, le verrou et toute écriture.
-    let matcher = ProjectFilters::load_matcher(repo)?;
+    let matcher = effective_matcher(repo, &cli_filters)?;
     let setup = setup(no_llm, batch_files)?;
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
     let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
-    finish(&report, "build")
+    let done = finish(&report, "build");
+    warn_transient(&cli_filters);
+    done
+}
+
+/// Filtres effectifs (DEC-045) : fichier de projet puis options de la commande.
+pub(crate) fn effective_matcher(repo: &Path, cli_filters: &Filters) -> Result<Matcher> {
+    ProjectFilters::load(repo)?
+        .merge(cli_filters.clone())
+        .compile(repo)
+}
+
+/// Avertissement A-3 : les options de filtre ne valent que pour la commande en cours. Écrit une
+/// seule fois, après le bilan, seulement si une option a été donnée.
+pub(crate) fn warn_transient(cli_filters: &Filters) {
+    if cli_filters.is_active() {
+        warn("--exclude et --exclude-type valent pour cette commande seulement : status et update sans option ne les appliquent pas (filtre durable : .nephila.toml)");
+    }
 }
 
 /// Affiche le bilan ; un fichier resté en attente, un fichier à enrichir (LLM actif) ou un arrêt
