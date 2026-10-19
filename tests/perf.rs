@@ -1,6 +1,8 @@
 //! Performances sur 10 000 fichiers (REQ-021). Tests `#[ignore]` à lancer en release :
 //! `cargo test --release -q --color never -- --ignored perf`.
 
+#[path = "support/gen_js.rs"]
+mod gen_js;
 #[path = "support/gen_repo.rs"]
 mod gen_repo;
 
@@ -230,4 +232,68 @@ fn perf_req021_ac6_export() {
         assert!(out.metadata().unwrap().len() > 0);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dépôt JavaScript/TypeScript de 3 000 fichiers sous `target/perf-fixture-js` (AC-021-7).
+fn js_fixture() -> Fixture {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-fixture-js");
+    let _ = std::fs::remove_dir_all(&root);
+    let repo = root.join("repo");
+    let mock = root.join("mock");
+    gen_js::generate(&repo, &mock);
+    let config = root.join("config.toml");
+    std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    Fixture { repo, config, mock }
+}
+
+#[test]
+#[ignore]
+fn perf_req021_ac7_js_ts() {
+    let _g = serial();
+    let f = js_fixture();
+    let (d, out) = timed(&f, &["build", "--no-llm"]);
+    assert_under("build --no-llm (JS/TS)", d, 15_000);
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout).trim());
+    let name = gen_js::class_name(gen_js::EDITED);
+    let (_, found) = timed(&f, &["query", "search", &name]);
+    assert!(String::from_utf8_lossy(&found.stdout).contains(&name));
+    // Enrichissement initial (LLM simulé), puis fenêtre « racy ».
+    timed(&f, &["build"]);
+    std::thread::sleep(Duration::from_millis(2_100));
+    timed(&f, &["update"]);
+    let path = f.repo.join(gen_js::path(gen_js::EDITED));
+    assert!(path.to_string_lossy().ends_with(".ts"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{text}// modifié\n")).unwrap();
+    let log = f.repo.parent().unwrap().join("mock.log");
+    let _ = std::fs::remove_file(&log);
+    let t = Instant::now();
+    let out = cmd(&f, &["update"])
+        .env("NEPHILA_MOCK_LOG", &log)
+        .output()
+        .unwrap();
+    let d = t.elapsed();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_under("update (1 .ts modifié)", d, 3_000);
+    let logged = std::fs::read_to_string(&log).unwrap();
+    let called: Vec<&str> = logged
+        .lines()
+        .map(|l| l.split('\t').next().unwrap())
+        .collect();
+    assert_eq!(called, vec![gen_js::path(gen_js::EDITED)], "{logged}");
+    let (_, found) = timed(&f, &["query", "search", gen_js::SUMMARY_WORD]);
+    assert!(String::from_utf8_lossy(&found.stdout).contains(&name));
+}
+
+#[test]
+#[ignore]
+fn perf_req021_ac7_help_with_grammars() {
+    let _g = serial();
+    let f = js_fixture();
+    let (d, _) = best(&f, &["--help"]);
+    assert_under("--help (grammaires JS/TS)", d, 50);
 }
