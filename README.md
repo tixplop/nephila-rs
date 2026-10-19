@@ -19,6 +19,7 @@ Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, JavaScript et 
 - [Démarrage rapide](#démarrage-rapide)
 - [Installation](#installation)
 - [Commandes](#commandes)
+- [Filtrer l'analyse](#filtrer-lanalyse)
 - [Export et vue HTML](#export-et-vue-html)
 - [Configuration du LLM](#configuration-du-llm)
 - [Proxy d'entreprise et certificats auto-signés](#proxy-dentreprise-et-certificats-auto-signés)
@@ -70,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge.
 
 ```sh
-V=v0.11.0                                      # version voulue
+V=v0.12.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -112,8 +113,8 @@ Les commandes sans LLM ne lisent aucune configuration. Si le graphe est en retar
 ### `nephila build` et `nephila update`
 
 ```
-nephila build  [--no-llm] [-v|--verbose] [--batch-files <N>]
-nephila update [--no-llm] [-v|--verbose] [--batch-files <N>]
+nephila build  [--no-llm] [-v|--verbose] [--batch-files <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
+nephila update [--no-llm] [-v|--verbose] [--batch-files <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
 ```
 
 `build` analyse chaque fichier puis, si le LLM est actif, enrichit le graphe. `update` ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus ceux restés en attente ou à enrichir.
@@ -123,6 +124,8 @@ nephila update [--no-llm] [-v|--verbose] [--batch-files <N>]
 | `--no-llm` | Structure seule : la configuration n'est pas lue (même invalide) et aucun appel n'est fait |
 | `-v, --verbose` | Traces sur stderr (voir [Traces](#traces---verbose)) |
 | `--batch-files <N>` | Taille de lot pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
+| `--exclude <MOTIF>` | Exclut de l'analyse les fichiers qui correspondent au motif ; répétable (voir [Filtrer l'analyse](#filtrer-lanalyse)) |
+| `--exclude-type <TYPES>` | Exclut un ou plusieurs types de fichiers, séparés par des virgules ; répétable |
 
 ```
 $ nephila -C repo update
@@ -221,6 +224,90 @@ trace: [1.053s] politique: arrêt de l'envoi (clé d'API refusée par le fournis
 ```
 
 Les traces ne contiennent jamais de contenu de fichier, de prompt, de réponse du LLM ni de clé d'API.
+
+## Filtrer l'analyse
+
+Par défaut, `nephila` analyse tout ce qu'il prend en charge. Les filtres retirent de l'analyse des fichiers sans intérêt (code généré, fichiers minifiés, données). Ils ne font qu'exclure : aucun filtre ne fait indexer un fichier que `.gitignore` ou les exclusions fixes (dossiers `.git/`, `target/`, `node_modules/`, fichiers de verrouillage…) écartent déjà.
+
+### Motifs
+
+Un motif suit la syntaxe `.gitignore`, relativement à la racine du dépôt, et est sensible à la casse :
+
+- sans `/`, il vaut à tout niveau : `*.min.js` ;
+- un `/` en tête ou au milieu l'ancre à la racine : `/src/gen/`, `docs/legacy/` ;
+- un `/` final désigne un dossier : tout son contenu est exclu ;
+- `**` traverse les dossiers : `**/generated/**` ;
+- `!motif` réinclut un fichier exclu par un motif précédent de la liste : `!docs/garde.md`.
+
+### Types
+
+Chaque fichier pris en charge appartient à un seul type.
+
+| Type | Fichiers |
+|---|---|
+| `markdown` | `.md`, `.markdown` |
+| `java` | `.java` |
+| `kotlin` | `.kt`, `.kts` (sauf `build.gradle.kts` et `settings.gradle.kts`) |
+| `groovy` | `.groovy` |
+| `scala` | `.scala` |
+| `javascript` | `.js`, `.mjs`, `.cjs`, `.jsx` |
+| `typescript` | `.ts`, `.mts`, `.cts`, `.tsx`, `.d.ts` |
+| `sql` | `.sql` |
+| `xml` | `.xml` (sauf `pom.xml` et `ivy.xml`) |
+| `json` | `.json` (sauf `package.json`) |
+| `yaml` | `.yaml`, `.yml` |
+| `maven` | `pom.xml` |
+| `ivy` | `ivy.xml` |
+| `gradle` | tout `.gradle` (scripts appliqués compris), `build.gradle.kts`, `settings.gradle.kts` |
+| `npm` | `package.json` |
+
+Il n'y a pas de groupe : `--exclude-type sql,xml,json,yaml` exclut les fichiers de données.
+
+### En ligne de commande
+
+```
+nephila build --exclude '*.min.js' --exclude-type json,yaml
+```
+
+`--exclude` et `--exclude-type` (de `build` et `update`) valent pour la commande seulement et ne sont enregistrées nulle part ; la commande écrit un avertissement sur stderr. `status` ne les accepte pas : il compare le graphe au parcours filtré par le seul fichier de projet.
+
+### Fichier de projet `.nephila.toml`
+
+Pour un filtre durable, créez `.nephila.toml` à la racine du dépôt (le dossier de `-C`) et versionnez-le avec le dépôt :
+
+```toml
+# Filtres d'analyse de nephila (exclusions seulement)
+exclude = ["docs/legacy/", "*.min.js"]   # motifs .gitignore, relatifs à la racine
+exclude_types = ["json"]                 # types : voir nephila build --help
+```
+
+Les deux clés sont facultatives ; toute autre clé est une erreur. Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour »), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé.
+
+### Fusion des deux sources
+
+Les types sont réunis. Les motifs forment une seule liste, ceux du fichier puis ceux de l'option, et le dernier motif qui s'applique l'emporte : `--exclude '!docs/garde.md'` réinclut un fichier exclu par le fichier de projet.
+
+### Effet incrémental
+
+Un fichier indexé puis exclu est traité par `update` comme supprimé (nœuds, références et liens retirés) ; un fichier qui cesse d'être exclu est traité comme ajouté. `update` suffit : pas besoin de `build`. Un fichier de build exclu (`pom.xml`, `package.json`, `build.gradle`…) ne déclare pas de module.
+
+```
+$ nephila build --exclude '*.min.js' --exclude-type json --verbose
+trace: [0.001s] config: llm inactif (aucune configuration)
+trace: [0.018s] parcours: 1 fichiers (filtres : 1 motifs, types json, 2 fichiers exclus)
+build terminé : 1 fichiers traités, 1 nœuds, 0 liens, 0 références non résolues, 0 fichiers en attente, 1 fichiers à enrichir, enrichissement : désactivé, 2 fichiers exclus par les filtres
+avertissement: --exclude et --exclude-type valent pour cette commande seulement : status et update sans option ne les appliquent pas (filtre durable : .nephila.toml)
+```
+
+Le segment `fichiers exclus par les filtres` n'apparaît que si un filtre est actif ; un compte à `0` révèle un motif qui ne correspond à rien. Avec `--verbose` (exemple ci-dessus), la ligne `parcours` se termine par le détail des filtres (`filtres : 1 motifs, types json, 2 fichiers exclus`).
+
+### Erreurs
+
+Un fichier de projet invalide arrête toute commande qui parcourt le dépôt, avant toute analyse :
+
+```
+erreur: ./.nephila.toml : clé `exclude_types` : type inconnu `python` (types valides : markdown, java, kotlin, groovy, scala, javascript, typescript, sql, xml, json, yaml, maven, ivy, gradle, npm)
+```
 
 ## Export et vue HTML
 
@@ -458,6 +545,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.12.0 | Filtres d'analyse (`--exclude`, `--exclude-type`, `.nephila.toml`) |
 | 0.11.0 | Certificats d'autorité et désactivation du contrôle TLS (clés `tls_ca_cert`, `tls_insecure`) |
 | 0.10.0 | JavaScript et TypeScript (modules ES, imports, appels, JSX), `package.json` comme fichier de build ; sous-genres `alias` et `object` ; modules désignés par leur nom qualifié |
 | 0.9.0 | Fichiers de données : SQL (tables, vues, `references`), XML, JSON et YAML (clés, noms JVM cités) ; genres `table` et `key` |
@@ -476,7 +564,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.11.0 && git push origin v0.11.0
+git tag v0.12.0 && git push origin v0.12.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
