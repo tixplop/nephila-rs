@@ -1,4 +1,4 @@
-//! Performances sur 10 000 fichiers (REQ-021). Tests `#[ignore]` à lancer en release :
+//! Performances sur 10 000 fichiers (REQ-021) et sur un dépôt JS/TS de 3 000 fichiers. Tests `#[ignore]` à lancer en release :
 //! `cargo test --release -q --color never -- --ignored perf`.
 
 #[path = "support/gen_js.rs"]
@@ -253,7 +253,12 @@ fn perf_req021_ac7_js_ts() {
     let f = js_fixture();
     let (d, out) = timed(&f, &["build", "--no-llm"]);
     assert_under("build --no-llm (JS/TS)", d, 15_000);
-    eprintln!("{}", String::from_utf8_lossy(&out.stdout).trim());
+    let summary = String::from_utf8_lossy(&out.stdout).to_string();
+    eprintln!("{}", summary.trim());
+    assert!(
+        summary.contains(", 0 références non résolues,"),
+        "références non résolues : {summary}"
+    );
     let name = gen_js::class_name(gen_js::EDITED);
     let (_, found) = timed(&f, &["query", "search", &name]);
     assert!(String::from_utf8_lossy(&found.stdout).contains(&name));

@@ -4,7 +4,7 @@
 
 > *Nephila* est le genre des néphiles dorées, des araignées qui tissent de très grandes toiles d'une soie couleur d'or. Cet outil tisse de la même manière les liens entre tous les éléments d'un dépôt.
 
-`nephila` (crate `nephila-rs`) analyse un dépôt de code JVM et sa documentation, en tire un graphe de connaissances stocké localement, et permet de l'interroger en ligne de commande, de l'exporter ou de l'explorer dans le navigateur.
+`nephila` (crate `nephila-rs`) analyse un dépôt de code JVM, JavaScript ou TypeScript et sa documentation, en tire un graphe de connaissances stocké localement, et permet de l'interroger en ligne de commande, de l'exporter ou de l'explorer dans le navigateur.
 
 - **Analyse locale, sans LLM** : la structure (modules, packages, types, méthodes, documents, sections) et les liens (`imports`, `extends`, `implements`, `calls`, `depends_on`, `links_to`, `mentions`, `references`, `contains`) viennent d'une analyse syntaxique. Ni Maven, ni Gradle, ni compilateur ne sont exécutés.
 - **LLM facultatif** : s'il est configuré, il enrichit le graphe (résumés des nœuds, concepts des documents) et répond aux questions en langage naturel. Anthropic, OpenAI et tout serveur compatible OpenAI (Ollama, llama.cpp, vLLM…) sont pris en charge.
@@ -12,7 +12,7 @@
 - **Pensé pour les agents** : sorties `--json` stables, codes de sortie explicites, messages sur stderr.
 - **Exploration visuelle** : `nephila export --format html` produit une page autonome, utilisable hors ligne.
 
-Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, Maven (`pom.xml`), Ivy (`ivy.xml`), Gradle (Groovy et Kotlin DSL), Markdown, et les fichiers de données SQL, XML, JSON et YAML.
+Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, JavaScript et TypeScript, Maven (`pom.xml`), Ivy (`ivy.xml`), Gradle (Groovy et Kotlin DSL), npm (`package.json`), Markdown, et les fichiers de données SQL, XML, JSON et YAML.
 
 ## Sommaire
 
@@ -51,14 +51,16 @@ build terminé : 11 fichiers traités, 23 nœuds, 30 liens, 0 références non r
 
 $ nephila -C demo summary
 Modules (3)
-  api -> module:com.acme:core
-  core -> dependency:org.slf4j:slf4j-api
-  store -> module:com.acme:core
+  com.acme:api -> module:com.acme:core
+  com.acme:core -> dependency:org.slf4j:slf4j-api
+  com.acme:store -> module:com.acme:core
 Nœuds les plus reliés
   type:com.acme.core.OrderRepository (degré 6)
   module:com.acme:core (degré 5)
   ...
 ```
+
+Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'acceptent les requêtes.
 
 ## Installation
 
@@ -67,7 +69,7 @@ Nœuds les plus reliés
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge.
 
 ```sh
-V=v0.9.0                                       # version voulue
+V=v0.10.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -326,11 +328,13 @@ Par défaut (`batch_files = 1`), un appel LLM porte sur un seul fichier. Pour un
 
 ## Ce que l'analyse extrait
 
-Chaque fichier est analysé localement : tree-sitter pour les langages JVM, un lecteur XML pour Maven et Ivy, un lecteur lexical pour Gradle et pour SQL, `serde_json` pour JSON, un analyseur à événements pour YAML, et CommonMark pour Markdown.
+Chaque fichier est analysé localement : tree-sitter pour les langages JVM, JavaScript et TypeScript, un lecteur XML pour Maven et Ivy, un lecteur lexical pour Gradle et pour SQL, `serde_json` pour `package.json` et pour JSON, un analyseur à événements pour YAML, et CommonMark pour Markdown.
 
 | Fichier | Nœuds | Liens |
 |---|---|---|
 | `.java`, `.kt`, `.kts` (hors Gradle), `.groovy`, `.scala` | package, types (class, interface, enum, annotation, object, trait Scala ; imbriqués `Externe.Interne`), méthodes (constructeurs `<init>`) ; fonctions de premier niveau rattachées au type de fichier conventionnel (`NomFichierKt`, `NomFichier`, `NomFichier$package`) | `imports`, `extends`, `implements`, `calls` |
+| `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.mts`, `.cts`, `.tsx` | package (un fichier = un module ES, nommé par son chemin sans extension : `src/app/order.service`), types (class, interface, enum ; sous-genres `alias` pour `type X = …` et `object` pour `namespace`), méthodes (constructeurs `<init>`) ; fonctions de premier niveau contenues par le package | `imports`, `extends`, `implements`, `calls` |
+| `package.json` | module = champ `name` (sinon nom du dossier) | `depends_on` : clés de `dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies` |
 | `pom.xml`, `ivy.xml` | module `groupId:artifactId` ou `organisation:module` | `depends_on` (hors `dependencyManagement`, plugins et `parent`) |
 | `build.gradle(.kts)`, `settings.gradle(.kts)` | module = chemin de projet (`:services:api`) ; `settings` est suivi mais ne crée pas de nœud | `depends_on` : `project(':core')`, chaînes `g:a[:v]`, notation map ; seul le bloc `dependencies { }` de premier niveau compte |
 | autre `.gradle` | analysé comme un script Groovy | comme Groovy |
@@ -339,6 +343,22 @@ Chaque fichier est analysé localement : tree-sitter pour les langages JVM, un l
 | `.xml` autre que `pom.xml` et `ivy.xml` | document (sous-genre `xml`), sans nœud par élément | `mentions` (noms JVM cités) |
 | `.json` | document (sous-genre `json`), `key` par clé feuille | `mentions` (noms JVM cités) |
 | `.yaml`, `.yml` | document (sous-genre `yaml`), `key` par clé feuille | `mentions` (noms JVM cités) |
+
+**JavaScript et TypeScript.** Grammaires : `.ts`, `.mts`, `.cts` en TypeScript, `.tsx` en TSX, `.js`, `.mjs`, `.cjs`, `.jsx` en JavaScript (JSX compris). Un fichier est un module ES, nœud `package` nommé par son chemin sans extension ; `src/a.ts` et `src/a.d.ts` partagent le même nœud. Les fonctions de premier niveau (`function f`, `const f = () => …`) sont des méthodes contenues par le package. Formes d'import reconnues : `import { a, b as c } from`, `import type`, `import X from`, `import * as ns from`, `const ns = require(…)` et `const { a } = require(…)` ; seuls les spécifieurs relatifs (`./`, `../`) et les alias `@/`, `~/` sont suivis (ces derniers par nom simple unique), un paquet npm est externe. Appels : `f()` vise la fonction du fichier ou le nom importé, `this.m()` la classe englobante, `x.m()` le type annoté ou construit par `new T()` de `x` (paramètres-propriétés de constructeur compris), `T.m()` et `ns.f()` la classe ou le module visé ; un global (`fetch`, `console`), un appel `f()` sur un paramètre ou un receveur inconnu ne crée aucun lien. En JSX, `<Button/>` (majuscule) est un appel de `Button`, `<div>` n'en est pas un. `node_modules/` et les fichiers de verrouillage (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`) ne sont jamais indexés.
+
+**Fichiers `package.json`.** Fichier de build de l'écosystème JS/TS : le module porte le champ `name` (`@shop/web`, nom court `web`). Les paquets des espaces de travail sont reliés aux modules du dépôt de même nom, les autres dépendances à un nœud `dependency`. Un module ES se rattache au `package.json` ancêtre le plus proche, un nœud de code JVM au fichier de build JVM le plus proche. `scripts`, `workspaces` et `engines` ne donnent rien.
+
+Dans un dépôt où le module `@shop/web` (un `package.json`) dépend de `lodash` et du module `shop` du même dépôt :
+
+```
+$ nephila query search formatPrice
+src/utils/format.formatPrice (method, src/utils/format.ts)
+
+$ nephila query neighbors @shop/web
+utilise :
+  depends_on lodash (dependency)
+  depends_on shop (module, package.json)
+```
 
 **Fichiers SQL.** Le lecteur est indépendant du dialecte : il n'exécute rien et ne se connecte à aucune base. Il reconnaît `CREATE [modificateurs] TABLE`, `CREATE [modificateurs] VIEW` (dont `MATERIALIZED`) et `ALTER TABLE`, avec identifiants entre `"…"`, `` `…` `` ou `[…]` ; les noms sont mis en minuscules (`"Orders"` donne `orders`, `shop.products` reste qualifié). Une table déclarée par plusieurs fichiers (création, puis `ALTER TABLE` d'une migration) est un seul nœud. Les liens `references` viennent de `REFERENCES <table>` dans un `CREATE TABLE` ou un `ALTER TABLE`, et de chaque table qui suit `FROM` ou `JOIN` dans une vue (ni fonctions, ni sous-requêtes, ni noms de CTE). Hors périmètre : colonnes, index, séquences, fonctions, procédures, triggers, `INSERT`/`UPDATE`/`DELETE`, `DROP` (le graphe décrit les déclarations des fichiers, pas l'état de la base après migrations), `CREATE TABLE … AS SELECT` (table sans référence) et changelogs Liquibase.
 
@@ -400,20 +420,27 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 - **Chemins Gradle relatifs** : `project("core")` (sans `:` initial) est ignoré. Écrivez `project(':core')`.
 - **JSONC et JSON5** : non pris en charge. Un JSON à commentaires, à virgule finale ou tronqué donne le document seul, sans clé ni candidat, avec un `avertissement:`.
 - **Nom SQL qualifié** : `public.orders` ne trouve pas une table déclarée `orders` (l'inverse fonctionne si `public.orders` est seul).
+- **Ré-exportations** : `export … from` et `export *` ne sont pas suivis. Un nom importé depuis un barrel (`index.ts`) se résout par nom simple unique, ou reste non résolu s'il est ambigu.
+- **`tsconfig.json`** : ses `paths` ne sont pas lus. Les imports `@/…` et `~/…` visent le nom importé par nom simple unique. Un `tsconfig.json` à commentaires est un JSON mal formé : document seul, avec avertissement.
+- **Imports dynamiques** : `import()` n'est pas suivi.
+- **`.vue`, `.svelte`, `.astro`** : non pris en charge.
+- **Syntaxe TypeScript récente** : une syntaxe postérieure à la grammaire embarquée est exploitée au mieux.
 - **Pas de lecture propre à Spring ou Kubernetes** : `application.yml`, manifestes et workflows CI sont des YAML comme les autres.
-- **Gros JSON de données** (`package-lock.json`, fixtures) : indexés dans la limite de 1 000 clés ; excluez-les par `.gitignore`.
+- **Gros JSON de données** (fixtures, exports de données) : indexés dans la limite de 1 000 clés ; excluez-les par `.gitignore`.
 - **Export dans le dépôt** : un export écrit dans le dépôt sous un autre nom que `<slug>.json` est indexé comme n'importe quel JSON ; excluez-le par `.gitignore`.
 - **`query path`** : renvoie le plus court chemin sans tenir compte du sens des liens. Il peut donc passer par un `import` ou un package plutôt que par des appels.
 
 ## Mise à niveau
 
 - **Renommage `rkg` → `nephila`** : le binaire s'appelle `nephila`, le graphe est stocké dans `.nephila/` (au lieu de `.rkg/`), la configuration dans `~/.config/nephila/config.toml` et les variables d'environnement sont préfixées `NEPHILA_` (`NEPHILA_CONFIG`, `NEPHILA_MOCK_DIR`…). Déplacez votre configuration (`mv ~/.config/rkg ~/.config/nephila`), puis reconstruisez le graphe avec `nephila build` et supprimez l'ancien dossier `.rkg/`.
+- **Vers 0.10** : un graphe 0.9 est complété par `nephila update`, sans `build` : les fichiers JS/TS sont ajoutés, les `package.json` sont réanalysés en fichiers de build (leur document et leurs clés disparaissent) et les fichiers de verrouillage (`package-lock.json`…) sont retirés.
 - **Vers 0.9** : un graphe 0.8 est complété par `nephila update` : les fichiers `.sql`, `.xml`, `.json`, `.yaml` et `.yml`, nouvellement pris en charge, sont ajoutés sans reconstruction.
 - **Vers 0.4** : `nephila export` sans option écrit dans un fichier au lieu de stdout. Pour l'ancien comportement, utilisez `nephila export --output -`.
 - **Depuis 0.2** : le schéma du graphe a changé. Un graphe ancien est refusé (`… lancez nephila build`) : reconstruisez-le avec `nephila build`. Les fixtures du fournisseur `mock` passent au schéma version 2.
 
 | Version | Nouveautés |
 |---|---|
+| 0.10.0 | JavaScript et TypeScript (modules ES, imports, appels, JSX), `package.json` comme fichier de build ; sous-genres `alias` et `object` ; modules désignés par leur nom qualifié |
 | 0.9.0 | Fichiers de données : SQL (tables, vues, `references`), XML, JSON et YAML (clés, noms JVM cités) ; genres `table` et `key` |
 | 0.8.1 | Premiers binaires précompilés (Linux musl, macOS) publiés par la CI |
 | 0.8 | Renommage `rkg` → `nephila` (binaire, dossier `.nephila/`, configuration, variables `NEPHILA_*`) |
@@ -430,7 +457,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.9.0 && git push origin v0.9.0
+git tag v0.10.0 && git push origin v0.10.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
