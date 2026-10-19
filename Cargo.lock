@@ -622,6 +622,8 @@ dependencies = [
  "pulldown-cmark",
  "quick-xml",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tempfile",
@@ -634,6 +636,7 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-typescript",
  "ureq",
+ "webpki-roots 0.26.11",
  "yaml-rust2",
 ]
 

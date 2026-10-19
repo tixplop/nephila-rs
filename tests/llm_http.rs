@@ -10,6 +10,7 @@ use nephila::llm::openai::OpenAiLlm;
 use nephila::llm::AskReply;
 use nephila::llm::Llm;
 use nephila::llm::LotItem;
+use nephila::llm::Tls;
 
 const EXTRACTION: &str =
     r#"{"version":2,"summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}"#;
@@ -34,6 +35,7 @@ fn anthropic(s: &FakeServer) -> AnthropicLlm {
         "claude-x".into(),
         "sk-test".into(),
         30,
+        &Tls::default(),
     )
 }
 
@@ -43,6 +45,7 @@ fn openai(s: &FakeServer, key: Option<&str>) -> OpenAiLlm {
         "gpt-x".into(),
         key.map(String::from),
         30,
+        &Tls::default(),
     )
 }
 
@@ -82,7 +85,7 @@ fn req002_ac3_connection_refused_is_network() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://{}", l.local_addr().unwrap())
     };
-    let llm = AnthropicLlm::new(Some(url), "m".into(), "k".into(), 30);
+    let llm = AnthropicLlm::new(Some(url), "m".into(), "k".into(), 30, &Tls::default());
     assert!(matches!(llm.verify_key(), Err(Error::Network(_))));
 }
 
@@ -175,7 +178,13 @@ fn req002_ac5_openai_key_is_optional_for_local_model() {
 #[test]
 fn req002_ac5_base_url_trailing_slash_is_tolerated() {
     let s = FakeServer::start(vec![(200, "{}".into())]);
-    let llm = AnthropicLlm::new(Some(format!("{}/", s.base_url)), "m".into(), "k".into(), 30);
+    let llm = AnthropicLlm::new(
+        Some(format!("{}/", s.base_url)),
+        "m".into(),
+        "k".into(),
+        30,
+        &Tls::default(),
+    );
     llm.verify_key().unwrap();
     assert_eq!(s.requests()[0].path, "/v1/models");
 }
@@ -245,7 +254,13 @@ fn req002_invalid_responses_are_message_errors() {
 #[test]
 fn req002_ac8_slow_server_gives_timeout_error() {
     let s = FakeServer::start_with_delays(vec![(200, anthropic_reply(EXTRACTION), 2000)]);
-    let llm = AnthropicLlm::new(Some(s.base_url.clone()), "m".into(), "k".into(), 1);
+    let llm = AnthropicLlm::new(
+        Some(s.base_url.clone()),
+        "m".into(),
+        "k".into(),
+        1,
+        &Tls::default(),
+    );
     let t = std::time::Instant::now();
     let r = llm.enrich("A.java", 1, "class A {}", &a_ids());
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
@@ -255,7 +270,13 @@ fn req002_ac8_slow_server_gives_timeout_error() {
 #[test]
 fn req002_ac8_openai_slow_server_gives_timeout_error() {
     let s = FakeServer::start_with_delays(vec![(200, openai_reply(EXTRACTION), 2000)]);
-    let llm = OpenAiLlm::new(Some(s.base_url.clone()), "m".into(), None, 1);
+    let llm = OpenAiLlm::new(
+        Some(s.base_url.clone()),
+        "m".into(),
+        None,
+        1,
+        &Tls::default(),
+    );
     let r = llm.verify_key();
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
 }
@@ -263,7 +284,13 @@ fn req002_ac8_openai_slow_server_gives_timeout_error() {
 #[test]
 fn req002_ac8_fast_server_succeeds_within_timeout() {
     let s = FakeServer::start_with_delays(vec![(200, anthropic_reply(EXTRACTION), 500)]);
-    let llm = AnthropicLlm::new(Some(s.base_url.clone()), "m".into(), "k".into(), 1);
+    let llm = AnthropicLlm::new(
+        Some(s.base_url.clone()),
+        "m".into(),
+        "k".into(),
+        1,
+        &Tls::default(),
+    );
     assert_eq!(
         llm.enrich("A.java", 1, "class A {}", &a_ids())
             .unwrap()

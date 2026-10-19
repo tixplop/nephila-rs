@@ -4,7 +4,7 @@ use super::ask::{ask_system_prompt, ask_user_prompt, AskReply};
 use super::enrich::{
     enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt, parse_lot,
 };
-use super::{http, Llm};
+use super::{http, Llm, Tls};
 use super::{Enrichment, LotItem};
 use crate::error::{Error, Result};
 
@@ -24,12 +24,13 @@ impl OpenAiLlm {
         model: String,
         key: Option<String>,
         timeout_secs: u64,
+        tls: &Tls,
     ) -> OpenAiLlm {
         OpenAiLlm {
             base_url,
             model,
             key,
-            agent: http::agent(timeout_secs),
+            agent: http::agent(timeout_secs, tls),
         }
     }
 

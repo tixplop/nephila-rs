@@ -4,6 +4,7 @@ pub mod anthropic;
 pub mod ask;
 pub mod enrich;
 mod http;
+pub use http::Tls;
 pub mod mock;
 pub mod openai;
 
@@ -44,6 +45,7 @@ pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
                 config.model.clone(),
                 key,
                 config.timeout_secs,
+                &Tls::default(),
             )))
         }
         Provider::OpenAi => Ok(Box::new(openai::OpenAiLlm::new(
@@ -51,6 +53,7 @@ pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
             config.model.clone(),
             config.api_key()?,
             config.timeout_secs,
+            &Tls::default(),
         ))),
     }
 }

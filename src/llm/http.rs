@@ -1,12 +1,94 @@
 //! Outils HTTP communs aux adaptateurs (REQ-002) : erreurs, JSON de la réponse texte.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{ring, CryptoProvider, WebPkiSupportedAlgorithms};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 
 use crate::error::{Error, Result};
 
+/// Réglages TLS d'un fournisseur (REQ-036).
+#[derive(Debug, Clone, Default)]
+pub struct Tls {
+    /// Autorités ajoutées aux autorités publiques embarquées (DER).
+    pub ca_certs: Vec<CertificateDer<'static>>,
+    /// Désactive tout contrôle du certificat du serveur (chaîne, dates, nom).
+    pub insecure: bool,
+}
+
+/// Vérificateur qui accepte tout certificat ; les signatures de la poignée de main
+/// restent vérifiées par le fournisseur cryptographique (la connexion reste chiffrée).
+#[derive(Debug)]
+struct AcceptAnyCert(WebPkiSupportedAlgorithms);
+
+impl ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
+    }
+}
+
+/// Configuration rustls : racines Mozilla embarquées + `ca_certs`, ou vérificateur permissif.
+fn client_config(tls: &Tls) -> Arc<rustls::ClientConfig> {
+    let provider: Arc<CryptoProvider> = Arc::new(ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("versions de protocole par défaut valides");
+    let config = if tls.insecure {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(
+                provider.signature_verification_algorithms,
+            )))
+            .with_no_client_auth()
+    } else {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for cert in &tls.ca_certs {
+            // Un certificat inexploitable est écarté ici : la configuration (T-072) le
+            // rejette avant la construction du fournisseur.
+            let _ = roots.add(cert.clone());
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Arc::new(config)
+}
+
 /// Agent HTTP ; `timeout_secs` borne la durée totale d'une requête.
-pub fn agent(timeout_secs: u64) -> ureq::Agent {
+pub fn agent(timeout_secs: u64, tls: &Tls) -> ureq::Agent {
     ureq::AgentBuilder::new()
+        .tls_config(client_config(tls))
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(timeout_secs))
         .build()
@@ -50,10 +132,35 @@ pub fn send(
         Err(e) if is_timeout(&e) => Err(Error::Timeout(format!(
             "délai dépassé avec {provider} sur {url} ({e}) ; augmentez timeout_secs"
         ))),
+        Err(e) if let Some(cause) = certificate_error(&e) => Err(Error::Network(format!(
+            "certificat du serveur refusé par {provider} sur {url} : {cause} ; \
+             ajoutez l'autorité avec tls_ca_cert, ou désactivez le contrôle avec tls_insecure = true"
+        ))),
         Err(e) => Err(Error::Network(format!(
             "erreur réseau avec {provider} sur {url} : {e}"
         ))),
     }
+}
+
+/// Cause rustls si le transport a échoué sur le certificat du serveur.
+fn certificate_error(e: &ureq::Error) -> Option<rustls::Error> {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(c) = cause {
+        if let Some(r) = c.downcast_ref::<rustls::Error>() {
+            if matches!(r, rustls::Error::InvalidCertificate(_)) {
+                return Some(r.clone());
+            }
+        }
+        if let Some(io) = c.downcast_ref::<std::io::Error>() {
+            if let Some(r) = io.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()) {
+                if matches!(r, rustls::Error::InvalidCertificate(_)) {
+                    return Some(r.clone());
+                }
+            }
+        }
+        cause = c.source();
+    }
+    None
 }
 
 /// Vrai si une erreur de transport a pour cause un délai (E/S expirée).
