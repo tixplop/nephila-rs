@@ -74,6 +74,7 @@ string_enum! {
         Annotation => "annotation",
         Object => "object",
         Trait => "trait",
+        Alias => "alias",
         Table => "table",
         View => "view",
         Sql => "sql",
@@ -103,12 +104,17 @@ impl EdgeKind {
         use NodeKind as N;
         match self {
             EdgeKind::DependsOn => from == N::Module && matches!(to, N::Module | N::Dependency),
-            EdgeKind::Imports | EdgeKind::Extends | EdgeKind::Implements => {
-                from == N::Type && to == N::Type
-            }
+            EdgeKind::Imports => match from {
+                N::Type => to == N::Type,
+                // Module ES (JavaScript, TypeScript) : DEC-040.
+                N::Package => matches!(to, N::Type | N::Method),
+                _ => false,
+            },
+            EdgeKind::Extends | EdgeKind::Implements => from == N::Type && to == N::Type,
             EdgeKind::Contains => matches!(
                 (from, to),
                 (N::Type, N::Method)
+                    | (N::Package, N::Method)
                     | (N::Package, N::Type)
                     | (N::Module, N::Package)
                     | (N::Document, N::Section)

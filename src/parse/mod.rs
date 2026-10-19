@@ -7,6 +7,7 @@ pub mod gradle_lex;
 pub mod groovy;
 pub mod ivy;
 pub mod java;
+pub mod js;
 pub mod json;
 pub mod jvm;
 pub mod keys;
@@ -14,6 +15,7 @@ pub mod kotlin;
 pub mod lang;
 pub mod markdown;
 pub mod maven;
+pub mod npm;
 pub mod scala;
 pub mod sql;
 pub mod xml_data;
@@ -93,6 +95,8 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure>
         Some(Lang::DataXml) => Ok(xml_data::extract(path, text)),
         Some(Lang::Json) => Ok(json::extract(path, text)),
         Some(Lang::Yaml) => Ok(yaml::extract(path, text)),
+        Some(l @ (Lang::JavaScript | Lang::TypeScript | Lang::Tsx)) => js::extract(l, path, text),
+        Some(Lang::PackageJson) => Ok(npm::extract(path, text)),
         Some(Lang::KotlinGradle) | Some(Lang::GroovyGradle) => Ok(gradle::extract(path, text, ctx)),
         None => Ok(FileStructure::default()),
     }

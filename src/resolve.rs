@@ -343,8 +343,13 @@ fn derive_contains(
                 }
             }
             NodeKind::Method => {
-                if let Some(t) = parent_of(&n.qualified).filter(|t| is_kind(t, NodeKind::Type)) {
-                    push(NodeKind::Type, t, NodeKind::Method, &n.qualified);
+                // Un parent type l'emporte ; sinon un package (fonction de module ES, DEC-040).
+                if let Some(parent) = parent_of(&n.qualified) {
+                    if is_kind(parent, NodeKind::Type) {
+                        push(NodeKind::Type, parent, NodeKind::Method, &n.qualified);
+                    } else if is_kind(parent, NodeKind::Package) {
+                        push(NodeKind::Package, parent, NodeKind::Method, &n.qualified);
+                    }
                 }
             }
             NodeKind::Section => {
@@ -912,6 +917,35 @@ mod tests {
             "key:c.json#a.b#c"
         ));
         assert!(!has_edge(&e, &d("c.json"), EdgeKind::Contains, &t));
+    }
+
+    #[test]
+    fn contains_package_method_pour_un_module_es() {
+        let mut e = env(&["src/a.ts"]);
+        e.store
+            .replace_file(
+                "src/a.ts",
+                &[
+                    plain(NodeKind::Package, "src/a", Some("src/a.ts")),
+                    ty("src/a.S", "src/a.ts"),
+                    method("src/a.f", "src/a.ts"),
+                    method("src/a.S.m", "src/a.ts"),
+                ],
+                &[],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        let pk = node_id(NodeKind::Package, "src/a");
+        assert!(has_edge(&e, &pk, EdgeKind::Contains, &mid("src/a.f")));
+        assert!(has_edge(&e, &pk, EdgeKind::Contains, &tid("src/a.S")));
+        // Un parent type l'emporte : la méthode d'un type n'est pas contenue par le package.
+        assert!(has_edge(
+            &e,
+            &tid("src/a.S"),
+            EdgeKind::Contains,
+            &mid("src/a.S.m")
+        ));
+        assert!(!has_edge(&e, &pk, EdgeKind::Contains, &mid("src/a.S.m")));
     }
 
     #[test]

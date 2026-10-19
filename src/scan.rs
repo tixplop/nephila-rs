@@ -12,12 +12,22 @@ use std::time::UNIX_EPOCH;
 /// taille dans le même pas de date du système de fichiers passerait inaperçue.
 const RACY_WINDOW_MS: i64 = 2_000;
 
-const EXCLUDED_DIRS: [&str; 5] = ["target", "build", ".gradle", ".git", ".nephila"];
-const EXTENSIONS: [&str; 13] = [
-    "md", "markdown", "java", "kt", "kts", "groovy", "gradle", "scala", "sql", "xml", "json",
-    "yaml", "yml",
+const EXCLUDED_DIRS: [&str; 6] = [
+    "target",
+    "build",
+    ".gradle",
+    ".git",
+    ".nephila",
+    "node_modules",
 ];
-const BUILD_FILES: [&str; 6] = [
+/// Fichiers verrous jamais retenus, à tout niveau.
+const LOCK_FILES: [&str; 3] = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml"];
+const EXTENSIONS: [&str; 21] = [
+    "md", "markdown", "java", "kt", "kts", "groovy", "gradle", "scala", "sql", "xml", "json",
+    "yaml", "yml", "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx",
+];
+const BUILD_FILES: [&str; 7] = [
+    "package.json",
     "pom.xml",
     "ivy.xml",
     "build.gradle",
@@ -55,6 +65,9 @@ fn is_build_file(name: &str) -> bool {
 }
 
 fn is_supported(name: &str) -> bool {
+    if LOCK_FILES.contains(&name) {
+        return false;
+    }
     if is_build_file(name) {
         return true;
     }

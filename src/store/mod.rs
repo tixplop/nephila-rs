@@ -1076,6 +1076,14 @@ mod tests {
         assert!(!E::Contains.allows(N::Section, N::Key));
         assert!(!E::Contains.allows(N::Table, N::Key));
         assert!(E::References.allows(N::Table, N::Table));
+        // Module ES (AC-005-2) : package -> type|method.
+        assert!(E::Imports.allows(N::Package, N::Type));
+        assert!(E::Imports.allows(N::Package, N::Method));
+        assert!(!E::Imports.allows(N::Package, N::Package));
+        assert!(!E::Imports.allows(N::Method, N::Type));
+        assert!(!E::Extends.allows(N::Package, N::Type));
+        assert!(E::Contains.allows(N::Package, N::Method));
+        assert!(!E::Contains.allows(N::Method, N::Package));
         assert!(!E::References.allows(N::Table, N::Type));
         assert!(!E::References.allows(N::Type, N::Table));
         assert!(E::Calls.allows(N::Method, N::Method));
@@ -1107,6 +1115,7 @@ mod tests {
             "annotation",
             "object",
             "trait",
+            "alias",
         ] {
             assert_eq!(SubKind::parse(s).unwrap().as_str(), s);
         }

@@ -23,6 +23,14 @@ pub enum Lang {
     DataXml,
     Json,
     Yaml,
+    /// JavaScript, JSX, CommonJS et modules ES (DEC-039).
+    JavaScript,
+    /// TypeScript (`.ts`, `.mts`, `.cts`, dont `.d.ts`).
+    TypeScript,
+    /// TypeScript avec JSX (`.tsx`).
+    Tsx,
+    /// `package.json` (DEC-040).
+    PackageJson,
 }
 
 impl Lang {
@@ -33,6 +41,7 @@ impl Lang {
             "build.gradle" | "settings.gradle" => return Some(Lang::GroovyGradle),
             "build.gradle.kts" | "settings.gradle.kts" => return Some(Lang::KotlinGradle),
             "pom.xml" | "ivy.xml" => return Some(Lang::Xml),
+            "package.json" => return Some(Lang::PackageJson),
             _ => {}
         }
         let ext = path.extension()?.to_str()?;
@@ -41,6 +50,9 @@ impl Lang {
             "kt" | "kts" => Some(Lang::Kotlin),
             "scala" => Some(Lang::Scala),
             "groovy" | "gradle" => Some(Lang::Groovy),
+            "js" | "mjs" | "cjs" | "jsx" => Some(Lang::JavaScript),
+            "ts" | "mts" | "cts" => Some(Lang::TypeScript),
+            "tsx" => Some(Lang::Tsx),
             "md" | "markdown" => Some(Lang::Markdown),
             "sql" => Some(Lang::Sql),
             "xml" => Some(Lang::DataXml),
@@ -57,10 +69,22 @@ impl Lang {
             Lang::Kotlin | Lang::KotlinGradle => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
             Lang::Scala => Some(tree_sitter_scala::LANGUAGE.into()),
             Lang::Groovy | Lang::GroovyGradle => Some(tree_sitter_groovy::LANGUAGE.into()),
-            Lang::Xml | Lang::Markdown | Lang::Sql | Lang::DataXml | Lang::Json | Lang::Yaml => {
-                None
-            }
+            Lang::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+            Lang::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            Lang::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+            Lang::Xml
+            | Lang::PackageJson
+            | Lang::Markdown
+            | Lang::Sql
+            | Lang::DataXml
+            | Lang::Json
+            | Lang::Yaml => None,
         }
+    }
+
+    /// Vrai pour JavaScript, TypeScript et TSX.
+    pub fn is_js_ts(self) -> bool {
+        matches!(self, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
     }
 
     /// Analyse `text` ; l'arbre est tolérant aux erreurs (nœuds `ERROR`/manquants).
@@ -108,6 +132,20 @@ mod tests {
         assert_eq!(l("c.json"), Some(Lang::Json));
         assert_eq!(l("a.yaml"), Some(Lang::Yaml));
         assert_eq!(l("a.yml"), Some(Lang::Yaml));
+        assert_eq!(l("a.js"), Some(Lang::JavaScript));
+        assert_eq!(l("a.mjs"), Some(Lang::JavaScript));
+        assert_eq!(l("a.cjs"), Some(Lang::JavaScript));
+        assert_eq!(l("a.jsx"), Some(Lang::JavaScript));
+        assert_eq!(l("a.ts"), Some(Lang::TypeScript));
+        assert_eq!(l("a.mts"), Some(Lang::TypeScript));
+        assert_eq!(l("a.cts"), Some(Lang::TypeScript));
+        assert_eq!(l("a.d.ts"), Some(Lang::TypeScript));
+        assert_eq!(l("a.tsx"), Some(Lang::Tsx));
+        assert_eq!(l("x/package.json"), Some(Lang::PackageJson));
+        assert_eq!(l("tsconfig.json"), Some(Lang::Json));
+        assert_eq!(l("a.vue"), None);
+        assert!(Lang::Tsx.is_js_ts() && Lang::JavaScript.is_js_ts() && Lang::TypeScript.is_js_ts());
+        assert!(!Lang::Json.is_js_ts() && !Lang::PackageJson.is_js_ts() && !Lang::Java.is_js_ts());
         assert_eq!(l("a.properties"), None);
         assert_eq!(l("a.jsonc"), None);
         assert_eq!(l("noext"), None);

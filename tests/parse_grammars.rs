@@ -120,3 +120,52 @@ fn extract_renvoie_une_structure_vide_pour_chaque_langage() {
         assert_eq!(s, FileStructure::default(), "{name}");
     }
 }
+
+#[test]
+fn grammaire_javascript_jsx_et_commonjs() {
+    parse_clean("Sample.js");
+}
+
+#[test]
+fn grammaire_typescript() {
+    parse_clean("Sample.ts");
+}
+
+#[test]
+fn grammaire_tsx() {
+    parse_clean("Sample.tsx");
+}
+
+#[test]
+fn broken_ts_donne_un_arbre_partiel() {
+    let text = fixture("Broken.ts");
+    let tree = Lang::TypeScript.parse(&text).expect("analyse");
+    let root = tree.root_node();
+    assert!(root.has_error());
+    let mut cur = root.walk();
+    let kinds: Vec<_> = root.named_children(&mut cur).map(|n| n.kind()).collect();
+    assert!(kinds.contains(&"export_statement"), "{kinds:?}");
+    let first = root.named_child(0).unwrap();
+    assert!(
+        text[first.byte_range()].contains("function ok"),
+        "{}",
+        root.to_sexp()
+    );
+}
+
+/// Le même `Parser` change de langage d'un fichier à l'autre (T-037).
+#[test]
+fn un_parser_reutilise_change_de_grammaire() {
+    let mut parser = tree_sitter::Parser::new();
+    for (lang, src, ok) in [
+        (Lang::JavaScript, "const a = <b/>;", true),
+        (Lang::TypeScript, "let a: number = 1;", true),
+        (Lang::Tsx, "const a = <b/>;", true),
+        (Lang::Java, "class A {}", true),
+        (Lang::JavaScript, "let a: number = 1;", false),
+    ] {
+        parser.set_language(&lang.grammar().unwrap()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        assert_eq!(!tree.root_node().has_error(), ok, "{lang:?} {src}");
+    }
+}

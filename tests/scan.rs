@@ -308,3 +308,87 @@ fn req011_ac6_racy_record_is_rehashed() {
     assert!(res.files[0].rehashed);
     assert_eq!(res.files[0].hash, f.hash);
 }
+
+// --- JavaScript et TypeScript (REQ-004, AC-004-6 et AC-004-7) ---
+
+#[test]
+fn req004_ac6_js() {
+    check_type("src/a.js");
+}
+#[test]
+fn req004_ac6_mjs() {
+    check_type("src/a.mjs");
+}
+#[test]
+fn req004_ac6_cjs() {
+    check_type("src/a.cjs");
+}
+#[test]
+fn req004_ac6_jsx() {
+    check_type("src/a.jsx");
+}
+#[test]
+fn req004_ac6_ts() {
+    check_type("src/a.ts");
+}
+#[test]
+fn req004_ac6_mts() {
+    check_type("src/a.mts");
+}
+#[test]
+fn req004_ac6_cts() {
+    check_type("src/a.cts");
+}
+#[test]
+fn req004_ac6_tsx() {
+    check_type("src/a.tsx");
+}
+#[test]
+fn req004_ac6_d_ts() {
+    check_type("types/a.d.ts");
+}
+#[test]
+fn req004_ac6_package_json() {
+    check_type("web/package.json");
+}
+
+#[test]
+fn req004_ac6_vue_non_indexe() {
+    let d = tempfile::tempdir().unwrap();
+    put(d.path(), "a.vue", b"<template/>");
+    assert!(scan(d.path(), &[]).unwrap().files.is_empty());
+}
+
+#[test]
+fn req004_ac6_package_json_est_un_fichier_de_build() {
+    let d = tempfile::tempdir().unwrap();
+    put(d.path(), "web/package.json", b"{}");
+    put(d.path(), "web/src/a.ts", b"x");
+    let res = scan(d.path(), &[]).unwrap();
+    let a = res.files.iter().find(|f| f.path == "web/src/a.ts").unwrap();
+    assert_eq!(a.module.as_deref(), Some("web"));
+}
+
+#[test]
+fn req004_ac7_node_modules_et_verrous_exclus() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    for p in [
+        "node_modules/x/index.js",
+        "web/node_modules/y/package.json",
+        "web/node_modules/y/lib/z.ts",
+        "package-lock.json",
+        "web/npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "web/deep/pnpm-lock.yaml",
+        "web/deep/package-lock.json",
+    ] {
+        put(r, p, b"x");
+    }
+    put(r, "web/package.json", b"{}");
+    put(r, "web/other-lock.json", b"{}");
+    assert_eq!(
+        paths(&scan(r, &[]).unwrap()),
+        vec!["web/other-lock.json", "web/package.json"]
+    );
+}
