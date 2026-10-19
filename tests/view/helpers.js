@@ -79,4 +79,23 @@ function randomGraph(nodeCount, edgeCount, seed = 42) {
   return { version: 1, name: "random", nodeKinds, edgeKinds: ["calls", "contains"], nodes, edges };
 }
 
-module.exports = { loadMaven3, noModuleGraph, moduleGraph, starGraph, randomGraph };
+// n nœuds `type` aux degrés variés (beaucoup d'égalités, quelques degrés distincts élevés) :
+// le nœud j émet (j % 7) liens vers les suivants ; les 40 premiers ont en plus j + 8 liens vers les derniers.
+function degreeGraph(n) {
+  const nodes = [];
+  const edges = [];
+  for (let i = 0; i < n; i++) {
+    // identifiants volontairement non monotones en l'indice, pour que l'ordre par identifiant compte
+    const id = "type:p.D" + String((i * 7919) % n).padStart(6, "0") + "_" + i;
+    nodes.push([id, 0, "D" + i, "p.D" + i, null, null, null]);
+  }
+  for (let j = 0; j < n; j++) {
+    for (let k = 1; k <= j % 7; k++) edges.push([j, (j + k) % n, 0]);
+  }
+  for (let j = 0; j < 40 && j < n; j++) {
+    for (let k = 0; k < j + 8; k++) edges.push([j, n - 1 - ((j * 13 + k) % (n - 1)), 0]);
+  }
+  return { version: 1, name: "degrees", nodeKinds: ["type"], edgeKinds: ["calls"], nodes, edges };
+}
+
+module.exports = { loadMaven3, noModuleGraph, moduleGraph, starGraph, randomGraph, degreeGraph, lcg };

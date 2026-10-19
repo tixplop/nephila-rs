@@ -318,3 +318,314 @@ test("REQ025_AC11 navigate : étoile de 500, vue de 300 feuilles sans le centre"
   assert.throws(() => model.navigate(g, full, -1), RangeError);
   assert.throws(() => model.navigate(g, full, 1.5), RangeError);
 });
+
+// ---- REQ-039 : allView ----
+
+function degreeRank(g) {
+  const idx = [...Array(g.n).keys()];
+  idx.sort((a, b) => g.degree[b] - g.degree[a] || (g.ids[a] < g.ids[b] ? -1 : g.ids[a] > g.ids[b] ? 1 : 0));
+  return idx;
+}
+
+test("REQ039_AC1 allView sur maven3 : tous les nœuds, tous les liens", () => {
+  const data = helpers.loadMaven3();
+  const g = model.load(data);
+  const r = model.allView(g);
+  assert.equal(r.hidden, 0);
+  assert.equal(r.view.size, g.n);
+  const v = model.visible(g, r.view);
+  assert.equal(v.nodes.length, data.nodes.length);
+  assert.equal(v.edges.length, data.edges.length);
+});
+
+test("REQ039_AC1 allView sur un graphe vide", () => {
+  const g = model.load({ nodes: [], edges: [], nodeKinds: [], edgeKinds: [] });
+  const r = model.allView(g);
+  assert.equal(r.view.size, 0);
+  assert.equal(r.hidden, 0);
+});
+
+test("REQ039_AC2 allView : 6000 nœuds, les 5000 de plus haut degré", () => {
+  const g = model.load(helpers.degreeGraph(6000));
+  const rank = degreeRank(g);
+  assert.equal(g.degree[rank[4999]], g.degree[rank[5000]], "la coupure doit traverser une égalité");
+  assert.ok(g.degree[rank[0]] > g.degree[rank[1]]);
+  const r = model.allView(g);
+  assert.equal(model.ALL_LIMIT, 5000);
+  assert.equal(r.hidden, 1000);
+  assert.deepEqual([...r.view].sort((a, b) => a - b), rank.slice(0, 5000).sort((a, b) => a - b));
+});
+
+test("REQ039_AC2 allView : plafond explicite et plafond égal au nombre de nœuds", () => {
+  const g = model.load(helpers.loadMaven3());
+  const r = model.allView(g, 10);
+  assert.equal(r.view.size, 10);
+  assert.equal(r.hidden, g.n - 10);
+  assert.deepEqual([...r.view].sort((a, b) => a - b), degreeRank(g).slice(0, 10).sort((a, b) => a - b));
+  const full = model.allView(g, g.n);
+  assert.equal(full.view.size, g.n);
+  assert.equal(full.hidden, 0);
+  const g2 = model.load(helpers.noModuleGraph(40));
+  for (const cap of [1, 7, 39]) {
+    const r2 = model.allView(g2, cap);
+    assert.deepEqual([...r2.view].sort((a, b) => a - b), degreeRank(g2).slice(0, cap).sort((a, b) => a - b));
+    assert.equal(r2.hidden, 40 - cap);
+  }
+});
+
+test("REQ039_AC2 allView : plafonds invalides", () => {
+  const g = model.load(helpers.loadMaven3());
+  for (const cap of [0, -1, 1.5]) {
+    assert.throws(() => model.allView(g, cap), RangeError);
+    assert.throws(() => model.expand(g, new Set(), 0, cap), RangeError);
+  }
+});
+
+test("REQ039_AC3 mode ensemble : expand et navigate au plafond de 5000", () => {
+  const g = model.load(helpers.degreeGraph(6000));
+  const { view } = model.allView(g);
+  const copy = new Set(view);
+  // nœud affiché dont des voisins manquent
+  let i = -1;
+  for (const x of view) {
+    const nb = new Set();
+    for (let p = g.out.start[x]; p < g.out.start[x + 1]; p++) nb.add(g.dst[g.out.list[p]]);
+    for (let p = g.in.start[x]; p < g.in.start[x + 1]; p++) nb.add(g.src[g.in.list[p]]);
+    nb.delete(x);
+    const missing = [...nb].filter((y) => !view.has(y)).length;
+    if (missing > 0) {
+      i = x;
+      const r = model.expand(g, view, x, 5000);
+      assert.deepEqual([...r.view].sort((a, b) => a - b), [...view].sort((a, b) => a - b));
+      assert.equal(r.hidden, missing);
+      break;
+    }
+  }
+  assert.ok(i >= 0, "un nœud affiché doit avoir un voisin absent");
+  // navigation vers un absent
+  let j = -1;
+  for (let x = 0; x < g.n; x++) if (!view.has(x)) { j = x; break; }
+  const nav = model.navigate(g, view, j, 5000);
+  assert.equal(nav.recentered, true);
+  assert.ok(nav.view.has(j));
+  assert.ok(nav.view.size <= 5000);
+  const expected = model.neighborsView(g, j, 5000);
+  assert.deepEqual([...nav.view].sort((a, b) => a - b), [...expected.view].sort((a, b) => a - b));
+  assert.deepEqual([...view].sort((a, b) => a - b), [...copy].sort((a, b) => a - b));
+});
+
+test("REQ039_AC3 mode ensemble : 1000 nœuds, navigate ne change rien", () => {
+  const g = model.load(helpers.noModuleGraph(1000));
+  const { view } = model.allView(g);
+  const copy = new Set(view);
+  for (let j = 0; j < g.n; j++) {
+    const r = model.navigate(g, view, j, 5000);
+    assert.equal(r.view.size, 1000);
+    assert.equal(r.hidden, 0);
+    assert.equal(r.recentered, false);
+  }
+  assert.deepEqual(view, copy);
+});
+
+test("REQ039_AC4 allView et visible sur 120 000 nœuds", () => {
+  const g = model.load(helpers.randomGraph(120000, 300000));
+  let t = performance.now();
+  const r = model.allView(g);
+  const tAll = performance.now() - t;
+  t = performance.now();
+  const v = model.visible(g, r.view);
+  const tVis = performance.now() - t;
+  assert.equal(r.view.size, 5000);
+  assert.equal(r.hidden, 115000);
+  assert.ok(v.nodes.length === 5000);
+  assert.ok(tAll < 200, "allView " + tAll);
+  assert.ok(tVis < 100, "visible " + tVis);
+});
+
+// ---- REQ-039 : layoutStep ----
+
+// Référence : tick() de app.js 0.13.0 (répulsion sur toutes les paires), copie littérale de la logique.
+function referenceStep(p, edges, alpha, pinned) {
+  const n = p.length;
+  let a, b, dx, dy, d2, d, f;
+  for (a = 0; a < n; a++) {
+    for (b = a + 1; b < n; b++) {
+      dx = p[a].x - p[b].x;
+      dy = p[a].y - p[b].y;
+      d2 = dx * dx + dy * dy + 0.01;
+      if (d2 > 90000) continue;
+      f = (2000 * alpha) / d2;
+      d = Math.sqrt(d2);
+      p[a].vx += (dx / d) * f * d;
+      p[a].vy += (dy / d) * f * d;
+      p[b].vx -= (dx / d) * f * d;
+      p[b].vy -= (dy / d) * f * d;
+    }
+  }
+  edges.forEach(function (e) {
+    const s = p[e[0]];
+    const t = p[e[1]];
+    dx = t.x - s.x;
+    dy = t.y - s.y;
+    d = Math.sqrt(dx * dx + dy * dy) + 0.01;
+    f = (d - 70) * 0.05 * alpha;
+    s.vx += (dx / d) * f;
+    s.vy += (dy / d) * f;
+    t.vx -= (dx / d) * f;
+    t.vy -= (dy / d) * f;
+  });
+  for (a = 0; a < n; a++) {
+    p[a].vx -= p[a].x * 0.01 * alpha;
+    p[a].vy -= p[a].y * 0.01 * alpha;
+    if (a === pinned) {
+      p[a].vx = 0;
+      p[a].vy = 0;
+      continue;
+    }
+    p[a].vx *= 0.6;
+    p[a].vy *= 0.6;
+    p[a].x += p[a].vx;
+    p[a].y += p[a].vy;
+  }
+  alpha *= 0.985;
+  return alpha < 0.005 ? 0 : alpha;
+}
+
+function randomPoints(n, rnd, spread, offsetX = 0, offsetY = 0) {
+  const p = [];
+  for (let i = 0; i < n; i++) p.push({ x: (rnd() - 0.5) * spread + offsetX, y: (rnd() - 0.5) * spread + offsetY, vx: 0, vy: 0 });
+  return p;
+}
+
+function randomEdges(n, m, rnd) {
+  const e = [];
+  for (let k = 0; k < m; k++) e.push([Math.floor(rnd() * n), Math.floor(rnd() * n)]);
+  return e;
+}
+
+function assertSame(p, q, label) {
+  assert.equal(p.length, q.length);
+  for (let i = 0; i < p.length; i++) {
+    for (const k of ["x", "y", "vx", "vy"]) {
+      assert.ok(Math.abs(p[i][k] - q[i][k]) <= 1e-6, label + " nœud " + i + " " + k + " : " + p[i][k] + " vs " + q[i][k]);
+    }
+  }
+}
+
+function compareSteps(p0, edges, steps, pinned, label) {
+  const a = p0.map((x) => ({ ...x }));
+  const b = p0.map((x) => ({ ...x }));
+  let al = 1;
+  let bl = 1;
+  for (let s = 0; s < steps; s++) {
+    al = model.layoutStep(a, edges, al, pinned);
+    bl = referenceStep(b, edges, bl, pinned);
+    assert.equal(al, bl);
+    assertSame(a, b, label + " pas " + s);
+  }
+}
+
+test("REQ039_AC5 layoutStep égal au calcul par paires (300 nœuds, 600 liens)", () => {
+  const rnd = helpers.lcg(7);
+  const p = randomPoints(300, rnd, 1200);
+  compareSteps(p, randomEdges(300, 600, rnd), 6, -1, "aléatoire");
+});
+
+test("REQ039_AC5 layoutStep : cas limites de la grille", () => {
+  const mk = (xs) => xs.map(([x, y]) => ({ x, y, vx: 0, vy: 0 }));
+  compareSteps(mk([[0, 0], [300, 0]]), [], 3, -1, "300 exact");
+  compareSteps(mk([[299.99, 0], [0.01, 0]]), [], 3, -1, "juste sous 300");
+  compareSteps(mk([[-1, -1], [1, 1], [-299, 0], [-301, 5], [299, -299]]), [[0, 1], [2, 3]], 4, -1, "négatives");
+  const rnd = helpers.lcg(11);
+  compareSteps(randomPoints(60, rnd, 1400, -700, -700), randomEdges(60, 90, rnd), 4, -1, "négatives aléatoires");
+  compareSteps(randomPoints(80, rnd, 200, 5, 5), randomEdges(80, 120, rnd), 4, -1, "une seule case");
+  compareSteps(randomPoints(50, rnd, 900), randomEdges(50, 70, rnd), 4, 3, "épinglé");
+});
+
+test("REQ039_AC5 layoutStep : 5000 nœuds, un pas < 50 ms", () => {
+  const rnd = helpers.lcg(3);
+  const p = [];
+  for (let i = 0; i < 5000; i++) {
+    const r = 2000 * Math.sqrt(rnd());
+    const th = 2 * Math.PI * rnd();
+    p.push({ x: r * Math.cos(th), y: r * Math.sin(th), vx: 0, vy: 0 });
+  }
+  const edges = randomEdges(5000, 15000, rnd);
+  let alpha = model.layoutStep(p, edges, 1, -1); // échauffement
+  const times = [];
+  for (let s = 0; s < 5; s++) {
+    const t = performance.now();
+    alpha = model.layoutStep(p, edges, alpha, -1);
+    times.push(performance.now() - t);
+  }
+  times.sort((a, b) => a - b);
+  assert.ok(times[2] < 50, "médiane " + times[2]);
+});
+
+test("REQ039_AC5 layoutStep : nœud épinglé immobile, alpha décroît jusqu'à 0", () => {
+  const rnd = helpers.lcg(5);
+  const p = randomPoints(20, rnd, 300);
+  const edges = randomEdges(20, 30, rnd);
+  const x0 = p[4].x;
+  const y0 = p[4].y;
+  let alpha = 1;
+  const seen = [];
+  for (let s = 0; s < 400 && alpha > 0; s++) {
+    alpha = model.layoutStep(p, edges, alpha, 4);
+    seen.push(alpha);
+    assert.equal(p[4].x, x0);
+    assert.equal(p[4].y, y0);
+    assert.equal(p[4].vx, 0);
+    assert.equal(p[4].vy, 0);
+  }
+  assert.equal(alpha, 0);
+  assert.ok(Math.abs(seen[0] - 0.985) < 1e-12);
+  assert.ok(Math.abs(seen[1] - 0.985 * 0.985) < 1e-12);
+  let ref = 1;
+  let steps = 0;
+  while (ref >= 0.005) {
+    ref *= 0.985;
+    steps++;
+  }
+  assert.equal(seen.length, steps);
+  assert.ok(seen[steps - 2] >= 0.005);
+});
+
+// ---- REQ-040 : liens masqués ----
+
+test("REQ040_AC1 linksShown : état initial et délai après la molette", () => {
+  assert.equal(model.LINKS_DELAY_MS, 150);
+  let m = model.motionState();
+  assert.equal(model.linksShown(m, 0), true);
+  m = model.onWheel(m, 1000);
+  assert.equal(model.linksShown(m, 1000), false);
+  assert.equal(model.linksShown(m, 1149), false);
+  assert.equal(model.linksShown(m, 1150), true);
+  assert.equal(model.linksDueAt(m), 1150);
+  m = model.onWheel(m, 1100);
+  assert.equal(model.linksShown(m, 1149), false);
+  assert.equal(model.linksShown(m, 1249), false);
+  assert.equal(model.linksShown(m, 1250), true);
+  assert.equal(model.linksDueAt(m), 1250);
+});
+
+test("REQ040_AC2 linksShown : déplacement du fond", () => {
+  const m0 = model.motionState();
+  const m = model.onPanStart(m0);
+  assert.equal(model.linksShown(m, 0), false);
+  assert.equal(model.linksShown(m, 10000), false);
+  assert.equal(model.linksDueAt(m), null);
+  const e = model.onPanEnd(m);
+  assert.equal(model.linksShown(e, 10000), true);
+  // fin pendant le délai d'une molette
+  let w = model.onPanStart(model.motionState());
+  w = model.onWheel(w, 9950);
+  w = model.onPanEnd(w);
+  assert.equal(model.linksShown(w, 10000), false);
+  assert.equal(model.linksShown(w, 10099), false);
+  assert.equal(model.linksShown(w, 10100), true);
+  assert.equal(model.linksDueAt(w), 10100);
+  // fonctions pures : l'état reçu n'est pas modifié ; état initial inchangé
+  assert.deepEqual(m0, { lastWheel: -Infinity, panning: false });
+  assert.deepEqual(m, { lastWheel: -Infinity, panning: true });
+});

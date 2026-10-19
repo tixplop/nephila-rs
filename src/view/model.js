@@ -3,6 +3,8 @@
 
 var INITIAL_LIMIT = 100;
 var SEARCH_LIMIT = 20;
+var ALL_LIMIT = 5000;
+var LINKS_DELAY_MS = 150;
 
 function readData(text) {
   return JSON.parse(text);
@@ -10,6 +12,13 @@ function readData(text) {
 
 function cmp(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// Comparateur de nœuds : plus haut degré d'abord, identifiant à égalité.
+function byDegree(g) {
+  return function (a, b) {
+    return g.degree[b] - g.degree[a] || cmp(g.ids[a], g.ids[b]);
+  };
 }
 
 // Adjacence en CSR : start[i]..start[i + 1] indexe `list` (indices de liens).
@@ -94,9 +103,7 @@ function initialView(g, limite) {
   }
   var hasModules = pool.length > 0;
   if (!hasModules) for (i = 0; i < g.n; i++) pool.push(i);
-  pool.sort(function (a, b) {
-    return g.degree[b] - g.degree[a] || cmp(g.ids[a], g.ids[b]);
-  });
+  pool.sort(byDegree(g));
   var kept = pool.slice(0, limite);
   return { view: new Set(kept), hidden: hasModules ? pool.length - kept.length : 0 };
 }
@@ -185,13 +192,45 @@ function expand(g, view, i, plafond) {
   neighborSet(g, i).forEach(function (x) {
     if (!next.has(x)) cands.push(x);
   });
-  cands.sort(function (a, b) {
-    return g.degree[b] - g.degree[a] || cmp(g.ids[a], g.ids[b]);
-  });
+  cands.sort(byDegree(g));
   var room = next.has(i) ? Math.max(0, plafond - next.size) : 0;
   var take = Math.min(room, cands.length);
   for (var k = 0; k < take; k++) next.add(cands[k]);
   return { view: next, hidden: cands.length - take };
+}
+
+// Vue d'ensemble : tous les nœuds, ou les `plafond` de plus haut degré (identifiant à égalité) au-delà.
+// Sans filtre de genre. Sélection par seuil de degré (comptage), sans tri complet. Retourne { view, hidden }.
+function allView(g, plafond) {
+  if (plafond === undefined) plafond = ALL_LIMIT;
+  checkCap(plafond);
+  var i;
+  if (g.n <= plafond) {
+    var all = new Set();
+    for (i = 0; i < g.n; i++) all.add(i);
+    return { view: all, hidden: 0 };
+  }
+  var maxDeg = 0;
+  for (i = 0; i < g.n; i++) if (g.degree[i] > maxDeg) maxDeg = g.degree[i];
+  var count = new Int32Array(maxDeg + 2);
+  for (i = 0; i < g.n; i++) count[g.degree[i]]++;
+  // Seuil t : moins de `plafond` nœuds de degré > t, au moins `plafond` de degré >= t.
+  var above = 0;
+  var t = maxDeg;
+  while (t > 0 && above + count[t] < plafond) {
+    above += count[t];
+    t--;
+  }
+  var kept = [];
+  var ties = [];
+  for (i = 0; i < g.n; i++) {
+    if (g.degree[i] > t) kept.push(i);
+    else if (g.degree[i] === t) ties.push(i);
+  }
+  ties.sort(byDegree(g));
+  var view = new Set(kept);
+  for (var k = 0; view.size < plafond && k < ties.length; k++) view.add(ties[k]);
+  return { view: view, hidden: g.n - plafond };
 }
 
 // Vue d'un résultat de recherche : le nœud et ses voisins directs, sous le même plafond.
@@ -253,6 +292,106 @@ function visible(g, view, filtres) {
   return { nodes: nodes, edges: edges };
 }
 
+// Pas de disposition par forces (répulsion, ressorts, gravité, amortissement, refroidissement).
+// p : [{x, y, vx, vy}] ; edges : paires d'indices dans p ; pinned : indice du nœud glissé ou -1.
+// La répulsion, nulle au-delà de 300 unités, parcourt une grille de cases de 300 unités. Retourne le nouvel alpha.
+var CELL = 300;
+var FORWARD = [
+  [1, 0],
+  [-1, 1],
+  [0, 1],
+  [1, 1],
+];
+
+function repel(p, a, b, alpha) {
+  var dx = p[a].x - p[b].x;
+  var dy = p[a].y - p[b].y;
+  var d2 = dx * dx + dy * dy + 0.01;
+  if (d2 > 90000) return;
+  var f = (2000 * alpha) / d2;
+  var d = Math.sqrt(d2);
+  p[a].vx += (dx / d) * f * d;
+  p[a].vy += (dy / d) * f * d;
+  p[b].vx -= (dx / d) * f * d;
+  p[b].vy -= (dy / d) * f * d;
+}
+
+function layoutStep(p, edges, alpha, pinned) {
+  var n = p.length;
+  var a, b, k, dx, dy, d, f;
+  var cells = new Map();
+  var keys = [];
+  var BIG = 1048576;
+  for (a = 0; a < n; a++) {
+    var cx = Math.floor(p[a].x / CELL);
+    var cy = Math.floor(p[a].y / CELL);
+    var key = (cx + BIG) * 2097152 + (cy + BIG);
+    var cell = cells.get(key);
+    if (!cell) {
+      cell = { cx: cx, cy: cy, list: [] };
+      cells.set(key, cell);
+      keys.push(cell);
+    }
+    cell.list.push(a);
+  }
+  keys.forEach(function (c) {
+    var l = c.list;
+    for (a = 0; a < l.length; a++) for (b = a + 1; b < l.length; b++) repel(p, l[a], l[b], alpha);
+    for (var q = 0; q < FORWARD.length; q++) {
+      var o = cells.get((c.cx + FORWARD[q][0] + BIG) * 2097152 + (c.cy + FORWARD[q][1] + BIG));
+      if (!o) continue;
+      for (a = 0; a < l.length; a++) for (b = 0; b < o.list.length; b++) repel(p, l[a], o.list[b], alpha);
+    }
+  });
+  for (k = 0; k < edges.length; k++) {
+    var s = p[edges[k][0]];
+    var t = p[edges[k][1]];
+    dx = t.x - s.x;
+    dy = t.y - s.y;
+    d = Math.sqrt(dx * dx + dy * dy) + 0.01;
+    f = (d - 70) * 0.05 * alpha;
+    s.vx += (dx / d) * f;
+    s.vy += (dy / d) * f;
+    t.vx -= (dx / d) * f;
+    t.vy -= (dy / d) * f;
+  }
+  for (a = 0; a < n; a++) {
+    p[a].vx -= p[a].x * 0.01 * alpha;
+    p[a].vy -= p[a].y * 0.01 * alpha;
+    if (a === pinned) {
+      p[a].vx = 0;
+      p[a].vy = 0;
+      continue;
+    }
+    p[a].vx *= 0.6;
+    p[a].vy *= 0.6;
+    p[a].x += p[a].vx;
+    p[a].y += p[a].vy;
+  }
+  alpha *= 0.985;
+  return alpha < 0.005 ? 0 : alpha;
+}
+
+// État de mouvement (REQ-040) : liens masqués pendant la molette (150 ms) et le déplacement du fond.
+function motionState() {
+  return { lastWheel: -Infinity, panning: false };
+}
+function onWheel(m, now) {
+  return { lastWheel: now, panning: m.panning };
+}
+function onPanStart(m) {
+  return { lastWheel: m.lastWheel, panning: true };
+}
+function onPanEnd(m) {
+  return { lastWheel: m.lastWheel, panning: false };
+}
+function linksShown(m, now) {
+  return !m.panning && now - m.lastWheel >= LINKS_DELAY_MS;
+}
+function linksDueAt(m) {
+  return m.panning ? null : m.lastWheel + LINKS_DELAY_MS;
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     readData: readData,
@@ -265,5 +404,15 @@ if (typeof module !== "undefined") {
     indexOf: indexOf,
     navigate: navigate,
     visible: visible,
+    ALL_LIMIT: ALL_LIMIT,
+    allView: allView,
+    layoutStep: layoutStep,
+    LINKS_DELAY_MS: LINKS_DELAY_MS,
+    motionState: motionState,
+    onWheel: onWheel,
+    onPanStart: onPanStart,
+    onPanEnd: onPanEnd,
+    linksShown: linksShown,
+    linksDueAt: linksDueAt,
   };
 }
