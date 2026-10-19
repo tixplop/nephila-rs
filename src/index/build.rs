@@ -77,7 +77,11 @@ pub(crate) struct Setup {
 
 /// Prépare une commande d'indexation : avec `--no-llm` la configuration n'est pas lue ; sans
 /// fichier de configuration le LLM est inactif ; sinon validation et vérification de la clé.
-pub(crate) fn setup(no_llm: bool, batch_files: Option<usize>) -> Result<Setup> {
+pub(crate) fn setup(
+    no_llm: bool,
+    batch_files: Option<usize>,
+    format_retries: Option<u32>,
+) -> Result<Setup> {
     if no_llm {
         trace!("config: llm inactif (--no-llm)");
         return Ok(Setup {
@@ -96,6 +100,9 @@ pub(crate) fn setup(no_llm: bool, batch_files: Option<usize>) -> Result<Setup> {
         Some(mut config) => {
             if let Some(n) = batch_files {
                 config.batch_files = n;
+            }
+            if let Some(n) = format_retries {
+                config.format_retries = n;
             }
             let mut tls_trace = String::new();
             if let Some(p) = &config.tls_ca_cert {
@@ -162,13 +169,14 @@ pub fn run(
     no_llm: bool,
     verbose: bool,
     batch_files: Option<usize>,
+    format_retries: Option<u32>,
     cli_filters: Filters,
 ) -> Result<()> {
     trace::init(verbose);
     check_repo(repo)?;
     // Le fichier de projet est lu avant la configuration LLM, le verrou et toute écriture.
     let matcher = effective_matcher(repo, &cli_filters)?;
-    let setup = setup(no_llm, batch_files)?;
+    let setup = setup(no_llm, batch_files, format_retries)?;
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
     let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;

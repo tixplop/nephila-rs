@@ -22,12 +22,13 @@ pub fn run(
     no_llm: bool,
     verbose: bool,
     batch_files: Option<usize>,
+    format_retries: Option<u32>,
     cli_filters: Filters,
 ) -> Result<()> {
     trace::init(verbose);
     build::check_repo(repo)?;
     let matcher = build::effective_matcher(repo, &cli_filters)?;
-    let setup = build::setup(no_llm, batch_files)?;
+    let setup = build::setup(no_llm, batch_files, format_retries)?;
     let lock = RepoLock::acquire(repo)?;
     // Le test d'existence se fait sous verrou : aucun build concurrent ne peut le créer entre-temps.
     if !db_path(repo).is_file() {

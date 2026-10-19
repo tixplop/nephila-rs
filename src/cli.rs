@@ -37,6 +37,14 @@ fn parse_batch_files(s: &str) -> std::result::Result<usize, String> {
     }
 }
 
+/// Entier positif ou nul tenant sur 32 bits (REQ-038).
+fn parse_format_retries(s: &str) -> std::result::Result<u32, String> {
+    s.parse::<u32>()
+        .map_err(|_| format!("`{s}` n'est pas un entier positif ou nul"))
+}
+
+const FORMAT_RETRIES_HELP: &str = "Nombre de nouveaux essais d'un appel LLM dont la réponse est non conforme (remplace `format_retries` de la configuration ; défaut 2 ; 0 = aucun nouvel essai)";
+
 /// Motif `--exclude` : compilé seul, pour que l'erreur d'usage le nomme (REQ-037).
 fn parse_exclude(s: &str) -> std::result::Result<String, String> {
     compile_pattern(std::path::Path::new("/"), s)?;
@@ -78,6 +86,8 @@ pub struct IndexOpts {
     /// Nombre maximal de fichiers par appel d'enrichissement (remplace `batch_files` de la configuration)
     #[arg(long, value_name = "N", value_parser = parse_batch_files, allow_hyphen_values = true)]
     pub batch_files: Option<usize>,
+    #[arg(help = FORMAT_RETRIES_HELP, long, value_name = "N", value_parser = parse_format_retries, allow_hyphen_values = true)]
+    pub format_retries: Option<u32>,
     /// Exclut de l'analyse les fichiers qui correspondent au motif (syntaxe .gitignore, relatif à la racine du dépôt ; répétable ; !motif réinclut un fichier exclu par un motif précédent)
     #[arg(long, value_name = "MOTIF", action = clap::ArgAction::Append, value_parser = parse_exclude)]
     pub exclude: Vec<String>,
@@ -159,18 +169,30 @@ pub enum Query {
         question: String,
         #[command(flatten)]
         json: JsonOpt,
+        #[arg(help = FORMAT_RETRIES_HELP, long, value_name = "N", value_parser = parse_format_retries, allow_hyphen_values = true)]
+        format_retries: Option<u32>,
     },
 }
 
 /// Exécute la commande.
 pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
-        Command::Build(o) => {
-            crate::index::build::run(&cli.repo, o.no_llm, o.verbose, o.batch_files, o.filters())
-        }
-        Command::Update(o) => {
-            crate::index::update::run(&cli.repo, o.no_llm, o.verbose, o.batch_files, o.filters())
-        }
+        Command::Build(o) => crate::index::build::run(
+            &cli.repo,
+            o.no_llm,
+            o.verbose,
+            o.batch_files,
+            o.format_retries,
+            o.filters(),
+        ),
+        Command::Update(o) => crate::index::update::run(
+            &cli.repo,
+            o.no_llm,
+            o.verbose,
+            o.batch_files,
+            o.format_retries,
+            o.filters(),
+        ),
         Command::Status(j) => crate::status::run(&cli.repo, j.json),
         Command::Summary(j) => crate::summary::run(&cli.repo, j.json),
         Command::Export { output, format } => {
@@ -190,8 +212,10 @@ pub fn run(cli: Cli) -> Result<()> {
             cible,
             json,
         }) => crate::query::path::run(&cli.repo, source, cible, json.json),
-        Command::Query(Query::Ask { question, json }) => {
-            crate::query::ask::run(&cli.repo, question, json.json)
-        }
+        Command::Query(Query::Ask {
+            question,
+            json,
+            format_retries,
+        }) => crate::query::ask::run(&cli.repo, question, json.json, *format_retries),
     }
 }

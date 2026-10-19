@@ -466,7 +466,7 @@ fn server_env(server: &FakeServer, extra: &str) -> Env {
     Env::new(
         1,
         &format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T078_KEY\"\nconcurrency = 1\n{extra}",
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\n{extra}",
             server.base_url
         ),
     )
@@ -488,7 +488,7 @@ fn req038_ac9_openai_empty_reply_is_retried_with_identical_body() {
         (200, openai_reply(GOOD)),
     ]);
     let env = server_env(&server, "");
-    let o = env.run(&["build"], &[("NEPHILA_T078_KEY", "sk")]);
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
     assert!(o.status.success(), "{}", stderr(&o));
     let reqs = posts(&server);
     assert_eq!(reqs.len(), 2);
@@ -509,14 +509,14 @@ fn req038_ac9_openai_text_without_json_three_requests_then_zero_retries_one() {
         (200, bad.clone()),
     ]);
     let env = server_env(&server, "");
-    let o = env.run(&["build"], &[("NEPHILA_T078_KEY", "sk")]);
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
     assert!(!o.status.success());
     assert_eq!(posts(&server).len(), 3);
     assert_eq!(env.to_enrich(), 1);
 
     let server = FakeServer::start(vec![(200, "{}".into()), (200, bad)]);
     let env = server_env(&server, "format_retries = 0\n");
-    let o = env.run(&["build"], &[("NEPHILA_T078_KEY", "sk")]);
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
     assert!(!o.status.success());
     assert_eq!(posts(&server).len(), 1);
 }
@@ -525,7 +525,7 @@ fn req038_ac9_openai_text_without_json_three_requests_then_zero_retries_one() {
 fn req038_ac6_http_error_is_not_retried() {
     let server = FakeServer::start(vec![(200, "{}".into()), (500, "{}".into())]);
     let env = server_env(&server, "");
-    let o = env.run(&["build"], &[("NEPHILA_T078_KEY", "sk")]);
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
     assert!(!o.status.success());
     assert_eq!(posts(&server).len(), 1);
 }
@@ -541,11 +541,11 @@ fn req038_ac9_anthropic_reply_without_text_block_is_retried() {
     let env = Env::new(
         1,
         &format!(
-            "provider = \"anthropic\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T078_KEY\"\nconcurrency = 1\n",
+            "provider = \"anthropic\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\n",
             server.base_url
         ),
     );
-    let o = env.run(&["build"], &[("NEPHILA_T078_KEY", "sk")]);
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
     assert!(o.status.success(), "{}", stderr(&o));
     let reqs = posts(&server);
     assert_eq!(reqs.len(), 2);
@@ -568,12 +568,272 @@ fn req038_ac6_lot_omitting_a_file_is_sent_once() {
     let env = Env::new(
         3,
         &format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T078_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
             server.base_url
         ),
     );
-    let o = env.run(&["build"], &[("NEPHILA_T078_KEY", "sk")]);
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
     assert!(!o.status.success());
     assert_eq!(posts(&server).len(), 1, "{}", stderr(&o));
     assert_eq!(env.to_enrich(), 1);
+}
+
+// ---- Option --format-retries (REQ-038, T-079) ----
+
+fn help_of(args: &[&str]) -> String {
+    let o = Command::new(cargo_bin("nephila"))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+const RETRIES_HELP: &str = "--format-retries <N> Nombre de nouveaux essais d'un appel LLM dont la réponse est non conforme (remplace `format_retries` de la configuration ; défaut 2 ; 0 = aucun nouvel essai)";
+
+#[test]
+fn req038_ac2_ac14_help_mentions_option() {
+    for args in [
+        &["build", "--help"][..],
+        &["update", "--help"][..],
+        &["query", "ask", "--help"][..],
+    ] {
+        let h = help_of(args);
+        let norm = h.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(norm.contains(RETRIES_HELP), "{args:?}\n{h}");
+        // Le `[default: .]` de `-C` est d'une autre option : seule l'entrée de la nôtre
+        // compte. Elle s'arrête à la prochaine occurrence de ` -` (DEC-048), car l'aide
+        // d'une option courte suivante (`-h, --help`) commence par ` -h`.
+        let from = norm.find("--format-retries").unwrap();
+        let rest = &norm[from..];
+        let entry = &rest[..rest[2..].find(" -").map_or(rest.len(), |i| i + 2)];
+        assert!(!entry.contains("[default:"), "{args:?} {entry}");
+        if args[0] != "query" {
+            let p = |s: &str| norm.find(s).unwrap();
+            assert!(p("--batch-files") < p("--format-retries"));
+            assert!(p("--format-retries") < p("--exclude <MOTIF>"));
+        }
+    }
+    for args in [
+        &["query", "search", "--help"][..],
+        &["query", "neighbors", "--help"][..],
+        &["query", "path", "--help"][..],
+        &["status", "--help"][..],
+    ] {
+        assert!(!help_of(args).contains("--format-retries"));
+    }
+}
+
+#[test]
+fn req038_ac2_ac15_usage_errors_touch_nothing() {
+    let env = Env::new(1, MOCK_CONFIG);
+    let mut cases: Vec<(Vec<&str>, &str)> = Vec::new();
+    for v in ["-1", "abc"] {
+        cases.push((vec!["build", "--format-retries", v], v));
+        cases.push((vec!["update", "--format-retries", v], v));
+        cases.push((vec!["query", "ask", "x", "--format-retries", v], v));
+    }
+    cases.push((
+        vec!["query", "ask", "x", "--format-retries", "4294967296"],
+        "4294967296",
+    ));
+    cases.push((vec!["build", "--format-retries", "1.5"], "1.5"));
+    for (args, v) in cases {
+        let o = env.run(&args, &[]);
+        assert!(!o.status.success(), "{args:?}");
+        let e = stderr(&o);
+        assert!(e.contains("--format-retries"), "{e}");
+        assert!(
+            e.contains(&format!("`{v}` n'est pas un entier positif ou nul")),
+            "{e}"
+        );
+        assert!(o.stdout.is_empty());
+        assert!(!o.stdout.contains(&0x1b) && !o.stderr.contains(&0x1b));
+        assert!(!env.log.exists(), "{args:?}");
+        assert!(!env.repo.join(".nephila").exists());
+    }
+    for args in [
+        &["status", "--format-retries", "1"][..],
+        &["query", "search", "x", "--format-retries", "1"][..],
+    ] {
+        let o = env.run(args, &[]);
+        assert!(!o.status.success(), "{args:?}");
+        assert!(!env.repo.join(".nephila").exists());
+    }
+}
+
+fn nephila_listing(env: &Env) -> Vec<(String, u64)> {
+    let mut v: Vec<(String, u64)> = fs::read_dir(env.repo.join(".nephila"))
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                e.metadata().unwrap().len(),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn req038_ac2_ac15_usage_errors_keep_existing_index() {
+    let env = Env::new(2, MOCK_CONFIG);
+    let o = env.run(&["build"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let db = fs::read(env.repo.join(".nephila/graph.db")).unwrap();
+    let listing = nephila_listing(&env);
+    let _ = fs::remove_file(&env.log);
+    for args in [
+        &["update", "--format-retries", "-1"][..],
+        &["update", "--format-retries", "abc"][..],
+        &["query", "ask", "x", "--format-retries", "-1"][..],
+        &["query", "ask", "x", "--format-retries", "abc"][..],
+    ] {
+        let o = env.run(args, &[]);
+        assert!(!o.status.success(), "{args:?}");
+        assert!(!env.log.exists(), "{args:?}");
+        assert!(
+            fs::read(env.repo.join(".nephila/graph.db")).unwrap() == db,
+            "{args:?}"
+        );
+        assert_eq!(nephila_listing(&env), listing, "{args:?}");
+    }
+}
+
+#[test]
+fn req038_ac2_ac15_no_llm_accepts_option() {
+    let env = Env::new(1, MOCK_CONFIG);
+    for v in ["3", "0", "4294967295"] {
+        let o = env.run(&["build", "--no-llm", "--format-retries", v], &[]);
+        assert!(o.status.success(), "{}", stderr(&o));
+        assert!(env.log_lines().is_empty());
+    }
+    // Sans configuration : acceptée, sans effet ni avertissement.
+    let _ = fs::remove_file(&env.config);
+    let o = env.run(&["build", "--format-retries", "3"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("avertissement"), "{}", stderr(&o));
+}
+
+#[test]
+fn req038_ac4_option_overrides_key_both_ways() {
+    let env = Env::new(2, &format!("{MOCK_CONFIG}format_retries = 3\n"));
+    let o = env.run(
+        &["build", "--format-retries", "0"],
+        &[("NEPHILA_MOCK_MALFORMED", "src/F00.java:3")],
+    );
+    assert!(!o.status.success());
+    assert_eq!(env.calls_for("src/F00.java"), 1);
+    assert_eq!(env.to_enrich(), 1);
+
+    let env = Env::new(2, &format!("{MOCK_CONFIG}format_retries = 0\n"));
+    let o = env.run(
+        &["build", "--format-retries", "3"],
+        &[("NEPHILA_MOCK_MALFORMED", "src/F00.java:3")],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(env.calls_for("src/F00.java"), 4);
+    assert_eq!(env.to_enrich(), 0);
+
+    // update : l'option s'applique aussi.
+    let env = Env::new(2, MOCK_CONFIG);
+    let o = env.run(
+        &["update", "--format-retries", "4"],
+        &[("NEPHILA_MOCK_MALFORMED", "src/F00.java:4")],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(env.calls_for("src/F00.java"), 5);
+}
+
+#[test]
+fn req038_ac12_ac16_trace_and_invalid_key_with_option() {
+    let env = Env::new(1, MOCK_CONFIG);
+    let o = env.run(&["build", "--verbose", "--format-retries", "5"], &[]);
+    let line = stderr(&o)
+        .lines()
+        .find(|l| l.contains("config: llm="))
+        .unwrap()
+        .to_string();
+    assert!(line.ends_with(" format_retries=5"), "{line}");
+
+    for bad in ["-1", "1.5", "\"2\""] {
+        let env = Env::new(1, &format!("{MOCK_CONFIG}format_retries = {bad}\n"));
+        let at = env.config.display();
+        for args in [
+            &["build"][..],
+            &["build", "--format-retries", "3"][..],
+            &["query", "ask", "x", "--format-retries", "3"][..],
+        ] {
+            let o = env.run(args, &[]);
+            assert!(!o.status.success(), "{args:?} {bad}");
+            let e = stderr(&o);
+            assert_eq!(
+                e.trim_end(),
+                format!("erreur: configuration invalide ({at}) : clé « format_retries » doit être un entier positif ou nul (reçu : {bad})"),
+                "{args:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn req026_ac11_option_four_marks_single_departure_of_second_try() {
+    let env = Env::new(2, MOCK_CONFIG);
+    let o = env.run(
+        &["build", "--verbose", "--format-retries", "4"],
+        &[("NEPHILA_MOCK_MALFORMED", "src/F01.java:1")],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    let marked: Vec<_> = departures(&o)
+        .into_iter()
+        .filter(|l| l.contains("(essai "))
+        .collect();
+    assert_eq!(marked.len(), 1, "{marked:?}");
+    assert!(marked[0].ends_with("(essai 2/5)"), "{marked:?}");
+}
+
+#[test]
+fn req038_ac17_option_one_gives_two_tries_suffix() {
+    let env = Env::new(1, MOCK_CONFIG);
+    let o = env.run(
+        &["build", "--format-retries", "1"],
+        &[("NEPHILA_MOCK_MALFORMED", "src/F00.java:3")],
+    );
+    let w = lines_naming(&o, "src/F00.java");
+    assert_eq!(w.len(), 1, "{}", stderr(&o));
+    assert!(w[0].ends_with(" (2 essais sur 2)"), "{}", w[0]);
+}
+
+#[test]
+fn req038_ac11_openai_ask_retried_after_nonconforming_reply() {
+    let ask_ok = r#"{"found":true,"answer":"oui","nodes":["type:p.F00"]}"#;
+    let server = FakeServer::start(vec![
+        (200, "{}".into()),
+        (200, openai_reply(r#"{"found": "oui"}"#)),
+        (200, openai_reply(ask_ok)),
+    ]);
+    let env = Env::new(1, MOCK_CONFIG);
+    assert!(env.run(&["build"], &[]).status.success());
+    fs::write(
+        &env.config,
+        format!(
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let o = env.run(
+        &["query", "ask", "F00 ?"],
+        &[("NEPHILA_RETRIES_TEST_KEY", "sk")],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("oui"));
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+    let chats: Vec<_> = posts(&server)
+        .into_iter()
+        .filter(|r| r.path.ends_with("/v1/chat/completions"))
+        .collect();
+    assert_eq!(chats.len(), 2);
 }

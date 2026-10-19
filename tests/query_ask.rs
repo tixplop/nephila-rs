@@ -388,3 +388,102 @@ fn req003_ac4_ask_uses_mock_fixture_without_fixture_is_not_found() {
     assert_not_found(&env.ask(Q, &[]));
     assert_eq!(env.llm_calls(), 1);
 }
+
+// ---- REQ-038 : nouveaux essais de `query ask` ----
+
+const ASK_OK: &str = r#"{"found":true,"answer":"Le module billing gère la facturation.","nodes":["type:com.acme.billing.BillingService"]}"#;
+
+impl Env {
+    fn ask_malformed(&self, k: u32, extra: &[&str]) -> Output {
+        let mut a = vec!["query", "ask", Q];
+        a.extend_from_slice(extra);
+        fs::write(&self.log, "").unwrap();
+        self.cmd(&a)
+            .env("NEPHILA_MOCK_MALFORMED", format!("_ask:{k}"))
+            .output()
+            .unwrap()
+    }
+}
+
+#[test]
+fn req038_ac11_ask_retried_until_conforming() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    let o = env.ask_malformed(2, &[]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("Le module billing gère la facturation."));
+    assert!(text(&o.stderr).is_empty(), "{}", text(&o.stderr));
+    assert_eq!(env.llm_calls(), 3);
+    // REQ-016 AC-5 : même sortie que sans réponse mal formée.
+    let clean = env.ask(Q, &[]);
+    assert!(clean.status.success(), "{}", text(&clean.stderr));
+    assert_eq!(text(&o.stdout), text(&clean.stdout));
+
+    let o = env.ask_malformed(2, &["--json"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["answer"], "Le module billing gère la facturation.");
+    assert!(text(&o.stderr).is_empty());
+    let clean = env.ask(Q, &["--json"]);
+    assert!(clean.status.success(), "{}", text(&clean.stderr));
+    assert_eq!(text(&o.stdout), text(&clean.stdout));
+}
+
+#[test]
+fn req038_ac11_ask_still_malformed_after_last_try() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    let o = env.ask_malformed(3, &[]);
+    assert!(!o.status.success());
+    assert!(o.stdout.is_empty(), "{}", text(&o.stdout));
+    let err = text(&o.stderr);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(
+        err.starts_with("erreur: réponse LLM non conforme")
+            && err.trim_end().ends_with(" (3 essais sur 3)"),
+        "{err}"
+    );
+    assert_eq!(env.llm_calls(), 3);
+
+    let o = env.ask_malformed(3, &["--format-retries", "3"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("Le module billing gère la facturation."));
+    assert!(text(&o.stderr).is_empty(), "{}", text(&o.stderr));
+    assert_eq!(env.llm_calls(), 4);
+
+    // format_retries = 0 : message de la 0.12.0, sans suffixe.
+    let o = env.ask_malformed(1, &["--format-retries", "0"]);
+    assert!(!o.status.success());
+    assert!(
+        !text(&o.stderr).contains("essais sur"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert_eq!(env.llm_calls(), 1);
+
+    let o = env.ask_malformed(3, &["--format-retries", "1"]);
+    assert!(!o.status.success());
+    assert!(o.stdout.is_empty(), "{}", text(&o.stdout));
+    assert!(text(&o.stderr).trim_end().ends_with(" (2 essais sur 2)"));
+    assert_eq!(env.llm_calls(), 2);
+}
+
+#[test]
+fn req016_ac5_ac6_ask_option_priority_over_config() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nformat_retries = 0\n",
+    )
+    .unwrap();
+    let o = env.ask_malformed(1, &[]);
+    assert!(!o.status.success());
+    let err = text(&o.stderr);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.starts_with("erreur: "), "{err}");
+    assert!(!err.contains("essais sur"), "{err}");
+    assert_eq!(env.llm_calls(), 1);
+    let o = env.ask_malformed(2, &["--format-retries", "3"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+}

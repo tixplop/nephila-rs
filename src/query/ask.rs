@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
@@ -10,7 +11,7 @@ use super::lookup::{self, Lookup};
 use super::search;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::llm::{build_llm, AskReply, Llm};
+use crate::llm::{build_llm, with_format_retries, AskReply, Llm};
 use crate::model::{Edge, Node};
 use crate::store::Store;
 
@@ -132,7 +133,12 @@ fn to_json(n: &Node) -> Value {
 }
 
 /// Pose la question ; retourne la réponse et les nœuds cités existant dans le graphe.
-pub fn answer(store: &Store, llm: &dyn Llm, question: &str) -> Result<(String, Vec<Node>)> {
+pub fn answer(
+    store: &Store,
+    llm: &dyn Llm,
+    question: &str,
+    format_retries: u32,
+) -> Result<(String, Vec<Node>)> {
     let nodes = store.nodes()?;
     let seeds = find_seeds(&nodes, &keywords(question));
     if seeds.is_empty() {
@@ -140,7 +146,9 @@ pub fn answer(store: &Store, llm: &dyn Llm, question: &str) -> Result<(String, V
     }
     let context = build_context(&nodes, &store.edges()?, &seeds);
     llm.verify_key()?;
-    match llm.ask(question, &context)? {
+    let stop = AtomicBool::new(false);
+    let reply = with_format_retries(format_retries, &stop, |_| llm.ask(question, &context))?;
+    match reply {
         AskReply::NotFound => Err(not_found()),
         AskReply::Found {
             answer,
@@ -163,14 +171,19 @@ pub fn answer(store: &Store, llm: &dyn Llm, question: &str) -> Result<(String, V
     }
 }
 
-pub fn run(repo: &Path, question: &str, as_json: bool) -> Result<()> {
+pub fn run(repo: &Path, question: &str, as_json: bool, format_retries: Option<u32>) -> Result<()> {
     if question.trim().is_empty() {
         return Err(Error::Message("la question est vide".to_string()));
     }
     let config = Config::load()?;
     let llm = build_llm(&config)?;
     let store = super::open(repo)?;
-    let (answer, cited) = answer(&store, llm.as_ref(), question)?;
+    let (answer, cited) = answer(
+        &store,
+        llm.as_ref(),
+        question,
+        format_retries.unwrap_or(config.format_retries),
+    )?;
     if as_json {
         let nodes: Vec<Value> = cited.iter().map(to_json).collect();
         println!("{}", json!({"answer": answer, "nodes": nodes}));
