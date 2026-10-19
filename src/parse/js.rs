@@ -1,5 +1,5 @@
-//! Extracteur JavaScript et TypeScript (REQ-034, DEC-039, DEC-040) : amorce, le nœud package du
-//! module ES seulement.
+//! Extracteur JavaScript et TypeScript (REQ-034, DEC-039, DEC-040) : nœuds package, type et
+//! méthode, héritage, imports et contexte de résolution. Les appels et le JSX viennent ensuite.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -9,6 +9,7 @@ use tree_sitter::Node;
 use crate::error::Result;
 use crate::model::{node_id, EdgeKind, NodeKind, SubKind};
 
+use super::js_imports::Imports;
 use super::jvm::INIT;
 use super::{Declared, FileStructure, Lang, Reference};
 
@@ -42,6 +43,11 @@ pub fn module_name(path: &Path) -> (String, String) {
 /// membres de classe et d'interface, héritage. Analyse tolérante aux erreurs.
 pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
     let (module, short) = module_name(path);
+    let rel = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
     let tree = lang.parse(text)?;
     let mut x = Extractor {
         src: text.as_bytes(),
@@ -54,11 +60,16 @@ pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
         }],
         references: Vec::new(),
         seen: HashSet::new(),
+        imports: Imports::collect(tree.root_node(), text.as_bytes(), &rel),
     };
-    x.seen.insert(node_id(NodeKind::Package, &module));
+    let package = node_id(NodeKind::Package, &module);
+    x.seen.insert(package.clone());
+    for name in x.imports.import_targets() {
+        x.add_ref(&package, EdgeKind::Imports, name);
+    }
     x.statements(tree.root_node(), &module);
     Ok(FileStructure {
-        context: Some(format!("package {module}")),
+        context: Some(x.imports.context(&module)),
         declares: x.declares,
         references: x.references,
         warnings: Vec::new(),
@@ -70,6 +81,7 @@ struct Extractor<'a> {
     declares: Vec<Declared>,
     references: Vec<Reference>,
     seen: HashSet<String>,
+    imports: Imports,
 }
 
 impl Extractor<'_> {
@@ -255,7 +267,7 @@ impl Extractor<'_> {
     }
 
     fn heritage_name(&mut self, n: Node, id: &str, kind: EdgeKind) {
-        if let Some(name) = self.simple_name(n) {
+        if let Some(name) = self.simple_name(n).and_then(|nm| self.imports.rewrite(&nm)) {
             self.add_ref(id, kind, name);
         }
     }
@@ -531,6 +543,22 @@ mod tests {
             refs(&s),
             vec!["type:h.A extends B", "type:h.C extends ns.D"]
         );
+    }
+
+    #[test]
+    fn req034_heritage_espace_de_noms_et_externe() {
+        let src = "import * as ns from './base';\nimport React from 'react';\nimport { Base } from 'lib';\n\
+                   class A extends ns.B {}\nclass P extends React.Component {}\nclass Q extends Base {}\n";
+        let s = ex(Lang::TypeScript, "src/h.ts", src);
+        let r = refs(&s);
+        assert!(r.contains(&"type:src/h.A extends B".to_string()), "{r:?}");
+        assert!(!r
+            .iter()
+            .any(|x| x.contains("React") || x.contains("Component")));
+        assert!(!r.iter().any(|x| x.contains("Q extends")), "{r:?}");
+        let ctx = s.context.unwrap();
+        assert!(ctx.contains("import src/base.B"), "{ctx}");
+        assert!(!ctx.contains("React"), "{ctx}");
     }
 
     #[test]
