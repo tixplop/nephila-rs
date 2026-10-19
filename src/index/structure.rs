@@ -255,7 +255,7 @@ mod tests {
         let repo = dir.path();
         std::fs::write(repo.join("A.java"), "package p;\npublic class A {}\n").unwrap();
         std::fs::write(repo.join("B.java"), "package p;\npublic class B {}\n").unwrap();
-        let scanned = crate::scan::scan(repo, &[]).unwrap();
+        let scanned = crate::scan::scan(repo, &[], &crate::filter::Matcher::none()).unwrap();
         assert_eq!(scanned.files.len(), 2);
         let mut store = Store::open_or_create(repo).unwrap();
         let records: Vec<FileRecord> = scanned
@@ -306,7 +306,9 @@ mod tests {
         drop(store);
         std::fs::write(repo.join("B.java"), "package p;\npublic class B {}\n").unwrap();
         let lock = RepoLock::acquire(repo).unwrap();
-        let report = update(repo, &opts, None, &lock).unwrap().unwrap();
+        let report = update(repo, &opts, None, &lock, &crate::filter::Matcher::none())
+            .unwrap()
+            .unwrap();
         assert_eq!(report.pending, 0);
         assert!(finish(&report, "update").is_ok());
         let store = Store::open_readonly(repo).unwrap();

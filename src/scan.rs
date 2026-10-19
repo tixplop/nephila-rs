@@ -1,6 +1,7 @@
 //! Parcours du dépôt : filtrage, empreintes BLAKE3 et rattachement aux modules.
 
 use crate::error::{warn, Error, Result};
+use crate::filter::{FileType, Matcher};
 use crate::model::FileRecord;
 use ignore::WalkBuilder;
 use std::collections::{HashMap, HashSet};
@@ -19,12 +20,6 @@ const EXCLUDED_DIRS: [&str; 6] = [
     ".git",
     ".nephila",
     "node_modules",
-];
-/// Fichiers verrous jamais retenus, à tout niveau.
-const LOCK_FILES: [&str; 3] = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml"];
-const EXTENSIONS: [&str; 21] = [
-    "md", "markdown", "java", "kt", "kts", "groovy", "gradle", "scala", "sql", "xml", "json",
-    "yaml", "yml", "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx",
 ];
 const BUILD_FILES: [&str; 7] = [
     "package.json",
@@ -58,6 +53,8 @@ pub struct ScanResult {
     /// Dossiers (relatifs, `""` = racine) contenant un `settings.gradle(.kts)`, avec `rootProject.name`
     /// (laissé à `None` par le parcours).
     pub gradle_settings: HashMap<String, Option<String>>,
+    /// Fichiers que le parcours aurait retenus sans filtre (REQ-037).
+    pub excluded: usize,
 }
 
 fn is_build_file(name: &str) -> bool {
@@ -65,16 +62,7 @@ fn is_build_file(name: &str) -> bool {
 }
 
 fn is_supported(name: &str) -> bool {
-    if LOCK_FILES.contains(&name) {
-        return false;
-    }
-    if is_build_file(name) {
-        return true;
-    }
-    Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| EXTENSIONS.contains(&e))
+    FileType::of(name).is_some()
 }
 
 /// Module d'un fichier : dossier du fichier de build le plus proche ancêtre
@@ -93,8 +81,9 @@ pub fn module_of(path: &str, build_dirs: &HashSet<String>) -> Option<String> {
 }
 
 /// Parcourt `root`. `known` : enregistrements de la table `files`, dont l'empreinte est
-/// réutilisée quand taille et mtime n'ont pas changé.
-pub fn scan(root: &Path, known: &[FileRecord]) -> Result<ScanResult> {
+/// réutilisée quand taille et mtime n'ont pas changé. `matcher` : filtres de REQ-037, appliqués
+/// après les exclusions de REQ-004 et avant toute lecture.
+pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<ScanResult> {
     if !root.is_dir() {
         return Err(Error::Message(format!(
             "{} n'est pas un dossier lisible",
@@ -146,6 +135,10 @@ pub fn scan(root: &Path, known: &[FileRecord]) -> Result<ScanResult> {
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
+        if matcher.excludes(&rel) {
+            res.excluded += 1;
+            continue;
+        }
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
@@ -245,7 +238,7 @@ mod tests {
         .unwrap();
         std::fs::create_dir(dir.path().join("t")).unwrap();
         std::fs::write(dir.path().join("t/settings.gradle.kts"), "include(\"x\")\n").unwrap();
-        let res = scan(dir.path(), &[]).unwrap();
+        let res = scan(dir.path(), &[], &Matcher::none()).unwrap();
         assert_eq!(res.gradle_settings.get(""), Some(&Some("app".to_string())));
         assert_eq!(res.gradle_settings.get("t"), Some(&None));
     }

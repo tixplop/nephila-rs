@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::Result;
+use crate::filter::Matcher;
 use crate::model::{FileRecord, FileState};
 use crate::scan::{self, ScannedFile};
 use crate::store::Store;
@@ -44,6 +45,8 @@ pub struct Diff {
     pub known: Vec<FileRecord>,
     /// Dossiers contenant un `settings.gradle(.kts)`, avec `rootProject.name` s'il est connu.
     pub gradle_settings: HashMap<String, Option<String>>,
+    /// Fichiers que le parcours aurait retenus sans filtre (REQ-037).
+    pub excluded: usize,
 }
 
 impl Diff {
@@ -61,14 +64,15 @@ impl Diff {
 
 /// Compare le dépôt avec les fichiers connus du graphe. Un fichier en attente reste « en
 /// attente » même s'il a changé (il sera retraité de toute façon) ; absent du disque, il est
-/// « supprimé ».
-pub fn compute(repo: &Path, store: &Store) -> Result<Diff> {
+/// « supprimé » (c'est aussi le cas d'un fichier indexé que `matcher` exclut désormais).
+pub fn compute(repo: &Path, store: &Store, matcher: &Matcher) -> Result<Diff> {
     let known = store.files()?;
     let scan::ScanResult {
         files: scanned,
         gradle_settings,
+        excluded,
         ..
-    } = scan::scan(repo, &known)?;
+    } = scan::scan(repo, &known, matcher)?;
     let on_disk: HashMap<&str, &ScannedFile> =
         scanned.iter().map(|f| (f.path.as_str(), f)).collect();
     // Mise à niveau 0.9 -> 0.10 : un `package.json` enregistré comme document de données doit
@@ -117,5 +121,6 @@ pub fn compute(repo: &Path, store: &Store) -> Result<Diff> {
         scanned,
         known,
         gradle_settings,
+        excluded,
     })
 }

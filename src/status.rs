@@ -6,11 +6,13 @@ use serde_json::json;
 
 use crate::diff;
 use crate::error::Result;
+use crate::filter::ProjectFilters;
 use crate::store::Store;
 
 pub fn run(repo: &Path, as_json: bool) -> Result<()> {
+    let matcher = ProjectFilters::load_matcher(repo)?;
     let store = Store::open_readonly(repo)?;
-    let d = diff::compute(repo, &store)?;
+    let d = diff::compute(repo, &store, &matcher)?;
     let to_enrich = store.count_files_to_enrich()?;
     if as_json {
         let files: Vec<_> = d

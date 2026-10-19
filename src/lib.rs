@@ -4,6 +4,7 @@ pub mod config;
 pub mod diff;
 pub mod error;
 pub mod export;
+pub mod filter;
 pub mod index;
 pub mod llm;
 pub mod model;

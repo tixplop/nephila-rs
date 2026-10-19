@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::config::{Config, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS};
 use crate::error::{warn, Error, Result};
+use crate::filter::{Matcher, ProjectFilters};
 use crate::index::lock::RepoLock;
 use crate::index::{enrich, structure};
 use crate::llm::{build_llm, Llm};
@@ -30,6 +31,8 @@ pub struct BuildReport {
     pub llm_active: bool,
     /// Cause de l'arrêt de l'envoi de nouveaux fichiers (clé refusée, panne réseau répétée).
     pub stop_cause: Option<String>,
+    /// Fichiers exclus par les filtres (REQ-037) ; `None` sans filtre actif.
+    pub excluded: Option<usize>,
 }
 
 /// Réglages de l'indexation : ceux de la configuration, ou les défauts sans configuration.
@@ -141,6 +144,9 @@ impl BuildReport {
         if !self.llm_active {
             line.push_str(", enrichissement : désactivé");
         }
+        if let Some(k) = self.excluded {
+            line.push_str(&format!(", {k} fichiers exclus par les filtres"));
+        }
         line
     }
 }
@@ -149,10 +155,12 @@ impl BuildReport {
 pub fn run(repo: &Path, no_llm: bool, verbose: bool, batch_files: Option<usize>) -> Result<()> {
     trace::init(verbose);
     check_repo(repo)?;
+    // Le fichier de projet est lu avant la configuration LLM, le verrou et toute écriture.
+    let matcher = ProjectFilters::load_matcher(repo)?;
     let setup = setup(no_llm, batch_files)?;
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
-    let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock)?;
+    let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
     finish(&report, "build")
 }
 
@@ -215,6 +223,7 @@ pub fn build(
     opts: &IndexOptions,
     llm: Option<&dyn Llm>,
     _lock: &RepoLock,
+    matcher: &Matcher,
 ) -> Result<BuildReport> {
     check_repo(repo)?;
     let mut store = Store::open_or_create(repo)?;
@@ -223,7 +232,7 @@ pub fn build(
     } else {
         Vec::new()
     };
-    let scanned = scan::scan(repo, &known)?;
+    let scanned = scan::scan(repo, &known, matcher)?;
     let records: Vec<FileRecord> = scanned
         .files
         .iter()
@@ -236,13 +245,20 @@ pub fn build(
             state: FileState::Pending,
         })
         .collect();
-    trace!("parcours: {} fichiers", records.len());
+    trace!(
+        "parcours: {} fichiers{}",
+        records.len(),
+        matcher.trace_suffix(scanned.excluded)
+    );
     store.reset_with_pending_files(&records)?;
     if records.is_empty() {
         warn("aucun fichier pris en charge dans le dépôt : graphe vide");
     }
 
-    let mut report = BuildReport::default();
+    let mut report = BuildReport {
+        excluded: matcher.is_active().then_some(scanned.excluded),
+        ..BuildReport::default()
+    };
     structure::analyze(
         repo,
         &scanned.files,

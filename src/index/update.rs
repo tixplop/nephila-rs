@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::diff::{self, Change};
 use crate::error::Result;
+use crate::filter::{Matcher, ProjectFilters};
 use crate::index::build::{self, BuildReport, IndexOptions};
 use crate::index::lock::RepoLock;
 use crate::index::structure;
@@ -19,15 +20,16 @@ use crate::trace;
 pub fn run(repo: &Path, no_llm: bool, verbose: bool, batch_files: Option<usize>) -> Result<()> {
     trace::init(verbose);
     build::check_repo(repo)?;
+    let matcher = ProjectFilters::load_matcher(repo)?;
     let setup = build::setup(no_llm, batch_files)?;
     let lock = RepoLock::acquire(repo)?;
     // Le test d'existence se fait sous verrou : aucun build concurrent ne peut le créer entre-temps.
     if !db_path(repo).is_file() {
         eprintln!("aucun graphe : build complet");
-        let report = build::build(repo, &setup.opts, setup.llm.as_deref(), &lock)?;
+        let report = build::build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
         return build::finish(&report, "build");
     }
-    match update(repo, &setup.opts, setup.llm.as_deref(), &lock)? {
+    match update(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)? {
         None => {
             println!("graphe à jour");
             Ok(())
@@ -60,16 +62,18 @@ pub fn update(
     opts: &IndexOptions,
     llm: Option<&dyn Llm>,
     _lock: &RepoLock,
+    matcher: &Matcher,
 ) -> Result<Option<BuildReport>> {
     build::check_repo(repo)?;
     let mut store = Store::open_existing(repo)?;
-    let d = diff::compute(repo, &store)?;
+    let d = diff::compute(repo, &store, matcher)?;
     trace!(
-        "parcours: {} ajoutés, {} modifiés, {} supprimés, {} en attente",
+        "parcours: {} ajoutés, {} modifiés, {} supprimés, {} en attente{}",
         d.paths(Change::Added).count(),
         d.paths(Change::Modified).count(),
         d.paths(Change::Deleted).count(),
-        d.paths(Change::Pending).count()
+        d.paths(Change::Pending).count(),
+        matcher.trace_suffix(d.excluded)
     );
 
     // Fichiers dont seule la date a changé : l'enregistrement est rafraîchi pour ne plus
@@ -129,7 +133,10 @@ pub fn update(
     let records: Vec<FileRecord> = todo.iter().map(|f| record(f, FileState::Pending)).collect();
     store.insert_files(&records)?;
 
-    let mut report = BuildReport::default();
+    let mut report = BuildReport {
+        excluded: matcher.is_active().then_some(d.excluded),
+        ..BuildReport::default()
+    };
     structure::analyze(
         repo,
         &todo,
