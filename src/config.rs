@@ -2,6 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::CertificateDer;
+use rustls::RootCertStore;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
@@ -40,6 +43,12 @@ pub struct Config {
     pub timeout_secs: u64,
     /// Nombre maximal de fichiers par appel d'enrichissement (REQ-027).
     pub batch_files: usize,
+    /// Chemin résolu du PEM d'autorités ajoutées aux autorités publiques (REQ-036).
+    pub tls_ca_cert: Option<PathBuf>,
+    /// Certificats d'autorité (DER) lus dans `tls_ca_cert`, déjà validés.
+    pub tls_ca_certs: Vec<CertificateDer<'static>>,
+    /// Désactive le contrôle du certificat du serveur (REQ-036).
+    pub tls_insecure: bool,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +62,8 @@ struct RawConfig {
     concurrency: Option<i64>,
     timeout_secs: Option<i64>,
     batch_files: Option<i64>,
+    tls_ca_cert: Option<String>,
+    tls_insecure: Option<bool>,
 }
 
 /// Chemin du fichier de configuration : `NEPHILA_CONFIG`, sinon
@@ -91,7 +102,7 @@ impl Config {
     /// Comme `load`, avec un environnement fourni.
     pub fn load_with(env: &dyn Fn(&str) -> Option<String>) -> Result<Config> {
         let path = config_path_with(env)?;
-        let cfg = Config::load_from(&path)?;
+        let cfg = Config::load_from_with(&path, env)?;
         cfg.api_key_with(env)?;
         Ok(cfg)
     }
@@ -105,7 +116,7 @@ impl Config {
         if !path.exists() {
             return Ok(None);
         }
-        let cfg = Config::load_from(&path)?;
+        let cfg = Config::load_from_with(&path, env)?;
         cfg.api_key_with(env)?;
         Ok(Some(cfg))
     }
@@ -117,6 +128,11 @@ impl Config {
 
     /// Lit et valide un fichier de configuration (sans lire la clé d'API).
     pub fn load_from(path: &Path) -> Result<Config> {
+        Config::load_from_with(path, &|k| std::env::var(k).ok())
+    }
+
+    /// Comme `load_from`, avec un environnement fourni (`HOME` pour `~/`).
+    pub fn load_from_with(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Config> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -133,11 +149,21 @@ impl Config {
                 )))
             }
         };
-        Config::parse(&text, path)
+        Config::parse_with(&text, path, env)
     }
 
-    /// Analyse le contenu TOML ; `path` ne sert qu'aux messages.
+    /// Analyse le contenu TOML ; `path` désigne le fichier de configuration (messages et
+    /// base des chemins relatifs). `HOME` est celui du processus.
     pub fn parse(text: &str, path: &Path) -> Result<Config> {
+        Config::parse_with(text, path, &|k| std::env::var(k).ok())
+    }
+
+    /// Comme `parse`, avec un environnement fourni.
+    pub fn parse_with(
+        text: &str,
+        path: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Config> {
         let at = path.display();
         let raw: RawConfig = toml::from_str(text)
             .map_err(|e| Error::Message(format!("configuration invalide ({at}) : {e}")))?;
@@ -177,6 +203,15 @@ impl Config {
             return Err(missing("api_key_env"));
         }
         let base_url = nonblank("base_url", raw.base_url)?;
+        let tls_ca_cert = nonblank("tls_ca_cert", raw.tls_ca_cert)?;
+        let (tls_ca_cert, tls_ca_certs) = match tls_ca_cert {
+            None => (None, Vec::new()),
+            Some(raw_path) => {
+                let resolved = resolve_ca_path(&raw_path, path, env, &at.to_string())?;
+                let certs = read_ca_certs(&resolved)?;
+                (Some(resolved), certs)
+            }
+        };
         let positive = |key: &str, v: Option<i64>, default: usize| -> Result<usize> {
             match v {
                 None => Ok(default),
@@ -204,6 +239,9 @@ impl Config {
                 DEFAULT_TIMEOUT_SECS as usize,
             )? as u64,
             batch_files: positive("batch_files", raw.batch_files, DEFAULT_BATCH_FILES)?,
+            tls_ca_cert,
+            tls_ca_certs,
+            tls_insecure: raw.tls_insecure.unwrap_or(false),
         })
     }
 
@@ -226,4 +264,54 @@ impl Config {
     pub fn api_key(&self) -> Result<Option<String>> {
         self.api_key_with(&|k| std::env::var(k).ok())
     }
+}
+
+/// Résout `tls_ca_cert` : absolu tel quel, `~/…` depuis `HOME`, sinon relatif au dossier du
+/// fichier de configuration.
+fn resolve_ca_path(
+    raw: &str,
+    config: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    at: &str,
+) -> Result<PathBuf> {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return match env("HOME").filter(|h| !h.is_empty()) {
+            Some(home) => Ok(PathBuf::from(home).join(rest)),
+            None => Err(Error::Message(format!(
+                "configuration invalide ({at}) : clé « tls_ca_cert » : {raw} commence par ~/ \
+                 mais HOME n'est pas défini"
+            ))),
+        };
+    }
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    Ok(config.parent().unwrap_or(Path::new("")).join(p))
+}
+
+/// Lit les blocs `CERTIFICATE` du PEM (les autres blocs sont ignorés) et vérifie que chacun
+/// est exploitable comme autorité.
+fn read_ca_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let fail = |why: String| {
+        Error::Message(format!(
+            "configuration invalide : clé « tls_ca_cert » ({}) : {why}",
+            path.display()
+        ))
+    };
+    let bytes = std::fs::read(path).map_err(|e| fail(format!("lecture impossible : {e}")))?;
+    let mut certs = Vec::new();
+    for item in CertificateDer::pem_slice_iter(&bytes) {
+        certs.push(item.map_err(|e| fail(format!("PEM invalide : {e}")))?);
+    }
+    if certs.is_empty() {
+        return Err(fail("aucun bloc CERTIFICATE dans le fichier".into()));
+    }
+    let mut roots = RootCertStore::empty();
+    for cert in &certs {
+        roots
+            .add(cert.clone())
+            .map_err(|e| fail(format!("certificat inexploitable : {e}")))?;
+    }
+    Ok(certs)
 }

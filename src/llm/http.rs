@@ -76,9 +76,10 @@ fn client_config(tls: &Tls) -> Arc<rustls::ClientConfig> {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         for cert in &tls.ca_certs {
-            // Un certificat inexploitable est écarté ici : la configuration (T-072) le
-            // rejette avant la construction du fournisseur.
-            let _ = roots.add(cert.clone());
+            // Invariant : la configuration valide chaque certificat au chargement.
+            roots
+                .add(cert.clone())
+                .expect("autorité tls_ca_cert validée au chargement de la configuration");
         }
         builder.with_root_certificates(roots).with_no_client_auth()
     };
@@ -132,13 +133,15 @@ pub fn send(
         Err(e) if is_timeout(&e) => Err(Error::Timeout(format!(
             "délai dépassé avec {provider} sur {url} ({e}) ; augmentez timeout_secs"
         ))),
-        Err(e) if let Some(cause) = certificate_error(&e) => Err(Error::Network(format!(
-            "certificat du serveur refusé par {provider} sur {url} : {cause} ; \
-             ajoutez l'autorité avec tls_ca_cert, ou désactivez le contrôle avec tls_insecure = true"
-        ))),
-        Err(e) => Err(Error::Network(format!(
-            "erreur réseau avec {provider} sur {url} : {e}"
-        ))),
+        Err(e) => match certificate_error(&e) {
+            Some(cause) => Err(Error::Network(format!(
+                "certificat du serveur refusé par {provider} sur {url} : {cause} ; \
+                 ajoutez l'autorité avec tls_ca_cert, ou désactivez le contrôle avec tls_insecure = true"
+            ))),
+            None => Err(Error::Network(format!(
+                "erreur réseau avec {provider} sur {url} : {e}"
+            ))),
+        },
     }
 }
 

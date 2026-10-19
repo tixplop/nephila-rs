@@ -90,14 +90,22 @@ pub(crate) fn setup(no_llm: bool, batch_files: Option<usize>) -> Result<Setup> {
             if let Some(n) = batch_files {
                 config.batch_files = n;
             }
+            let mut tls_trace = String::new();
+            if let Some(p) = &config.tls_ca_cert {
+                tls_trace.push_str(&format!(" tls_ca_cert={}", p.display()));
+            }
+            if config.tls_insecure {
+                tls_trace.push_str(" tls_insecure");
+            }
             trace!(
-                "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={}",
+                "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={}{}",
                 config.provider.as_str(),
                 config.model,
                 config.concurrency,
                 config.timeout_secs,
                 config.max_chunk_chars,
-                config.batch_files
+                config.batch_files,
+                tls_trace
             );
             let llm = build_llm(&config)?;
             let started = Instant::now();

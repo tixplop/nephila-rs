@@ -34,6 +34,22 @@ pub trait Llm: Send + Sync {
 
 /// Construit le fournisseur décrit par la configuration.
 pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
+    let tls = Tls {
+        ca_certs: config.tls_ca_certs.clone(),
+        insecure: config.tls_insecure,
+    };
+    if config.tls_insecure && config.provider != Provider::Mock {
+        let default = match config.provider {
+            Provider::Anthropic => "https://api.anthropic.com",
+            _ => "https://api.openai.com",
+        };
+        let url = config.base_url.as_deref().unwrap_or(default);
+        if url.starts_with("https://") {
+            crate::error::warn(
+                "tls_insecure = true : contrôle des certificats du serveur désactivé",
+            );
+        }
+    }
     match config.provider {
         Provider::Mock => Ok(Box::new(mock::MockLlm::from_env()?)),
         Provider::Anthropic => {
@@ -45,7 +61,7 @@ pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
                 config.model.clone(),
                 key,
                 config.timeout_secs,
-                &Tls::default(),
+                &tls,
             )))
         }
         Provider::OpenAi => Ok(Box::new(openai::OpenAiLlm::new(
@@ -53,7 +69,7 @@ pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
             config.model.clone(),
             config.api_key()?,
             config.timeout_secs,
-            &Tls::default(),
+            &tls,
         ))),
     }
 }

@@ -403,3 +403,92 @@ fn req027_ac1_build_with_invalid_batch_files_fails_but_no_llm_succeeds() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+fn ca_dir() -> (tempfile::TempDir, PathBuf) {
+    let d = tempfile::tempdir().unwrap();
+    let ca = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls/ca.pem");
+    std::fs::create_dir_all(d.path().join("certs")).unwrap();
+    std::fs::copy(&ca, d.path().join("certs/ca.pem")).unwrap();
+    std::fs::copy(&ca, d.path().join("home.pem")).unwrap();
+    let cfg = d.path().join("config.toml");
+    (d, cfg)
+}
+
+#[test]
+fn req036_tls_defaults() {
+    let c = parse("provider = \"mock\"\n").unwrap();
+    assert_eq!(c.tls_ca_cert, None);
+    assert!(c.tls_ca_certs.is_empty());
+    assert!(!c.tls_insecure);
+    assert!(
+        parse("provider = \"mock\"\ntls_insecure = true\n")
+            .unwrap()
+            .tls_insecure
+    );
+}
+
+#[test]
+fn req036_ac3_ca_path_resolution() {
+    let (d, cfg) = ca_dir();
+    let p = |t: &str, home: &str| {
+        Config::parse_with(t, &cfg, &env_of(&[("HOME", home)])).map_err(|e| e.to_string())
+    };
+    let c = p(
+        "provider = \"mock\"\ntls_ca_cert = \"certs/ca.pem\"\n",
+        "/nope",
+    )
+    .unwrap();
+    assert_eq!(c.tls_ca_cert, Some(d.path().join("certs/ca.pem")));
+    assert_eq!(c.tls_ca_certs.len(), 1);
+    let home = d.path().display().to_string();
+    let c = p("provider = \"mock\"\ntls_ca_cert = \"~/home.pem\"\n", &home).unwrap();
+    assert_eq!(c.tls_ca_cert, Some(d.path().join("home.pem")));
+    let abs = d.path().join("certs/ca.pem");
+    let t = format!("provider = \"mock\"\ntls_ca_cert = \"{}\"\n", abs.display());
+    assert_eq!(p(&t, "/nope").unwrap().tls_ca_cert, Some(abs));
+    let e = Config::parse_with(
+        "provider = \"mock\"\ntls_ca_cert = \"~/x.pem\"\n",
+        &cfg,
+        &env_of(&[]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("tls_ca_cert") && e.contains("HOME"), "{e}");
+}
+
+#[test]
+fn req036_ac5_ca_errors_and_type_errors() {
+    let (d, cfg) = ca_dir();
+    std::fs::write(
+        d.path().join("none.pem"),
+        "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.path().join("bad.pem"),
+        "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.path().join("junk.pem"),
+        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    for name in ["absent.pem", "certs", "none.pem", "bad.pem", "junk.pem"] {
+        let t = format!("provider = \"mock\"\ntls_ca_cert = \"{name}\"\n");
+        let e = Config::parse(&t, &cfg).unwrap_err().to_string();
+        assert!(e.contains("tls_ca_cert"), "{name}: {e}");
+        assert!(
+            e.contains(&d.path().join(name).display().to_string()),
+            "{name}: {e}"
+        );
+    }
+    let e = Config::parse("provider = \"mock\"\ntls_ca_cert = \" \"\n", &cfg).unwrap_err();
+    assert!(e.to_string().contains("tls_ca_cert") && e.to_string().contains("vide"));
+    for v in ["\"yes\"", "1"] {
+        let e = Config::parse(&format!("provider = \"mock\"\ntls_insecure = {v}\n"), &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("tls_insecure"), "{e}");
+    }
+}
