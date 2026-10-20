@@ -72,6 +72,8 @@ const FILTERS_HELP: &str =
 Filtres durables (lus aussi par status et query) : fichier .nephila.toml à la racine du dépôt
   exclude = [\"docs/legacy/\", \"*.min.js\"]
   exclude_types = [\"json\"]
+Réglages LLM du dépôt, dans le même fichier (prioritaires sur la configuration personnelle) :
+  model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries
 Exemple : nephila build --exclude '*.min.js' --exclude-type json,yaml";
 
 #[derive(Debug, Args)]
@@ -217,5 +219,13 @@ pub fn run(cli: Cli) -> Result<()> {
             json,
             format_retries,
         }) => crate::query::ask::run(&cli.repo, question, json.json, *format_retries),
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    #[test]
+    fn req037_ac18_aide_cite_les_reglages_de_projet() {
+        assert!(super::FILTERS_HELP.contains(&crate::config::PROJECT_SETTINGS.join(", ")));
     }
 }

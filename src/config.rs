@@ -15,6 +15,77 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_BATCH_FILES: usize = 1;
 pub const DEFAULT_FORMAT_RETRIES: u32 = 2;
 
+/// Réglages que le fichier de projet peut porter, dans l'ordre d'affichage (REQ-042). Seule
+/// déclaration de la liste : l'aide, l'erreur de clé inconnue et la trace s'en servent.
+pub const PROJECT_SETTINGS: [&str; 6] = [
+    "model",
+    "max_chunk_chars",
+    "concurrency",
+    "timeout_secs",
+    "batch_files",
+    "format_retries",
+];
+
+/// Clés de connexion : permises dans la configuration personnelle seulement (DEC-052).
+pub const CONNECTION_KEYS: [&str; 5] = [
+    "provider",
+    "base_url",
+    "api_key_env",
+    "tls_ca_cert",
+    "tls_insecure",
+];
+
+/// Réglages LLM lus dans le fichier de projet `.nephila.toml` (REQ-042).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectSettings {
+    pub model: Option<String>,
+    pub max_chunk_chars: Option<usize>,
+    pub concurrency: Option<usize>,
+    pub timeout_secs: Option<u64>,
+    pub batch_files: Option<usize>,
+    pub format_retries: Option<u32>,
+}
+
+impl ProjectSettings {
+    /// Lit et valide les réglages présents dans `table` ; `shown` = chemin affiché du fichier.
+    pub fn from_table(table: &toml::Table, shown: &str) -> Result<ProjectSettings> {
+        let mut out = ProjectSettings::default();
+        for key in PROJECT_SETTINGS {
+            let Some(value) = table.get(key) else {
+                continue;
+            };
+            let invalid = |expected: &str| {
+                Error::Message(format!(
+                    "{shown} : clé `{key}` : valeur invalide `{value}` ({expected})"
+                ))
+            };
+            let positive = || -> Result<u64> {
+                match value {
+                    toml::Value::Integer(n) if *n >= 1 => Ok(*n as u64),
+                    _ => Err(invalid("entier strictement positif attendu")),
+                }
+            };
+            match key {
+                "model" => match value {
+                    toml::Value::String(s) if !s.trim().is_empty() => out.model = Some(s.clone()),
+                    _ => return Err(invalid("chaîne non vide attendue")),
+                },
+                "max_chunk_chars" => out.max_chunk_chars = Some(positive()? as usize),
+                "concurrency" => out.concurrency = Some(positive()? as usize),
+                "timeout_secs" => out.timeout_secs = Some(positive()?),
+                "batch_files" => out.batch_files = Some(positive()? as usize),
+                _ => match value {
+                    toml::Value::Integer(n) if (0..=i64::from(u32::MAX)).contains(n) => {
+                        out.format_retries = Some(*n as u32)
+                    }
+                    _ => return Err(invalid("entier positif ou nul attendu, au plus 4294967295")),
+                },
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Anthropic,
@@ -98,6 +169,51 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 impl Config {
+    /// Applique les réglages de projet puis les options (REQ-042). Rend la configuration
+    /// effective et les réglages du fichier de projet qu'aucune option n'a remplacés, dans
+    /// l'ordre de `PROJECT_SETTINGS`. Les clés de connexion ne sont jamais touchées.
+    pub fn with_project(
+        mut self,
+        p: &ProjectSettings,
+        batch_files: Option<usize>,
+        format_retries: Option<u32>,
+    ) -> (Config, Vec<&'static str>) {
+        let mut from_project = Vec::new();
+        if let Some(v) = &p.model {
+            self.model = v.clone();
+            from_project.push("model");
+        }
+        if let Some(v) = p.max_chunk_chars {
+            self.max_chunk_chars = v;
+            from_project.push("max_chunk_chars");
+        }
+        if let Some(v) = p.concurrency {
+            self.concurrency = v;
+            from_project.push("concurrency");
+        }
+        if let Some(v) = p.timeout_secs {
+            self.timeout_secs = v;
+            from_project.push("timeout_secs");
+        }
+        if let Some(v) = p.batch_files {
+            self.batch_files = v;
+            from_project.push("batch_files");
+        }
+        if let Some(v) = p.format_retries {
+            self.format_retries = v;
+            from_project.push("format_retries");
+        }
+        if let Some(n) = batch_files {
+            self.batch_files = n;
+            from_project.retain(|k| *k != "batch_files");
+        }
+        if let Some(n) = format_retries {
+            self.format_retries = n;
+            from_project.retain(|k| *k != "format_retries");
+        }
+        (self, from_project)
+    }
+
     /// Charge et valide la configuration depuis l'environnement du processus.
     pub fn load() -> Result<Config> {
         Config::load_with(&|k| std::env::var(k).ok())
@@ -329,4 +445,204 @@ fn read_ca_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
             .map_err(|e| fail(format!("certificat inexploitable : {e}")))?;
     }
     Ok(certs)
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    fn base() -> Config {
+        Config {
+            provider: Provider::OpenAi,
+            model: "m-perso".into(),
+            base_url: Some("http://x".into()),
+            api_key_env: Some("K".into()),
+            max_chunk_chars: 100,
+            concurrency: 2,
+            timeout_secs: 30,
+            batch_files: 3,
+            format_retries: 1,
+            tls_ca_cert: None,
+            tls_ca_certs: Vec::new(),
+            tls_insecure: true,
+        }
+    }
+
+    fn table(s: &str) -> toml::Table {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn req042_ac2_chaque_reglage_seul_remplace_sa_valeur() {
+        let cases: Vec<(&str, ProjectSettings, Config)> = vec![
+            (
+                "model",
+                ProjectSettings {
+                    model: Some("m".into()),
+                    ..Default::default()
+                },
+                Config {
+                    model: "m".into(),
+                    ..base()
+                },
+            ),
+            (
+                "max_chunk_chars",
+                ProjectSettings {
+                    max_chunk_chars: Some(7),
+                    ..Default::default()
+                },
+                Config {
+                    max_chunk_chars: 7,
+                    ..base()
+                },
+            ),
+            (
+                "concurrency",
+                ProjectSettings {
+                    concurrency: Some(9),
+                    ..Default::default()
+                },
+                Config {
+                    concurrency: 9,
+                    ..base()
+                },
+            ),
+            (
+                "timeout_secs",
+                ProjectSettings {
+                    timeout_secs: Some(5),
+                    ..Default::default()
+                },
+                Config {
+                    timeout_secs: 5,
+                    ..base()
+                },
+            ),
+            (
+                "batch_files",
+                ProjectSettings {
+                    batch_files: Some(8),
+                    ..Default::default()
+                },
+                Config {
+                    batch_files: 8,
+                    ..base()
+                },
+            ),
+            (
+                "format_retries",
+                ProjectSettings {
+                    format_retries: Some(0),
+                    ..Default::default()
+                },
+                Config {
+                    format_retries: 0,
+                    ..base()
+                },
+            ),
+        ];
+        assert_eq!(cases.len(), PROJECT_SETTINGS.len());
+        for (name, p, expected) in cases {
+            let (c, from) = base().with_project(&p, None, None);
+            assert_eq!(c, expected, "{name}");
+            assert_eq!(from, vec![name]);
+        }
+    }
+
+    #[test]
+    fn req042_ac2_vide_option_et_valeur_egale() {
+        let (c, from) = base().with_project(&ProjectSettings::default(), None, None);
+        assert_eq!(c, base());
+        assert!(from.is_empty());
+
+        let p = ProjectSettings {
+            batch_files: Some(2),
+            format_retries: Some(5),
+            concurrency: Some(2),
+            ..Default::default()
+        };
+        let (c, from) = base().with_project(&p, Some(1), Some(0));
+        assert_eq!((c.batch_files, c.format_retries), (1, 0));
+        assert_eq!(from, vec!["concurrency"]);
+        // valeur égale à la valeur personnelle : nommée quand même
+        assert_eq!(c.concurrency, 2);
+    }
+
+    #[test]
+    fn req042_ac15_valeurs_invalides() {
+        let cases = [
+            ("model = \"\"", "model", "\"\"", "chaîne non vide attendue"),
+            (
+                "model = \"  \"",
+                "model",
+                "\"  \"",
+                "chaîne non vide attendue",
+            ),
+            ("model = 3", "model", "3", "chaîne non vide attendue"),
+            (
+                "max_chunk_chars = 0",
+                "max_chunk_chars",
+                "0",
+                "entier strictement positif attendu",
+            ),
+            (
+                "concurrency = -1",
+                "concurrency",
+                "-1",
+                "entier strictement positif attendu",
+            ),
+            (
+                "timeout_secs = 1.5",
+                "timeout_secs",
+                "1.5",
+                "entier strictement positif attendu",
+            ),
+            (
+                "batch_files = \"2\"",
+                "batch_files",
+                "\"2\"",
+                "entier strictement positif attendu",
+            ),
+            (
+                "batch_files = true",
+                "batch_files",
+                "true",
+                "entier strictement positif attendu",
+            ),
+            (
+                "format_retries = -1",
+                "format_retries",
+                "-1",
+                "entier positif ou nul attendu, au plus 4294967295",
+            ),
+            (
+                "format_retries = 4294967296",
+                "format_retries",
+                "4294967296",
+                "entier positif ou nul attendu, au plus 4294967295",
+            ),
+        ];
+        for (toml, key, shown, expected) in cases {
+            let e = ProjectSettings::from_table(&table(toml), "./.nephila.toml").unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("./.nephila.toml : clé `{key}` : valeur invalide `{shown}` ({expected})")
+            );
+        }
+        let ok = ProjectSettings::from_table(
+            &table("format_retries = 4294967295\nmodel = \"x\"\nbatch_files = 1"),
+            "f",
+        )
+        .unwrap();
+        assert_eq!(ok.format_retries, Some(u32::MAX));
+        assert_eq!(ok.model.as_deref(), Some("x"));
+        assert_eq!(ok.batch_files, Some(1));
+    }
+
+    #[test]
+    fn req042_premier_reglage_invalide_dans_l_ordre_de_la_liste() {
+        let e = ProjectSettings::from_table(&table("concurrency = 0\nmodel = 1"), "f").unwrap_err();
+        assert!(e.to_string().contains("clé `model`"), "{e}");
+    }
 }

@@ -183,7 +183,7 @@ fn req037_ac9_les_filtres_nelargissent_pas_req004() {
 }
 
 const BAD: [(&str, &str); 5] = [
-    ("exclud = [\"a\"]\n", "clé inconnue `exclud` (clés permises : exclude, exclude_types)"),
+    ("exclud = [\"a\"]\n", "clé inconnue `exclud` (clés permises : exclude, exclude_types, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries)"),
     (
         "exclude_types = \"json\"\n",
         "clé `exclude_types` : tableau de chaînes attendu, ex. exclude_types = [\"json\"]",
@@ -260,7 +260,7 @@ fn req037_ac16_chemin_par_defaut_dot_slash() {
     let err = String::from_utf8_lossy(&o.stderr).into_owned();
     assert_eq!(
         err,
-        "erreur: ./.nephila.toml : clé inconnue `exclud` (clés permises : exclude, exclude_types)\n"
+        "erreur: ./.nephila.toml : clé inconnue `exclud` (clés permises : exclude, exclude_types, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries)\n"
     );
     let o = e
         .command()

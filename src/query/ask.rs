@@ -11,6 +11,7 @@ use super::lookup::{self, Lookup};
 use super::search;
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::filter::ProjectFile;
 use crate::llm::{build_llm, with_format_retries, AskReply, Llm};
 use crate::model::{Edge, Node};
 use crate::store::Store;
@@ -175,15 +176,12 @@ pub fn run(repo: &Path, question: &str, as_json: bool, format_retries: Option<u3
     if question.trim().is_empty() {
         return Err(Error::Message("la question est vide".to_string()));
     }
+    let project = ProjectFile::load(repo)?;
     let config = Config::load()?;
+    let (config, _) = config.with_project(&project.settings, None, format_retries);
     let llm = build_llm(&config)?;
     let store = super::open(repo)?;
-    let (answer, cited) = answer(
-        &store,
-        llm.as_ref(),
-        question,
-        format_retries.unwrap_or(config.format_retries),
-    )?;
+    let (answer, cited) = answer(&store, llm.as_ref(), question, config.format_retries)?;
     if as_json {
         let nodes: Vec<Value> = cited.iter().map(to_json).collect();
         println!("{}", json!({"answer": answer, "nodes": nodes}));

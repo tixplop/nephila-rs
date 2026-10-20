@@ -7,6 +7,7 @@ use std::path::Path;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+use crate::config::{self, ProjectSettings, CONNECTION_KEYS, PROJECT_SETTINGS};
 use crate::error::{Error, Result};
 
 /// Nom du fichier de projet, à la racine du dépôt.
@@ -238,23 +239,27 @@ impl Matcher {
     }
 }
 
-/// Fichier de projet `<dépôt>/.nephila.toml`.
-pub struct ProjectFilters;
+/// Contenu validé du fichier de projet `<dépôt>/.nephila.toml` : filtres et réglages LLM.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectFile {
+    pub filters: Filters,
+    pub settings: ProjectSettings,
+}
 
 const EXAMPLES: [(&str, &str); 2] = [
     ("exclude", "exclude = [\"docs/legacy/\"]"),
     ("exclude_types", "exclude_types = [\"json\"]"),
 ];
 
-impl ProjectFilters {
-    /// Lit le fichier de projet ; absent ou vide : aucun filtre. Erreurs en une ligne (E-1 à E-6),
-    /// chemin = `repo` + `/.nephila.toml` sans normalisation.
-    pub fn load(repo: &Path) -> Result<Filters> {
+impl ProjectFile {
+    /// Lit le fichier de projet ; absent ou vide : aucun filtre ni réglage. Erreurs en une
+    /// ligne (E-1 à E-6, E-9, E-10), chemin = `repo` + `/.nephila.toml` sans normalisation.
+    pub fn load(repo: &Path) -> Result<ProjectFile> {
         let path = repo.join(PROJECT_FILE);
         let shown = path.display().to_string();
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Filters::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ProjectFile::default()),
             Err(e) => {
                 return Err(Error::Message(format!(
                     "{shown} : lecture impossible : {e}"
@@ -269,9 +274,23 @@ impl ProjectFilters {
             Error::Message(format!("{shown} : TOML invalide ligne {line} : {msg}"))
         })?;
         for key in table.keys() {
-            if key != "exclude" && key != "exclude_types" {
+            let key = key.as_str();
+            if CONNECTION_KEYS.contains(&key) {
+                let at = config::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "~/.config/nephila/config.toml".to_string());
                 return Err(Error::Message(format!(
-                    "{shown} : clé inconnue `{key}` (clés permises : exclude, exclude_types)"
+                    "{shown} : clé `{key}` permise seulement dans la configuration personnelle ({at})"
+                )));
+            }
+            if key != "exclude" && key != "exclude_types" && !PROJECT_SETTINGS.contains(&key) {
+                let allowed = ["exclude", "exclude_types"]
+                    .into_iter()
+                    .chain(PROJECT_SETTINGS)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::Message(format!(
+                    "{shown} : clé inconnue `{key}` (clés permises : {allowed})"
                 )));
             }
         }
@@ -303,7 +322,17 @@ impl ProjectFilters {
                 }
             }
         }
-        Ok(filters)
+        let settings = ProjectSettings::from_table(&table, &shown)?;
+        Ok(ProjectFile { filters, settings })
+    }
+}
+
+/// Filtres du fichier de projet (enveloppe de `ProjectFile`, qui valide le fichier entier).
+pub struct ProjectFilters;
+
+impl ProjectFilters {
+    pub fn load(repo: &Path) -> Result<Filters> {
+        Ok(ProjectFile::load(repo)?.filters)
     }
 
     /// Lit et compile le fichier de projet.
