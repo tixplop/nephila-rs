@@ -1,34 +1,130 @@
-# Exemple de configuration de nephila.
-# Emplacement : $NEPHILA_CONFIG, sinon $XDG_CONFIG_HOME/nephila/config.toml,
-# sinon ~/.config/nephila/config.toml.
-# Gardez une seule section `provider` active.
+# Exemple de configuration LLM de nephila (copié sous le nom config.example.toml dans l'archive
+# de release).
 #
-# Ce fichier est facultatif : sans lui (ou avec `nephila build --no-llm`), nephila construit la
-# structure du graphe sans LLM. Le LLM sert à enrichir (résumés, concepts) et à `query ask`.
+# Emplacement, le premier trouvé dans cet ordre :
+#   1. le chemin donné par la variable NEPHILA_CONFIG ;
+#   2. $XDG_CONFIG_HOME/nephila/config.toml ;
+#   3. ~/.config/nephila/config.toml.
+#
+# Ce fichier est facultatif. Sans lui, ou avec `nephila build --no-llm`, nephila construit la
+# structure du graphe sans LLM (bilan : `enrichissement : désactivé`). Le LLM est actif quand ce
+# fichier existe et que `--no-llm` est absent ; il sert à enrichir (résumés, concepts) et à
+# `query ask`.
+#
+# Règles :
+#   - un fichier invalide est une erreur avant tout traitement (sauf avec `--no-llm`) ;
+#   - une clé inconnue est refusée ;
+#   - TOML n'admet qu'une valeur par clé : gardez une seule section fournisseur active, les
+#     autres restent en commentaire ;
+#   - la clé d'API n'est jamais écrite ici : `api_key_env` donne le NOM de la variable
+#     d'environnement qui la contient. Avant tout traitement, nephila la vérifie par un appel
+#     qui liste les modèles, sans coût de génération.
+#
+# Les clés communes à tous les fournisseurs (taille des morceaux, parallélisme, délais, TLS)
+# sont en fin de fichier, dans « Options communes ».
 
 # --- Anthropic ---
+# Fournisseur actif dans cet exemple. Puis : export ANTHROPIC_API_KEY=...
+
+# Fournisseur du LLM. Texte : « anthropic », « openai » (protocole compatible OpenAI) ou
+# « mock ». Obligatoire.
 provider = "anthropic"
+
+# Nom du modèle, texte non vide. Obligatoire, sauf pour le fournisseur « mock » (valeur par
+# défaut : « mock »).
 model = "claude-sonnet-4-5"
-api_key_env = "ANTHROPIC_API_KEY"   # nom de la variable, jamais la clé elle-même
+
+# NOM de la variable d'environnement qui contient la clé d'API (jamais la clé elle-même).
+# Obligatoire pour « anthropic » ; facultatif pour « openai » (aucun défaut : sans cette clé,
+# aucune clé n'est envoyée, ce qui convient à un modèle local).
+api_key_env = "ANTHROPIC_API_KEY"
+
+# URL du serveur, texte non vide, SANS « /v1 » final : nephila ajoute lui-même /v1/... aux
+# requêtes. Défaut : https://api.anthropic.com pour « anthropic », https://api.openai.com pour
+# « openai ». Utile pour passer par un proxy ou une passerelle.
 # base_url = "https://api.anthropic.com"
 
-# --- Serveur compatible OpenAI (OpenAI, Ollama, llama.cpp, vLLM...) ---
+# --- OpenAI ---
+# Puis : export OPENAI_API_KEY=...
+# Pour utiliser cette section, mettez la section Anthropic en commentaire et réactivez ces
+# lignes (provider, model et api_key_env sont décrites dans la section Anthropic).
 # provider = "openai"
 # model = "gpt-4o-mini"
 # api_key_env = "OPENAI_API_KEY"
-#
-# Modèle local avec Ollama : pas de clé, et base_url SANS « /v1 » final
-# (nephila ajoute lui-même /v1/chat/completions et /v1/models) :
+
+# --- Modèle local (Ollama) ---
+# Pas de clé d'API. `base_url` SANS « /v1 » final : avec http://localhost:11434/v1, les requêtes
+# partiraient vers /v1/v1/chat/completions.
 # provider = "openai"
 # model = "llama3.1"
 # base_url = "http://localhost:11434"
 
-# --- LLM simulé, pour les tests (voir NEPHILA_MOCK_* dans le README) ---
-# provider = "mock"
+# --- Autre serveur compatible OpenAI (llama.cpp, vLLM, LM Studio) ---
+# Serveur local ou distant qui parle le protocole OpenAI. Adaptez le nom du modèle et le port
+# (ports usuels : 8080 pour llama.cpp, 8000 pour vLLM, 1234 pour LM Studio). Si le serveur exige
+# une clé, ajoutez `api_key_env` comme dans la section OpenAI. `base_url` reste SANS « /v1 »
+# final.
+# provider = "openai"
+# model = "nom-du-modele-servi"
+# base_url = "http://localhost:8080"
 
-# Options communes (valeurs par défaut)
-# max_chunk_chars = 60000   # taille maximale d'un morceau envoyé au LLM
-# concurrency = 4           # appels LLM simultanés
-# timeout_secs = 300        # durée maximale d'un appel LLM HTTP, en secondes (entier > 0)
-# batch_files = 8           # fichiers par appel d'enrichissement (défaut 1 ; 4 à 8 pour de nombreux petits fichiers)
-# format_retries = 2        # nouveaux essais d'un appel dont la réponse est non conforme (entier ≥ 0 ; 0 = aucun)
+# --- LLM simulé ---
+# Remplace le LLM par des fixtures, sans réseau : pour les tests et les démonstrations. `model`
+# est facultatif ; `timeout_secs`, `tls_ca_cert` et `tls_insecure` sont sans effet. Le détail de
+# chaque variable est dans la section « LLM simulé » du README.
+# provider = "mock"
+#
+# Variables d'environnement lues par ce fournisseur :
+#   NEPHILA_MOCK_DIR               dossier de fixtures (réponses d'enrichissement et de `query ask`)
+#   NEPHILA_MOCK_LOG               fichier de journal des appels, une ligne par appel
+#   NEPHILA_MOCK_FAIL_AFTER        nombre d'appels réussis avant des erreurs réseau simulées
+#   NEPHILA_MOCK_INVALID_KEY       si non vide et différent de 0, la vérification de clé échoue
+#   NEPHILA_MOCK_DELAY_MS          délai ajouté à chaque appel, en millisecondes
+#   NEPHILA_MOCK_TIMEOUT_FILES     chemins relatifs, séparés par des virgules, dont l'appel
+#                                  échoue par délai dépassé
+#   NEPHILA_MOCK_KEY_REVOKED_AFTER nombre d'appels d'enrichissement avant des refus de clé
+#                                  simulés
+#   NEPHILA_MOCK_MALFORMED         <chemin>:<k>[,<chemin>:<k>...] : les k premiers appels qui
+#                                  portent ce fichier reçoivent une réponse non conforme
+
+# --- Options communes ---
+# Valables pour tous les fournisseurs. Les lignes ci-dessous montrent les valeurs par défaut
+# (sauf tls_ca_cert, qui n'a pas de défaut) : décommentez une ligne pour la changer.
+
+# Taille maximale, en caractères, d'un morceau de fichier envoyé au LLM. Entier > 0.
+# Défaut : 60000. Un lot de fichiers (voir batch_files) ne dépasse jamais cette taille.
+# max_chunk_chars = 60000
+
+# Nombre d'appels LLM simultanés. Entier > 0. Défaut : 4. Borne aussi le nombre de fils de
+# l'analyse syntaxique.
+# concurrency = 4
+
+# Durée maximale d'un appel LLM HTTP entier, en secondes. Entier > 0. Défaut : 300. La
+# connexion est limitée à 10 s, quelle que soit cette valeur. Sans effet avec « mock ».
+# timeout_secs = 300
+
+# Nombre maximal de fichiers par appel d'enrichissement. Entier > 0. Défaut : 1 (un fichier par
+# appel) ; 4 à 8 convient à de nombreux petits fichiers. Un lot ne dépasse jamais
+# max_chunk_chars et un gros fichier part seul ; concurrency x batch_files fichiers sont en vol
+# au plus. Remplacé, pour une commande, par l'option --batch-files (priorité : option, puis
+# cette clé, puis le défaut).
+# batch_files = 1
+
+# Nouveaux essais d'un appel dont la réponse est non conforme. Entier >= 0. Défaut : 2, soit au
+# plus 3 appels pour une même requête ; 0 = aucun nouvel essai. Les erreurs réseau, les délais
+# dépassés et les clés refusées ne sont jamais retentés. Remplacé, pour une commande, par
+# l'option --format-retries (priorité : option, puis cette clé, puis le défaut).
+# format_retries = 2
+
+# Fichier PEM d'autorités de certification, AJOUTÉES aux autorités publiques embarquées dans
+# nephila (le magasin du système n'est pas lu ; pour s'y fier, donnez
+# /etc/ssl/certs/ca-certificates.crt). Texte non vide : chemin absolu, « ~/... », ou relatif au
+# dossier de ce fichier de configuration. Défaut : aucun. Utile derrière un proxy d'entreprise ou
+# face à un serveur à certificat privé. Sans effet avec « mock » et avec une base_url en http://.
+# tls_ca_cert = "certs/ca.pem"
+
+# Désactive tout contrôle du certificat du serveur (chaîne, dates, nom d'hôte), comme `curl -k` ;
+# la connexion reste chiffrée. Booléen. Défaut : false. Un avertissement est écrit à chaque
+# commande. L'emporte sur tls_ca_cert. À réserver à un poste de développement. Sans effet avec
+# « mock » et avec une base_url en http://.
+# tls_insecure = false

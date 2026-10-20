@@ -1,0 +1,59 @@
+# Exemple de fichier de projet de nephila (copié sous le nom nephila.example.toml dans l'archive
+# de release). Ce n'est PAS la configuration du LLM (voir config.toml) : sa présence n'active pas
+# le LLM.
+#
+# Emplacement : `.nephila.toml` à la racine du dépôt analysé (le dossier désigné par `-C`) ; un
+# fichier placé dans un sous-dossier n'est pas lu. Fichier facultatif, à versionner avec le
+# dépôt : nephila ne le crée ni ne le réécrit jamais.
+#
+# Lu par `build`, `update`, `status` et par l'avertissement « graphe pas à jour » des `query`,
+# avec ou sans `--no-llm`. Ni `export` ni `summary` ne le lisent.
+#
+# Il ne sert qu'à exclure des fichiers de l'analyse. Les deux clés sont facultatives ; toute autre
+# clé est une erreur, signalée avant tout parcours. Dans cet exemple, les deux clés sont en
+# commentaire : copié tel quel dans un dépôt, ce fichier ne filtre rien. Décommentez ce qui vous
+# sert.
+#
+# Un filtre s'ajoute à ce que nephila ignore déjà (.gitignore, target/, build/, .gradle/, .git/,
+# .nephila/) et ne peut jamais réinclure un fichier ignoré.
+#
+# Les options `--exclude` et `--exclude-type` de `build` et `update` s'ajoutent à ces clés, pour
+# la commande seulement : les types sont réunis, les motifs forment une seule liste (ceux de ce
+# fichier, puis ceux de l'option) où le dernier motif qui s'applique l'emporte.
+#
+# Effet incrémental : un fichier déjà indexé qui devient exclu est retiré du graphe par
+# `nephila update` ; un fichier qui cesse d'être exclu y est ajouté. `update` suffit, pas besoin
+# de `build`. Le bilan de `build` et de `update` compte les « fichiers exclus par les filtres ».
+
+# Motifs de fichiers à exclure. Tableau de textes. Défaut : aucun. Syntaxe de .gitignore, relative
+# à la racine du dépôt, sensible à la casse :
+#   - un motif sans « / » (`*.min.js`) vaut à tous les niveaux ;
+#   - un « / » au début ou au milieu (`/src/gen/`, `web/dist`) ancre le motif à la racine ;
+#   - un « / » final (`docs/legacy/`) ne désigne que des dossiers ;
+#   - `**` traverse les dossiers (`**/generated/**`) ;
+#   - `!motif` réinclut ce qu'un motif précédent a exclu (le dernier motif qui s'applique
+#     l'emporte).
+# Complété, pour une commande, par l'option --exclude <MOTIF> (répétable).
+# exclude = ["docs/legacy/", "*.min.js"]
+
+# Types de fichiers à exclure. Tableau de noms en minuscules, comparés tels quels. Défaut :
+# aucun. Chaque fichier pris en charge a un seul type :
+#   markdown    .md, .markdown
+#   java        .java
+#   kotlin      .kt, .kts (sauf build.gradle.kts et settings.gradle.kts)
+#   groovy      .groovy
+#   scala       .scala
+#   javascript  .js, .mjs, .cjs, .jsx
+#   typescript  .ts, .mts, .cts, .tsx (.d.ts compris)
+#   sql         .sql
+#   xml         .xml (sauf pom.xml et ivy.xml)
+#   json        .json (sauf package.json)
+#   yaml        .yaml, .yml
+#   maven       pom.xml
+#   ivy         ivy.xml
+#   gradle      .gradle, build.gradle.kts, settings.gradle.kts
+#   npm         package.json
+# Pas de groupes : pour exclure les fichiers de données, écrivez
+# ["sql", "xml", "json", "yaml"]. Complété, pour une commande, par l'option
+# --exclude-type <TYPE>[,<TYPE>...].
+# exclude_types = ["json"]
