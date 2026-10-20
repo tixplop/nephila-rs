@@ -1,4 +1,4 @@
-//! Option `--show-progress` de build et update (REQ-043) : phase d'extraction.
+//! Option `--show-progress` de build et update (REQ-043) : extraction et enrichissement.
 
 use assert_cmd::Command;
 use std::fs;
@@ -232,4 +232,317 @@ fn req043_ac11_help_text() {
         assert!(!flat.contains("-s, --show-progress"));
         assert!(!flat.contains("--show-progress <"));
     }
+}
+
+// ---------------------------------------------------------------- enrichissement (T-091)
+
+struct Mock {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    config: PathBuf,
+    mock: PathBuf,
+    log: PathBuf,
+}
+
+impl Mock {
+    fn new(n: usize, config: &str) -> Mock {
+        let (tmp, repo) = repo_with(n);
+        let mock = tmp.path().join("mock");
+        fs::create_dir_all(&mock).unwrap();
+        let cfg = tmp.path().join("config.toml");
+        fs::write(
+            &cfg,
+            format!("provider = \"mock\"\nmodel = \"mock\"\n{config}"),
+        )
+        .unwrap();
+        let log = tmp.path().join("mock.log");
+        Mock {
+            _tmp: tmp,
+            repo,
+            config: cfg,
+            mock,
+            log,
+        }
+    }
+
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+        let mut c = Command::cargo_bin("nephila").unwrap();
+        for v in [
+            "NEPHILA_MOCK_FAIL_AFTER",
+            "NEPHILA_MOCK_DELAY_MS",
+            "NEPHILA_MOCK_INVALID_KEY",
+            "NEPHILA_MOCK_TIMEOUT_FILES",
+            "NEPHILA_MOCK_KEY_REVOKED_AFTER",
+            "NEPHILA_MOCK_MALFORMED",
+            "NO_COLOR",
+        ] {
+            c.env_remove(v);
+        }
+        c.env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log)
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    }
+
+    fn graph(&self) -> String {
+        let s = nephila::store::Store::open_readonly(&self.repo).unwrap();
+        let mut nodes: Vec<String> = s
+            .nodes()
+            .unwrap()
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect();
+        let mut edges: Vec<String> = s
+            .edges()
+            .unwrap()
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect();
+        nodes.sort();
+        edges.sort();
+        format!("{nodes:?}\n{edges:?}")
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+fn enrich_lines(o: &std::process::Output) -> Vec<String> {
+    progress_lines(o)
+        .into_iter()
+        .filter(|l| l.starts_with("progression: enrichissement"))
+        .collect()
+}
+
+fn ks(lines: &[String], n: usize) -> Vec<usize> {
+    lines
+        .iter()
+        .map(|l| {
+            let tail = l.split('(').nth(1).unwrap();
+            let (k, rest) = tail.split_once('/').unwrap();
+            assert_eq!(rest, format!("{n} fichiers)"), "{l}");
+            k.parse().unwrap()
+        })
+        .collect()
+}
+
+fn without_progress(o: &std::process::Output) -> String {
+    stderr(o)
+        .lines()
+        .filter(|l| !l.starts_with("progression:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn req043_ac4_ac12_mock_three_files_exact_lines_and_same_effects() {
+    let a = Mock::new(3, "concurrency = 1\n");
+    let b = Mock::new(3, "concurrency = 1\n");
+    let o = a.run(&["build", "--show-progress"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let plain = b.run(&["build"], &[]);
+    assert_eq!(
+        stderr(&o).lines().collect::<Vec<_>>(),
+        [
+            "progression: extraction 0 % (0/3 fichiers)",
+            "progression: extraction 33 % (1/3 fichiers)",
+            "progression: extraction 66 % (2/3 fichiers)",
+            "progression: extraction 100 % (3/3 fichiers)",
+            "progression: enrichissement 0 % (0/3 fichiers)",
+            "progression: enrichissement 33 % (1/3 fichiers)",
+            "progression: enrichissement 66 % (2/3 fichiers)",
+            "progression: enrichissement 100 % (3/3 fichiers)",
+        ]
+    );
+    assert!(stderr(&plain).is_empty(), "{}", stderr(&plain));
+    assert_eq!(o.stdout, plain.stdout);
+    assert_eq!(a.log(), b.log());
+    assert!(!a.log().is_empty());
+    assert_eq!(a.graph(), b.graph());
+}
+
+#[test]
+fn req043_ac5_batch_of_four_moves_by_block() {
+    let m = Mock::new(10, "concurrency = 1\nbatch_files = 4\n");
+    let o = m.run(&["build", "--show-progress"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(ks(&enrich_lines(&o), 10), [0, 4, 8, 10]);
+    assert_eq!(
+        enrich_lines(&o)[1],
+        "progression: enrichissement 40 % (4/10 fichiers)"
+    );
+}
+
+#[test]
+fn req043_ac5_chunks_count_once_per_file() {
+    let m = Mock::new(
+        2,
+        "concurrency = 1\nbatch_files = 1\nmax_chunk_chars = 300\n",
+    );
+    let methods: String = (0..12)
+        .map(|i| format!("public void method_number_{i}() {{ int a{i} = {i}; }}\n"))
+        .collect();
+    write_java(&m.repo, 0, &methods);
+    let o = m.run(&["build", "--show-progress"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let calls_c0 = m
+        .log()
+        .lines()
+        .filter(|l| l.starts_with("C0.java\t"))
+        .count();
+    assert_eq!(calls_c0, 3, "{}", m.log());
+    assert_eq!(ks(&enrich_lines(&o), 2), [0, 1, 2]);
+}
+
+#[test]
+fn req043_ac5_format_retries_do_not_count() {
+    let m = Mock::new(2, "concurrency = 1\nbatch_files = 1\n");
+    let o = m.run(
+        &["build", "--show-progress"],
+        &[("NEPHILA_MOCK_MALFORMED", "C0.java:2")],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(m.log().lines().filter(|l| l.starts_with("C0.java")).count() >= 2);
+    assert_eq!(ks(&enrich_lines(&o), 2), [0, 1, 2]);
+}
+
+#[test]
+fn req043_ac6_ac13_timeout_file_counts_as_processed() {
+    let a = Mock::new(4, "concurrency = 1\nbatch_files = 1\n");
+    let b = Mock::new(4, "concurrency = 1\nbatch_files = 1\n");
+    let env = [("NEPHILA_MOCK_TIMEOUT_FILES", "C1.java")];
+    let o = a.run(&["build", "--show-progress"], &env);
+    let plain = b.run(&["build"], &env);
+    assert_eq!(
+        enrich_lines(&o).last().unwrap(),
+        "progression: enrichissement 100 % (4/4 fichiers)"
+    );
+    assert!(stderr(&o).contains("avertissement:"), "{}", stderr(&o));
+    assert_eq!(without_progress(&o), stderr(&plain).trim_end());
+    assert_eq!(o.status.code(), plain.status.code());
+    assert_eq!(o.stdout, plain.stdout);
+}
+
+#[test]
+fn req043_ac6_ac13_stop_leaves_enrichment_under_100() {
+    let a = Mock::new(8, "concurrency = 1\nbatch_files = 1\n");
+    let b = Mock::new(8, "concurrency = 1\nbatch_files = 1\n");
+    let env = [("NEPHILA_MOCK_FAIL_AFTER", "2")];
+    let o = a.run(&["build", "--show-progress"], &env);
+    let plain = b.run(&["build"], &env);
+    assert_ne!(o.status.code(), Some(0));
+    let lines = enrich_lines(&o);
+    assert_eq!(
+        lines.last().unwrap(),
+        "progression: enrichissement 62 % (5/8 fichiers)"
+    );
+    assert!(!stderr(&o).contains("enrichissement 100 %"));
+    let all: Vec<String> = stderr(&o).lines().map(str::to_string).collect();
+    let err_pos = all.iter().position(|l| l.starts_with("erreur:")).unwrap();
+    assert!(all[err_pos..]
+        .iter()
+        .all(|l| !l.starts_with("progression:")));
+    assert_eq!(without_progress(&o), stderr(&plain).trim_end());
+    assert_eq!(o.status.code(), plain.status.code());
+    assert_eq!(o.stdout, plain.stdout);
+}
+
+#[test]
+fn req043_ac6_invalid_key_no_progress_line() {
+    let m = Mock::new(4, "concurrency = 1\n");
+    let o = m.run(
+        &["build", "--show-progress"],
+        &[("NEPHILA_MOCK_INVALID_KEY", "1")],
+    );
+    assert_ne!(o.status.code(), Some(0));
+    assert!(progress_lines(&o).is_empty(), "{}", stderr(&o));
+}
+
+#[test]
+fn req043_ac7_update_counts_only_files_to_process() {
+    let m = Mock::new(10, "concurrency = 1\n");
+    assert!(m.run(&["build"], &[]).status.success());
+    write_java(&m.repo, 2, "int x;");
+    write_java(&m.repo, 7, "int y;");
+    let o = m.run(&["update", "--show-progress"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        stderr(&o).lines().collect::<Vec<_>>(),
+        [
+            "progression: extraction 0 % (0/2 fichiers)",
+            "progression: extraction 50 % (1/2 fichiers)",
+            "progression: extraction 100 % (2/2 fichiers)",
+            "progression: enrichissement 0 % (0/2 fichiers)",
+            "progression: enrichissement 50 % (1/2 fichiers)",
+            "progression: enrichissement 100 % (2/2 fichiers)",
+        ]
+    );
+    // Sans graphe : lignes d'un build complet.
+    let fresh = Mock::new(10, "concurrency = 1\n");
+    let o = fresh.run(&["update", "--show-progress"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        ks(&progress_lines(&o)[..11], 10),
+        (0..=10).collect::<Vec<_>>()
+    );
+    assert_eq!(enrich_lines(&o).len(), 11);
+}
+
+#[test]
+fn req043_ac8_multi_thread_lines_whole_and_monotonic() {
+    let m = Mock::new(40, "concurrency = 4\nbatch_files = 3\n");
+    let o = m.run(&["build", "--show-progress"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    for l in stderr(&o).lines() {
+        assert!(
+            l.starts_with("progression: ")
+                || l.starts_with("avertissement:")
+                || l.starts_with("erreur:"),
+            "{l}"
+        );
+    }
+    for phase in ["extraction", "enrichissement"] {
+        let lines: Vec<String> = progress_lines(&o)
+            .into_iter()
+            .filter(|l| l.starts_with(&format!("progression: {phase}")))
+            .collect();
+        let k = ks(&lines, 40);
+        assert!(k.windows(2).all(|w| w[0] < w[1]), "{phase} {k:?}");
+        assert_eq!(*k.last().unwrap(), 40);
+    }
+}
+
+#[test]
+fn req043_ac9_redirected_output_is_plain_and_free_of_secrets() {
+    let m = Mock::new(
+        4,
+        "concurrency = 1\nbatch_files = 1\napi_key_env = \"NEPHILA_T091_KEY\"\n",
+    );
+    write_java(&m.repo, 0, "String s = \"SECRET_CONTENU_42\";");
+    let key = "sk-cle-secrete-91";
+    let env = [
+        ("NEPHILA_MOCK_TIMEOUT_FILES", "C1.java"),
+        ("NEPHILA_T091_KEY", key),
+    ];
+    let a = m.run(&["build", "--show-progress"], &env);
+    let mut env_nc = env.to_vec();
+    env_nc.push(("NO_COLOR", "1"));
+    let b = m.run(&["build", "--show-progress"], &env_nc);
+    for o in [&a, &b] {
+        for stream in [&o.stdout, &o.stderr] {
+            assert!(!stream.contains(&0x1B) && !stream.contains(&b'\r'));
+        }
+        for l in progress_lines(o) {
+            assert!(!l.contains("SECRET_CONTENU_42") && !l.contains(key), "{l}");
+        }
+    }
+    assert_eq!(a.stdout, b.stdout);
+    assert_eq!(a.stderr, b.stderr);
 }

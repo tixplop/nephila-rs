@@ -13,6 +13,7 @@ use crate::error::{warn, Error, Result};
 use crate::index::build::{BuildReport, IndexOptions};
 use crate::llm::{with_format_retries, Enrichment, Llm, LotItem};
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
+use crate::progress::{self, Phase};
 use crate::store::Store;
 use crate::trace;
 
@@ -442,7 +443,7 @@ pub(crate) fn enrich_with_stop(
     let units = form_units(files, batch_files, max_chunk_chars);
     let queue: Mutex<VecDeque<Unit>> = Mutex::new(units.into());
     let policy = Mutex::new(Policy::default());
-    let (tx, rx) = mpsc::channel::<Outcome>();
+    let (tx, rx) = mpsc::channel::<Vec<Outcome>>();
     let workers = concurrency.clamp(1, queue_len(&queue).max(1));
     let mut write_error: Option<Error> = None;
     let mut failures: Vec<(String, Error)> = Vec::new();
@@ -450,6 +451,7 @@ pub(crate) fn enrich_with_stop(
         "enrichissement: début {} fichiers, {workers} fils",
         files.len()
     );
+    let mut meter = progress::Meter::start(Phase::Enrichment, files.len());
 
     std::thread::scope(|scope| {
         let queue = &queue;
@@ -507,44 +509,50 @@ pub(crate) fn enrich_with_stop(
                 if halt {
                     stop.store(true, Ordering::SeqCst);
                 }
-                if outcomes.into_iter().any(|o| tx.send(o).is_err()) {
+                if !outcomes.is_empty() && tx.send(outcomes).is_err() {
                     break;
                 }
             });
         }
         drop(tx);
-        for outcome in rx {
-            match outcome {
-                Outcome::Failed(path, e) => {
-                    warn(&format!("{path} : {e}"));
-                    report.failed += 1;
-                    failures.push((path, e));
+        for batch in rx {
+            let count = batch.len();
+            for outcome in batch {
+                match outcome {
+                    Outcome::Failed(path, e) => {
+                        warn(&format!("{path} : {e}"));
+                        report.failed += 1;
+                        failures.push((path, e));
+                    }
+                    Outcome::Done(file, x) => {
+                        if write_error.is_some() {
+                            continue;
+                        }
+                        succeeded += 1;
+                        if !x.rejected.is_empty() {
+                            warn(&format!(
+                                "{} : {} élément(s) d'enrichissement écarté(s) : {}",
+                                file.path,
+                                x.rejected.len(),
+                                x.rejected.join(" ; ")
+                            ));
+                        }
+                        let (concepts, refs) = concept_records(&x);
+                        if let Err(e) = store.apply_enrichment(
+                            &file.path,
+                            &file.hash,
+                            &x.summaries,
+                            &concepts,
+                            &refs,
+                        ) {
+                            stop.store(true, Ordering::SeqCst);
+                            write_error = Some(e);
+                        }
+                    }
                 }
-                Outcome::Done(file, x) => {
-                    if write_error.is_some() {
-                        continue;
-                    }
-                    succeeded += 1;
-                    if !x.rejected.is_empty() {
-                        warn(&format!(
-                            "{} : {} élément(s) d'enrichissement écarté(s) : {}",
-                            file.path,
-                            x.rejected.len(),
-                            x.rejected.join(" ; ")
-                        ));
-                    }
-                    let (concepts, refs) = concept_records(&x);
-                    if let Err(e) = store.apply_enrichment(
-                        &file.path,
-                        &file.hash,
-                        &x.summaries,
-                        &concepts,
-                        &refs,
-                    ) {
-                        stop.store(true, Ordering::SeqCst);
-                        write_error = Some(e);
-                    }
-                }
+            }
+            if let Some(m) = meter.as_mut() {
+                m.advance(count);
             }
         }
     });
@@ -794,5 +802,67 @@ mod tests {
         assert_eq!(failures[1].0, "B.java");
         assert!(matches!(failures[1].1, Error::InvalidKey(_)));
         assert!(report.stop_cause.is_some());
+    }
+
+    /// Un lot de 4 fichiers avance le compte d'un bloc (AC-043-5).
+    #[test]
+    fn req043_ac5_batch_advances_as_one_block() {
+        struct Lots;
+        impl Llm for Lots {
+            fn verify_key(&self) -> Result<()> {
+                Ok(())
+            }
+            fn enrich(&self, _: &str, _: usize, _: &str, _: &[String]) -> Result<Enrichment> {
+                Ok(Enrichment::default())
+            }
+            fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+                Ok(items
+                    .iter()
+                    .map(|i| (i.file.clone(), Ok(Enrichment::default())))
+                    .collect())
+            }
+            fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+                Err(Error::Message("inutilisé".into()))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for i in 0..10 {
+            let name = format!("C{i}.java");
+            std::fs::write(dir.path().join(&name), "package p;\npublic class X {}\n").unwrap();
+            files.push(rec(&name, 30));
+        }
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(&files).unwrap();
+        let mut report = BuildReport::default();
+        let opts = IndexOptions {
+            concurrency: 1,
+            max_chunk_chars: 1000,
+            batch_files: 4,
+            format_retries: 0,
+        };
+        progress::init(true);
+        progress::take_captured();
+        enrich_with_stop(
+            dir.path(),
+            &files,
+            &opts,
+            &Lots,
+            &mut store,
+            &mut report,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let lines = progress::take_captured();
+        progress::init(false);
+        assert_eq!(
+            lines,
+            [
+                "progression: enrichissement 0 % (0/10 fichiers)",
+                "progression: enrichissement 40 % (4/10 fichiers)",
+                "progression: enrichissement 80 % (8/10 fichiers)",
+                "progression: enrichissement 100 % (10/10 fichiers)",
+            ]
+        );
     }
 }
