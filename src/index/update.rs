@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::diff::{self, Change};
 use crate::error::Result;
-use crate::filter::{Filters, Matcher};
+use crate::filter::{Filters, Matcher, ProjectFile};
 use crate::index::build::{self, BuildReport, IndexOptions};
 use crate::index::lock::RepoLock;
 use crate::index::structure;
@@ -27,8 +27,9 @@ pub fn run(
 ) -> Result<()> {
     trace::init(verbose);
     build::check_repo(repo)?;
-    let matcher = build::effective_matcher(repo, &cli_filters)?;
-    let setup = build::setup(no_llm, batch_files, format_retries)?;
+    let project = ProjectFile::load(repo)?;
+    let matcher = build::effective_matcher(repo, &project.filters, &cli_filters)?;
+    let setup = build::setup(no_llm, &project.settings, batch_files, format_retries)?;
     let lock = RepoLock::acquire(repo)?;
     // Le test d'existence se fait sous verrou : aucun build concurrent ne peut le créer entre-temps.
     if !db_path(repo).is_file() {

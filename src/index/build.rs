@@ -3,9 +3,9 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::config::{Config, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS};
+use crate::config::{Config, ProjectSettings, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS};
 use crate::error::{warn, Error, Result};
-use crate::filter::{Filters, Matcher, ProjectFilters};
+use crate::filter::{Filters, Matcher, ProjectFile};
 use crate::index::lock::RepoLock;
 use crate::index::{enrich, structure};
 use crate::llm::{build_llm, Llm};
@@ -79,6 +79,7 @@ pub(crate) struct Setup {
 /// fichier de configuration le LLM est inactif ; sinon validation et vérification de la clé.
 pub(crate) fn setup(
     no_llm: bool,
+    project: &ProjectSettings,
     batch_files: Option<usize>,
     format_retries: Option<u32>,
 ) -> Result<Setup> {
@@ -97,19 +98,17 @@ pub(crate) fn setup(
                 llm: None,
             })
         }
-        Some(mut config) => {
-            if let Some(n) = batch_files {
-                config.batch_files = n;
-            }
-            if let Some(n) = format_retries {
-                config.format_retries = n;
-            }
+        Some(config) => {
+            let (config, from_project) = config.with_project(project, batch_files, format_retries);
             let mut tls_trace = String::new();
             if let Some(p) = &config.tls_ca_cert {
                 tls_trace.push_str(&format!(" tls_ca_cert={}", p.display()));
             }
             if config.tls_insecure {
                 tls_trace.push_str(" tls_insecure");
+            }
+            if !from_project.is_empty() {
+                tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
             }
             trace!(
                 "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}",
@@ -175,8 +174,9 @@ pub fn run(
     trace::init(verbose);
     check_repo(repo)?;
     // Le fichier de projet est lu avant la configuration LLM, le verrou et toute écriture.
-    let matcher = effective_matcher(repo, &cli_filters)?;
-    let setup = setup(no_llm, batch_files, format_retries)?;
+    let project = ProjectFile::load(repo)?;
+    let matcher = effective_matcher(repo, &project.filters, &cli_filters)?;
+    let setup = setup(no_llm, &project.settings, batch_files, format_retries)?;
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
     let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
@@ -186,8 +186,13 @@ pub fn run(
 }
 
 /// Filtres effectifs (DEC-045) : fichier de projet puis options de la commande.
-pub(crate) fn effective_matcher(repo: &Path, cli_filters: &Filters) -> Result<Matcher> {
-    ProjectFilters::load(repo)?
+pub(crate) fn effective_matcher(
+    repo: &Path,
+    project_filters: &Filters,
+    cli_filters: &Filters,
+) -> Result<Matcher> {
+    project_filters
+        .clone()
         .merge(cli_filters.clone())
         .compile(repo)
 }

@@ -370,3 +370,400 @@ fn req042_ac5_query_ask_ne_contacte_pas_le_serveur() {
     assert!(text(&o.stderr).contains("clé `concurrency` : valeur invalide `0`"));
     assert!(server.requests().is_empty());
 }
+
+// ---- T-087 : application des réglages dans build, update et query ask ----
+
+const KEY_VAR: &str = "NEPHILA_T087_KEY";
+const ENRICH_A: &str =
+    r#"{"version":2,"summaries":[{"node":"type:p.Alpha","summary":"résumé A"}],"concepts":[]}"#;
+const ASK_A: &str = r#"{"found":true,"answer":"réponse","nodes":["type:p.Alpha"]}"#;
+
+fn http_reply(provider: &str, text: &str) -> String {
+    if provider == "anthropic" {
+        serde_json::json!({"content":[{"type":"text","text":text}]}).to_string()
+    } else {
+        serde_json::json!({"choices":[{"message":{"role":"assistant","content":text}}]}).to_string()
+    }
+}
+
+impl Env {
+    /// Dépôt réduit à `A.java` et configuration personnelle `provider` pointée sur `server`.
+    fn http(provider: &str, server_url: &str, extra: &str) -> Env {
+        let e = Env::new();
+        fs::remove_dir_all(&e.repo).unwrap();
+        fs::create_dir_all(&e.repo).unwrap();
+        fs::write(
+            e.repo.join("Alpha.java"),
+            "package p;\npublic class Alpha {}\n",
+        )
+        .unwrap();
+        fs::write(
+            &e.config,
+            format!(
+                "provider = \"{provider}\"\nmodel = \"m-perso\"\nbase_url = \"{server_url}\"\napi_key_env = \"{KEY_VAR}\"\n{extra}"
+            ),
+        )
+        .unwrap();
+        e
+    }
+
+    fn run_key(&self, args: &[&str]) -> std::process::Output {
+        self.command()
+            .env(KEY_VAR, "sk-test")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// `n` fichiers `src/Fnn.java` et leurs fixtures, config `mock` donnée.
+    fn small(&self, n: usize, config: &str) {
+        fs::remove_dir_all(&self.repo).unwrap();
+        fs::remove_dir_all(&self.mock).unwrap();
+        fs::create_dir_all(self.repo.join("src")).unwrap();
+        fs::create_dir_all(self.mock.join("src")).unwrap();
+        for i in 0..n {
+            fs::write(
+                self.repo.join(format!("src/F{i:02}.java")),
+                format!("package p;\npublic class F{i:02} {{}}\n"),
+            )
+            .unwrap();
+            fs::write(
+                self.mock.join(format!("src/F{i:02}.java.json")),
+                format!(
+                    r#"{{"version":2,"summaries":[{{"node":"type:p.F{i:02}","summary":"résumé {i:02}"}}],"concepts":[]}}"#
+                ),
+            )
+            .unwrap();
+        }
+        fs::write(&self.config, config).unwrap();
+        let _ = fs::remove_file(&self.log);
+    }
+
+    fn log_lines(&self) -> Vec<String> {
+        fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    fn to_enrich(&self) -> usize {
+        nephila::store::Store::open_readonly(&self.repo)
+            .unwrap()
+            .files_to_enrich()
+            .unwrap()
+            .len()
+    }
+}
+
+fn posts(server: &FakeServer) -> Vec<fake_server::Recorded> {
+    server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect()
+}
+
+#[test]
+fn req042_ac1_modele_du_fichier_de_projet_dans_les_requetes() {
+    for provider in ["openai", "anthropic"] {
+        for (project, expected) in [("model = \"m-projet\"\n", "m-projet"), ("", "m-perso")] {
+            let server = FakeServer::start(vec![
+                (200, "{}".into()),
+                (200, http_reply(provider, ENRICH_A)),
+                (200, "{}".into()),
+                (200, http_reply(provider, ASK_A)),
+            ]);
+            let e = Env::http(provider, &server.base_url, "");
+            if !project.is_empty() {
+                e.project(project);
+            }
+            let o = e.run_key(&["build"]);
+            assert!(o.status.success(), "{provider}: {}", text(&o.stderr));
+            let o = e.run_key(&["query", "ask", "Alpha"]);
+            assert!(o.status.success(), "{provider}: {}", text(&o.stderr));
+            let p = posts(&server);
+            assert_eq!(p.len(), 2, "{provider}: enrichissement et ask");
+            let path = if provider == "openai" {
+                "/v1/chat/completions"
+            } else {
+                "/v1/messages"
+            };
+            for r in &p {
+                assert_eq!(r.path, path);
+                let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+                assert_eq!(body["model"], expected, "{provider}: {}", r.body);
+            }
+        }
+    }
+}
+
+#[test]
+fn req042_ac3_essais_de_format_et_lots_du_fichier_de_projet() {
+    let e = Env::new();
+    let personal = "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\nformat_retries = 0\n";
+    e.small(1, personal);
+    e.project("format_retries = 3\n");
+    let malformed = [("NEPHILA_MOCK_MALFORMED", "src/F00.java:3")];
+    let run = |args: &[&str]| {
+        let _ = fs::remove_file(&e.log);
+        e.command()
+            .envs(malformed)
+            .arg("-C")
+            .arg(&e.repo)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let o = run(&["build"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(e.log_lines().len(), 4);
+    assert_eq!(e.to_enrich(), 0);
+    let o = run(&["build", "--format-retries", "0"]);
+    assert!(!o.status.success());
+    assert_eq!(e.log_lines().len(), 1);
+    assert_eq!(e.to_enrich(), 1);
+
+    // query ask
+    fs::write(e.mock.join("_ask.json"), ASK_A.replace("p.Alpha", "p.F00")).unwrap();
+    assert!(run(&["build"]).status.success());
+    let ask = |extra: &[&str]| {
+        let mut a = vec!["query", "ask", "F00"];
+        a.extend_from_slice(extra);
+        e.command()
+            .env("NEPHILA_MOCK_MALFORMED", "_ask:3")
+            .arg("-C")
+            .arg(&e.repo)
+            .args(a)
+            .output()
+            .unwrap()
+    };
+    let o = ask(&[]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let o = ask(&["--format-retries", "0"]);
+    assert!(!o.status.success());
+
+    // lots
+    e.small(
+        4,
+        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\nbatch_files = 1\n",
+    );
+    e.project("batch_files = 2\nconcurrency = 1\n");
+    assert!(e.run(&["build"]).status.success());
+    let log = e.log_lines();
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert!(log
+        .iter()
+        .all(|l| l.split('\t').next().unwrap().split(';').count() == 2));
+    let _ = fs::remove_file(&e.log);
+    assert!(e.run(&["build", "--batch-files", "1"]).status.success());
+    assert_eq!(e.log_lines().len(), 4);
+}
+
+#[test]
+fn req042_ac4_fils_morceaux_et_delai() {
+    let e = Env::new();
+    e.small(
+        4,
+        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\ntimeout_secs = 300\nmax_chunk_chars = 60000\n",
+    );
+    fs::write(
+        e.repo.join("src/F02.java"),
+        format!(
+            "package p;\npublic class F02 {{}}\n{}",
+            "// remplissage\n".repeat(100)
+        ),
+    )
+    .unwrap();
+    e.project("concurrency = 3\ntimeout_secs = 7\nmax_chunk_chars = 1000\n");
+    let o = e.run(&["build", "--verbose"]);
+    let err = text(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    let config = err.lines().find(|l| l.contains("config: llm=")).unwrap();
+    for needle in ["concurrency=3", "timeout_secs=7", "max_chunk_chars=1000"] {
+        assert!(config.contains(needle), "{config}");
+    }
+    assert!(err.contains("structure: début 4 fichiers, 3 fils"), "{err}");
+    let enrich = err
+        .lines()
+        .find(|l| l.contains("enrichissement: début"))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(enrich.trim_end().ends_with(", 3 fils"), "{enrich}");
+    let own = e
+        .log_lines()
+        .into_iter()
+        .filter(|l| l.starts_with("src/F02.java\t"))
+        .count();
+    assert!(own > 1, "{:?}", e.log_lines());
+
+    // délai
+    let server = FakeServer::start_with_delays(vec![
+        (200, "{}".into(), 0),
+        (200, http_reply("openai", ENRICH_A), 2000),
+    ]);
+    let e = Env::http("openai", &server.base_url, "timeout_secs = 300\n");
+    e.project("timeout_secs = 1\n");
+    let o = e.run_key(&["build", "-v"]);
+    assert!(
+        text(&o.stderr).contains("délai dépassé"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+const SIX: &str = "model = \"x\"\nmax_chunk_chars = 1000\nconcurrency = 2\ntimeout_secs = 5\nbatch_files = 2\nformat_retries = 1\n";
+
+#[test]
+fn req042_ac7_llm_inactif_reglages_sans_effet() {
+    let e = Env::new();
+    let absent = e.config.with_file_name("absent.toml");
+    let run = |args: &[&str]| {
+        e.command()
+            .env("NEPHILA_CONFIG", &absent)
+            .arg("-C")
+            .arg(&e.repo)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    e.project(SIX);
+    let o = run(&["build", "--verbose"]);
+    let err = text(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(text(&o.stdout).contains("enrichissement : désactivé"));
+    assert!(
+        err.lines()
+            .any(|l| l.ends_with("] config: llm inactif (aucune configuration)")),
+        "{err}"
+    );
+    assert!(
+        err.contains("structure: début") && err.contains(", 4 fils"),
+        "{err}"
+    );
+    assert!(!err.contains("(.nephila.toml :"));
+    assert!(
+        !err.contains("avertissement:") && !err.contains("erreur:"),
+        "{err}"
+    );
+    fs::write(
+        e.repo.join("core/Extra.java"),
+        "package p;\nclass Extra {}\n",
+    )
+    .unwrap();
+    let o = run(&["update"]);
+    let err = text(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(text(&o.stdout).contains("enrichissement : désactivé"));
+    assert!(
+        !err.contains("avertissement:") && !err.contains("erreur:"),
+        "{err}"
+    );
+    assert!(!e.log.exists());
+
+    // --no-llm avec une configuration personnelle
+    let o = e.run(&["build", "--no-llm", "--verbose"]);
+    let err = text(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(
+        err.lines()
+            .any(|l| l.ends_with("] config: llm inactif (--no-llm)")),
+        "{err}"
+    );
+    assert!(!err.contains("(.nephila.toml :"));
+    assert!(!e.log.exists());
+
+    // ask sans configuration personnelle
+    let o = run(&["query", "ask", "x"]);
+    assert!(!o.status.success());
+    assert!(
+        text(&o.stderr).contains(&absent.display().to_string()),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+#[test]
+fn req042_ac8_configuration_personnelle_validee_seule() {
+    let e = Env::new();
+    fs::write(&e.config, "provider = \"openai\"\n").unwrap();
+    e.project("model = \"x\"\n");
+    let o = e.run(&["build"]);
+    assert!(!o.status.success());
+    assert!(text(&o.stderr).contains("model"), "{}", text(&o.stderr));
+    assert!(!e.repo.join(".nephila").exists());
+
+    fs::write(
+        &e.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 0\n",
+    )
+    .unwrap();
+    e.project("concurrency = 2\n");
+    let o = e.run(&["build"]);
+    assert!(!o.status.success());
+    assert!(
+        text(&o.stderr).contains("concurrency"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(!e.repo.join(".nephila").exists());
+}
+
+#[test]
+fn req042_ac9_changer_de_reglage_ne_reenrichit_rien() {
+    let e = Env::new();
+    let o = e.run(&["build"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let log = fs::read(&e.log).unwrap();
+    e.project("model = \"autre\"\nformat_retries = 3\nconcurrency = 1\n");
+    let o = e.run(&["status"]);
+    assert!(
+        text(&o.stdout).contains("graphe à jour"),
+        "{}",
+        text(&o.stdout)
+    );
+    let o = e.run(&["query", "search", "x"]);
+    assert!(
+        !text(&o.stderr).contains("pas à jour"),
+        "{}",
+        text(&o.stderr)
+    );
+    let o = e.run(&["update"]);
+    assert!(o.status.success());
+    assert_eq!(text(&o.stdout), "graphe à jour\n");
+    assert_eq!(fs::read(&e.log).unwrap(), log);
+}
+
+#[test]
+fn req042_ac11_filtres_et_reglages_combines() {
+    let e = Env::new();
+    e.project("exclude = [\"docs/legacy/\"]\nexclude_types = [\"json\"]\nmodel = \"m-projet\"\nformat_retries = 1\n");
+    let o = e.run(&["build", "--verbose"]);
+    let err = text(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(text(&o.stdout).contains("fichiers exclus par les filtres"));
+    let config = err.lines().find(|l| l.contains("config: llm=")).unwrap();
+    assert!(
+        config.contains("model=m-projet") && config.contains("format_retries=1"),
+        "{config}"
+    );
+    assert!(!err.contains("valent pour cette commande"), "{err}");
+}
+
+#[test]
+fn req042_ac16_aucune_trace_sans_verbose() {
+    let with = Env::new();
+    with.project("model = \"m-projet\"\nformat_retries = 3\n");
+    let without = Env::new();
+    let a = with.run(&["build"]);
+    let b = without.run(&["build"]);
+    assert_eq!(a.stdout, b.stdout);
+    assert_eq!(a.stderr, b.stderr);
+    assert_eq!(a.status.code(), b.status.code());
+    let err = text(&a.stderr);
+    assert!(
+        !err.contains(".nephila.toml") && !err.contains("m-projet"),
+        "{err}"
+    );
+}

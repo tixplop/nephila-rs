@@ -403,3 +403,105 @@ fn req026_ac6_no_secret_in_traces() {
         assert!(l.chars().count() <= 300, "{l}");
     }
 }
+
+// ---- REQ-042 : marque de source de la ligne `config` ----
+
+fn config_line(o: &std::process::Output) -> String {
+    trace_lines(o)
+        .into_iter()
+        .find(|l| l.contains("] config: "))
+        .unwrap_or_else(|| panic!("{}", stderr(o)))
+}
+
+impl Env {
+    fn project(&self, content: &str) {
+        fs::write(self.repo.join(".nephila.toml"), content).unwrap();
+    }
+}
+
+#[test]
+fn req026_ac12_marque_de_source() {
+    // modèle et format_retries, dans cet ordre dans le fichier
+    let env = Env::mock();
+    env.project("format_retries = 1\nmodel = \"m-projet\"\n");
+    let o = env.cmd(&["build", "--verbose"]);
+    let line = config_line(&o);
+    assert!(line.contains(" model=m-projet "), "{line}");
+    assert!(
+        line.ends_with(" format_retries=1 (.nephila.toml : model,format_retries)"),
+        "{line}"
+    );
+    // update sans changement : même fin de ligne
+    let o = env.cmd(&["update", "--verbose"]);
+    assert!(
+        config_line(&o).ends_with(" format_retries=1 (.nephila.toml : model,format_retries)"),
+        "{}",
+        stderr(&o)
+    );
+
+    // l'option remplace batch_files, qui n'est plus nommé
+    let env = Env::mock();
+    env.project("batch_files = 2\nconcurrency = 3\n");
+    let o = env.cmd(&["build", "--verbose", "--batch-files", "1"]);
+    let line = config_line(&o);
+    assert!(
+        line.ends_with(" batch_files=1 format_retries=2 (.nephila.toml : concurrency)"),
+        "{line}"
+    );
+
+    // réglages TLS avant la marque
+    let env =
+        Env::new("provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 4\ntls_insecure = true\n");
+    env.project("batch_files = 2\nconcurrency = 3\n");
+    let o = env.cmd(&["build", "--verbose", "--batch-files", "1"]);
+    let line = config_line(&o);
+    assert!(
+        line.ends_with(" format_retries=2 tls_insecure (.nephila.toml : concurrency)"),
+        "{line}"
+    );
+
+    // valeur égale à celle de la configuration personnelle : nommée quand même
+    let env = Env::mock();
+    env.project("concurrency = 4\n");
+    let o = env.cmd(&["build", "--verbose"]);
+    assert!(config_line(&o).ends_with(" (.nephila.toml : concurrency)"));
+
+    // filtres seuls : aucune marque
+    let env = Env::mock();
+    env.project("exclude_types = [\"json\"]\n");
+    let o = env.cmd(&["build", "--verbose"]);
+    assert!(!config_line(&o).contains(".nephila.toml"));
+
+    // LLM inactif : ligne exacte, aucune marque
+    let env = Env::mock();
+    fs::remove_file(&env.config).unwrap();
+    env.project(
+        "model = \"x\"\nmax_chunk_chars = 1000\nconcurrency = 2\ntimeout_secs = 5\nbatch_files = 2\nformat_retries = 1\n",
+    );
+    let o = env.cmd(&["build", "--verbose"]);
+    assert!(config_line(&o).ends_with("] config: llm inactif (aucune configuration)"));
+    assert!(!stderr(&o).contains("(.nephila.toml :"), "{}", stderr(&o));
+}
+
+#[test]
+fn req042_ac10_aucune_trace_ne_contient_la_cle_d_api() {
+    let secret = "sk-SECRET-VALEUR-T087-reconnaissable";
+    let server = FakeServer::start(vec![
+        (200, "{}".into()),
+        (
+            200,
+            serde_json::json!({"choices":[{"message":{"role":"assistant","content":
+                r#"{"version":2,"summaries":[],"concepts":[]}"#}}]})
+            .to_string(),
+        ),
+        (200, "{}".into()),
+    ]);
+    let env = openai_env(&server, 30, "class A {}\n");
+    env.project("model = \"m-projet\"\n");
+    for sub in ["build", "update"] {
+        let o = env.cmd_with(&[sub, "--verbose"], &[("NEPHILA_T049_KEY", secret)]);
+        let all = format!("{}{}", stderr(&o), String::from_utf8_lossy(&o.stdout));
+        assert!(!all.contains(secret), "{sub}: {all}");
+        assert!(all.contains("(.nephila.toml : model)"), "{sub}: {all}");
+    }
+}
