@@ -354,3 +354,30 @@ fn REQ041_AC7_types_cites_egaux_aux_types_du_produit() {
     assert_eq!(in_code.len(), 15);
     assert_eq!(type_names_of_example(), in_code);
 }
+
+fn repo_file(rel: &str) -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    fs::read_to_string(&p).unwrap_or_else(|e| panic!("{} illisible : {e}", p.display()))
+}
+
+#[test]
+fn REQ041_AC8_readme_renvoie_aux_deux_exemples() {
+    let readme = repo_file("README.md");
+    assert!(readme.contains("examples/config.toml"));
+    assert!(readme.contains("examples/nephila.toml"));
+    assert!(readme.contains("config.example.toml"));
+    assert!(readme.contains("nephila.example.toml"));
+}
+
+#[test]
+fn REQ041_AC8_etape_d_empaquetage_copie_les_deux_exemples() {
+    let release = repo_file(".github/workflows/release.yml");
+    let has = |src: &str, dst: &str| {
+        release.lines().any(|l| {
+            let l = l.trim();
+            l.starts_with("cp ") && l.contains(src) && l.contains(dst)
+        })
+    };
+    assert!(has("examples/config.toml", "config.example.toml"));
+    assert!(has("examples/nephila.toml", "nephila.example.toml"));
+}

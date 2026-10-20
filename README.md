@@ -68,10 +68,10 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 
 ### Binaires précompilés
 
-Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge.
+Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.14.0                                      # version voulue
+V=v0.14.1                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -289,7 +289,7 @@ exclude = ["docs/legacy/", "*.min.js"]   # motifs .gitignore, relatifs à la rac
 exclude_types = ["json"]                 # types : voir nephila build --help
 ```
 
-Les deux clés sont facultatives ; toute autre clé est une erreur. Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour »), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé.
+Les deux clés sont facultatives ; toute autre clé est une erreur. Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour »), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé. Un exemple commenté est fourni dans [`examples/nephila.toml`](examples/nephila.toml).
 
 ### Fusion des deux sources
 
@@ -357,7 +357,7 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 2. `$XDG_CONFIG_HOME/nephila/config.toml` ;
 3. `~/.config/nephila/config.toml`.
 
-Un exemple commenté est fourni dans [`examples/config.toml`](examples/config.toml).
+[`examples/config.toml`](examples/config.toml) documente toutes les clés et toutes les variables (fournisseurs, options communes, TLS, LLM simulé).
 
 | Clé | Rôle | Défaut |
 |---|---|---|
@@ -574,6 +574,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.14.1 | Exemples de configuration complets (`examples/config.toml`, `examples/nephila.toml`), vérifiés par les tests |
 | 0.14 | Vue HTML : bouton « Tout étendre », liens masqués pendant le zoom et le déplacement |
 | 0.13 | Nouveaux essais des réponses LLM non conformes (`format_retries`, `--format-retries`) |
 | 0.12.0 | Filtres d'analyse (`--exclude`, `--exclude-type`, `.nephila.toml`) |
@@ -595,7 +596,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.14.0 && git push origin v0.14.0
+git tag v0.14.1 && git push origin v0.14.1
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.

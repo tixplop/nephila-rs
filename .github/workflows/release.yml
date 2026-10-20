@@ -69,6 +69,7 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/$BIN" README.md "dist/$name/"
           cp examples/config.toml "dist/$name/config.example.toml"
+          cp examples/nephila.toml "dist/$name/nephila.example.toml"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
           echo "name=$name" >> "$GITHUB_OUTPUT"
