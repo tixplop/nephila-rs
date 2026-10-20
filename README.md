@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.15.0                                      # version voulue
+V=v0.16.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -113,8 +113,8 @@ Les commandes sans LLM ne lisent aucune configuration. Si le graphe est en retar
 ### `nephila build` et `nephila update`
 
 ```
-nephila build  [--no-llm] [-v|--verbose] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
-nephila update [--no-llm] [-v|--verbose] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
+nephila build  [--no-llm] [-v|--verbose | --show-progress] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
+nephila update [--no-llm] [-v|--verbose | --show-progress] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
 ```
 
 `build` analyse chaque fichier puis, si le LLM est actif, enrichit le graphe. `update` ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus ceux restés en attente ou à enrichir.
@@ -123,6 +123,7 @@ nephila update [--no-llm] [-v|--verbose] [--batch-files <N>] [--format-retries <
 |---|---|
 | `--no-llm` | Structure seule : la configuration n'est pas lue (même invalide) et aucun appel n'est fait |
 | `-v, --verbose` | Traces sur stderr (voir [Traces](#traces---verbose)) |
+| `--show-progress` | Avancement des phases sur stderr, voir [Progression](#progression---show-progress) |
 | `--batch-files <N>` | Taille de lot pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
 | `--format-retries <N>` | Nombre de nouveaux essais d'un appel dont la réponse est non conforme, pour cette commande seulement (voir [Réponses non conformes et nouveaux essais](#réponses-non-conformes-et-nouveaux-essais)) |
 | `--exclude <MOTIF>` | Exclut de l'analyse les fichiers qui correspondent au motif ; répétable (voir [Filtrer l'analyse](#filtrer-lanalyse)) |
@@ -208,7 +209,7 @@ Nœuds les plus reliés
 
 ### Traces (`--verbose`)
 
-Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, préfixée `trace:` et horodatée depuis le lancement. stdout est inchangé : `nephila build -v 2>trace.log` garde le bilan lisible.
+Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, préfixée `trace:` et horodatée depuis le lancement. stdout est inchangé : `nephila build -v 2>trace.log` garde le bilan lisible. `--verbose` est incompatible avec `--show-progress` (erreur d'usage) : voir [Progression](#progression---show-progress).
 
 Événements tracés :
 
@@ -233,6 +234,40 @@ trace: [1.053s] politique: arrêt de l'envoi (clé d'API refusée par le fournis
 ```
 
 Les traces ne contiennent jamais de contenu de fichier, de prompt, de réponse du LLM ni de clé d'API.
+
+### Progression (`--show-progress`)
+
+Avec `--show-progress`, `build` et `update` écrivent sur stderr l'avancement de leurs deux phases, `extraction` puis `enrichissement`, et elles seules. Chaque ligne suit le gabarit `progression: <phase> <p> % (<k>/<n> fichiers)`. stdout est inchangé.
+
+- L'unité est le fichier : `k` fichiers traités sur `n`. Un lot avance d'un bloc ; les morceaux et les nouveaux essais ne sont pas comptés ; un fichier en échec est compté comme traité.
+- Une ligne au départ de la phase (`0 %`), puis une par palier de 10 % franchi : au plus 11 lignes par phase, quelle que soit la taille du dépôt.
+- `update` ne compte que les fichiers à traiter.
+- Si l'envoi au LLM s'arrête (clé refusée, panne répétée), la dernière ligne d'enrichissement reste sous 100 % : l'écart `n` − `k` est le nombre de fichiers non envoyés.
+- Aucune ligne pour une phase sans fichier, ni pour l'enrichissement avec `--no-llm`.
+- Les lignes sont entières et jamais réécrites : elles restent lisibles redirigées dans un fichier et se filtrent par `grep '^progression:'`.
+- `--show-progress` est incompatible avec `--verbose` (erreur d'usage).
+
+Exemple, `build --show-progress --batch-files 4` sur 10 fichiers Java avec le LLM simulé :
+
+```
+$ nephila build --show-progress --batch-files 4
+progression: extraction 0 % (0/10 fichiers)
+progression: extraction 10 % (1/10 fichiers)
+progression: extraction 20 % (2/10 fichiers)
+progression: extraction 30 % (3/10 fichiers)
+progression: extraction 40 % (4/10 fichiers)
+progression: extraction 50 % (5/10 fichiers)
+progression: extraction 60 % (6/10 fichiers)
+progression: extraction 70 % (7/10 fichiers)
+progression: extraction 80 % (8/10 fichiers)
+progression: extraction 90 % (9/10 fichiers)
+progression: extraction 100 % (10/10 fichiers)
+progression: enrichissement 0 % (0/10 fichiers)
+progression: enrichissement 40 % (4/10 fichiers)
+progression: enrichissement 80 % (8/10 fichiers)
+progression: enrichissement 100 % (10/10 fichiers)
+build terminé : 10 fichiers traités, 11 nœuds, 10 liens, 0 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir
+```
 
 ## Filtrer l'analyse
 
@@ -603,6 +638,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.16 | Option `--show-progress` de `build` et `update` |
 | 0.15 | Réglages LLM du dépôt dans `.nephila.toml` |
 | 0.14.1 | Exemples de configuration complets (`examples/config.toml`, `examples/nephila.toml`), vérifiés par les tests |
 | 0.14 | Vue HTML : bouton « Tout étendre », liens masqués pendant le zoom et le déplacement |
@@ -626,7 +662,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.15.0 && git push origin v0.15.0
+git tag v0.16.0 && git push origin v0.16.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
