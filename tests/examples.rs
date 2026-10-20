@@ -615,3 +615,67 @@ fn REQ042_AC12_blocs_de_config_citent_le_fichier_de_projet() {
         );
     }
 }
+
+/// Section du README qui commence au titre donné et finit au titre suivant de même niveau ou supérieur.
+fn readme_section(readme: &str, title: &str) -> String {
+    let level = title.chars().take_while(|c| *c == '#').count();
+    let mut out = Vec::new();
+    let mut inside = false;
+    let mut in_fence = false;
+    for line in readme.lines() {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+        }
+        let depth = line.chars().take_while(|c| *c == '#').count();
+        let is_title = !in_fence && depth > 0 && line.chars().nth(depth) == Some(' ');
+        if line == title {
+            inside = true;
+            continue;
+        }
+        if inside && is_title && depth <= level {
+            break;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    assert!(!out.is_empty(), "section absente : {title}");
+    out.join("\n")
+}
+
+#[test]
+fn REQ042_AC13_readme_decrit_les_reglages_de_projet() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
+    assert!(sec.contains(".nephila.toml"));
+    for k in [
+        "model",
+        "max_chunk_chars",
+        "concurrency",
+        "timeout_secs",
+        "batch_files",
+        "format_retries",
+    ] {
+        assert!(sec.contains(k), "réglage absent de la section : {k}");
+    }
+    for needle in [
+        "configuration personnelle",
+        "provider",
+        "base_url",
+        "api_key_env",
+        "tls_ca_cert",
+        "tls_insecure",
+        "--no-llm",
+        "graphe à jour",
+        "nephila build",
+        "build --verbose",
+        "examples/nephila.toml",
+    ] {
+        assert!(
+            sec.contains(needle),
+            "texte absent de la section : {needle}"
+        );
+    }
+    assert!(sec.contains("option > fichier de projet > configuration personnelle > défaut"));
+    assert!(!readme.contains("configuration globale"));
+}

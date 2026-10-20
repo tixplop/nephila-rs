@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.14.1                                      # version voulue
+V=v0.15.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -212,7 +212,7 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 
 Événements tracés :
 
-- la configuration (fournisseur, modèle, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ;
+- la configuration (fournisseur, modèle, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;
 - la vérification de la clé ;
 - le parcours des fichiers ;
 - le début et la fin de chaque phase (structure, résolution, enrichissement) ;
@@ -220,6 +220,7 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 - les décisions d'arrêt.
 
 ```
+trace: [0.000s] config: llm=mock model=m-projet concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
 trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
 trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts) 19 ms
 trace: [0.003s] llm enrich fin src/A.java [1/1] erreur 0 ms : réponse LLM non conforme au schéma
@@ -289,7 +290,24 @@ exclude = ["docs/legacy/", "*.min.js"]   # motifs .gitignore, relatifs à la rac
 exclude_types = ["json"]                 # types : voir nephila build --help
 ```
 
-Les deux clés sont facultatives ; toute autre clé est une erreur. Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour »), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé. Un exemple commenté est fourni dans [`examples/nephila.toml`](examples/nephila.toml).
+Les filtres (`exclude`, `exclude_types`) et les six réglages sont facultatifs ; toute autre clé est une erreur. Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour » et, avec `query ask`, pour les réglages ci-dessous), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé.
+
+Le même fichier porte aussi les réglages LLM du dépôt, au premier niveau, avec le même nom et le même type que dans la configuration personnelle : on copie une ligne d'un fichier à l'autre.
+
+```toml
+# Réglages LLM du dépôt (prioritaires sur la configuration personnelle)
+model = "qwen2.5-coder:14b"
+format_retries = 4
+```
+
+Les six réglages sont `model` (chaîne non vide), `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` (entiers ≥ 1) et `format_retries` (entier ≥ 0). Un réglage du fichier de projet remplace celui de la configuration personnelle ; un réglage absent garde la valeur personnelle, ou le défaut. Priorité : option > fichier de projet > configuration personnelle > défaut (les options sont `--batch-files` et `--format-retries`).
+
+- **Clés de connexion refusées** : `provider`, `base_url`, `api_key_env`, `tls_ca_cert` et `tls_insecure` ne sont permises que dans la configuration personnelle. Le fichier de projet est versionné et vient souvent d'un dépôt cloné : s'il pouvait changer l'adresse du serveur ou la variable qui contient la clé, cloner un dépôt suffirait à envoyer votre code et une clé d'API (ou un autre secret de l'environnement) à un serveur tiers, ou à désactiver le contrôle des certificats.
+- **Sans LLM actif** (aucune configuration personnelle, ou `--no-llm`), les réglages n'ont aucun effet et aucun message : un collègue sans configuration ne voit rien. Le fichier reste validé en entier.
+- **Changer de modèle ne réenrichit rien** : `status` et `update` disent `graphe à jour`. Pour réenrichir avec le nouveau modèle, lancez `nephila build`.
+- **Dépôt tiers** : un dépôt cloné peut choisir un modèle plus coûteux ou une `concurrency` plus forte que les vôtres. Vérifiez avec `nephila build --verbose` : la ligne `config` donne les valeurs effectives et nomme les réglages venus de `.nephila.toml` (voir [Traces](#traces---verbose)).
+
+Un exemple commenté est fourni dans [`examples/nephila.toml`](examples/nephila.toml).
 
 ### Fusion des deux sources
 
@@ -316,6 +334,15 @@ Un fichier de projet invalide arrête toute commande qui parcourt le dépôt, av
 ```
 erreur: ./.nephila.toml : clé `exclude_types` : type inconnu `python` (types valides : markdown, java, kotlin, groovy, scala, javascript, typescript, sql, xml, json, yaml, maven, ivy, gradle, npm)
 ```
+
+Une clé de connexion et un réglage invalide donnent chacun une ligne :
+
+```
+erreur: ./.nephila.toml : clé `base_url` permise seulement dans la configuration personnelle (/home/vous/.config/nephila/config.toml)
+erreur: ./.nephila.toml : clé `concurrency` : valeur invalide `-1` (entier strictement positif attendu)
+```
+
+La première ne reprend pas la valeur écrite (une `base_url` peut contenir un jeton).
 
 ## Export et vue HTML
 
@@ -356,6 +383,8 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 1. le chemin donné par la variable `NEPHILA_CONFIG` ;
 2. `$XDG_CONFIG_HOME/nephila/config.toml` ;
 3. `~/.config/nephila/config.toml`.
+
+Six de ces réglages (`model`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files`, `format_retries`) peuvent être remplacés par dépôt dans `.nephila.toml` (voir [Fichier de projet](#fichier-de-projet-nephilatoml)) ; les autres clés restent personnelles.
 
 [`examples/config.toml`](examples/config.toml) documente toutes les clés et toutes les variables (fournisseurs, options communes, TLS, LLM simulé).
 
@@ -574,6 +603,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.15 | Réglages LLM du dépôt dans `.nephila.toml` |
 | 0.14.1 | Exemples de configuration complets (`examples/config.toml`, `examples/nephila.toml`), vérifiés par les tests |
 | 0.14 | Vue HTML : bouton « Tout étendre », liens masqués pendant le zoom et le déplacement |
 | 0.13 | Nouveaux essais des réponses LLM non conformes (`format_retries`, `--format-retries`) |
@@ -596,7 +626,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.14.1 && git push origin v0.14.1
+git tag v0.15.0 && git push origin v0.15.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
