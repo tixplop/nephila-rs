@@ -82,9 +82,12 @@ pub struct IndexOpts {
     /// N'appelle pas le LLM (la configuration n'est pas lue) : structure seule, sans enrichissement
     #[arg(long)]
     pub no_llm: bool,
-    /// Traces synthétiques des étapes et des appels LLM sur stderr (préfixe `trace:`)
+    /// Traces synthétiques des étapes et des appels LLM sur stderr (préfixe `trace:` ; incompatible avec --show-progress)
     #[arg(short, long)]
     pub verbose: bool,
+    /// Avancement des phases extraction et enrichissement sur stderr, par paliers de 10 % (préfixe `progression:` ; incompatible avec --verbose)
+    #[arg(long, conflicts_with = "verbose")]
+    pub show_progress: bool,
     /// Nombre maximal de fichiers par appel d'enrichissement (remplace `batch_files` de la configuration)
     #[arg(long, value_name = "N", value_parser = parse_batch_files, allow_hyphen_values = true)]
     pub batch_files: Option<usize>,
@@ -179,22 +182,28 @@ pub enum Query {
 /// Exécute la commande.
 pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
-        Command::Build(o) => crate::index::build::run(
-            &cli.repo,
-            o.no_llm,
-            o.verbose,
-            o.batch_files,
-            o.format_retries,
-            o.filters(),
-        ),
-        Command::Update(o) => crate::index::update::run(
-            &cli.repo,
-            o.no_llm,
-            o.verbose,
-            o.batch_files,
-            o.format_retries,
-            o.filters(),
-        ),
+        Command::Build(o) => {
+            crate::progress::init(o.show_progress);
+            crate::index::build::run(
+                &cli.repo,
+                o.no_llm,
+                o.verbose,
+                o.batch_files,
+                o.format_retries,
+                o.filters(),
+            )
+        }
+        Command::Update(o) => {
+            crate::progress::init(o.show_progress);
+            crate::index::update::run(
+                &cli.repo,
+                o.no_llm,
+                o.verbose,
+                o.batch_files,
+                o.format_retries,
+                o.filters(),
+            )
+        }
         Command::Status(j) => crate::status::run(&cli.repo, j.json),
         Command::Summary(j) => crate::summary::run(&cli.repo, j.json),
         Command::Export { output, format } => {

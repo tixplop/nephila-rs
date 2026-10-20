@@ -9,6 +9,7 @@ pub mod index;
 pub mod llm;
 pub mod model;
 pub mod parse;
+pub mod progress;
 pub mod query;
 pub mod resolve;
 pub mod scan;

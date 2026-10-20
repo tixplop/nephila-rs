@@ -10,6 +10,7 @@ use crate::error::{warn, Error, Result};
 use crate::index::build::BuildReport;
 use crate::model::{Node, NodeKind, Ref};
 use crate::parse::{self, FileStructure, ParseCtx};
+use crate::progress::{self, Phase};
 use crate::scan::ScannedFile;
 use crate::store::Store;
 use crate::trace;
@@ -49,6 +50,7 @@ pub(crate) fn analyze(
     trace!("structure: début {} fichiers, {workers} fils", files.len());
     let mut batch: Vec<Batched> = Vec::new();
 
+    let mut meter = progress::Meter::start(Phase::Extraction, files.len());
     std::thread::scope(|scope| {
         let queue = &queue;
         let ctx = &ctx;
@@ -75,6 +77,9 @@ pub(crate) fn analyze(
         }
         drop(tx);
         for outcome in rx {
+            if let Some(m) = meter.as_mut() {
+                m.advance(1);
+            }
             match outcome {
                 Outcome::Failed(path, e) => {
                     warn(&format!("{path} : {e}"));
@@ -274,6 +279,8 @@ mod tests {
         // La lecture de B échoue : le fichier disparaît après le parcours.
         std::fs::remove_file(repo.join("B.java")).unwrap();
         let mut report = BuildReport::default();
+        crate::progress::init(true);
+        crate::progress::take_captured();
         analyze(
             repo,
             &scanned.files,
@@ -283,6 +290,15 @@ mod tests {
             &mut report,
         )
         .unwrap();
+        crate::progress::init(false);
+        assert_eq!(
+            crate::progress::take_captured(),
+            vec![
+                "progression: extraction 0 % (0/2 fichiers)",
+                "progression: extraction 50 % (1/2 fichiers)",
+                "progression: extraction 100 % (2/2 fichiers)",
+            ]
+        );
         let opts = IndexOptions::default();
         finalize(&mut store, None, &opts, repo, &mut report).unwrap();
         assert_eq!((report.processed, report.failed, report.pending), (1, 1, 1));
