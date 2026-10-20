@@ -26,6 +26,25 @@ pub const PROJECT_SETTINGS: [&str; 6] = [
     "format_retries",
 ];
 
+/// Plafonds inclus des réglages entiers du fichier de projet seulement (DEC-055), dans l'ordre
+/// de `PROJECT_SETTINGS`, `model` exclu. Seule source du message d'erreur, de l'exemple et du
+/// README ; la configuration personnelle et les options n'en ont pas.
+pub const PROJECT_CAPS: [(&str, u64); 5] = [
+    ("max_chunk_chars", 1_000_000),
+    ("concurrency", 64),
+    ("timeout_secs", 3600),
+    ("batch_files", 100),
+    ("format_retries", 10),
+];
+
+/// Plafond de `key` dans le fichier de projet, s'il en a un.
+pub fn project_cap(key: &str) -> Option<u64> {
+    PROJECT_CAPS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, c)| *c)
+}
+
 /// Clés de connexion : permises dans la configuration personnelle seulement (DEC-052).
 pub const CONNECTION_KEYS: [&str; 5] = [
     "provider",
@@ -59,11 +78,16 @@ impl ProjectSettings {
                     "{shown} : clé `{key}` : valeur invalide `{value}` ({expected})"
                 ))
             };
-            let positive = || -> Result<u64> {
+            // Un seul `<attendu>` par clé, quelle que soit la faute (DEC-055).
+            let bounded = |min: i64, cap: u64, expected: &str| -> Result<u64> {
                 match value {
-                    toml::Value::Integer(n) if *n >= 1 => Ok(*n as u64),
-                    _ => Err(invalid("entier strictement positif attendu")),
+                    toml::Value::Integer(n) if *n >= min && (*n as u64) <= cap => Ok(*n as u64),
+                    _ => Err(invalid(&format!("{expected}, au plus {cap}"))),
                 }
+            };
+            let positive = || -> Result<u64> {
+                let cap = project_cap(key).expect("réglage entier plafonné");
+                bounded(1, cap, "entier strictement positif attendu")
             };
             match key {
                 "model" => match value {
@@ -74,12 +98,11 @@ impl ProjectSettings {
                 "concurrency" => out.concurrency = Some(positive()? as usize),
                 "timeout_secs" => out.timeout_secs = Some(positive()?),
                 "batch_files" => out.batch_files = Some(positive()? as usize),
-                _ => match value {
-                    toml::Value::Integer(n) if (0..=i64::from(u32::MAX)).contains(n) => {
-                        out.format_retries = Some(*n as u32)
-                    }
-                    _ => return Err(invalid("entier positif ou nul attendu, au plus 4294967295")),
-                },
+                _ => {
+                    let cap = project_cap(key).expect("réglage entier plafonné");
+                    out.format_retries =
+                        Some(bounded(0, cap, "entier positif ou nul attendu")? as u32)
+                }
             }
         }
         Ok(out)
@@ -584,43 +607,43 @@ mod project_tests {
                 "max_chunk_chars = 0",
                 "max_chunk_chars",
                 "0",
-                "entier strictement positif attendu",
+                "entier strictement positif attendu, au plus 1000000",
             ),
             (
                 "concurrency = -1",
                 "concurrency",
                 "-1",
-                "entier strictement positif attendu",
+                "entier strictement positif attendu, au plus 64",
             ),
             (
                 "timeout_secs = 1.5",
                 "timeout_secs",
                 "1.5",
-                "entier strictement positif attendu",
+                "entier strictement positif attendu, au plus 3600",
             ),
             (
                 "batch_files = \"2\"",
                 "batch_files",
                 "\"2\"",
-                "entier strictement positif attendu",
+                "entier strictement positif attendu, au plus 100",
             ),
             (
                 "batch_files = true",
                 "batch_files",
                 "true",
-                "entier strictement positif attendu",
+                "entier strictement positif attendu, au plus 100",
             ),
             (
                 "format_retries = -1",
                 "format_retries",
                 "-1",
-                "entier positif ou nul attendu, au plus 4294967295",
+                "entier positif ou nul attendu, au plus 10",
             ),
             (
-                "format_retries = 4294967296",
+                "format_retries = 11",
                 "format_retries",
-                "4294967296",
-                "entier positif ou nul attendu, au plus 4294967295",
+                "11",
+                "entier positif ou nul attendu, au plus 10",
             ),
         ];
         for (toml, key, shown, expected) in cases {
@@ -631,13 +654,97 @@ mod project_tests {
             );
         }
         let ok = ProjectSettings::from_table(
-            &table("format_retries = 4294967295\nmodel = \"x\"\nbatch_files = 1"),
+            &table("format_retries = 10\nmodel = \"x\"\nbatch_files = 1"),
             "f",
         )
         .unwrap();
-        assert_eq!(ok.format_retries, Some(u32::MAX));
+        assert_eq!(ok.format_retries, Some(10));
         assert_eq!(ok.model.as_deref(), Some("x"));
         assert_eq!(ok.batch_files, Some(1));
+    }
+
+    #[test]
+    fn req042_ac17_plafonds_declares_une_fois() {
+        assert_eq!(
+            PROJECT_CAPS,
+            [
+                ("max_chunk_chars", 1_000_000),
+                ("concurrency", 64),
+                ("timeout_secs", 3600),
+                ("batch_files", 100),
+                ("format_retries", 10)
+            ]
+        );
+        let keys: Vec<&str> = PROJECT_CAPS.iter().map(|(k, _)| *k).collect();
+        let settings: Vec<&str> = PROJECT_SETTINGS
+            .iter()
+            .copied()
+            .filter(|k| *k != "model")
+            .collect();
+        assert_eq!(keys, settings);
+        assert_eq!(project_cap("concurrency"), Some(64));
+        assert_eq!(project_cap("model"), None);
+    }
+
+    fn expected_for(key: &str) -> String {
+        let cap = project_cap(key).unwrap();
+        if key == "format_retries" {
+            format!("entier positif ou nul attendu, au plus {cap}")
+        } else {
+            format!("entier strictement positif attendu, au plus {cap}")
+        }
+    }
+
+    #[test]
+    fn req042_ac17_valeur_au_plafond_acceptee_au_dessus_refusee() {
+        for (key, cap) in PROJECT_CAPS {
+            let ok = ProjectSettings::from_table(&table(&format!("{key} = {cap}")), "f").unwrap();
+            let got = match key {
+                "max_chunk_chars" => ok.max_chunk_chars.unwrap() as u64,
+                "concurrency" => ok.concurrency.unwrap() as u64,
+                "timeout_secs" => ok.timeout_secs.unwrap(),
+                "batch_files" => ok.batch_files.unwrap() as u64,
+                _ => u64::from(ok.format_retries.unwrap()),
+            };
+            assert_eq!(got, cap, "{key}");
+            let e = ProjectSettings::from_table(&table(&format!("{key} = {}", cap + 1)), "f")
+                .unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "f : clé `{key}` : valeur invalide `{}` ({})",
+                    cap + 1,
+                    expected_for(key)
+                )
+            );
+        }
+        for toml in [
+            "format_retries = 4294967295",
+            "concurrency = 9223372036854775807",
+        ] {
+            let key = toml.split(' ').next().unwrap();
+            let value = toml.rsplit(' ').next().unwrap();
+            let e = ProjectSettings::from_table(&table(toml), "f").unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "f : clé `{key}` : valeur invalide `{value}` ({})",
+                    expected_for(key)
+                )
+            );
+        }
+        let all = ProjectSettings::from_table(
+            &table(
+                "model = \"m\"\nmax_chunk_chars = 1000000\nconcurrency = 64\ntimeout_secs = 3600\nbatch_files = 100\nformat_retries = 10",
+            ),
+            "f",
+        )
+        .unwrap();
+        assert_eq!(all.max_chunk_chars, Some(1_000_000));
+        assert_eq!(all.concurrency, Some(64));
+        assert_eq!(all.timeout_secs, Some(3600));
+        assert_eq!(all.batch_files, Some(100));
+        assert_eq!(all.format_retries, Some(10));
     }
 
     #[test]

@@ -237,33 +237,68 @@ fn req042_ac14_sans_c_le_chemin_est_relatif() {
     );
 }
 
-const INVALID: [(&str, &str, &str); 7] = [
+const INVALID: [(&str, &str, &str); 14] = [
     ("model = \"\"", "model", "`\"\"` (chaîne non vide attendue)"),
     ("model = 3", "model", "`3` (chaîne non vide attendue)"),
     (
         "max_chunk_chars = 0",
         "max_chunk_chars",
-        "`0` (entier strictement positif attendu)",
+        "`0` (entier strictement positif attendu, au plus 1000000)",
     ),
     (
         "concurrency = -1",
         "concurrency",
-        "`-1` (entier strictement positif attendu)",
+        "`-1` (entier strictement positif attendu, au plus 64)",
     ),
     (
         "timeout_secs = 1.5",
         "timeout_secs",
-        "`1.5` (entier strictement positif attendu)",
+        "`1.5` (entier strictement positif attendu, au plus 3600)",
     ),
     (
         "batch_files = \"2\"",
         "batch_files",
-        "`\"2\"` (entier strictement positif attendu)",
+        "`\"2\"` (entier strictement positif attendu, au plus 100)",
     ),
     (
         "format_retries = -1",
         "format_retries",
-        "`-1` (entier positif ou nul attendu, au plus 4294967295)",
+        "`-1` (entier positif ou nul attendu, au plus 10)",
+    ),
+    (
+        "concurrency = 65",
+        "concurrency",
+        "`65` (entier strictement positif attendu, au plus 64)",
+    ),
+    (
+        "timeout_secs = 3601",
+        "timeout_secs",
+        "`3601` (entier strictement positif attendu, au plus 3600)",
+    ),
+    (
+        "format_retries = 11",
+        "format_retries",
+        "`11` (entier positif ou nul attendu, au plus 10)",
+    ),
+    (
+        "max_chunk_chars = 1000001",
+        "max_chunk_chars",
+        "`1000001` (entier strictement positif attendu, au plus 1000000)",
+    ),
+    (
+        "batch_files = 101",
+        "batch_files",
+        "`101` (entier strictement positif attendu, au plus 100)",
+    ),
+    (
+        "max_chunk_chars = 1_000_001",
+        "max_chunk_chars",
+        "`1000001` (entier strictement positif attendu, au plus 1000000)",
+    ),
+    (
+        "format_retries = 50",
+        "format_retries",
+        "`50` (entier positif ou nul attendu, au plus 10)",
     ),
 ];
 
@@ -281,6 +316,7 @@ fn req042_ac6_ac15_reglage_invalide() {
             COMMANDS.iter().map(|a| (a.to_vec(), false)).collect();
         runs.push((vec!["build", "--no-llm"], false));
         runs.push((vec!["build", "--batch-files", "4"], false));
+        runs.push((vec!["build", "--format-retries", "2"], false));
         runs.push((vec!["build"], true));
         runs.push((vec!["status"], true));
         runs.push((vec!["query", "ask", "x"], true));
@@ -294,6 +330,7 @@ fn req042_ac6_ac15_reglage_invalide() {
             assert!(!o.status.success(), "{args:?}");
             assert!(o.stdout.is_empty(), "{args:?}");
             assert_eq!(text(&o.stderr), expected, "{args:?}");
+            assert!(!text(&o.stderr).contains("4294967295"), "{args:?}");
         }
         assert!(!e.repo.join(".nephila").exists());
         assert!(!e.log.exists());
@@ -766,4 +803,94 @@ fn req042_ac16_aucune_trace_sans_verbose() {
         !err.contains(".nephila.toml") && !err.contains("m-projet"),
         "{err}"
     );
+}
+
+const CAPS: &str = "max_chunk_chars = 1000000\nconcurrency = 64\ntimeout_secs = 3600\nbatch_files = 100\nformat_retries = 10\n";
+
+fn config_line(err: &str) -> String {
+    err.lines()
+        .find(|l| l.contains("] config:"))
+        .unwrap_or_else(|| panic!("{err}"))
+        .to_string()
+}
+
+#[test]
+fn req042_ac18_reglages_au_plafond_acceptes() {
+    let e = Env::new();
+    e.project(CAPS);
+    let o = e.run(&["build", "--verbose"]);
+    let err = text(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let line = config_line(&err);
+    assert!(
+        line.contains(
+            "concurrency=64 timeout_secs=3600 max_chunk_chars=1000000 batch_files=100 format_retries=10"
+        ),
+        "{line}"
+    );
+}
+
+#[test]
+fn req042_ac19_bornes_personnelles_et_options_inchangees() {
+    let e = Env::new();
+    fs::write(
+        &e.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nmax_chunk_chars = 5000000\nconcurrency = 100\ntimeout_secs = 7200\nbatch_files = 500\nformat_retries = 4294967295\n",
+    )
+    .unwrap();
+    let o = e.run(&["build", "--verbose"]);
+    let err = text(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let line = config_line(&err);
+    for want in [
+        "max_chunk_chars=5000000",
+        "concurrency=100",
+        "timeout_secs=7200",
+        "batch_files=500",
+        "format_retries=4294967295",
+    ] {
+        assert!(line.contains(want), "{line}");
+    }
+    assert!(!err.contains("erreur:"), "{err}");
+
+    let e = Env::new();
+    e.project("format_retries = 3\nbatch_files = 2\n");
+    let o = e.run(&[
+        "build",
+        "--verbose",
+        "--format-retries",
+        "11",
+        "--batch-files",
+        "101",
+    ]);
+    let err = text(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let line = config_line(&err);
+    assert!(line.contains("batch_files=101 format_retries=11"), "{line}");
+}
+
+#[test]
+fn req042_ac22_valeurs_egales_au_plafond_et_sans_couleur() {
+    let e = Env::new();
+    for line in ["concurrency = 64", "max_chunk_chars = 1_000_000"] {
+        e.project(&format!("{line}\n"));
+        let o = e.run(&["build", "--no-llm"]);
+        let err = text(&o.stderr);
+        assert_eq!(o.status.code(), Some(0), "{line} {err}");
+        assert!(!err.lines().any(|l| l.starts_with("erreur:")), "{err}");
+    }
+    e.project("concurrency = 65\n");
+    let plain = e.run(&["build", "--no-llm"]);
+    let no_color = e
+        .command()
+        .env("NO_COLOR", "1")
+        .arg("-C")
+        .arg(&e.repo)
+        .args(["build", "--no-llm"])
+        .output()
+        .unwrap();
+    assert!(!plain.status.success());
+    assert_eq!(plain.stderr, no_color.stderr);
+    assert!(!plain.stderr.contains(&0x1B));
+    assert!(text(&plain.stderr).contains("valeur invalide `65`"));
 }
