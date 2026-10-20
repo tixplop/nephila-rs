@@ -20,6 +20,8 @@
 #     d'environnement qui la contient. Avant tout traitement, nephila la vérifie par un appel
 #     qui liste les modèles, sans coût de génération.
 #
+# Un dépôt peut remplacer six réglages par son fichier .nephila.toml (model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries) ; les autres clés ne sont lues qu'ici.
+#
 # Les clés communes à tous les fournisseurs (taille des morceaux, parallélisme, délais, TLS)
 # sont en fin de fichier, dans « Options communes ».
 
@@ -31,7 +33,8 @@
 provider = "anthropic"
 
 # Nom du modèle, texte non vide. Obligatoire, sauf pour le fournisseur « mock » (valeur par
-# défaut : « mock »).
+# défaut : « mock »). Un dépôt peut le remplacer par son .nephila.toml.
+# Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 model = "claude-sonnet-4-5"
 
 # NOM de la variable d'environnement qui contient la clé d'API (jamais la clé elle-même).
@@ -93,27 +96,35 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 # Taille maximale, en caractères, d'un morceau de fichier envoyé au LLM. Entier > 0.
 # Défaut : 60000. Un lot de fichiers (voir batch_files) ne dépasse jamais cette taille.
+# Un dépôt peut le remplacer par son .nephila.toml.
+# Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # max_chunk_chars = 60000
 
 # Nombre d'appels LLM simultanés. Entier > 0. Défaut : 4. Borne aussi le nombre de fils de
 # l'analyse syntaxique.
+# Un dépôt peut le remplacer par son .nephila.toml.
+# Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # concurrency = 4
 
 # Durée maximale d'un appel LLM HTTP entier, en secondes. Entier > 0. Défaut : 300. La
 # connexion est limitée à 10 s, quelle que soit cette valeur. Sans effet avec « mock ».
+# Un dépôt peut le remplacer par son .nephila.toml.
+# Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # timeout_secs = 300
 
 # Nombre maximal de fichiers par appel d'enrichissement. Entier > 0. Défaut : 1 (un fichier par
 # appel) ; 4 à 8 convient à de nombreux petits fichiers. Un lot ne dépasse jamais
 # max_chunk_chars et un gros fichier part seul ; concurrency x batch_files fichiers sont en vol
-# au plus. Remplacé, pour une commande, par l'option --batch-files (priorité : option, puis
-# cette clé, puis le défaut).
+# au plus. Remplacé, pour une commande, par l'option --batch-files ; un dépôt peut le remplacer
+# par son .nephila.toml.
+# Priorité : --batch-files > .nephila.toml du dépôt > ce fichier > défaut.
 # batch_files = 1
 
 # Nouveaux essais d'un appel dont la réponse est non conforme. Entier >= 0. Défaut : 2, soit au
 # plus 3 appels pour une même requête ; 0 = aucun nouvel essai. Les erreurs réseau, les délais
 # dépassés et les clés refusées ne sont jamais retentés. Remplacé, pour une commande, par
-# l'option --format-retries (priorité : option, puis cette clé, puis le défaut).
+# l'option --format-retries ; un dépôt peut le remplacer par son .nephila.toml.
+# Priorité : --format-retries > .nephila.toml du dépôt > ce fichier > défaut.
 # format_retries = 2
 
 # Fichier PEM d'autorités de certification, AJOUTÉES aux autorités publiques embarquées dans

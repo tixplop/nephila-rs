@@ -9,10 +9,11 @@
 # Lu par `build`, `update`, `status` et par l'avertissement « graphe pas à jour » des `query`,
 # avec ou sans `--no-llm`. Ni `export` ni `summary` ne le lisent.
 #
-# Il ne sert qu'à exclure des fichiers de l'analyse. Les deux clés sont facultatives ; toute autre
-# clé est une erreur, signalée avant tout parcours. Dans cet exemple, les deux clés sont en
-# commentaire : copié tel quel dans un dépôt, ce fichier ne filtre rien. Décommentez ce qui vous
-# sert.
+# Il sert à exclure des fichiers de l'analyse et à régler le LLM pour ce dépôt. Toutes les clés
+# sont facultatives ; toute autre clé est une erreur, signalée avant tout parcours. Dans cet
+# exemple, toutes les clés sont en commentaire : copié tel quel dans un dépôt, ce fichier ne
+# filtre rien et ne règle rien. Décommentez ce qui vous sert.
+# Copié tel quel, ce fichier n'a aucun effet : toutes les clés sont désactivées.
 #
 # Un filtre s'ajoute à ce que nephila ignore déjà (.gitignore, target/, build/, .gradle/, .git/,
 # .nephila/) et ne peut jamais réinclure un fichier ignoré.
@@ -24,6 +25,8 @@
 # Effet incrémental : un fichier déjà indexé qui devient exclu est retiré du graphe par
 # `nephila update` ; un fichier qui cesse d'être exclu y est ajouté. `update` suffit, pas besoin
 # de `build`. Le bilan de `build` et de `update` compte les « fichiers exclus par les filtres ».
+
+# --- Filtres ---
 
 # Motifs de fichiers à exclure. Tableau de textes. Défaut : aucun. Syntaxe de .gitignore, relative
 # à la racine du dépôt, sensible à la casse :
@@ -57,3 +60,41 @@
 # ["sql", "xml", "json", "yaml"]. Complété, pour une commande, par l'option
 # --exclude-type <TYPE>[,<TYPE>...].
 # exclude_types = ["json"]
+
+# --- Réglages LLM du dépôt ---
+# Ils remplacent, clé par clé, la configuration personnelle (NEPHILA_CONFIG, sinon ~/.config/nephila/config.toml).
+# Elle seule active le LLM : sans elle, ou avec --no-llm, ces réglages n'ont aucun effet et rien n'est affiché.
+# Changer un réglage, le modèle compris, ne réenrichit aucun fichier : lancer nephila build pour réenrichir.
+# Valeurs effectives et réglages venus de ce fichier : nephila build --verbose (ligne config).
+# Refusées ici (configuration personnelle seulement) : provider, base_url, api_key_env, tls_ca_cert, tls_insecure.
+# Raison : ce fichier est versionné ; un dépôt cloné ne doit pas pouvoir envoyer votre code ou votre clé d'API à un autre serveur, ni couper le contrôle des certificats.
+
+# Nom du modèle utilisé pour ce dépôt. Texte non vide. Remplace le modèle de la configuration
+# personnelle.
+# Priorité : ce fichier > configuration personnelle > défaut.
+# model = "claude-sonnet-4-5"
+
+# Taille maximale, en caractères, d'un morceau de fichier envoyé au LLM. Entier > 0. Remplace la
+# valeur de la configuration personnelle.
+# Priorité : ce fichier > configuration personnelle > défaut.
+# max_chunk_chars = 30000
+
+# Nombre d'appels LLM simultanés (borne aussi les fils d'analyse). Entier > 0. Remplace la valeur
+# de la configuration personnelle.
+# Priorité : ce fichier > configuration personnelle > défaut.
+# concurrency = 2
+
+# Durée maximale d'un appel LLM HTTP entier, en secondes. Entier > 0. Remplace la valeur de la
+# configuration personnelle.
+# Priorité : ce fichier > configuration personnelle > défaut.
+# timeout_secs = 600
+
+# Nombre maximal de fichiers par appel d'enrichissement. Entier > 0. Remplace la valeur de la
+# configuration personnelle ; l'option --batch-files l'emporte, pour une commande.
+# Priorité : --batch-files > ce fichier > configuration personnelle > défaut.
+# batch_files = 4
+
+# Nouveaux essais d'un appel dont la réponse est non conforme. Entier >= 0. Remplace la valeur de
+# la configuration personnelle ; l'option --format-retries l'emporte, pour une commande.
+# Priorité : --format-retries > ce fichier > configuration personnelle > défaut.
+# format_retries = 4
