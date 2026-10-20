@@ -47,8 +47,6 @@ impl<'t> Preorder<'t> {
         }
     }
 
-    // Utilisé par Scala et Groovy (T-094).
-    #[allow(dead_code)]
     /// Le prochain `next` ne descend pas dans le dernier nœud rendu.
     pub(crate) fn skip_children(&mut self) {
         self.skip = true;

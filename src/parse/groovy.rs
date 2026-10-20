@@ -22,6 +22,7 @@ use crate::model::{EdgeKind, SubKind};
 
 use super::calls::{Calls, Locals, Receiver};
 use super::jvm::{clean_type_name, file_stem_ident, Builder, INIT};
+use super::walk::Preorder;
 use super::{FileStructure, Lang};
 
 /// Méthode qui porte les instructions d'un script (`Script.run()` de Groovy).
@@ -243,10 +244,18 @@ impl Ctx<'_> {
     }
 
     /// Types locaux (paramètres et variables), sans distinguer les portées.
-    fn collect_locals(&self, n: Node, locals: &mut Locals) {
-        if n.kind() == "ERROR" {
-            return;
+    fn collect_locals(&self, root: Node, locals: &mut Locals) {
+        let mut it = Preorder::new(root);
+        while let Some(n) = it.next() {
+            if n.kind() == "ERROR" {
+                it.skip_children();
+                continue;
+            }
+            self.collect_local(n, locals);
         }
+    }
+
+    fn collect_local(&self, n: Node, locals: &mut Locals) {
         match n.kind() {
             "formal_parameter" | "enhanced_for_statement" => {
                 if let Some(name) = n.child_by_field_name("name") {
@@ -269,10 +278,6 @@ impl Ctx<'_> {
             }
             _ => {}
         }
-        let mut cur = n.walk();
-        for c in n.children(&mut cur) {
-            self.collect_locals(c, locals);
-        }
     }
 
     fn method_calls(&mut self, method: &str, decl: Node) {
@@ -282,10 +287,18 @@ impl Ctx<'_> {
         self.walk_calls(decl, method, &types, &locals);
     }
 
-    fn walk_calls(&mut self, n: Node, method: &str, types: &[String], locals: &Locals) {
-        if n.kind() == "ERROR" {
-            return;
+    fn walk_calls(&mut self, root: Node, method: &str, types: &[String], locals: &Locals) {
+        let mut it = Preorder::new(root);
+        while let Some(n) = it.next() {
+            if n.kind() == "ERROR" {
+                it.skip_children();
+                continue;
+            }
+            self.visit_call(n, method, types, locals);
         }
+    }
+
+    fn visit_call(&mut self, n: Node, method: &str, types: &[String], locals: &Locals) {
         match n.kind() {
             "method_invocation" => {
                 if let Some(name) = n.child_by_field_name("name") {
@@ -309,10 +322,6 @@ impl Ctx<'_> {
                 }
             }
             _ => {}
-        }
-        let mut cur = n.walk();
-        for c in n.children(&mut cur) {
-            self.walk_calls(c, method, types, locals);
         }
     }
 
@@ -553,5 +562,38 @@ mod tests {
         assert_eq!(run("E.groovy", ""), FileStructure::default());
         let s = run("B.groovy", "class Ok { void f() { } }\nclass {{{ ((\n");
         assert!(decl(&s, NodeKind::Method, "Ok.f").is_some());
+    }
+
+    fn run_small_stack(name: &'static str, src: String) -> FileStructure {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || extract(Path::new(name), &src))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn req044_ac2_concatenation_de_10000_termes_en_pile_reduite() {
+        let terms: String = (1..10_000).map(|i| format!(" + \"s{i}\"")).collect();
+        let src = format!(
+            "class G {{\n  String helper() {{ \"\" }}\n  String m() {{ return helper(){terms} }}\n}}\n"
+        );
+        let s = run_small_stack("G.groovy", src);
+        assert!(has_ref(&s, "method:G.m", EdgeKind::Calls, "G.helper"));
+    }
+
+    #[test]
+    fn req044_ac2_script_de_10000_termes_en_pile_reduite() {
+        let terms: String = (1..10_000).map(|i| format!(" + \"s{i}\"")).collect();
+        let src = format!("def helper() {{ \"\" }}\ndef s = helper(){terms}\n");
+        let s = run_small_stack("Deep.groovy", src);
+        assert!(has_ref(
+            &s,
+            "method:Deep.run",
+            EdgeKind::Calls,
+            "Deep.helper"
+        ));
     }
 }

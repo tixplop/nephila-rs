@@ -11,6 +11,7 @@ use crate::model::{EdgeKind, SubKind};
 
 use super::calls::{Calls, Locals, Receiver};
 use super::jvm::{clean_type_name, file_stem_ident, Builder, INIT};
+use super::walk::Preorder;
 use super::{FileStructure, Lang};
 
 /// Extrait la structure d'un fichier Scala, en un seul passage sur l'arbre.
@@ -259,10 +260,18 @@ impl Ctx<'_> {
         t.filter(|t| t.kind() != "arguments").map(|t| self.text(t))
     }
 
-    fn collect_locals(&self, n: Node, locals: &mut Locals) {
-        if n.kind() == "ERROR" {
-            return;
+    fn collect_locals(&self, root: Node, locals: &mut Locals) {
+        let mut it = Preorder::new(root);
+        while let Some(n) = it.next() {
+            if n.kind() == "ERROR" {
+                it.skip_children();
+                continue;
+            }
+            self.collect_local(n, locals);
         }
+    }
+
+    fn collect_local(&self, n: Node, locals: &mut Locals) {
         match n.kind() {
             "parameter" | "class_parameter" => {
                 if let Some(name) = n.child_by_field_name("name") {
@@ -280,10 +289,6 @@ impl Ctx<'_> {
             }
             _ => {}
         }
-        let mut cur = n.walk();
-        for c in n.children(&mut cur) {
-            self.collect_locals(c, locals);
-        }
     }
 
     fn method_calls(&mut self, method: &str, decl: Node) {
@@ -293,10 +298,18 @@ impl Ctx<'_> {
         self.walk_calls(decl, method, &types, &locals);
     }
 
-    fn walk_calls(&mut self, n: Node, method: &str, types: &[String], locals: &Locals) {
-        if n.kind() == "ERROR" {
-            return;
+    fn walk_calls(&mut self, root: Node, method: &str, types: &[String], locals: &Locals) {
+        let mut it = Preorder::new(root);
+        while let Some(n) = it.next() {
+            if n.kind() == "ERROR" {
+                it.skip_children();
+                continue;
+            }
+            self.visit_call(n, method, types, locals);
         }
+    }
+
+    fn visit_call(&mut self, n: Node, method: &str, types: &[String], locals: &Locals) {
         if n.kind() == "call_expression" {
             if let Some(mut f) = n.child_by_field_name("function") {
                 if f.kind() == "generic_function" {
@@ -324,10 +337,6 @@ impl Ctx<'_> {
                     _ => {}
                 }
             }
-        }
-        let mut cur = n.walk();
-        for c in n.children(&mut cur) {
-            self.walk_calls(c, method, types, locals);
         }
     }
 
@@ -573,5 +582,25 @@ mod tests {
         assert_eq!(run("E.scala", ""), FileStructure::default());
         let s = run("B.scala", "class Ok { def f() = 1 }\nclass {{{ ((\n");
         assert!(decl(&s, NodeKind::Method, "Ok.f").is_some());
+    }
+
+    fn run_small_stack(name: &'static str, src: String) -> FileStructure {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || extract(Path::new(name), &src))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn req044_ac2_concatenation_de_10000_termes_en_pile_reduite() {
+        let terms: String = (1..10_000).map(|i| format!(" + \"s{i}\"")).collect();
+        let src = format!(
+            "class S {{\n  def helper(): String = \"\"\n  def m(): String = helper(){terms}\n}}\n"
+        );
+        let s = run_small_stack("S.scala", src);
+        assert!(has_ref(&s, "method:S.m", EdgeKind::Calls, "S.helper"));
     }
 }
