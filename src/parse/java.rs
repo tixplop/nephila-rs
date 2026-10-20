@@ -8,6 +8,7 @@ use crate::model::{EdgeKind, SubKind};
 
 use super::calls::{Calls, Locals, Receiver};
 use super::jvm::{clean_type_name, Builder, INIT};
+use super::walk::Preorder;
 use super::{FileStructure, Lang};
 
 /// Extrait la structure d'un fichier Java, en un seul passage sur l'arbre (tolérant aux erreurs).
@@ -203,45 +204,44 @@ fn collect_locals(n: Node, src: &[u8], locals: &mut Locals) {
             locals.declare(&text_of(name, src), &text_of(t, src));
         }
     };
-    match n.kind() {
-        "formal_parameter" | "enhanced_for_statement" => typed(n, locals),
-        "resource" => {
-            if let (Some(t), Some(name)) =
-                (n.child_by_field_name("type"), n.child_by_field_name("name"))
-            {
-                let ty = text_of(t, src);
-                locals.declare(
-                    &text_of(name, src),
-                    &initialised_type(&ty, n.child_by_field_name("value"), src),
-                );
+    let mut it = Preorder::new(n);
+    while let Some(n) = it.next() {
+        match n.kind() {
+            "formal_parameter" | "enhanced_for_statement" => typed(n, locals),
+            "resource" => {
+                if let (Some(t), Some(name)) =
+                    (n.child_by_field_name("type"), n.child_by_field_name("name"))
+                {
+                    let ty = text_of(t, src);
+                    locals.declare(
+                        &text_of(name, src),
+                        &initialised_type(&ty, n.child_by_field_name("value"), src),
+                    );
+                }
             }
-        }
-        "local_variable_declaration" => {
-            if let Some(t) = n.child_by_field_name("type") {
-                let ty = text_of(t, src);
-                let mut cur = n.walk();
-                for d in n.children_by_field_name("declarator", &mut cur) {
-                    if let Some(name) = d.child_by_field_name("name") {
-                        let ty = initialised_type(&ty, d.child_by_field_name("value"), src);
-                        locals.declare(&text_of(name, src), &ty);
+            "local_variable_declaration" => {
+                if let Some(t) = n.child_by_field_name("type") {
+                    let ty = text_of(t, src);
+                    let mut cur = n.walk();
+                    for d in n.children_by_field_name("declarator", &mut cur) {
+                        if let Some(name) = d.child_by_field_name("name") {
+                            let ty = initialised_type(&ty, d.child_by_field_name("value"), src);
+                            locals.declare(&text_of(name, src), &ty);
+                        }
                     }
                 }
             }
-        }
-        "type_pattern" => {
-            let mut cur = n.walk();
-            let kids: Vec<Node> = n.named_children(&mut cur).collect();
-            if let [t, name] = kids.as_slice() {
-                if name.kind() == "identifier" {
-                    locals.declare(&text_of(*name, src), &text_of(*t, src));
+            "type_pattern" => {
+                let mut cur = n.walk();
+                let kids: Vec<Node> = n.named_children(&mut cur).collect();
+                if let [t, name] = kids.as_slice() {
+                    if name.kind() == "identifier" {
+                        locals.declare(&text_of(*name, src), &text_of(*t, src));
+                    }
                 }
             }
+            _ => {}
         }
-        _ => {}
-    }
-    let mut cur = n.walk();
-    for c in n.children(&mut cur) {
-        collect_locals(c, src, locals);
     }
 }
 
@@ -276,18 +276,17 @@ fn walk_calls(
     locals: &Locals,
     calls: &mut Calls,
 ) {
-    if n.kind() == "method_invocation" {
-        if let Some(name) = n.child_by_field_name("name") {
-            let receiver = match n.child_by_field_name("object") {
-                None => Receiver::Implicit,
-                Some(o) => receiver_of(o, src),
-            };
-            calls.record(method, types, locals, receiver, &text_of(name, src));
+    let mut it = Preorder::new(n);
+    while let Some(n) = it.next() {
+        if n.kind() == "method_invocation" {
+            if let Some(name) = n.child_by_field_name("name") {
+                let receiver = match n.child_by_field_name("object") {
+                    None => Receiver::Implicit,
+                    Some(o) => receiver_of(o, src),
+                };
+                calls.record(method, types, locals, receiver, &text_of(name, src));
+            }
         }
-    }
-    let mut cur = n.walk();
-    for c in n.children(&mut cur) {
-        walk_calls(c, src, method, types, locals, calls);
     }
 }
 
@@ -612,5 +611,35 @@ interface I extends J, K<X> { void m(); }
             .iter()
             .filter(|d| d.kind == NodeKind::Method)
             .all(|d| d.qualified.starts_with("gen.Big.")));
+    }
+
+    fn in_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn req044_ac2_concatenation_de_10000_termes_en_pile_reduite() {
+        let terms: String = (1..10_000).map(|i| format!(" + \"s{i}\"")).collect();
+        let src = format!(
+            "class Big {{\n  String helper() {{ return \"\"; }}\n  String m() {{\n    return helper(){terms};\n  }}\n}}\n"
+        );
+        let s = in_small_stack(move || extract(&src)).unwrap();
+        assert!(has_ref(&s, "method:Big.m", EdgeKind::Calls, "Big.helper"));
+    }
+
+    #[test]
+    fn req044_ac2_5000_parentheses_imbriquees_en_pile_reduite() {
+        let src = format!(
+            "class Big {{\n  String helper() {{ return \"\"; }}\n  String m() {{\n    return {}helper(){};\n  }}\n}}\n",
+            "(".repeat(5_000),
+            ")".repeat(5_000)
+        );
+        let s = in_small_stack(move || extract(&src)).unwrap();
+        assert!(has_ref(&s, "method:Big.m", EdgeKind::Calls, "Big.helper"));
     }
 }

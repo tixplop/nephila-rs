@@ -12,6 +12,7 @@ use crate::model::{EdgeKind, SubKind};
 
 use super::calls::{Calls, Locals, Receiver};
 use super::jvm::{Builder, INIT};
+use super::walk::Preorder;
 use super::{FileStructure, Lang};
 
 /// Extrait la structure d'un fichier Kotlin (`.kt` ou script `.kts`), en un passage.
@@ -320,23 +321,22 @@ fn constructor_type(decl: Node, src: &[u8]) -> Option<String> {
 
 /// Types locaux : paramètres et variables locales, sans distinguer les portées.
 fn collect_locals(n: Node, src: &[u8], al: &Aliases, locals: &mut Locals) {
-    match n.kind() {
-        "parameter" | "class_parameter" => {
-            if let Some(id) = first_named(n, &["identifier"]) {
-                let ty = type_child(n).map(|t| text_of(t, src)).unwrap_or_default();
-                locals.declare(&text_of(id, src), &al.resolve(&ty));
+    let mut it = Preorder::new(n);
+    while let Some(n) = it.next() {
+        match n.kind() {
+            "parameter" | "class_parameter" => {
+                if let Some(id) = first_named(n, &["identifier"]) {
+                    let ty = type_child(n).map(|t| text_of(t, src)).unwrap_or_default();
+                    locals.declare(&text_of(id, src), &al.resolve(&ty));
+                }
             }
-        }
-        "property_declaration" => {
-            if let Some((name, ty)) = declared_variable(n, src, al) {
-                locals.declare(&name, &ty);
+            "property_declaration" => {
+                if let Some((name, ty)) = declared_variable(n, src, al) {
+                    locals.declare(&name, &ty);
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
-    let mut cur = n.walk();
-    for c in n.children(&mut cur) {
-        collect_locals(c, src, al, locals);
     }
 }
 
@@ -363,38 +363,37 @@ fn walk_calls(
     locals: &Locals,
     calls: &mut Calls,
 ) {
-    if n.kind() == "call_expression" {
-        if let Some(callee) = n.named_child(0) {
-            match callee.kind() {
-                // `T(…)` : construction, pas un appel de méthode.
-                "identifier" => {
-                    let name = text_of(callee, src);
-                    if !name.chars().next().is_some_and(char::is_uppercase) {
-                        calls.record(method, types, locals, Receiver::Implicit, &name);
-                    }
-                }
-                "navigation_expression" => {
-                    let mut cur = callee.walk();
-                    let kids: Vec<Node> = callee.named_children(&mut cur).collect();
-                    if let (Some(recv), Some(name)) = (kids.first(), kids.last()) {
-                        if kids.len() == 2 && name.kind() == "identifier" {
-                            calls.record(
-                                method,
-                                types,
-                                locals,
-                                receiver_of(*recv, src, al),
-                                &text_of(*name, src),
-                            );
+    let mut it = Preorder::new(n);
+    while let Some(n) = it.next() {
+        if n.kind() == "call_expression" {
+            if let Some(callee) = n.named_child(0) {
+                match callee.kind() {
+                    // `T(…)` : construction, pas un appel de méthode.
+                    "identifier" => {
+                        let name = text_of(callee, src);
+                        if !name.chars().next().is_some_and(char::is_uppercase) {
+                            calls.record(method, types, locals, Receiver::Implicit, &name);
                         }
                     }
+                    "navigation_expression" => {
+                        let mut cur = callee.walk();
+                        let kids: Vec<Node> = callee.named_children(&mut cur).collect();
+                        if let (Some(recv), Some(name)) = (kids.first(), kids.last()) {
+                            if kids.len() == 2 && name.kind() == "identifier" {
+                                calls.record(
+                                    method,
+                                    types,
+                                    locals,
+                                    receiver_of(*recv, src, al),
+                                    &text_of(*name, src),
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-    }
-    let mut cur = n.walk();
-    for c in n.children(&mut cur) {
-        walk_calls(c, src, al, method, types, locals, calls);
     }
 }
 
@@ -566,5 +565,20 @@ mod tests {
     fn entree_vide_ou_invalide() {
         assert!(run("E.kt", "").declares.is_empty());
         let _ = run("E.kt", "class {{{ fun ((");
+    }
+
+    #[test]
+    fn req044_ac2_concatenation_de_10000_termes_en_pile_reduite() {
+        let terms: String = (1..10_000).map(|i| format!(" + \"s{i}\"")).collect();
+        let src =
+            format!("class K {{\n  fun helper() = \"\"\n  fun m(): String = helper(){terms}\n}}\n");
+        let s = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || extract(Path::new("K.kt"), &src))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(has_ref(&s, "method:K.m", EdgeKind::Calls, "K.helper"));
     }
 }

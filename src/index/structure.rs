@@ -15,6 +15,9 @@ use crate::scan::ScannedFile;
 use crate::store::Store;
 use crate::trace;
 
+/// Pile des fils d'analyse : filet pour les récursions restantes (DEC-054).
+const EXTRACT_STACK: usize = 16 * 1024 * 1024;
+
 /// Nombre de fichiers enregistrés par transaction.
 const BATCH: usize = 200;
 
@@ -51,29 +54,47 @@ pub(crate) fn analyze(
     let mut batch: Vec<Batched> = Vec::new();
 
     let mut meter = progress::Meter::start(Phase::Extraction, files.len());
+    let mut spawn_error: Option<Error> = None;
     std::thread::scope(|scope| {
         let queue = &queue;
         let ctx = &ctx;
+        let mut started_workers = 0usize;
         for _ in 0..workers {
             let tx = tx.clone();
-            scope.spawn(move || loop {
-                let Some(file) = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front() else {
-                    break;
-                };
-                let outcome = match std::fs::read_to_string(repo.join(&file.path)) {
-                    Err(e) => Outcome::Failed(
-                        file.path.clone(),
-                        Error::Message(format!("lecture de {} impossible : {e}", file.path)),
-                    ),
-                    Ok(text) => match parse::extract(Path::new(&file.path), &text, ctx) {
-                        Ok(s) => Outcome::Parsed(file.path.clone(), s),
-                        Err(e) => Outcome::Failed(file.path.clone(), e),
-                    },
-                };
-                if tx.send(outcome).is_err() {
+            let spawned = std::thread::Builder::new()
+                .name("nephila-extract".into())
+                .stack_size(EXTRACT_STACK)
+                .spawn_scoped(scope, move || loop {
+                    let Some(file) = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front()
+                    else {
+                        break;
+                    };
+                    let outcome = match std::fs::read_to_string(repo.join(&file.path)) {
+                        Err(e) => Outcome::Failed(
+                            file.path.clone(),
+                            Error::Message(format!("lecture de {} impossible : {e}", file.path)),
+                        ),
+                        Ok(text) => match parse::extract(Path::new(&file.path), &text, ctx) {
+                            Ok(s) => Outcome::Parsed(file.path.clone(), s),
+                            Err(e) => Outcome::Failed(file.path.clone(), e),
+                        },
+                    };
+                    if tx.send(outcome).is_err() {
+                        break;
+                    }
+                });
+            match spawned {
+                Ok(_) => started_workers += 1,
+                Err(e) => {
+                    if started_workers == 0 {
+                        queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                        spawn_error = Some(Error::Message(format!(
+                            "création des fils d'analyse impossible : {e}"
+                        )));
+                    }
                     break;
                 }
-            });
+            }
         }
         drop(tx);
         for outcome in rx {
@@ -114,7 +135,7 @@ pub(crate) fn analyze(
         started.elapsed().as_millis(),
         report.failed - failed_before
     );
-    match write_error {
+    match spawn_error.or(write_error) {
         Some(e) => Err(e),
         None => Ok(()),
     }

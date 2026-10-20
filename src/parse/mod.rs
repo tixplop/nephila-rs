@@ -20,6 +20,7 @@ pub mod maven;
 pub mod npm;
 pub mod scala;
 pub mod sql;
+pub(crate) mod walk;
 pub mod xml_data;
 pub mod yaml;
 

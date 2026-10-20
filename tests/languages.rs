@@ -350,3 +350,74 @@ fn req015_ac1_path_from_analysis_calls() {
             .unwrap_or_else(|| panic!("« {p} » absent : {t}"));
     }
 }
+
+fn big_java(terms: usize) -> String {
+    let tail: String = (1..terms).map(|i| format!(" + \"s{i}\"")).collect();
+    format!(
+        "class Big {{\n  String helper() {{ return \"\"; }}\n  String m() {{\n    return helper(){tail};\n  }}\n}}\n"
+    )
+}
+
+fn big_repo(terms: usize) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/Big.java"), big_java(terms)).unwrap();
+    (tmp, repo)
+}
+
+fn assert_big_graph(repo: &Path) {
+    let st = Env::run(repo, &["status"]);
+    assert!(
+        text(&st.stdout).starts_with("graphe à jour"),
+        "{}",
+        text(&st.stdout)
+    );
+    let out = Env::run(repo, &["export", "--output", "-"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(node(&v, "type:Big").is_some());
+    assert!(node(&v, "method:Big.m").is_some());
+    assert!(has_edge(&v, "method:Big.m", "calls", "method:Big.helper"));
+}
+
+#[test]
+fn req044_ac1_java_concatenation_de_10000_termes_indexee() {
+    let (_tmp, repo) = big_repo(10_000);
+    let out = Env::run(&repo, &["build"]);
+    assert!(
+        out.status.success(),
+        "{:?} {}",
+        out.status,
+        text(&out.stderr)
+    );
+    assert!(text(&out.stderr).is_empty(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("0 fichiers en attente"));
+    assert_big_graph(&repo);
+}
+
+#[test]
+fn req044_ac4_update_apres_modification() {
+    let (_tmp, repo) = big_repo(10_000);
+    let out = Env::run(&repo, &["build"]);
+    assert!(
+        out.status.success(),
+        "{:?} {}",
+        out.status,
+        text(&out.stderr)
+    );
+    fs::write(repo.join("src/Big.java"), big_java(10_001)).unwrap();
+    let out = Env::run(&repo, &["update"]);
+    assert!(
+        out.status.success(),
+        "{:?} {}",
+        out.status,
+        text(&out.stderr)
+    );
+    assert!(
+        text(&out.stdout).contains("0 fichiers en attente"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_big_graph(&repo);
+}
