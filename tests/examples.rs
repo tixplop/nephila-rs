@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use nephila::config::{
     Config, ProjectSettings, Provider, DEFAULT_BATCH_FILES, DEFAULT_CONCURRENCY,
-    DEFAULT_FORMAT_RETRIES, DEFAULT_MAX_CHUNK_CHARS, DEFAULT_TIMEOUT_SECS, PROJECT_SETTINGS,
+    DEFAULT_FORMAT_RETRIES, DEFAULT_MAX_CHUNK_CHARS, DEFAULT_TIMEOUT_SECS, PROJECT_CAPS,
+    PROJECT_SETTINGS,
 };
 use nephila::filter::{FileType, Filters, ProjectFile, ProjectFilters};
 
@@ -578,6 +579,12 @@ fn REQ042_AC12_lignes_reactivees_donnent_les_reglages_ecrits() {
         })
         .collect();
     assert_eq!(written.len(), PROJECT_SETTINGS.len());
+    for (key, text) in &written {
+        if let Some(cap) = nephila::config::project_cap(key) {
+            let n: u64 = text.parse().unwrap();
+            assert!(n <= cap, "{key} = {n} dépasse le plafond {cap}");
+        }
+    }
     let value = |k: &str| written.iter().find(|(n, _)| *n == k).unwrap().1.clone();
     let s = &file.settings;
     assert_eq!(s.model.as_deref(), Some(value("model").trim_matches('"')));
@@ -670,6 +677,7 @@ fn REQ042_AC13_readme_decrit_les_reglages_de_projet() {
         "nephila build",
         "build --verbose",
         "examples/nephila.toml",
+        "au plus 64",
     ] {
         assert!(
             sec.contains(needle),
@@ -678,4 +686,68 @@ fn REQ042_AC13_readme_decrit_les_reglages_de_projet() {
     }
     assert!(sec.contains("option > fichier de projet > configuration personnelle > défaut"));
     assert!(!readme.contains("configuration globale"));
+}
+
+const CAPS_HEADER: &str = "# Plafonds : ici seulement, chaque réglage entier a un plafond (ligne « Plafond dans ce fichier ») ; la configuration personnelle et les options n'en ont pas.";
+
+#[test]
+fn REQ042_AC20_lignes_de_plafond_de_l_exemple() {
+    let text = example("nephila.toml");
+    let lines: Vec<&str> = text.lines().collect();
+    let reason = lines
+        .iter()
+        .position(|l| l.starts_with("# Raison : "))
+        .unwrap();
+    assert_eq!(lines[reason + 1], CAPS_HEADER);
+    for (key, cap) in PROJECT_CAPS {
+        let index = lines.iter().position(|l| key_of(l) == Some(key)).unwrap();
+        assert!(lines[index - 1].starts_with("# Priorité : "), "{key}");
+        assert_eq!(
+            lines[index - 2],
+            format!("# Plafond dans ce fichier : au plus {cap}."),
+            "{key}"
+        );
+    }
+    let count = lines
+        .iter()
+        .filter(|l| l.starts_with("# Plafond dans ce fichier :"))
+        .count();
+    assert_eq!(count, 5);
+    let model = lines
+        .iter()
+        .position(|l| key_of(l) == Some("model"))
+        .unwrap();
+    assert!(!lines[model - 3..model]
+        .iter()
+        .any(|l| l.starts_with("# Plafond dans ce fichier :")));
+    for l in &lines {
+        assert!(
+            !l.contains("maximum")
+                || l.starts_with("# Taille maximale")
+                || l.starts_with("# Durée maximale")
+                || l.starts_with("# Nombre maximal"),
+            "{l}"
+        );
+        assert!(!l.contains("4294967295"));
+    }
+}
+
+#[test]
+fn REQ042_AC21_readme_table_des_plafonds() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
+    let lines: Vec<&str> = sec.lines().collect();
+    let head = lines
+        .iter()
+        .position(|l| *l == "| Réglage | Plafond dans `.nephila.toml` |")
+        .expect("en-tête de table absent");
+    assert_eq!(lines[head + 1], "|---|---|");
+    for (i, (key, cap)) in PROJECT_CAPS.iter().enumerate() {
+        assert_eq!(lines[head + 2 + i], format!("| `{key}` | {cap} |"));
+    }
+    assert!(!lines[head + 2..head + 7]
+        .iter()
+        .any(|l| l.contains("`model`")));
+    assert!(lines[head + 7].is_empty());
+    assert!(lines[head + 8].starts_with("Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et les options --batch-files et --format-retries n'en ont pas."));
 }

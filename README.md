@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.16.1                                      # version voulue
+V=v0.17.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -337,10 +337,20 @@ format_retries = 4
 
 Les six réglages sont `model` (chaîne non vide), `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` (entiers ≥ 1) et `format_retries` (entier ≥ 0). Un réglage du fichier de projet remplace celui de la configuration personnelle ; un réglage absent garde la valeur personnelle, ou le défaut. Priorité : option > fichier de projet > configuration personnelle > défaut (les options sont `--batch-files` et `--format-retries`).
 
+| Réglage | Plafond dans `.nephila.toml` |
+|---|---|
+| `max_chunk_chars` | 1000000 |
+| `concurrency` | 64 |
+| `timeout_secs` | 3600 |
+| `batch_files` | 100 |
+| `format_retries` | 10 |
+
+Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et les options --batch-files et --format-retries n'en ont pas. Un dépôt cloné ne peut ainsi imposer ni plus de fils, ni des appels plus longs ou plus gros, ni plus d'essais.
+
 - **Clés de connexion refusées** : `provider`, `base_url`, `api_key_env`, `tls_ca_cert` et `tls_insecure` ne sont permises que dans la configuration personnelle. Le fichier de projet est versionné et vient souvent d'un dépôt cloné : s'il pouvait changer l'adresse du serveur ou la variable qui contient la clé, cloner un dépôt suffirait à envoyer votre code et une clé d'API (ou un autre secret de l'environnement) à un serveur tiers, ou à désactiver le contrôle des certificats.
 - **Sans LLM actif** (aucune configuration personnelle, ou `--no-llm`), les réglages n'ont aucun effet et aucun message : un collègue sans configuration ne voit rien. Le fichier reste validé en entier.
 - **Changer de modèle ne réenrichit rien** : `status` et `update` disent `graphe à jour`. Pour réenrichir avec le nouveau modèle, lancez `nephila build`.
-- **Dépôt tiers** : un dépôt cloné peut choisir un modèle plus coûteux ou une `concurrency` plus forte que les vôtres. Vérifiez avec `nephila build --verbose` : la ligne `config` donne les valeurs effectives et nomme les réglages venus de `.nephila.toml` (voir [Traces](#traces---verbose)).
+- **Dépôt tiers** : un dépôt cloné peut choisir un modèle plus coûteux ou une `concurrency` plus forte que les vôtres (au plus 64). Vérifiez avec `nephila build --verbose` : la ligne `config` donne les valeurs effectives et nomme les réglages venus de `.nephila.toml` (voir [Traces](#traces---verbose)).
 
 Un exemple commenté est fourni dans [`examples/nephila.toml`](examples/nephila.toml).
 
@@ -374,7 +384,8 @@ Une clé de connexion et un réglage invalide donnent chacun une ligne :
 
 ```
 erreur: ./.nephila.toml : clé `base_url` permise seulement dans la configuration personnelle (/home/vous/.config/nephila/config.toml)
-erreur: ./.nephila.toml : clé `concurrency` : valeur invalide `-1` (entier strictement positif attendu)
+erreur: ./.nephila.toml : clé `concurrency` : valeur invalide `-1` (entier strictement positif attendu, au plus 64)
+erreur: ./.nephila.toml : clé `format_retries` : valeur invalide `50` (entier positif ou nul attendu, au plus 10)
 ```
 
 La première ne reprend pas la valeur écrite (une `base_url` peut contenir un jeton).
@@ -638,6 +649,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.17 | Plafonds des réglages entiers de `.nephila.toml` (rupture : une valeur au-dessus est refusée) |
 | 0.16.1 | Analyse des expressions très imbriquées (Java, Kotlin, Scala, Groovy) sans débordement de pile |
 | 0.16 | Option `--show-progress` de `build` et `update` |
 | 0.15 | Réglages LLM du dépôt dans `.nephila.toml` |
@@ -663,7 +675,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.16.1 && git push origin v0.16.1
+git tag v0.17.0 && git push origin v0.17.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.

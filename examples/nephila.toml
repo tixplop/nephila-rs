@@ -68,6 +68,7 @@
 # Valeurs effectives et réglages venus de ce fichier : nephila build --verbose (ligne config).
 # Refusées ici (configuration personnelle seulement) : provider, base_url, api_key_env, tls_ca_cert, tls_insecure.
 # Raison : ce fichier est versionné ; un dépôt cloné ne doit pas pouvoir envoyer votre code ou votre clé d'API à un autre serveur, ni couper le contrôle des certificats.
+# Plafonds : ici seulement, chaque réglage entier a un plafond (ligne « Plafond dans ce fichier ») ; la configuration personnelle et les options n'en ont pas.
 
 # Nom du modèle utilisé pour ce dépôt. Texte non vide. Remplace le modèle de la configuration
 # personnelle.
@@ -76,25 +77,30 @@
 
 # Taille maximale, en caractères, d'un morceau de fichier envoyé au LLM. Entier > 0. Remplace la
 # valeur de la configuration personnelle.
+# Plafond dans ce fichier : au plus 1000000.
 # Priorité : ce fichier > configuration personnelle > défaut.
 # max_chunk_chars = 30000
 
 # Nombre d'appels LLM simultanés (borne aussi les fils d'analyse). Entier > 0. Remplace la valeur
 # de la configuration personnelle.
+# Plafond dans ce fichier : au plus 64.
 # Priorité : ce fichier > configuration personnelle > défaut.
 # concurrency = 2
 
 # Durée maximale d'un appel LLM HTTP entier, en secondes. Entier > 0. Remplace la valeur de la
 # configuration personnelle.
+# Plafond dans ce fichier : au plus 3600.
 # Priorité : ce fichier > configuration personnelle > défaut.
 # timeout_secs = 600
 
 # Nombre maximal de fichiers par appel d'enrichissement. Entier > 0. Remplace la valeur de la
 # configuration personnelle ; l'option --batch-files l'emporte, pour une commande.
+# Plafond dans ce fichier : au plus 100.
 # Priorité : --batch-files > ce fichier > configuration personnelle > défaut.
 # batch_files = 4
 
 # Nouveaux essais d'un appel dont la réponse est non conforme. Entier >= 0. Remplace la valeur de
 # la configuration personnelle ; l'option --format-retries l'emporte, pour une commande.
+# Plafond dans ce fichier : au plus 10.
 # Priorité : --format-retries > ce fichier > configuration personnelle > défaut.
 # format_retries = 4
