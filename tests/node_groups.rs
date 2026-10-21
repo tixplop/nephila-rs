@@ -358,7 +358,7 @@ fn req047_ac4_mock_journal_traces_fixture_et_pannes() {
 }
 
 #[test]
-fn req047_ac5_deux_morceaux_deux_groupes_dans_l_ordre() {
+fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
     // 199 méthodes + le type = 200 nœuds ; limite de morceau à la moitié du fichier environ.
     let src = java("Big", 199);
     let limit = src.chars().count() / 2 + 100;
@@ -369,13 +369,13 @@ fn req047_ac5_deux_morceaux_deux_groupes_dans_l_ordre() {
     let o = probe.run(&["build"], &[]);
     let (out, err) = text(&o);
     assert_eq!(o.status.code(), Some(0), "{out} {err}");
-    let expected: Vec<String> = (1..=4).map(|i| format!("{BIG}\t{i}")).collect();
+    let expected: Vec<String> = (1..=2).map(|i| format!("{BIG}\t{i}")).collect();
     assert_eq!(probe.log_lines(), expected);
     assert!(out.contains("0 fichiers à enrichir"), "{out}");
 
     // Même dépôt vers le faux serveur : contenus et listes de chaque requête.
     let mut responses = vec![(200, "{}".to_string())];
-    responses.extend((0..4).map(|_| reply("openai", &summary_json(&[]))));
+    responses.extend((0..2).map(|_| reply("openai", &summary_json(&[]))));
     let env = Env::http(
         "openai",
         &[(BIG, src)],
@@ -389,27 +389,43 @@ fn req047_ac5_deux_morceaux_deux_groupes_dans_l_ordre() {
         .iter()
         .map(|b| user_prompt(b))
         .collect();
-    assert_eq!(prompts.len(), 4);
-    let groups = groups_of(&ids);
-    assert_eq!(groups.len(), 2);
+    assert_eq!(prompts.len(), 2);
     for (i, p) in prompts.iter().enumerate() {
         assert!(
             p.contains(&format!("(morceau {})", i + 1)),
             "appel {}",
             i + 1
         );
-        assert_eq!(listed_ids(p), groups[i % 2], "liste de l'appel {}", i + 1);
     }
-    assert_eq!(content_of(&prompts[0]), content_of(&prompts[1]));
-    assert_eq!(content_of(&prompts[2]), content_of(&prompts[3]));
-    assert_ne!(content_of(&prompts[0]), content_of(&prompts[2]));
-    let first = content_of(&prompts[0]);
-    assert!(first.starts_with("public class Big {"), "{first}");
-    assert!(first.contains("void m0()"), "appel 1");
-    assert!(!first.contains("void m198()"), "appel 1");
-    let last = content_of(&prompts[2]);
-    assert!(last.contains("void m198()"), "appel 3");
-    assert!(!last.contains("void m0()"), "appel 3");
+    // Liste attendue : identifiants dont le nom court (`Big`, `m<i>`) est un mot du contenu.
+    let words = |c: &str| -> BTreeSet<String> {
+        c.split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
+            .map(str::to_string)
+            .collect()
+    };
+    let short = |id: &str| id.rsplit(['.', ':']).next().unwrap().to_string();
+    let lists: Vec<Vec<String>> = prompts.iter().map(|p| listed_ids(p)).collect();
+    for (k, p) in prompts.iter().enumerate() {
+        let w = words(content_of(p));
+        let expected: Vec<String> = ids
+            .iter()
+            .filter(|id| w.contains(&short(id)))
+            .cloned()
+            .collect();
+        assert_eq!(lists[k], expected, "liste de la requête {}", k + 1);
+        assert!(lists[k].len() <= 150);
+    }
+    let big = ids.iter().find(|i| i.starts_with("type:")).unwrap();
+    assert!(lists[0].contains(big) && lists[1].contains(big));
+    let methods: BTreeSet<&String> = lists[0]
+        .iter()
+        .filter(|i| i.starts_with("method:"))
+        .collect();
+    assert!(lists[1].iter().all(|i| !methods.contains(i)));
+    let union: BTreeSet<&String> = lists.iter().flatten().collect();
+    assert_eq!(union, ids.iter().collect::<BTreeSet<_>>());
+    assert_ne!(content_of(&prompts[0]), content_of(&prompts[1]));
+    assert!(content_of(&prompts[0]).starts_with("public class Big {"));
 }
 
 #[test]
@@ -621,4 +637,144 @@ fn req047_ac11_une_seule_ligne_par_fichier() {
         .collect();
     assert_eq!(warns.len(), 1, "{err}");
     assert!(warns[0].starts_with(&prefix), "{}", warns[0]);
+}
+
+/// `n` caractères de remplissage (lettres et espaces), en lignes de 49 caractères au plus.
+fn filler(n: usize) -> String {
+    let base: Vec<char> = "Lorem ipsum dolor sit amet consectetur adipiscing elit "
+        .chars()
+        .collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while out.chars().count() < n {
+        let room = n - out.chars().count();
+        let len = room.min(50);
+        for _ in 0..len - 1 {
+            out.push(base[i % base.len()]);
+            i += 1;
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Titres `head` suivis de remplissage, pour un total de exactement `total` caractères.
+fn block(head: &str, total: usize) -> String {
+    let used = head.chars().count();
+    format!("{head}{}", filler(total - used))
+}
+
+const GUIDE: &str = "docs/guide.md";
+
+#[test]
+fn req047_ac15_sections_markdown_au_morceau_de_leur_titre() {
+    let m1 = block(
+        "# Guide\n\n## Installation rapide\n\n## Configuration du fournisseur\n\n",
+        3000,
+    );
+    let m2 = block(
+        "## Usage avancé\n\nExemples complets\n-----------------\n\n## Dépannage\n\n",
+        3000,
+    );
+    let m3 = block("## Dépannage\n\n```\n# Installation rapide\n```\n\n", 2800);
+    let src = format!("{m1}{m2}{m3}");
+    assert!(!src.contains("guide") && !src.contains("dépannage"));
+    let parts = nephila::chunk::split(&src, 3000);
+    assert_eq!(parts.len(), 3, "morceaux");
+    assert!(parts[0].contains("# Guide") && parts[0].contains("## Configuration"));
+    assert!(parts[1].contains("## Usage avancé") && parts[1].contains("Exemples complets"));
+    assert!(parts[2].contains("```\n# Installation rapide"));
+
+    let extra = "max_chunk_chars = 3000\n";
+    let mut responses = vec![(200, "{}".to_string())];
+    let answers = [
+        (
+            "document:docs/guide.md",
+            "Résumé du document guide numéro 1",
+        ),
+        (
+            "section:docs/guide.md#dépannage",
+            "Résumé de dépannage numéro 2",
+        ),
+        (
+            "section:docs/guide.md#dépannage-1",
+            "Résumé de dépannage numéro 3",
+        ),
+    ];
+    for (id, s) in answers {
+        responses.push(reply("openai", &summary_json(&[(id, s)])));
+    }
+    let env = Env::http(
+        "openai",
+        &[(GUIDE, src)],
+        extra,
+        FakeServer::start(responses),
+    );
+    let o = env.run(&["build"], &[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out} {err}");
+    assert!(out.contains("0 fichiers à enrichir"), "{out}");
+    let prompts: Vec<String> = env
+        .enrich_posts("openai")
+        .iter()
+        .map(|b| user_prompt(b))
+        .collect();
+    assert_eq!(prompts.len(), 3);
+    let expected: [&[&str]; 3] = [
+        &[
+            "document:docs/guide.md",
+            "section:docs/guide.md#configuration-du-fournisseur",
+            "section:docs/guide.md#guide",
+            "section:docs/guide.md#installation-rapide",
+        ],
+        &[
+            "section:docs/guide.md#dépannage",
+            "section:docs/guide.md#exemples-complets",
+            "section:docs/guide.md#usage-avancé",
+        ],
+        &["section:docs/guide.md#dépannage-1"],
+    ];
+    let titles: [&[&str]; 3] = [
+        &[
+            "# Guide",
+            "## Installation rapide",
+            "## Configuration du fournisseur",
+        ],
+        &["## Usage avancé", "Exemples complets", "## Dépannage"],
+        &["## Dépannage"],
+    ];
+    for (k, p) in prompts.iter().enumerate() {
+        assert!(
+            p.contains(&format!("(morceau {})", k + 1)),
+            "requête {}",
+            k + 1
+        );
+        assert_eq!(listed_ids(p), expected[k], "liste de la requête {}", k + 1);
+        for t in titles[k] {
+            assert!(
+                content_of(p).contains(&format!("{t}\n")),
+                "{t} dans {}",
+                k + 1
+            );
+        }
+    }
+    let o = env.run(&["query", "search", "Résumé", "--json"], &[]);
+    let (out, _) = text(&o);
+    assert!(o.status.success());
+    for s in [
+        "document guide numéro 1",
+        "dépannage numéro 2",
+        "dépannage numéro 3",
+    ] {
+        assert!(out.contains(s), "{s} : {out}");
+    }
+
+    let mock = Env::mock(
+        &[(GUIDE, fs::read_to_string(env.repo.join(GUIDE)).unwrap())],
+        extra,
+    );
+    let o = mock.run(&["build"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    let log: Vec<String> = (1..=3).map(|i| format!("{GUIDE}\t{i}")).collect();
+    assert_eq!(mock.log_lines(), log);
 }

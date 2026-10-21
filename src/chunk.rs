@@ -65,33 +65,49 @@ pub fn header(text: &str) -> String {
 /// morceaux suivant le premier sont précédés de l'en-tête. Une ligne plus longue que la limite
 /// forme un morceau à elle seule. Un texte sous la limite est renvoyé tel quel.
 pub fn split(text: &str, max_chars: usize) -> Vec<String> {
+    split_spans(text, max_chars)
+        .into_iter()
+        .map(|(part, _)| part)
+        .collect()
+}
+
+/// Comme `split`, avec pour chaque morceau l'octet de début de son corps dans `text` (0 pour le
+/// premier ; l'en-tête répété n'en fait pas partie). Le corps du morceau k s'étend jusqu'au début
+/// du corps du suivant (DEC-061).
+pub fn split_spans(text: &str, max_chars: usize) -> Vec<(String, usize)> {
     let max = max_chars.max(1);
     if text.chars().count() <= max {
-        return vec![text.to_string()];
+        return vec![(text.to_string(), 0)];
     }
     let head = header(text);
     let head_len = head.chars().count();
     // L'en-tête ne doit pas manger tout le budget : au moins la moitié reste pour le corps.
     let later_budget = max.saturating_sub(head_len).max(max / 2).max(1);
 
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<(String, usize)> = Vec::new();
     let mut cur = String::new();
+    let mut cur_start = 0usize;
     let mut cur_len = 0usize;
+    let mut pos = 0usize;
     for line in text.split_inclusive('\n') {
         let n = line.chars().count();
         let budget = if parts.is_empty() { max } else { later_budget };
         if cur_len > 0 && cur_len + n > budget {
-            parts.push(std::mem::take(&mut cur));
+            parts.push((std::mem::take(&mut cur), cur_start));
             cur_len = 0;
         }
-        if cur.is_empty() && !parts.is_empty() {
-            cur.push_str(&head);
+        if cur.is_empty() {
+            cur_start = pos;
+            if !parts.is_empty() {
+                cur.push_str(&head);
+            }
         }
         cur.push_str(line);
         cur_len += n;
+        pos += line.len();
     }
     if cur_len > 0 {
-        parts.push(cur);
+        parts.push((cur, cur_start));
     }
     parts
 }
@@ -181,5 +197,37 @@ mod tests {
         assert_eq!(m.concepts.len(), 1);
         assert_eq!(m.concepts[0].summary.as_deref(), Some("def"));
         assert_eq!(m.concepts[0].sections, ["section:g#a", "section:g#b"]);
+    }
+
+    #[test]
+    fn split_spans_corps_et_concatenation() {
+        let mut text = String::from("package p;\nimport x.Y;\npublic class A {\n");
+        for i in 0..40 {
+            text.push_str(&format!("  void m{i}() {{}}\n"));
+        }
+        text.push_str("}\n");
+        let spans = split_spans(&text, 200);
+        assert!(spans.len() > 2);
+        assert_eq!(spans[0].1, 0);
+        let head = header(&text);
+        assert!(!head.is_empty());
+        let mut rebuilt = String::new();
+        for (k, (part, start)) in spans.iter().enumerate() {
+            let end = spans.get(k + 1).map_or(text.len(), |(_, s)| *s);
+            let body = &text[*start..end];
+            if k == 0 {
+                assert_eq!(part, body);
+            } else {
+                assert_eq!(*part, format!("{head}{body}"));
+            }
+            rebuilt.push_str(body);
+        }
+        assert_eq!(rebuilt, text);
+        let parts: Vec<String> = spans.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(split(&text, 200), parts);
+        assert_eq!(
+            split_spans("court\n", 200),
+            vec![("court\n".to_string(), 0)]
+        );
     }
 }

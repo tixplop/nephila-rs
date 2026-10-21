@@ -97,6 +97,8 @@ struct State {
     anchors: HashSet<String>,
     current: Option<String>,
     seen: HashSet<(String, EdgeKind, String)>,
+    /// Ancre (suffixée si besoin) et octet de début de la ligne de chaque titre, dans l'ordre.
+    offsets: Vec<(String, usize)>,
 }
 
 impl State {
@@ -117,7 +119,7 @@ impl State {
         self.add_ref(section, EdgeKind::Mentions, target);
     }
 
-    fn open_section(&mut self, title: &str) {
+    fn open_section(&mut self, title: &str, position: usize) {
         let base = anchor_of(title);
         let mut anchor = base.clone();
         let mut n = 0;
@@ -126,6 +128,7 @@ impl State {
             anchor = format!("{base}-{n}");
         }
         let qualified = format!("{}#{anchor}", self.doc);
+        self.offsets.push((anchor, position));
         self.out.declares.push(Declared {
             kind: NodeKind::Section,
             qualified: qualified.clone(),
@@ -139,7 +142,17 @@ impl State {
 
 /// Extrait le document, ses sections, ses liens vers d'autres documents et ses mentions candidates.
 pub fn extract(path: &Path, text: &str) -> FileStructure {
-    let doc = doc_path(path);
+    scan(doc_path(path), text).out
+}
+
+/// Sections du document dans l'ordre du texte : ancre (celle des nœuds `section:` de `extract`,
+/// suffixe `-n` des doublons compris) et octet de début de la ligne de leur titre (DEC-061).
+pub fn section_offsets(text: &str) -> Vec<(String, usize)> {
+    scan(String::new(), text).offsets
+}
+
+/// Parcours unique du document, commun à `extract` et à `section_offsets`.
+fn scan(doc: String, text: &str) -> State {
     let mut st = State {
         doc_id: node_id(NodeKind::Document, &doc),
         doc,
@@ -147,6 +160,7 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
         anchors: HashSet::new(),
         current: None,
         seen: HashSet::new(),
+        offsets: Vec::new(),
     };
     st.out.declares.push(Declared {
         kind: NodeKind::Document,
@@ -156,13 +170,16 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
         short: None,
     });
     // Titre en cours de lecture : texte et spans de code rencontrés.
-    let mut heading: Option<(String, Vec<String>)> = None;
-    for ev in Parser::new(text) {
+    let mut heading: Option<(String, Vec<String>, usize)> = None;
+    for (ev, range) in Parser::new(text).into_offset_iter() {
         match ev {
-            Event::Start(Tag::Heading { .. }) => heading = Some((String::new(), Vec::new())),
+            Event::Start(Tag::Heading { .. }) => {
+                let line = text[..range.start].rfind('\n').map_or(0, |i| i + 1);
+                heading = Some((String::new(), Vec::new(), line));
+            }
             Event::End(TagEnd::Heading(_)) => {
-                if let Some((title, codes)) = heading.take() {
-                    st.open_section(&title);
+                if let Some((title, codes, line)) = heading.take() {
+                    st.open_section(&title, line);
                     for c in codes {
                         st.add_mention(&c);
                     }
@@ -179,26 +196,26 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
                 }
             }
             Event::Text(t) => {
-                if let Some((title, _)) = heading.as_mut() {
+                if let Some((title, _, _)) = heading.as_mut() {
                     title.push_str(&t);
                 }
             }
             Event::Code(c) => match heading.as_mut() {
-                Some((title, codes)) => {
+                Some((title, codes, _)) => {
                     title.push_str(&c);
                     codes.push(c.to_string());
                 }
                 None => st.add_mention(&c),
             },
             Event::SoftBreak | Event::HardBreak => {
-                if let Some((title, _)) = heading.as_mut() {
+                if let Some((title, _, _)) = heading.as_mut() {
                     title.push(' ');
                 }
             }
             _ => {}
         }
     }
-    st.out
+    st
 }
 
 #[cfg(test)]
@@ -347,5 +364,40 @@ mod tests {
         let f = run("x.md", "");
         assert_eq!(ids(&f), ["document:x.md"]);
         assert!(f.references.is_empty());
+    }
+
+    #[test]
+    fn req047_ac16_section_offsets_comme_extract() {
+        let text = "# Un\n\ntexte\n\n## Deux ##\n\nTitre setext\n============\n\nAutre\n-----\n\n### Avec `code` et [lien](x.md)\n\n```\n# x\n```\n\n## Deux ##\n\n# Un\n";
+        let f = run("a.md", text);
+        let expected: Vec<String> = f
+            .declares
+            .iter()
+            .filter(|d| d.kind == NodeKind::Section)
+            .map(|d| d.qualified.split_once('#').unwrap().1.to_string())
+            .collect();
+        let got = section_offsets(text);
+        assert_eq!(
+            got.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(expected.len(), 7);
+        assert!(expected.contains(&"deux-1".to_string()) && expected.contains(&"un-1".to_string()));
+        let lines: Vec<&str> = got
+            .iter()
+            .map(|(_, p)| text[*p..].lines().next().unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "# Un",
+                "## Deux ##",
+                "Titre setext",
+                "Autre",
+                "### Avec `code` et [lien](x.md)",
+                "## Deux ##",
+                "# Un"
+            ]
+        );
     }
 }

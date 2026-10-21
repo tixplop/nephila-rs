@@ -135,6 +135,47 @@ fn req007_ac2_merged_into_one_type_with_all_methods_contained() {
 }
 
 #[test]
+fn req007_ac4_nombre_exact_d_appels() {
+    // Valeur relevée après la correction : 4 morceaux, 16 appels (liste par morceau, DEC-059).
+    const EXPECTED_CALLS: usize = 16;
+    let java = big_java(2_000);
+    let env = Env::new(10_000, &java);
+    let out = env.build(None);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = env.calls();
+    let n = calls.len();
+    assert_eq!(n, EXPECTED_CALLS, "appels : {calls:?}");
+    let parts = split(&java, 10_000).len();
+    assert!(
+        n < parts * 2001usize.div_ceil(150),
+        "{n} appels, {parts} morceaux"
+    );
+    for (i, l) in calls.iter().enumerate() {
+        assert_eq!(l, &format!("src/main/java/com/acme/Big.java\t{}", i + 1));
+    }
+    let store = env.store();
+    let summaries: Vec<String> = store
+        .nodes()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m.summary.clone())
+        .collect();
+    for k in 1..=n {
+        assert!(
+            summaries.contains(&format!("part{k}")),
+            "résumé part{k} absent"
+        );
+    }
+    assert_eq!(summaries.len(), n);
+    assert_eq!(store.count_files_to_enrich().unwrap(), 0);
+}
+
+#[test]
 fn req007_ac3_small_file_is_one_call() {
     let env = Env::new(60_000, &big_java(50));
     assert!(env.build(None).status.success());
