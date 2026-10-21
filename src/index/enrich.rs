@@ -1,7 +1,7 @@
 //! Phase enrichissement (DEC-019, REQ-024) : résumés et concepts demandés au LLM pour les
 //! fichiers « à enrichir », avec la politique d'échec de DEC-015 / DEC-022.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -93,10 +93,6 @@ impl Unit<'_> {
 /// résumé, ce qui reste sous `max_tokens = 8192` ; non configurable.
 const MAX_NODES_PER_CALL: usize = 150;
 
-/// Nombre maximal d'appels d'enrichissement pour un fichier envoyé seul (DEC-059, non
-/// configurable) : 50 appels = 7 500 nœuds d'un seul morceau. Au-delà, aucun appel n'est envoyé.
-const MAX_CALLS_PER_FILE: usize = 50;
-
 /// Découpe la liste des nœuds d'un fichier en groupes d'au plus `MAX_NODES_PER_CALL` ; au moins
 /// un groupe, vide si la liste l'est.
 fn node_groups(ids: &[String]) -> Vec<&[String]> {
@@ -168,7 +164,7 @@ fn run_unit(
     repo: &Path,
     max_chunk_chars: usize,
     llm: &dyn Llm,
-    ids: &HashMap<String, Vec<(String, String)>>,
+    ids: &HashMap<String, Vec<String>>,
     retries: u32,
     stop: &AtomicBool,
 ) -> (Vec<Outcome>, Option<Option<Error>>) {
@@ -187,13 +183,8 @@ fn run_unit(
             )),
         }
     }
-    let nodes =
-        |f: &FileRecord| -> Vec<(String, String)> { ids.get(&f.path).cloned().unwrap_or_default() };
-    let node_ids = |f: &FileRecord| -> Vec<String> {
-        ids.get(&f.path)
-            .map(|v| v.iter().map(|(id, _)| id.clone()).collect())
-            .unwrap_or_default()
-    };
+    let node_ids =
+        |f: &FileRecord| -> Vec<String> { ids.get(&f.path).cloned().unwrap_or_default() };
     match readable.len() {
         0 => (outcomes, None),
         1 => {
@@ -203,7 +194,7 @@ fn run_unit(
                 &f.path,
                 text,
                 max_chunk_chars,
-                &nodes(f),
+                &node_ids(f),
                 retries,
                 stop,
             );
@@ -377,102 +368,19 @@ fn traced_lot_once(
     result
 }
 
-/// Plan d'appels d'un fichier (DEC-059) : couples (indice du morceau, liste de nœuds demandée),
-/// dans l'ordre d'envoi. Un seul morceau : la liste complète, découpée par `node_groups`. Sinon,
-/// chaque morceau ne demande que les nœuds dont le nom court y figure (mot entier, ou, pour un
-/// nom qui n'est pas un mot, occurrence aux bords contrôlés) ; un nœud de nom vide ou absent de
-/// tous les morceaux va dans le morceau 1. Au moins un appel par morceau, liste vide permise.
-fn call_plan(parts: &[String], nodes: &[(String, String)]) -> Vec<(usize, Vec<String>)> {
-    let ids: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
-    if parts.len() <= 1 {
-        return node_groups(&ids)
-            .into_iter()
-            .map(|g| (0, g.to_vec()))
-            .collect();
-    }
-    let words: Vec<HashSet<&str>> = parts.iter().map(|p| ident_words(p)).collect();
-    let mut lists: Vec<Vec<String>> = vec![Vec::new(); parts.len()];
-    for (id, short) in nodes {
-        let mut found = false;
-        if !short.is_empty() {
-            let simple = short.chars().all(is_ident);
-            for (k, part) in parts.iter().enumerate() {
-                let hit = if simple {
-                    words[k].contains(short.as_str())
-                } else {
-                    contains_bounded(part, short)
-                };
-                if hit {
-                    lists[k].push(id.clone());
-                    found = true;
-                }
-            }
-        }
-        if !found {
-            lists[0].push(id.clone());
-        }
-    }
-    let mut plan = Vec::new();
-    for (k, list) in lists.iter().enumerate() {
-        for g in node_groups(list) {
-            plan.push((k, g.to_vec()));
-        }
-    }
-    plan
-}
-
-/// Caractère d'un identifiant : lettre, chiffre, `_` ou `$` (REQ-047).
-fn is_ident(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '$'
-}
-
-/// Mots maximaux d'`is_ident` d'un texte, en un seul parcours.
-fn ident_words(text: &str) -> HashSet<&str> {
-    let mut set = HashSet::new();
-    let mut start: Option<usize> = None;
-    for (i, c) in text.char_indices() {
-        match (is_ident(c), start) {
-            (true, None) => start = Some(i),
-            (false, Some(s)) => {
-                set.insert(&text[s..i]);
-                start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some(s) = start {
-        set.insert(&text[s..]);
-    }
-    set
-}
-
-/// Vrai si `name` (non vide) figure dans `text` avec des bords qui ne prolongent pas un mot : le
-/// caractère qui précède (resp. suit) ne doit pas être `is_ident` quand le nom commence (resp.
-/// finit) par un caractère `is_ident`.
-fn contains_bounded(text: &str, name: &str) -> bool {
-    let first_ident = name.chars().next().is_some_and(is_ident);
-    let last_ident = name.chars().next_back().is_some_and(is_ident);
-    text.match_indices(name).any(|(i, m)| {
-        let before_ok = !first_ident || !text[..i].chars().next_back().is_some_and(is_ident);
-        let after_ok = !last_ident || !text[i + m.len()..].chars().next().is_some_and(is_ident);
-        before_ok && after_ok
-    })
-}
-
-/// Enrichit un fichier selon `call_plan` : un appel par morceau et par groupe de la liste propre
-/// à ce morceau, numérotés 1..n dans l'ordre du plan ; le premier échec d'un appel fait échouer
-/// le fichier entier (REQ-007).
+/// Enrichit un fichier en `morceaux × groupes de nœuds` appels, numérotés dans l'ordre morceau 1
+/// groupe 1, morceau 1 groupe 2, …, puis morceau 2 ; le premier échec d'un appel fait échouer le
+/// fichier entier (REQ-007).
 fn enrich_chunks(
     llm: &dyn Llm,
     path: &str,
     text: &str,
     max_chunk_chars: usize,
-    nodes: &[(String, String)],
+    node_ids: &[String],
     retries: u32,
     stop: &AtomicBool,
 ) -> Result<Enrichment> {
     let total = retries.saturating_add(1);
-    let known: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
     // Le compte d'essais repart à 1 pour chaque appel ; seul l'appel fautif est renvoyé.
     let one = |index: usize, count: usize, part: &str, requested: &[String]| {
         with_format_retries(retries, stop, |current| {
@@ -483,37 +391,33 @@ fn enrich_chunks(
                 count,
                 part,
                 requested,
-                &known,
+                node_ids,
                 Attempt { current, total },
             )
         })
     };
     let parts = chunk::split(text, max_chunk_chars);
-    let plan = call_plan(&parts, nodes);
-    let count = plan.len();
-    if count > MAX_CALLS_PER_FILE {
-        return Err(Error::TooManyCalls {
-            calls: count,
-            max: MAX_CALLS_PER_FILE,
-        });
-    }
+    let groups = node_groups(node_ids);
+    let count = parts.len() * groups.len();
     if count == 1 {
-        return one(1, 1, &parts[plan[0].0], &plan[0].1);
+        return one(1, 1, &parts[0], groups[0]);
     }
     let mut results = Vec::with_capacity(count);
-    for (k, list) in &plan {
-        results.push(one(results.len() + 1, count, &parts[*k], list)?);
+    for part in &parts {
+        for group in &groups {
+            results.push(one(results.len() + 1, count, part, group)?);
+        }
     }
     Ok(chunk::merge_enrichments(results))
 }
 
-/// Nœuds déclarés par chaque fichier (identifiant, nom court), hors packages et clés de
-/// configuration (REQ-024).
-fn nodes_by_file(store: &Store) -> Result<HashMap<String, Vec<(String, String)>>> {
-    let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for (file, node, short) in store.declared_short_names()? {
+/// Identifiants des nœuds déclarés par chaque fichier, hors packages et clés de configuration
+/// (REQ-024).
+fn node_ids_by_file(store: &Store) -> Result<HashMap<String, Vec<String>>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for (file, node) in store.declarations()? {
         if !node.starts_with("package:") && !node.starts_with("key:") {
-            map.entry(file).or_default().push((node, short));
+            map.entry(file).or_default().push(node);
         }
     }
     Ok(map)
@@ -585,7 +489,7 @@ pub(crate) fn enrich_with_stop(
         batch_files,
         format_retries,
     } = *opts;
-    let ids = nodes_by_file(store)?;
+    let ids = node_ids_by_file(store)?;
     let started = Instant::now();
     let failed_before = report.failed;
     let mut succeeded = 0usize;
@@ -805,114 +709,6 @@ mod tests {
         assert_eq!(joined, all);
     }
 
-    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
-        v.iter()
-            .map(|(a, b)| (a.to_string(), b.to_string()))
-            .collect()
-    }
-
-    fn strs(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn req047_ac12_plan_par_nom_court() {
-        let parts = strs(&[
-            "class A {\n  void foo() {}\n  void m1() {}\n",
-            "class A {\n  void m12() {}\n  void bar() { foo(); }\n",
-            "// rien\n",
-        ]);
-        let nodes = pairs(&[
-            ("A", "A"),
-            ("bar", "bar"),
-            ("foo", "foo"),
-            ("m1", "m1"),
-            ("m12", "m12"),
-            ("qux", "qux"),
-            ("vide", ""),
-        ]);
-        assert_eq!(
-            call_plan(&parts, &nodes),
-            vec![
-                (0, strs(&["A", "foo", "m1", "qux", "vide"])),
-                (1, strs(&["A", "bar", "foo", "m12"])),
-                (2, vec![]),
-            ]
-        );
-
-        // Un seul morceau : la liste complète, comme en 0.17.4.
-        let many: Vec<(String, String)> = (0..160)
-            .map(|i| (format!("id{i}"), format!("n{i}")))
-            .collect();
-        let all: Vec<String> = many.iter().map(|(a, _)| a.clone()).collect();
-        let plan = call_plan(&parts[2..], &many);
-        let expected: Vec<(usize, Vec<String>)> = node_groups(&all)
-            .into_iter()
-            .map(|g| (0, g.to_vec()))
-            .collect();
-        assert_eq!(plan, expected);
-        assert_eq!(plan.len(), 2);
-
-        // 160 nœuds tous dans le morceau 1, aucun dans le morceau 2.
-        let text1: String = (0..160).map(|i| format!("n{i} ")).collect();
-        let two = vec![text1, "rien".to_string()];
-        let plan = call_plan(&two, &many);
-        let sizes: Vec<(usize, usize)> = plan.iter().map(|(k, l)| (*k, l.len())).collect();
-        assert_eq!(sizes, [(0, 150), (0, 10), (1, 0)]);
-    }
-
-    #[test]
-    fn req047_ac12_noms_non_mots_et_bords() {
-        let parts = strs(&["a operator+ b\n", "x+= y\n foo$bar\n"]);
-        let nodes = pairs(&[
-            ("plus", "operator+"),
-            ("bords", "+="),
-            ("dollar", "foo$bar"),
-            ("prefixe", "foo"),
-        ]);
-        let plan = call_plan(&parts, &nodes);
-        assert_eq!(plan[0], (0, strs(&["plus", "prefixe"])));
-        assert_eq!(plan[1], (1, strs(&["bords", "dollar"])));
-    }
-
-    #[test]
-    fn req047_ac13_plan_de_20000_noeuds_rapide() {
-        let nodes: Vec<(String, String)> = (0..20_000)
-            .map(|i| (format!("method:p.C.m{i}"), format!("m{i}")))
-            .collect();
-        // Le morceau k cite les 4 000 noms de sa tranche, puis du remplissage jusqu'à 100 000.
-        let parts: Vec<String> = (0..5)
-            .map(|k| {
-                let mut s = String::new();
-                for i in k * 4_000..(k + 1) * 4_000 {
-                    s.push_str(&format!("void m{i}();\n"));
-                }
-                while s.len() < 100_000 {
-                    s.push_str("// remplissage\n");
-                }
-                s
-            })
-            .collect();
-        let plan = call_plan(&parts, &nodes);
-        let expected: usize = (0..5)
-            .map(|k| {
-                let n = plan
-                    .iter()
-                    .filter(|(p, _)| *p == k)
-                    .map(|(_, l)| l.len())
-                    .sum::<usize>();
-                n.div_ceil(MAX_NODES_PER_CALL).max(1)
-            })
-            .sum();
-        assert_eq!(plan.len(), expected);
-        assert!(
-            plan.len() <= 20_000usize.div_ceil(150) + 10,
-            "{}",
-            plan.len()
-        );
-        assert!(plan.iter().all(|(_, l)| l.len() <= MAX_NODES_PER_CALL));
-    }
-
     #[test]
     fn req047_ac1_form_units_by_nodes() {
         let counts = [100usize, 60, 40, 200, 10];
@@ -991,74 +787,6 @@ mod tests {
         for _ in 0..5 {
             let t = p.dispatch();
             assert!(!p.record(t, Some(&trunc)));
-        }
-        assert!(p.stop_cause.is_none());
-    }
-
-    /// Faux `Llm` qui compte ses appels d'extraction.
-    struct Counting(std::sync::atomic::AtomicUsize);
-    impl Llm for Counting {
-        fn verify_key(&self) -> Result<()> {
-            Ok(())
-        }
-        fn enrich(
-            &self,
-            _: &str,
-            _: usize,
-            _: &str,
-            _: &[String],
-            _: &[String],
-        ) -> Result<Enrichment> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(Enrichment::default())
-        }
-        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
-            Err(Error::Message("inutilisé".into()))
-        }
-        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
-            Err(Error::Message("inutilisé".into()))
-        }
-    }
-
-    #[test]
-    fn req048_ac1_plafond_de_50_appels() {
-        let stop = AtomicBool::new(false);
-        let run = |lines: usize| {
-            let text = "aaaaaaaaa\n".repeat(lines);
-            assert_eq!(chunk::split(&text, 10).len(), lines);
-            let llm = Counting(std::sync::atomic::AtomicUsize::new(0));
-            let r = enrich_chunks(&llm, "x", &text, 10, &[], 0, &stop);
-            (r, llm.0.load(Ordering::SeqCst))
-        };
-        let (r, calls) = run(51);
-        assert_eq!(calls, 0);
-        let e = r.unwrap_err();
-        assert_eq!(e, Error::TooManyCalls { calls: 51, max: 50 });
-        assert_eq!(
-            format!("avertissement: x : {e}"),
-            "avertissement: x : trop d'appels d'enrichissement (51 nécessaires, au plus 50 par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml"
-        );
-        let (r, calls) = run(50);
-        assert!(r.is_ok());
-        assert_eq!(calls, 50);
-    }
-
-    #[test]
-    fn req048_too_many_calls_neither_counts_nor_resets() {
-        let many = Error::TooManyCalls { calls: 51, max: 50 };
-        let mut p = Policy::default();
-        for r in [Some(&net()), Some(&net()), Some(&many)] {
-            let t = p.dispatch();
-            assert!(!p.record(t, r));
-        }
-        assert_eq!((p.consecutive_network, p.network_total), (2, 2));
-        let t = p.dispatch();
-        assert!(p.record(t, Some(&net())));
-
-        let mut p = Policy::default();
-        for _ in 0..5 {
-            let t = p.dispatch();
-            assert!(!p.record(t, Some(&many)));
         }
         assert!(p.stop_cause.is_none());
     }

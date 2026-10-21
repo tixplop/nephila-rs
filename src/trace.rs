@@ -68,7 +68,7 @@ pub fn classify(e: &crate::error::Error) -> String {
         Error::Network(_) => "réseau",
         Error::InvalidKey(_) => "clé refusée",
         Error::Truncated(_) => "tronquée",
-        Error::Message(_) | Error::Format(_) | Error::TooManyCalls { .. } => "erreur",
+        Error::Message(_) | Error::Format(_) => "erreur",
     };
     label.to_string()
 }

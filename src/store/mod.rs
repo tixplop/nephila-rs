@@ -729,25 +729,6 @@ impl Store {
         rows.map(|r| r.map_err(db_err)).collect()
     }
 
-    /// Triplets (fichier, identifiant de nœud, nom court) des déclarations, dans l'ordre
-    /// (fichier, identifiant).
-    pub fn declared_short_names(&self) -> Result<Vec<(String, String, String)>> {
-        let mut st = self
-            .conn
-            .prepare("SELECT file, node, short FROM declarations ORDER BY file, node")
-            .map_err(db_err)?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(db_err)?;
-        rows.map(|r| r.map_err(db_err)).collect()
-    }
-
     /// Parmi `files`, ceux qui déclarent encore le nœud `document:<chemin>` (requête ciblée
     /// par clé primaire, sans charger toute la table des déclarations).
     pub fn files_declaring_document(&self, files: &[&str]) -> Result<Vec<String>> {
