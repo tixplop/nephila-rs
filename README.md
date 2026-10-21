@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.17.3                                      # version voulue
+V=v0.17.4                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -137,7 +137,7 @@ update terminé : 2 fichiers traités, 2 nœuds, 1 liens, 0 références non ré
 Le bilan donne deux compteurs :
 
 - **en attente** : l'analyse du fichier n'a pas abouti ou n'a pas été faite. La commande sort avec le code 1 ; `nephila update` le retraite.
-- **à enrichir** : la structure du fichier est dans le graphe, mais son contenu actuel n'a pas été enrichi par le LLM (réponse non conforme, erreur, `--no-llm`, ou fichier modifié depuis). Avec le LLM actif, la commande sort avec le code 1 et `nephila update` ne renvoie au LLM que ces fichiers. Sans LLM, ce n'est pas une erreur (code 0, `enrichissement : désactivé`).
+- **à enrichir** : la structure du fichier est dans le graphe, mais son contenu actuel n'a pas été enrichi par le LLM (réponse non conforme, réponse tronquée, erreur, `--no-llm`, ou fichier modifié depuis). Avec le LLM actif, la commande sort avec le code 1 et `nephila update` ne renvoie au LLM que ces fichiers. Sans LLM, ce n'est pas une erreur (code 0, `enrichissement : désactivé`).
 
 Réanalyser un fichier modifié efface ses résumés et concepts.
 
@@ -217,7 +217,7 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 - la vérification de la clé ;
 - le parcours des fichiers ;
 - le début et la fin de chaque phase (structure, résolution, enrichissement) ;
-- le départ et la fin de chaque appel LLM, avec son résultat et sa durée ; le départ d'un nouvel essai porte la marque ` (essai <e>/<t>)`, où `<t>` vaut `format_retries` + 1 (le premier essai n'a pas de marque) ;
+- le départ et la fin de chaque appel LLM, avec son résultat (`ok`, `délai dépassé`, `réseau`, `clé refusée`, `erreur` ou `tronquée`) et sa durée ; `[i/n]` compte les appels du fichier (morceaux et groupes de 150 nœuds confondus) ; le départ d'un nouvel essai porte la marque ` (essai <e>/<t>)`, où `<t>` vaut `format_retries` + 1 (le premier essai n'a pas de marque) ;
 - les décisions d'arrêt.
 
 ```
@@ -229,6 +229,7 @@ trace: [0.003s] llm enrich départ src/A.java [1/1] 24 car. (essai 2/3)
 trace: [0.003s] llm enrich fin src/A.java [1/1] erreur 0 ms : réponse LLM non conforme au schéma
 trace: [0.003s] llm enrich départ src/A.java [1/1] 24 car. (essai 3/3)
 trace: [0.003s] llm enrich fin src/A.java [1/1] ok (0 résumés, 0 concepts) 0 ms
+trace: [1.410s] llm enrich fin src/Big.java [2/3] tronquée 770 ms : réponse tronquée par la limite de jetons
 trace: [1.040s] llm enrich fin docs/guide.md [1/1] délai dépassé 1003 ms : délai dépassé avec openai sur https://api.openai.com/v1/chat/completions ; augmentez timeout_secs
 trace: [1.053s] politique: arrêt de l'envoi (clé d'API refusée par le fournisseur), 3 fichiers non envoyés
 ```
@@ -511,17 +512,18 @@ Un certificat refusé produit une erreur contenant « certificat » et nommant `
 Par défaut (`batch_files = 1`), un appel LLM porte sur un seul fichier. Pour un dépôt fait de nombreux petits fichiers, `batch_files = 4` à `8` regroupe plusieurs fichiers par appel et réduit le nombre d'appels.
 
 - Les fichiers sont pris dans l'ordre des chemins. Un lot ne dépasse ni `batch_files` fichiers ni `max_chunk_chars` octets au total. Un fichier plus gros que `max_chunk_chars` part seul, en morceaux successifs.
+- Un appel demande au plus 150 nœuds ; la somme des nœuds d'un lot reste au plus égale à 150. Un fichier de plus de 150 nœuds est envoyé seul, en plusieurs appels (morceaux × groupes de 150 nœuds), sans réglage.
 - `--batch-files <N>` remplace la clé pour la commande en cours, sans rien écrire. Priorité : option, puis clé `batch_files`, puis défaut 1. Sans LLM actif, l'option est acceptée sans effet.
 - Jusqu'à `concurrency` lots sont en vol en même temps, soit `concurrency` × `batch_files` fichiers.
 - Si un lot échoue, tous ses fichiers restent « à enrichir » et sont repris par le prochain `nephila update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse échoue seul.
-- Si la réponse du modèle est tronquée par sa limite de jetons de sortie, tout le lot échoue. Réduisez alors `batch_files`.
+- Si la réponse du modèle est tronquée par la limite de jetons, tout le lot échoue ; voir [Réponse tronquée par la limite de jetons](#réponse-tronquée-par-la-limite-de-jetons).
 
 ## Réponses non conformes et nouveaux essais
 
 Un modèle, surtout local, rate parfois son JSON. Quand un appel aboutit mais que la réponse est inexploitable, `nephila` renvoie aussitôt la même requête, à l'identique, jusqu'à `format_retries` fois (défaut 2, soit au plus 3 appels).
 
-- **Retenté** : réponse reçue mais inexploitable (JSON illisible, aucun objet JSON dans le texte, schéma non respecté, réponse tronquée par la limite de jetons de sortie).
-- **Jamais retenté** : délai dépassé, erreur réseau, clé refusée (ils relèvent de la politique d'arrêt), fichier illisible, éléments écartés d'une réponse conforme, fichier absent d'une réponse de lot conforme (il reste « à enrichir » pour le prochain `update`).
+- **Retenté** : réponse reçue mais inexploitable (JSON illisible, aucun objet JSON dans le texte, schéma non respecté).
+- **Jamais retenté** : réponse tronquée par la limite de jetons (voir ci-dessous), délai dépassé, erreur réseau, clé refusée (ils relèvent de la politique d'arrêt), fichier illisible, éléments écartés d'une réponse conforme, fichier absent d'une réponse de lot conforme (il reste « à enrichir » pour le prochain `update`).
 - **Unité d'essai** : l'appel. Un morceau d'un gros fichier est retenté seul ; un lot est retenté en entier.
 - **Un essai réussi ne laisse aucune trace** : ni avertissement, ni changement du bilan ; seul `--verbose` montre les essais.
 - **Échec final** : le fichier reste « à enrichir » et une ligne le nomme, avec le nombre d'essais faits :
@@ -534,6 +536,22 @@ avertissement: src/A.java : réponse LLM non conforme au schéma : JSON illisibl
 - `--format-retries <N>` de `build`, `update` et `query ask` remplace la clé pour la commande seulement, sans rien écrire. Priorité : option, puis clé `format_retries`, puis défaut 2. Sans LLM actif, l'option est acceptée sans effet.
 
 Un modèle qui échoue souvent au format se règle mieux en changeant de modèle ou en réduisant `batch_files` qu'en augmentant les essais.
+
+### Réponse tronquée par la limite de jetons
+
+Le fournisseur signale la troncature de la réponse (`stop_reason`, `finish_reason`). `nephila` ne la renvoie jamais, quelle que soit `format_retries` : la même requête rendrait la même réponse. Le fichier reste « à enrichir », une seule ligne le nomme, sans suffixe d'essais, et la commande sort avec le code 1 :
+
+```
+avertissement: db/schema.sql : réponse tronquée par la limite de jetons ; réduisez max_chunk_chars ou batch_files
+```
+
+Pour `nephila query ask`, une seule ligne sur stderr, stdout vide :
+
+```
+erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée
+```
+
+Que faire : relancer le seul fichier avec `nephila update --batch-files 1`, ou donner à `max_chunk_chars` ou à `batch_files` une valeur plus petite dans `.nephila.toml` ou dans la configuration personnelle. Une troncature n'arrête jamais l'envoi : les autres fichiers continuent. Avec `--verbose`, l'appel se termine par le résultat `tronquée`.
 
 ## Ce que l'analyse extrait
 
@@ -649,6 +667,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.17.4 | Réponse tronquée par la limite de jetons reconnue et jamais renvoyée ; au plus 150 nœuds demandés par appel d'enrichissement |
 | 0.17 | Plafonds des réglages entiers de `.nephila.toml` (rupture : une valeur au-dessus est refusée ; pour corriger le fichier, donnez au réglage une valeur au plus égale à son plafond, donné par la table de la section « Fichier de projet `.nephila.toml` », ou déplacez le réglage dans votre configuration personnelle, qui n'a pas de plafond mais vaut pour tous vos dépôts ; les options `--batch-files` et `--format-retries` n'ont pas de plafond non plus, mais ne corrigent pas un fichier refusé) |
 | 0.16.1 | Analyse des expressions très imbriquées (Java, Kotlin, Scala, Groovy) sans débordement de pile |
 | 0.16 | Option `--show-progress` de `build` et `update` |
@@ -675,7 +694,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.17.3 && git push origin v0.17.3
+git tag v0.17.4 && git push origin v0.17.4
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
@@ -698,8 +717,8 @@ Le fournisseur `mock` remplace le LLM par des fixtures et se pilote par l'enviro
 
 | Variable | Effet |
 |---|---|
-| `NEPHILA_MOCK_DIR` | Dossier de fixtures : `<dir>/<chemin relatif>.json` (ou `<chemin>.<n>.json` pour le morceau n, à partir de 1) est la réponse d'enrichissement ; `_ask.json` est la réponse de `query ask`. Sans fixture, la réponse est vide et valide. |
-| `NEPHILA_MOCK_LOG` | Journal des appels : une ligne `chemin<TAB>n°morceau` par appel, ou `chemin_1;chemin_2;…<TAB>1` pour un lot |
+| `NEPHILA_MOCK_DIR` | Dossier de fixtures : `<dir>/<chemin relatif>.json` (ou `<chemin>.<i>.json` pour l'appel i, à partir de 1 ; i est le numéro du morceau avec 150 nœuds ou moins) est la réponse d'enrichissement ; `_ask.json` est la réponse de `query ask`. Sans fixture, la réponse est vide et valide. |
+| `NEPHILA_MOCK_LOG` | Journal des appels : une ligne `chemin<TAB>n°appel` par appel (égal au numéro de morceau avec 150 nœuds ou moins), ou `chemin_1;chemin_2;…<TAB>1` pour un lot |
 | `NEPHILA_MOCK_FAIL_AFTER` | Nombre d'appels réussis avant des erreurs réseau simulées |
 | `NEPHILA_MOCK_INVALID_KEY` | Si non vide et différent de `0`, la vérification de clé échoue |
 | `NEPHILA_MOCK_DELAY_MS` | Délai ajouté à chaque appel |
