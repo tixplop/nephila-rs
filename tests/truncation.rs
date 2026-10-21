@@ -404,3 +404,271 @@ fn req046_ac9_ligne_a5_identique_quelle_que_soit_la_politique() {
     }
     assert!(lines.windows(2).all(|w| w[0] == w[1]));
 }
+
+// ---- T-101 : `query ask`, traces `--verbose` et progression ----
+
+const E11: &str =
+    "erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée";
+
+impl Setup {
+    fn run_env(&self, args: &[&str], no_color: bool) -> Output {
+        let mut c = Command::new(cargo_bin("nephila"));
+        c.arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_T100_KEY", "sk-test")
+            .env_remove("NO_COLOR");
+        if no_color {
+            c.env("NO_COLOR", "1");
+        }
+        c.output().unwrap()
+    }
+
+    /// Graphe sans LLM, puis `query ask` : la première réponse du serveur sert à la
+    /// vérification de clé, les suivantes à la génération.
+    fn ask(&self, extra: &[&str]) -> Output {
+        let mut args = vec!["query", "ask"];
+        args.extend_from_slice(extra);
+        args.push("Alpha");
+        self.run(&args)
+    }
+}
+
+fn ask_setup(provider: &str, secret: bool) -> Setup {
+    let mut responses = vec![match provider {
+        "anthropic" => anthropic_reply("{}", None),
+        _ => openai_reply("{}", None),
+    }];
+    responses.extend(vec![trunc_with(provider, secret); 10]);
+    let s = Setup::new(provider, responses, "");
+    s.write("A.java", "public class Alpha {}\n");
+    let o = s.run(&["build", "--no-llm"]);
+    assert!(o.status.success(), "{}", err(&o));
+    s
+}
+
+#[test]
+fn req046_ac7_ask_tronquee_un_seul_envoi() {
+    for p in ["anthropic", "openai"] {
+        let s = ask_setup(p, false);
+        let o = s.ask(&[]);
+        assert!(!o.status.success(), "{p}");
+        assert_eq!(s.posts().len(), 1, "{p} {}", err(&o));
+        assert!(out(&o).is_empty(), "{p} {}", out(&o));
+        let e = err(&o);
+        let lines: Vec<&str> = e.lines().filter(|l| l.starts_with("erreur:")).collect();
+        assert_eq!(lines.len(), 1, "{p} {e}");
+        assert!(lines[0].contains("réponse tronquée"), "{p} {e}");
+        assert!(
+            !e.contains("max_chunk_chars") && !e.contains("essais sur"),
+            "{e}"
+        );
+    }
+}
+
+#[test]
+fn req046_ac10_ask_ligne_e11_exacte() {
+    for p in ["anthropic", "openai"] {
+        for extra in [
+            vec!["--format-retries", "0"],
+            vec!["--format-retries", "4"],
+            vec!["--json"],
+        ] {
+            let s = ask_setup(p, true);
+            let o = s.ask(&extra);
+            assert!(!o.status.success(), "{p} {extra:?}");
+            assert!(out(&o).is_empty(), "{p} {extra:?} {}", out(&o));
+            assert_eq!(s.posts().len(), 1, "{p} {extra:?}");
+            let e = err(&o);
+            assert_eq!(e, format!("{E11}\n"), "{p} {extra:?}");
+            for bad in ["max_chunk_chars", "batch_files", "essais sur", SECRET] {
+                assert!(!e.contains(bad), "{bad} dans {e}");
+            }
+        }
+    }
+}
+
+fn trace_lines_of(e: &str) -> Vec<&str> {
+    e.lines().filter(|l| l.starts_with("trace:")).collect()
+}
+
+fn llm_enrich_for<'a>(e: &'a str, needle: &str) -> Vec<&'a str> {
+    trace_lines_of(e)
+        .into_iter()
+        .filter(|l| l.contains("llm enrich") && l.contains(needle))
+        .collect()
+}
+
+fn no_forbidden_trace(e: &str) {
+    for l in trace_lines_of(e) {
+        for bad in ["réduisez", SECRET, "(essai", "politique:"] {
+            assert!(!l.contains(bad), "{bad} dans {l}");
+        }
+    }
+}
+
+/// `^trace: \[[0-9]+\.[0-9]{3}s\] llm enrich fin <path> \[1/1\] tronquée [0-9]+ ms : <LABEL>$`
+fn fin_matches(line: &str, path: &str) -> bool {
+    let Some(rest) = line.strip_prefix("trace: [") else {
+        return false;
+    };
+    let Some((time, rest)) = rest.split_once("s] ") else {
+        return false;
+    };
+    let Some((sec, milli)) = time.split_once('.') else {
+        return false;
+    };
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    if !digits(sec) || milli.len() != 3 || !digits(milli) {
+        return false;
+    }
+    let Some(rest) = rest.strip_prefix(&format!("llm enrich fin {path} [1/1] tronquée ")) else {
+        return false;
+    };
+    let Some((ms, detail)) = rest.split_once(" ms : ") else {
+        return false;
+    };
+    digits(ms) && detail == LABEL
+}
+
+#[test]
+fn req046_ac8_ac11_trace_depart_et_fin_tronquee() {
+    for p in ["anthropic", "openai"] {
+        let s = Setup::new(p, vec![trunc_with(p, true); 10], "");
+        s.write("A.java", A_JAVA);
+        let o = s.run(&["build", "--verbose"]);
+        let e = err(&o);
+        let lines = llm_enrich_for(&e, "A.java");
+        assert_eq!(lines.len(), 2, "{p} {e}");
+        assert!(
+            lines[0].contains("llm enrich départ A.java [1/1]"),
+            "{}",
+            lines[0]
+        );
+        assert!(fin_matches(lines[1], "A.java"), "{}", lines[1]);
+        no_forbidden_trace(&e);
+    }
+}
+
+#[test]
+fn req046_ac11_lot_tronque_trace_et_lignes_a5() {
+    let mk = || {
+        let s = Setup::new(
+            "anthropic",
+            vec![anthropic_reply("{}", None), trunc("anthropic")],
+            "batch_files = 2\n",
+        );
+        for n in ["A", "B"] {
+            s.write(&format!("{n}.java"), &format!("public class {n} {{}}\n"));
+        }
+        s
+    };
+    let s = mk();
+    let o = s.run(&["build", "--verbose"]);
+    let e = err(&o);
+    let fin: Vec<&str> = llm_enrich_for(&e, "llm enrich fin");
+    assert_eq!(fin.len(), 1, "{e}");
+    assert!(fin_matches(fin[0], "lot A.java +1"), "{}", fin[0]);
+    no_forbidden_trace(&e);
+
+    let s = mk();
+    let o = s.run(&["build"]);
+    let e = err(&o);
+    let warns: Vec<&str> = e
+        .lines()
+        .filter(|l| l.starts_with("avertissement:"))
+        .collect();
+    assert_eq!(warns, [a5("A.java"), a5("B.java")], "{e}");
+}
+
+#[test]
+fn req046_ac12_gros_fichier_traces_par_morceau() {
+    let text = big_text();
+    let cfg = format!("max_chunk_chars = {}\n", text.len() / 3 + 40);
+    let ok = r#"{"version": 2, "summaries": [], "concepts": []}"#;
+    let reply = |k: usize| -> Vec<String> {
+        let mut v = vec![openai_reply("{}", None)];
+        for i in 1..=3 {
+            v.push(if i == k {
+                trunc("openai")
+            } else {
+                openai_reply(ok, Some("stop"))
+            });
+        }
+        v
+    };
+    let s = Setup::new("openai", reply(2), &cfg);
+    s.write("A.java", &text);
+    let o = s.run(&["build", "--verbose"]);
+    let e = err(&o);
+    let lines = llm_enrich_for(&e, "A.java");
+    assert_eq!(lines.len(), 4, "{e}");
+    assert!(lines[0].contains("départ A.java [1/3]"), "{}", lines[0]);
+    assert!(lines[1].contains("fin A.java [1/3] ok ("), "{}", lines[1]);
+    assert!(lines[2].contains("départ A.java [2/3]"), "{}", lines[2]);
+    assert!(
+        lines[3].contains("fin A.java [2/3] tronquée"),
+        "{}",
+        lines[3]
+    );
+    assert!(!e.contains("[3/3]"), "{e}");
+    no_forbidden_trace(&e);
+
+    for k in 1..=3 {
+        let s = Setup::new("openai", reply(k), &cfg);
+        s.write("A.java", &text);
+        let o = s.run(&["build"]);
+        let e = err(&o);
+        let warns: Vec<&str> = e
+            .lines()
+            .filter(|l| l.starts_with("avertissement:"))
+            .collect();
+        assert_eq!(warns, [a5("A.java")], "k={k} {e}");
+    }
+}
+
+#[test]
+fn req046_ac13_progression_cinq_lignes() {
+    let mut seen = Vec::new();
+    for no_color in [false, true] {
+        let s = Setup::new("anthropic", vec![trunc_with("anthropic", true); 10], "");
+        s.write("A.java", A_JAVA);
+        let o = s.run_env(&["build", "--show-progress"], no_color);
+        let e = err(&o);
+        // Hors l'erreur finale `erreur: 1 fichier(s) à enrichir` (code non nul, REQ-010).
+        let lines: Vec<&str> = e.lines().filter(|l| !l.starts_with("erreur:")).collect();
+        assert_eq!(
+            e.lines().last(),
+            Some("erreur: 1 fichier(s) à enrichir"),
+            "{e}"
+        );
+        let expected = [
+            "progression: extraction 0 % (0/1 fichiers)",
+            "progression: extraction 100 % (1/1 fichiers)",
+            "progression: enrichissement 0 % (0/1 fichiers)",
+        ];
+        assert_eq!(lines.len(), 5, "{e}");
+        assert_eq!(&lines[..3], &expected, "{e}");
+        assert_eq!(lines[3], a5("A.java"), "{e}");
+        assert_eq!(
+            lines[4], "progression: enrichissement 100 % (1/1 fichiers)",
+            "{e}"
+        );
+        let so = out(&o);
+        assert_eq!(so.lines().count(), 1, "{so}");
+        assert!(
+            so.starts_with("build terminé : 1 fichiers traités, "),
+            "{so}"
+        );
+        assert!(
+            so.trim_end()
+                .ends_with(", 0 fichiers en attente, 1 fichiers à enrichir"),
+            "{so}"
+        );
+        assert!(!o.stderr.contains(&0x1b) && !o.stdout.contains(&0x1b));
+        assert!(!o.stderr.contains(&b'\r') && !o.stdout.contains(&b'\r'));
+        seen.push((e, so));
+    }
+    assert_eq!(seen[0], seen[1]);
+}

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use super::lookup::{self, Lookup};
 use super::search;
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TRUNCATED};
 use crate::filter::ProjectFile;
 use crate::llm::{build_llm, with_format_retries, AskReply, Llm};
 use crate::model::{Edge, Node};
@@ -148,7 +148,13 @@ pub fn answer(
     let context = build_context(&nodes, &store.edges()?, &seeds);
     llm.verify_key()?;
     let stop = AtomicBool::new(false);
-    let reply = with_format_retries(format_retries, &stop, |_| llm.ask(question, &context))?;
+    let reply = with_format_retries(format_retries, &stop, |_| llm.ask(question, &context))
+        .map_err(|e| match e {
+            Error::Truncated(_) => {
+                Error::Truncated(format!("{TRUNCATED} ; posez une question plus ciblée"))
+            }
+            other => other,
+        })?;
     match reply {
         AskReply::NotFound => Err(not_found()),
         AskReply::Found {
