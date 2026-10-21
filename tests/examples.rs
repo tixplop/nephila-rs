@@ -750,7 +750,7 @@ fn REQ042_AC21_readme_table_des_plafonds() {
 fn REQ042_AC23_readme_ligne_0_17() {
     let readme = repo_file("README.md");
     let lines: Vec<&str> = readme.lines().collect();
-    let expected = "| 0.17 | Plafonds des réglages entiers de `.nephila.toml` (rupture : une valeur au-dessus est refusée ; pour corriger le fichier, donnez au réglage une valeur au plus égale à son plafond, donné par la table de la section « Fichier de projet `.nephila.toml` », ou déplacez le réglage dans votre configuration personnelle, qui n'a pas de plafond) |";
+    let expected = "| 0.17 | Plafonds des réglages entiers de `.nephila.toml` (rupture : une valeur au-dessus est refusée ; pour corriger le fichier, donnez au réglage une valeur au plus égale à son plafond, donné par la table de la section « Fichier de projet `.nephila.toml` », ou déplacez le réglage dans votre configuration personnelle, qui n'a pas de plafond mais vaut pour tous vos dépôts ; les options `--batch-files` et `--format-retries` n'ont pas de plafond non plus, mais ne corrigent pas un fichier refusé) |";
     assert_eq!(
         lines.iter().filter(|l| l.starts_with("| 0.17 |")).count(),
         1
