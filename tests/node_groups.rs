@@ -357,11 +357,15 @@ fn req047_ac4_mock_journal_traces_fixture_et_pannes() {
     assert!(out.contains("1 fichiers à enrichir"), "{out}");
 }
 
+/// Limite de morceau (littérale) et indice de la première méthode du morceau 2, relevés sur le binaire 0.17.5.
+const AC5_LIMIT: usize = 1946;
+const AC5_SPLIT: usize = 107;
+
 #[test]
 fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
     // 199 méthodes + le type = 200 nœuds ; limite de morceau à la moitié du fichier environ.
     let src = java("Big", 199);
-    let limit = src.chars().count() / 2 + 100;
+    let limit = AC5_LIMIT;
     let extra = format!("max_chunk_chars = {limit}\n");
     let probe = Env::mock(&[(BIG, src.clone())], &extra);
     let ids = probe.node_ids(BIG);
@@ -397,24 +401,20 @@ fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
             i + 1
         );
     }
-    // Liste attendue : identifiants dont le nom court (`Big`, `m<i>`) est un mot du contenu.
-    let words = |c: &str| -> BTreeSet<String> {
-        c.split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
-            .map(str::to_string)
-            .collect()
-    };
-    let short = |id: &str| id.rsplit(['.', ':']).next().unwrap().to_string();
     let lists: Vec<Vec<String>> = prompts.iter().map(|p| listed_ids(p)).collect();
-    for (k, p) in prompts.iter().enumerate() {
-        let w = words(content_of(p));
-        let expected: Vec<String> = ids
-            .iter()
-            .filter(|id| w.contains(&short(id)))
-            .cloned()
-            .collect();
-        assert_eq!(lists[k], expected, "liste de la requête {}", k + 1);
-        assert!(lists[k].len() <= 150);
+    let literal = |range: std::ops::Range<usize>| -> Vec<String> {
+        let mut v: Vec<String> = range.map(|i| format!("method:Big.m{i}")).collect();
+        v.push("type:Big".to_string());
+        v.sort();
+        v
+    };
+    assert_eq!(lists[0], literal(0..AC5_SPLIT), "liste de la requête 1");
+    assert_eq!(lists[1], literal(AC5_SPLIT..199), "liste de la requête 2");
+    for l in &lists {
+        assert!(l.len() <= 150);
     }
+    let all: Vec<String> = literal(0..199);
+    assert_eq!(all.len(), 200);
     let big = ids.iter().find(|i| i.starts_with("type:")).unwrap();
     assert!(lists[0].contains(big) && lists[1].contains(big));
     let methods: BTreeSet<&String> = lists[0]
@@ -423,7 +423,9 @@ fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
         .collect();
     assert!(lists[1].iter().all(|i| !methods.contains(i)));
     let union: BTreeSet<&String> = lists.iter().flatten().collect();
-    assert_eq!(union, ids.iter().collect::<BTreeSet<_>>());
+    assert_eq!(union, all.iter().collect::<BTreeSet<_>>());
+    let ids_set: BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(ids_set, all.iter().collect::<BTreeSet<_>>());
     assert_ne!(content_of(&prompts[0]), content_of(&prompts[1]));
     assert!(content_of(&prompts[0]).starts_with("public class Big {"));
 }

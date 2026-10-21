@@ -761,3 +761,18 @@ fn REQ042_AC23_readme_ligne_0_17() {
         .expect("ligne 0.17 absente");
     assert!(lines[i + 1].starts_with("| 0.16.1 |"));
 }
+
+#[test]
+fn REQ048_AC11_readme_second_remede() {
+    let readme = repo_file("README.md");
+    let expected = "Deux remèdes : `exclude` dans [`.nephila.toml`](#fichier-de-projet-nephilatoml), qui retire aussi sa structure du graphe ; ou une valeur plus grande de `max_chunk_chars` (dans `.nephila.toml`, au plus 1000000, ou dans la configuration personnelle), qui réduit le nombre de morceaux, donc d'appels, mais vaut pour tous les fichiers et allonge chaque requête. `max_chunk_chars` ne suffit pas pour un fichier de plus de 7500 nœuds (50 appels de 150 nœuds), comme une classe générée de 20 000 méthodes : seul `exclude` règle alors le cas.";
+    let lines: Vec<&str> = readme
+        .lines()
+        .filter(|l| {
+            l.contains("trop d'appels d'enrichissement (134 nécessaires, au plus 50 par fichier)")
+        })
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].ends_with(expected), "{}", lines[0]);
+    assert!(!readme.contains("Seul remède"));
+}

@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.17.5                                      # version voulue
+V=v0.17.6                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -514,7 +514,7 @@ Un certificat refusé produit une erreur contenant « certificat » et nommant `
 Par défaut (`batch_files = 1`), un appel LLM porte sur un seul fichier. Pour un dépôt fait de nombreux petits fichiers, `batch_files = 4` à `8` regroupe plusieurs fichiers par appel et réduit le nombre d'appels.
 
 - Les fichiers sont pris dans l'ordre des chemins. Un lot ne dépasse ni `batch_files` fichiers ni `max_chunk_chars` octets au total. Un fichier plus gros que `max_chunk_chars` part seul, en morceaux successifs.
-- Un appel demande au plus 150 nœuds ; la somme des nœuds d'un lot reste au plus égale à 150. Un fichier de plus de 150 nœuds est envoyé seul, en plusieurs appels : chaque morceau d'un gros fichier ne demande que les nœuds dont le nom court figure dans le morceau, en groupes de 150 ; un nœud cité nulle part est demandé avec le premier morceau ; une section Markdown est demandée avec le morceau qui porte son titre, et un nom de table SQL est cherché sans tenir compte de la casse. Sans réglage. Un fichier qui demanderait plus de 50 appels n'est pas envoyé, reste à enrichir, et est nommé par la ligne `avertissement: src/gen/Big.java : trop d'appels d'enrichissement (134 nécessaires, au plus 50 par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml`. Seul remède : `exclude` dans [`.nephila.toml`](#fichier-de-projet-nephilatoml), qui retire aussi sa structure du graphe.
+- Un appel demande au plus 150 nœuds ; la somme des nœuds d'un lot reste au plus égale à 150. Un fichier de plus de 150 nœuds est envoyé seul, en plusieurs appels : chaque morceau d'un gros fichier ne demande que les nœuds dont le nom court figure dans le morceau, en groupes de 150 ; un nœud cité nulle part est demandé avec le premier morceau ; une section Markdown est demandée avec le morceau qui porte son titre, et un nom de table SQL est cherché sans tenir compte de la casse. Sans réglage. Un fichier qui demanderait plus de 50 appels n'est pas envoyé, reste à enrichir, et est nommé par la ligne `avertissement: src/gen/Big.java : trop d'appels d'enrichissement (134 nécessaires, au plus 50 par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml`. Deux remèdes : `exclude` dans [`.nephila.toml`](#fichier-de-projet-nephilatoml), qui retire aussi sa structure du graphe ; ou une valeur plus grande de `max_chunk_chars` (dans `.nephila.toml`, au plus 1000000, ou dans la configuration personnelle), qui réduit le nombre de morceaux, donc d'appels, mais vaut pour tous les fichiers et allonge chaque requête. `max_chunk_chars` ne suffit pas pour un fichier de plus de 7500 nœuds (50 appels de 150 nœuds), comme une classe générée de 20 000 méthodes : seul `exclude` règle alors le cas.
 - `--batch-files <N>` remplace la clé pour la commande en cours, sans rien écrire. Priorité : option, puis clé `batch_files`, puis défaut 1. Sans LLM actif, l'option est acceptée sans effet.
 - Jusqu'à `concurrency` lots sont en vol en même temps, soit `concurrency` × `batch_files` fichiers.
 - Si un lot échoue, tous ses fichiers restent « à enrichir » et sont repris par le prochain `nephila update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse échoue seul.
@@ -697,7 +697,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.17.5 && git push origin v0.17.5
+git tag v0.17.6 && git push origin v0.17.6
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
