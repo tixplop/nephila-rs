@@ -6,7 +6,7 @@ use super::enrich::{
 };
 use super::{http, Llm, Tls};
 use super::{Enrichment, LotItem};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TRUNCATED};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
@@ -58,6 +58,9 @@ impl OpenAiLlm {
             Some(&body),
         )?;
         let v = http::parse_body("openai", &raw)?;
+        if v["choices"][0]["finish_reason"] == "length" {
+            return Err(Error::Truncated(TRUNCATED.into()));
+        }
         v["choices"][0]["message"]["content"]
             .as_str()
             .map(String::from)

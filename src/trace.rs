@@ -67,6 +67,7 @@ pub fn classify(e: &crate::error::Error) -> String {
         Error::Timeout(_) => "délai dépassé",
         Error::Network(_) => "réseau",
         Error::InvalidKey(_) => "clé refusée",
+        Error::Truncated(_) => "tronquée",
         Error::Message(_) | Error::Format(_) => "erreur",
     };
     label.to_string()

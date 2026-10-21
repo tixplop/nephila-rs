@@ -6,7 +6,7 @@ use super::enrich::{
 };
 use super::{http, Llm, Tls};
 use super::{Enrichment, LotItem};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TRUNCATED};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
@@ -56,6 +56,9 @@ impl AnthropicLlm {
             Some(&body),
         )?;
         let v = http::parse_body("anthropic", &raw)?;
+        if v["stop_reason"] == "max_tokens" {
+            return Err(Error::Truncated(TRUNCATED.into()));
+        }
         v["content"]
             .as_array()
             .and_then(|blocks| blocks.iter().find(|b| b["type"] == "text"))

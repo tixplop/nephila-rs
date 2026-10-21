@@ -16,7 +16,14 @@ pub enum Error {
     /// Réponse reçue du LLM jugée inexploitable (illisible, hors schéma) ; seule erreur
     /// qui justifie un nouvel essai (REQ-038). S'affiche comme `Message`.
     Format(String),
+    /// Réponse que le fournisseur marque tronquée par sa limite de jetons ; jamais retentée, ni
+    /// comptée ni remise à zéro par la politique d'échec (REQ-046). S'affiche comme `Message`.
+    Truncated(String),
 }
+
+/// Libellé fixe d'une réponse tronquée (avertissement d'enrichissement, erreur de `query ask`,
+/// traces) : seule source du texte.
+pub const TRUNCATED: &str = "réponse tronquée par la limite de jetons";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -36,7 +43,8 @@ impl fmt::Display for Error {
             | Error::Network(m)
             | Error::Timeout(m)
             | Error::Message(m)
-            | Error::Format(m) => f.write_str(m),
+            | Error::Format(m)
+            | Error::Truncated(m) => f.write_str(m),
         }
     }
 }

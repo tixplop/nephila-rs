@@ -108,4 +108,45 @@ mod tests {
         let (r, c) = run(2, &AtomicBool::new(true), Some(1));
         assert_eq!((r, c), (Ok(1), 1));
     }
+
+    fn truncated() -> Error {
+        Error::Truncated("tronquée".into())
+    }
+
+    #[test]
+    fn req046_truncated_first_try_is_one_call_without_suffix() {
+        let mut calls = 0;
+        let r: Result<()> = with_format_retries(2, &AtomicBool::new(false), |_| {
+            calls += 1;
+            Err(truncated())
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(r, Err(truncated()));
+        assert_eq!(r.unwrap_err().to_string(), "tronquée");
+    }
+
+    #[test]
+    fn req046_format_then_truncated_stops_without_suffix() {
+        let mut calls = 0;
+        let r: Result<()> = with_format_retries(5, &AtomicBool::new(false), |n| {
+            calls += 1;
+            if n == 1 {
+                Err(Error::Format("mauvais".into()))
+            } else {
+                Err(truncated())
+            }
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(r, Err(truncated()));
+    }
+
+    #[test]
+    fn req046_truncated_with_zero_retries_is_one_call() {
+        let mut calls = 0;
+        let r: Result<()> = with_format_retries(0, &AtomicBool::new(false), |_| {
+            calls += 1;
+            Err(truncated())
+        });
+        assert_eq!((calls, r), (1, Err(truncated())));
+    }
 }

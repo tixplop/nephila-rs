@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::chunk;
-use crate::error::{warn, Error, Result};
+use crate::error::{warn, Error, Result, TRUNCATED};
 use crate::index::build::{BuildReport, IndexOptions};
 use crate::llm::{with_format_retries, Enrichment, Llm, LotItem};
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
@@ -167,6 +167,7 @@ fn run_unit(
                 stop,
             );
             let err = r.as_ref().err().cloned();
+            let r = r.map_err(truncation_advice);
             outcomes.push(match r {
                 Ok(x) => Outcome::Done((*f).clone(), x),
                 Err(e) => Outcome::Failed(f.path.clone(), e),
@@ -184,8 +185,9 @@ fn run_unit(
                 .collect();
             match traced_lot(llm, &items, retries, stop) {
                 Err(e) => {
+                    let per_file = truncation_advice(e.clone());
                     for (f, _) in &readable {
-                        outcomes.push(Outcome::Failed(f.path.clone(), e.clone()));
+                        outcomes.push(Outcome::Failed(f.path.clone(), per_file.clone()));
                     }
                     (outcomes, Some(Some(e)))
                 }
@@ -214,7 +216,18 @@ fn run_unit(
 fn trace_detail(e: &Error) -> String {
     match e {
         Error::Message(m) | Error::Format(m) => m.split(" : ").next().unwrap_or("").to_string(),
+        Error::Truncated(_) => TRUNCATED.to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Erreur de chaque fichier dont l'appel a été tronqué : le libellé fixe et l'action (A-5).
+fn truncation_advice(e: Error) -> Error {
+    match e {
+        Error::Truncated(_) => Error::Truncated(format!(
+            "{TRUNCATED} ; réduisez max_chunk_chars ou batch_files"
+        )),
+        other => other,
     }
 }
 
@@ -681,6 +694,26 @@ mod tests {
         }
         let t = p.dispatch();
         assert!(p.record(t, Some(&net())));
+    }
+
+    #[test]
+    fn req046_ac6_truncated_neither_counts_nor_resets() {
+        let trunc = Error::Truncated("tronquée".into());
+        let mut p = Policy::default();
+        for r in [Some(&net()), Some(&net()), Some(&trunc)] {
+            let t = p.dispatch();
+            assert!(!p.record(t, r));
+        }
+        assert_eq!((p.consecutive_network, p.network_total), (2, 2));
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&net())));
+
+        let mut p = Policy::default();
+        for _ in 0..5 {
+            let t = p.dispatch();
+            assert!(!p.record(t, Some(&trunc)));
+        }
+        assert!(p.stop_cause.is_none());
     }
 
     #[test]
