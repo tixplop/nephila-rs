@@ -93,7 +93,7 @@ fn req002_ac3_connection_refused_is_network() {
 fn req002_ac3_extract_401_is_invalid_key() {
     let s = FakeServer::start(vec![(401, "{}".into())]);
     assert!(matches!(
-        anthropic(&s).enrich("A.java", 1, "class A {}", &a_ids()),
+        anthropic(&s).enrich("A.java", 1, "class A {}", &a_ids(), &a_ids()),
         Err(Error::InvalidKey(_))
     ));
 }
@@ -114,7 +114,7 @@ fn req002_ac5_anthropic_verify_key_request() {
 fn req002_ac5_anthropic_extract_request_and_response() {
     let s = FakeServer::start(vec![(200, anthropic_reply(EXTRACTION))]);
     let ex = anthropic(&s)
-        .enrich("src/A.java", 2, "class A {}", &a_ids())
+        .enrich("src/A.java", 2, "class A {}", &a_ids(), &a_ids())
         .unwrap();
     assert_eq!(ex.summaries.len(), 1);
     let r = &s.requests()[0];
@@ -149,7 +149,7 @@ fn req002_ac5_openai_verify_key_request() {
 fn req002_ac5_openai_extract_request_and_response() {
     let s = FakeServer::start(vec![(200, openai_reply(EXTRACTION))]);
     let ex = openai(&s, Some("sk-o"))
-        .enrich("A.java", 1, "class A {}", &a_ids())
+        .enrich("A.java", 1, "class A {}", &a_ids(), &a_ids())
         .unwrap();
     assert_eq!(ex.summaries[0].0, "type:A");
     let r = &s.requests()[0];
@@ -195,7 +195,7 @@ fn req002_ac5_json_is_extracted_from_fenced_text() {
     let s = FakeServer::start(vec![(200, anthropic_reply(&fenced))]);
     assert_eq!(
         anthropic(&s)
-            .enrich("A.java", 1, "x", &a_ids())
+            .enrich("A.java", 1, "x", &a_ids(), &a_ids())
             .unwrap()
             .summaries
             .len(),
@@ -238,13 +238,13 @@ fn req002_invalid_responses_are_message_errors() {
     let llm = anthropic(&s);
     for _ in 0..4 {
         assert!(matches!(
-            llm.enrich("A.java", 1, "x", &a_ids()),
+            llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()),
             Err(Error::Format(_))
         ));
     }
     let s = FakeServer::start(vec![(200, r#"{"choices":[]}"#.into())]);
     assert!(matches!(
-        openai(&s, None).enrich("A.java", 1, "x", &a_ids()),
+        openai(&s, None).enrich("A.java", 1, "x", &a_ids(), &a_ids()),
         Err(Error::Format(_))
     ));
 }
@@ -262,7 +262,7 @@ fn req002_ac8_slow_server_gives_timeout_error() {
         &Tls::default(),
     );
     let t = std::time::Instant::now();
-    let r = llm.enrich("A.java", 1, "class A {}", &a_ids());
+    let r = llm.enrich("A.java", 1, "class A {}", &a_ids(), &a_ids());
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
     assert!(t.elapsed() < std::time::Duration::from_millis(2000));
 }
@@ -292,7 +292,7 @@ fn req002_ac8_fast_server_succeeds_within_timeout() {
         &Tls::default(),
     );
     assert_eq!(
-        llm.enrich("A.java", 1, "class A {}", &a_ids())
+        llm.enrich("A.java", 1, "class A {}", &a_ids(), &a_ids())
             .unwrap()
             .summaries
             .len(),
@@ -332,7 +332,7 @@ fn req024_ac8_anthropic_enrich_request_carries_content_nodes_and_schema() {
     let s = FakeServer::start(vec![(200, anthropic_reply(ENRICHMENT))]);
     let ids = vec!["type:A".to_string(), "method:A.f".to_string()];
     let e = anthropic(&s)
-        .enrich("A.java", 1, "class A {}", &ids)
+        .enrich("A.java", 1, "class A {}", &ids, &ids)
         .unwrap();
     assert_eq!(e.summaries, vec![("type:A".into(), "Le A.".into())]);
     let b: serde_json::Value = serde_json::from_str(&s.requests()[0].body).unwrap();
@@ -346,7 +346,7 @@ fn req024_ac8_openai_enrich_request_carries_content_nodes_and_schema() {
     let s = FakeServer::start(vec![(200, openai_reply(ENRICHMENT))]);
     let ids = vec!["type:A".to_string(), "method:A.f".to_string()];
     openai(&s, None)
-        .enrich("A.java", 1, "class A {}", &ids)
+        .enrich("A.java", 1, "class A {}", &ids, &ids)
         .unwrap();
     let b: serde_json::Value = serde_json::from_str(&s.requests()[0].body).unwrap();
     check_enrich_request(b["messages"][1]["content"].as_str().unwrap());
@@ -358,7 +358,7 @@ fn req024_ac8_openai_enrich_request_carries_content_nodes_and_schema() {
 fn req024_ac5_enrich_version_1_is_non_conforming() {
     let s = FakeServer::start(vec![(200, anthropic_reply(VERSION_1))]);
     assert!(matches!(
-        anthropic(&s).enrich("A.java", 1, "x", &[]),
+        anthropic(&s).enrich("A.java", 1, "x", &[], &[]),
         Err(Error::Format(_))
     ));
 }

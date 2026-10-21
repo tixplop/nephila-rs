@@ -102,12 +102,8 @@ fn req002_ac4_missing_env_var_named() {
 const GOOD: &str = r#"{"version":2,"summaries":[{"node":"type:A","summary":"un"},{"node":"type:Z","summary":"deux"}],"concepts":[]}"#;
 
 fn ex(m: &MockLlm, file: &str, chunk: usize) -> nephila::error::Result<Enrichment> {
-    m.enrich(
-        file,
-        chunk,
-        "",
-        &["type:A".to_string(), "type:Z".to_string()],
-    )
+    let ids = ["type:A".to_string(), "type:Z".to_string()];
+    m.enrich(file, chunk, "", &ids, &ids)
 }
 
 // ---- LLM simulé (REQ-003)

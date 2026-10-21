@@ -89,34 +89,66 @@ impl Unit<'_> {
     }
 }
 
-/// Forme les unités dans l'ordre des fichiers : un lot compte au plus `batch_files` fichiers et
-/// au plus `max_chunk_chars` octets au total ; un fichier plus gros que `max_chunk_chars` forme
-/// une unité `Big` et coupe le lot en cours.
+/// Nombre maximal de nœuds demandés par appel d'enrichissement (DEC-058) : environ 40 jetons par
+/// résumé, ce qui reste sous `max_tokens = 8192` ; non configurable.
+const MAX_NODES_PER_CALL: usize = 150;
+
+/// Découpe la liste des nœuds d'un fichier en groupes d'au plus `MAX_NODES_PER_CALL` ; au moins
+/// un groupe, vide si la liste l'est.
+fn node_groups(ids: &[String]) -> Vec<&[String]> {
+    if ids.is_empty() {
+        return vec![ids];
+    }
+    ids.chunks(MAX_NODES_PER_CALL).collect()
+}
+
+/// Forme les unités avec 0 nœud par fichier (tests de la forme par taille et par nombre).
+#[cfg(test)]
 pub(crate) fn form_units(
     files: &[FileRecord],
     batch_files: usize,
     max_chunk_chars: usize,
 ) -> Vec<Unit<'_>> {
+    form_units_by_nodes(files, |_| 0, batch_files, max_chunk_chars)
+}
+
+/// Forme les unités dans l'ordre des fichiers : un lot compte au plus `batch_files` fichiers, au
+/// plus `max_chunk_chars` octets et au plus `MAX_NODES_PER_CALL` nœuds au total ; un fichier plus
+/// gros que `max_chunk_chars` ou de plus de `MAX_NODES_PER_CALL` nœuds forme une unité `Big` et
+/// coupe le lot en cours.
+pub(crate) fn form_units_by_nodes<'a>(
+    files: &'a [FileRecord],
+    nodes: impl Fn(&FileRecord) -> usize,
+    batch_files: usize,
+    max_chunk_chars: usize,
+) -> Vec<Unit<'a>> {
     let batch_files = batch_files.max(1);
     let mut units = Vec::new();
     let mut current: Vec<&FileRecord> = Vec::new();
     let mut total = 0u64;
+    let mut total_nodes = 0usize;
     for f in files {
-        if f.size > max_chunk_chars as u64 {
+        let n = nodes(f);
+        if f.size > max_chunk_chars as u64 || n > MAX_NODES_PER_CALL {
             if !current.is_empty() {
                 units.push(Unit::Lot(std::mem::take(&mut current)));
                 total = 0;
+                total_nodes = 0;
             }
             units.push(Unit::Big(f));
             continue;
         }
         if !current.is_empty()
-            && (current.len() >= batch_files || total + f.size > max_chunk_chars as u64)
+            && (current.len() >= batch_files
+                || total + f.size > max_chunk_chars as u64
+                || total_nodes + n > MAX_NODES_PER_CALL)
         {
             units.push(Unit::Lot(std::mem::take(&mut current)));
             total = 0;
+            total_nodes = 0;
         }
         total += f.size;
+        total_nodes += n;
         current.push(f);
     }
     if !current.is_empty() {
@@ -250,17 +282,19 @@ impl Attempt {
 }
 
 /// Un appel `llm.enrich` encadré de ses traces de départ et de fin (jamais de contenu).
+#[allow(clippy::too_many_arguments)]
 fn traced_enrich(
     llm: &dyn Llm,
     path: &str,
     index: usize,
     total: usize,
     text: &str,
-    node_ids: &[String],
+    requested: &[String],
+    known: &[String],
     attempt: Attempt,
 ) -> Result<Enrichment> {
     if !trace::enabled() {
-        return llm.enrich(path, index, text, node_ids);
+        return llm.enrich(path, index, text, requested, known);
     }
     trace!(
         "llm enrich départ {path} [{index}/{total}] {} car.{}",
@@ -268,7 +302,7 @@ fn traced_enrich(
         attempt.mark()
     );
     let started = Instant::now();
-    let result = llm.enrich(path, index, text, node_ids);
+    let result = llm.enrich(path, index, text, requested, known);
     let ms = started.elapsed().as_millis();
     match &result {
         Ok(x) => trace!(
@@ -334,8 +368,9 @@ fn traced_lot_once(
     result
 }
 
-/// Enrichit un fichier, en plusieurs appels s'il dépasse `max_chunk_chars` ; le premier échec
-/// d'un morceau fait échouer le fichier entier (REQ-007).
+/// Enrichit un fichier en `morceaux × groupes de nœuds` appels, numérotés dans l'ordre morceau 1
+/// groupe 1, morceau 1 groupe 2, …, puis morceau 2 ; le premier échec d'un appel fait échouer le
+/// fichier entier (REQ-007).
 fn enrich_chunks(
     llm: &dyn Llm,
     path: &str,
@@ -346,8 +381,8 @@ fn enrich_chunks(
     stop: &AtomicBool,
 ) -> Result<Enrichment> {
     let total = retries.saturating_add(1);
-    // Le compte d'essais repart à 1 pour chaque morceau ; seul le morceau fautif est renvoyé.
-    let one = |index: usize, count: usize, part: &str| {
+    // Le compte d'essais repart à 1 pour chaque appel ; seul l'appel fautif est renvoyé.
+    let one = |index: usize, count: usize, part: &str, requested: &[String]| {
         with_format_retries(retries, stop, |current| {
             traced_enrich(
                 llm,
@@ -355,18 +390,23 @@ fn enrich_chunks(
                 index,
                 count,
                 part,
+                requested,
                 node_ids,
                 Attempt { current, total },
             )
         })
     };
     let parts = chunk::split(text, max_chunk_chars);
-    if parts.len() == 1 {
-        return one(1, 1, &parts[0]);
+    let groups = node_groups(node_ids);
+    let count = parts.len() * groups.len();
+    if count == 1 {
+        return one(1, 1, &parts[0], groups[0]);
     }
-    let mut results = Vec::with_capacity(parts.len());
-    for (i, part) in parts.iter().enumerate() {
-        results.push(one(i + 1, parts.len(), part)?);
+    let mut results = Vec::with_capacity(count);
+    for part in &parts {
+        for group in &groups {
+            results.push(one(results.len() + 1, count, part, group)?);
+        }
     }
     Ok(chunk::merge_enrichments(results))
 }
@@ -453,7 +493,12 @@ pub(crate) fn enrich_with_stop(
     let started = Instant::now();
     let failed_before = report.failed;
     let mut succeeded = 0usize;
-    let units = form_units(files, batch_files, max_chunk_chars);
+    let units = form_units_by_nodes(
+        files,
+        |f| ids.get(&f.path).map_or(0, Vec::len),
+        batch_files,
+        max_chunk_chars,
+    );
     let queue: Mutex<VecDeque<Unit>> = Mutex::new(units.into());
     let policy = Mutex::new(Policy::default());
     let (tx, rx) = mpsc::channel::<Vec<Outcome>>();
@@ -646,6 +691,36 @@ mod tests {
         assert_eq!(shape(&form_units(&files, 4, 100)), ["a,b", "c"]);
     }
 
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("n{i}")).collect()
+    }
+
+    #[test]
+    fn req047_ac2_node_groups_bounds() {
+        assert_eq!(node_groups(&[]).len(), 1);
+        assert!(node_groups(&[])[0].is_empty());
+        let sizes =
+            |n: usize| -> Vec<usize> { node_groups(&ids(n)).iter().map(|g| g.len()).collect() };
+        assert_eq!(sizes(150), [150]);
+        assert_eq!(sizes(151), [150, 1]);
+        assert_eq!(sizes(401), [150, 150, 101]);
+        let all = ids(401);
+        let joined: Vec<String> = node_groups(&all).concat();
+        assert_eq!(joined, all);
+    }
+
+    #[test]
+    fn req047_ac1_form_units_by_nodes() {
+        let counts = [100usize, 60, 40, 200, 10];
+        let files: Vec<_> = (0..5).map(|i| rec(&format!("f{i}"), 1)).collect();
+        let nodes = |f: &FileRecord| counts[f.path[1..].parse::<usize>().unwrap()];
+        let u = form_units_by_nodes(&files, nodes, 8, 1000);
+        assert_eq!(shape(&u), ["f0", "f1,f2", "BIG:f3", "f4"]);
+        let files = vec![rec("a", 1)];
+        let u = form_units_by_nodes(&files, |_| 150, 8, 1000);
+        assert_eq!(shape(&u), ["a"]);
+    }
+
     fn net() -> Error {
         Error::Network("réseau".into())
     }
@@ -766,7 +841,14 @@ mod tests {
             fn verify_key(&self) -> Result<()> {
                 Ok(())
             }
-            fn enrich(&self, path: &str, _: usize, _: &str, _: &[String]) -> Result<Enrichment> {
+            fn enrich(
+                &self,
+                path: &str,
+                _: usize,
+                _: &str,
+                _: &[String],
+                _: &[String],
+            ) -> Result<Enrichment> {
                 if path.ends_with("B.java") {
                     self.tx.lock().unwrap().send(()).unwrap();
                     return Err(Error::InvalidKey("clé refusée".into()));
@@ -845,7 +927,14 @@ mod tests {
             fn verify_key(&self) -> Result<()> {
                 Ok(())
             }
-            fn enrich(&self, _: &str, _: usize, _: &str, _: &[String]) -> Result<Enrichment> {
+            fn enrich(
+                &self,
+                _: &str,
+                _: usize,
+                _: &str,
+                _: &[String],
+                _: &[String],
+            ) -> Result<Enrichment> {
                 Ok(Enrichment::default())
             }
             fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {

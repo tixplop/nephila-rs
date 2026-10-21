@@ -165,9 +165,9 @@ pub fn enrichment_system_prompt() -> String {
 }
 
 /// Message utilisateur d'enrichissement : liste des nœuds puis contenu du morceau.
-pub fn enrichment_user_prompt(file: &str, chunk: usize, text: &str, node_ids: &[String]) -> String {
-    let list: String = node_ids.iter().map(|n| format!("- {n}\n")).collect();
-    format!("Fichier : {file} (morceau {chunk})\n\nNœuds du fichier :\n{list}\nContenu :\n{text}")
+pub fn enrichment_user_prompt(file: &str, call: usize, text: &str, requested: &[String]) -> String {
+    let list: String = requested.iter().map(|n| format!("- {n}\n")).collect();
+    format!("Fichier : {file} (morceau {call})\n\nNœuds du fichier :\n{list}\nContenu :\n{text}")
 }
 
 /// Version du schéma de réponse d'un lot de 2 fichiers ou plus (DEC-033).

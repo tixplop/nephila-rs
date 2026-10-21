@@ -100,7 +100,9 @@ fn req036_ac2_openai_with_authority_succeeds() {
     );
     let llm = openai(&s.base_url, &tls_with("ca.pem"));
     llm.verify_key().unwrap();
-    let ex = llm.enrich("A.java", 1, "class A {}", &ids()).unwrap();
+    let ex = llm
+        .enrich("A.java", 1, "class A {}", &ids(), &ids())
+        .unwrap();
     assert_eq!(ex.summaries.len(), 1);
     let r = s.requests();
     assert_eq!(
@@ -127,7 +129,9 @@ fn req036_ac2_anthropic_with_authority_succeeds() {
     );
     let llm = anthropic(&s.base_url, &tls_with("ca.pem"));
     llm.verify_key().unwrap();
-    let ex = llm.enrich("A.java", 1, "class A {}", &ids()).unwrap();
+    let ex = llm
+        .enrich("A.java", 1, "class A {}", &ids(), &ids())
+        .unwrap();
     assert_eq!(ex.summaries.len(), 1);
     let r = s.requests();
     assert_eq!(r[0].path, "/v1/models");
@@ -178,10 +182,10 @@ fn req036_ac6_insecure_accepts_any_certificate() {
         );
         let o = openai(&s.base_url, &insecure());
         o.verify_key().unwrap();
-        o.enrich("A.java", 1, "class A {}", &ids()).unwrap();
+        o.enrich("A.java", 1, "class A {}", &ids(), &ids()).unwrap();
         let a = anthropic(&s.base_url, &insecure());
         a.verify_key().unwrap();
-        a.enrich("A.java", 1, "class A {}", &ids()).unwrap();
+        a.enrich("A.java", 1, "class A {}", &ids(), &ids()).unwrap();
         assert_eq!(s.requests().len(), 4, "{cert}");
     }
 }

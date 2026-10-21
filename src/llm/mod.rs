@@ -19,13 +19,15 @@ pub use retry::with_format_retries;
 pub trait Llm: Send + Sync {
     /// Vérifie la clé par un appel sans coût de génération.
     fn verify_key(&self) -> Result<()>;
-    /// Enrichit un morceau : résumés des nœuds `node_ids` et concepts (schéma version 2).
+    /// Enrichit un appel : résumés et concepts (schéma version 2). `requested` = nœuds écrits
+    /// dans le prompt ; `known` = liste complète du fichier, qui filtre la réponse.
     fn enrich(
         &self,
         file: &str,
-        chunk: usize,
+        call: usize,
         text: &str,
-        node_ids: &[String],
+        requested: &[String],
+        known: &[String],
     ) -> Result<Enrichment>;
     /// Enrichit un lot de 2 fichiers ou plus en un seul appel (schéma version 3, DEC-033).
     /// `Err` = échec de l'appel entier ; sinon un résultat par fichier du lot, dans l'ordre.

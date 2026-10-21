@@ -76,15 +76,16 @@ impl Llm for AnthropicLlm {
     fn enrich(
         &self,
         file: &str,
-        chunk: usize,
+        call: usize,
         text: &str,
-        node_ids: &[String],
+        requested: &[String],
+        known: &[String],
     ) -> Result<Enrichment> {
         let out = self.complete(
             enrichment_system_prompt(),
-            enrichment_user_prompt(file, chunk, text, node_ids),
+            enrichment_user_prompt(file, call, text, requested),
         )?;
-        Enrichment::parse(http::extract_json(&out)?, file, node_ids)
+        Enrichment::parse(http::extract_json(&out)?, file, known)
     }
 
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {

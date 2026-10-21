@@ -20,7 +20,10 @@ fn req003_build_llm_mock_reads_process_env() {
     std::env::set_var("NEPHILA_MOCK_INVALID_KEY", "1");
     let llm = build_llm(&cfg).unwrap();
     assert_eq!(
-        llm.enrich("A.java", 1, "", &ids).unwrap().summaries.len(),
+        llm.enrich("A.java", 1, "", &ids, &ids)
+            .unwrap()
+            .summaries
+            .len(),
         1
     );
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "A.java\t1\n");
@@ -31,11 +34,11 @@ fn req003_build_llm_mock_reads_process_env() {
     std::env::set_var("NEPHILA_MOCK_KEY_REVOKED_AFTER", "1");
     let llm = build_llm(&cfg).unwrap();
     assert!(matches!(
-        llm.enrich("B.java", 1, "", &ids),
+        llm.enrich("B.java", 1, "", &ids, &ids),
         Err(nephila::error::Error::Timeout(_))
     ));
     assert!(matches!(
-        llm.enrich("C.java", 1, "", &ids),
+        llm.enrich("C.java", 1, "", &ids, &ids),
         Err(nephila::error::Error::InvalidKey(_))
     ));
     std::env::remove_var("NEPHILA_MOCK_TIMEOUT_FILES");
@@ -111,10 +114,10 @@ mod malformed {
     fn req003_ac8_file_count_then_fixture() {
         let d = setup();
         let m = mock(d.path(), "a.java:2", &[]);
-        assert!(is_format(&m.enrich("a.java", 1, "", &ids("A"))));
-        assert!(is_format(&m.enrich("a.java", 1, "", &ids("A"))));
+        assert!(is_format(&m.enrich("a.java", 1, "", &ids("A"), &ids("A"))));
+        assert!(is_format(&m.enrich("a.java", 1, "", &ids("A"), &ids("A"))));
         assert_eq!(
-            m.enrich("a.java", 1, "", &ids("A"))
+            m.enrich("a.java", 1, "", &ids("A"), &ids("A"))
                 .unwrap()
                 .summaries
                 .len(),
@@ -122,7 +125,7 @@ mod malformed {
         );
         assert_eq!(log_lines(d.path()), 3);
         // Un autre fichier n'est pas touché.
-        assert!(m.enrich("b.java", 1, "", &ids("B")).is_ok());
+        assert!(m.enrich("b.java", 1, "", &ids("B"), &ids("B")).is_ok());
     }
 
     #[test]
@@ -174,9 +177,9 @@ mod malformed {
     fn req003_ac8_fail_after_applies_after_the_malformed_call() {
         let d = setup();
         let m = mock(d.path(), "a.java:1", &[("NEPHILA_MOCK_FAIL_AFTER", "1")]);
-        assert!(is_format(&m.enrich("a.java", 1, "", &ids("A"))));
+        assert!(is_format(&m.enrich("a.java", 1, "", &ids("A"), &ids("A"))));
         assert!(matches!(
-            m.enrich("a.java", 1, "", &ids("A")),
+            m.enrich("a.java", 1, "", &ids("A"), &ids("A")),
             Err(Error::Network(_))
         ));
     }

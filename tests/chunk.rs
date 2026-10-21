@@ -43,8 +43,8 @@ impl Env {
         let mock = tmp.path().join("mock");
         let mdir = mock.join("src/main/java/com/acme");
         fs::create_dir_all(&mdir).unwrap();
-        // Une fixture par morceau (jusqu'à 40) : chacun résume une méthode propre.
-        for n in 1..=40 {
+        // Une fixture par appel (jusqu'à 1000) : chacun résume une méthode propre.
+        for n in 1..=1000 {
             let json = format!(
                 r#"{{"version":2,"summaries":[{{"node":"method:com.acme.Big.m{n}","summary":"part{n}"}}],"concepts":[]}}"#
             );
@@ -108,6 +108,7 @@ fn req007_ac2_merged_into_one_type_with_all_methods_contained() {
     let env = Env::new(100_000, &big_java(20_000));
     assert!(env.build(None).status.success());
     let n_calls = env.calls().len();
+    assert!(n_calls <= 1000, "appels : {n_calls}");
     let store = env.store();
     let nodes = store.nodes().unwrap();
     let types: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Type).collect();

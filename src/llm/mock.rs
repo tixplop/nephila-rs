@@ -186,11 +186,11 @@ impl MockLlm {
     }
 
     /// Journalise l'appel, applique les échecs simulés et lit la fixture du morceau.
-    fn fixture_json(&self, file: &str, chunk: usize) -> Result<Option<String>> {
+    fn fixture_json(&self, file: &str, call: usize) -> Result<Option<String>> {
         check_relative(file)?;
-        self.gate(file, chunk, &[file])?;
+        self.gate(file, call, &[file])?;
         self.check_malformed(&[file])?;
-        let by_chunk = self.read_fixture(&format!("{file}.{chunk}.json"))?;
+        let by_chunk = self.read_fixture(&format!("{file}.{call}.json"))?;
         let json = match by_chunk {
             Some(j) => Some(j),
             None => self.read_fixture(&format!("{file}.json"))?,
@@ -252,12 +252,13 @@ impl Llm for MockLlm {
     fn enrich(
         &self,
         file: &str,
-        chunk: usize,
+        call: usize,
         _text: &str,
-        node_ids: &[String],
+        _requested: &[String],
+        known: &[String],
     ) -> Result<Enrichment> {
-        match self.fixture_json(file, chunk)? {
-            Some(j) => Enrichment::parse(&j, file, node_ids),
+        match self.fixture_json(file, call)? {
+            Some(j) => Enrichment::parse(&j, file, known),
             None => Ok(Enrichment::default()),
         }
     }

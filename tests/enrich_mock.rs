@@ -33,11 +33,11 @@ fn req003_ac1_enrich_returns_fixture_per_file_and_chunk_else_empty() {
     let log = d.path().join("log");
     let m = mock(d.path(), Some(&log));
     let n = ids(&["type:A"]);
-    let e1 = m.enrich("src/A.java", 1, "", &n).unwrap();
+    let e1 = m.enrich("src/A.java", 1, "", &n, &n).unwrap();
     assert_eq!(e1.summaries[0].1, "général");
-    let e2 = m.enrich("src/A.java", 2, "", &n).unwrap();
+    let e2 = m.enrich("src/A.java", 2, "", &n, &n).unwrap();
     assert_eq!(e2.summaries[0].1, "morceau 2");
-    let none = m.enrich("src/B.java", 1, "", &n).unwrap();
+    let none = m.enrich("src/B.java", 1, "", &n, &n).unwrap();
     assert!(none.summaries.is_empty() && none.concepts.is_empty() && none.rejected.is_empty());
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
@@ -54,8 +54,8 @@ fn req003_ac1_enrich_rejects_version_1_fixture_and_bad_paths() {
     )
     .unwrap();
     let m = mock(d.path(), None);
-    assert!(m.enrich("A.java", 1, "", &[]).is_err());
-    assert!(m.enrich("../A.java", 1, "", &[]).is_err());
+    assert!(m.enrich("A.java", 1, "", &[], &[]).is_err());
+    assert!(m.enrich("../A.java", 1, "", &[], &[]).is_err());
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn req003_ac6_summary_for_node_outside_list_is_rejected() {
     )
     .unwrap();
     let e = mock(d.path(), None)
-        .enrich("A.java", 1, "", &ids(&["type:A"]))
+        .enrich("A.java", 1, "", &ids(&["type:A"]), &ids(&["type:A"]))
         .unwrap();
     assert_eq!(e.summaries.len(), 1);
     assert_eq!(e.rejected.len(), 1);
@@ -84,11 +84,11 @@ fn req003_enrich_shares_failure_switches_with_extract() {
         ..Default::default()
     });
     assert!(matches!(
-        m.enrich("T.java", 1, "", &[]),
+        m.enrich("T.java", 1, "", &[], &[]),
         Err(Error::Timeout(_))
     ));
     assert!(matches!(
-        m.enrich("B.java", 1, "", &[]),
+        m.enrich("B.java", 1, "", &[], &[]),
         Err(Error::Network(_))
     ));
 }
