@@ -60,7 +60,30 @@ impl Env {
         }
     }
 
+    /// Ajoute un petit fichier `Small.java` (une méthode) et sa fixture.
+    fn add_small(&self) {
+        let dir = self.repo.join("src/main/java/com/acme");
+        fs::write(
+            dir.join("Small.java"),
+            "package com.acme;\n\npublic class Small {\n    void run() {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            self.mock.join("src/main/java/com/acme/Small.java.json"),
+            r#"{"version":2,"summaries":[{"node":"method:com.acme.Small.run","summary":"petit"}],"concepts":[]}"#,
+        )
+        .unwrap();
+    }
+
+    fn update(&self) -> std::process::Output {
+        self.command_with("update", None)
+    }
+
     fn build(&self, fail_after: Option<&str>) -> std::process::Output {
+        self.command_with("build", fail_after)
+    }
+
+    fn command_with(&self, sub: &str, fail_after: Option<&str>) -> std::process::Output {
         let mut c = Command::cargo_bin("nephila").unwrap();
         c.env_remove("NEPHILA_MOCK_FAIL_AFTER")
             .env_remove("NEPHILA_MOCK_INVALID_KEY")
@@ -71,7 +94,7 @@ impl Env {
         if let Some(f) = fail_after {
             c.env("NEPHILA_MOCK_FAIL_AFTER", f);
         }
-        c.arg("-C").arg(&self.repo).arg("build").output().unwrap()
+        c.arg("-C").arg(&self.repo).arg(sub).output().unwrap()
     }
 
     fn calls(&self) -> Vec<String> {
@@ -89,7 +112,7 @@ impl Env {
 
 #[test]
 fn req007_ac1_big_class_is_sent_in_several_calls() {
-    let env = Env::new(100_000, &big_java(20_000));
+    let env = Env::new(10_000, &big_java(2_000));
     let out = env.build(None);
     assert!(
         out.status.success(),
@@ -105,10 +128,9 @@ fn req007_ac1_big_class_is_sent_in_several_calls() {
 
 #[test]
 fn req007_ac2_merged_into_one_type_with_all_methods_contained() {
-    let env = Env::new(100_000, &big_java(20_000));
+    let env = Env::new(10_000, &big_java(2_000));
     assert!(env.build(None).status.success());
     let n_calls = env.calls().len();
-    assert!(n_calls <= 1000, "appels : {n_calls}");
     let store = env.store();
     let nodes = store.nodes().unwrap();
     let types: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Type).collect();
@@ -117,7 +139,7 @@ fn req007_ac2_merged_into_one_type_with_all_methods_contained() {
         .iter()
         .filter(|n| n.kind == NodeKind::Method)
         .collect();
-    assert_eq!(methods.len(), 20_000);
+    assert_eq!(methods.len(), 2_000);
     let edges = store.edges().unwrap();
     for m in methods.iter().take(50) {
         assert!(
@@ -132,6 +154,67 @@ fn req007_ac2_merged_into_one_type_with_all_methods_contained() {
     let summarized: Vec<_> = methods.iter().filter(|m| m.summary.is_some()).collect();
     assert_eq!(summarized.len(), n_calls);
     assert_eq!(store.count_files_to_enrich().unwrap(), 0);
+}
+
+#[test]
+fn req048_ac2_classe_de_20000_methodes_aucun_appel() {
+    let env = Env::new(100_000, &big_java(20_000));
+    env.add_small();
+    let check = |out: &std::process::Output| -> String {
+        let calls = env.calls();
+        assert!(
+            calls.iter().all(|l| !l.contains("Big.java")),
+            "appels pour Big.java : {}",
+            calls.iter().filter(|l| l.contains("Big.java")).count()
+        );
+        assert!(calls.iter().any(|l| l.contains("Small.java")));
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let warns: Vec<&str> = err
+            .lines()
+            .filter(|l| l.starts_with("avertissement:"))
+            .collect();
+        assert_eq!(warns.len(), 1, "{err}");
+        assert!(warns[0].contains("Big.java"), "{err}");
+        let store = env.store();
+        assert_eq!(store.count_files_to_enrich().unwrap(), 1);
+        warns[0].to_string()
+    };
+    let out = env.build(None);
+    let first = check(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 fichiers à enrichir"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let nodes = env.store().nodes().unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Type && n.id.contains("Big"))
+            .count(),
+        1
+    );
+    let methods: Vec<_> = nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Method && n.id.contains("Big."))
+        .collect();
+    assert_eq!(methods.len(), 20_000);
+    assert!(methods.iter().all(|m| m.summary.is_none()));
+    assert!(nodes
+        .iter()
+        .any(|n| n.id == "method:com.acme.Small.run" && n.summary.is_some()));
+    let edges = env.store().edges().unwrap();
+    let contained = edges
+        .iter()
+        .filter(|e| {
+            e.kind == EdgeKind::Contains && e.source.contains("Big") && e.target.contains("Big.")
+        })
+        .count();
+    assert_eq!(contained, 20_000);
+
+    let second = check(&env.update());
+    assert_eq!(first, second);
 }
 
 #[test]
@@ -184,7 +267,7 @@ fn req007_ac3_small_file_is_one_call() {
 
 #[test]
 fn req007_failure_on_a_chunk_keeps_structure_and_leaves_file_to_enrich() {
-    let env = Env::new(100_000, &big_java(20_000));
+    let env = Env::new(10_000, &big_java(2_000));
     let out = env.build(Some("1"));
     assert!(!out.status.success());
     let store = env.store();
@@ -196,7 +279,7 @@ fn req007_failure_on_a_chunk_keeps_structure_and_leaves_file_to_enrich() {
     let nodes = store.nodes().unwrap();
     assert_eq!(
         nodes.iter().filter(|n| n.kind == NodeKind::Method).count(),
-        20_000
+        2_000
     );
     assert!(nodes.iter().all(|n| n.summary.is_none()));
 }

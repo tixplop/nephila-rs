@@ -93,6 +93,10 @@ impl Unit<'_> {
 /// résumé, ce qui reste sous `max_tokens = 8192` ; non configurable.
 const MAX_NODES_PER_CALL: usize = 150;
 
+/// Nombre maximal d'appels d'enrichissement pour un fichier envoyé seul (DEC-059, non
+/// configurable) : 50 appels = 7 500 nœuds d'un seul morceau. Au-delà, aucun appel n'est envoyé.
+const MAX_CALLS_PER_FILE: usize = 50;
+
 /// Découpe la liste des nœuds d'un fichier en groupes d'au plus `MAX_NODES_PER_CALL` ; au moins
 /// un groupe, vide si la liste l'est.
 fn node_groups(ids: &[String]) -> Vec<&[String]> {
@@ -487,6 +491,12 @@ fn enrich_chunks(
     let parts = chunk::split(text, max_chunk_chars);
     let plan = call_plan(&parts, nodes);
     let count = plan.len();
+    if count > MAX_CALLS_PER_FILE {
+        return Err(Error::TooManyCalls {
+            calls: count,
+            max: MAX_CALLS_PER_FILE,
+        });
+    }
     if count == 1 {
         return one(1, 1, &parts[plan[0].0], &plan[0].1);
     }
@@ -981,6 +991,74 @@ mod tests {
         for _ in 0..5 {
             let t = p.dispatch();
             assert!(!p.record(t, Some(&trunc)));
+        }
+        assert!(p.stop_cause.is_none());
+    }
+
+    /// Faux `Llm` qui compte ses appels d'extraction.
+    struct Counting(std::sync::atomic::AtomicUsize);
+    impl Llm for Counting {
+        fn verify_key(&self) -> Result<()> {
+            Ok(())
+        }
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req048_ac1_plafond_de_50_appels() {
+        let stop = AtomicBool::new(false);
+        let run = |lines: usize| {
+            let text = "aaaaaaaaa\n".repeat(lines);
+            assert_eq!(chunk::split(&text, 10).len(), lines);
+            let llm = Counting(std::sync::atomic::AtomicUsize::new(0));
+            let r = enrich_chunks(&llm, "x", &text, 10, &[], 0, &stop);
+            (r, llm.0.load(Ordering::SeqCst))
+        };
+        let (r, calls) = run(51);
+        assert_eq!(calls, 0);
+        let e = r.unwrap_err();
+        assert_eq!(e, Error::TooManyCalls { calls: 51, max: 50 });
+        assert_eq!(
+            format!("avertissement: x : {e}"),
+            "avertissement: x : trop d'appels d'enrichissement (51 nécessaires, au plus 50 par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml"
+        );
+        let (r, calls) = run(50);
+        assert!(r.is_ok());
+        assert_eq!(calls, 50);
+    }
+
+    #[test]
+    fn req048_too_many_calls_neither_counts_nor_resets() {
+        let many = Error::TooManyCalls { calls: 51, max: 50 };
+        let mut p = Policy::default();
+        for r in [Some(&net()), Some(&net()), Some(&many)] {
+            let t = p.dispatch();
+            assert!(!p.record(t, r));
+        }
+        assert_eq!((p.consecutive_network, p.network_total), (2, 2));
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&net())));
+
+        let mut p = Policy::default();
+        for _ in 0..5 {
+            let t = p.dispatch();
+            assert!(!p.record(t, Some(&many)));
         }
         assert!(p.stop_cause.is_none());
     }

@@ -19,6 +19,9 @@ pub enum Error {
     /// Réponse que le fournisseur marque tronquée par sa limite de jetons ; jamais retentée, ni
     /// comptée ni remise à zéro par la politique d'échec (REQ-046). S'affiche comme `Message`.
     Truncated(String),
+    /// Plan d'appels d'un fichier envoyé seul au-delà du plafond : aucun appel n'est envoyé.
+    /// Ni comptée ni remise à zéro par la politique d'échec, jamais retentée (REQ-048).
+    TooManyCalls { calls: usize, max: usize },
 }
 
 /// Libellé fixe d'une réponse tronquée (avertissement d'enrichissement, erreur de `query ask`,
@@ -45,6 +48,10 @@ impl fmt::Display for Error {
             | Error::Message(m)
             | Error::Format(m)
             | Error::Truncated(m) => f.write_str(m),
+            Error::TooManyCalls { calls, max } => write!(
+                f,
+                "trop d'appels d'enrichissement ({calls} nécessaires, au plus {max} par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml"
+            ),
         }
     }
 }
