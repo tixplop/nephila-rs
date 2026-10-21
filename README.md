@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.17.4                                      # version voulue
+V=v0.17.5                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -137,7 +137,7 @@ update terminé : 2 fichiers traités, 2 nœuds, 1 liens, 0 références non ré
 Le bilan donne deux compteurs :
 
 - **en attente** : l'analyse du fichier n'a pas abouti ou n'a pas été faite. La commande sort avec le code 1 ; `nephila update` le retraite.
-- **à enrichir** : la structure du fichier est dans le graphe, mais son contenu actuel n'a pas été enrichi par le LLM (réponse non conforme, réponse tronquée, erreur, `--no-llm`, ou fichier modifié depuis). Avec le LLM actif, la commande sort avec le code 1 et `nephila update` ne renvoie au LLM que ces fichiers. Sans LLM, ce n'est pas une erreur (code 0, `enrichissement : désactivé`).
+- **à enrichir** : la structure du fichier est dans le graphe, mais son contenu actuel n'a pas été enrichi par le LLM (réponse non conforme, réponse tronquée, trop d'appels d'enrichissement (aucun envoyé), erreur, `--no-llm`, ou fichier modifié depuis). Avec le LLM actif, la commande sort avec le code 1 et `nephila update` ne renvoie au LLM que ces fichiers. Sans LLM, ce n'est pas une erreur (code 0, `enrichissement : désactivé`).
 
 Réanalyser un fichier modifié efface ses résumés et concepts.
 
@@ -219,6 +219,8 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 - le début et la fin de chaque phase (structure, résolution, enrichissement) ;
 - le départ et la fin de chaque appel LLM, avec son résultat (`ok`, `délai dépassé`, `réseau`, `clé refusée`, `erreur` ou `tronquée`) et sa durée ; `[i/n]` compte les appels du fichier (morceaux et groupes de 150 nœuds confondus) ; le départ d'un nouvel essai porte la marque ` (essai <e>/<t>)`, où `<t>` vaut `format_retries` + 1 (le premier essai n'a pas de marque) ;
 - les décisions d'arrêt.
+
+Un fichier non envoyé pour trop d'appels n'a aucune ligne `llm enrich`.
 
 ```
 trace: [0.000s] config: llm=mock model=m-projet concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
@@ -512,7 +514,7 @@ Un certificat refusé produit une erreur contenant « certificat » et nommant `
 Par défaut (`batch_files = 1`), un appel LLM porte sur un seul fichier. Pour un dépôt fait de nombreux petits fichiers, `batch_files = 4` à `8` regroupe plusieurs fichiers par appel et réduit le nombre d'appels.
 
 - Les fichiers sont pris dans l'ordre des chemins. Un lot ne dépasse ni `batch_files` fichiers ni `max_chunk_chars` octets au total. Un fichier plus gros que `max_chunk_chars` part seul, en morceaux successifs.
-- Un appel demande au plus 150 nœuds ; la somme des nœuds d'un lot reste au plus égale à 150. Un fichier de plus de 150 nœuds est envoyé seul, en plusieurs appels (morceaux × groupes de 150 nœuds), sans réglage.
+- Un appel demande au plus 150 nœuds ; la somme des nœuds d'un lot reste au plus égale à 150. Un fichier de plus de 150 nœuds est envoyé seul, en plusieurs appels : chaque morceau d'un gros fichier ne demande que les nœuds dont le nom court figure dans le morceau, en groupes de 150 ; un nœud cité nulle part est demandé avec le premier morceau. Sans réglage. Un fichier qui demanderait plus de 50 appels n'est pas envoyé, reste à enrichir, et est nommé par la ligne `avertissement: src/gen/Big.java : trop d'appels d'enrichissement (134 nécessaires, au plus 50 par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml`. Seul remède : `exclude` dans [`.nephila.toml`](#fichier-de-projet-nephilatoml), qui retire aussi sa structure du graphe.
 - `--batch-files <N>` remplace la clé pour la commande en cours, sans rien écrire. Priorité : option, puis clé `batch_files`, puis défaut 1. Sans LLM actif, l'option est acceptée sans effet.
 - Jusqu'à `concurrency` lots sont en vol en même temps, soit `concurrency` × `batch_files` fichiers.
 - Si un lot échoue, tous ses fichiers restent « à enrichir » et sont repris par le prochain `nephila update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse échoue seul.
@@ -667,6 +669,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.17.5 | Liste de nœuds propre à chaque morceau d'un gros fichier ; au plus 50 appels d'enrichissement par fichier, au-delà le fichier est nommé et laissé à enrichir |
 | 0.17.4 | Réponse tronquée par la limite de jetons reconnue et jamais renvoyée ; au plus 150 nœuds demandés par appel d'enrichissement |
 | 0.17 | Plafonds des réglages entiers de `.nephila.toml` (rupture : une valeur au-dessus est refusée ; pour corriger le fichier, donnez au réglage une valeur au plus égale à son plafond, donné par la table de la section « Fichier de projet `.nephila.toml` », ou déplacez le réglage dans votre configuration personnelle, qui n'a pas de plafond mais vaut pour tous vos dépôts ; les options `--batch-files` et `--format-retries` n'ont pas de plafond non plus, mais ne corrigent pas un fichier refusé) |
 | 0.16.1 | Analyse des expressions très imbriquées (Java, Kotlin, Scala, Groovy) sans débordement de pile |
@@ -694,7 +697,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.17.4 && git push origin v0.17.4
+git tag v0.17.5 && git push origin v0.17.5
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
