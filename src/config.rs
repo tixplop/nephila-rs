@@ -86,7 +86,8 @@ impl ProjectSettings {
                 }
             };
             let positive = || -> Result<u64> {
-                let cap = project_cap(key).expect("réglage entier plafonné");
+                let cap = project_cap(key)
+                    .unwrap_or_else(|| unreachable!("réglage entier sans plafond : {key}"));
                 bounded(1, cap, "entier strictement positif attendu")
             };
             match key {
@@ -98,11 +99,13 @@ impl ProjectSettings {
                 "concurrency" => out.concurrency = Some(positive()? as usize),
                 "timeout_secs" => out.timeout_secs = Some(positive()?),
                 "batch_files" => out.batch_files = Some(positive()? as usize),
-                _ => {
-                    let cap = project_cap(key).expect("réglage entier plafonné");
+                "format_retries" => {
+                    let cap = project_cap(key)
+                        .unwrap_or_else(|| unreachable!("réglage entier sans plafond : {key}"));
                     out.format_retries =
                         Some(bounded(0, cap, "entier positif ou nul attendu")? as u32)
                 }
+                _ => unreachable!("réglage hors de PROJECT_SETTINGS : {key}"),
             }
         }
         Ok(out)

@@ -833,40 +833,53 @@ fn req042_ac18_reglages_au_plafond_acceptes() {
 #[test]
 fn req042_ac19_bornes_personnelles_et_options_inchangees() {
     let e = Env::new();
+    let mut personal = String::from("provider = \"mock\"\nmodel = \"mock\"\n");
+    let mut wants = Vec::new();
+    for (key, cap) in nephila::config::PROJECT_CAPS {
+        personal.push_str(&format!("{key} = {}\n", cap + 1));
+        wants.push(format!("{key}={}", cap + 1));
+    }
+    fs::write(&e.config, personal).unwrap();
+    let o = e.run(&["build", "--verbose"]);
+    let err = text(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let line = config_line(&err);
+    for want in &wants {
+        assert!(line.contains(want.as_str()), "{want} {line}");
+    }
+    assert!(!err.contains("erreur:"), "{err}");
+
+    let e = Env::new();
     fs::write(
         &e.config,
-        "provider = \"mock\"\nmodel = \"mock\"\nmax_chunk_chars = 5000000\nconcurrency = 100\ntimeout_secs = 7200\nbatch_files = 500\nformat_retries = 4294967295\n",
+        "provider = \"mock\"\nmodel = \"mock\"\nformat_retries = 4294967295\n",
     )
     .unwrap();
     let o = e.run(&["build", "--verbose"]);
     let err = text(&o.stderr);
     assert_eq!(o.status.code(), Some(0), "{err}");
     let line = config_line(&err);
-    for want in [
-        "max_chunk_chars=5000000",
-        "concurrency=100",
-        "timeout_secs=7200",
-        "batch_files=500",
-        "format_retries=4294967295",
-    ] {
-        assert!(line.contains(want), "{line}");
-    }
-    assert!(!err.contains("erreur:"), "{err}");
+    assert!(line.contains("format_retries=4294967295"), "{line}");
 
+    let cap = |k: &str| nephila::config::project_cap(k).unwrap() + 1;
+    let (retries, batch) = (cap("format_retries"), cap("batch_files"));
     let e = Env::new();
     e.project("format_retries = 3\nbatch_files = 2\n");
     let o = e.run(&[
         "build",
         "--verbose",
         "--format-retries",
-        "11",
+        &retries.to_string(),
         "--batch-files",
-        "101",
+        &batch.to_string(),
     ]);
     let err = text(&o.stderr);
     assert_eq!(o.status.code(), Some(0), "{err}");
     let line = config_line(&err);
-    assert!(line.contains("batch_files=101 format_retries=11"), "{line}");
+    assert!(
+        line.contains(&format!("batch_files={batch} format_retries={retries}")),
+        "{line}"
+    );
 }
 
 #[test]
@@ -880,7 +893,14 @@ fn req042_ac22_valeurs_egales_au_plafond_et_sans_couleur() {
         assert!(!err.lines().any(|l| l.starts_with("erreur:")), "{err}");
     }
     e.project("concurrency = 65\n");
-    let plain = e.run(&["build", "--no-llm"]);
+    let plain = e
+        .command()
+        .env_remove("NO_COLOR")
+        .arg("-C")
+        .arg(&e.repo)
+        .args(["build", "--no-llm"])
+        .output()
+        .unwrap();
     let no_color = e
         .command()
         .env("NO_COLOR", "1")

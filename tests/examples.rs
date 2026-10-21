@@ -721,13 +721,7 @@ fn REQ042_AC20_lignes_de_plafond_de_l_exemple() {
         .iter()
         .any(|l| l.starts_with("# Plafond dans ce fichier :")));
     for l in &lines {
-        assert!(
-            !l.contains("maximum")
-                || l.starts_with("# Taille maximale")
-                || l.starts_with("# Durée maximale")
-                || l.starts_with("# Nombre maximal"),
-            "{l}"
-        );
+        assert!(!l.contains("maximum"), "{l}");
         assert!(!l.contains("4294967295"));
     }
 }
@@ -749,5 +743,21 @@ fn REQ042_AC21_readme_table_des_plafonds() {
         .iter()
         .any(|l| l.contains("`model`")));
     assert!(lines[head + 7].is_empty());
-    assert!(lines[head + 8].starts_with("Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et les options --batch-files et --format-retries n'en ont pas."));
+    assert_eq!(lines[head + 8], "Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et les options --batch-files et --format-retries n'en ont pas. Un dépôt cloné ne peut ainsi imposer ni plus de fils, ni des appels plus longs ou plus gros, ni plus d'essais.");
+}
+
+#[test]
+fn REQ042_AC23_readme_ligne_0_17() {
+    let readme = repo_file("README.md");
+    let lines: Vec<&str> = readme.lines().collect();
+    let expected = "| 0.17 | Plafonds des réglages entiers de `.nephila.toml` (rupture : une valeur au-dessus est refusée ; pour corriger le fichier, donnez au réglage une valeur au plus égale à son plafond, donné par la table de la section « Fichier de projet `.nephila.toml` », ou déplacez le réglage dans votre configuration personnelle, qui n'a pas de plafond) |";
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("| 0.17 |")).count(),
+        1
+    );
+    let i = lines
+        .iter()
+        .position(|l| *l == expected)
+        .expect("ligne 0.17 absente");
+    assert!(lines[i + 1].starts_with("| 0.16.1 |"));
 }
