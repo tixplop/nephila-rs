@@ -19,6 +19,8 @@ use crate::trace;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuildReport {
     pub processed: usize,
+    /// Fichiers dont l'enrichissement conservé a été réappliqué par cette commande (REQ-049).
+    pub retained: usize,
     pub pending: usize,
     pub nodes: usize,
     pub edges: usize,

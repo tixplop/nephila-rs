@@ -190,7 +190,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM summary; DELETE FROM meta WHERE key <> 'schema_version';",
+             DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model');",
         )
         .map_err(db_err)?;
         tx.commit().map_err(db_err)
@@ -203,7 +203,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM summary; DELETE FROM meta WHERE key <> 'schema_version';",
+             DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model');",
         )
         .map_err(db_err)?;
         {
@@ -288,8 +288,18 @@ impl Store {
     /// Comme `replace_structure` pour plusieurs fichiers en une seule transaction (tout ou rien) :
     /// évite une validation par fichier lors d'un build de milliers de fichiers.
     pub fn replace_structures(&mut self, items: &[(String, Vec<Node>, Vec<Ref>)]) -> Result<()> {
+        self.replace_structures_counted(items).map(|_| ())
+    }
+
+    /// Comme `replace_structures` ; renvoie le nombre de fichiers dont l'enrichissement conservé
+    /// a été réappliqué (DEC-062).
+    pub fn replace_structures_counted(
+        &mut self,
+        items: &[(String, Vec<Node>, Vec<Ref>)],
+    ) -> Result<usize> {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
+        let mut reapplied = 0;
         for (path, nodes, refs) in items {
             require_known(&tx, path)?;
             clear_summaries(&tx, path)?;
@@ -298,9 +308,12 @@ impl Store {
             insert_refs(&tx, path, refs, "parse")?;
             tx.execute("UPDATE files SET state = 'indexed' WHERE path = ?1", [path])
                 .map_err(db_err)?;
-            reapply_enrichment(&tx, path)?;
+            if reapply_enrichment(&tx, path)? {
+                reapplied += 1;
+            }
         }
-        tx.commit().map_err(db_err)
+        tx.commit().map_err(db_err)?;
+        Ok(reapplied)
     }
 
     /// Applique en une transaction le résultat de l'enrichissement d'un fichier : remplace ses
@@ -1159,7 +1172,7 @@ fn apply_enrichment_tx(
 /// Réapplique l'enrichissement conservé d'un fichier dont la structure vient d'être écrite si
 /// son empreinte de contenu est celle du fichier ; une entrée de contenu différent est
 /// supprimée. Les éléments sans nœud correspondant sont écartés en silence.
-fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<bool> {
     let row: Option<(String, String)> = match tx.query_row(
         "SELECT e.content_hash, e.payload FROM enrichments e WHERE e.path = ?1",
         [path],
@@ -1170,7 +1183,7 @@ fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> 
         Err(e) => return Err(db_err(e)),
     };
     let Some((entry_hash, json)) = row else {
-        return Ok(());
+        return Ok(false);
     };
     let file_hash: String = tx
         .query_row("SELECT hash FROM files WHERE path = ?1", [path], |r| {
@@ -1185,7 +1198,7 @@ fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> 
     let Some(payload) = payload else {
         tx.execute("DELETE FROM enrichments WHERE path = ?1", [path])
             .map_err(db_err)?;
-        return Ok(());
+        return Ok(false);
     };
     let declared: std::collections::HashSet<String> = declared_by(tx, path)?.into_iter().collect();
     let summaries: Vec<(String, String)> = payload
@@ -1226,7 +1239,8 @@ fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> 
             )
         })
         .collect();
-    apply_enrichment_tx(tx, path, &summaries, &concepts, &refs)
+    apply_enrichment_tx(tx, path, &summaries, &concepts, &refs)?;
+    Ok(true)
 }
 
 fn version_error(v: i32) -> Error {

@@ -329,3 +329,278 @@ fn req049_ac9_unreadable_then_readable_file_is_reapplied_without_call() {
     assert!(text(&o.stdout).contains("0 fichiers à enrichir"));
     assert_eq!(summary_of(&env, "type:com.acme.core.OrderService"), summary);
 }
+
+fn all_paths(env: &Env) -> BTreeSet<String> {
+    env.store()
+        .files()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect()
+}
+
+fn set_personal_model(env: &Env, model: &str) {
+    fs::write(
+        &env.config,
+        format!("provider = \"mock\"\nmodel = \"{model}\"\nbatch_files = 1\nconcurrency = 1\n"),
+    )
+    .unwrap();
+}
+
+/// Change le modèle (`personal` : configuration personnelle, sinon `.nephila.toml`).
+fn change_model(env: &Env, personal: bool) {
+    if personal {
+        set_personal_model(env, "autre");
+    } else {
+        env.write(".nephila.toml", "model = \"autre\"\n");
+    }
+}
+
+#[test]
+fn req049_ac3_model_change_resends_each_file_once_by_build_and_by_update() {
+    for personal in [true, false] {
+        for verb in ["build", "update"] {
+            let env = Env::new();
+            env.ok(&["build"]);
+            let files = all_paths(&env);
+            change_model(&env, personal);
+
+            if verb == "update" {
+                let st = env.ok(&["status"]);
+                assert!(
+                    text(&st.stdout).contains("graphe à jour"),
+                    "{}",
+                    text(&st.stdout)
+                );
+            }
+            env.ok(&[verb]);
+            let sent = env.logged();
+            assert_eq!(sent.len(), files.len(), "{verb} {personal} : {sent:?}");
+            assert_eq!(env.logged_paths(), files, "{verb} {personal}");
+            assert_eq!(env.store().count_files_to_enrich().unwrap(), 0);
+            for f in &files {
+                assert_eq!(
+                    env.store().enrichment_entry(f).unwrap().unwrap().model,
+                    "autre"
+                );
+            }
+
+            let again = env.ok(&[verb]);
+            assert!(
+                env.logged().is_empty(),
+                "{verb} {personal} : {:?}",
+                env.logged()
+            );
+            if verb == "update" {
+                assert_eq!(text(&again.stdout), "graphe à jour\n");
+            }
+            env.ok(&["build"]);
+            assert!(env.logged().is_empty(), "{:?}", env.logged());
+        }
+    }
+}
+
+#[test]
+fn req049_ac3_other_settings_send_nothing() {
+    let env = Env::new();
+    env.ok(&["build"]);
+    env.write(
+        ".nephila.toml",
+        "max_chunk_chars = 4000\nbatch_files = 3\nconcurrency = 2\nformat_retries = 3\ntimeout_secs = 100\n",
+    );
+    env.ok(&["build"]);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    let o = env.ok(&["update"]);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    assert_eq!(text(&o.stdout), "graphe à jour\n");
+}
+
+#[test]
+fn req049_ac3_model_survives_build_no_llm() {
+    let env = Env::new();
+    env.ok(&["build"]);
+    env.ok(&["build", "--no-llm"]);
+    let st = env.ok(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
+    assert_eq!(v["to_enrich"], 0);
+    set_personal_model(&env, "autre");
+    env.ok(&["update"]);
+    assert_eq!(env.logged_paths(), all_paths(&env));
+}
+
+#[test]
+fn req049_ac6_resume_sends_only_files_not_enriched_before_failure() {
+    let env = Env::new();
+    for i in 0..8 {
+        env.write(
+            &format!("docs/extra{i}.md"),
+            &format!("# Extra {i}\n\nTexte.\n"),
+        );
+    }
+    let o = env.run(&["build"]);
+    assert!(o.status.success());
+    let _ = o;
+    // Graphe neuf : le premier build ci-dessous est celui qui échoue.
+    fs::remove_dir_all(env.repo.join(".nephila")).unwrap();
+    let o = env
+        .cmd()
+        .env("NEPHILA_MOCK_FAIL_AFTER", "2")
+        .arg("build")
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", text(&o.stdout));
+    let store = env.store();
+    let files: Vec<String> = store.files().unwrap().into_iter().map(|f| f.path).collect();
+    assert!(files.iter().filter(|f| f.ends_with(".md")).count() >= 8);
+    let enriched: BTreeSet<String> = files
+        .iter()
+        .filter(|f| store.enrichment_entry(f).unwrap().is_some())
+        .cloned()
+        .collect();
+    assert_eq!(enriched.len(), 2, "{enriched:?}");
+    drop(store);
+
+    env.ok(&["build"]);
+    let expected: BTreeSet<String> = files
+        .into_iter()
+        .filter(|f| !enriched.contains(f))
+        .collect();
+    assert_eq!(env.logged_paths(), expected);
+    assert_eq!(env.logged().len(), expected.len());
+}
+
+#[test]
+fn req049_ac7_killed_build_keeps_enriched_files() {
+    let env = Env::new();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+        .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+        .env("NEPHILA_MOCK_DELAY_MS", "300")
+        .env("NEPHILA_CONFIG", &env.config)
+        .env("NEPHILA_MOCK_DIR", &env.mock)
+        .env("NEPHILA_MOCK_LOG", &env.log)
+        .arg("-C")
+        .arg(&env.repo)
+        .arg("build")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        assert!(
+            start.elapsed().as_secs() < 30,
+            "aucun enrichissement enregistré"
+        );
+        if let Ok(store) = Store::open_readonly(&env.repo) {
+            let files = store.files().unwrap_or_default();
+            if files
+                .iter()
+                .any(|f| store.enrichment_entry(&f.path).ok().flatten().is_some())
+            {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let store = env.store();
+    let files: Vec<String> = store.files().unwrap().into_iter().map(|f| f.path).collect();
+    let enriched: BTreeSet<String> = files
+        .iter()
+        .filter(|f| store.enrichment_entry(f).unwrap().is_some())
+        .cloned()
+        .collect();
+    drop(store);
+    assert!(!enriched.is_empty() && enriched.len() < files.len());
+    env.ok(&["build"]);
+    let sent = env.logged_paths();
+    assert!(sent.is_disjoint(&enriched), "{sent:?} / {enriched:?}");
+    assert_eq!(sent.len() + enriched.len(), files.len());
+}
+
+fn trace_lines(o: &Output) -> Vec<String> {
+    text(&o.stderr).lines().map(str::to_string).collect()
+}
+
+fn structure_end(o: &Output) -> String {
+    trace_lines(o)
+        .into_iter()
+        .find(|l| l.contains("structure: fin"))
+        .unwrap_or_else(|| panic!("pas de ligne structure: fin : {}", text(&o.stderr)))
+}
+
+fn processed(o: &Output) -> usize {
+    let out = text(&o.stdout);
+    let rest = out.split("terminé : ").nth(1).unwrap();
+    rest.split(' ').next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn req049_ac10_retained_count_in_structure_end_line() {
+    let env = Env::new();
+    let first = env.ok(&["build", "--verbose"]);
+    assert!(
+        structure_end(&first).ends_with(", 0 en attente, 0 enrichissements conservés"),
+        "{}",
+        structure_end(&first)
+    );
+    let second = env.ok(&["build", "--verbose"]);
+    let n = processed(&second);
+    assert!(n > 0);
+    assert!(
+        structure_end(&second).ends_with(&format!(", 0 en attente, {n} enrichissements conservés")),
+        "{}",
+        structure_end(&second)
+    );
+    assert!(!text(&second.stderr).contains("llm enrich"));
+    assert_eq!(text(&second.stdout), text(&first.stdout));
+
+    let third = env.ok(&["build", "--no-llm", "--verbose"]);
+    assert!(
+        structure_end(&third).ends_with(&format!(", 0 en attente, {n} enrichissements conservés")),
+        "{}",
+        structure_end(&third)
+    );
+
+    let fourth = env.ok(&["build", "--show-progress"]);
+    assert!(
+        !trace_lines(&fourth)
+            .iter()
+            .any(|l| l.starts_with("progression: enrichissement")),
+        "{}",
+        text(&fourth.stderr)
+    );
+    assert!(trace_lines(&fourth)
+        .iter()
+        .any(|l| l.starts_with("progression: extraction")));
+}
+
+#[test]
+fn req049_ac10_update_of_reapplied_pending_file_counts_one() {
+    let env = Env::new();
+    let path = env.repo.join(SVC);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    env.ok(&["build"]);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&path).is_ok() {
+        return;
+    }
+    let o = env.run(&["build"]);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!o.status.success());
+    let o = env.ok(&["update", "--verbose"]);
+    assert!(
+        structure_end(&o).ends_with(", 0 en attente, 1 enrichissements conservés"),
+        "{}",
+        structure_end(&o)
+    );
+    assert!(env.logged().is_empty());
+}

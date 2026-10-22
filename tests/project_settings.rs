@@ -750,12 +750,37 @@ fn req042_ac8_configuration_personnelle_validee_seule() {
 }
 
 #[test]
-fn req042_ac9_changer_de_reglage_ne_reenrichit_rien() {
+fn req042_ac9_changer_de_modele_reenrichit_une_fois_les_autres_reglages_rien() {
     let e = Env::new();
+    fs::write(
+        &e.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\n",
+    )
+    .unwrap();
     let o = e.run(&["build"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
-    let log = fs::read(&e.log).unwrap();
-    e.project("model = \"autre\"\nformat_retries = 3\nconcurrency = 1\n");
+    let sent = |e: &Env| -> Vec<String> {
+        let mut v: Vec<String> = fs::read_to_string(&e.log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let first = sent(&e);
+    assert!(!first.is_empty());
+
+    // Autres réglages : rien n'est envoyé.
+    let _ = fs::remove_file(&e.log);
+    e.project("format_retries = 3\nconcurrency = 1\nbatch_files = 2\n");
+    let o = e.run(&["update"]);
+    assert!(o.status.success());
+    assert_eq!(text(&o.stdout), "graphe à jour\n");
+    assert!(sent(&e).is_empty());
+
+    // Modèle : status et recherche inchangés, update envoie chaque fichier une fois.
+    e.project("model = \"autre\"\nformat_retries = 3\nconcurrency = 1\nbatch_files = 1\n");
     let o = e.run(&["status"]);
     assert!(
         text(&o.stdout).contains("graphe à jour"),
@@ -768,10 +793,15 @@ fn req042_ac9_changer_de_reglage_ne_reenrichit_rien() {
         "{}",
         text(&o.stderr)
     );
+    let _ = fs::remove_file(&e.log);
+    let o = e.run(&["update"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(sent(&e), first);
+    let _ = fs::remove_file(&e.log);
     let o = e.run(&["update"]);
     assert!(o.status.success());
     assert_eq!(text(&o.stdout), "graphe à jour\n");
-    assert_eq!(fs::read(&e.log).unwrap(), log);
+    assert!(sent(&e).is_empty());
 }
 
 #[test]

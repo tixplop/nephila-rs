@@ -50,6 +50,7 @@ pub(crate) fn analyze(
     let mut write_error: Option<Error> = None;
     let started = std::time::Instant::now();
     let failed_before = report.failed;
+    let retained_before = report.retained;
     trace!("structure: début {} fichiers, {workers} fils", files.len());
     let mut batch: Vec<Batched> = Vec::new();
 
@@ -131,9 +132,10 @@ pub(crate) fn analyze(
         }
     });
     trace!(
-        "structure: fin {} ms, {} en attente",
+        "structure: fin {} ms, {} en attente, {} enrichissements conservés",
         started.elapsed().as_millis(),
-        report.failed - failed_before
+        report.failed - failed_before,
+        report.retained - retained_before
     );
     match spawn_error.or(write_error) {
         Some(e) => Err(e),
@@ -153,8 +155,11 @@ fn flush(
     if batch.is_empty() {
         return;
     }
-    match store.replace_structures(batch) {
-        Ok(()) => report.processed += batch.len(),
+    match store.replace_structures_counted(batch) {
+        Ok(retained) => {
+            report.processed += batch.len();
+            report.retained += retained;
+        }
         Err(e) => {
             queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
             *write_error = Some(e);

@@ -106,16 +106,16 @@ pub fn update(
     if !touched.is_empty() {
         store.insert_files(&touched)?;
     }
+    // Le modèle effectif est enregistré avant la comparaison : un changement de modèle (ou de
+    // version du prompt) rend les fichiers « à enrichir », et ce n'est donc pas « aucun
+    // changement » (REQ-049). Les statuts et commandes LLM inactif comparent à ce modèle.
+    if let Some(llm) = llm {
+        store.set_enrich_model(llm.model())?;
+    }
     // « Aucun changement » : rien d'ajouté, modifié, supprimé ou en attente, et (LLM inactif ou
     // aucun fichier à enrichir).
     if d.is_up_to_date() && (llm.is_none() || store.count_files_to_enrich()? == 0) {
         return Ok(None);
-    }
-    // Le modèle effectif est enregistré dès qu'une mise à jour a lieu ; la comparaison avec le
-    // modèle des entrées conservées est faite par T-114 (un changement de modèle seul n'est
-    // pas encore une mise à jour).
-    if let Some(llm) = llm {
-        store.set_enrich_model(llm.model())?;
     }
 
     for path in d.paths(Change::Deleted) {

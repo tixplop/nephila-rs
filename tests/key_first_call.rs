@@ -211,6 +211,12 @@ fn req054_ac1_ask_single_request_and_update_none() {
 fn req054_ac1_update_without_change_no_request() {
     let env = Env::new();
     env.file("docs/a.md", "# A\n\ntexte\n");
+    // Même modèle (« m ») pour le build et l'update : un autre modèle ferait réenrichir (REQ-049).
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nmodel = \"m\"\nconcurrency = 1\nbatch_files = 10\n",
+    )
+    .unwrap();
     assert!(env.run(&["build"]).status.success());
     let server = FakeServer::start(vec![]);
     env.config_http("openai", &server.base_url, 1, 10);
