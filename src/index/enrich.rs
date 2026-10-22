@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::chunk;
 use crate::error::{warn, Error, Result, TRUNCATED};
@@ -78,19 +78,32 @@ enum Outcome {
     Failed(String, Error),
 }
 
-/// Unité de travail d'un fil : un lot de fichiers envoyés ensemble, ou un gros fichier envoyé
-/// seul en morceaux (REQ-027).
+/// Unité de travail d'un fil (DEC-063) : un lot de fichiers envoyés ensemble, un gros fichier
+/// envoyé seul (REQ-027) qui se transforme en appels dans la file commune, ou un de ces appels
+/// (morceau × groupe de nœuds, REQ-047).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Unit<'a> {
     Lot(Vec<&'a FileRecord>),
     Big(&'a FileRecord),
+    Call {
+        file: &'a FileRecord,
+        /// Rang de l'appel dans le plan, à partir de 1.
+        index: usize,
+        count: usize,
+        part: Arc<str>,
+        requested: Vec<String>,
+        /// Liste complète des nœuds du fichier, qui filtre la réponse.
+        known: Arc<[String]>,
+    },
 }
 
 impl Unit<'_> {
+    /// Fichiers pas encore commencés que cette unité représente.
     fn file_count(&self) -> usize {
         match self {
             Unit::Lot(v) => v.len(),
             Unit::Big(_) => 1,
+            Unit::Call { .. } => 0,
         }
     }
 }
@@ -167,23 +180,31 @@ pub(crate) fn form_units_by_nodes<'a>(
     units
 }
 
-/// Enrichit une unité : un résultat par fichier, et l'erreur de l'appel (pour la politique) s'il
-/// y a eu un appel. Un fichier illisible échoue seul et sort du lot.
-fn run_unit(
-    unit: &Unit<'_>,
+/// Suite d'une unité qui n'est pas un appel.
+enum Step<'a> {
+    /// Résultats par fichier, et l'erreur de l'appel (pour la politique) s'il y a eu un appel.
+    Finished(Vec<Outcome>, Option<Option<Error>>),
+    /// Un fichier envoyé seul : ses appels, dans l'ordre du plan, à mettre dans la file.
+    Calls(Vec<Outcome>, Vec<Unit<'a>>),
+}
+
+/// Exécute une unité `Lot` ou `Big`. Un fichier illisible échoue seul et sort du lot.
+fn run_unit<'a>(
+    unit: &Unit<'a>,
     repo: &Path,
     max_chunk_chars: usize,
     llm: &dyn Llm,
     ids: &HashMap<String, Vec<(String, String)>>,
     retries: u32,
     stop: &AtomicBool,
-) -> (Vec<Outcome>, Option<Option<Error>>) {
-    let files: Vec<&FileRecord> = match unit {
+) -> Step<'a> {
+    let files: Vec<&'a FileRecord> = match unit {
         Unit::Lot(v) => v.clone(),
         Unit::Big(f) => vec![*f],
+        Unit::Call { .. } => unreachable!("un appel ne passe pas par run_unit"),
     };
     let mut outcomes = Vec::new();
-    let mut readable: Vec<(&FileRecord, String)> = Vec::new();
+    let mut readable: Vec<(&'a FileRecord, String)> = Vec::new();
     for f in files {
         match std::fs::read_to_string(repo.join(&f.path)) {
             Ok(t) => readable.push((f, t)),
@@ -201,25 +222,19 @@ fn run_unit(
             .unwrap_or_default()
     };
     match readable.len() {
-        0 => (outcomes, None),
+        0 => Step::Finished(outcomes, None),
         1 => {
             let (f, text) = &readable[0];
-            let r = enrich_chunks(
-                llm,
-                &f.path,
-                text,
-                max_chunk_chars,
-                &nodes(f),
-                retries,
-                stop,
-            );
-            let err = r.as_ref().err().cloned();
-            let r = r.map_err(truncation_advice);
-            outcomes.push(match r {
-                Ok(x) => Outcome::Done((*f).clone(), x),
-                Err(e) => Outcome::Failed(f.path.clone(), e),
-            });
-            (outcomes, Some(err))
+            match plan_calls(f, text, max_chunk_chars, &nodes(f)) {
+                Ok(calls) => Step::Calls(outcomes, calls),
+                Err(e) => {
+                    outcomes.push(Outcome::Failed(
+                        f.path.clone(),
+                        truncation_advice(e.clone()),
+                    ));
+                    Step::Finished(outcomes, Some(Some(e)))
+                }
+            }
         }
         _ => {
             let items: Vec<LotItem> = readable
@@ -236,7 +251,7 @@ fn run_unit(
                     for (f, _) in &readable {
                         outcomes.push(Outcome::Failed(f.path.clone(), per_file.clone()));
                     }
-                    (outcomes, Some(Some(e)))
+                    Step::Finished(outcomes, Some(Some(e)))
                 }
                 Ok(results) => {
                     let mut by_path: HashMap<String, Result<Enrichment>> =
@@ -251,7 +266,7 @@ fn run_unit(
                             ),
                         });
                     }
-                    (outcomes, Some(None))
+                    Step::Finished(outcomes, Some(None))
                 }
             }
         }
@@ -516,35 +531,16 @@ fn section_homes(
     homes
 }
 
-/// Enrichit un fichier selon `call_plan` : un appel par morceau et par groupe de la liste propre
-/// à ce morceau, numérotés 1..n dans l'ordre du plan ; le premier échec d'un appel fait échouer
-/// le fichier entier (REQ-007).
-fn enrich_chunks(
-    llm: &dyn Llm,
-    path: &str,
+/// Appels d'un fichier envoyé seul selon `call_plan`, numérotés 1..n dans l'ordre du plan. Le
+/// plafond de `MAX_CALLS_PER_FILE` est vérifié ici, avant qu'un seul appel soit mis en file
+/// (REQ-048).
+fn plan_calls<'a>(
+    file: &'a FileRecord,
     text: &str,
     max_chunk_chars: usize,
     nodes: &[(String, String)],
-    retries: u32,
-    stop: &AtomicBool,
-) -> Result<Enrichment> {
-    let total = retries.saturating_add(1);
-    let known: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
-    // Le compte d'essais repart à 1 pour chaque appel ; seul l'appel fautif est renvoyé.
-    let one = |index: usize, count: usize, part: &str, requested: &[String]| {
-        with_format_retries(retries, stop, |current| {
-            traced_enrich(
-                llm,
-                path,
-                index,
-                count,
-                part,
-                requested,
-                &known,
-                Attempt { current, total },
-            )
-        })
-    };
+) -> Result<Vec<Unit<'a>>> {
+    let known: Arc<[String]> = nodes.iter().map(|(id, _)| id.clone()).collect();
     let spans = chunk::split_spans(text, max_chunk_chars);
     let homes = section_homes(text, &spans, nodes);
     let parts: Vec<String> = spans.into_iter().map(|(part, _)| part).collect();
@@ -556,14 +552,48 @@ fn enrich_chunks(
             max: MAX_CALLS_PER_FILE,
         });
     }
-    if count == 1 {
-        return one(1, 1, &parts[plan[0].0], &plan[0].1);
-    }
-    let mut results = Vec::with_capacity(count);
-    for (k, list) in &plan {
-        results.push(one(results.len() + 1, count, &parts[*k], list)?);
-    }
-    Ok(chunk::merge_enrichments(results))
+    let shared: Vec<Arc<str>> = parts.iter().map(|p| Arc::from(p.as_str())).collect();
+    Ok(plan
+        .into_iter()
+        .enumerate()
+        .map(|(i, (k, requested))| Unit::Call {
+            file,
+            index: i + 1,
+            count,
+            part: Arc::clone(&shared[k]),
+            requested,
+            known: Arc::clone(&known),
+        })
+        .collect())
+}
+
+/// Un appel d'enrichissement avec ses nouveaux essais de format (REQ-038) ; le compte d'essais
+/// repart à 1 pour chaque appel et seul l'appel fautif est renvoyé.
+#[allow(clippy::too_many_arguments)]
+fn run_call(
+    llm: &dyn Llm,
+    path: &str,
+    index: usize,
+    count: usize,
+    part: &str,
+    requested: &[String],
+    known: &[String],
+    retries: u32,
+    stop: &AtomicBool,
+) -> Result<Enrichment> {
+    let total = retries.saturating_add(1);
+    with_format_retries(retries, stop, |current| {
+        traced_enrich(
+            llm,
+            path,
+            index,
+            count,
+            part,
+            requested,
+            known,
+            Attempt { current, total },
+        )
+    })
 }
 
 /// Nœuds déclarés par chaque fichier (identifiant, nom court), hors packages et clés de
@@ -603,8 +633,132 @@ fn concept_records(e: &Enrichment) -> (Vec<Node>, Vec<Ref>) {
     (nodes, refs)
 }
 
-fn queue_len(queue: &Mutex<VecDeque<Unit>>) -> usize {
-    queue.lock().unwrap_or_else(|p| p.into_inner()).len()
+/// Ce que les fils envoient au fil écrivain.
+enum Msg<'a> {
+    /// Résultats par fichier d'un lot, ou échecs d'un fichier envoyé seul.
+    Outcomes(Vec<Outcome>),
+    /// Résultat d'un appel d'un fichier envoyé seul (`index` à partir de 1).
+    Chunk {
+        file: &'a FileRecord,
+        index: usize,
+        count: usize,
+        result: Result<Enrichment>,
+    },
+}
+
+/// Résultats rangés par indice des appels d'un fichier envoyé seul, côté fil écrivain.
+struct Partial {
+    results: Vec<Option<Enrichment>>,
+    done: usize,
+    failed: bool,
+}
+
+/// File commune des fils (DEC-063), sous un seul verrou.
+struct Shared<'a> {
+    queue: VecDeque<Unit<'a>>,
+    /// Fichiers dont un appel a échoué : leurs appels non partis sont sautés.
+    failed: HashSet<String>,
+    /// Unités qui peuvent encore ajouter des appels à la file (lecture et plan d'un fichier).
+    expanding: usize,
+}
+
+/// Délai de réveil d'un fil qui attend des appels, pour voir l'arrêt posé hors de la file.
+const IDLE_WAKE: Duration = Duration::from_millis(20);
+
+/// Prend l'unité suivante ; attend quand la file est vide mais qu'une unité en cours peut encore
+/// y ajouter des appels. `None` : plus rien à faire ou arrêt demandé.
+fn next_unit<'a>(
+    shared: &Mutex<Shared<'a>>,
+    wake: &Condvar,
+    stop: &AtomicBool,
+) -> Option<Unit<'a>> {
+    let mut guard = shared.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        match guard.queue.pop_front() {
+            Some(Unit::Call { file, .. }) if guard.failed.contains(&file.path) => continue,
+            Some(unit) => {
+                if !matches!(unit, Unit::Call { .. }) {
+                    guard.expanding += 1;
+                }
+                return Some(unit);
+            }
+            None if guard.expanding == 0 => return None,
+            None => {
+                guard = wake
+                    .wait_timeout(guard, IDLE_WAKE)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+            }
+        }
+    }
+}
+
+/// Fin de l'expansion d'une unité : ses appels passent en tête de file, dans l'ordre du plan.
+fn finish_unit<'a>(
+    shared: &Mutex<Shared<'a>>,
+    wake: &Condvar,
+    calls: Vec<Unit<'a>>,
+    ran_unit: bool,
+) {
+    let mut guard = shared.lock().unwrap_or_else(|p| p.into_inner());
+    for call in calls.into_iter().rev() {
+        guard.queue.push_front(call);
+    }
+    if ran_unit {
+        guard.expanding -= 1;
+    }
+    drop(guard);
+    wake.notify_all();
+}
+
+/// Garde de l'expansion d'une unité : si le fil panique avant `finish_unit`, le compteur
+/// `expanding` est tout de même décrémenté, pour que les autres fils ne l'attendent pas.
+struct ExpandGuard<'s, 'a> {
+    shared: &'s Mutex<Shared<'a>>,
+    wake: &'s Condvar,
+    armed: bool,
+}
+
+impl Drop for ExpandGuard<'_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            guard.expanding = guard.expanding.saturating_sub(1);
+            drop(guard);
+            self.wake.notify_all();
+        }
+    }
+}
+
+/// Écrit l'enrichissement complet d'un fichier (une transaction).
+fn apply_done(
+    store: &mut Store,
+    file: &FileRecord,
+    x: &Enrichment,
+    stop: &AtomicBool,
+    succeeded: &mut usize,
+    write_error: &mut Option<Error>,
+) {
+    if write_error.is_some() {
+        return;
+    }
+    *succeeded += 1;
+    if !x.rejected.is_empty() {
+        warn(&format!(
+            "{} : {} élément(s) d'enrichissement écarté(s) : {}",
+            file.path,
+            x.rejected.len(),
+            x.rejected.join(" ; ")
+        ));
+    }
+    let (concepts, refs) = concept_records(x);
+    if let Err(e) = store.apply_enrichment(&file.path, &file.hash, &x.summaries, &concepts, &refs) {
+        stop.store(true, Ordering::SeqCst);
+        *write_error = Some(e);
+    }
 }
 
 /// Pool de threads LLM ; le thread courant écrit une transaction par fichier.
@@ -654,12 +808,26 @@ pub(crate) fn enrich_with_stop(
         batch_files,
         max_chunk_chars,
     );
-    let queue: Mutex<VecDeque<Unit>> = Mutex::new(units.into());
+    // Un gros fichier peut donner jusqu'à `MAX_CALLS_PER_FILE` appels : autant de fils utiles.
+    let useful: usize = units
+        .iter()
+        .map(|u| match u {
+            Unit::Big(_) => MAX_CALLS_PER_FILE,
+            _ => 1,
+        })
+        .sum();
+    let workers = concurrency.clamp(1, useful.max(1));
+    let shared = Mutex::new(Shared {
+        queue: units.into(),
+        failed: HashSet::new(),
+        expanding: 0,
+    });
+    let wake = Condvar::new();
     let policy = Mutex::new(Policy::default());
-    let (tx, rx) = mpsc::channel::<Vec<Outcome>>();
-    let workers = concurrency.clamp(1, queue_len(&queue).max(1));
+    let (tx, rx) = mpsc::channel::<Msg>();
     let mut write_error: Option<Error> = None;
     let mut failures: Vec<(String, Error)> = Vec::new();
+    let mut partials: HashMap<String, Partial> = HashMap::new();
     trace!(
         "enrichissement: début {} fichiers, {workers} fils",
         files.len()
@@ -667,108 +835,221 @@ pub(crate) fn enrich_with_stop(
     let mut meter = progress::Meter::start(Phase::Enrichment, files.len());
 
     std::thread::scope(|scope| {
-        let queue = &queue;
+        let shared = &shared;
+        let wake = &wake;
         let policy = &policy;
         let ids = &ids;
         for _ in 0..workers {
             let tx = tx.clone();
-            scope.spawn(move || loop {
-                if stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                let Some(unit) = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front() else {
-                    break;
-                };
-                let ticket = policy.lock().unwrap_or_else(|p| p.into_inner()).dispatch();
-                let (outcomes, call) = run_unit(
-                    &unit,
-                    repo,
-                    max_chunk_chars,
-                    llm,
-                    ids,
-                    format_retries,
-                    stop,
-                );
-                let error = call.as_ref().and_then(|e| e.as_ref());
-                let halt = {
-                    let mut guard = policy.lock().unwrap_or_else(|p| p.into_inner());
-                    let was_stopped = guard.stop_cause.is_some();
-                    let halt = match call {
-                        Some(_) => guard.record(ticket, error),
-                        None => guard.stop_cause.is_some(),
+            scope.spawn(move || {
+                while let Some(unit) = next_unit(shared, wake, stop) {
+                    let mut expand = ExpandGuard {
+                        shared,
+                        wake,
+                        armed: !matches!(unit, Unit::Call { .. }),
                     };
-                    if trace::enabled() {
-                        if matches!(error, Some(Error::Network(_))) {
-                            trace!(
-                                "politique: erreurs réseau consécutives {}/{MAX_CONSECUTIVE_NETWORK_ERRORS}",
-                                guard.consecutive_network
+                    let ticket = policy.lock().unwrap_or_else(|p| p.into_inner()).dispatch();
+                    // Résultat de l'unité : l'erreur de l'appel pour la politique s'il y en a eu un.
+                    let (call, message, calls, expanded) = match unit {
+                        Unit::Call {
+                            file,
+                            index,
+                            count,
+                            part,
+                            requested,
+                            known,
+                        } => {
+                            let result = run_call(
+                                llm,
+                                &file.path,
+                                index,
+                                count,
+                                &part,
+                                &requested,
+                                &known,
+                                format_retries,
+                                stop,
                             );
+                            let err = result.as_ref().err().cloned();
+                            // Toute cause d'échec fait sauter les appels non partis du fichier
+                            // (AC-051-5) ; la politique enregistre quand même cet appel.
+                            if err.is_some() {
+                                shared
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .failed
+                                    .insert(file.path.clone());
+                            }
+                            let result = result.map_err(truncation_advice);
+                            (
+                                Some(err),
+                                Some(Msg::Chunk {
+                                    file,
+                                    index,
+                                    count,
+                                    result,
+                                }),
+                                Vec::new(),
+                                false,
+                            )
                         }
-                        if halt && !was_stopped {
-                            let left: usize = queue
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .iter()
-                                .map(Unit::file_count)
-                                .sum();
-                            trace!(
-                                "politique: arrêt de l'envoi ({}), {left} fichiers non envoyés",
-                                guard.stop_cause.as_deref().unwrap_or("")
+                        unit => {
+                            let step = run_unit(
+                                &unit,
+                                repo,
+                                max_chunk_chars,
+                                llm,
+                                ids,
+                                format_retries,
+                                stop,
                             );
+                            match step {
+                                Step::Finished(outcomes, call) => (
+                                    call,
+                                    (!outcomes.is_empty()).then_some(Msg::Outcomes(outcomes)),
+                                    Vec::new(),
+                                    true,
+                                ),
+                                Step::Calls(outcomes, calls) => (
+                                    None,
+                                    (!outcomes.is_empty()).then_some(Msg::Outcomes(outcomes)),
+                                    calls,
+                                    true,
+                                ),
+                            }
+                        }
+                    };
+                    expand.armed = false;
+                    finish_unit(shared, wake, calls, expanded);
+                    let error = call.as_ref().and_then(|e| e.as_ref());
+                    let halt = {
+                        let mut guard = policy.lock().unwrap_or_else(|p| p.into_inner());
+                        let was_stopped = guard.stop_cause.is_some();
+                        let halt = match call {
+                            Some(_) => guard.record(ticket, error),
+                            None => guard.stop_cause.is_some(),
+                        };
+                        if trace::enabled() {
+                            if matches!(error, Some(Error::Network(_))) {
+                                trace!(
+                                    "politique: erreurs réseau consécutives {}/{MAX_CONSECUTIVE_NETWORK_ERRORS}",
+                                    guard.consecutive_network
+                                );
+                            }
+                            if halt && !was_stopped {
+                                let left: usize = shared
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .queue
+                                    .iter()
+                                    .map(Unit::file_count)
+                                    .sum();
+                                trace!(
+                                    "politique: arrêt de l'envoi ({}), {left} fichiers non envoyés",
+                                    guard.stop_cause.as_deref().unwrap_or("")
+                                );
+                            }
+                        }
+                        halt
+                    };
+                    if halt {
+                        stop.store(true, Ordering::SeqCst);
+                        // Réveille les fils qui attendent des appels.
+                        drop(shared.lock().unwrap_or_else(|p| p.into_inner()));
+                        wake.notify_all();
+                    }
+                    if let Some(m) = message {
+                        if tx.send(m).is_err() {
+                            break;
                         }
                     }
-                    halt
-                };
-                if halt {
-                    stop.store(true, Ordering::SeqCst);
-                }
-                if !outcomes.is_empty() && tx.send(outcomes).is_err() {
-                    break;
                 }
             });
         }
         drop(tx);
-        for batch in rx {
-            let count = batch.len();
-            for outcome in batch {
-                match outcome {
-                    Outcome::Failed(path, e) => {
-                        // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
-                        if !matches!(e, Error::InvalidKey(_)) {
-                            warn(&format!("{path} : {e}"));
+        for msg in rx {
+            let mut advance = 0usize;
+            match msg {
+                Msg::Outcomes(batch) => {
+                    advance = batch.len();
+                    for outcome in batch {
+                        match outcome {
+                            Outcome::Failed(path, e) => {
+                                // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
+                                if !matches!(e, Error::InvalidKey(_)) {
+                                    warn(&format!("{path} : {e}"));
+                                }
+                                report.failed += 1;
+                                failures.push((path, e));
+                            }
+                            Outcome::Done(file, x) => {
+                                apply_done(
+                                    store,
+                                    &file,
+                                    &x,
+                                    stop,
+                                    &mut succeeded,
+                                    &mut write_error,
+                                );
+                            }
                         }
-                        report.failed += 1;
-                        failures.push((path, e));
                     }
-                    Outcome::Done(file, x) => {
-                        if write_error.is_some() {
-                            continue;
-                        }
-                        succeeded += 1;
-                        if !x.rejected.is_empty() {
-                            warn(&format!(
-                                "{} : {} élément(s) d'enrichissement écarté(s) : {}",
-                                file.path,
-                                x.rejected.len(),
-                                x.rejected.join(" ; ")
-                            ));
-                        }
-                        let (concepts, refs) = concept_records(&x);
-                        if let Err(e) = store.apply_enrichment(
-                            &file.path,
-                            &file.hash,
-                            &x.summaries,
-                            &concepts,
-                            &refs,
-                        ) {
-                            stop.store(true, Ordering::SeqCst);
-                            write_error = Some(e);
+                }
+                Msg::Chunk {
+                    file,
+                    index,
+                    count,
+                    result,
+                } => {
+                    let entry = partials
+                        .entry(file.path.clone())
+                        .or_insert_with(|| Partial {
+                            results: vec![None; count],
+                            done: 0,
+                            failed: false,
+                        });
+                    // Résultat d'un fichier déjà en échec : ignoré.
+                    if !entry.failed {
+                        match result {
+                            Err(e) => {
+                                entry.failed = true;
+                                // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
+                                if !matches!(e, Error::InvalidKey(_)) {
+                                    warn(&format!("{} : {e}", file.path));
+                                }
+                                report.failed += 1;
+                                failures.push((file.path.clone(), e));
+                                advance = 1;
+                            }
+                            Ok(x) => {
+                                entry.results[index - 1] = Some(x);
+                                entry.done += 1;
+                                if entry.done == count {
+                                    let parts: Vec<Enrichment> =
+                                        entry.results.iter_mut().filter_map(Option::take).collect();
+                                    // Un seul appel : résultat tel quel, comme avant DEC-063.
+                                    let merged = if count == 1 {
+                                        parts.into_iter().next().unwrap_or_default()
+                                    } else {
+                                        chunk::merge_enrichments(parts)
+                                    };
+                                    apply_done(
+                                        store,
+                                        file,
+                                        &merged,
+                                        stop,
+                                        &mut succeeded,
+                                        &mut write_error,
+                                    );
+                                    advance = 1;
+                                }
+                            }
                         }
                     }
                 }
             }
             if let Some(m) = meter.as_mut() {
-                m.advance(count);
+                m.advance(advance);
             }
         }
     });
@@ -811,6 +1092,7 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(","),
                 Unit::Big(f) => format!("BIG:{}", f.path),
+                Unit::Call { .. } => unreachable!(),
             })
             .collect()
     }
@@ -1179,6 +1461,40 @@ mod tests {
         }
     }
 
+    /// Enchaîne les appels d'un fichier dans l'ordre, comme un seul fil, et fusionne.
+    fn enrich_chunks(
+        llm: &dyn Llm,
+        path: &str,
+        text: &str,
+        max_chunk_chars: usize,
+        nodes: &[(String, String)],
+        retries: u32,
+        stop: &AtomicBool,
+    ) -> Result<Enrichment> {
+        let file = rec(path, text.len() as u64);
+        let mut results = Vec::new();
+        for unit in plan_calls(&file, text, max_chunk_chars, nodes)? {
+            let Unit::Call {
+                index,
+                count,
+                part,
+                requested,
+                known,
+                ..
+            } = unit
+            else {
+                unreachable!()
+            };
+            results.push(run_call(
+                llm, path, index, count, &part, &requested, &known, retries, stop,
+            )?);
+        }
+        if results.len() == 1 {
+            return Ok(results.remove(0));
+        }
+        Ok(chunk::merge_enrichments(results))
+    }
+
     #[test]
     fn req048_ac1_plafond_de_50_appels() {
         let stop = AtomicBool::new(false);
@@ -1436,5 +1752,303 @@ mod tests {
                 "progression: enrichissement 100 % (10/10 fichiers)",
             ]
         );
+    }
+
+    /// Faux `Llm` qui identifie chaque appel par fichier et indice (`"A#2"`, ou `"lot:S0,S1"`
+    /// pour un lot), mesure les appels simultanés et force les `rendezvous` premiers appels à
+    /// se rencontrer (AC-051-3, AC-051-5).
+    struct Probe {
+        now: std::sync::atomic::AtomicUsize,
+        max: std::sync::atomic::AtomicUsize,
+        arrivals: std::sync::atomic::AtomicUsize,
+        rendezvous: usize,
+        barrier: std::sync::Barrier,
+        calls: Mutex<Vec<String>>,
+        /// Appels (`"fichier#indice"`) en erreur réseau.
+        network: Vec<String>,
+    }
+
+    impl Probe {
+        fn new(rendezvous: usize, network: &[&str]) -> Probe {
+            Probe {
+                now: Default::default(),
+                max: Default::default(),
+                arrivals: Default::default(),
+                rendezvous,
+                barrier: std::sync::Barrier::new(rendezvous.max(1)),
+                calls: Mutex::new(Vec::new()),
+                network: network.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn measured<T>(&self, f: impl FnOnce() -> T) -> T {
+            let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max.fetch_max(n, Ordering::SeqCst);
+            // Les premiers appels attendent les autres : ils sont donc simultanés.
+            if self.arrivals.fetch_add(1, Ordering::SeqCst) < self.rendezvous {
+                self.barrier.wait();
+            }
+            let r = f();
+            self.now.fetch_sub(1, Ordering::SeqCst);
+            r
+        }
+    }
+
+    impl Llm for Probe {
+        fn enrich(
+            &self,
+            file: &str,
+            call: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            let id = format!("{file}#{call}");
+            self.calls.lock().unwrap().push(id.clone());
+            self.measured(|| {
+                if self.network.contains(&id) {
+                    return Err(net());
+                }
+                let mut x = Enrichment::default();
+                if file == "Big.txt" {
+                    x.concepts.push(crate::llm::enrich::Concept {
+                        name: "c".into(),
+                        summary: Some(format!("s{call}")),
+                        sections: vec![format!("section:x#{call}")],
+                    });
+                }
+                Ok(x)
+            })
+        }
+        fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            let names: Vec<&str> = items.iter().map(|i| i.file.as_str()).collect();
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("lot:{}", names.join(",")));
+            self.measured(|| {
+                Ok(items
+                    .iter()
+                    .map(|i| (i.file.clone(), Ok(Enrichment::default())))
+                    .collect())
+            })
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    /// Dépôt temporaire : chaque gros fichier `(nom, lignes)` (lignes de 10 octets, un morceau
+    /// par ligne avec `max_chunk_chars = 10`), puis `small` petits fichiers de 2 octets.
+    fn probe_repo(big: &[(&str, usize)], small: usize) -> (tempfile::TempDir, Vec<FileRecord>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for (name, lines) in big {
+            std::fs::write(dir.path().join(name), "aaaaaaaaa\n".repeat(*lines)).unwrap();
+            files.push(rec(name, 10 * *lines as u64));
+        }
+        for i in 0..small {
+            let name = format!("S{i}.txt");
+            std::fs::write(dir.path().join(&name), "x\n").unwrap();
+            files.push(rec(&name, 2));
+        }
+        (dir, files)
+    }
+
+    fn probe_run(
+        dir: &tempfile::TempDir,
+        files: &[FileRecord],
+        llm: &dyn Llm,
+        concurrency: usize,
+        batch_files: usize,
+    ) -> (Store, BuildReport, Vec<(String, Error)>) {
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(files).unwrap();
+        // Les sections que citent les concepts du faux `Llm` sont déclarées par `Big.txt`.
+        let sections: Vec<Node> = (1..=8)
+            .map(|k| {
+                let name = format!("x#{k}");
+                Node::new(NodeKind::Section, &name, &name, Some("Big.txt"), None, None)
+            })
+            .collect();
+        if files.iter().any(|f| f.path == "Big.txt") {
+            store.replace_structure("Big.txt", &sections, &[]).unwrap();
+        }
+        let mut report = BuildReport::default();
+        let opts = IndexOptions {
+            concurrency,
+            max_chunk_chars: 10,
+            batch_files,
+            format_retries: 0,
+        };
+        let failures = enrich_with_stop(
+            dir.path(),
+            files,
+            &opts,
+            llm,
+            &mut store,
+            &mut report,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        (store, report, failures)
+    }
+
+    fn names(failures: &[(String, Error)]) -> Vec<&str> {
+        failures.iter().map(|(p, _)| p.as_str()).collect()
+    }
+
+    #[test]
+    fn req051_ac3_appels_simultanes_bornes_par_concurrency() {
+        for concurrency in [3usize, 1] {
+            let (dir, files) = probe_repo(&[("Big.txt", 8)], 4);
+            let llm = Probe::new(concurrency, &[]);
+            let (store, report, failures) = probe_run(&dir, &files, &llm, concurrency, 2);
+            assert!(failures.is_empty(), "{failures:?}");
+            assert_eq!(report.failed, 0);
+            assert_eq!(
+                llm.max.load(Ordering::SeqCst),
+                concurrency,
+                "concurrency = {concurrency}"
+            );
+            let calls = llm.calls();
+            let (lots, chunks): (Vec<_>, Vec<_>) =
+                calls.iter().partition(|c| c.starts_with("lot:"));
+            assert_eq!(lots.len(), 2, "deux appels de lot : {calls:?}");
+            let mut seen: Vec<&str> = lots
+                .iter()
+                .flat_map(|l| l.trim_start_matches("lot:").split(','))
+                .collect();
+            seen.sort_unstable();
+            assert_eq!(seen, ["S0.txt", "S1.txt", "S2.txt", "S3.txt"]);
+            let mut chunks: Vec<String> = chunks.into_iter().cloned().collect();
+            if concurrency == 1 {
+                let expected: Vec<String> = (1..=8).map(|k| format!("Big.txt#{k}")).collect();
+                assert_eq!(chunks, expected);
+            }
+            chunks.sort_unstable();
+            let expected: Vec<String> = (1..=8).map(|k| format!("Big.txt#{k}")).collect();
+            assert_eq!(chunks, expected, "chaque appel une fois");
+            for i in 0..4 {
+                let name = format!("S{i}.txt");
+                assert_eq!(
+                    store.enriched_hash(&name).unwrap(),
+                    Some(String::new()),
+                    "{name}"
+                );
+            }
+            // Fusion attendue : premier résumé du concept (appel 1), sections des 8 appels.
+            let concept = store.node_by_id("concept:c").unwrap().unwrap();
+            assert_eq!(concept.summary.as_deref(), Some("s1"));
+            let mut sections: Vec<String> = store
+                .refs()
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.kind == EdgeKind::Mentions)
+                .map(|r| r.source)
+                .collect();
+            sections.sort();
+            let expected: Vec<String> = (1..=8).map(|k| format!("section:x#{k}")).collect();
+            assert_eq!(sections, expected);
+            assert_eq!(store.enriched_hash("Big.txt").unwrap(), Some(String::new()));
+        }
+    }
+
+    /// Sans petits fichiers : seuls les morceaux d'un même gros fichier peuvent franchir la
+    /// barrière (3 rendez-vous), ce qui prouve leur parallélisme (maximum exactement 3).
+    #[test]
+    fn req051_ac3_morceaux_d_un_gros_fichier_en_parallele_bornes_par_concurrency() {
+        let (dir, files) = probe_repo(&[("Big.txt", 8)], 0);
+        let llm = Probe::new(3, &[]);
+        let (_store, report, failures) = probe_run(&dir, &files, &llm, 3, 2);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert_eq!(llm.max.load(Ordering::SeqCst), 3);
+        let mut calls = llm.calls();
+        assert!(calls.iter().all(|c| c.starts_with("Big.txt#")), "{calls:?}");
+        calls.sort_unstable();
+        let expected: Vec<String> = (1..=8).map(|k| format!("Big.txt#{k}")).collect();
+        assert_eq!(calls, expected);
+    }
+
+    #[test]
+    fn req051_ac5_a_trois_erreurs_reseau_arretent_l_envoi() {
+        let (dir, files) = probe_repo(&[("A", 2), ("B", 2), ("C", 2), ("D", 2)], 0);
+        let llm = Probe::new(0, &["A#1", "A#2", "B#1", "B#2", "C#1", "C#2", "D#1", "D#2"]);
+        let (store, report, failures) = probe_run(&dir, &files, &llm, 1, 1);
+        assert_eq!(llm.calls(), ["A#1", "B#1", "C#1"]);
+        assert!(report
+            .stop_cause
+            .as_deref()
+            .is_some_and(|c| c.contains("panne réseau répétée")));
+        assert_eq!(names(&failures), ["A", "B", "C"], "chacun nommé une fois");
+        assert!(failures.iter().all(|(_, e)| matches!(e, Error::Network(_))));
+        assert_eq!(report.failed, 3);
+        for f in ["A", "B", "C", "D"] {
+            assert_eq!(store.enriched_hash(f).unwrap(), None, "{f} à enrichir");
+        }
+    }
+
+    #[test]
+    fn req051_ac5_b_une_reussite_remet_le_compte_a_zero() {
+        let (dir, files) = probe_repo(&[("A", 2), ("B", 2), ("C", 2), ("D", 2)], 0);
+        let llm = Probe::new(0, &["A#1", "B#2", "C#1"]);
+        let (store, report, failures) = probe_run(&dir, &files, &llm, 1, 1);
+        assert_eq!(llm.calls(), ["A#1", "B#1", "B#2", "C#1", "D#1", "D#2"]);
+        assert!(report.stop_cause.is_none(), "{:?}", report.stop_cause);
+        assert_eq!(names(&failures), ["A", "B", "C"], "chacun nommé une fois");
+        for f in ["A", "B", "C"] {
+            assert_eq!(store.enriched_hash(f).unwrap(), None, "{f} à enrichir");
+        }
+        assert_eq!(store.enriched_hash("D").unwrap(), Some(String::new()));
+    }
+
+    #[test]
+    fn req051_ac5_c_une_erreur_reseau_isolee_ne_fait_partir_que_le_premier_appel() {
+        let (dir, files) = probe_repo(&[("Big.txt", 5)], 0);
+        let llm = Probe::new(0, &["Big.txt#1"]);
+        let (store, report, failures) = probe_run(&dir, &files, &llm, 1, 1);
+        assert_eq!(llm.calls(), ["Big.txt#1"]);
+        assert!(report.stop_cause.is_none(), "{:?}", report.stop_cause);
+        assert_eq!(names(&failures), ["Big.txt"]);
+        assert_eq!(report.failed, 1);
+        assert_eq!(store.enriched_hash("Big.txt").unwrap(), None);
+    }
+
+    #[test]
+    fn req051_echec_non_reseau_fait_sauter_les_appels_restants() {
+        struct FailSecond(Mutex<Vec<usize>>);
+        impl Llm for FailSecond {
+            fn enrich(
+                &self,
+                _: &str,
+                call: usize,
+                _: &str,
+                _: &[String],
+                _: &[String],
+            ) -> Result<Enrichment> {
+                self.0.lock().unwrap().push(call);
+                if call == 2 {
+                    return Err(Error::Format("non conforme".into()));
+                }
+                Ok(Enrichment::default())
+            }
+            fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+                Err(Error::Message("inutilisé".into()))
+            }
+            fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+                Err(Error::Message("inutilisé".into()))
+            }
+        }
+        let (dir, files) = probe_repo(&[("Big.txt", 4)], 0);
+        let llm = FailSecond(Mutex::new(Vec::new()));
+        let (_, report, failures) = probe_run(&dir, &files, &llm, 1, 1);
+        assert_eq!(*llm.0.lock().unwrap(), [1, 2]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(report.failed, 1);
     }
 }

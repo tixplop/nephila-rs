@@ -37,7 +37,7 @@ impl Env {
         let config = tmp.path().join("config.toml");
         fs::write(
             &config,
-            format!("provider = \"mock\"\nmodel = \"mock\"\nmax_chunk_chars = {max_chunk}\n"),
+            format!("provider = \"mock\"\nmodel = \"mock\"\nmax_chunk_chars = {max_chunk}\nconcurrency = 1\n"),
         )
         .unwrap();
         let mock = tmp.path().join("mock");
