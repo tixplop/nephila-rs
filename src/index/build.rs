@@ -285,6 +285,9 @@ pub fn build(
         matcher.trace_suffix(scanned.excluded)
     );
     store.reset_with_pending_files(&records)?;
+    if let Some(llm) = llm {
+        store.set_enrich_model(llm.model())?;
+    }
     if records.is_empty() {
         warn("aucun fichier pris en charge dans le dépôt : graphe vide");
     }
@@ -314,6 +317,7 @@ pub(crate) fn finalize(
     repo: &Path,
     report: &mut BuildReport,
 ) -> Result<()> {
+    store.prune_enrichments()?;
     let mut stats = resolve_pass(store)?;
     report.llm_active = llm.is_some();
     if let Some(llm) = llm {

@@ -9,6 +9,12 @@ use crate::error::{Error, Result};
 /// Version du schéma de réponse d'enrichissement.
 pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 
+/// Version du prompt d'enrichissement (DEC-062). À incrémenter à chaque changement des consignes
+/// système, des gabarits de requête (fichier seul et lot) ou des schémas de réponse version 2 et
+/// 3 : tout enrichissement conservé avec une autre version est refait. Un test fige l'empreinte
+/// BLAKE3 de ces textes à côté de cette valeur.
+pub const ENRICH_PROMPT_VERSION: u32 = 1;
+
 /// Concept proposé pour un document Markdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Concept {
@@ -311,6 +317,48 @@ pub fn lot_user_prompt(items: &[LotItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Empreinte BLAKE3 des consignes, gabarits et schémas (version 2 et 3) d'enrichissement.
+    fn prompts_fingerprint() -> String {
+        let items = [
+            LotItem {
+                file: "a.md".into(),
+                text: "texte a".into(),
+                node_ids: ids(&["document:a.md", "section:a.md#x"]),
+            },
+            LotItem {
+                file: "B.java".into(),
+                text: "texte b".into(),
+                node_ids: ids(&["type:p.B"]),
+            },
+        ];
+        let all = [
+            format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
+            enrichment_system_prompt(),
+            enrichment_user_prompt(
+                "a.md",
+                2,
+                "texte a",
+                &ids(&["document:a.md", "section:a.md#x"]),
+            ),
+            lot_system_prompt(),
+            lot_user_prompt(&items),
+        ]
+        .join("\n<<<->>>\n");
+        blake3::hash(all.as_bytes()).to_hex().to_string()
+    }
+
+    #[test]
+    fn req049_ac4_prompt_texts_are_frozen_next_to_the_prompt_version() {
+        // Changer une consigne, un gabarit ou un schéma : incrémenter `ENRICH_PROMPT_VERSION`,
+        // puis mettre à jour les deux littéraux ci-dessous.
+        assert_eq!(ENRICH_PROMPT_VERSION, 1);
+        assert_eq!(
+            prompts_fingerprint(),
+            "9d89eb9166852d117d282e3559895d7e2e5e3caf46da37b53548f491a589f8c5",
+            "les textes du prompt ont changé : incrémentez ENRICH_PROMPT_VERSION"
+        );
+    }
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

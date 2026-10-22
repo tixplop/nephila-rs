@@ -557,6 +557,8 @@ fn req043_ac9_redirected_output_is_plain_and_free_of_secrets() {
     let a = m.run(&["build", "--show-progress"], &env);
     let mut env_nc = env.to_vec();
     env_nc.push(("NO_COLOR", "1"));
+    // Graphe neuf : un build sans changement n'enrichit plus que le fichier en échec (REQ-049).
+    fs::remove_dir_all(m.repo.join(".nephila")).unwrap();
     let b = m.run(&["build", "--show-progress"], &env_nc);
     for o in [&a, &b] {
         for stream in [&o.stdout, &o.stderr] {

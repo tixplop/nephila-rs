@@ -288,7 +288,7 @@ fn req009_ac2_only_nephila_dir_is_written() {
 }
 
 #[test]
-fn req009_ac3_second_build_reanalyzes_resends_every_file_and_drops_deleted_nodes() {
+fn req009_ac3_second_build_reanalyzes_everything_resends_nothing_and_drops_deleted_nodes() {
     let env = Env::new();
     env.build_ok();
     assert_eq!(env.log_lines().len(), SOURCES.len());
@@ -299,16 +299,16 @@ fn req009_ac3_second_build_reanalyzes_resends_every_file_and_drops_deleted_nodes
     .unwrap();
     fs::remove_file(&env.log).unwrap();
     env.build_ok();
-    let lines = env.log_lines();
-    assert_eq!(lines.len(), SOURCES.len() - 1);
-    let sent: BTreeSet<String> = lines
-        .iter()
-        .map(|l| l.split('\t').next().unwrap().to_string())
-        .collect();
-    assert!(sent.contains("README.md"));
-    assert!(sent.contains(SVC));
-    assert!(!sent.contains("core/src/main/java/com/acme/domain/Order.java"));
+    // AC-009-3 modifié (REQ-049) : tout est réanalysé, seuls les fichiers sans enrichissement
+    // conservé à jour sont envoyés ; ici, aucun.
+    assert!(env.log_lines().is_empty(), "{:?}", env.log_lines());
     let store = env.store();
+    assert_eq!(store.count_files_to_enrich().unwrap(), 0);
+    assert!(store
+        .nodes()
+        .unwrap()
+        .iter()
+        .any(|n| n.id.contains("OrderService") && n.summary.is_some()));
     assert!(!store
         .nodes()
         .unwrap()

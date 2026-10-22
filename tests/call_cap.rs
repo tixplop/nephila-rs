@@ -429,6 +429,8 @@ fn req047_ac14_deux_morceaux_quatre_lignes() {
         "{out}"
     );
 
+    // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
+    fs::remove_dir_all(env.repo.join(".nephila")).unwrap();
     let o = env.run(&["build", "--show-progress"], &[]);
     let (_, err) = text(&o);
     let prog: Vec<&str> = err

@@ -320,10 +320,9 @@ fn req011_ac8_pending_files_are_processed_even_if_unchanged() {
     drop(store);
     env.clear_log();
     env.ok("update");
-    assert_eq!(
-        env.logged_paths(),
-        BTreeSet::from([ORDER_SERVICE.to_string(), ORDER_REPO.to_string()])
-    );
+    // Traités (réanalysés, de nouveau « indexés ») ; leur contenu n'ayant pas changé, leurs
+    // résumés sont réappliqués sans appel LLM (AC-049-9).
+    assert!(env.logged_paths().is_empty(), "{:?}", env.logged_paths());
     assert!(env
         .store()
         .files()

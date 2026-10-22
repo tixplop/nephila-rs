@@ -17,6 +17,10 @@ pub use retry::with_format_retries;
 
 /// Fournisseur LLM. Les implémentations sont partagées entre threads.
 pub trait Llm: Send + Sync {
+    /// Modèle effectif, qui entre dans l'empreinte d'enrichissement (REQ-049). Vide par défaut.
+    fn model(&self) -> &str {
+        ""
+    }
     /// Enrichit un appel : résumés et concepts (schéma version 2). `requested` = nœuds écrits
     /// dans le prompt ; `known` = liste complète du fichier, qui filtre la réponse.
     fn enrich(
@@ -34,8 +38,46 @@ pub trait Llm: Send + Sync {
     fn ask(&self, question: &str, context: &str) -> Result<AskReply>;
 }
 
+/// Fournisseur qui porte le modèle effectif de la configuration (le simulé n'en a pas).
+struct WithModel {
+    inner: Box<dyn Llm>,
+    model: String,
+}
+
+impl Llm for WithModel {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn enrich(
+        &self,
+        file: &str,
+        call: usize,
+        text: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> Result<Enrichment> {
+        self.inner.enrich(file, call, text, requested, known)
+    }
+
+    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+        self.inner.enrich_lot(items)
+    }
+
+    fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
+        self.inner.ask(question, context)
+    }
+}
+
 /// Construit le fournisseur décrit par la configuration.
 pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
+    Ok(Box::new(WithModel {
+        inner: build_provider(config)?,
+        model: config.model.clone(),
+    }))
+}
+
+fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
     let tls = Tls {
         ca_certs: config.tls_ca_certs.clone(),
         insecure: config.tls_insecure,

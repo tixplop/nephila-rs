@@ -1351,6 +1351,7 @@ mod tests {
             .apply_enrichment(
                 "d.md",
                 "h",
+                "m",
                 &[],
                 &[],
                 &[rf(&sec, EdgeKind::Mentions, "concept:Inconnu", None)],

@@ -111,6 +111,12 @@ pub fn update(
     if d.is_up_to_date() && (llm.is_none() || store.count_files_to_enrich()? == 0) {
         return Ok(None);
     }
+    // Le modèle effectif est enregistré dès qu'une mise à jour a lieu ; la comparaison avec le
+    // modèle des entrées conservées est faite par T-114 (un changement de modèle seul n'est
+    // pas encore une mise à jour).
+    if let Some(llm) = llm {
+        store.set_enrich_model(llm.model())?;
+    }
 
     for path in d.paths(Change::Deleted) {
         store.remove_file(path)?;

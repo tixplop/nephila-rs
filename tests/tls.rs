@@ -228,6 +228,8 @@ fn req036_ac3_path_forms() {
     for f in forms {
         let s = server("server-ip.pem", script("openai"));
         env.config("openai", &s.base_url, &format!("tls_ca_cert = \"{f}\"\n"));
+        // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
+        let _ = fs::remove_dir_all(env.repo.join(".nephila"));
         let b = env.run(&["build"]);
         assert!(b.status.success(), "{f}: {}", text(&b.stderr));
         assert_eq!(s.requests().len(), 1, "{f}");

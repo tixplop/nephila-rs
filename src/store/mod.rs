@@ -3,6 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
+
+use crate::llm::enrich::ENRICH_PROMPT_VERSION;
 
 use crate::error::{Error, Result};
 use crate::model::{
@@ -17,7 +20,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
@@ -267,8 +270,9 @@ impl Store {
     }
 
     /// Remplace en une transaction tout ce qui vient d'un fichier (déclarations et références,
-    /// origines `parse` et `llm`), efface les résumés de ses nœuds et remet `enriched_hash` à
-    /// NULL, puis marque le fichier indexé. Le fichier doit être connu. Un nœud peut être déclaré
+    /// origines `parse` et `llm`), efface les résumés de ses nœuds, puis marque le fichier indexé.
+    /// L'enrichissement conservé de même empreinte de contenu est réappliqué dans la même
+    /// transaction, un enrichissement de contenu différent est supprimé (DEC-062). Le fichier doit être connu. Un nœud peut être déclaré
     /// par plusieurs fichiers (DEC-014) : la ligne du nœud (attributs, fichier de rattachement)
     /// est une projection des déclarations (DEC-026 : attributs et fichier de la déclaration de plus petit chemin, résumé de la plus petite déclaration résumée), les références restent attachées au fichier qui les a
     /// émises. Un nœud sans fichier (concept) est déclaré lui aussi par le fichier
@@ -292,24 +296,24 @@ impl Store {
             release_file(&tx, path, None)?;
             insert_nodes(&tx, path, nodes, "parse")?;
             insert_refs(&tx, path, refs, "parse")?;
-            tx.execute(
-                "UPDATE files SET state = 'indexed', enriched_hash = NULL WHERE path = ?1",
-                [path],
-            )
-            .map_err(db_err)?;
+            tx.execute("UPDATE files SET state = 'indexed' WHERE path = ?1", [path])
+                .map_err(db_err)?;
+            reapply_enrichment(&tx, path)?;
         }
         tx.commit().map_err(db_err)
     }
 
     /// Applique en une transaction le résultat de l'enrichissement d'un fichier : remplace ses
     /// déclarations et références d'origine `llm` (nœuds concept compris) et les résumés de ses
-    /// nœuds, puis pose `enriched_hash = hash`. `summaries` : couples (identifiant, texte), les
+    /// nœuds, puis enregistre l'enrichissement conservé du chemin (`hash` = empreinte du contenu,
+    /// `model`, `ENRICH_PROMPT_VERSION`, payload). `summaries` : couples (identifiant, texte), les
     /// identifiants devant être déclarés par le fichier. Les références `llm` doivent partir d'un
     /// nœud déclaré par le fichier.
     pub fn apply_enrichment(
         &mut self,
         path: &str,
         hash: &str,
+        model: &str,
         summaries: &[(String, String)],
         concept_nodes: &[Node],
         refs: &[Ref],
@@ -317,67 +321,141 @@ impl Store {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
         require_known(&tx, path)?;
-        clear_summaries(&tx, path)?;
-        release_file(&tx, path, Some("llm"))?;
-        insert_nodes(&tx, path, concept_nodes, "llm")?;
-        for (id, text) in summaries {
-            let n = tx
-                .execute(
-                    "UPDATE declarations SET summary = ?2 WHERE node = ?1 AND file = ?3",
-                    params![id, text, path],
-                )
-                .map_err(db_err)?;
-            if n == 0 {
-                return Err(Error::Message(format!(
-                    "résumé pour le nœud {id}, non déclaré dans {path}"
-                )));
-            }
-        }
-        let ids = declared_by(&tx, path)?;
-        refresh_nodes(&tx, &ids)?;
-        insert_refs(&tx, path, refs, "llm")?;
+        apply_enrichment_tx(&tx, path, summaries, concept_nodes, refs)?;
+        let payload = Payload {
+            summaries: summaries.to_vec(),
+            concepts: concept_nodes
+                .iter()
+                .map(|n| PayloadConcept {
+                    name: n.qualified.clone(),
+                    summary: n.summary.clone(),
+                })
+                .collect(),
+            refs: refs
+                .iter()
+                .map(|r| PayloadRef {
+                    source: r.source.clone(),
+                    kind: r.kind.as_str().to_string(),
+                    target: r.target_name.clone(),
+                })
+                .collect(),
+        };
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| Error::Message(format!("enrichissement non sérialisable : {e}")))?;
         tx.execute(
-            "UPDATE files SET enriched_hash = ?2 WHERE path = ?1",
-            params![path, hash],
+            "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(path) DO UPDATE SET content_hash = excluded.content_hash,
+                 model = excluded.model, prompt_version = excluded.prompt_version,
+                 payload = excluded.payload",
+            params![path, hash, model, ENRICH_PROMPT_VERSION, json],
         )
         .map_err(db_err)?;
         tx.commit().map_err(db_err)
     }
 
-    /// Fichiers indexés à enrichir : `enriched_hash` absent ou différent de `hash`.
+    /// Fichiers indexés à enrichir : sans enrichissement conservé pour (chemin, empreinte, modèle
+    /// effectif, `ENRICH_PROMPT_VERSION`). Le modèle effectif est celui de `meta.enrich_model`
+    /// (écrit par `build`/`update` LLM actif) ; absent, le modèle n'est pas comparé.
     pub fn files_to_enrich(&self) -> Result<Vec<FileRecord>> {
+        let model = self.enrich_model()?;
+        let mut st = self
+            .conn
+            .prepare(&format!(
+                "SELECT f.path FROM files f WHERE f.state = 'indexed' AND NOT EXISTS ({UP_TO_DATE}) ORDER BY f.path"
+            ))
+            .map_err(db_err)?;
+        let paths: Vec<String> = st
+            .query_map(params![ENRICH_PROMPT_VERSION, model], |r| r.get(0))
+            .map_err(db_err)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        let set: std::collections::HashSet<String> = paths.into_iter().collect();
         Ok(self
             .files()?
             .into_iter()
-            .filter(|f| f.state == FileState::Indexed)
-            .filter(|f| self.enriched_hash(&f.path).ok().flatten().as_deref() != Some(&f.hash))
+            .filter(|f| set.contains(&f.path))
             .collect())
     }
 
     /// Nombre de fichiers à enrichir.
     pub fn count_files_to_enrich(&self) -> Result<usize> {
+        let model = self.enrich_model()?;
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM files WHERE state = 'indexed'
-                 AND (enriched_hash IS NULL OR enriched_hash <> hash)",
-                [],
+                &format!(
+                    "SELECT COUNT(*) FROM files f WHERE f.state = 'indexed' AND NOT EXISTS ({UP_TO_DATE})"
+                ),
+                params![ENRICH_PROMPT_VERSION, model],
                 |r| r.get::<_, i64>(0),
             )
             .map(|n| n as usize)
             .map_err(db_err)
     }
 
-    /// Empreinte enrichie d'un fichier (`None` : jamais enrichi ou fichier inconnu).
-    pub fn enriched_hash(&self, path: &str) -> Result<Option<String>> {
+    /// Modèle effectif du dernier `build`/`update` LLM actif (`None` : aucun depuis la
+    /// réinitialisation).
+    pub fn enrich_model(&self) -> Result<Option<String>> {
         match self.conn.query_row(
-            "SELECT enriched_hash FROM files WHERE path = ?1",
-            [path],
-            |r| r.get::<_, Option<String>>(0),
+            "SELECT value FROM meta WHERE key = 'enrich_model'",
+            [],
+            |r| r.get::<_, String>(0),
         ) {
-            Ok(h) => Ok(h),
+            Ok(m) => Ok(Some(m)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(db_err(e)),
         }
+    }
+
+    /// Enregistre le modèle effectif d'une commande LLM active.
+    pub fn set_enrich_model(&mut self, model: &str) -> Result<()> {
+        self.ensure_writable()?;
+        self.conn
+            .execute(
+                "INSERT INTO meta(key, value) VALUES ('enrich_model', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [model],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Empreinte de contenu de l'enrichissement conservé d'un chemin (`None` : aucune entrée).
+    pub fn enriched_hash(&self, path: &str) -> Result<Option<String>> {
+        Ok(self.enrichment_entry(path)?.map(|e| e.content_hash))
+    }
+
+    /// Entrée d'enrichissement conservée d'un chemin, sans son contenu.
+    pub fn enrichment_entry(&self, path: &str) -> Result<Option<EnrichmentEntry>> {
+        match self.conn.query_row(
+            "SELECT content_hash, model, prompt_version FROM enrichments WHERE path = ?1",
+            [path],
+            |r| {
+                Ok(EnrichmentEntry {
+                    content_hash: r.get(0)?,
+                    model: r.get(1)?,
+                    prompt_version: r.get(2)?,
+                })
+            },
+        ) {
+            Ok(e) => Ok(Some(e)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Supprime les enrichissements conservés d'un chemin qui n'est plus connu du graphe ou dont
+    /// le contenu a changé. Renvoie le nombre d'entrées supprimées.
+    pub fn prune_enrichments(&mut self) -> Result<usize> {
+        self.ensure_writable()?;
+        self.conn
+            .execute(
+                "DELETE FROM enrichments WHERE NOT EXISTS
+                   (SELECT 1 FROM files f WHERE f.path = enrichments.path
+                    AND f.hash = enrichments.content_hash)",
+                [],
+            )
+            .map_err(db_err)
     }
 
     /// Supprime un fichier, ses nœuds, références et les liens attachés. Renvoie `false` si inconnu.
@@ -386,6 +464,8 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         clear_summaries(&tx, path)?;
         release_file(&tx, path, None)?;
+        tx.execute("DELETE FROM enrichments WHERE path = ?1", [path])
+            .map_err(db_err)?;
         let n = tx
             .execute("DELETE FROM files WHERE path = ?1", [path])
             .map_err(db_err)?;
@@ -1015,6 +1095,140 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
     Ok(())
 }
 
+/// Condition « enrichissement conservé à jour » (`?1` = version du prompt, `?2` = modèle ou NULL).
+const UP_TO_DATE: &str = "SELECT 1 FROM enrichments e WHERE e.path = f.path
+    AND e.content_hash = f.hash AND e.prompt_version = ?1 AND (?2 IS NULL OR e.model = ?2)";
+
+/// Entrée d'enrichissement conservée (DEC-062), sans son contenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrichmentEntry {
+    pub content_hash: String,
+    pub model: String,
+    pub prompt_version: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PayloadConcept {
+    name: String,
+    summary: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PayloadRef {
+    source: String,
+    kind: String,
+    target: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Payload {
+    summaries: Vec<(String, String)>,
+    concepts: Vec<PayloadConcept>,
+    refs: Vec<PayloadRef>,
+}
+
+/// Remplace la part LLM d'un fichier : déclarations et références `llm`, résumés, concepts.
+fn apply_enrichment_tx(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    summaries: &[(String, String)],
+    concept_nodes: &[Node],
+    refs: &[Ref],
+) -> Result<()> {
+    clear_summaries(tx, path)?;
+    release_file(tx, path, Some("llm"))?;
+    insert_nodes(tx, path, concept_nodes, "llm")?;
+    for (id, text) in summaries {
+        let n = tx
+            .execute(
+                "UPDATE declarations SET summary = ?2 WHERE node = ?1 AND file = ?3",
+                params![id, text, path],
+            )
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err(Error::Message(format!(
+                "résumé pour le nœud {id}, non déclaré dans {path}"
+            )));
+        }
+    }
+    let ids = declared_by(tx, path)?;
+    refresh_nodes(tx, &ids)?;
+    insert_refs(tx, path, refs, "llm")
+}
+
+/// Réapplique l'enrichissement conservé d'un fichier dont la structure vient d'être écrite si
+/// son empreinte de contenu est celle du fichier ; une entrée de contenu différent est
+/// supprimée. Les éléments sans nœud correspondant sont écartés en silence.
+fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+    let row: Option<(String, String)> = match tx.query_row(
+        "SELECT e.content_hash, e.payload FROM enrichments e WHERE e.path = ?1",
+        [path],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(db_err(e)),
+    };
+    let Some((entry_hash, json)) = row else {
+        return Ok(());
+    };
+    let file_hash: String = tx
+        .query_row("SELECT hash FROM files WHERE path = ?1", [path], |r| {
+            r.get(0)
+        })
+        .map_err(db_err)?;
+    let payload: Option<Payload> = if entry_hash == file_hash {
+        serde_json::from_str(&json).ok()
+    } else {
+        None
+    };
+    let Some(payload) = payload else {
+        tx.execute("DELETE FROM enrichments WHERE path = ?1", [path])
+            .map_err(db_err)?;
+        return Ok(());
+    };
+    let declared: std::collections::HashSet<String> = declared_by(tx, path)?.into_iter().collect();
+    let summaries: Vec<(String, String)> = payload
+        .summaries
+        .into_iter()
+        .filter(|(id, _)| declared.contains(id))
+        .collect();
+    let mut refs = Vec::new();
+    let mut kept: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut with_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in payload.refs {
+        with_refs.insert(r.target.clone());
+        let Ok(kind) = EdgeKind::parse(&r.kind) else {
+            continue;
+        };
+        if declared.contains(&r.source) {
+            kept.insert(r.target.clone());
+            refs.push(Ref {
+                source: r.source,
+                kind,
+                target_name: r.target,
+                context: None,
+            });
+        }
+    }
+    let concepts: Vec<Node> = payload
+        .concepts
+        .iter()
+        .filter(|c| !with_refs.contains(&c.name) || kept.contains(&c.name))
+        .map(|c| {
+            Node::new(
+                NodeKind::Concept,
+                &c.name,
+                &c.name,
+                None,
+                None,
+                c.summary.as_deref(),
+            )
+        })
+        .collect();
+    apply_enrichment_tx(tx, path, &summaries, &concepts, &refs)
+}
+
 fn version_error(v: i32) -> Error {
     Error::Message(format!(
         "version de schéma du graphe non prise en charge ({v}, attendue {SCHEMA_VERSION}) : relancez `nephila build`"
@@ -1484,6 +1698,7 @@ mod tests {
         st.apply_enrichment(
             "a.md",
             "h",
+            "m",
             &[("type:p.A".into(), "résumé".into())],
             &[concept("idée")],
             &[mention("type:p.A", "idée")],
@@ -1503,7 +1718,11 @@ mod tests {
                 .as_deref(),
             Some("résumé")
         );
-        // Le fichier est réanalysé : résumés, concepts, références llm et marque disparaissent.
+        // Le fichier est modifié puis réanalysé : résumés, concepts, références llm et marque
+        // disparaissent (un contenu inchangé réappliquerait l'enrichissement conservé).
+        let mut modified = file("a.md");
+        modified.hash = "h2".into();
+        st.insert_files(&[modified]).unwrap();
         st.replace_structure("a.md", &[a], &[]).unwrap();
         let n = st.nodes().unwrap();
         assert_eq!(n.len(), 1);
@@ -1527,6 +1746,7 @@ mod tests {
         st.apply_enrichment(
             "b.md",
             "h",
+            "m",
             &[
                 ("concept:pkg".into(), "partagé".into()),
                 ("type:p.B".into(), "propre à b".into()),
@@ -1563,6 +1783,7 @@ mod tests {
         st.apply_enrichment(
             "a.md",
             "h",
+            "m",
             &[("concept:pkg".into(), "résumé".into())],
             &[],
             &[],
@@ -1585,15 +1806,17 @@ mod tests {
         st.replace_structure("b.md", &[ty("p.B", "b.md")], &[])
             .unwrap();
         for (f, s) in [("a.md", "type:p.A"), ("b.md", "type:p.B")] {
-            st.apply_enrichment(f, "h", &[], &[concept("c")], &[mention(s, "c")])
+            st.apply_enrichment(f, "h", "m", &[], &[concept("c")], &[mention(s, "c")])
                 .unwrap();
         }
         assert_eq!(st.nodes().unwrap().len(), 3);
         // a.md est ré-enrichi sans le concept : b.md le déclare encore.
-        st.apply_enrichment("a.md", "h", &[], &[], &[]).unwrap();
+        st.apply_enrichment("a.md", "h", "m", &[], &[], &[])
+            .unwrap();
         assert!(st.nodes().unwrap().iter().any(|n| n.id == "concept:c"));
         assert_eq!(st.refs().unwrap().len(), 1);
-        st.apply_enrichment("b.md", "h", &[], &[], &[]).unwrap();
+        st.apply_enrichment("b.md", "h", "m", &[], &[], &[])
+            .unwrap();
         assert!(!st.nodes().unwrap().iter().any(|n| n.id == "concept:c"));
         assert_eq!(st.nodes().unwrap().len(), 2);
     }
@@ -1615,15 +1838,159 @@ mod tests {
                 .collect()
         };
         assert_eq!(paths(&st), vec!["a.md"]);
-        st.apply_enrichment("a.md", "autre", &[], &[], &[]).unwrap();
+        st.apply_enrichment("a.md", "autre", "m", &[], &[], &[])
+            .unwrap();
         assert_eq!(paths(&st), vec!["a.md"]);
-        st.apply_enrichment("a.md", "h", &[], &[], &[]).unwrap();
+        st.apply_enrichment("a.md", "h", "m", &[], &[], &[])
+            .unwrap();
         assert!(paths(&st).is_empty());
         // Contenu modifié : l'empreinte diffère à nouveau.
         let mut f = file("a.md");
         f.hash = "h2".into();
         st.insert_files(&[f]).unwrap();
         assert_eq!(paths(&st), vec!["a.md"]);
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+    }
+
+    fn enriched_store() -> (tempfile::TempDir, Store) {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        st.apply_enrichment(
+            "a.md",
+            "h",
+            "m",
+            &[("type:p.A".into(), "résumé".into())],
+            &[concept("idée")],
+            &[mention("type:p.A", "idée")],
+        )
+        .unwrap();
+        (dir, st)
+    }
+
+    #[test]
+    fn req049_entry_is_written_by_apply_enrichment_and_survives_reset() {
+        let (_d, mut st) = enriched_store();
+        let e = st.enrichment_entry("a.md").unwrap().unwrap();
+        assert_eq!(
+            (e.content_hash.as_str(), e.model.as_str(), e.prompt_version),
+            ("h", "m", ENRICH_PROMPT_VERSION)
+        );
+        st.reset().unwrap();
+        assert!(st.enrichment_entry("a.md").unwrap().is_some());
+        st.reset_with_pending_files(&[file("a.md")]).unwrap();
+        assert!(st.enrichment_entry("a.md").unwrap().is_some());
+        assert!(st.nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn req049_entry_is_reapplied_when_the_content_is_unchanged() {
+        let (_d, mut st) = enriched_store();
+        let before = (st.nodes().unwrap(), st.refs_with_origin().unwrap().len());
+        st.reset_with_pending_files(&[file("a.md")]).unwrap();
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        let mut after = st.nodes().unwrap();
+        let mut b = before.0;
+        after.sort_by(|x, y| x.id.cmp(&y.id));
+        b.sort_by(|x, y| x.id.cmp(&y.id));
+        assert_eq!(after, b);
+        assert_eq!(st.refs_with_origin().unwrap().len(), before.1);
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+    }
+
+    #[test]
+    fn req049_reapplication_drops_elements_without_a_node_silently() {
+        let (_d, mut st) = enriched_store();
+        st.reset_with_pending_files(&[file("a.md")]).unwrap();
+        // L'analyseur ne déclare plus `p.A` : résumé, mention et concept sont écartés.
+        st.replace_structure("a.md", &[ty("p.Autre", "a.md")], &[])
+            .unwrap();
+        let nodes = st.nodes().unwrap();
+        assert!(nodes.iter().all(|n| n.summary.is_none()));
+        assert!(!nodes.iter().any(|n| n.kind == NodeKind::Concept));
+        assert!(st.refs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn req049_entry_of_changed_content_is_deleted() {
+        let (_d, mut st) = enriched_store();
+        let mut modified = file("a.md");
+        modified.hash = "h2".into();
+        st.reset_with_pending_files(&[modified]).unwrap();
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        assert_eq!(st.enrichment_entry("a.md").unwrap(), None);
+        assert!(st.nodes().unwrap().iter().all(|n| n.summary.is_none()));
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+    }
+
+    #[test]
+    fn req049_entry_of_an_unindexed_path_is_pruned() {
+        let (_d, mut st) = enriched_store();
+        st.reset_with_pending_files(&[]).unwrap();
+        assert!(st.enrichment_entry("a.md").unwrap().is_some());
+        assert_eq!(st.prune_enrichments().unwrap(), 1);
+        assert_eq!(st.enrichment_entry("a.md").unwrap(), None);
+        // `remove_file` supprime aussi l'entrée.
+        let (_d, mut st) = enriched_store();
+        st.remove_file("a.md").unwrap();
+        assert_eq!(st.enrichment_entry("a.md").unwrap(), None);
+    }
+
+    #[test]
+    fn req049_to_enrich_compares_hash_model_and_prompt_version() {
+        let (_d, mut st) = enriched_store();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        st.set_enrich_model("m").unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        st.set_enrich_model("autre").unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+        assert_eq!(st.files_to_enrich().unwrap().len(), 1);
+        st.set_enrich_model("m").unwrap();
+        st.conn
+            .execute(
+                "UPDATE enrichments SET prompt_version = prompt_version + 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+    }
+
+    #[test]
+    fn req049_ac4_to_enrich_changes_with_content_model_or_prompt_version_only() {
+        let (_d, mut st) = enriched_store();
+        st.set_enrich_model("m").unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        // Autres réglages (charge utile, métadonnées du fichier, autre clé de meta) : sans effet.
+        st.conn
+            .execute("UPDATE enrichments SET payload = '{}'", [])
+            .unwrap();
+        st.conn
+            .execute("UPDATE files SET size = size + 1, mtime = mtime + 1", [])
+            .unwrap();
+        st.conn
+            .execute(
+                "INSERT INTO meta(key, value) VALUES ('autre', 'x')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        assert!(st.files_to_enrich().unwrap().is_empty());
+        // Le contenu, le modèle ou la version du prompt changent : le fichier est à enrichir.
+        st.set_enrich_model("autre").unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+        st.set_enrich_model("m").unwrap();
+        st.conn.execute("UPDATE files SET hash = 'h2'", []).unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+        st.conn.execute("UPDATE files SET hash = 'h'", []).unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        st.conn
+            .execute("UPDATE enrichments SET prompt_version = 99", [])
+            .unwrap();
         assert_eq!(st.count_files_to_enrich().unwrap(), 1);
     }
 
@@ -1637,6 +2004,7 @@ mod tests {
         st.apply_enrichment(
             "a.md",
             "h",
+            "m",
             &[],
             &[concept("c")],
             &[mention("type:p.A", "c")],
@@ -1645,6 +2013,7 @@ mod tests {
         let r = st.apply_enrichment(
             "a.md",
             "h2",
+            "m",
             &[("type:inconnu".into(), "x".into())],
             &[],
             &[],
@@ -1653,7 +2022,7 @@ mod tests {
         assert_eq!(st.enriched_hash("a.md").unwrap().as_deref(), Some("h"));
         assert_eq!(st.refs().unwrap().len(), 1);
         assert!(st
-            .apply_enrichment("absent.md", "h", &[], &[], &[])
+            .apply_enrichment("absent.md", "h", "m", &[], &[], &[])
             .is_err());
     }
 
@@ -1698,12 +2067,22 @@ mod tests {
         for order in [["a", "b"], ["b", "a"]] {
             let (_d, mut st) = shared_store(order);
             for f in order {
-                st.apply_enrichment(f, "h", &[("type:p.A".into(), format!("res-{f}"))], &[], &[])
-                    .unwrap();
+                st.apply_enrichment(
+                    f,
+                    "h",
+                    "m",
+                    &[("type:p.A".into(), format!("res-{f}"))],
+                    &[],
+                    &[],
+                )
+                .unwrap();
             }
             let n = &st.nodes().unwrap()[0];
             assert_eq!(n.summary.as_deref(), Some("res-a"));
-            // Réanalyse de `a` : son résumé disparaît, celui de `b` apparaît.
+            // Modification et réanalyse de `a` : son résumé disparaît, celui de `b` apparaît.
+            let mut modified = file("a");
+            modified.hash = "h2".into();
+            st.insert_files(&[modified]).unwrap();
             st.replace_structure("a", &[shared("a", "Aa", SubKind::Class, None)], &[])
                 .unwrap();
             assert_eq!(st.nodes().unwrap()[0].summary.as_deref(), Some("res-b"));
@@ -1719,8 +2098,15 @@ mod tests {
         for f in ["b.md", "a.md"] {
             st.replace_structure(f, &[], &[]).unwrap();
             let c = Node::new(NodeKind::Concept, "c", "c", None, None, None);
-            st.apply_enrichment(f, "h", &[("concept:c".into(), format!("r-{f}"))], &[c], &[])
-                .unwrap();
+            st.apply_enrichment(
+                f,
+                "h",
+                "m",
+                &[("concept:c".into(), format!("r-{f}"))],
+                &[c],
+                &[],
+            )
+            .unwrap();
         }
         let n = &st.nodes().unwrap()[0];
         assert_eq!(n.file, None);

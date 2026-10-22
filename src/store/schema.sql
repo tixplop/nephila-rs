@@ -9,9 +9,17 @@ CREATE TABLE files (
     size  INTEGER NOT NULL,
     mtime INTEGER NOT NULL,
     recorded_at INTEGER NOT NULL DEFAULT 0,
-    state TEXT NOT NULL CHECK (state IN ('indexed', 'pending')),
-    -- Empreinte du contenu au moment du dernier enrichissement LLM ; NULL = jamais enrichi.
-    enriched_hash TEXT
+    state TEXT NOT NULL CHECK (state IN ('indexed', 'pending'))
+);
+
+-- Enrichissements conservés (DEC-062) : une entrée par chemin, la dernière. Survit à la
+-- réinitialisation du graphe ; `payload` = JSON des résumés, concepts et mentions.
+CREATE TABLE enrichments (
+    path           TEXT PRIMARY KEY,
+    content_hash   TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    prompt_version INTEGER NOT NULL,
+    payload        TEXT NOT NULL
 );
 
 CREATE TABLE nodes (

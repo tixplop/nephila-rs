@@ -265,6 +265,8 @@ fn req010_ac5_four_timeouts_do_not_stop_the_sending() {
     assert!(all.len() >= 8);
     let bad: Vec<String> = all.iter().take(4).cloned().collect();
     fs::remove_file(&env.log).unwrap();
+    // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
+    fs::remove_dir_all(env.repo.join(".nephila")).unwrap();
     let out = env.run("build", &[("NEPHILA_MOCK_TIMEOUT_FILES", &bad.join(","))]);
     assert!(!out.status.success());
     assert_eq!(logged_paths(&env), all);

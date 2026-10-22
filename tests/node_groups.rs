@@ -323,6 +323,8 @@ fn req047_ac4_mock_journal_traces_fixture_et_pannes() {
 
     // Fixture du troisième appel qui résume un nœud du premier groupe : appliquée.
     let _ = fs::remove_file(&env.log);
+    // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
+    fs::remove_dir_all(env.repo.join(".nephila")).unwrap();
     env.fixture(
         BIG,
         3,
@@ -340,6 +342,8 @@ fn req047_ac4_mock_journal_traces_fixture_et_pannes() {
 
     // Appel 1 non conforme une fois : renvoyé, puis les suivants.
     let _ = fs::remove_file(&env.log);
+    // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
+    fs::remove_dir_all(env.repo.join(".nephila")).unwrap();
     let o = env.run(
         &["build"],
         &[("NEPHILA_MOCK_MALFORMED", &format!("{BIG}:1"))],
@@ -350,6 +354,8 @@ fn req047_ac4_mock_journal_traces_fixture_et_pannes() {
 
     // Délai dépassé : un seul appel, le fichier reste à enrichir.
     let _ = fs::remove_file(&env.log);
+    // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
+    fs::remove_dir_all(env.repo.join(".nephila")).unwrap();
     let o = env.run(&["build"], &[("NEPHILA_MOCK_TIMEOUT_FILES", BIG)]);
     let (out, _) = text(&o);
     assert!(!o.status.success());
@@ -485,6 +491,8 @@ fn req047_ac8_aucune_mention_des_groupes() {
             .ends_with(", 0 fichiers en attente, 0 fichiers à enrichir"),
         "{out}"
     );
+    // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
+    fs::remove_dir_all(env.repo.join(".nephila")).unwrap();
     let verbose = env.run(&["build", "--verbose"], &[]);
     let (vout, verr) = text(&verbose);
     assert!(verbose.status.success(), "{verr}");

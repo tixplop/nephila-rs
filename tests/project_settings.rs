@@ -556,6 +556,8 @@ fn req042_ac3_essais_de_format_et_lots_du_fichier_de_projet() {
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert_eq!(e.log_lines().len(), 4);
     assert_eq!(e.to_enrich(), 0);
+    // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
+    fs::remove_dir_all(e.repo.join(".nephila")).unwrap();
     let o = run(&["build", "--format-retries", "0"]);
     assert!(!o.status.success());
     assert_eq!(e.log_lines().len(), 1);
@@ -593,6 +595,8 @@ fn req042_ac3_essais_de_format_et_lots_du_fichier_de_projet() {
         .iter()
         .all(|l| l.split('\t').next().unwrap().split(';').count() == 2));
     let _ = fs::remove_file(&e.log);
+    // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
+    fs::remove_dir_all(e.repo.join(".nephila")).unwrap();
     assert!(e.run(&["build", "--batch-files", "1"]).status.success());
     assert_eq!(e.log_lines().len(), 4);
 }

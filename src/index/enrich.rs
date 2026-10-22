@@ -736,6 +736,7 @@ impl Drop for ExpandGuard<'_, '_> {
 /// Écrit l'enrichissement complet d'un fichier (une transaction).
 fn apply_done(
     store: &mut Store,
+    model: &str,
     file: &FileRecord,
     x: &Enrichment,
     stop: &AtomicBool,
@@ -755,7 +756,14 @@ fn apply_done(
         ));
     }
     let (concepts, refs) = concept_records(x);
-    if let Err(e) = store.apply_enrichment(&file.path, &file.hash, &x.summaries, &concepts, &refs) {
+    if let Err(e) = store.apply_enrichment(
+        &file.path,
+        &file.hash,
+        model,
+        &x.summaries,
+        &concepts,
+        &refs,
+    ) {
         stop.store(true, Ordering::SeqCst);
         *write_error = Some(e);
     }
@@ -985,6 +993,7 @@ pub(crate) fn enrich_with_stop(
                             Outcome::Done(file, x) => {
                                 apply_done(
                                     store,
+                                    llm.model(),
                                     &file,
                                     &x,
                                     stop,
@@ -1035,6 +1044,7 @@ pub(crate) fn enrich_with_stop(
                                     };
                                     apply_done(
                                         store,
+                                        llm.model(),
                                         file,
                                         &merged,
                                         stop,
