@@ -687,6 +687,84 @@ fn REQ042_AC13_readme_decrit_les_reglages_de_projet() {
     }
     assert!(sec.contains("option > fichier de projet > configuration personnelle > défaut"));
     assert!(!readme.contains("configuration globale"));
+    // AC-042-13 modifié : réenrichissement par `update` ou `build` après un changement de modèle.
+    assert!(
+        sec.contains("réenrichi") && sec.contains("nephila update"),
+        "le réenrichissement par update ou build après un changement de modèle n'est pas décrit"
+    );
+    assert!(
+        !sec.contains("Changer de modèle ne réenrichit rien"),
+        "texte périmé : le changement de modèle réenrichit"
+    );
+}
+
+#[test]
+fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "## Enrichissement en lots");
+    assert!(sec.contains(
+        "Par défaut, seuls les documents Markdown sont enrichis ; enrich_code = true (configuration personnelle) ou --enrich-code (une commande) enrichit aussi le code source et les fichiers de build et de données."
+    ));
+    for needle in [
+        "enrich_code",
+        "--enrich-code",
+        "conservés",
+        "fichiers à enrichir",
+        "max_chunk_chars",
+        "concurrency",
+    ] {
+        assert!(
+            sec.contains(needle),
+            "texte absent de la section : {needle}"
+        );
+    }
+    let line = readme
+        .lines()
+        .find(|l| l.starts_with("| 0.18 |"))
+        .expect("ligne 0.18 absente du tableau des versions");
+    assert!(line.contains("Rupture : seuls les documents Markdown sont enrichis par défaut"));
+    assert!(line.contains("enrich_code = true"));
+    assert!(line.contains("--enrich-code"));
+    assert!(line.contains("0.17"));
+    let at = |needle: &str| readme.find(needle).unwrap();
+    assert!(at("| 0.18 |") < at("| 0.17.5 |"));
+    for needle in ["V=v0.18.0", "git tag v0.18.0 && git push origin v0.18.0"] {
+        assert!(readme.contains(needle), "absent : {needle}");
+    }
+    assert!(!readme.contains("0.17.6"));
+    // Plus de vérification préalable de la clé (REQ-054).
+    assert!(!readme.contains("/v1/models"));
+    assert!(!readme.contains("verify_key"));
+    assert!(!readme.contains("la vérification de la clé"));
+    let verbose = readme_section(&readme, "### Traces (`--verbose`)");
+    for needle in [
+        "enrichissements conservés",
+        "llm enrich attente",
+        "enrich_code",
+    ] {
+        assert!(verbose.contains(needle), "trace absente : {needle}");
+    }
+    let retries = readme_section(&readme, "## Réponses non conformes et nouveaux essais");
+    for needle in [
+        "429",
+        "503",
+        "529",
+        "retry-after",
+        "60 s",
+        "4 nouveaux essais",
+    ] {
+        assert!(retries.contains(needle), "nouveaux essais HTTP : {needle}");
+    }
+    let dev = readme_section(&readme, "## Développement");
+    assert!(dev.contains("NEPHILA_RETRY_BASE_MS"));
+    assert!(dev.contains("chaque appel échoue en « clé refusée »"));
+    let cfg = readme_section(&readme, "## Configuration du LLM");
+    assert!(cfg.contains("| `enrich_code` |"));
+    assert!(
+        cfg.contains("| `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |")
+    );
+    let upgrade = readme_section(&readme, "## Mise à niveau");
+    assert!(upgrade.contains("schéma 5"));
 }
 
 const CAPS_HEADER: &str = "# Plafonds : ici seulement, chaque réglage entier a un plafond (ligne « Plafond dans ce fichier ») ; la configuration personnelle et les options n'en ont pas.";

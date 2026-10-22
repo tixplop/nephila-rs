@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.17.6                                      # version voulue
+V=v0.18.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -113,15 +113,16 @@ Les commandes sans LLM ne lisent aucune configuration. Si le graphe est en retar
 ### `nephila build` et `nephila update`
 
 ```
-nephila build  [--no-llm] [-v|--verbose | --show-progress] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
-nephila update [--no-llm] [-v|--verbose | --show-progress] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
+nephila build  [--no-llm] [-v|--verbose | --show-progress] [--enrich-code] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
+nephila update [--no-llm] [-v|--verbose | --show-progress] [--enrich-code] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
 ```
 
-`build` analyse chaque fichier puis, si le LLM est actif, enrichit le graphe. `update` ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus ceux restés en attente ou à enrichir.
+`build` analyse chaque fichier puis, si le LLM est actif, enrichit le graphe. Par défaut, seuls les documents Markdown sont enrichis ; le code l'est avec `--enrich-code` ou `enrich_code = true`. Les enrichissements sont conservés d'un `build` à l'autre : un fichier dont le contenu et le modèle n'ont pas changé n'est pas renvoyé au LLM, et un second `build` sans changement ne fait aucun appel. `update` ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus ceux restés en attente ou à enrichir.
 
 | Option | Effet |
 |---|---|
 | `--no-llm` | Structure seule : la configuration n'est pas lue (même invalide) et aucun appel n'est fait |
+| `--enrich-code` | Enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown, pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
 | `-v, --verbose` | Traces sur stderr (voir [Traces](#traces---verbose)) |
 | `--show-progress` | Avancement des phases sur stderr, voir [Progression](#progression---show-progress) |
 | `--batch-files <N>` | Taille de lot pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
@@ -139,12 +140,13 @@ Le bilan donne deux compteurs :
 - **en attente** : l'analyse du fichier n'a pas abouti ou n'a pas été faite. La commande sort avec le code 1 ; `nephila update` le retraite.
 - **à enrichir** : la structure du fichier est dans le graphe, mais son contenu actuel n'a pas été enrichi par le LLM (réponse non conforme, réponse tronquée, trop d'appels d'enrichissement (aucun envoyé), erreur, `--no-llm`, ou fichier modifié depuis). Avec le LLM actif, la commande sort avec le code 1 et `nephila update` ne renvoie au LLM que ces fichiers. Sans LLM, ce n'est pas une erreur (code 0, `enrichissement : désactivé`).
 
-Réanalyser un fichier modifié efface ses résumés et concepts.
+Réanalyser un fichier modifié efface ses résumés et concepts ; un fichier inchangé garde les siens, même après `build --no-llm`.
 
 **Gestion des échecs** :
 
 - un fichier en échec reste « en attente » ou « à enrichir », est nommé sur stderr avec sa cause, et le traitement des autres continue ;
-- l'envoi au LLM s'arrête sur une clé refusée (HTTP 401/403, dès le premier refus) ou après 3 erreurs réseau consécutives (une réussite remet le compte à zéro) ;
+- il n'y a pas de vérification préalable de la clé d'API : l'extraction a lieu d'abord, et le premier appel révèle une clé refusée (HTTP 401/403). L'envoi s'arrête alors, la ligne de bilan est affichée, et stderr porte une seule ligne `erreur: clé d'API refusée par <fournisseur> (HTTP <code>) ; vérifiez la variable désignée par api_key_env`, avec le code 1. Une fois la variable corrigée, `nephila update` n'envoie que les fichiers à enrichir. Sans fichier à enrichir, aucun appel n'a lieu et une clé fausse passe inaperçue ;
+- l'envoi au LLM s'arrête aussi, sur une clé refusée (dès le premier refus) ou après 3 erreurs réseau consécutives, comptées une fois les nouveaux essais épuisés (une réussite remet le compte à zéro) ;
 - les appels déjà en cours se terminent et sont enregistrés, et la ligne de bilan est toujours affichée ;
 - une référence dont le genre de lien est inconnu ou non autorisé pour son nœud source est écartée avec un avertissement ; le fichier est indexé normalement.
 
@@ -213,18 +215,20 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 
 Événements tracés :
 
-- la configuration (fournisseur, modèle, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;
-- la vérification de la clé ;
+- la configuration (fournisseur, modèle, `enrich_code`, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;
 - le parcours des fichiers ;
-- le début et la fin de chaque phase (structure, résolution, enrichissement) ;
+- le début et la fin de chaque phase (structure, résolution, enrichissement) ; la fin de la phase structure donne le nombre de fichiers dont les résumés ont été repris sans appel (`, <r> enrichissements conservés`) ;
 - le départ et la fin de chaque appel LLM, avec son résultat (`ok`, `délai dépassé`, `réseau`, `clé refusée`, `erreur` ou `tronquée`) et sa durée ; `[i/n]` compte les appels du fichier (morceaux et groupes de 150 nœuds confondus) ; le départ d'un nouvel essai porte la marque ` (essai <e>/<t>)`, où `<t>` vaut `format_retries` + 1 (le premier essai n'a pas de marque) ;
+- chaque attente avant un nouvel essai HTTP, entre le départ et la fin de l'appel : `llm enrich attente <chemin> [i/n] <ms> ms après HTTP 503 (nouvel essai 1/4)` (cause `HTTP <code>` ou `erreur réseau`) ;
 - les décisions d'arrêt.
 
 Un fichier non envoyé pour trop d'appels n'a aucune ligne `llm enrich`.
 
 ```
-trace: [0.000s] config: llm=mock model=m-projet concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
+trace: [0.000s] config: llm=mock model=m-projet enrich_code=false concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
+trace: [0.009s] structure: fin 7 ms, 0 en attente, 3 enrichissements conservés
 trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
+trace: [0.020s] llm enrich attente src/shop/Order.java [1/1] 1000 ms après HTTP 503 (nouvel essai 1/4)
 trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts) 19 ms
 trace: [0.003s] llm enrich fin src/A.java [1/1] erreur 0 ms : réponse LLM non conforme au schéma
 trace: [0.003s] llm enrich départ src/A.java [1/1] 24 car. (essai 2/3)
@@ -328,7 +332,7 @@ exclude = ["docs/legacy/", "*.min.js"]   # motifs .gitignore, relatifs à la rac
 exclude_types = ["json"]                 # types : voir nephila build --help
 ```
 
-Les filtres (`exclude`, `exclude_types`) et les six réglages sont facultatifs ; toute autre clé est une erreur. Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour » et, avec `query ask`, pour les réglages ci-dessous), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé.
+Les filtres (`exclude`, `exclude_types`) et les six réglages sont facultatifs ; toute autre clé est une erreur (`enrich_code` comprise : elle reste dans la configuration personnelle). Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour » et, avec `query ask`, pour les réglages ci-dessous), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé.
 
 Le même fichier porte aussi les réglages LLM du dépôt, au premier niveau, avec le même nom et le même type que dans la configuration personnelle : on copie une ligne d'un fichier à l'autre.
 
@@ -352,7 +356,7 @@ Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et 
 
 - **Clés de connexion refusées** : `provider`, `base_url`, `api_key_env`, `tls_ca_cert` et `tls_insecure` ne sont permises que dans la configuration personnelle. Le fichier de projet est versionné et vient souvent d'un dépôt cloné : s'il pouvait changer l'adresse du serveur ou la variable qui contient la clé, cloner un dépôt suffirait à envoyer votre code et une clé d'API (ou un autre secret de l'environnement) à un serveur tiers, ou à désactiver le contrôle des certificats.
 - **Sans LLM actif** (aucune configuration personnelle, ou `--no-llm`), les réglages n'ont aucun effet et aucun message : un collègue sans configuration ne voit rien. Le fichier reste validé en entier.
-- **Changer de modèle ne réenrichit rien** : `status` et `update` disent `graphe à jour`. Pour réenrichir avec le nouveau modèle, lancez `nephila build`.
+- **Changer de modèle réenrichit une fois** : `nephila update` ou `nephila build` envoie ensuite chaque fichier de la portée de l'enrichissement, puis plus rien tant que le modèle ne change pas. `status` compte selon le modèle du dernier `build` ou `update` : il peut encore dire `graphe à jour` jusqu'à cet `update`. Changer `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` ou `format_retries` ne réenrichit rien.
 - **Dépôt tiers** : un dépôt cloné peut choisir un modèle plus coûteux ou une `concurrency` plus forte que les vôtres (au plus 64). Vérifiez avec `nephila build --verbose` : la ligne `config` donne les valeurs effectives et nomme les réglages venus de `.nephila.toml` (voir [Traces](#traces---verbose)).
 
 Un exemple commenté est fourni dans [`examples/nephila.toml`](examples/nephila.toml).
@@ -445,13 +449,14 @@ Six de ces réglages (`model`, `max_chunk_chars`, `concurrency`, `timeout_secs`,
 | `base_url` | URL du serveur, **sans** `/v1` final | celle du fournisseur |
 | `max_chunk_chars` | Taille maximale d'un morceau envoyé au LLM | 60000 |
 | `concurrency` | Appels simultanés | 4 |
-| `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 1 |
+| `enrich_code` | Booléen. `true` enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown ; configuration personnelle seulement, `--enrich-code` le demande pour une commande | `false` |
+| `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |
 | `format_retries` | Nouveaux essais d'un appel dont la réponse est non conforme, entier ≥ 0 (2 = au plus 3 appels pour une même requête ; 0 = aucun nouvel essai, comme en 0.12.0) | 2 |
 | `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 (la connexion reste limitée à 10 s) | 300 |
 | `tls_ca_cert` | Chemin d'un fichier PEM d'autorités de certification, **ajoutées** aux autorités publiques embarquées. Absolu, `~/…`, ou relatif au dossier du fichier de configuration. Le magasin du système n'est pas lu (pour s'y fier : `/etc/ssl/certs/ca-certificates.crt`) | aucun |
 | `tls_insecure` | Booléen. `true` désactive tout contrôle du certificat du serveur, comme `curl -k` ; un avertissement est écrit à chaque commande | `false` |
 
-La clé d'API n'est jamais écrite dans le fichier. Avant tout traitement, `nephila` la vérifie par un appel qui liste les modèles, sans coût de génération.
+La clé d'API n'est jamais écrite dans le fichier. `nephila` ne la vérifie pas avant le traitement : une clé refusée est constatée au premier appel, après l'extraction (voir [`nephila build` et `nephila update`](#nephila-build-et-nephila-update)).
 
 <details>
 <summary>Exemples : Anthropic, OpenAI, modèle local, simulé</summary>
@@ -484,7 +489,7 @@ provider = "mock"
 
 </details>
 
-`nephila` ajoute lui-même `/v1/chat/completions` et `/v1/models` à `base_url`. Avec `http://localhost:11434/v1`, les requêtes partiraient donc vers `/v1/v1/…`.
+`nephila` ajoute lui-même `/v1/chat/completions` à `base_url`. Avec `http://localhost:11434/v1`, les requêtes partiraient donc vers `/v1/v1/…`.
 
 **Comportement selon la configuration**
 
@@ -511,12 +516,18 @@ Un certificat refusé produit une erreur contenant « certificat » et nommant `
 
 ## Enrichissement en lots
 
-Par défaut (`batch_files = 1`), un appel LLM porte sur un seul fichier. Pour un dépôt fait de nombreux petits fichiers, `batch_files = 4` à `8` regroupe plusieurs fichiers par appel et réduit le nombre d'appels.
+Par défaut, seuls les documents Markdown sont enrichis ; enrich_code = true (configuration personnelle) ou --enrich-code (une commande) enrichit aussi le code source et les fichiers de build et de données.
 
-- Les fichiers sont pris dans l'ordre des chemins. Un lot ne dépasse ni `batch_files` fichiers ni `max_chunk_chars` octets au total. Un fichier plus gros que `max_chunk_chars` part seul, en morceaux successifs.
+- **Portée** : sans `enrich_code`, un fichier de code n'est ni envoyé ni compté dans `fichiers à enrichir`, et il ne rend pas le code de sortie non nul. `enrich_code` n'est permis que dans la configuration personnelle ; dans `.nephila.toml`, la clé est refusée. Les concepts restent réservés aux documents.
+- **Enrichissements conservés** : un fichier enrichi garde ses résumés tant que son contenu et le modèle ne changent pas. Repasser à la portée des documents seuls ne retire rien : les résumés de code déjà faits restent dans le graphe tant que le fichier ne change pas. Un fichier de code modifié perd ses résumés, n'est pas envoyé et n'est pas compté « à enrichir ». Passer à `enrich_code = true` rend « à enrichir » les fichiers de code sans résumé conservé, et `nephila update --enrich-code` les envoie.
+- **Changement de modèle** : le `build` ou l'`update` suivant envoie une fois chaque fichier de la portée.
+
+Par défaut (`batch_files = 10`), un appel LLM regroupe jusqu'à dix fichiers, ce qui réduit le nombre d'appels pour un dépôt fait de nombreux petits fichiers. `batch_files = 1` envoie un fichier par appel.
+
+- Les fichiers sont pris dans l'ordre des chemins. Un lot ne dépasse ni `batch_files` fichiers ni `max_chunk_chars` octets au total (le budget d'un lot). Un fichier plus gros que `max_chunk_chars` part seul, en morceaux. Ces morceaux sont envoyés en parallèle, dans la limite de `concurrency` appels simultanés tous fichiers confondus, et le résultat fusionné est le même qu'en série.
 - Un appel demande au plus 150 nœuds ; la somme des nœuds d'un lot reste au plus égale à 150. Un fichier de plus de 150 nœuds est envoyé seul, en plusieurs appels : chaque morceau d'un gros fichier ne demande que les nœuds dont le nom court figure dans le morceau, en groupes de 150 ; un nœud cité nulle part est demandé avec le premier morceau ; une section Markdown est demandée avec le morceau qui porte son titre, et un nom de table SQL est cherché sans tenir compte de la casse. Sans réglage. Un fichier qui demanderait plus de 50 appels n'est pas envoyé, reste à enrichir, et est nommé par la ligne `avertissement: src/gen/Big.java : trop d'appels d'enrichissement (134 nécessaires, au plus 50 par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml`. Deux remèdes : `exclude` dans [`.nephila.toml`](#fichier-de-projet-nephilatoml), qui retire aussi sa structure du graphe ; ou une valeur plus grande de `max_chunk_chars` (dans `.nephila.toml`, au plus 1000000, ou dans la configuration personnelle), qui réduit le nombre de morceaux, donc d'appels, mais vaut pour tous les fichiers et allonge chaque requête. `max_chunk_chars` ne suffit pas pour un fichier de plus de 7500 nœuds (50 appels de 150 nœuds), comme une classe générée de 20 000 méthodes : seul `exclude` règle alors le cas.
-- `--batch-files <N>` remplace la clé pour la commande en cours, sans rien écrire. Priorité : option, puis clé `batch_files`, puis défaut 1. Sans LLM actif, l'option est acceptée sans effet.
-- Jusqu'à `concurrency` lots sont en vol en même temps, soit `concurrency` × `batch_files` fichiers.
+- `--batch-files <N>` remplace la clé pour la commande en cours, sans rien écrire. Priorité : option, puis clé `batch_files`, puis défaut 10. Sans LLM actif, l'option est acceptée sans effet.
+- Jusqu'à `concurrency` appels (lots ou morceaux) sont en vol en même temps. Les connexions HTTP sont réutilisées d'un appel à l'autre.
 - Si un lot échoue, tous ses fichiers restent « à enrichir » et sont repris par le prochain `nephila update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse échoue seul.
 - Si la réponse du modèle est tronquée par la limite de jetons, tout le lot échoue ; voir [Réponse tronquée par la limite de jetons](#réponse-tronquée-par-la-limite-de-jetons).
 
@@ -536,6 +547,15 @@ avertissement: src/A.java : réponse LLM non conforme au schéma : JSON illisibl
 
 - Toute la suite d'essais d'un appel compte pour **un seul appel** dans la politique d'arrêt.
 - `--format-retries <N>` de `build`, `update` et `query ask` remplace la clé pour la commande seulement, sans rien écrire. Priorité : option, puis clé `format_retries`, puis défaut 2. Sans LLM actif, l'option est acceptée sans effet.
+
+### Nouveaux essais HTTP
+
+Une surcharge passagère du fournisseur ne fait pas échouer un fichier. Les réponses HTTP 429, 500, 502, 503, 504 et 529, et les erreurs réseau transitoires (connexion refusée, réinitialisée ou fermée avant la réponse), sont renvoyées à l'identique jusqu'à 4 nouveaux essais, soit 5 envois au plus, avec une attente de plus en plus longue : environ 1, 2, 4 puis 8 s, tirées au hasard entre la moitié et la totalité de ces durées (15 s d'attente au plus par appel).
+
+- **`retry-after`** : si la réponse porte un `retry-after` en secondes, l'attente vaut cette valeur. Au-delà de 60 s, il n'y a aucun nouvel essai : le fichier échoue aussitôt, la commande ne reste pas bloquée.
+- **Jamais renvoyés** : 401 et 403 (clé refusée), les autres statuts (400, 404, 413…), le délai dépassé, le refus de certificat.
+- **Politique d'arrêt** : les essais sont internes à l'appel. Seul l'échec final compte, et les 3 erreurs réseau consécutives qui arrêtent l'envoi sont celles d'appels dont les essais sont épuisés. Un succès à un nouvel essai ne laisse aucune trace, sauf avec `--verbose` (lignes `llm enrich attente`).
+- **Échec final** : l'avertissement habituel, `avertissement: <chemin> : erreur de openai (HTTP 503) sur <url>`, sans mention des essais.
 
 Un modèle qui échoue souvent au format se règle mieux en changeant de modèle ou en réduisant `batch_files` qu'en augmentant les essais.
 
@@ -662,6 +682,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 ## Mise à niveau
 
 - **Renommage `rkg` → `nephila`** : le binaire s'appelle `nephila`, le graphe est stocké dans `.nephila/` (au lieu de `.rkg/`), la configuration dans `~/.config/nephila/config.toml` et les variables d'environnement sont préfixées `NEPHILA_` (`NEPHILA_CONFIG`, `NEPHILA_MOCK_DIR`…). Déplacez votre configuration (`mv ~/.config/rkg ~/.config/nephila`), puis reconstruisez le graphe avec `nephila build` et supprimez l'ancien dossier `.rkg/`.
+- **Vers 0.18** : le graphe passe au schéma 5. Un graphe 0.17 est refusé (`… lancez nephila build`) : le premier `nephila build` avec le LLM actif le remplace et enrichit une fois tous les fichiers de la portée (documents Markdown, ou tout avec `enrich_code`), puis les `build` suivants n'envoient que les fichiers nouveaux ou modifiés. Le code n'est plus enrichi par défaut et `batch_files` vaut 10.
 - **Vers 0.10** : un graphe 0.9 est complété par `nephila update`, sans `build` : les fichiers JS/TS sont ajoutés, les `package.json` sont réanalysés en fichiers de build (leur document et leurs clés disparaissent) et les fichiers de verrouillage (`package-lock.json`…) sont retirés.
 - **Vers 0.9** : un graphe 0.8 est complété par `nephila update` : les fichiers `.sql`, `.xml`, `.json`, `.yaml` et `.yml`, nouvellement pris en charge, sont ajoutés sans reconstruction.
 - **Vers 0.4** : `nephila export` sans option écrit dans un fichier au lieu de stdout. Pour l'ancien comportement, utilisez `nephila export --output -`.
@@ -669,6 +690,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.18 | Rupture : seuls les documents Markdown sont enrichis par défaut ; enrich_code = true dans la configuration personnelle, ou --enrich-code, rétablit le comportement de la 0.17. Les résumés sont conservés d'un build à l'autre : le premier build en 0.18 remplace le graphe et enrichit une fois tous les fichiers de la portée, les suivants n'envoient que les fichiers nouveaux ou modifiés. Une clé d'API refusée est constatée au premier appel, après l'extraction. Lots de 10 fichiers par défaut (`batch_files = 10`), morceaux d'un gros fichier envoyés en parallèle, nouveaux essais HTTP avec attente progressive, connexions réutilisées. |
 | 0.17.5 | Liste de nœuds propre à chaque morceau d'un gros fichier ; au plus 50 appels d'enrichissement par fichier, au-delà le fichier est nommé et laissé à enrichir |
 | 0.17.4 | Réponse tronquée par la limite de jetons reconnue et jamais renvoyée ; au plus 150 nœuds demandés par appel d'enrichissement |
 | 0.17 | Plafonds des réglages entiers de `.nephila.toml` (rupture : une valeur au-dessus est refusée ; pour corriger le fichier, donnez au réglage une valeur au plus égale à son plafond, donné par la table de la section « Fichier de projet `.nephila.toml` », ou déplacez le réglage dans votre configuration personnelle, qui n'a pas de plafond mais vaut pour tous vos dépôts ; les options `--batch-files` et `--format-retries` n'ont pas de plafond non plus, mais ne corrigent pas un fichier refusé) |
@@ -697,7 +719,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.17.6 && git push origin v0.17.6
+git tag v0.18.0 && git push origin v0.18.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
@@ -709,6 +731,8 @@ cargo clippy -q --all-targets --color never -- -D warnings      # lint
 cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf       # performances (dépôt de 10 000 fichiers)
 node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests/view/*.test.js'   # logique de la vue HTML
 ```
+
+`NEPHILA_RETRY_BASE_MS` (entier ≥ 0, en millisecondes) remplace la base de 1 s de l'attente entre deux envois HTTP, pour des tests rapides ; `retry-after` reste respecté. Une valeur mal formée donne `erreur: NEPHILA_RETRY_BASE_MS : entier attendu, reçu « abc »`.
 
 Les certificats de test TLS (`tests/fixtures/tls/`) se régénèrent par `tests/fixtures/tls/gen.sh` (nécessite `openssl`).
 
@@ -723,7 +747,7 @@ Le fournisseur `mock` remplace le LLM par des fixtures et se pilote par l'enviro
 | `NEPHILA_MOCK_DIR` | Dossier de fixtures : `<dir>/<chemin relatif>.json` (ou `<chemin>.<i>.json` pour l'appel i, à partir de 1 ; i est le numéro du morceau avec 150 nœuds ou moins) est la réponse d'enrichissement ; `_ask.json` est la réponse de `query ask`. Sans fixture, la réponse est vide et valide. |
 | `NEPHILA_MOCK_LOG` | Journal des appels : une ligne `chemin<TAB>n°appel` par appel (égal au numéro de morceau avec 150 nœuds ou moins), ou `chemin_1;chemin_2;…<TAB>1` pour un lot |
 | `NEPHILA_MOCK_FAIL_AFTER` | Nombre d'appels réussis avant des erreurs réseau simulées |
-| `NEPHILA_MOCK_INVALID_KEY` | Si non vide et différent de `0`, la vérification de clé échoue |
+| `NEPHILA_MOCK_INVALID_KEY` | Si non vide et différent de `0`, chaque appel échoue en « clé refusée » |
 | `NEPHILA_MOCK_DELAY_MS` | Délai ajouté à chaque appel |
 | `NEPHILA_MOCK_TIMEOUT_FILES` | Chemins relatifs, séparés par des virgules, dont l'enrichissement échoue par délai dépassé |
 | `NEPHILA_MOCK_KEY_REVOKED_AFTER` | Nombre d'appels d'enrichissement avant des refus de clé simulés |
