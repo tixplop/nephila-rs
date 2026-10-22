@@ -410,7 +410,7 @@ fn req036_ac8_verbose_config_line() {
     env.config(
         "openai",
         &s.base_url,
-        "tls_ca_cert = \"certs/ca.pem\"\ntls_insecure = true\n",
+        "batch_files = 1\ntls_ca_cert = \"certs/ca.pem\"\ntls_insecure = true\n",
     );
     let o = env.run(&["build", "--verbose"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
@@ -422,7 +422,7 @@ fn req036_ac8_verbose_config_line() {
 
     fs::remove_dir_all(env.db()).unwrap();
     let s = FakeServer::start(script("openai"));
-    env.config("openai", &s.base_url, "");
+    env.config("openai", &s.base_url, "batch_files = 1\n");
     let o = env.run(&["build", "--verbose"]);
     assert!(
         line(&o).ends_with("batch_files=1 format_retries=2"),

@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 pub const DEFAULT_MAX_CHUNK_CHARS: usize = 60_000;
 pub const DEFAULT_CONCURRENCY: usize = 4;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
-pub const DEFAULT_BATCH_FILES: usize = 1;
+pub const DEFAULT_BATCH_FILES: usize = 10;
 pub const DEFAULT_FORMAT_RETRIES: u32 = 2;
 
 /// Réglages que le fichier de projet peut porter, dans l'ordre d'affichage (REQ-042). Seule

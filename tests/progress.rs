@@ -128,7 +128,7 @@ fn req043_ac2_no_mock_log_on_conflict() {
     let cfg = tmp.path().join("c.toml");
     fs::write(
         &cfg,
-        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+        "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nmodel = \"mock\"\n",
     )
     .unwrap();
     let log = tmp.path().join("mock.log");
@@ -347,8 +347,8 @@ fn without_progress(o: &std::process::Output) -> String {
 
 #[test]
 fn req043_ac4_ac12_mock_three_files_exact_lines_and_same_effects() {
-    let a = Mock::new(3, "concurrency = 1\n");
-    let b = Mock::new(3, "concurrency = 1\n");
+    let a = Mock::new(3, "concurrency = 1\nbatch_files = 1\n");
+    let b = Mock::new(3, "concurrency = 1\nbatch_files = 1\n");
     let o = a.run(&["build", "--show-progress"], &[]);
     assert!(o.status.success(), "{}", stderr(&o));
     let plain = b.run(&["build"], &[]);
@@ -460,7 +460,7 @@ fn req043_ac6_ac13_stop_leaves_enrichment_under_100() {
 
 #[test]
 fn req043_ac6_invalid_key_progress_stops_before_error_line() {
-    let m = Mock::new(4, "concurrency = 1\n");
+    let m = Mock::new(4, "concurrency = 1\nbatch_files = 1\n");
     let o = m.run(
         &["build", "--show-progress"],
         &[("NEPHILA_MOCK_INVALID_KEY", "1")],
@@ -494,7 +494,7 @@ fn req043_ac6_invalid_key_progress_stops_before_error_line() {
 
 #[test]
 fn req043_ac7_update_counts_only_files_to_process() {
-    let m = Mock::new(10, "concurrency = 1\n");
+    let m = Mock::new(10, "concurrency = 1\nbatch_files = 1\n");
     assert!(m.run(&["build"], &[]).status.success());
     write_java(&m.repo, 2, "int x;");
     write_java(&m.repo, 7, "int y;");
@@ -512,7 +512,7 @@ fn req043_ac7_update_counts_only_files_to_process() {
         ]
     );
     // Sans graphe : lignes d'un build complet.
-    let fresh = Mock::new(10, "concurrency = 1\n");
+    let fresh = Mock::new(10, "concurrency = 1\nbatch_files = 1\n");
     let o = fresh.run(&["update", "--show-progress"], &[]);
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(

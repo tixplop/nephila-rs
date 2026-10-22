@@ -1381,6 +1381,64 @@ mod tests {
         assert_eq!(shape(&u), ["a"]);
     }
 
+    #[test]
+    fn req027_ac13_form_units_properties_on_pseudo_random_sets() {
+        // Générateur congruentiel linéaire (graine fixe), sans dépendance.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        for set in 0..1000 {
+            let count = 1 + next(40) as usize;
+            let sizes_cap = [50u64, 600, 5_000, 80_000][next(4) as usize];
+            let files: Vec<FileRecord> = (0..count)
+                .map(|i| rec(&format!("f{i:03}"), 1 + next(sizes_cap)))
+                .collect();
+            let node_counts: Vec<usize> = (0..count)
+                .map(|_| match next(10) {
+                    0 => 100 + next(150) as usize,
+                    _ => next(60) as usize,
+                })
+                .collect();
+            let nodes = |f: &FileRecord| node_counts[f.path[1..].parse::<usize>().unwrap()];
+            for batch in [1usize, 10, 100] {
+                for max in [100usize, 1_000, 60_000] {
+                    let units = form_units_by_nodes(&files, nodes, batch, max);
+                    let ctx = format!("jeu {set}, batch {batch}, max {max}");
+                    let mut seen: Vec<&str> = Vec::new();
+                    for u in &units {
+                        match u {
+                            Unit::Lot(v) => {
+                                assert!(!v.is_empty(), "{ctx}");
+                                assert!(v.len() <= batch, "{ctx}");
+                                assert!(
+                                    v.iter().map(|f| f.size).sum::<u64>() <= max as u64,
+                                    "{ctx}"
+                                );
+                                assert!(v.iter().map(|f| nodes(f)).sum::<usize>() <= 150, "{ctx}");
+                                seen.extend(v.iter().map(|f| f.path.as_str()));
+                            }
+                            Unit::Big(f) => {
+                                assert!(
+                                    f.size > max as u64 || nodes(f) > 150,
+                                    "{ctx} : {} seul sans raison",
+                                    f.path
+                                );
+                                seen.push(f.path.as_str());
+                            }
+                            Unit::Call { .. } => unreachable!(),
+                        }
+                    }
+                    let expected: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+                    assert_eq!(seen, expected, "{ctx}");
+                }
+            }
+        }
+    }
+
     fn net() -> Error {
         Error::Network("réseau".into())
     }

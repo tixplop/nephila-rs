@@ -19,8 +19,10 @@ struct Env {
     config: PathBuf,
 }
 
-const MOCK_CONFIG: &str =
+const MOCK_BASE: &str =
     "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\n";
+const MOCK_CONFIG: &str =
+    "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nmodel = \"mock\"\nconcurrency = 1\n";
 
 impl Env {
     fn new(n: usize, config: &str) -> Env {
@@ -335,7 +337,7 @@ fn req038_ac8_only_failing_chunk_is_resent() {
 
 #[test]
 fn req038_ac8_batch_resends_whole_lot() {
-    let env = Env::new(4, &format!("{MOCK_CONFIG}batch_files = 2\n"));
+    let env = Env::new(4, &format!("{MOCK_BASE}batch_files = 2\n"));
     let o = env.run(
         &["build", "--verbose"],
         &[("NEPHILA_MOCK_MALFORMED", "src/F01.java:1")],
@@ -441,7 +443,7 @@ fn req038_ac17_final_warning_carries_attempt_count() {
     assert!(!stderr(&o).contains("essais sur"), "{}", stderr(&o));
     assert_eq!(lines_naming(&o, "src/F00.java").len(), 1);
 
-    let env = Env::new(4, &format!("{MOCK_CONFIG}batch_files = 2\n"));
+    let env = Env::new(4, &format!("{MOCK_BASE}batch_files = 2\n"));
     let o = env.run(&["build"], &[("NEPHILA_MOCK_MALFORMED", "src/F01.java:3")]);
     for f in ["src/F00.java", "src/F01.java"] {
         let w = lines_naming(&o, f);

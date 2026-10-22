@@ -40,7 +40,7 @@ impl Env {
         let config = tmp.path().join("config.toml");
         fs::write(
             &config,
-            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\n",
+            "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nmodel = \"mock\"\nconcurrency = 1\n",
         )
         .unwrap();
         let log = tmp.path().join("mock.log");
@@ -188,7 +188,7 @@ fn req010_ac1_with_concurrency_at_most_five_plus_n_minus_one_calls() {
     let env = Env::new();
     fs::write(
         &env.config,
-        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 3\n",
+        "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nmodel = \"mock\"\nconcurrency = 3\n",
     )
     .unwrap();
     let out = env.run("build", &[("NEPHILA_MOCK_FAIL_AFTER", "2")]);

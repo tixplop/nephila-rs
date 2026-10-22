@@ -41,7 +41,7 @@ impl Env {
         let config = tmp.path().join("config.toml");
         fs::write(
             &config,
-            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+            "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nmodel = \"mock\"\n",
         )
         .unwrap();
         let log = tmp.path().join("mock.log");

@@ -141,11 +141,11 @@ fn req027_ac2_batch_one_logs_one_line_per_file() {
     assert!(log.iter().all(|l| !l.contains(';') && l.ends_with("\t1")));
     assert_eq!(env.summaries().len(), 5);
 
-    // Sans la clé batch_files : même comportement que batch_files = 1.
+    // Configuration équivalente écrite sans la clé concurrency de Env : batch_files = 1 explicite.
     let env2 = Env::new(5, 1, 1);
     fs::write(
         &env2.config,
-        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\nmax_chunk_chars = 60000\n",
+        "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nmodel = \"mock\"\nconcurrency = 1\nmax_chunk_chars = 60000\n",
     )
     .unwrap();
     let o2 = env2.run("build", &[]);
@@ -622,7 +622,9 @@ fn req028_ac2_option_overrides_file_and_default() {
     config_without_batch(&env);
     let o = env.run("build", &[]);
     assert!(o.status.success(), "{}", stderr(&o));
-    assert_eq!(env.log_lines().len(), 10);
+    let log = env.log_lines();
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(files_of(&log[0]), fnames(0..10));
 }
 
 #[test]
@@ -741,4 +743,109 @@ fn req028_ac6_verbose_config_line_shows_effective_value() {
             && l.contains("batch_files=8")),
         "{err}"
     );
+}
+
+// ---- REQ-027 modifiée : défaut 10 ----
+
+/// Configuration `mock` sans `batch_files` ni `max_chunk_chars`.
+fn config_defaults(env: &Env) {
+    config_without_batch(env);
+}
+
+/// `n` documents `dNNN.md` d'une section ; `size(i)` donne la taille en octets du i-ème.
+fn write_docs(env: &Env, n: usize, size: impl Fn(usize) -> usize) {
+    for i in 0..n {
+        let mut text = format!("# Doc {i:03}\n\n");
+        let mut k = 0;
+        while text.len() < size(i) {
+            text.push_str(&format!("ligne {k:04} de remplissage du document\n"));
+            k += 1;
+        }
+        text.truncate(size(i));
+        fs::write(env.repo.join(format!("d{i:03}.md")), text).unwrap();
+    }
+}
+
+#[test]
+fn req027_ac1_batch_files_absent_means_ten() {
+    let env = Env::new(25, 1, 1);
+    config_defaults(&env);
+    let o = env.run("build", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let sizes: Vec<usize> = env.log_lines().iter().map(|l| files_of(l).len()).collect();
+    assert_eq!(sizes, [10, 10, 5]);
+}
+
+#[test]
+fn req027_ac11_hundred_documents_give_ten_calls_of_ten() {
+    let env = Env::new(0, 1, 1);
+    config_defaults(&env);
+    write_docs(&env, 100, |i| 500 + (i * 37) % 501);
+    let o = env.run("build", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let log = env.log_lines();
+    assert_eq!(log.len(), 10, "{log:?}");
+    let all: Vec<String> = log.iter().flat_map(|l| files_of(l)).collect();
+    let expected: Vec<String> = (0..100).map(|i| format!("d{i:03}.md")).collect();
+    assert_eq!(all, expected);
+    assert!(log.iter().all(|l| files_of(l).len() == 10));
+
+    let env = Env::new(0, 1, 1);
+    write_docs(&env, 100, |i| 500 + (i * 37) % 501);
+    env.set_config(1, 1, 60000);
+    let o = env.run("build", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(env.log_lines().len(), 100);
+}
+
+#[test]
+fn req027_ac12_character_budget_bounds_lots_and_big_document_goes_alone() {
+    let env = Env::new(0, 1, 1);
+    write_docs(&env, 100, |_| 1000);
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\nmax_chunk_chars = 3500\n",
+    )
+    .unwrap();
+    let o = env.run("build -v", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let sizes: Vec<usize> = env.log_lines().iter().map(|l| files_of(l).len()).collect();
+    assert_eq!(sizes.len(), 34, "{sizes:?}");
+    assert!(sizes[..33].iter().all(|&n| n == 3));
+    assert_eq!(sizes[33], 1);
+    let mut lots = 0;
+    for l in stderr(&o)
+        .lines()
+        .filter(|l| l.contains("llm enrich départ lot "))
+    {
+        lots += 1;
+        let c: usize = l
+            .trim_end_matches(" car.")
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(c <= 3500, "{l}");
+    }
+    assert_eq!(lots, 33);
+
+    // Un document de 8 000 octets : ses propres appels, dans aucun lot.
+    let mut big = String::from("# Gros\n\n");
+    let mut k = 0;
+    while big.len() < 8000 {
+        big.push_str(&format!("ligne {k:04} de remplissage du document\n"));
+        k += 1;
+    }
+    big.truncate(8000);
+    fs::write(env.repo.join("zbig.md"), big).unwrap();
+    fs::remove_file(&env.log).unwrap();
+    let o = env.run("update", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let log = env.log_lines();
+    let own: Vec<&String> = log.iter().filter(|l| l.starts_with("zbig.md\t")).collect();
+    assert!(own.len() >= 2, "{log:?}");
+    assert!(log
+        .iter()
+        .all(|l| !l.contains(';') || !l.contains("zbig.md")));
 }

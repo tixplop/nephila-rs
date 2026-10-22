@@ -369,8 +369,8 @@ fn req003_ac5_key_revoked_after_n_extractions() {
 // ---- REQ-027 : batch_files
 
 #[test]
-fn req027_ac1_batch_files_default_is_one() {
-    assert_eq!(parse("provider='mock'").unwrap().batch_files, 1);
+fn req027_ac1_batch_files_default_is_ten() {
+    assert_eq!(parse("provider='mock'").unwrap().batch_files, 10);
     assert_eq!(
         parse("provider='mock'\nbatch_files=8").unwrap().batch_files,
         8

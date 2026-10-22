@@ -52,7 +52,7 @@ impl Env {
         let config = tmp.path().join("config.toml");
         fs::write(
             &config,
-            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+            "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nmodel = \"mock\"\n",
         )
         .unwrap();
         let mock = tmp.path().join("mock");
@@ -400,7 +400,7 @@ fn req024_ac4_discarded_items_give_one_warning_per_file() {
         .unwrap();
         fs::write(
             &env.config,
-            format!("provider = \"mock\"\nenrich_code = true\nconcurrency = {concurrency}\n"),
+            format!("provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nconcurrency = {concurrency}\n"),
         )
         .unwrap();
         let out = env.build_ok();
@@ -592,7 +592,7 @@ fn req024_ac1_ac2_no_llm_option_ignores_the_configuration() {
     let reference = Env::new();
     reference.build_plain_ok();
     for config in [
-        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+        "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nmodel = \"mock\"\n",
         "provider = \"inconnu\"\n",
     ] {
         let env = Env::new();
@@ -612,14 +612,14 @@ fn req006_ac1_concurrency_setting_gives_same_graph() {
     let b = Env::new();
     fs::write(
         &b.config,
-        "provider = \"mock\"\nenrich_code = true\nconcurrency = 1\n",
+        "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nconcurrency = 1\n",
     )
     .unwrap();
     b.build_ok();
     let c = Env::new();
     fs::write(
         &c.config,
-        "provider = \"mock\"\nenrich_code = true\nconcurrency = 8\n",
+        "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nconcurrency = 8\n",
     )
     .unwrap();
     c.build_ok();
@@ -898,7 +898,7 @@ fn req024_ac5_invalid_response_keeps_structure_and_leaves_file_to_enrich() {
         fs::write(env.mock.join(format!("{bad}.json")), bad_json).unwrap();
         fs::write(
             &env.config,
-            format!("provider = \"mock\"\nenrich_code = true\nconcurrency = {concurrency}\nformat_retries = 0\n"),
+            format!("provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nconcurrency = {concurrency}\nformat_retries = 0\n"),
         )
         .unwrap();
         let out = env.build();
@@ -986,7 +986,7 @@ fn req002_ac4_missing_key_variable_is_named() {
     let env = Env::new();
     fs::write(
         &env.config,
-        "provider = \"mock\"\nenrich_code = true\napi_key_env = \"NEPHILA_TEST_ABSENT_KEY_VAR\"\n",
+        "provider = \"mock\"\nenrich_code = true\nbatch_files = 1\napi_key_env = \"NEPHILA_TEST_ABSENT_KEY_VAR\"\n",
     )
     .unwrap();
     let out = env
@@ -1049,7 +1049,7 @@ fn dup_env(concurrency: usize, with_a: bool) -> Env {
     let e = Env::empty();
     fs::write(
         &e.config,
-        format!("provider = \"mock\"\nenrich_code = true\nconcurrency = {concurrency}\n"),
+        format!("provider = \"mock\"\nenrich_code = true\nbatch_files = 1\nconcurrency = {concurrency}\n"),
     )
     .unwrap();
     if with_a {

@@ -122,13 +122,13 @@ api_key_env = "ANTHROPIC_API_KEY"
 # Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # timeout_secs = 300
 
-# Nombre maximal de fichiers par appel d'enrichissement. Entier > 0. Défaut : 1 (un fichier par
-# appel) ; 4 à 8 convient à de nombreux petits fichiers. Un lot ne dépasse jamais
+# Nombre maximal de fichiers par appel d'enrichissement. Entier > 0. Défaut : 10 ; 1 envoie un
+# fichier par appel. Un lot ne dépasse jamais
 # max_chunk_chars et un gros fichier part seul ; concurrency x batch_files fichiers sont en vol
 # au plus. Remplacé, pour une commande, par l'option --batch-files ; un dépôt peut le remplacer
 # par son .nephila.toml.
 # Priorité : --batch-files > .nephila.toml du dépôt > ce fichier > défaut.
-# batch_files = 1
+# batch_files = 10
 
 # Nouveaux essais d'un appel dont la réponse est non conforme. Entier >= 0. Défaut : 2, soit au
 # plus 3 appels pour une même requête ; 0 = aucun nouvel essai. Les erreurs réseau, les délais
