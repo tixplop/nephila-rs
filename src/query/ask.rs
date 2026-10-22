@@ -146,7 +146,6 @@ pub fn answer(
         return Err(not_found());
     }
     let context = build_context(&nodes, &store.edges()?, &seeds);
-    llm.verify_key()?;
     let stop = AtomicBool::new(false);
     let reply = with_format_retries(format_retries, &stop, |_| llm.ask(question, &context))
         .map_err(|e| match e {

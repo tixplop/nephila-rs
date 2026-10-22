@@ -157,16 +157,13 @@ fn req026_ac3_config_parcours_and_phases() {
             && l.contains("timeout_secs=")),
         "{lines:?}"
     );
-    assert!(lines
-        .iter()
-        .any(|l| l.contains("verify_key") && l.contains(" ok ")));
+    assert!(!has(&lines, "verify_key"));
     assert!(has(&lines, "parcours"));
     assert!(has(&lines, "structure: début"));
     assert!(has(&lines, "structure: fin"));
     assert!(has(&lines, "résolution:"));
     let pos = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
-    assert!(pos("config") < pos("verify_key"));
-    assert!(pos("verify_key") < pos("parcours"));
+    assert!(pos("config") < pos("parcours"));
     assert!(pos("parcours") < pos("structure: début"));
     assert!(pos("structure: fin") < pos("résolution:"));
     for l in stderr(&o).lines() {
@@ -323,8 +320,7 @@ fn openai_reply(text: &str) -> String {
 
 #[test]
 fn req026_ac5_openai_timeout_duration() {
-    let server =
-        FakeServer::start_with_delays(vec![(200, "{}".into(), 0), (200, openai_reply("{}"), 2000)]);
+    let server = FakeServer::start_with_delays(vec![(200, openai_reply("{}"), 2000)]);
     let env = openai_env(&server, 1, "class A {}\n");
     let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-x")]);
     let lines = trace_lines(&o);
@@ -344,7 +340,7 @@ fn req026_ac5_openai_timeout_duration() {
 }
 
 #[test]
-fn req026_ac5_openai_key_refused_at_verification() {
+fn req026_ac5_openai_key_refused_at_first_call() {
     let server = FakeServer::start(vec![(401, "{}".into())]);
     let env = openai_env(&server, 5, "class A {}\n");
     let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-x")]);
@@ -353,14 +349,25 @@ fn req026_ac5_openai_key_refused_at_verification() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("verify_key") && l.contains("clé refusée")),
+            .any(|l| l.contains("llm enrich fin") && l.contains("clé refusée")),
         "{lines:?}"
     );
-    assert!(stderr(&o).contains("erreur:"));
+    assert_eq!(o.status.code(), Some(1));
+    let errs: Vec<String> = stderr(&o)
+        .lines()
+        .filter(|l| l.starts_with("erreur:"))
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        errs,
+        vec!["erreur: clé d'API refusée par openai (HTTP 401) ; vérifiez la variable désignée par api_key_env".to_string()],
+        "{}",
+        stderr(&o)
+    );
 }
 
 fn assert_no_secret_in_failed_call(reply_text: &str) {
-    let server = FakeServer::start(vec![(200, "{}".into()), (200, openai_reply(reply_text))]);
+    let server = FakeServer::start(vec![(200, openai_reply(reply_text))]);
     let env = openai_env(&server, 5, "class A {}\n");
     let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-test-SECRET")]);
     let lines = trace_lines(&o);
@@ -387,7 +394,7 @@ fn req026_ac6_no_secret_from_unknown_field() {
 #[test]
 fn req026_ac6_no_secret_in_traces() {
     let long = format!("SECRET_REPONSE_42 {}", "x".repeat(5000));
-    let server = FakeServer::start(vec![(200, "{}".into()), (200, openai_reply(&long))]);
+    let server = FakeServer::start(vec![(200, openai_reply(&long))]);
     let env = openai_env(
         &server,
         5,
@@ -486,16 +493,12 @@ fn req026_ac12_marque_de_source() {
 #[test]
 fn req042_ac10_aucune_trace_ne_contient_la_cle_d_api() {
     let secret = "sk-SECRET-VALEUR-T087-reconnaissable";
-    let server = FakeServer::start(vec![
-        (200, "{}".into()),
-        (
-            200,
-            serde_json::json!({"choices":[{"message":{"role":"assistant","content":
+    let server = FakeServer::start(vec![(
+        200,
+        serde_json::json!({"choices":[{"message":{"role":"assistant","content":
                 r#"{"version":2,"summaries":[],"concepts":[]}"#}}]})
-            .to_string(),
-        ),
-        (200, "{}".into()),
-    ]);
+        .to_string(),
+    )]);
     let env = openai_env(&server, 30, "class A {}\n");
     env.project("model = \"m-projet\"\n");
     for sub in ["build", "update"] {

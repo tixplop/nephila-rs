@@ -69,10 +69,6 @@ impl AnthropicLlm {
 }
 
 impl Llm for AnthropicLlm {
-    fn verify_key(&self) -> Result<()> {
-        http::send("anthropic", self.request("GET", "/v1/models"), None).map(|_| ())
-    }
-
     fn enrich(
         &self,
         file: &str,

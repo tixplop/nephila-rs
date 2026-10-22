@@ -455,14 +455,37 @@ fn req043_ac6_ac13_stop_leaves_enrichment_under_100() {
 }
 
 #[test]
-fn req043_ac6_invalid_key_no_progress_line() {
+fn req043_ac6_invalid_key_progress_stops_before_error_line() {
     let m = Mock::new(4, "concurrency = 1\n");
     let o = m.run(
         &["build", "--show-progress"],
         &[("NEPHILA_MOCK_INVALID_KEY", "1")],
     );
     assert_ne!(o.status.code(), Some(0));
-    assert!(progress_lines(&o).is_empty(), "{}", stderr(&o));
+    // REQ-054 : la clé est constatée au premier appel, après l'extraction.
+    let err = stderr(&o);
+    let lines: Vec<&str> = err.lines().collect();
+    let ext = lines
+        .iter()
+        .position(|l| *l == "progression: extraction 100 % (4/4 fichiers)")
+        .unwrap_or_else(|| panic!("{err}"));
+    let enr = lines
+        .iter()
+        .position(|l| l.starts_with("progression: enrichissement 0 % (0/"))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(ext < enr, "{err}");
+    let errs: Vec<usize> = (0..lines.len())
+        .filter(|i| lines[*i].starts_with("erreur:"))
+        .collect();
+    assert_eq!(errs.len(), 1, "{err}");
+    assert!(lines[errs[0]].contains("clé d'API refusée"), "{err}");
+    assert_eq!(errs[0], lines.len() - 1, "{err}");
+    assert!(
+        lines[errs[0]..]
+            .iter()
+            .all(|l| !l.starts_with("progression:")),
+        "{err}"
+    );
 }
 
 #[test]

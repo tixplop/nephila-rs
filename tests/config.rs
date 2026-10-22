@@ -180,10 +180,12 @@ fn req003_ac3_fail_after_and_invalid_key() {
     let e = ex(&m, "c", 1).unwrap_err().to_string();
     assert!(e.contains("réseau"), "{e}");
     assert!(ex(&m, "d", 1).is_err());
-    assert!(m.verify_key().is_ok());
 
     let m = mock_with(d.path(), |o| o.invalid_key = true);
-    assert!(m.verify_key().is_err());
+    assert!(matches!(
+        ex(&m, "a", 1),
+        Err(nephila::error::Error::InvalidKey(_))
+    ));
 }
 
 #[test]
@@ -277,15 +279,28 @@ fn req003_from_env_with_reads_all_variables() {
     ]);
     let m = MockLlm::from_env_with(&env).unwrap();
     let t0 = std::time::Instant::now();
-    assert_eq!(ex(&m, "A.java", 1).unwrap().summaries.len(), 1);
+    assert!(matches!(
+        ex(&m, "A.java", 1),
+        Err(nephila::error::Error::InvalidKey(_))
+    ));
     assert!(t0.elapsed() >= std::time::Duration::from_millis(50));
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "A.java\t1\n");
     assert!(ex(&m, "A.java", 1).is_err());
-    assert!(m.verify_key().is_err());
+
+    let m = MockLlm::from_env_with(&env_of(&[
+        ("NEPHILA_MOCK_DIR", &dir),
+        ("NEPHILA_MOCK_FAIL_AFTER", "1"),
+    ]))
+    .unwrap();
+    assert_eq!(ex(&m, "A.java", 1).unwrap().summaries.len(), 1);
+    assert!(matches!(
+        ex(&m, "A.java", 1),
+        Err(nephila::error::Error::Network(_))
+    ));
 
     for v in ["0", ""] {
         let m = MockLlm::from_env_with(&env_of(&[("NEPHILA_MOCK_INVALID_KEY", v)])).unwrap();
-        assert!(m.verify_key().is_ok(), "INVALID_KEY={v:?}");
+        assert!(ex(&m, "A.java", 1).is_ok(), "INVALID_KEY={v:?}");
     }
     let m = MockLlm::from_env_with(&env_of(&[])).unwrap();
     assert!(ex(&m, "A.java", 1).unwrap().summaries.is_empty());
@@ -349,7 +364,6 @@ fn req003_ac5_key_revoked_after_n_extractions() {
         ex(&m, "d", 1),
         Err(nephila::error::Error::InvalidKey(_))
     ));
-    assert!(m.verify_key().is_ok());
 }
 
 // ---- REQ-027 : batch_files

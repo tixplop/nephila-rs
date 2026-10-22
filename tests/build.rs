@@ -943,20 +943,6 @@ fn req002_ac1_missing_config_builds_without_llm_and_ask_names_the_path() {
     }
 }
 
-fn snapshot_nephila(repo: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
-    let mut v = Vec::new();
-    for e in fs::read_dir(repo.join(".nephila")).unwrap() {
-        let p = e.unwrap().path();
-        v.push((
-            p.file_name().unwrap().to_string_lossy().into_owned(),
-            fs::read(&p).unwrap(),
-            fs::metadata(&p).unwrap().modified().unwrap(),
-        ));
-    }
-    v.sort_by(|a, b| a.0.cmp(&b.0));
-    v
-}
-
 #[test]
 fn req002_ac2_unknown_provider_names_faulty_key_unless_no_llm() {
     let env = Env::new();
@@ -977,32 +963,6 @@ fn req002_ac2_missing_required_key_names_it() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("api_key_env"), "{}", stderr(&out));
     assert!(!env.repo.join(".nephila").exists());
-}
-
-#[test]
-fn req002_ac3_refused_key_stops_before_any_analysis() {
-    let env = Env::new();
-    let out = env
-        .cmd()
-        .env("NEPHILA_MOCK_INVALID_KEY", "1")
-        .arg("build")
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(stderr(&out).starts_with("erreur:"));
-    assert!(env.log_lines().is_empty());
-    assert!(!env.repo.join(".nephila").exists());
-    // Graphe existant inchangé.
-    env.build_ok();
-    let snapshot = snapshot_nephila(&env.repo);
-    let out = env
-        .cmd()
-        .env("NEPHILA_MOCK_INVALID_KEY", "1")
-        .arg("build")
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    assert_eq!(snapshot, snapshot_nephila(&env.repo));
 }
 
 #[test]

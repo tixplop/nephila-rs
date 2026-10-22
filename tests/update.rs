@@ -578,7 +578,7 @@ fn req011_update_on_old_schema_asks_for_build_and_keeps_db() {
 }
 
 #[test]
-fn req002_update_checks_key_before_touching_anything() {
+fn req054_update_refused_key_reported_at_first_call() {
     let env = Env::maven();
     env.ok("build");
     let mut t = fs::read_to_string(env.repo.join(ORDER)).unwrap();
@@ -587,8 +587,17 @@ fn req002_update_checks_key_before_touching_anything() {
     env.clear_log();
     let out = env.run("update", &[("NEPHILA_MOCK_INVALID_KEY", "1")]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("clé"), "{}", stderr(&out));
-    assert!(env.log_lines().is_empty());
+    assert!(
+        stderr(&out).contains("clé d'API refusée"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("envoi interrompu"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.log_lines().len(), 1);
 }
 
 #[test]

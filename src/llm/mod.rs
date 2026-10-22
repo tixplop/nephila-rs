@@ -17,8 +17,6 @@ pub use retry::with_format_retries;
 
 /// Fournisseur LLM. Les implémentations sont partagées entre threads.
 pub trait Llm: Send + Sync {
-    /// Vérifie la clé par un appel sans coût de génération.
-    fn verify_key(&self) -> Result<()>;
     /// Enrichit un appel : résumés et concepts (schéma version 2). `requested` = nœuds écrits
     /// dans le prompt ; `known` = liste complète du fichier, qui filtre la réponse.
     fn enrich(

@@ -279,7 +279,11 @@ fn req010_ac6_revoked_key_stops_at_first_refusal() {
     assert!(!out.status.success());
     assert_eq!(call_count(&env), 3);
     let err = stderr(&out);
-    assert!(err.contains("clé"), "{err}");
+    assert!(
+        err.contains("clé d'API refusée par le fournisseur (LLM simulé)"),
+        "{err}"
+    );
+    assert!(!err.contains("envoi interrompu"), "{err}");
     assert!(!err.contains("panne réseau"), "{err}");
     assert_eq!(paths_in_graph(&env, FileState::Indexed).len(), 10);
     assert_eq!(to_enrich(&env).len(), 8);

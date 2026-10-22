@@ -483,7 +483,6 @@ fn posts(server: &FakeServer) -> Vec<fake_server::Recorded> {
 #[test]
 fn req038_ac9_openai_empty_reply_is_retried_with_identical_body() {
     let server = FakeServer::start(vec![
-        (200, "{}".into()),
         (200, r#"{"choices":[]}"#.into()),
         (200, openai_reply(GOOD)),
     ]);
@@ -503,7 +502,6 @@ fn req038_ac9_openai_empty_reply_is_retried_with_identical_body() {
 fn req038_ac9_openai_text_without_json_three_requests_then_zero_retries_one() {
     let bad = openai_reply("désolé, pas de JSON");
     let server = FakeServer::start(vec![
-        (200, "{}".into()),
         (200, bad.clone()),
         (200, bad.clone()),
         (200, bad.clone()),
@@ -514,7 +512,7 @@ fn req038_ac9_openai_text_without_json_three_requests_then_zero_retries_one() {
     assert_eq!(posts(&server).len(), 3);
     assert_eq!(env.to_enrich(), 1);
 
-    let server = FakeServer::start(vec![(200, "{}".into()), (200, bad)]);
+    let server = FakeServer::start(vec![(200, bad)]);
     let env = server_env(&server, "format_retries = 0\n");
     let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
     assert!(!o.status.success());
@@ -523,7 +521,7 @@ fn req038_ac9_openai_text_without_json_three_requests_then_zero_retries_one() {
 
 #[test]
 fn req038_ac6_http_error_is_not_retried() {
-    let server = FakeServer::start(vec![(200, "{}".into()), (500, "{}".into())]);
+    let server = FakeServer::start(vec![(500, "{}".into())]);
     let env = server_env(&server, "");
     let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
     assert!(!o.status.success());
@@ -533,11 +531,7 @@ fn req038_ac6_http_error_is_not_retried() {
 #[test]
 fn req038_ac9_anthropic_reply_without_text_block_is_retried() {
     let good = serde_json::json!({"content":[{"type":"text","text":GOOD}]}).to_string();
-    let server = FakeServer::start(vec![
-        (200, "{}".into()),
-        (200, r#"{"content":[]}"#.into()),
-        (200, good),
-    ]);
+    let server = FakeServer::start(vec![(200, r#"{"content":[]}"#.into()), (200, good)]);
     let env = Env::new(
         1,
         &format!(
@@ -564,7 +558,7 @@ fn req038_ac6_lot_omitting_a_file_is_sent_once() {
         )
     };
     let reply = format!(r#"{{"version":3,"files":[{},{}]}}"#, entry(0), entry(2));
-    let server = FakeServer::start(vec![(200, "{}".into()), (200, openai_reply(&reply))]);
+    let server = FakeServer::start(vec![(200, openai_reply(&reply))]);
     let env = Env::new(
         3,
         &format!(
@@ -810,7 +804,6 @@ fn req038_ac17_option_one_gives_two_tries_suffix() {
 fn req038_ac11_openai_ask_retried_after_nonconforming_reply() {
     let ask_ok = r#"{"found":true,"answer":"oui","nodes":["type:p.F00"]}"#;
     let server = FakeServer::start(vec![
-        (200, "{}".into()),
         (200, openai_reply(r#"{"found": "oui"}"#)),
         (200, openai_reply(ask_ok)),
     ]);

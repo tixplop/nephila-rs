@@ -529,9 +529,7 @@ fn req027_ac7_omitted_file_stays_pending_and_update_resends_only_it() {
     let single =
         r#"{"version":2,"summaries":[{"node":"type:p.F01","summary":"résumé 01"}],"concepts":[]}"#;
     let server = FakeServer::start(vec![
-        (200, "{}".into()),
         (200, openai_reply(&reply)),
-        (200, "{}".into()),
         (200, openai_reply(single)),
     ]);
     let env = server_env(&server, 3);
@@ -566,7 +564,6 @@ fn req027_ac8_version_2_reply_for_a_lot_fails_all_its_files() {
         lot_entry(5)
     );
     let server = FakeServer::start(vec![
-        (200, "{}".into()),
         (200, openai_reply(wrong)),
         (200, openai_reply(&reply)),
     ]);

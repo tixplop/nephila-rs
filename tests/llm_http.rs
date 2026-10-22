@@ -55,7 +55,7 @@ fn openai(s: &FakeServer, key: Option<&str>) -> OpenAiLlm {
 fn req002_ac3_anthropic_401_is_invalid_key() {
     let s = FakeServer::start(vec![(401, "{}".into())]);
     assert!(matches!(
-        anthropic(&s).verify_key(),
+        anthropic(&s).enrich("A.java", 1, "x", &a_ids(), &a_ids()),
         Err(Error::InvalidKey(_))
     ));
 }
@@ -64,7 +64,7 @@ fn req002_ac3_anthropic_401_is_invalid_key() {
 fn req002_ac3_openai_403_is_invalid_key() {
     let s = FakeServer::start(vec![(403, "{}".into())]);
     assert!(matches!(
-        openai(&s, Some("k")).verify_key(),
+        openai(&s, Some("k")).enrich("A.java", 1, "x", &a_ids(), &a_ids()),
         Err(Error::InvalidKey(_))
     ));
 }
@@ -72,9 +72,12 @@ fn req002_ac3_openai_403_is_invalid_key() {
 #[test]
 fn req002_ac3_server_error_is_network_not_key() {
     let s = FakeServer::start(vec![(500, "{}".into()), (429, "{}".into())]);
-    assert!(matches!(anthropic(&s).verify_key(), Err(Error::Network(_))));
     assert!(matches!(
-        openai(&s, None).verify_key(),
+        anthropic(&s).enrich("A.java", 1, "x", &a_ids(), &a_ids()),
+        Err(Error::Network(_))
+    ));
+    assert!(matches!(
+        openai(&s, None).enrich("A.java", 1, "x", &a_ids(), &a_ids()),
         Err(Error::Network(_))
     ));
 }
@@ -86,7 +89,10 @@ fn req002_ac3_connection_refused_is_network() {
         format!("http://{}", l.local_addr().unwrap())
     };
     let llm = AnthropicLlm::new(Some(url), "m".into(), "k".into(), 30, &Tls::default());
-    assert!(matches!(llm.verify_key(), Err(Error::Network(_))));
+    assert!(matches!(
+        llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()),
+        Err(Error::Network(_))
+    ));
 }
 
 #[test]
@@ -99,16 +105,6 @@ fn req002_ac3_extract_401_is_invalid_key() {
 }
 
 // ---- AC-002-5 : requêtes conformes au protocole ----
-
-#[test]
-fn req002_ac5_anthropic_verify_key_request() {
-    let s = FakeServer::start(vec![(200, r#"{"data":[]}"#.into())]);
-    anthropic(&s).verify_key().unwrap();
-    let r = &s.requests()[0];
-    assert_eq!((r.method.as_str(), r.path.as_str()), ("GET", "/v1/models"));
-    assert_eq!(r.headers["x-api-key"], "sk-test");
-    assert!(r.headers.contains_key("anthropic-version"));
-}
 
 #[test]
 fn req002_ac5_anthropic_extract_request_and_response() {
@@ -137,15 +133,6 @@ fn req002_ac5_anthropic_extract_request_and_response() {
 }
 
 #[test]
-fn req002_ac5_openai_verify_key_request() {
-    let s = FakeServer::start(vec![(200, r#"{"data":[]}"#.into())]);
-    openai(&s, Some("sk-o")).verify_key().unwrap();
-    let r = &s.requests()[0];
-    assert_eq!((r.method.as_str(), r.path.as_str()), ("GET", "/v1/models"));
-    assert_eq!(r.headers["authorization"], "Bearer sk-o");
-}
-
-#[test]
 fn req002_ac5_openai_extract_request_and_response() {
     let s = FakeServer::start(vec![(200, openai_reply(EXTRACTION))]);
     let ex = openai(&s, Some("sk-o"))
@@ -170,14 +157,16 @@ fn req002_ac5_openai_extract_request_and_response() {
 
 #[test]
 fn req002_ac5_openai_key_is_optional_for_local_model() {
-    let s = FakeServer::start(vec![(200, r#"{"data":[]}"#.into())]);
-    openai(&s, None).verify_key().unwrap();
+    let s = FakeServer::start(vec![(200, openai_reply(EXTRACTION))]);
+    openai(&s, None)
+        .enrich("A.java", 1, "x", &a_ids(), &a_ids())
+        .unwrap();
     assert!(!s.requests()[0].headers.contains_key("authorization"));
 }
 
 #[test]
 fn req002_ac5_base_url_trailing_slash_is_tolerated() {
-    let s = FakeServer::start(vec![(200, "{}".into())]);
+    let s = FakeServer::start(vec![(200, anthropic_reply(EXTRACTION))]);
     let llm = AnthropicLlm::new(
         Some(format!("{}/", s.base_url)),
         "m".into(),
@@ -185,8 +174,8 @@ fn req002_ac5_base_url_trailing_slash_is_tolerated() {
         30,
         &Tls::default(),
     );
-    llm.verify_key().unwrap();
-    assert_eq!(s.requests()[0].path, "/v1/models");
+    llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()).unwrap();
+    assert_eq!(s.requests()[0].path, "/v1/messages");
 }
 
 #[test]
@@ -277,7 +266,7 @@ fn req002_ac8_openai_slow_server_gives_timeout_error() {
         1,
         &Tls::default(),
     );
-    let r = llm.verify_key();
+    let r = llm.enrich("A.java", 1, "x", &a_ids(), &a_ids());
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
 }
 
@@ -311,7 +300,7 @@ fn req002_ac8_config_timeout_secs_reaches_http_agent() {
         nephila::config::Config::parse(&text, std::path::Path::new("/x/config.toml")).unwrap();
     let llm = nephila::llm::build_llm(&cfg).unwrap();
     let t = std::time::Instant::now();
-    let r = llm.verify_key();
+    let r = llm.enrich("A.java", 1, "x", &a_ids(), &a_ids());
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
     assert!(t.elapsed() < std::time::Duration::from_secs(2));
 }
@@ -459,7 +448,7 @@ fn req027_ac8_lot_version_2_is_non_conforming_and_errors_classified() {
 #[test]
 fn req024_ac10_openai_node_list_of_json_document_has_no_key() {
     let reply = r#"{"version":2,"summaries":[{"node":"document:config/app.json","summary":"Configuration."}],"concepts":[]}"#;
-    let s = FakeServer::start(vec![(200, "{}".into()), (200, openai_reply(reply))]);
+    let s = FakeServer::start(vec![(200, openai_reply(reply))]);
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join("config")).unwrap();
@@ -504,7 +493,7 @@ fn req024_ac10_openai_node_list_of_json_document_has_no_key() {
 
 /// Construit un dépôt à un fichier, lance `build` contre le faux serveur et rend la requête POST.
 fn openai_build_one_file(rel: &str, text: &str, reply: &str) -> String {
-    let s = FakeServer::start(vec![(200, "{}".into()), (200, openai_reply(reply))]);
+    let s = FakeServer::start(vec![(200, openai_reply(reply))]);
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     let p = repo.join(rel);

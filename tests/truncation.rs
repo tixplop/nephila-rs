@@ -276,7 +276,6 @@ fn req046_ac5_lot_tronque_deux_fichiers_nommes() {
     let s = Setup::new(
         "anthropic",
         vec![
-            anthropic_reply("{}", None),
             trunc("anthropic"),
             anthropic_reply(lot_ok, Some("end_turn")),
         ],
@@ -324,7 +323,6 @@ fn req046_ac5_gros_fichier_morceau_2_tronque() {
     let w = Setup::new(
         "openai",
         vec![
-            openai_reply("{}", None),
             openai_reply(ok, Some("stop")),
             openai_reply(ok, Some("stop")),
             openai_reply(ok, Some("stop")),
@@ -340,7 +338,6 @@ fn req046_ac5_gros_fichier_morceau_2_tronque() {
     let s = Setup::new(
         "openai",
         vec![
-            openai_reply("{}", None),
             openai_reply(ok, Some("stop")),
             trunc("openai"),
             openai_reply(ok, Some("stop")),
@@ -436,10 +433,7 @@ impl Setup {
 }
 
 fn ask_setup(provider: &str, secret: bool) -> Setup {
-    let mut responses = vec![match provider {
-        "anthropic" => anthropic_reply("{}", None),
-        _ => openai_reply("{}", None),
-    }];
+    let mut responses = Vec::new();
     responses.extend(vec![trunc_with(provider, secret); 10]);
     let s = Setup::new(provider, responses, "");
     s.write("A.java", "public class Alpha {}\n");
@@ -554,11 +548,7 @@ fn req046_ac8_ac11_trace_depart_et_fin_tronquee() {
 #[test]
 fn req046_ac11_lot_tronque_trace_et_lignes_a5() {
     let mk = || {
-        let s = Setup::new(
-            "anthropic",
-            vec![anthropic_reply("{}", None), trunc("anthropic")],
-            "batch_files = 2\n",
-        );
+        let s = Setup::new("anthropic", vec![trunc("anthropic")], "batch_files = 2\n");
         for n in ["A", "B"] {
             s.write(&format!("{n}.java"), &format!("public class {n} {{}}\n"));
         }
@@ -588,7 +578,7 @@ fn req046_ac12_gros_fichier_traces_par_morceau() {
     let cfg = format!("max_chunk_chars = {}\n", text.len() / 3 + 40);
     let ok = r#"{"version": 2, "summaries": [], "concepts": []}"#;
     let reply = |k: usize| -> Vec<String> {
-        let mut v = vec![openai_reply("{}", None)];
+        let mut v = Vec::new();
         for i in 1..=3 {
             v.push(if i == k {
                 trunc("openai")

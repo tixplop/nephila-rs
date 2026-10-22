@@ -42,12 +42,7 @@ fn reply(provider: &str, body: &str) -> (u16, String) {
 
 /// Réponses pour une commande `build` puis une commande `query ask`.
 fn script(provider: &str) -> Vec<(u16, String)> {
-    vec![
-        (200, r#"{"data":[]}"#.into()),
-        reply(provider, EXTRACTION),
-        (200, r#"{"data":[]}"#.into()),
-        reply(provider, ASK),
-    ]
+    vec![reply(provider, EXTRACTION), reply(provider, ASK)]
 }
 
 struct Env {
@@ -134,15 +129,43 @@ fn assert_cert_failure(o: &Output) {
     );
 }
 
+/// Refus de certificat par `build` (AC-036-1 modifié) : au premier appel, après
+/// la phase structure ; le fichier de l'appel refusé est nommé par un
+/// avertissement ; bilan sur stdout ; aucune requête HTTP reçue.
+fn assert_build_cert_refused(env: &Env, o: &Output) {
+    assert_cert_failure(o);
+    assert!(env.db().exists());
+    let w = warnings(o);
+    assert!(
+        w.iter().any(|l| l.contains("certificat")
+            && l.contains("tls_ca_cert")
+            && l.contains("tls_insecure")),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(
+        text(&o.stdout).starts_with("build terminé"),
+        "{}",
+        text(&o.stdout)
+    );
+    // La structure est construite : le nœud du fichier est trouvé.
+    let s = env.run(&["query", "search", "Alpha"]);
+    assert!(text(&s.stdout).contains("Alpha"), "{}", text(&s.stdout));
+    // Le fichier du dépôt reste à enrichir.
+    let st = env.run(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
+    assert_eq!(v["to_enrich"], 1, "{v}");
+}
+
 #[test]
-fn req036_ac1_build_refused_before_anything() {
+fn req036_ac1_build_refused_at_first_call() {
     for provider in ["openai", "anthropic"] {
         let env = Env::new();
         let s = server("server-ip.pem", script(provider));
         env.config(provider, &s.base_url, "");
         let o = env.run(&["build"]);
-        assert_cert_failure(&o);
-        assert!(!env.db().exists());
+        // Plus de vérification préalable (REQ-054) : la structure est construite.
+        assert_build_cert_refused(&env, &o);
         assert!(s.requests().is_empty());
     }
 }
@@ -173,7 +196,7 @@ fn full_cycle(provider: &str, extra: &str, cert: &str) -> (Output, Output) {
     } else {
         "/v1/messages"
     };
-    assert_eq!(paths, ["/v1/models", chat, "/v1/models", chat], "{paths:?}");
+    assert_eq!(paths, [chat, chat], "{paths:?}");
     (b, a)
 }
 
@@ -207,7 +230,7 @@ fn req036_ac3_path_forms() {
         env.config("openai", &s.base_url, &format!("tls_ca_cert = \"{f}\"\n"));
         let b = env.run(&["build"]);
         assert!(b.status.success(), "{f}: {}", text(&b.stderr));
-        assert_eq!(s.requests().len(), 2, "{f}");
+        assert_eq!(s.requests().len(), 1, "{f}");
     }
 }
 
@@ -217,13 +240,15 @@ fn req036_ac4_wrong_authority_and_wrong_name() {
     fs::write(env.path("conf/other.pem"), fixture("other-ca.pem")).unwrap();
     let s = server("server-ip.pem", script("openai"));
     env.config("openai", &s.base_url, "tls_ca_cert = \"other.pem\"\n");
-    assert_cert_failure(&env.run(&["build"]));
-    assert!(!env.db().exists() && s.requests().is_empty());
+    let o = env.run(&["build"]);
+    assert_build_cert_refused(&env, &o);
+    assert!(s.requests().is_empty());
 
     let s = server("server-name.pem", script("openai"));
     env.config("openai", &s.base_url, "tls_ca_cert = \"certs/ca.pem\"\n");
-    assert_cert_failure(&env.run(&["build"]));
-    assert!(!env.db().exists() && s.requests().is_empty());
+    let o = env.run(&["build"]);
+    assert_build_cert_refused(&env, &o);
+    assert!(s.requests().is_empty());
 }
 
 #[test]
@@ -312,8 +337,13 @@ fn req036_ac6_no_warning_when_false_or_absent() {
         let s = server("server-ip.pem", script("openai"));
         env.config("openai", &s.base_url, extra);
         let o = env.run(&["build"]);
-        assert_cert_failure(&o);
-        assert!(warnings(&o).is_empty(), "{extra}");
+        assert_build_cert_refused(&env, &o);
+        assert!(
+            !warnings(&o)
+                .iter()
+                .any(|w| w.contains("contrôle des certificats du serveur désactivé")),
+            "{extra}"
+        );
     }
 }
 

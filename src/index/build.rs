@@ -31,6 +31,8 @@ pub struct BuildReport {
     pub llm_active: bool,
     /// Cause de l'arrêt de l'envoi de nouveaux fichiers (clé refusée, panne réseau répétée).
     pub stop_cause: Option<String>,
+    /// Message de la première clé refusée, quand elle a arrêté l'envoi (REQ-054).
+    pub key_refused: Option<String>,
     /// Fichiers exclus par les filtres (REQ-037) ; `None` sans filtre actif.
     pub excluded: Option<usize>,
 }
@@ -76,7 +78,7 @@ pub(crate) struct Setup {
 }
 
 /// Prépare une commande d'indexation : avec `--no-llm` la configuration n'est pas lue ; sans
-/// fichier de configuration le LLM est inactif ; sinon validation et vérification de la clé.
+/// fichier de configuration le LLM est inactif ; sinon validation (la clé n'est constatée qu'au premier appel, REQ-054).
 pub(crate) fn setup(
     no_llm: bool,
     project: &ProjectSettings,
@@ -122,18 +124,6 @@ pub(crate) fn setup(
                 tls_trace
             );
             let llm = build_llm(&config)?;
-            let started = Instant::now();
-            let verified = llm.verify_key();
-            let ms = started.elapsed().as_millis();
-            match &verified {
-                Ok(()) => trace!("verify_key: ok {ms} ms"),
-                Err(e) => trace!(
-                    "verify_key: {} {ms} ms : {}",
-                    trace::classify(e),
-                    trace::short(&e.to_string(), trace::MAX_MESSAGE_CHARS)
-                ),
-            }
-            verified?;
             Ok(Setup {
                 opts: IndexOptions::from(&config),
                 llm: Some(llm),
@@ -205,10 +195,13 @@ pub(crate) fn warn_transient(cli_filters: &Filters) {
     }
 }
 
-/// Affiche le bilan ; un fichier resté en attente, un fichier à enrichir (LLM actif) ou un arrêt
+/// Affiche le bilan ; une clé refusée est rendue telle quelle (REQ-054) ; un fichier resté en attente, un fichier à enrichir (LLM actif) ou un arrêt
 /// de l'envoi rend une erreur (code non nul).
 pub(crate) fn finish(report: &BuildReport, verb: &str) -> Result<()> {
     println!("{}", report.line_for(verb));
+    if let Some(message) = &report.key_refused {
+        return Err(Error::InvalidKey(message.clone()));
+    }
     let mut problems = Vec::new();
     if let Some(cause) = &report.stop_cause {
         problems.push(format!("envoi interrompu : {cause}"));

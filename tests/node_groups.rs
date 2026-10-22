@@ -236,7 +236,7 @@ fn req047_ac3_http_trois_requetes_de_150_nœuds_au_plus() {
         assert_eq!(ids.len(), 401);
         let groups = groups_of(&ids);
         assert_eq!(groups.len(), 3);
-        let mut responses = vec![(200, "{}".to_string())];
+        let mut responses = Vec::new();
         for (g, group) in groups.iter().enumerate() {
             let s = format!("Résumé du groupe numéro {g}");
             responses.push(reply(provider, &summary_json(&[(&group[0], &s)])));
@@ -378,7 +378,7 @@ fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
     assert!(out.contains("0 fichiers à enrichir"), "{out}");
 
     // Même dépôt vers le faux serveur : contenus et listes de chaque requête.
-    let mut responses = vec![(200, "{}".to_string())];
+    let mut responses = Vec::new();
     responses.extend((0..2).map(|_| reply("openai", &summary_json(&[]))));
     let env = Env::http(
         "openai",
@@ -453,7 +453,6 @@ fn req047_ac6_lots_de_150_nœuds_au_plus() {
         reply("openai", &v.to_string())
     };
     let server = FakeServer::start(vec![
-        (200, "{}".to_string()),
         lot("src/F0.java", "src/F1.java"),
         lot("src/F2.java", "src/F3.java"),
     ]);
@@ -688,7 +687,7 @@ fn req047_ac15_sections_markdown_au_morceau_de_leur_titre() {
     assert!(parts[2].contains("```\n# Installation rapide"));
 
     let extra = "max_chunk_chars = 3000\n";
-    let mut responses = vec![(200, "{}".to_string())];
+    let mut responses = Vec::new();
     let answers = [
         (
             "document:docs/guide.md",

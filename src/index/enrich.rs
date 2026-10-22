@@ -27,6 +27,8 @@ struct Policy {
     consecutive_network: usize,
     network_total: usize,
     stop_cause: Option<String>,
+    /// Première clé refusée reçue, si elle est la cause de l'arrêt (REQ-054).
+    key_refused: Option<String>,
 }
 
 /// Total des erreurs réseau constatées au départ d'un appel (DEC-022).
@@ -47,7 +49,10 @@ impl Policy {
                     .consecutive_network
                     .min(self.network_total.saturating_sub(ticket));
             }
-            Some(Error::InvalidKey(_)) => {
+            Some(Error::InvalidKey(message)) => {
+                if self.stop_cause.is_none() {
+                    self.key_refused = Some(message.clone());
+                }
                 self.stop_cause
                     .get_or_insert_with(|| "clé d'API refusée par le fournisseur".to_string());
             }
@@ -728,7 +733,10 @@ pub(crate) fn enrich_with_stop(
             for outcome in batch {
                 match outcome {
                     Outcome::Failed(path, e) => {
-                        warn(&format!("{path} : {e}"));
+                        // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
+                        if !matches!(e, Error::InvalidKey(_)) {
+                            warn(&format!("{path} : {e}"));
+                        }
                         report.failed += 1;
                         failures.push((path, e));
                     }
@@ -769,10 +777,9 @@ pub(crate) fn enrich_with_stop(
         started.elapsed().as_millis(),
         report.failed - failed_before
     );
-    report.stop_cause = policy
-        .into_inner()
-        .unwrap_or_else(|p| p.into_inner())
-        .stop_cause;
+    let policy = policy.into_inner().unwrap_or_else(|p| p.into_inner());
+    report.stop_cause = policy.stop_cause;
+    report.key_refused = policy.key_refused;
     match write_error {
         Some(e) => Err(e),
         None => Ok(failures),
@@ -1153,9 +1160,6 @@ mod tests {
     /// Faux `Llm` qui compte ses appels d'extraction.
     struct Counting(std::sync::atomic::AtomicUsize);
     impl Llm for Counting {
-        fn verify_key(&self) -> Result<()> {
-            Ok(())
-        }
         fn enrich(
             &self,
             _: &str,
@@ -1290,9 +1294,6 @@ mod tests {
             calls_a: AtomicUsize,
         }
         impl Llm for Fake<'_> {
-            fn verify_key(&self) -> Result<()> {
-                Ok(())
-            }
             fn enrich(
                 &self,
                 path: &str,
@@ -1376,9 +1377,6 @@ mod tests {
     fn req043_ac5_batch_advances_as_one_block() {
         struct Lots;
         impl Llm for Lots {
-            fn verify_key(&self) -> Result<()> {
-                Ok(())
-            }
             fn enrich(
                 &self,
                 _: &str,

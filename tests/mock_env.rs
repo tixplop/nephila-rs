@@ -19,17 +19,26 @@ fn req003_build_llm_mock_reads_process_env() {
     std::env::set_var("NEPHILA_MOCK_LOG", &log);
     std::env::set_var("NEPHILA_MOCK_INVALID_KEY", "1");
     let llm = build_llm(&cfg).unwrap();
+    // Clé refusée : tout appel, après journalisation (REQ-054).
+    assert!(matches!(
+        llm.enrich("A.java", 1, "", &ids, &ids),
+        Err(nephila::error::Error::InvalidKey(_))
+    ));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "A.java\t1\n");
+    assert!(matches!(
+        llm.ask("q", "c"),
+        Err(nephila::error::Error::InvalidKey(_))
+    ));
+    std::env::set_var("NEPHILA_MOCK_INVALID_KEY", "0");
     assert_eq!(
-        llm.enrich("A.java", 1, "", &ids, &ids)
+        build_llm(&cfg)
+            .unwrap()
+            .enrich("A.java", 1, "", &ids, &ids)
             .unwrap()
             .summaries
             .len(),
         1
     );
-    assert_eq!(std::fs::read_to_string(&log).unwrap(), "A.java\t1\n");
-    assert!(llm.verify_key().is_err());
-    std::env::set_var("NEPHILA_MOCK_INVALID_KEY", "0");
-    assert!(build_llm(&cfg).unwrap().verify_key().is_ok());
     std::env::set_var("NEPHILA_MOCK_TIMEOUT_FILES", "A.java, B.java");
     std::env::set_var("NEPHILA_MOCK_KEY_REVOKED_AFTER", "1");
     let llm = build_llm(&cfg).unwrap();

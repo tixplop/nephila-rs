@@ -307,13 +307,10 @@ fn http_env(env: &Env, server: &FakeServer) {
 fn req016_ac4_request_contains_only_graph_data() {
     let env = Env::new();
     let reply = r#"{"found":true,"answer":"billing","nodes":["BillingService"]}"#;
-    let server = FakeServer::start(vec![
-        (200, "{}".into()),
-        (
-            200,
-            serde_json::json!({"content":[{"type":"text","text":reply}]}).to_string(),
-        ),
-    ]);
+    let server = FakeServer::start(vec![(
+        200,
+        serde_json::json!({"content":[{"type":"text","text":reply}]}).to_string(),
+    )]);
     http_env(&env, &server);
     let o = env
         .cmd(&["query", "ask", Q])
@@ -363,13 +360,10 @@ fn req016_ac4_context_is_bounded() {
     let o = env.cmd(&["build"]).output().unwrap();
     assert!(o.status.success(), "{}", text(&o.stderr));
     let reply = r#"{"found":true,"answer":"a","nodes":["BillingService"]}"#;
-    let server = FakeServer::start(vec![
-        (200, "{}".into()),
-        (
-            200,
-            serde_json::json!({"content":[{"type":"text","text":reply}]}).to_string(),
-        ),
-    ]);
+    let server = FakeServer::start(vec![(
+        200,
+        serde_json::json!({"content":[{"type":"text","text":reply}]}).to_string(),
+    )]);
     http_env(&env, &server);
     let o = env
         .cmd(&["query", "ask", Q])

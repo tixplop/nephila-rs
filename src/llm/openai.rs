@@ -69,10 +69,6 @@ impl OpenAiLlm {
 }
 
 impl Llm for OpenAiLlm {
-    fn verify_key(&self) -> Result<()> {
-        http::send("openai", self.request("GET", "/v1/models"), None).map(|_| ())
-    }
-
     fn enrich(
         &self,
         file: &str,

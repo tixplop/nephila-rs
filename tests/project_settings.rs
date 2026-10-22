@@ -508,9 +508,7 @@ fn req042_ac1_modele_du_fichier_de_projet_dans_les_requetes() {
     for provider in ["openai", "anthropic"] {
         for (project, expected) in [("model = \"m-projet\"\n", "m-projet"), ("", "m-perso")] {
             let server = FakeServer::start(vec![
-                (200, "{}".into()),
                 (200, http_reply(provider, ENRICH_A)),
-                (200, "{}".into()),
                 (200, http_reply(provider, ASK_A)),
             ]);
             let e = Env::http(provider, &server.base_url, "");
