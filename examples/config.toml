@@ -17,10 +17,15 @@
 #   - TOML n'admet qu'une valeur par clé : gardez une seule section fournisseur active, les
 #     autres restent en commentaire ;
 #   - la clé d'API n'est jamais écrite ici : `api_key_env` donne le NOM de la variable
-#     d'environnement qui la contient. Avant tout traitement, nephila la vérifie par un appel
-#     qui liste les modèles, sans coût de génération.
+#     d'environnement qui la contient. Elle n'est pas vérifiée à l'avance : une clé refusée est
+#     constatée au premier appel au LLM et arrête l'enrichissement ; la structure du graphe est
+#     déjà construite, et nephila update reprend les fichiers à enrichir.
 #
 # Un dépôt peut remplacer six réglages par son fichier .nephila.toml (model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries) ; les autres clés ne sont lues qu'ici.
+#
+# Enrichissements conservés : un fichier déjà enrichi n'est renvoyé au LLM que si son contenu
+# change ou si le modèle change (ici ou dans .nephila.toml) ; les autres réglages ne
+# réenrichissent rien.
 #
 # Les clés communes à tous les fournisseurs (taille des morceaux, parallélisme, délais, TLS)
 # sont en fin de fichier, dans « Options communes ».
@@ -81,7 +86,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 #   NEPHILA_MOCK_DIR               dossier de fixtures (réponses d'enrichissement et de `query ask`)
 #   NEPHILA_MOCK_LOG               fichier de journal des appels, une ligne par appel
 #   NEPHILA_MOCK_FAIL_AFTER        nombre d'appels réussis avant des erreurs réseau simulées
-#   NEPHILA_MOCK_INVALID_KEY       si non vide et différent de 0, la vérification de clé échoue
+#   NEPHILA_MOCK_INVALID_KEY       si non vide et différent de 0, chaque appel échoue en « clé refusée »
 #   NEPHILA_MOCK_DELAY_MS          délai ajouté à chaque appel, en millisecondes
 #   NEPHILA_MOCK_TIMEOUT_FILES     chemins relatifs, séparés par des virgules, dont l'appel
 #                                  échoue par délai dépassé
@@ -122,8 +127,8 @@ api_key_env = "ANTHROPIC_API_KEY"
 # Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # timeout_secs = 300
 
-# Nombre maximal de fichiers par appel d'enrichissement. Entier > 0. Défaut : 10 ; 1 envoie un
-# fichier par appel. Un lot ne dépasse jamais
+# Nombre maximal de fichiers par appel d'enrichissement. Entier > 0. Défaut : 10 ; 1 = un fichier
+# par appel. Un lot ne dépasse jamais
 # max_chunk_chars et un gros fichier part seul ; concurrency x batch_files fichiers sont en vol
 # au plus. Remplacé, pour une commande, par l'option --batch-files ; un dépôt peut le remplacer
 # par son .nephila.toml.
@@ -131,8 +136,10 @@ api_key_env = "ANTHROPIC_API_KEY"
 # batch_files = 10
 
 # Nouveaux essais d'un appel dont la réponse est non conforme. Entier >= 0. Défaut : 2, soit au
-# plus 3 appels pour une même requête ; 0 = aucun nouvel essai. Les erreurs réseau, les délais
-# dépassés et les clés refusées ne sont jamais retentés. Remplacé, pour une commande, par
+# plus 3 appels pour une même requête ; 0 = aucun nouvel essai. Ces essais ne portent que sur le
+# format de la réponse ; les erreurs réseau et les réponses 429 et 5xx ont leurs propres nouveaux
+# essais (4 au plus, attente progressive), les délais dépassés et les clés refusées ne sont
+# jamais retentés. Remplacé, pour une commande, par
 # l'option --format-retries ; un dépôt peut le remplacer par son .nephila.toml.
 # Priorité : --format-retries > .nephila.toml du dépôt > ce fichier > défaut.
 # format_retries = 2

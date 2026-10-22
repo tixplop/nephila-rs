@@ -64,7 +64,7 @@
 # --- Réglages LLM du dépôt ---
 # Ils remplacent, clé par clé, la configuration personnelle (NEPHILA_CONFIG, sinon ~/.config/nephila/config.toml).
 # Elle seule active le LLM : sans elle, ou avec --no-llm, ces réglages n'ont aucun effet et rien n'est affiché.
-# Changer un réglage, le modèle compris, ne réenrichit aucun fichier : lancer nephila build pour réenrichir.
+# Changer model fait réenrichir les fichiers déjà enrichis, par nephila update comme par nephila build ; les autres réglages ne réenrichissent rien.
 # Valeurs effectives et réglages venus de ce fichier : nephila build --verbose (ligne config).
 # Refusées ici (configuration personnelle seulement) : provider, base_url, api_key_env, tls_ca_cert, tls_insecure.
 # Raison : ce fichier est versionné ; un dépôt cloné ne doit pas pouvoir envoyer votre code ou votre clé d'API à un autre serveur, ni couper le contrôle des certificats.

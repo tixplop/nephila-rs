@@ -802,3 +802,45 @@ fn REQ041_AC10_bloc_d_enrich_code_de_l_exemple_de_config() {
     }
     assert!(!block.join("\n").contains(".nephila.toml du dépôt"));
 }
+
+/// Texte des commentaires mis bout à bout : « # » retiré, lignes jointes par une espace.
+fn comments_joined(text: &str) -> String {
+    let words: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix('#'))
+        .map(str::trim)
+        .collect();
+    words.join(" ")
+}
+
+#[test]
+fn REQ041_AC10_textes_des_exemples_sur_les_enrichissements_conserves() {
+    let project = example("nephila.toml");
+    assert!(project.lines().any(|l| l
+        == concat!(
+            "# Changer model fait réenrichir les fichiers déjà enrichis, par nephila update ",
+            "comme par nephila build ; les autres réglages ne réenrichissent rien."
+        )));
+    let project_flat = comments_joined(&project);
+    for absent in ["ne réenrichit aucun fichier", "enrich_code"] {
+        assert!(!project_flat.contains(absent), "présent : {absent}");
+    }
+    let config = example("config.toml");
+    for wanted in [
+        "#     d'environnement qui la contient. Elle n'est pas vérifiée à l'avance : une clé refusée est",
+        "# Enrichissements conservés : un fichier déjà enrichi n'est renvoyé au LLM que si son contenu",
+        "# batch_files = 10",
+        "# plus 3 appels pour une même requête ; 0 = aucun nouvel essai. Ces essais ne portent que sur le",
+        "# jamais retentés. Remplacé, pour une commande, par",
+    ] {
+        assert!(config.lines().any(|l| l == wanted), "ligne absente : {wanted}");
+    }
+    let config_flat = comments_joined(&config);
+    for absent in [
+        "la vérifie par un appel",
+        "la vérification de clé",
+        "Les erreurs réseau, les délais dépassés et les clés refusées ne sont jamais retentés",
+    ] {
+        assert!(!config_flat.contains(absent), "présent : {absent}");
+    }
+}
