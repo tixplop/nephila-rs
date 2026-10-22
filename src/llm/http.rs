@@ -89,9 +89,13 @@ fn client_config(tls: &Tls) -> Arc<rustls::ClientConfig> {
     Arc::new(config)
 }
 
-/// Agent HTTP ; `timeout_secs` borne la durée totale d'une requête.
-pub fn agent(timeout_secs: u64, tls: &Tls) -> ureq::Agent {
+/// Agent HTTP ; `timeout_secs` borne la durée totale d'une requête. Il garde au moins
+/// `concurrency` connexions inactives par hôte (et au moins 100 au total), pour que chaque fil
+/// d'une commande réutilise une connexion établie (REQ-053).
+pub fn agent(timeout_secs: u64, concurrency: usize, tls: &Tls) -> ureq::Agent {
     ureq::AgentBuilder::new()
+        .max_idle_connections_per_host(concurrency.max(1))
+        .max_idle_connections(concurrency.max(100))
         .tls_config(client_config(tls))
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(timeout_secs))
@@ -178,6 +182,9 @@ fn jitter() -> f64 {
     (h.finish() >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// Cause d'un nouvel essai après une erreur de transport, dans la trace d'attente.
+const NETWORK_CAUSE: &str = "erreur réseau";
+
 /// Statuts HTTP retentés (REQ-052).
 fn is_retryable_status(code: u16) -> bool {
     matches!(code, 429 | 500 | 502 | 503 | 504 | 529)
@@ -199,29 +206,45 @@ enum Attempt {
     Retry {
         error: Error,
         retry_after: Option<String>,
+        /// Cause dite dans la trace d'attente : `HTTP <code>` ou `erreur réseau`.
+        cause: String,
     },
 }
 
 /// Exécute la requête, avec jusqu'à 4 nouveaux essais à l'identique (statuts 429, 500, 502, 503,
 /// 504, 529 et erreurs réseau transitoires, attente progressive) ; 401/403 -> `InvalidKey`,
-/// autres échecs -> `Network`. Retourne le corps de la réponse.
+/// autres échecs -> `Network`. Retourne le corps de la réponse. `label` nomme l'appel dans la
+/// trace d'attente (`<chemin> [i/n]`) ; `None` (`query ask`) : aucune ligne d'attente.
 pub fn send(
     provider: &str,
     req: ureq::Request,
     body: Option<&serde_json::Value>,
     retry: &Retry,
+    label: Option<&str>,
 ) -> Result<String> {
     let mut k = 0;
     loop {
         match attempt(provider, req.clone(), body) {
             Attempt::Done(r) => return r,
-            Attempt::Retry { error, retry_after } => {
+            Attempt::Retry {
+                error,
+                retry_after,
+                cause,
+            } => {
                 k += 1;
                 if k > MAX_RETRIES {
                     return Err(error);
                 }
                 match retry_delay(k, retry.base, retry_after.as_deref(), jitter()) {
-                    Some(d) => std::thread::sleep(d),
+                    Some(d) => {
+                        if let Some(label) = label {
+                            crate::trace!(
+                                "llm enrich attente {label} {} ms après {cause} (nouvel essai {k}/{MAX_RETRIES})",
+                                d.as_millis()
+                            );
+                        }
+                        std::thread::sleep(d)
+                    }
                     None => return Err(error),
                 }
             }
@@ -259,6 +282,7 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
                         Attempt::Retry {
                             error,
                             retry_after: None,
+                            cause: NETWORK_CAUSE.into(),
                         }
                     } else {
                         Attempt::Done(Err(error))
@@ -275,6 +299,7 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
                 Attempt::Retry {
                     error,
                     retry_after: resp.header("retry-after").map(String::from),
+                    cause: format!("HTTP {code}"),
                 }
             } else {
                 Attempt::Done(Err(error))
@@ -294,6 +319,7 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
                     Attempt::Retry {
                         error,
                         retry_after: None,
+                        cause: NETWORK_CAUSE.into(),
                     }
                 } else {
                     Attempt::Done(Err(error))
@@ -516,6 +542,162 @@ mod tests {
         }
         for c in [200, 400, 401, 403, 404, 413, 501] {
             assert!(!is_retryable_status(c));
+        }
+    }
+
+    /// Serveur keep-alive local : compte les connexions acceptées ; les 4 premières requêtes
+    /// ne reçoivent leur réponse que toutes ensemble (4 connexions simultanées nécessaires).
+    mod pool {
+        use super::*;
+        use rustls::pki_types::pem::PemObject;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Barrier, Condvar, Mutex};
+
+        const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/");
+        const THREADS: usize = 4;
+
+        fn serve<S: Read + Write>(mut stream: S, arrived: &(Mutex<usize>, Condvar)) {
+            loop {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_lowercase();
+                let len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() {
+                    return;
+                }
+                {
+                    let (count, cv) = arrived;
+                    let mut n = count.lock().unwrap();
+                    *n += 1;
+                    cv.notify_all();
+                    while *n < THREADS {
+                        n = cv.wait(n).unwrap();
+                    }
+                }
+                let reply = "{}";
+                let out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                    reply.len()
+                );
+                if stream.write_all(out.as_bytes()).is_err() || stream.flush().is_err() {
+                    return;
+                }
+            }
+        }
+
+        fn server(tls: bool) -> (String, Arc<AtomicUsize>) {
+            use rustls::pki_types::PrivateKeyDer;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let conns = Arc::new(AtomicUsize::new(0));
+            let cfg = tls.then(|| {
+                let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(
+                    &std::fs::read(format!("{FIXTURES}server-ip.pem")).unwrap(),
+                )
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+                let key = PrivateKeyDer::from_pem_slice(
+                    &std::fs::read(format!("{FIXTURES}server-ip.key")).unwrap(),
+                )
+                .unwrap();
+                Arc::new(
+                    rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                        .with_safe_default_protocol_versions()
+                        .unwrap()
+                        .with_no_client_auth()
+                        .with_single_cert(certs, key)
+                        .unwrap(),
+                )
+            });
+            let counted = conns.clone();
+            let arrived = Arc::new((Mutex::new(0usize), Condvar::new()));
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let (cfg, counted, arrived) = (cfg.clone(), counted.clone(), arrived.clone());
+                    std::thread::spawn(move || match cfg {
+                        None => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            serve(stream, &arrived)
+                        }
+                        Some(cfg) => {
+                            let Ok(conn) = rustls::ServerConnection::new(cfg) else {
+                                return;
+                            };
+                            let mut s: rustls::StreamOwned<_, TcpStream> =
+                                rustls::StreamOwned::new(conn, stream);
+                            while s.conn.is_handshaking() {
+                                if s.conn.complete_io(&mut s.sock).is_err() {
+                                    return;
+                                }
+                            }
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            serve(s, &arrived)
+                        }
+                    });
+                }
+            });
+            let scheme = if tls { "https" } else { "http" };
+            (format!("{scheme}://{addr}/x"), conns)
+        }
+
+        /// `THREADS` fils : une requête, puis (une fois les réponses toutes lues) une seconde.
+        fn connections_for(tls: bool) -> usize {
+            let (url, conns) = server(tls);
+            let settings = Tls {
+                ca_certs: if tls {
+                    CertificateDer::pem_slice_iter(
+                        &std::fs::read(format!("{FIXTURES}ca.pem")).unwrap(),
+                    )
+                    .collect::<std::result::Result<_, _>>()
+                    .unwrap()
+                } else {
+                    Vec::new()
+                },
+                insecure: false,
+            };
+            let agent = agent(10, THREADS, &settings);
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let retry = Retry::from_millis(0);
+            std::thread::scope(|scope| {
+                for _ in 0..THREADS {
+                    let (agent, url, barrier, retry) = (&agent, &url, &barrier, &retry);
+                    scope.spawn(move || {
+                        let body = serde_json::json!({});
+                        for round in 0..2 {
+                            let req = agent.post(url);
+                            send("test", req, Some(&body), retry, None).unwrap();
+                            if round == 0 {
+                                barrier.wait();
+                            }
+                        }
+                    });
+                }
+            });
+            conns.load(Ordering::SeqCst)
+        }
+
+        #[test]
+        fn req053_ac2_idle_pool_keeps_one_connection_per_thread() {
+            assert_eq!(connections_for(false), THREADS);
+        }
+
+        #[test]
+        fn req053_ac3_idle_pool_keeps_one_tls_connection_per_thread() {
+            assert_eq!(connections_for(true), THREADS);
         }
     }
 }

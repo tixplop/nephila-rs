@@ -140,6 +140,10 @@ fn req052_ac2_other_statuses_are_sent_once() {
         let o = env.run(&["build"], Some("10"));
         assert_ne!(o.status.code(), Some(0), "{status}");
         assert_eq!(posts(&s).len(), 1, "{status}");
+        assert!(
+            !env.search_finds_summary(),
+            "{status} : le fichier doit rester à enrichir"
+        );
         if status != 401 && status != 403 {
             assert!(!warnings(&o).is_empty(), "{status}: {}", text(&o.stderr));
         }
@@ -344,4 +348,265 @@ fn req052_ac12_malformed_base_variable_is_refused_before_any_request() {
         text(&o.stderr)
     );
     assert!(s.requests().is_empty());
+}
+
+// ---- Traces des nouveaux essais (AC-052-10, AC-052-11) ----
+
+const DOC: &str = "docs/d.md";
+
+fn trace_lines(o: &Output) -> Vec<String> {
+    text(&o.stderr)
+        .lines()
+        .filter(|l| l.starts_with("trace:"))
+        .map(String::from)
+        .collect()
+}
+
+fn waits(o: &Output) -> Vec<String> {
+    trace_lines(o)
+        .into_iter()
+        .filter(|l| l.contains("llm enrich attente"))
+        .collect()
+}
+
+/// `(ms, reste)` d'une ligne `attente` : `<label> <ms> ms <reste>`.
+fn wait_parts(line: &str, label: &str) -> (u64, String) {
+    let prefix = format!("llm enrich attente {label} ");
+    let after = &line[line.find(&prefix).unwrap_or_else(|| panic!("{line}")) + prefix.len()..];
+    let (ms, rest) = after.split_once(" ms ").unwrap_or_else(|| panic!("{line}"));
+    (ms.parse().unwrap_or_else(|_| panic!("{line}")), rest.into())
+}
+
+fn position(lines: &[String], needle: &str) -> usize {
+    lines
+        .iter()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("{needle} absent : {lines:#?}"))
+}
+
+fn assert_no_wait_or_retry_words(o: &Output) {
+    for l in text(&o.stderr)
+        .lines()
+        .filter(|l| l.starts_with("avertissement:") || l.starts_with("erreur:"))
+    {
+        assert!(!l.contains("nouvel essai") && !l.contains("envois"), "{l}");
+    }
+}
+
+#[test]
+fn req052_ac10_wait_lines_sit_between_start_and_end_without_content() {
+    let s = FakeServer::start_replies(vec![
+        Reply::status(503, "{}"),
+        Reply::status(503, "{}"),
+        good("openai"),
+    ]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], Some("10"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let lines = trace_lines(&o);
+    let start = position(&lines, &format!("llm enrich départ {DOC} [1/1]"));
+    let w1 = position(&lines, "(nouvel essai 1/4)");
+    let w2 = position(&lines, "(nouvel essai 2/4)");
+    let end = position(&lines, &format!("llm enrich fin {DOC} [1/1] ok"));
+    assert!(start < w1 && w1 < w2 && w2 < end, "{lines:#?}");
+    let w = waits(&o);
+    assert_eq!(w.len(), 2, "{w:#?}");
+    for l in &w {
+        assert!(l.contains("après HTTP 503"), "{l}");
+        for forbidden in ["sk-test", "Texte du document", SUMMARY, "127.0.0.1"] {
+            assert!(!l.contains(forbidden), "{l}");
+        }
+    }
+    assert_no_wait_or_retry_words(&o);
+
+    // Sans --verbose : mêmes sorties qu'un serveur qui répond bien du premier coup.
+    let s1 = FakeServer::start_replies(vec![
+        Reply::status(503, "{}"),
+        Reply::status(503, "{}"),
+        good("openai"),
+    ]);
+    let s2 = FakeServer::start_replies(vec![good("openai")]);
+    let (e1, e2) = (Env::new("openai", &s1), Env::new("openai", &s2));
+    let (o1, o2) = (
+        e1.run(&["build"], Some("10")),
+        e2.run(&["build"], Some("10")),
+    );
+    assert_eq!(text(&o1.stdout), text(&o2.stdout));
+    assert_eq!(text(&o1.stderr), text(&o2.stderr));
+}
+
+#[test]
+fn req052_ac11_wait_line_format_and_ranges() {
+    let s = FakeServer::start_replies(vec![
+        Reply::status(503, "{}"),
+        Reply::status(503, "{}"),
+        good("openai"),
+    ]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], Some("10"));
+    assert_eq!(o.status.code(), Some(0));
+    let w = waits(&o);
+    assert_eq!(w.len(), 2);
+    let label = format!("{DOC} [1/1]");
+    let (ms1, rest1) = wait_parts(&w[0], &label);
+    let (ms2, rest2) = wait_parts(&w[1], &label);
+    assert_eq!(rest1, "après HTTP 503 (nouvel essai 1/4)");
+    assert_eq!(rest2, "après HTTP 503 (nouvel essai 2/4)");
+    assert!((5..=10).contains(&ms1), "{ms1}");
+    assert!((10..=20).contains(&ms2), "{ms2}");
+    let shape = |l: &str| {
+        let t = l.strip_prefix("trace: [").unwrap();
+        let (time, rest) = t.split_once("s] ").unwrap();
+        let (sec, milli) = time.split_once('.').unwrap();
+        rest.starts_with("llm enrich attente ")
+            && !sec.is_empty()
+            && sec.bytes().all(|b| b.is_ascii_digit())
+            && milli.len() == 3
+            && milli.bytes().all(|b| b.is_ascii_digit())
+    };
+    assert!(w.iter().all(|l| shape(l)), "{w:#?}");
+}
+
+#[test]
+fn req052_ac11_lot_label() {
+    let lot = serde_json::json!({"version": 3, "files": [
+        {"file": "docs/d.md", "summaries": [], "concepts": []},
+        {"file": "docs/e.md", "summaries": [], "concepts": []},
+    ]})
+    .to_string();
+    let s = FakeServer::start_replies(vec![
+        Reply::status(503, "{}"),
+        Reply::status(200, &reply_body("openai", &lot)),
+    ]);
+    let env = Env::new("openai", &s);
+    fs::write(env.repo.join("docs/e.md"), "# E\n\nTexte.\n").unwrap();
+    let conf = env._tmp.path().join("config.toml");
+    let c = fs::read_to_string(&conf)
+        .unwrap()
+        .replace("batch_files = 1", "batch_files = 2");
+    fs::write(&conf, c).unwrap();
+    let o = env.run(&["build", "--verbose"], Some("10"));
+    let w = waits(&o);
+    assert_eq!(w.len(), 1, "{}", text(&o.stderr));
+    let (_, rest) = wait_parts(&w[0], "lot docs/d.md +1 [1/1]");
+    assert_eq!(rest, "après HTTP 503 (nouvel essai 1/4)");
+}
+
+#[test]
+fn req052_ac11_network_error_cause() {
+    let s = FakeServer::start_replies(vec![Reply::Close, good("openai")]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], Some("10"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let w = waits(&o);
+    assert_eq!(w.len(), 1, "{w:#?}");
+    let (_, rest) = wait_parts(&w[0], &format!("{DOC} [1/1]"));
+    assert_eq!(rest, "après erreur réseau (nouvel essai 1/4)");
+}
+
+#[test]
+fn req052_ac11_retry_after_is_the_wait() {
+    let s = FakeServer::start_replies(vec![
+        Reply::with_header(429, "{}", "retry-after", "1"),
+        good("openai"),
+    ]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], None);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let w = waits(&o);
+    assert_eq!(w.len(), 1, "{w:#?}");
+    let (ms, rest) = wait_parts(&w[0], &format!("{DOC} [1/1]"));
+    assert_eq!(ms, 1000);
+    assert_eq!(rest, "après HTTP 429 (nouvel essai 1/4)");
+}
+
+#[test]
+fn req052_ac11_no_wait_line_without_a_new_attempt() {
+    let cases = [
+        Reply::with_header(503, "{}", "retry-after", "120"),
+        Reply::status(400, "{}"),
+        Reply::status(401, "{}"),
+    ];
+    for first in cases {
+        let s = FakeServer::start_replies(vec![first.clone(), good("openai")]);
+        let env = Env::new("openai", &s);
+        let o = env.run(&["build", "--verbose"], None);
+        assert!(waits(&o).is_empty(), "{first:?}: {}", text(&o.stderr));
+        assert_eq!(posts(&s).len(), 1);
+        assert_no_wait_or_retry_words(&o);
+    }
+}
+
+#[test]
+fn req052_ac11_exhausted_calls_give_four_waits_one_start_one_end() {
+    let s = FakeServer::start_replies((0..8).map(|_| Reply::status(500, "{}")).collect());
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], Some("1"));
+    assert_ne!(o.status.code(), Some(0));
+    let w = waits(&o);
+    assert_eq!(w.len(), 4, "{w:#?}");
+    for (i, l) in w.iter().enumerate() {
+        assert!(l.ends_with(&format!("(nouvel essai {}/4)", i + 1)), "{l}");
+    }
+    let lines = trace_lines(&o);
+    let starts = lines
+        .iter()
+        .filter(|l| l.contains("llm enrich départ"))
+        .count();
+    let ends: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("llm enrich fin"))
+        .collect();
+    assert_eq!(starts, 1);
+    assert_eq!(ends.len(), 1);
+    assert!(ends[0].contains(" réseau "), "{}", ends[0]);
+    assert_no_wait_or_retry_words(&o);
+}
+
+#[test]
+fn req052_ac11_format_retry_restarts_the_wait_count() {
+    let s = FakeServer::start_replies(vec![
+        Reply::status(503, "{}"),
+        Reply::status(200, &reply_body("openai", "désolé, pas de JSON")),
+        Reply::status(503, "{}"),
+        good("openai"),
+    ]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], Some("10"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let lines = trace_lines(&o);
+    let second = lines
+        .iter()
+        .position(|l| l.contains("llm enrich départ") && l.contains("(essai 2/"))
+        .unwrap_or_else(|| panic!("{lines:#?}"));
+    let wait_after = lines[second..]
+        .iter()
+        .find(|l| l.contains("llm enrich attente"))
+        .unwrap();
+    assert!(wait_after.ends_with("(nouvel essai 1/4)"), "{wait_after}");
+    assert_eq!(waits(&o).len(), 2);
+}
+
+// ---- Une seule tentative (AC-052-6, intégration) ----
+
+#[test]
+fn req052_ac6_timeout_is_sent_once() {
+    let s = FakeServer::start_replies(vec![
+        Reply::Http {
+            status: 200,
+            body: reply_body("openai", &good_enrichment()),
+            headers: vec![],
+            delay_ms: 2500,
+        },
+        good("openai"),
+    ]);
+    let env = Env::new("openai", &s);
+    let conf = env._tmp.path().join("config.toml");
+    let c = fs::read_to_string(&conf).unwrap() + "timeout_secs = 1\n";
+    fs::write(&conf, c).unwrap();
+    let o = env.run(&["build", "--verbose"], Some("10"));
+    assert_ne!(o.status.code(), Some(0));
+    assert_eq!(posts(&s).len(), 1, "{}", text(&o.stderr));
+    assert!(waits(&o).is_empty());
+    assert!(text(&o.stderr).contains("délai dépassé"));
 }

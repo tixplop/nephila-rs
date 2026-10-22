@@ -31,9 +31,32 @@ pub trait Llm: Send + Sync {
         requested: &[String],
         known: &[String],
     ) -> Result<Enrichment>;
+    /// Comme `enrich`, en nommant l'appel pour les traces d'attente des nouveaux essais HTTP
+    /// (`<chemin> [i/n]`). Par défaut, le libellé est ignoré.
+    fn enrich_labeled(
+        &self,
+        label: &str,
+        file: &str,
+        call: usize,
+        text: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> Result<Enrichment> {
+        let _ = label;
+        self.enrich(file, call, text, requested, known)
+    }
     /// Enrichit un lot de 2 fichiers ou plus en un seul appel (schéma version 3, DEC-033).
     /// `Err` = échec de l'appel entier ; sinon un résultat par fichier du lot, dans l'ordre.
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>>;
+    /// Comme `enrich_lot`, en nommant l'appel (`lot <chemin> +<n-1> [1/1]`).
+    fn enrich_lot_labeled(
+        &self,
+        label: &str,
+        items: &[LotItem],
+    ) -> Result<Vec<(String, Result<Enrichment>)>> {
+        let _ = label;
+        self.enrich_lot(items)
+    }
     /// Répond à une question à partir d'un contexte de graphe.
     fn ask(&self, question: &str, context: &str) -> Result<AskReply>;
 }
@@ -60,8 +83,29 @@ impl Llm for WithModel {
         self.inner.enrich(file, call, text, requested, known)
     }
 
+    fn enrich_labeled(
+        &self,
+        label: &str,
+        file: &str,
+        call: usize,
+        text: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> Result<Enrichment> {
+        self.inner
+            .enrich_labeled(label, file, call, text, requested, known)
+    }
+
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
         self.inner.enrich_lot(items)
+    }
+
+    fn enrich_lot_labeled(
+        &self,
+        label: &str,
+        items: &[LotItem],
+    ) -> Result<Vec<(String, Result<Enrichment>)>> {
+        self.inner.enrich_lot_labeled(label, items)
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
@@ -108,6 +152,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     key,
                     config.timeout_secs,
                     &tls,
+                    config.concurrency,
                 )
                 .with_retry(retry),
             ))
@@ -121,6 +166,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     config.api_key()?,
                     config.timeout_secs,
                     &tls,
+                    config.concurrency,
                 )
                 .with_retry(retry),
             ))

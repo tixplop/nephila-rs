@@ -26,12 +26,13 @@ impl OpenAiLlm {
         key: Option<String>,
         timeout_secs: u64,
         tls: &Tls,
+        concurrency: usize,
     ) -> OpenAiLlm {
         OpenAiLlm {
             base_url,
             model,
             key,
-            agent: http::agent(timeout_secs, tls),
+            agent: http::agent(timeout_secs, concurrency, tls),
             retry: http::Retry::default(),
         }
     }
@@ -52,7 +53,7 @@ impl OpenAiLlm {
         }
     }
 
-    fn complete(&self, system: String, user: String) -> Result<String> {
+    fn complete(&self, label: Option<&str>, system: String, user: String) -> Result<String> {
         let body = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -65,6 +66,7 @@ impl OpenAiLlm {
             self.request("POST", "/v1/chat/completions"),
             Some(&body),
             &self.retry,
+            label,
         )?;
         let v = http::parse_body("openai", &raw)?;
         if v["choices"][0]["finish_reason"] == "length" {
@@ -86,20 +88,67 @@ impl Llm for OpenAiLlm {
         requested: &[String],
         known: &[String],
     ) -> Result<Enrichment> {
+        self.enrich_with(None, file, call, text, requested, known)
+    }
+
+    fn enrich_labeled(
+        &self,
+        label: &str,
+        file: &str,
+        call: usize,
+        text: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> Result<Enrichment> {
+        self.enrich_with(Some(label), file, call, text, requested, known)
+    }
+
+    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+        self.enrich_lot_with(None, items)
+    }
+
+    fn enrich_lot_labeled(
+        &self,
+        label: &str,
+        items: &[LotItem],
+    ) -> Result<Vec<(String, Result<Enrichment>)>> {
+        self.enrich_lot_with(Some(label), items)
+    }
+
+    fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
         let out = self.complete(
+            None,
+            ask_system_prompt(),
+            ask_user_prompt(question, context),
+        )?;
+        AskReply::parse(http::extract_json(&out)?)
+    }
+}
+
+impl OpenAiLlm {
+    fn enrich_with(
+        &self,
+        label: Option<&str>,
+        file: &str,
+        call: usize,
+        text: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> Result<Enrichment> {
+        let out = self.complete(
+            label,
             enrichment_system_prompt(),
             enrichment_user_prompt(file, call, text, requested),
         )?;
         Enrichment::parse(http::extract_json(&out)?, file, known)
     }
 
-    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
-        let out = self.complete(lot_system_prompt(), lot_user_prompt(items))?;
+    fn enrich_lot_with(
+        &self,
+        label: Option<&str>,
+        items: &[LotItem],
+    ) -> Result<Vec<(String, Result<Enrichment>)>> {
+        let out = self.complete(label, lot_system_prompt(), lot_user_prompt(items))?;
         Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
-    }
-
-    fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
-        let out = self.complete(ask_system_prompt(), ask_user_prompt(question, context))?;
-        AskReply::parse(http::extract_json(&out)?)
     }
 }

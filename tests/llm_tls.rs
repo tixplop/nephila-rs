@@ -52,11 +52,11 @@ fn anthropic_reply(text: &str) -> String {
 }
 
 fn openai(url: &str, tls: &Tls) -> OpenAiLlm {
-    OpenAiLlm::new(Some(url.into()), "m".into(), Some("k".into()), 30, tls)
+    OpenAiLlm::new(Some(url.into()), "m".into(), Some("k".into()), 30, tls, 1)
 }
 
 fn anthropic(url: &str, tls: &Tls) -> AnthropicLlm {
-    AnthropicLlm::new(Some(url.into()), "m".into(), "k".into(), 30, tls)
+    AnthropicLlm::new(Some(url.into()), "m".into(), "k".into(), 30, tls, 1)
 }
 
 fn ids() -> Vec<String> {

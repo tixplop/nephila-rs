@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -62,6 +63,23 @@ pub struct Recorded {
 pub struct FakeServer {
     pub base_url: String,
     requests: Arc<Mutex<Vec<Recorded>>>,
+    connections: Arc<AtomicUsize>,
+    handshakes: Arc<AtomicUsize>,
+}
+
+/// Mode keep-alive : plusieurs requêtes par connexion, connexions servies en parallèle, même
+/// réponse 200 à chaque requête.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct KeepAlive {
+    /// Corps de chaque réponse 200.
+    pub body: String,
+    /// Délai avant chaque réponse.
+    pub delay_ms: u64,
+    /// Requêtes servies par connexion avant que le serveur ne la ferme (None : jamais).
+    pub max_per_connection: Option<usize>,
+    /// Certificat et clé PEM : HTTPS.
+    pub tls: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl FakeServer {
@@ -86,24 +104,58 @@ impl FakeServer {
     /// donnés. Une poignée de main refusée n'enregistre aucune requête ; le serveur continue.
     #[allow(dead_code)]
     pub fn start_tls(responses: Vec<(u16, String)>, cert_pem: &[u8], key_pem: &[u8]) -> FakeServer {
-        use rustls::pki_types::pem::PemObject;
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let key = PrivateKeyDer::from_pem_slice(key_pem).unwrap();
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .unwrap();
+        let config = tls_config(cert_pem, key_pem);
         FakeServer::spawn(
             into_replies(responses.into_iter().map(|(s, b)| (s, b, 0)).collect()),
-            Some(Arc::new(config)),
+            Some(config),
         )
+    }
+
+    /// Serveur keep-alive (voir `KeepAlive`).
+    #[allow(dead_code)]
+    pub fn start_keep_alive(opts: KeepAlive) -> FakeServer {
+        let tls = opts.tls.as_ref().map(|(c, k)| tls_config(c, k));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let base_url = format!("{scheme}://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let (rec, conns, hs) = (requests.clone(), connections.clone(), handshakes.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                conns.fetch_add(1, Ordering::SeqCst);
+                let (rec, hs, opts, tls) = (rec.clone(), hs.clone(), opts.clone(), tls.clone());
+                std::thread::spawn(move || match tls {
+                    None => serve_keep_alive(stream, &rec, &opts),
+                    Some(cfg) => {
+                        if let Some(tls_stream) = handshake(stream, &cfg) {
+                            hs.fetch_add(1, Ordering::SeqCst);
+                            serve_keep_alive(tls_stream, &rec, &opts);
+                        }
+                    }
+                });
+            }
+        });
+        FakeServer {
+            base_url,
+            requests,
+            connections,
+            handshakes,
+        }
+    }
+
+    /// Connexions TCP acceptées.
+    #[allow(dead_code)]
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    /// Poignées de main TLS menées à bien.
+    #[allow(dead_code)]
+    pub fn handshakes(&self) -> usize {
+        self.handshakes.load(Ordering::SeqCst)
     }
 
     fn spawn(responses: Vec<Reply>, tls: Option<Arc<rustls::ServerConfig>>) -> FakeServer {
@@ -113,31 +165,32 @@ impl FakeServer {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
         let rec = requests.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let (conns, hs) = (connections.clone(), handshakes.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
+                conns.fetch_add(1, Ordering::SeqCst);
                 match &tls {
                     None => serve(stream, &rec, &queue),
                     Some(cfg) => {
-                        let Ok(conn) = rustls::ServerConnection::new(cfg.clone()) else {
+                        // Poignée de main explicite : un refus du client ne laisse aucune trace.
+                        let Some(tls_stream) = handshake(stream, cfg) else {
                             continue;
                         };
-                        let mut tls_stream = rustls::StreamOwned::new(conn, stream);
-                        // Poignée de main explicite : un refus du client ne laisse aucune trace.
-                        while tls_stream.conn.is_handshaking() {
-                            if tls_stream.conn.complete_io(&mut tls_stream.sock).is_err() {
-                                break;
-                            }
-                        }
-                        if tls_stream.conn.is_handshaking() {
-                            continue;
-                        }
+                        hs.fetch_add(1, Ordering::SeqCst);
                         serve(tls_stream, &rec, &queue);
                     }
                 }
             }
         });
-        FakeServer { base_url, requests }
+        FakeServer {
+            base_url,
+            requests,
+            connections,
+            handshakes,
+        }
     }
 
     pub fn requests(&self) -> Vec<Recorded> {
@@ -159,12 +212,46 @@ fn into_replies(responses: Vec<(u16, String, u64)>) -> Vec<Reply> {
         .collect()
 }
 
-/// Lit une requête, l'enregistre, écrit la réponse suivante de la file.
-fn serve<S: Read + Write>(mut stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, queue: &Queue) {
-    let mut reader = BufReader::new(&mut stream);
+fn tls_config(cert_pem: &[u8], key_pem: &[u8]) -> Arc<rustls::ServerConfig> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(key_pem).unwrap();
+    Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap(),
+    )
+}
+
+type TlsStream = rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>;
+
+/// Poignée de main TLS ; `None` si le client la refuse.
+fn handshake(stream: std::net::TcpStream, cfg: &Arc<rustls::ServerConfig>) -> Option<TlsStream> {
+    let conn = rustls::ServerConnection::new(cfg.clone()).ok()?;
+    let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+    while tls_stream.conn.is_handshaking() {
+        if tls_stream.conn.complete_io(&mut tls_stream.sock).is_err() {
+            return None;
+        }
+    }
+    Some(tls_stream)
+}
+
+/// Requête lue : méthode, chemin, en-têtes (minuscules), corps.
+type RawRequest = (String, String, HashMap<String, String>, Vec<u8>);
+
+fn read_request<R: BufRead>(reader: &mut R) -> Option<RawRequest> {
     let mut line = String::new();
     if reader.read_line(&mut line).unwrap_or(0) == 0 {
-        return;
+        return None;
     }
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
@@ -184,22 +271,58 @@ fn serve<S: Read + Write>(mut stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, queue:
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let mut body = vec![0; len];
-    if reader.read_exact(&mut body).is_err() {
-        return;
+    reader.read_exact(&mut body).ok()?;
+    Some((method, path, headers, body))
+}
+
+fn record(rec: &Arc<Mutex<Vec<Recorded>>>, (method, path, headers, body): RawRequest) -> usize {
+    let mut r = rec.lock().unwrap();
+    r.push(Recorded {
+        at: Instant::now(),
+        answered_at: None,
+        method,
+        path,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    });
+    r.len() - 1
+}
+
+/// Sert des requêtes sur une connexion tant que le client l'utilise (mode `KeepAlive`).
+fn serve_keep_alive<S: Read + Write>(stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, opts: &KeepAlive) {
+    let mut reader = BufReader::new(stream);
+    let mut served = 0;
+    while let Some(req) = read_request(&mut reader) {
+        let index = record(rec, req);
+        if opts.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(opts.delay_ms));
+        }
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: keep-alive\r\n\r\n{}",
+            opts.body.len(),
+            opts.body
+        );
+        let out = reader.get_mut();
+        if out.write_all(resp.as_bytes()).is_err() || out.flush().is_err() {
+            return;
+        }
+        rec.lock().unwrap()[index].answered_at = Some(Instant::now());
+        served += 1;
+        if opts.max_per_connection.is_some_and(|m| served >= m) {
+            return; // ferme la connexion : la suivante, côté client, est périmée
+        }
     }
-    drop(reader);
-    let index = {
-        let mut r = rec.lock().unwrap();
-        r.push(Recorded {
-            at: Instant::now(),
-            answered_at: None,
-            method,
-            path,
-            headers,
-            body: String::from_utf8_lossy(&body).into_owned(),
-        });
-        r.len() - 1
+}
+
+/// Lit une requête, l'enregistre, écrit la réponse suivante de la file.
+fn serve<S: Read + Write>(mut stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, queue: &Queue) {
+    let mut reader = BufReader::new(&mut stream);
+    let Some(req) = read_request(&mut reader) else {
+        return;
     };
+    drop(reader);
+    let index = record(rec, req);
     // File vide : 500.
     let reply = queue.lock().unwrap().pop_front().unwrap_or(Reply::Http {
         status: 500,

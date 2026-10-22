@@ -332,7 +332,8 @@ fn traced_enrich(
         attempt.mark()
     );
     let started = Instant::now();
-    let result = llm.enrich(path, index, text, requested, known);
+    let label = format!("{path} [{index}/{total}]");
+    let result = llm.enrich_labeled(&label, path, index, text, requested, known);
     let ms = started.elapsed().as_millis();
     match &result {
         Ok(x) => trace!(
@@ -377,7 +378,7 @@ fn traced_lot_once(
         attempt.mark()
     );
     let started = Instant::now();
-    let result = llm.enrich_lot(items);
+    let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items);
     let ms = started.elapsed().as_millis();
     match &result {
         Ok(results) => {

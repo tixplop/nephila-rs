@@ -37,6 +37,7 @@ fn anthropic(s: &FakeServer) -> AnthropicLlm {
         "sk-test".into(),
         30,
         &Tls::default(),
+        1,
     )
     .with_retry(Retry::from_millis(1))
 }
@@ -48,6 +49,7 @@ fn openai(s: &FakeServer, key: Option<&str>) -> OpenAiLlm {
         key.map(String::from),
         30,
         &Tls::default(),
+        1,
     )
     .with_retry(Retry::from_millis(1))
 }
@@ -94,7 +96,7 @@ fn req002_ac3_connection_refused_is_network() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://{}", l.local_addr().unwrap())
     };
-    let llm = AnthropicLlm::new(Some(url), "m".into(), "k".into(), 30, &Tls::default())
+    let llm = AnthropicLlm::new(Some(url), "m".into(), "k".into(), 30, &Tls::default(), 1)
         .with_retry(Retry::from_millis(1));
     assert!(matches!(
         llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()),
@@ -180,6 +182,7 @@ fn req002_ac5_base_url_trailing_slash_is_tolerated() {
         "k".into(),
         30,
         &Tls::default(),
+        1,
     );
     llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()).unwrap();
     assert_eq!(s.requests()[0].path, "/v1/messages");
@@ -256,6 +259,7 @@ fn req002_ac8_slow_server_gives_timeout_error() {
         "k".into(),
         1,
         &Tls::default(),
+        1,
     );
     let t = std::time::Instant::now();
     let r = llm.enrich("A.java", 1, "class A {}", &a_ids(), &a_ids());
@@ -272,6 +276,7 @@ fn req002_ac8_openai_slow_server_gives_timeout_error() {
         None,
         1,
         &Tls::default(),
+        1,
     );
     let r = llm.enrich("A.java", 1, "x", &a_ids(), &a_ids());
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
@@ -286,6 +291,7 @@ fn req002_ac8_fast_server_succeeds_within_timeout() {
         "k".into(),
         1,
         &Tls::default(),
+        1,
     );
     assert_eq!(
         llm.enrich("A.java", 1, "class A {}", &a_ids(), &a_ids())

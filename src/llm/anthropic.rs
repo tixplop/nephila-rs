@@ -27,12 +27,13 @@ impl AnthropicLlm {
         key: String,
         timeout_secs: u64,
         tls: &Tls,
+        concurrency: usize,
     ) -> AnthropicLlm {
         AnthropicLlm {
             base_url,
             model,
             key,
-            agent: http::agent(timeout_secs, tls),
+            agent: http::agent(timeout_secs, concurrency, tls),
             retry: http::Retry::default(),
         }
     }
@@ -51,7 +52,7 @@ impl AnthropicLlm {
     }
 
     /// Appelle `/v1/messages` et retourne le texte de la réponse.
-    fn complete(&self, system: String, user: String) -> Result<String> {
+    fn complete(&self, label: Option<&str>, system: String, user: String) -> Result<String> {
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": MAX_TOKENS,
@@ -63,6 +64,7 @@ impl AnthropicLlm {
             self.request("POST", "/v1/messages"),
             Some(&body),
             &self.retry,
+            label,
         )?;
         let v = http::parse_body("anthropic", &raw)?;
         if v["stop_reason"] == "max_tokens" {
@@ -86,20 +88,67 @@ impl Llm for AnthropicLlm {
         requested: &[String],
         known: &[String],
     ) -> Result<Enrichment> {
+        self.enrich_with(None, file, call, text, requested, known)
+    }
+
+    fn enrich_labeled(
+        &self,
+        label: &str,
+        file: &str,
+        call: usize,
+        text: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> Result<Enrichment> {
+        self.enrich_with(Some(label), file, call, text, requested, known)
+    }
+
+    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+        self.enrich_lot_with(None, items)
+    }
+
+    fn enrich_lot_labeled(
+        &self,
+        label: &str,
+        items: &[LotItem],
+    ) -> Result<Vec<(String, Result<Enrichment>)>> {
+        self.enrich_lot_with(Some(label), items)
+    }
+
+    fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
         let out = self.complete(
+            None,
+            ask_system_prompt(),
+            ask_user_prompt(question, context),
+        )?;
+        AskReply::parse(http::extract_json(&out)?)
+    }
+}
+
+impl AnthropicLlm {
+    fn enrich_with(
+        &self,
+        label: Option<&str>,
+        file: &str,
+        call: usize,
+        text: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> Result<Enrichment> {
+        let out = self.complete(
+            label,
             enrichment_system_prompt(),
             enrichment_user_prompt(file, call, text, requested),
         )?;
         Enrichment::parse(http::extract_json(&out)?, file, known)
     }
 
-    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
-        let out = self.complete(lot_system_prompt(), lot_user_prompt(items))?;
+    fn enrich_lot_with(
+        &self,
+        label: Option<&str>,
+        items: &[LotItem],
+    ) -> Result<Vec<(String, Result<Enrichment>)>> {
+        let out = self.complete(label, lot_system_prompt(), lot_user_prompt(items))?;
         Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
-    }
-
-    fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
-        let out = self.complete(ask_system_prompt(), ask_user_prompt(question, context))?;
-        AskReply::parse(http::extract_json(&out)?)
     }
 }
