@@ -56,7 +56,7 @@ impl Env {
         let config = tmp.path().join("config.toml");
         fs::write(
             &config,
-            format!("provider = \"mock\"\nmodel = \"mock\"\n{extra}"),
+            format!("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n{extra}"),
         )
         .unwrap();
         Env {

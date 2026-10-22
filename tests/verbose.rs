@@ -50,7 +50,7 @@ impl Env {
     }
 
     fn mock() -> Env {
-        Env::new("provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 4\n")
+        Env::new("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 4\n")
     }
 
     fn cmd(&self, args: &[&str]) -> std::process::Output {
@@ -267,7 +267,8 @@ fn req026_ac4_timeout_file() {
 
 #[test]
 fn req026_ac4_network_policy_trace() {
-    let env = Env::new("provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\n");
+    let env =
+        Env::new("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\n");
     let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_MOCK_FAIL_AFTER", "2")]);
     let lines = trace_lines(&o);
     let pos = |n: &str| {
@@ -290,7 +291,8 @@ fn req026_ac4_network_policy_trace() {
 
 #[test]
 fn req026_ac4_key_revoked() {
-    let env = Env::new("provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\n");
+    let env =
+        Env::new("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\n");
     let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_MOCK_KEY_REVOKED_AFTER", "2")]);
     let lines = trace_lines(&o);
     let r = lines
@@ -306,7 +308,7 @@ fn req026_ac4_key_revoked() {
 
 fn openai_env(server: &FakeServer, timeout: u32, source: &str) -> Env {
     let env = Env::new(&format!(
-        "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T049_KEY\"\n\
+        "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T049_KEY\"\n\
          concurrency = 1\ntimeout_secs = {timeout}\n",
         server.base_url
     ));
@@ -460,7 +462,7 @@ fn req026_ac12_marque_de_source() {
 
     // réglages TLS avant la marque
     let env =
-        Env::new("provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 4\ntls_insecure = true\n");
+        Env::new("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 4\ntls_insecure = true\n");
     env.project("batch_files = 2\nconcurrency = 3\n");
     let o = env.cmd(&["build", "--verbose", "--batch-files", "1"]);
     let line = config_line(&o);

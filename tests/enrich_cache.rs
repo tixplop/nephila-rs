@@ -45,7 +45,7 @@ impl Env {
         let config = tmp.path().join("config.toml");
         fs::write(
             &config,
-            "provider = \"mock\"\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\n",
+            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\n",
         )
         .unwrap();
         let log = tmp.path().join("mock.log");
@@ -342,7 +342,7 @@ fn all_paths(env: &Env) -> BTreeSet<String> {
 fn set_personal_model(env: &Env, model: &str) {
     fs::write(
         &env.config,
-        format!("provider = \"mock\"\nmodel = \"{model}\"\nbatch_files = 1\nconcurrency = 1\n"),
+        format!("provider = \"mock\"\nenrich_code = true\nmodel = \"{model}\"\nbatch_files = 1\nconcurrency = 1\n"),
     )
     .unwrap();
 }

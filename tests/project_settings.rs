@@ -60,7 +60,11 @@ impl Env {
         let mock = tmp.path().join("mock");
         copy_dir(&fx.join("mock"), &mock);
         let config = tmp.path().join("config.toml");
-        fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        fs::write(
+            &config,
+            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+        )
+        .unwrap();
         Env {
             log: tmp.path().join("mock.log"),
             _tmp: tmp,
@@ -124,7 +128,7 @@ fn req042_ac5_ac14_cle_de_connexion_refusee_sans_effet() {
     fs::write(
         &e.config,
         format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\n",
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\n",
             server.base_url
         ),
     )
@@ -396,7 +400,7 @@ fn req042_ac5_query_ask_ne_contacte_pas_le_serveur() {
     fs::write(
         &e.config,
         format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\n",
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\n",
             server.base_url
         ),
     )
@@ -437,7 +441,7 @@ impl Env {
         fs::write(
             &e.config,
             format!(
-                "provider = \"{provider}\"\nmodel = \"m-perso\"\nbase_url = \"{server_url}\"\napi_key_env = \"{KEY_VAR}\"\n{extra}"
+                "provider = \"{provider}\"\nenrich_code = true\nmodel = \"m-perso\"\nbase_url = \"{server_url}\"\napi_key_env = \"{KEY_VAR}\"\n{extra}"
             ),
         )
         .unwrap();
@@ -538,7 +542,7 @@ fn req042_ac1_modele_du_fichier_de_projet_dans_les_requetes() {
 #[test]
 fn req042_ac3_essais_de_format_et_lots_du_fichier_de_projet() {
     let e = Env::new();
-    let personal = "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\nformat_retries = 0\n";
+    let personal = "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\nformat_retries = 0\n";
     e.small(1, personal);
     e.project("format_retries = 3\n");
     let malformed = [("NEPHILA_MOCK_MALFORMED", "src/F00.java:3")];
@@ -585,7 +589,7 @@ fn req042_ac3_essais_de_format_et_lots_du_fichier_de_projet() {
     // lots
     e.small(
         4,
-        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\nbatch_files = 1\n",
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\nbatch_files = 1\n",
     );
     e.project("batch_files = 2\nconcurrency = 1\n");
     assert!(e.run(&["build"]).status.success());
@@ -606,7 +610,7 @@ fn req042_ac4_fils_morceaux_et_delai() {
     let e = Env::new();
     e.small(
         4,
-        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\ntimeout_secs = 300\nmax_chunk_chars = 60000\n",
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\ntimeout_secs = 300\nmax_chunk_chars = 60000\n",
     );
     fs::write(
         e.repo.join("src/F02.java"),
@@ -726,7 +730,7 @@ fn req042_ac7_llm_inactif_reglages_sans_effet() {
 #[test]
 fn req042_ac8_configuration_personnelle_validee_seule() {
     let e = Env::new();
-    fs::write(&e.config, "provider = \"openai\"\n").unwrap();
+    fs::write(&e.config, "provider = \"openai\"\nenrich_code = true\n").unwrap();
     e.project("model = \"x\"\n");
     let o = e.run(&["build"]);
     assert!(!o.status.success());
@@ -754,7 +758,7 @@ fn req042_ac9_changer_de_modele_reenrichit_une_fois_les_autres_reglages_rien() {
     let e = Env::new();
     fs::write(
         &e.config,
-        "provider = \"mock\"\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\n",
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\n",
     )
     .unwrap();
     let o = e.run(&["build"]);
@@ -865,7 +869,7 @@ fn req042_ac18_reglages_au_plafond_acceptes() {
 #[test]
 fn req042_ac19_bornes_personnelles_et_options_inchangees() {
     let e = Env::new();
-    let mut personal = String::from("provider = \"mock\"\nmodel = \"mock\"\n");
+    let mut personal = String::from("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n");
     let mut wants = Vec::new();
     for (key, cap) in nephila::config::PROJECT_CAPS {
         personal.push_str(&format!("{key} = {}\n", cap + 1));
@@ -884,7 +888,7 @@ fn req042_ac19_bornes_personnelles_et_options_inchangees() {
     let e = Env::new();
     fs::write(
         &e.config,
-        "provider = \"mock\"\nmodel = \"mock\"\nformat_retries = 4294967295\n",
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nformat_retries = 4294967295\n",
     )
     .unwrap();
     let o = e.run(&["build", "--verbose"]);

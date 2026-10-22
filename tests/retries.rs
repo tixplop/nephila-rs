@@ -19,7 +19,8 @@ struct Env {
     config: PathBuf,
 }
 
-const MOCK_CONFIG: &str = "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\n";
+const MOCK_CONFIG: &str =
+    "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\n";
 
 impl Env {
     fn new(n: usize, config: &str) -> Env {
@@ -466,7 +467,7 @@ fn server_env(server: &FakeServer, extra: &str) -> Env {
     Env::new(
         1,
         &format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\n{extra}",
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\n{extra}",
             server.base_url
         ),
     )
@@ -542,7 +543,7 @@ fn req038_ac9_anthropic_reply_without_text_block_is_retried() {
     let env = Env::new(
         1,
         &format!(
-            "provider = \"anthropic\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\n",
+            "provider = \"anthropic\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\n",
             server.base_url
         ),
     );
@@ -569,7 +570,7 @@ fn req038_ac6_lot_omitting_a_file_is_sent_once() {
     let env = Env::new(
         3,
         &format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
             server.base_url
         ),
     );
@@ -819,7 +820,7 @@ fn req038_ac11_openai_ask_retried_after_nonconforming_reply() {
     fs::write(
         &env.config,
         format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\n",
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\n",
             server.base_url
         ),
     )

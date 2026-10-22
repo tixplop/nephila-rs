@@ -73,7 +73,7 @@ impl Setup {
         fs::write(
             &config,
             format!(
-                "provider = \"{provider}\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T100_KEY\"\nconcurrency = 1\n{extra}",
+                "provider = \"{provider}\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T100_KEY\"\nconcurrency = 1\n{extra}",
                 server.base_url
             ),
         )

@@ -126,7 +126,11 @@ fn req043_ac2_indexed_repo_unchanged() {
 fn req043_ac2_no_mock_log_on_conflict() {
     let (tmp, repo) = repo_with(2);
     let cfg = tmp.path().join("c.toml");
-    fs::write(&cfg, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    fs::write(
+        &cfg,
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+    )
+    .unwrap();
     let log = tmp.path().join("mock.log");
     let o = Command::cargo_bin("nephila")
         .unwrap()
@@ -252,7 +256,7 @@ impl Mock {
         let cfg = tmp.path().join("config.toml");
         fs::write(
             &cfg,
-            format!("provider = \"mock\"\nmodel = \"mock\"\n{config}"),
+            format!("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n{config}"),
         )
         .unwrap();
         let log = tmp.path().join("mock.log");

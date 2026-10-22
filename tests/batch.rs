@@ -58,7 +58,7 @@ impl Env {
         fs::write(
             &self.config,
             format!(
-                "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = {concurrency}\nbatch_files = {batch}\nmax_chunk_chars = {max_chunk}\n"
+                "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = {concurrency}\nbatch_files = {batch}\nmax_chunk_chars = {max_chunk}\n"
             ),
         )
         .unwrap();
@@ -145,7 +145,7 @@ fn req027_ac2_batch_one_logs_one_line_per_file() {
     let env2 = Env::new(5, 1, 1);
     fs::write(
         &env2.config,
-        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\nmax_chunk_chars = 60000\n",
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\nmax_chunk_chars = 60000\n",
     )
     .unwrap();
     let o2 = env2.run("build", &[]);
@@ -251,7 +251,7 @@ fn graph_and_warnings(batch: usize, concurrency: usize) -> (String, Vec<String>)
     fs::write(
         &cfg,
         format!(
-            "provider=\"mock\"\nmodel=\"mock\"\nconcurrency={concurrency}\nbatch_files={batch}\n"
+            "provider=\"mock\"\nenrich_code = true\nmodel=\"mock\"\nconcurrency={concurrency}\nbatch_files={batch}\n"
         ),
     )
     .unwrap();
@@ -501,7 +501,7 @@ fn server_env(server: &FakeServer, n: usize) -> Env {
     fs::write(
         &env.config,
         format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T053_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T053_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
             server.base_url
         ),
     )
@@ -588,7 +588,7 @@ fn req027_ac8_version_2_reply_for_a_lot_fails_all_its_files() {
 fn config_without_batch(env: &Env) {
     fs::write(
         &env.config,
-        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\n",
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\n",
     )
     .unwrap();
 }

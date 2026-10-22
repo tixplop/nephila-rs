@@ -190,7 +190,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model');",
+             DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
         )
         .map_err(db_err)?;
         tx.commit().map_err(db_err)
@@ -203,7 +203,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model');",
+             DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
         )
         .map_err(db_err)?;
         {
@@ -367,11 +367,14 @@ impl Store {
         tx.commit().map_err(db_err)
     }
 
-    /// Fichiers indexés à enrichir : sans enrichissement conservé pour (chemin, empreinte, modèle
-    /// effectif, `ENRICH_PROMPT_VERSION`). Le modèle effectif est celui de `meta.enrich_model`
-    /// (écrit par `build`/`update` LLM actif) ; absent, le modèle n'est pas comparé.
+    /// Fichiers indexés à enrichir : dans la portée de l'enrichissement (documents, plus les
+    /// fichiers de code si `meta.enrich_code`, REQ-050) et sans enrichissement conservé pour
+    /// (chemin, empreinte, modèle effectif, `ENRICH_PROMPT_VERSION`). Le modèle effectif est celui
+    /// de `meta.enrich_model` (écrit par `build`/`update` LLM actif) ; absent, le modèle n'est
+    /// pas comparé.
     pub fn files_to_enrich(&self) -> Result<Vec<FileRecord>> {
         let model = self.enrich_model()?;
+        let code = self.enrich_code()?;
         let mut st = self
             .conn
             .prepare(&format!(
@@ -383,7 +386,10 @@ impl Store {
             .map_err(db_err)?
             .collect::<std::result::Result<_, _>>()
             .map_err(db_err)?;
-        let set: std::collections::HashSet<String> = paths.into_iter().collect();
+        let set: std::collections::HashSet<String> = paths
+            .into_iter()
+            .filter(|p| code || crate::llm::enrich::is_markdown(p))
+            .collect();
         Ok(self
             .files()?
             .into_iter()
@@ -393,17 +399,33 @@ impl Store {
 
     /// Nombre de fichiers à enrichir.
     pub fn count_files_to_enrich(&self) -> Result<usize> {
-        let model = self.enrich_model()?;
+        Ok(self.files_to_enrich()?.len())
+    }
+
+    /// Portée enregistrée par le dernier `build`/`update` LLM actif (`false` : documents seuls).
+    pub fn enrich_code(&self) -> Result<bool> {
+        match self.conn.query_row(
+            "SELECT value FROM meta WHERE key = 'enrich_code'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(v == "true"),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Enregistre la portée effective d'une commande LLM active.
+    pub fn set_enrich_code(&mut self, code: bool) -> Result<()> {
+        self.ensure_writable()?;
         self.conn
-            .query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM files f WHERE f.state = 'indexed' AND NOT EXISTS ({UP_TO_DATE})"
-                ),
-                params![ENRICH_PROMPT_VERSION, model],
-                |r| r.get::<_, i64>(0),
+            .execute(
+                "INSERT INTO meta(key, value) VALUES ('enrich_code', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [if code { "true" } else { "false" }],
             )
-            .map(|n| n as usize)
-            .map_err(db_err)
+            .map_err(db_err)?;
+        Ok(())
     }
 
     /// Modèle effectif du dernier `build`/`update` LLM actif (`None` : aucun depuis la

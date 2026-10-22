@@ -79,13 +79,15 @@ impl Env {
     }
 
     fn mock(files: &[(&str, String)], extra: &str) -> Env {
-        let cfg = format!("provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\n{extra}");
+        let cfg = format!(
+            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nconcurrency = 1\n{extra}"
+        );
         Env::new(files, &cfg, None)
     }
 
     fn http(provider: &str, files: &[(&str, String)], extra: &str, server: FakeServer) -> Env {
         let cfg = format!(
-            "provider = \"{provider}\"\nmodel = \"m\"\napi_key_env = \"NEPHILA_T103_KEY\"\nconcurrency = 1\n{extra}"
+            "provider = \"{provider}\"\nenrich_code = true\nmodel = \"m\"\napi_key_env = \"NEPHILA_T103_KEY\"\nconcurrency = 1\n{extra}"
         );
         Env::new(files, &cfg, Some(server))
     }

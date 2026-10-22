@@ -274,3 +274,245 @@ fn REQ050_AC11_nephila_toml_erreur_e2_exacte() {
         "erreur: ./.nephila.toml : clé inconnue `enrich_code` (clés permises : exclude, exclude_types, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries)\n"
     );
 }
+
+// --- T-118 : portée de l'enrichissement (AC-050-1 à AC-050-4, AC-050-12) ---
+
+/// Dépôt exemple (`tests/fixtures/maven2`) et fixtures du mock, journal du mock.
+struct Example {
+    env: Env,
+    mock: PathBuf,
+    log: PathBuf,
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &dest);
+        } else {
+            fs::copy(e.path(), dest).unwrap();
+        }
+    }
+}
+
+impl Example {
+    fn new(config: &str) -> Example {
+        let env = Env::new(config);
+        let fx = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        fs::remove_file(env.repo.join("A.java")).unwrap();
+        fs::remove_file(env.repo.join("README.md")).unwrap();
+        copy_dir(&fx.join("maven2"), &env.repo);
+        let mock = env._tmp.path().join("mock");
+        copy_dir(&fx.join("mock"), &mock);
+        let log = env._tmp.path().join("mock.log");
+        Example { env, mock, log }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        let _ = fs::remove_file(&self.log);
+        Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.env.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &self.env.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env("NEPHILA_MOCK_LOG", &self.log)
+            .output()
+            .unwrap()
+    }
+
+    /// Chemins du journal, triés, sans doublon de morceau.
+    fn logged(&self) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .flat_map(|l| l.split('\t').next().unwrap().split(';'))
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+}
+
+fn out(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+const DOCS: [&str; 3] = ["README.md", "docs/archi.md", "docs/guide.md"];
+
+const CODE: [&str; 7] = [
+    "api/pom.xml",
+    "api/src/main/java/com/acme/api/ApiController.java",
+    "core/pom.xml",
+    "core/src/main/java/com/acme/core/Broken.java",
+    "core/src/main/java/com/acme/core/OrderRepository.java",
+    "core/src/main/java/com/acme/core/OrderService.java",
+    "core/src/main/java/com/acme/domain/Order.java",
+];
+
+fn all_files() -> Vec<String> {
+    let mut v: Vec<String> = DOCS
+        .iter()
+        .chain(CODE.iter())
+        .map(|s| s.to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+fn code_files() -> Vec<String> {
+    let mut v: Vec<String> = CODE.iter().map(|s| s.to_string()).collect();
+    v.sort();
+    v
+}
+
+fn to_enrich(ex: &Example) -> u64 {
+    let st = ex.run(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
+    v["to_enrich"].as_u64().unwrap()
+}
+
+#[test]
+fn REQ050_AC1_par_defaut_seuls_les_documents_sont_envoyes() {
+    for config in [
+        "provider = \"mock\"\nbatch_files = 1\n",
+        "provider = \"mock\"\nbatch_files = 1\nenrich_code = false\n",
+    ] {
+        let ex = Example::new(config);
+        let o = ex.run(&["build"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(ex.logged(), DOCS.to_vec());
+        assert!(out(&o).contains("0 fichiers à enrichir"), "{}", out(&o));
+        assert_eq!(to_enrich(&ex), 0);
+        let s = ex.run(&["query", "search", "OrderService"]);
+        assert!(!out(&s).contains("Place les commandes."), "{}", out(&s));
+    }
+}
+
+#[test]
+fn REQ050_AC1_en_lot_les_trois_documents_seuls() {
+    let ex = Example::new("provider = \"mock\"\nbatch_files = 10\n");
+    let o = ex.run(&["build"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(ex.logged(), DOCS.to_vec());
+    assert!(out(&o).contains("0 fichiers à enrichir"), "{}", out(&o));
+}
+
+#[test]
+fn REQ050_AC2_enrich_code_vrai_enrichit_tous_les_fichiers() {
+    let ex = Example::new("provider = \"mock\"\nbatch_files = 1\nenrich_code = true\n");
+    let o = ex.run(&["build"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let logged = ex.logged();
+    assert_eq!(logged, all_files());
+    // Avec la clé à faux, on retombe sur la portée par défaut.
+    let ex = Example::new("provider = \"mock\"\nbatch_files = 1\n");
+    ex.env
+        .write_config("provider = \"mock\"\nbatch_files = 1\nenrich_code = false\n");
+    let o = ex.run(&["build"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(ex.logged(), DOCS.to_vec());
+    assert!(out(&o).contains("0 fichiers à enrichir"), "{}", out(&o));
+}
+
+#[test]
+fn REQ050_AC3_option_puis_update_enrich_code() {
+    for config in [
+        "provider = \"mock\"\nbatch_files = 1\n",
+        "provider = \"mock\"\nbatch_files = 1\nenrich_code = false\n",
+    ] {
+        let ex = Example::new(config);
+        let o = ex.run(&["build", "--enrich-code"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(ex.logged(), all_files());
+
+        let ex = Example::new(config);
+        ex.run(&["build"]);
+        assert_eq!(ex.logged(), DOCS.to_vec());
+        assert_eq!(to_enrich(&ex), 0);
+        let o = ex.run(&["update", "--enrich-code"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(ex.logged(), code_files());
+        let o = ex.run(&["update", "--enrich-code"]);
+        assert!(out(&o).contains("graphe à jour"), "{}", out(&o));
+        assert!(ex.logged().is_empty());
+    }
+}
+
+#[test]
+fn REQ050_AC4_les_resumes_de_code_restent_puis_disparaissent_a_la_modification() {
+    let ex = Example::new("provider = \"mock\"\nbatch_files = 1\n");
+    let o = ex.run(&["build", "--enrich-code"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let before = out(&ex.run(&["query", "search", "OrderService"]));
+    let summary = fs::read_to_string(
+        ex.mock
+            .join("core/src/main/java/com/acme/core/OrderService.java.json"),
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&summary).unwrap();
+    let text = v["summaries"][0]["summary"].as_str().unwrap().to_string();
+    assert!(before.contains(&text), "{before}");
+
+    let o = ex.run(&["build"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(ex.logged().is_empty());
+    assert!(out(&o).contains("0 fichiers à enrichir"), "{}", out(&o));
+    assert!(out(&ex.run(&["query", "search", "OrderService"])).contains(&text));
+
+    let path = ex
+        .env
+        .repo
+        .join("core/src/main/java/com/acme/core/OrderService.java");
+    let mut src = fs::read_to_string(&path).unwrap();
+    src.push_str("\n// modifié\n");
+    fs::write(&path, src).unwrap();
+    let o = ex.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(ex.logged().is_empty());
+    assert!(out(&o).contains("0 fichiers à enrichir"), "{}", out(&o));
+    assert!(!out(&ex.run(&["query", "search", "OrderService"])).contains(&text));
+}
+
+#[test]
+fn REQ050_AC12_progression_compte_la_portee() {
+    let ex = Example::new("provider = \"mock\"\n");
+    let o = ex.run(&["build", "--show-progress"]);
+    let err = stderr(&o);
+    let lines: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("progression: enrichissement"))
+        .collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("progression: enrichissement 0 % (0/3 fichiers)"),
+        "{err}"
+    );
+    assert_eq!(
+        lines.last().copied(),
+        Some("progression: enrichissement 100 % (3/3 fichiers)"),
+        "{err}"
+    );
+
+    let ex = Example::new("provider = \"mock\"\nenrich_code = true\n");
+    let o = ex.run(&["build", "--show-progress"]);
+    let err = stderr(&o);
+    let treated: usize = out(&o)
+        .split("fichiers traités")
+        .next()
+        .unwrap()
+        .split(|c: char| !c.is_ascii_digit())
+        .rfind(|s| !s.is_empty())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let first = format!("progression: enrichissement 0 % (0/{treated} fichiers)");
+    assert!(
+        err.lines().any(|l| l == first),
+        "{first}\n{err}\n{}",
+        out(&o)
+    );
+}

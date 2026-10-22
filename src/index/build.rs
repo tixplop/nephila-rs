@@ -310,6 +310,7 @@ pub fn build(
     store.reset_with_pending_files(&records)?;
     if let Some(llm) = llm {
         store.set_enrich_model(llm.model())?;
+        store.set_enrich_code(opts.enrich_code)?;
     }
     if records.is_empty() {
         warn("aucun fichier pris en charge dans le dépôt : graphe vide");

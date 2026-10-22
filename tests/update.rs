@@ -39,7 +39,11 @@ impl Env {
         fs::create_dir_all(&repo).unwrap();
         fs::create_dir_all(&mock).unwrap();
         let config = tmp.path().join("config.toml");
-        fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        fs::write(
+            &config,
+            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+        )
+        .unwrap();
         let log = tmp.path().join("mock.log");
         Env {
             _tmp: tmp,
@@ -604,7 +608,7 @@ fn req011_ac2_up_to_date_without_llm_config_even_with_files_to_enrich() {
     let env = Env::maven();
     let out = env.run("build", &[NO_CONFIG]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(env.store().count_files_to_enrich().unwrap(), 10);
+    assert_eq!(env.store().count_files_to_enrich().unwrap(), 3);
     let before = env.store().summary().unwrap().unwrap();
     std::thread::sleep(Duration::from_millis(20));
     let out = env.run("update", &[NO_CONFIG]);

@@ -29,7 +29,7 @@ impl Env {
         fs::write(
             &config,
             format!(
-                "provider = \"mock\"\nmodel = \"mock\"\nmax_chunk_chars = {max_chunk}\nconcurrency = {concurrency}\nbatch_files = 1\nformat_retries = {format_retries}\n"
+                "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nmax_chunk_chars = {max_chunk}\nconcurrency = {concurrency}\nbatch_files = 1\nformat_retries = {format_retries}\n"
             ),
         )
         .unwrap();

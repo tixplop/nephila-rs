@@ -306,7 +306,7 @@ fn req002_ac8_fast_server_succeeds_within_timeout() {
 fn req002_ac8_config_timeout_secs_reaches_http_agent() {
     let s = FakeServer::start_with_delays(vec![(200, openai_reply(EXTRACTION), 2000)]);
     let text = format!(
-        "provider='openai'\nmodel='m'\nbase_url='{}'\ntimeout_secs=1\n",
+        "provider='openai'\nenrich_code = true\nmodel='m'\nbase_url='{}'\ntimeout_secs=1\n",
         s.base_url
     );
     let cfg =
@@ -478,7 +478,7 @@ fn req024_ac10_openai_node_list_of_json_document_has_no_key() {
     std::fs::write(
         &config,
         format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T061_KEY\"\nconcurrency = 1\n",
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T061_KEY\"\nconcurrency = 1\n",
             s.base_url
         ),
     )
@@ -520,7 +520,7 @@ fn openai_build_one_file(rel: &str, text: &str, reply: &str) -> String {
     std::fs::write(
         &config,
         format!(
-            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T068_KEY\"\nconcurrency = 1\n",
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T068_KEY\"\nconcurrency = 1\n",
             s.base_url
         ),
     )

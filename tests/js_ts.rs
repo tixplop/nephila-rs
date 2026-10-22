@@ -351,7 +351,11 @@ fn req034_ac1_meme_graphe_avec_mock_et_no_llm() {
     assert_eq!(unresolved(&sans), "[]");
     let out = tempfile::tempdir().unwrap();
     let cfg = out.path().join("mock.toml");
-    fs::write(&cfg, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    fs::write(
+        &cfg,
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+    )
+    .unwrap();
     let mock_dir = out.path().join("mock");
     fs::create_dir_all(&mock_dir).unwrap();
     let log = out.path().join("mock.log");
@@ -811,7 +815,11 @@ impl Env {
         let mock = tmp.path().join("mock");
         fs::create_dir_all(&mock).unwrap();
         let config = tmp.path().join("config.toml");
-        fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        fs::write(
+            &config,
+            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+        )
+        .unwrap();
         let log = tmp.path().join("mock.log");
         Env {
             _tmp: tmp,

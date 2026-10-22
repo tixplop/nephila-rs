@@ -29,7 +29,11 @@ impl Env {
         let mock = tmp.path().join("mock");
         let config = tmp.path().join("config.toml");
         let log = tmp.path().join("mock.log");
-        fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        fs::write(
+            &config,
+            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+        )
+        .unwrap();
         let env = Env {
             tmp,
             repo,

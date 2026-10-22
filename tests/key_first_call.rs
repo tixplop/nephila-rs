@@ -259,8 +259,8 @@ fn req054_ac2_refused_key_one_request_graph_kept() {
         }
         let st = env.run(&["status", "--json"]);
         let v: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
-        // Avant REQ-050 (T-118), les 5 fichiers sont à enrichir.
-        assert_eq!(v["to_enrich"], 5, "{v}");
+        // Portée par défaut (REQ-050) : les 3 documents seulement.
+        assert_eq!(v["to_enrich"], 3, "{v}");
     }
 }
 
@@ -341,6 +341,25 @@ fn req054_ac5_mock_key_revoked_after_message_as_is() {
 }
 
 #[test]
+fn req054_ac6_no_document_no_call_no_key_noticed() {
+    let env = Env::new();
+    for name in ["Alpha", "Beta"] {
+        env.file(
+            &format!("src/{name}.java"),
+            &format!("package p;\npublic class {name} {{}}\n"),
+        );
+    }
+    let server = FakeServer::start(vec![(401, "{}".into()); 4]);
+    env.config_http("openai", &server.base_url, 1, 10);
+    for args in [vec!["build"], vec!["update"]] {
+        let o = env.run(&args);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+        assert!(error_lines(&o).is_empty(), "{}", text(&o.stderr));
+        assert!(server.requests().is_empty());
+    }
+}
+
+#[test]
 fn req054_ac7_missing_key_variable_before_anything() {
     let env = Env::new();
     env.five_files();
@@ -409,10 +428,10 @@ fn req054_ac9_no_warning_for_refused_files() {
         .last()
         .unwrap()
         .starts_with("erreur:"));
-    // Avant REQ-050 (T-118), les 5 fichiers sont à enrichir.
+    // Portée par défaut (REQ-050) : les 3 documents seulement.
     assert!(text(&o.stdout)
         .trim_end()
-        .ends_with(", 5 fichiers à enrichir"));
+        .ends_with(", 3 fichiers à enrichir"));
 
     // Plusieurs appels refusés en vol.
     let env = Env::new();
@@ -462,10 +481,9 @@ fn req054_ac10_progress_ends_with_error_line() {
         .iter()
         .position(|l| *l == "progression: extraction 100 % (5/5 fichiers)")
         .unwrap_or_else(|| panic!("{err}"));
-    // Avant REQ-050 (T-118), les 5 fichiers sont à enrichir.
     let b = lines
         .iter()
-        .position(|l| *l == "progression: enrichissement 0 % (0/5 fichiers)")
+        .position(|l| *l == "progression: enrichissement 0 % (0/3 fichiers)")
         .unwrap_or_else(|| panic!("{err}"));
     assert!(a < b);
     assert_eq!(

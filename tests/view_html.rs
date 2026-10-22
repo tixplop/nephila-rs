@@ -35,7 +35,11 @@ impl Env {
         let mock = tmp.path().join("mock");
         copy_dir(&fx.join("mock"), &mock);
         let config = tmp.path().join("config.toml");
-        fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        fs::write(
+            &config,
+            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+        )
+        .unwrap();
         Env {
             _tmp: tmp,
             repo,

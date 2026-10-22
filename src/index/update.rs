@@ -118,6 +118,7 @@ pub fn update(
     // changement » (REQ-049). Les statuts et commandes LLM inactif comparent à ce modèle.
     if let Some(llm) = llm {
         store.set_enrich_model(llm.model())?;
+        store.set_enrich_code(opts.enrich_code)?;
     }
     // « Aucun changement » : rien d'ajouté, modifié, supprimé ou en attente, et (LLM inactif ou
     // aucun fichier à enrichir).

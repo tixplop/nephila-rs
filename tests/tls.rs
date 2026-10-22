@@ -82,7 +82,7 @@ impl Env {
         fs::write(
             &self.config,
             format!(
-                "provider = \"{provider}\"\nmodel = \"m\"\nbase_url = \"{url}\"\n{key}{extra}\n"
+                "provider = \"{provider}\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{url}\"\n{key}{extra}\n"
             ),
         )
         .unwrap();
@@ -380,11 +380,15 @@ fn req036_ac7_mock_ignores_tls_settings() {
         let _ = fs::remove_dir_all(env.db());
         (o, fs::read_to_string(&log).unwrap_or_default())
     };
-    fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+    )
+    .unwrap();
     let (_, plain_log) = run(&env);
     fs::write(
         &env.config,
-        "provider = \"mock\"\nmodel = \"mock\"\ntls_insecure = true\ntls_ca_cert = \"certs/ca.pem\"\n",
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\ntls_insecure = true\ntls_ca_cert = \"certs/ca.pem\"\n",
     )
     .unwrap();
     let (o, log) = run(&env);

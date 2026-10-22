@@ -35,7 +35,11 @@ impl Env {
             log: tmp.path().join("mock.log"),
             _tmp: tmp,
         };
-        fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        fs::write(
+            &env.config,
+            "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+        )
+        .unwrap();
         env.file("billing/BillingService.java", BILLING_SRC);
         env.enrichment(
             "billing/BillingService.java",
@@ -268,7 +272,7 @@ fn req002_ac6_ask_requires_valid_configuration() {
     // Variable de clé absente.
     fs::write(
         &env.config,
-        "provider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"NEPHILA_TEST_ASK_NO_SUCH_KEY\"\n",
+        "provider = \"anthropic\"\nenrich_code = true\nmodel = \"m\"\napi_key_env = \"NEPHILA_TEST_ASK_NO_SUCH_KEY\"\n",
     )
     .unwrap();
     let o = env
@@ -283,7 +287,11 @@ fn req002_ac6_ask_requires_valid_configuration() {
         text(&o.stderr)
     );
     // Clé refusée.
-    fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n",
+    )
+    .unwrap();
     let o = env
         .cmd(&["query", "ask", Q])
         .env("NEPHILA_MOCK_INVALID_KEY", "1")
@@ -296,7 +304,7 @@ fn http_env(env: &Env, server: &FakeServer) {
     fs::write(
         &env.config,
         format!(
-            "provider = \"anthropic\"\nmodel = \"claude-x\"\napi_key_env = \"NEPHILA_TEST_ASK_KEY\"\nbase_url = \"{}\"\n",
+            "provider = \"anthropic\"\nenrich_code = true\nmodel = \"claude-x\"\napi_key_env = \"NEPHILA_TEST_ASK_KEY\"\nbase_url = \"{}\"\n",
             server.base_url
         ),
     )
@@ -468,7 +476,7 @@ fn req016_ac5_ac6_ask_option_priority_over_config() {
     env.fixture(ASK_OK);
     fs::write(
         &env.config,
-        "provider = \"mock\"\nmodel = \"mock\"\nformat_retries = 0\n",
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nformat_retries = 0\n",
     )
     .unwrap();
     let o = env.ask_malformed(1, &[]);
