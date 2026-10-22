@@ -59,7 +59,7 @@ fn env_number<T: std::str::FromStr>(env: EnvFn, name: &str) -> Result<Option<T>>
             .trim()
             .parse()
             .map(Some)
-            .map_err(|_| Error::Message(format!("{name} : entier attendu, reçu « {v} »"))),
+            .map_err(|_| Error::bad_integer_env(name, &v)),
     }
 }
 

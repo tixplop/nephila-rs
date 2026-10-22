@@ -4,7 +4,7 @@ pub mod anthropic;
 pub mod ask;
 pub mod enrich;
 mod http;
-pub use http::Tls;
+pub use http::{Retry, Tls};
 pub mod mock;
 pub mod openai;
 pub mod retry;
@@ -97,23 +97,33 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
     match config.provider {
         Provider::Mock => Ok(Box::new(mock::MockLlm::from_env()?)),
         Provider::Anthropic => {
+            let retry = Retry::from_env()?;
             let key = config.api_key()?.ok_or_else(|| {
                 Error::Message("clé api_key_env manquante pour le fournisseur anthropic".into())
             })?;
-            Ok(Box::new(anthropic::AnthropicLlm::new(
-                config.base_url.clone(),
-                config.model.clone(),
-                key,
-                config.timeout_secs,
-                &tls,
-            )))
+            Ok(Box::new(
+                anthropic::AnthropicLlm::new(
+                    config.base_url.clone(),
+                    config.model.clone(),
+                    key,
+                    config.timeout_secs,
+                    &tls,
+                )
+                .with_retry(retry),
+            ))
         }
-        Provider::OpenAi => Ok(Box::new(openai::OpenAiLlm::new(
-            config.base_url.clone(),
-            config.model.clone(),
-            config.api_key()?,
-            config.timeout_secs,
-            &tls,
-        ))),
+        Provider::OpenAi => {
+            let retry = Retry::from_env()?;
+            Ok(Box::new(
+                openai::OpenAiLlm::new(
+                    config.base_url.clone(),
+                    config.model.clone(),
+                    config.api_key()?,
+                    config.timeout_secs,
+                    &tls,
+                )
+                .with_retry(retry),
+            ))
+        }
     }
 }

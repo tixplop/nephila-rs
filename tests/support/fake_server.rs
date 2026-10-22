@@ -4,9 +4,54 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Réponse programmée du faux serveur.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum Reply {
+    /// Réponse HTTP avec en-têtes supplémentaires et délai avant l'envoi.
+    Http {
+        status: u16,
+        body: String,
+        headers: Vec<(String, String)>,
+        delay_ms: u64,
+    },
+    /// Ferme la connexion sans répondre (après lecture de la requête).
+    Close,
+}
+
+impl Reply {
+    #[allow(dead_code)]
+    pub fn status(status: u16, body: &str) -> Reply {
+        Reply::Http {
+            status,
+            body: body.into(),
+            headers: vec![],
+            delay_ms: 0,
+        }
+    }
+
+    /// Réponse avec un seul en-tête supplémentaire (`retry-after`, par exemple).
+    #[allow(dead_code)]
+    pub fn with_header(status: u16, body: &str, name: &str, value: &str) -> Reply {
+        Reply::Http {
+            status,
+            body: body.into(),
+            headers: vec![(name.into(), value.into())],
+            delay_ms: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Recorded {
+    /// Instant d'arrivée de la requête.
+    #[allow(dead_code)]
+    pub at: Instant,
+    /// Instant où la réponse a été écrite (None : connexion fermée sans réponse).
+    #[allow(dead_code)]
+    pub answered_at: Option<Instant>,
     pub method: String,
     pub path: String,
     /// Noms d'en-têtes en minuscules.
@@ -28,7 +73,13 @@ impl FakeServer {
 
     /// Comme `start`, avec un délai en millisecondes avant chaque réponse.
     pub fn start_with_delays(responses: Vec<(u16, String, u64)>) -> FakeServer {
-        FakeServer::spawn(responses, None)
+        FakeServer::spawn(into_replies(responses), None)
+    }
+
+    /// Comme `start`, avec des réponses programmées complètes (en-têtes, fermeture sans réponse).
+    #[allow(dead_code)]
+    pub fn start_replies(replies: Vec<Reply>) -> FakeServer {
+        FakeServer::spawn(replies, None)
     }
 
     /// Comme `start`, en HTTPS (`https://127.0.0.1:<port>`) avec le certificat et la clé PEM
@@ -50,15 +101,12 @@ impl FakeServer {
         .with_single_cert(certs, key)
         .unwrap();
         FakeServer::spawn(
-            responses.into_iter().map(|(s, b)| (s, b, 0)).collect(),
+            into_replies(responses.into_iter().map(|(s, b)| (s, b, 0)).collect()),
             Some(Arc::new(config)),
         )
     }
 
-    fn spawn(
-        responses: Vec<(u16, String, u64)>,
-        tls: Option<Arc<rustls::ServerConfig>>,
-    ) -> FakeServer {
+    fn spawn(responses: Vec<Reply>, tls: Option<Arc<rustls::ServerConfig>>) -> FakeServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let scheme = if tls.is_some() { "https" } else { "http" };
         let base_url = format!("{scheme}://{}", listener.local_addr().unwrap());
@@ -97,7 +145,19 @@ impl FakeServer {
     }
 }
 
-type Queue = Arc<Mutex<VecDeque<(u16, String, u64)>>>;
+type Queue = Arc<Mutex<VecDeque<Reply>>>;
+
+fn into_replies(responses: Vec<(u16, String, u64)>) -> Vec<Reply> {
+    responses
+        .into_iter()
+        .map(|(status, body, delay_ms)| Reply::Http {
+            status,
+            body,
+            headers: vec![],
+            delay_ms,
+        })
+        .collect()
+}
 
 /// Lit une requête, l'enregistre, écrit la réponse suivante de la file.
 fn serve<S: Read + Write>(mut stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, queue: &Queue) {
@@ -128,26 +188,44 @@ fn serve<S: Read + Write>(mut stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, queue:
         return;
     }
     drop(reader);
-    rec.lock().unwrap().push(Recorded {
-        method,
-        path,
-        headers,
-        body: String::from_utf8_lossy(&body).into_owned(),
+    let index = {
+        let mut r = rec.lock().unwrap();
+        r.push(Recorded {
+            at: Instant::now(),
+            answered_at: None,
+            method,
+            path,
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
+        r.len() - 1
+    };
+    // File vide : 500.
+    let reply = queue.lock().unwrap().pop_front().unwrap_or(Reply::Http {
+        status: 500,
+        body: "{}".into(),
+        headers: vec![],
+        delay_ms: 0,
     });
-    let (status, payload, delay_ms) =
-        queue
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or((500, "{}".into(), 0));
+    let Reply::Http {
+        status,
+        body: payload,
+        headers: extra,
+        delay_ms,
+    } = reply
+    else {
+        return; // fermeture sans réponse
+    };
     if delay_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     }
+    let extra: String = extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
     let resp = format!(
-        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}\
          Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     );
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
+    rec.lock().unwrap()[index].answered_at = Some(Instant::now());
 }

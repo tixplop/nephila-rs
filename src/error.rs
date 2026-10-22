@@ -34,6 +34,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub const EXIT_ERROR: i32 = 1;
 
 impl Error {
+    /// Variable d'environnement numérique mal formée (E-14) : seule source du texte.
+    pub fn bad_integer_env(name: &str, value: &str) -> Error {
+        Error::Message(format!("{name} : entier attendu, reçu « {value} »"))
+    }
+
     pub fn exit_code(&self) -> i32 {
         EXIT_ERROR
     }

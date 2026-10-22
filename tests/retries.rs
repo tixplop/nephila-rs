@@ -521,11 +521,18 @@ fn req038_ac9_openai_text_without_json_three_requests_then_zero_retries_one() {
 
 #[test]
 fn req038_ac6_http_error_is_not_retried() {
+    // Un 500 est retenté par les nouveaux essais HTTP (REQ-052), pas par ceux du format (REQ-038).
     let server = FakeServer::start(vec![(500, "{}".into())]);
     let env = server_env(&server, "");
-    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
+    let o = env.run(
+        &["build"],
+        &[
+            ("NEPHILA_RETRIES_TEST_KEY", "sk"),
+            ("NEPHILA_RETRY_BASE_MS", "1"),
+        ],
+    );
     assert!(!o.status.success());
-    assert_eq!(posts(&server).len(), 1);
+    assert_eq!(posts(&server).len(), 5);
 }
 
 #[test]

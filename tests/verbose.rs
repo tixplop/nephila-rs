@@ -68,6 +68,8 @@ impl Env {
         ] {
             c.env_remove(k);
         }
+        // Attente de nouvel essai HTTP minimale : un faux serveur à file épuisée ne ralentit pas la suite.
+        c.env("NEPHILA_RETRY_BASE_MS", "1");
         c.envs(envs.iter().copied());
         c.env("NEPHILA_CONFIG", &self.config)
             .env("NEPHILA_MOCK_DIR", &self.mock)

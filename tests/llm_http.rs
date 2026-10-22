@@ -10,6 +10,7 @@ use nephila::llm::openai::OpenAiLlm;
 use nephila::llm::AskReply;
 use nephila::llm::Llm;
 use nephila::llm::LotItem;
+use nephila::llm::Retry;
 use nephila::llm::Tls;
 
 const EXTRACTION: &str =
@@ -37,6 +38,7 @@ fn anthropic(s: &FakeServer) -> AnthropicLlm {
         30,
         &Tls::default(),
     )
+    .with_retry(Retry::from_millis(1))
 }
 
 fn openai(s: &FakeServer, key: Option<&str>) -> OpenAiLlm {
@@ -47,6 +49,7 @@ fn openai(s: &FakeServer, key: Option<&str>) -> OpenAiLlm {
         30,
         &Tls::default(),
     )
+    .with_retry(Retry::from_millis(1))
 }
 
 // ---- AC-002-3 : 401/403 -> erreur de clé, distincte d'une erreur réseau ----
@@ -71,7 +74,10 @@ fn req002_ac3_openai_403_is_invalid_key() {
 
 #[test]
 fn req002_ac3_server_error_is_network_not_key() {
-    let s = FakeServer::start(vec![(500, "{}".into()), (429, "{}".into())]);
+    // 5 envois par appel (REQ-052) : cinq 500 pour le premier, cinq 429 pour le second.
+    let mut replies: Vec<(u16, String)> = (0..5).map(|_| (500, "{}".to_string())).collect();
+    replies.extend((0..5).map(|_| (429, "{}".to_string())));
+    let s = FakeServer::start(replies);
     assert!(matches!(
         anthropic(&s).enrich("A.java", 1, "x", &a_ids(), &a_ids()),
         Err(Error::Network(_))
@@ -88,7 +94,8 @@ fn req002_ac3_connection_refused_is_network() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://{}", l.local_addr().unwrap())
     };
-    let llm = AnthropicLlm::new(Some(url), "m".into(), "k".into(), 30, &Tls::default());
+    let llm = AnthropicLlm::new(Some(url), "m".into(), "k".into(), 30, &Tls::default())
+        .with_retry(Retry::from_millis(1));
     assert!(matches!(
         llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()),
         Err(Error::Network(_))
@@ -432,6 +439,10 @@ fn req027_ac8_lot_version_2_is_non_conforming_and_errors_classified() {
     let s = FakeServer::start(vec![
         (200, openai_reply(EXTRACTION)),
         (401, "{}".into()),
+        (500, "{}".into()),
+        (500, "{}".into()),
+        (500, "{}".into()),
+        (500, "{}".into()),
         (500, "{}".into()),
     ]);
     let o = openai(&s, None);

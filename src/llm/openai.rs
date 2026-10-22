@@ -4,7 +4,7 @@ use super::ask::{ask_system_prompt, ask_user_prompt, AskReply};
 use super::enrich::{
     enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt, parse_lot,
 };
-use super::{http, Llm, Tls};
+use super::{http, Llm, Retry, Tls};
 use super::{Enrichment, LotItem};
 use crate::error::{Error, Result, TRUNCATED};
 
@@ -15,6 +15,7 @@ pub struct OpenAiLlm {
     model: String,
     key: Option<String>,
     agent: ureq::Agent,
+    retry: http::Retry,
 }
 
 impl OpenAiLlm {
@@ -31,7 +32,14 @@ impl OpenAiLlm {
             model,
             key,
             agent: http::agent(timeout_secs, tls),
+            retry: http::Retry::default(),
         }
+    }
+
+    /// Base d'attente des nouveaux essais HTTP (REQ-052).
+    pub fn with_retry(mut self, retry: Retry) -> OpenAiLlm {
+        self.retry = retry;
+        self
     }
 
     fn request(&self, method: &str, path: &str) -> ureq::Request {
@@ -56,6 +64,7 @@ impl OpenAiLlm {
             "openai",
             self.request("POST", "/v1/chat/completions"),
             Some(&body),
+            &self.retry,
         )?;
         let v = http::parse_body("openai", &raw)?;
         if v["choices"][0]["finish_reason"] == "length" {
