@@ -1606,7 +1606,10 @@ mod tests {
     }
 
     /// Une clé invalide sur un autre fil pose l'arrêt pendant que A boucle sur ses essais :
-    /// A garde son erreur `Format` et n'est pas réessayé.
+    /// A garde son erreur `Format` et n'est pas réessayé. Ordre imposé par deux canaux : A
+    /// signale « parti » à l'entrée de son premier appel, B attend ce signal avant de rendre
+    /// `InvalidKey`. Sans cela, B pouvait poser l'arrêt avant que `A#1` soit pris, et `A#1`
+    /// sautait (comportement voulu, DEC-063), laissant `calls_a` à 0.
     #[test]
     fn req038_ac10_invalid_key_on_other_thread_stops_retries() {
         use std::sync::atomic::AtomicUsize;
@@ -1617,6 +1620,8 @@ mod tests {
             stop: &'a AtomicBool,
             rx: Mutex<Receiver<()>>,
             tx: Mutex<Sender<()>>,
+            a_started_tx: Mutex<Sender<()>>,
+            a_started_rx: Mutex<Receiver<()>>,
             calls_a: AtomicUsize,
         }
         impl Llm for Fake<'_> {
@@ -1629,10 +1634,16 @@ mod tests {
                 _: &[String],
             ) -> Result<Enrichment> {
                 if path.ends_with("B.java") {
+                    self.a_started_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("premier appel de A jamais parti");
                     self.tx.lock().unwrap().send(()).unwrap();
                     return Err(Error::InvalidKey("clé refusée".into()));
                 }
                 if self.calls_a.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.a_started_tx.lock().unwrap().send(()).unwrap();
                     self.rx
                         .lock()
                         .unwrap()
@@ -1669,10 +1680,13 @@ mod tests {
         };
         let stop = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel();
+        let (a_tx, a_rx) = mpsc::channel();
         let llm = Fake {
             stop: &stop,
             rx: Mutex::new(rx),
             tx: Mutex::new(tx),
+            a_started_tx: Mutex::new(a_tx),
+            a_started_rx: Mutex::new(a_rx),
             calls_a: AtomicUsize::new(0),
         };
         let mut failures = enrich_with_stop(
