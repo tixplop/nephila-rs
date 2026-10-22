@@ -94,6 +94,16 @@ api_key_env = "ANTHROPIC_API_KEY"
 # Valables pour tous les fournisseurs. Les lignes ci-dessous montrent les valeurs par défaut
 # (sauf tls_ca_cert, qui n'a pas de défaut) : décommentez une ligne pour la changer.
 
+# Enrichit aussi les fichiers de code. Booléen. Défaut : false : seuls les documents Markdown
+# sont enrichis (résumés et concepts) ; le code source, les fichiers de build et les fichiers
+# de données gardent leur structure, sans résumé, et ne comptent pas dans « fichiers à
+# enrichir ». true : ils reçoivent aussi des résumés (comportement de la 0.17). Les résumés
+# déjà faits sont conservés tant que le fichier ne change pas, même en repassant à false.
+# Remplacé, pour une commande, par l'option --enrich-code (qui vaut true). Lue ici seulement :
+# .nephila.toml la refuse.
+# Priorité : --enrich-code > ce fichier > défaut.
+# enrich_code = false
+
 # Taille maximale, en caractères, d'un morceau de fichier envoyé au LLM. Entier > 0.
 # Défaut : 60000. Un lot de fichiers (voir batch_files) ne dépasse jamais cette taille.
 # Un dépôt peut le remplacer par son .nephila.toml.

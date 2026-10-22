@@ -806,6 +806,7 @@ pub(crate) fn enrich_with_stop(
         max_chunk_chars,
         batch_files,
         format_retries,
+        enrich_code: _,
     } = *opts;
     let ids = nodes_by_file(store)?;
     let started = Instant::now();
@@ -1678,6 +1679,7 @@ mod tests {
             max_chunk_chars: 1000,
             batch_files: 1,
             format_retries: u32::MAX,
+            enrich_code: false,
         };
         let stop = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel();
@@ -1753,6 +1755,7 @@ mod tests {
             max_chunk_chars: 1000,
             batch_files: 4,
             format_retries: 0,
+            enrich_code: false,
         };
         progress::init(true);
         progress::take_captured();
@@ -1909,6 +1912,7 @@ mod tests {
             max_chunk_chars: 10,
             batch_files,
             format_retries: 0,
+            enrich_code: false,
         };
         let failures = enrich_with_stop(
             dir.path(),

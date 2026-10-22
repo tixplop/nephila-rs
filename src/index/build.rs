@@ -49,6 +49,8 @@ pub struct IndexOptions {
     pub batch_files: usize,
     /// Nouveaux essais d'un appel LLM dont la réponse est non conforme (REQ-038).
     pub format_retries: u32,
+    /// Enrichit aussi les fichiers de code : option ou clé `enrich_code` (REQ-050).
+    pub enrich_code: bool,
 }
 
 impl Default for IndexOptions {
@@ -58,6 +60,7 @@ impl Default for IndexOptions {
             max_chunk_chars: DEFAULT_MAX_CHUNK_CHARS,
             batch_files: crate::config::DEFAULT_BATCH_FILES,
             format_retries: crate::config::DEFAULT_FORMAT_RETRIES,
+            enrich_code: false,
         }
     }
 }
@@ -69,6 +72,7 @@ impl From<&Config> for IndexOptions {
             max_chunk_chars: c.max_chunk_chars,
             batch_files: c.batch_files,
             format_retries: c.format_retries,
+            enrich_code: c.enrich_code,
         }
     }
 }
@@ -83,6 +87,7 @@ pub(crate) struct Setup {
 /// fichier de configuration le LLM est inactif ; sinon validation (la clé n'est constatée qu'au premier appel, REQ-054).
 pub(crate) fn setup(
     no_llm: bool,
+    enrich_code: bool,
     project: &ProjectSettings,
     batch_files: Option<usize>,
     format_retries: Option<u32>,
@@ -90,7 +95,10 @@ pub(crate) fn setup(
     if no_llm {
         trace!("config: llm inactif (--no-llm)");
         return Ok(Setup {
-            opts: IndexOptions::default(),
+            opts: IndexOptions {
+                enrich_code,
+                ..IndexOptions::default()
+            },
             llm: None,
         });
     }
@@ -98,12 +106,17 @@ pub(crate) fn setup(
         None => {
             trace!("config: llm inactif (aucune configuration)");
             Ok(Setup {
-                opts: IndexOptions::default(),
+                opts: IndexOptions {
+                    enrich_code,
+                    ..IndexOptions::default()
+                },
                 llm: None,
             })
         }
         Some(config) => {
-            let (config, from_project) = config.with_project(project, batch_files, format_retries);
+            let (mut config, from_project) =
+                config.with_project(project, batch_files, format_retries);
+            config.enrich_code |= enrich_code;
             let mut tls_trace = String::new();
             if let Some(p) = &config.tls_ca_cert {
                 tls_trace.push_str(&format!(" tls_ca_cert={}", p.display()));
@@ -115,9 +128,10 @@ pub(crate) fn setup(
                 tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
             }
             trace!(
-                "config: llm={} model={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}",
+                "config: llm={} model={} enrich_code={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}",
                 config.provider.as_str(),
                 config.model,
+                config.enrich_code,
                 config.concurrency,
                 config.timeout_secs,
                 config.max_chunk_chars,
@@ -158,6 +172,7 @@ impl BuildReport {
 pub fn run(
     repo: &Path,
     no_llm: bool,
+    enrich_code: bool,
     verbose: bool,
     batch_files: Option<usize>,
     format_retries: Option<u32>,
@@ -168,7 +183,13 @@ pub fn run(
     // Le fichier de projet est lu avant la configuration LLM, le verrou et toute écriture.
     let project = ProjectFile::load(repo)?;
     let matcher = effective_matcher(repo, &project.filters, &cli_filters)?;
-    let setup = setup(no_llm, &project.settings, batch_files, format_retries)?;
+    let setup = setup(
+        no_llm,
+        enrich_code,
+        &project.settings,
+        batch_files,
+        format_retries,
+    )?;
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
     let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;

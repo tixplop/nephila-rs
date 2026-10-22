@@ -20,6 +20,7 @@ use crate::trace;
 pub fn run(
     repo: &Path,
     no_llm: bool,
+    enrich_code: bool,
     verbose: bool,
     batch_files: Option<usize>,
     format_retries: Option<u32>,
@@ -29,7 +30,13 @@ pub fn run(
     build::check_repo(repo)?;
     let project = ProjectFile::load(repo)?;
     let matcher = build::effective_matcher(repo, &project.filters, &cli_filters)?;
-    let setup = build::setup(no_llm, &project.settings, batch_files, format_retries)?;
+    let setup = build::setup(
+        no_llm,
+        enrich_code,
+        &project.settings,
+        batch_files,
+        format_retries,
+    )?;
     let lock = RepoLock::acquire(repo)?;
     // Le test d'existence se fait sous verrou : aucun build concurrent ne peut le créer entre-temps.
     if !db_path(repo).is_file() {

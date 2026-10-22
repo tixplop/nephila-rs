@@ -143,6 +143,8 @@ pub struct Config {
     pub batch_files: usize,
     /// Nouveaux essais d'un appel dont la réponse est non conforme (REQ-038).
     pub format_retries: u32,
+    /// Enrichit aussi les fichiers de code, pas seulement les documents (REQ-050).
+    pub enrich_code: bool,
     /// Chemin résolu du PEM d'autorités ajoutées aux autorités publiques (REQ-036).
     pub tls_ca_cert: Option<PathBuf>,
     /// Certificats d'autorité (DER) lus dans `tls_ca_cert`, déjà validés.
@@ -163,6 +165,7 @@ struct RawConfig {
     timeout_secs: Option<i64>,
     batch_files: Option<i64>,
     format_retries: Option<toml::Value>,
+    enrich_code: Option<toml::Value>,
     tls_ca_cert: Option<String>,
     tls_insecure: Option<bool>,
 }
@@ -378,6 +381,16 @@ impl Config {
                 )))
             }
         };
+        let enrich_code = match &raw.enrich_code {
+            None => false,
+            Some(toml::Value::Boolean(b)) => *b,
+            Some(v) => {
+                return Err(Error::Message(format!(
+                    "configuration invalide ({at}) : clé « enrich_code » doit être un booléen, \
+                     true ou false (reçu : {v})"
+                )))
+            }
+        };
         Ok(Config {
             provider,
             model,
@@ -396,6 +409,7 @@ impl Config {
             )? as u64,
             batch_files: positive("batch_files", raw.batch_files, DEFAULT_BATCH_FILES)?,
             format_retries,
+            enrich_code,
             tls_ca_cert,
             tls_ca_certs,
             tls_insecure: raw.tls_insecure.unwrap_or(false),
@@ -488,6 +502,7 @@ mod project_tests {
             timeout_secs: 30,
             batch_files: 3,
             format_retries: 1,
+            enrich_code: false,
             tls_ca_cert: None,
             tls_ca_certs: Vec::new(),
             tls_insecure: true,

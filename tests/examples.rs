@@ -185,7 +185,7 @@ fn REQ041_AC4_valeurs_par_defaut_documentees_egales_aux_valeurs_reelles() {
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| key_of(l))
         .collect();
-    assert_eq!(active.len(), 6, "options communes réactivées : {active:?}");
+    assert_eq!(active.len(), 7, "options communes réactivées : {active:?}");
 }
 
 #[test]
@@ -244,6 +244,7 @@ fn REQ041_AC5_chaque_cle_est_documentee() {
         for (k, option) in [
             ("batch_files", "--batch-files"),
             ("format_retries", "--format-retries"),
+            ("enrich_code", "--enrich-code"),
         ] {
             if key == k {
                 assert!(doc.contains(option), "clé {k} sans {option} :\n{doc}");
@@ -775,4 +776,29 @@ fn REQ048_AC11_readme_second_remede() {
     assert_eq!(lines.len(), 1);
     assert!(lines[0].ends_with(expected), "{}", lines[0]);
     assert!(!readme.contains("Seul remède"));
+}
+
+#[test]
+fn REQ041_AC10_bloc_d_enrich_code_de_l_exemple_de_config() {
+    let text = example("config.toml");
+    let lines: Vec<&str> = text.lines().collect();
+    let at = |wanted: &str| position_of(&lines, wanted);
+    let title = at("# --- Options communes ---");
+    let key = at("# enrich_code = false");
+    let next = lines
+        .iter()
+        .position(|l| l.starts_with("# max_chunk_chars ="))
+        .unwrap();
+    assert!(title < key && key < next);
+    let block = exact_doc_of(&lines, key);
+    for wanted in [
+        "# Priorité : --enrich-code > ce fichier > défaut.",
+        "# .nephila.toml la refuse.",
+    ] {
+        assert!(
+            block.iter().any(|l| l == wanted),
+            "ligne absente : {wanted}"
+        );
+    }
+    assert!(!block.join("\n").contains(".nephila.toml du dépôt"));
 }

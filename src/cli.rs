@@ -82,6 +82,9 @@ pub struct IndexOpts {
     /// N'appelle pas le LLM (la configuration n'est pas lue) : structure seule, sans enrichissement
     #[arg(long)]
     pub no_llm: bool,
+    /// Enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown (remplace `enrich_code` de la configuration ; défaut : documents seulement)
+    #[arg(long)]
+    pub enrich_code: bool,
     /// Traces synthétiques des étapes et des appels LLM sur stderr (préfixe `trace:` ; incompatible avec --show-progress)
     #[arg(short, long)]
     pub verbose: bool,
@@ -187,6 +190,7 @@ pub fn run(cli: Cli) -> Result<()> {
             crate::index::build::run(
                 &cli.repo,
                 o.no_llm,
+                o.enrich_code,
                 o.verbose,
                 o.batch_files,
                 o.format_retries,
@@ -198,6 +202,7 @@ pub fn run(cli: Cli) -> Result<()> {
             crate::index::update::run(
                 &cli.repo,
                 o.no_llm,
+                o.enrich_code,
                 o.verbose,
                 o.batch_files,
                 o.format_retries,
