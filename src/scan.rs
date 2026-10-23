@@ -100,6 +100,59 @@ pub struct WalkResult {
     pub warnings: Vec<String>,
     /// Fichiers que le parcours aurait retenus sans filtre (REQ-037).
     pub excluded: usize,
+    /// Fichiers écartés parce qu'un autre a le même chemin après conversion (DEC-071).
+    pub collisions: Vec<Collision>,
+}
+
+/// Fichier écarté : son chemin converti est celui d'un autre fichier, seul retenu (DEC-071).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collision {
+    /// Chemin réel relatif du fichier ignoré.
+    pub ignored: PathBuf,
+    /// Chemin réel relatif du fichier retenu.
+    pub kept: PathBuf,
+    /// Chemin converti, commun aux deux.
+    pub path: String,
+}
+
+/// Choix du fichier retenu dans un groupe de chemins réels relatifs de même chemin converti
+/// (DEC-071) : celui dont le chemin entier est de l'UTF-8 valide, sinon le plus petit dans
+/// l'ordre de `OsStr`. Rend l'indice dans `group` (non vide). Seul endroit à changer pour
+/// modifier la règle.
+fn choose_kept(group: &[&Path]) -> usize {
+    let key = |i: usize| (group[i].to_str().is_none(), group[i].as_os_str());
+    (0..group.len()).min_by_key(|&i| key(i)).unwrap_or(0)
+}
+
+/// Forme échappée d'un chemin réel relatif pour les avertissements (V-006) : octets invalides en
+/// `\xHH` majuscules ; dans les suites valides `\` et `'` précédés d'un `\`, contrôles en `\xHH`.
+pub fn escaped(rel: &Path) -> String {
+    fn valid(out: &mut String, s: &str) {
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                c if c.is_control() && (c as u32) < 0x20 || c == '\u{7f}' => {
+                    out.push_str(&format!("\\x{:02X}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+    }
+    let mut out = String::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        for chunk in rel.as_os_str().as_bytes().utf8_chunks() {
+            valid(&mut out, chunk.valid());
+            for b in chunk.invalid() {
+                out.push_str(&format!("\\x{b:02X}"));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    valid(&mut out, &rel.to_string_lossy());
+    out
 }
 
 /// Parcourt `root` sans rien lire : dossiers exclus (REQ-004), types pris en charge, export
@@ -130,6 +183,7 @@ pub fn walk(root: &Path, matcher: &Matcher) -> Result<WalkResult> {
         .build();
 
     let mut res = WalkResult::default();
+    let mut found: Vec<(WalkedFile, PathBuf)> = Vec::new();
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
@@ -147,10 +201,12 @@ pub fn walk(root: &Path, matcher: &Matcher) -> Result<WalkResult> {
         if !is_supported(&name) || name == export_name {
             continue;
         }
-        let rel = entry
+        let real_rel = entry
             .path()
             .strip_prefix(root)
             .map_err(|e| Error::Message(e.to_string()))?
+            .to_path_buf();
+        let rel = real_rel
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
@@ -173,13 +229,42 @@ pub fn walk(root: &Path, matcher: &Matcher) -> Result<WalkResult> {
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_millis() as i64);
-        res.files.push(WalkedFile {
-            path: rel,
-            abs: entry.path().to_path_buf(),
-            size: meta.len(),
-            mtime,
-        });
+        found.push((
+            WalkedFile {
+                path: rel,
+                abs: entry.path().to_path_buf(),
+                size: meta.len(),
+                mtime,
+            },
+            real_rel,
+        ));
     }
+
+    // DEC-071 : un seul fichier par chemin converti, avant tout usage.
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (f, _)) in found.iter().enumerate() {
+        groups.entry(f.path.as_str()).or_default().push(i);
+    }
+    let mut dropped = vec![false; found.len()];
+    for (path, idx) in groups.iter().filter(|(_, idx)| idx.len() > 1) {
+        let reals: Vec<&Path> = idx.iter().map(|&i| found[i].1.as_path()).collect();
+        let kept = idx[choose_kept(&reals)];
+        for &i in idx.iter().filter(|&&i| i != kept) {
+            dropped[i] = true;
+            res.collisions.push(Collision {
+                ignored: found[i].1.clone(),
+                kept: found[kept].1.clone(),
+                path: (*path).to_string(),
+            });
+        }
+    }
+    res.collisions
+        .sort_by(|a, b| (&a.path, a.ignored.as_os_str()).cmp(&(&b.path, b.ignored.as_os_str())));
+    res.files = found
+        .into_iter()
+        .zip(dropped)
+        .filter_map(|((f, _), d)| (!d).then_some(f))
+        .collect();
     Ok(res)
 }
 
@@ -205,6 +290,16 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
         excluded: walked.excluded,
         ..ScanResult::default()
     };
+    for c in &walked.collisions {
+        let msg = format!(
+            "{} ignoré : même chemin dans le graphe que {} ({}), seul retenu ; renommez ce fichier",
+            escaped(&c.ignored),
+            escaped(&c.kept),
+            c.path
+        );
+        warn(&msg);
+        res.warnings.push(msg);
+    }
     for WalkedFile {
         path: rel,
         abs,
@@ -298,6 +393,18 @@ mod tests {
         assert_eq!(res.files.len(), 1, "{:?}", res.warnings);
         assert!(res.warnings.is_empty(), "{:?}", res.warnings);
         assert!(res.files[0].rehashed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_met_en_forme_le_nom_reel() {
+        use std::os::unix::ffi::OsStrExt;
+        let f = |b: &[u8]| escaped(Path::new(std::ffi::OsStr::from_bytes(b)));
+        assert_eq!(f(b"x\\y\xff.java"), "x\\\\y\\xFF.java");
+        assert_eq!(f(b"a\nb\xfe.java"), "a\\x0Ab\\xFE.java");
+        assert_eq!(f("A\u{FFFD}.java".as_bytes()), "A\u{FFFD}.java");
+        assert_eq!(f(b"\x80\x81.md"), "\\x80\\x81.md");
+        assert_eq!(f(b"l'a.java"), "l\\'a.java");
     }
 
     #[test]
