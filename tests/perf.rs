@@ -584,7 +584,7 @@ const C0_JS: i64 = 84_904_838;
 const U0_JVM: i64 = 153_509_888;
 const C0_JVM: i64 = 3_199_600;
 
-/// Place utilisée `(page_count − freelist_count) × page_size` et Σ `length(context)` de `refs`.
+/// Place utilisée `(page_count − freelist_count) × page_size` et Σ `length(context)` de `file_contexts` (schéma 7).
 fn graph_size(f: &Fixture) -> (i64, i64) {
     let conn = rusqlite::Connection::open(f.repo.join(".nephila/graph.db")).unwrap();
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
@@ -596,7 +596,7 @@ fn graph_size(f: &Fixture) -> (i64, i64) {
     let used = (pragma("page_count") - pragma("freelist_count")) * pragma("page_size");
     let ctx: i64 = conn
         .query_row(
-            "SELECT coalesce(sum(length(context)), 0) FROM refs",
+            "SELECT coalesce(sum(length(context)), 0) FROM file_contexts",
             [],
             |r| r.get(0),
         )
@@ -604,7 +604,7 @@ fn graph_size(f: &Fixture) -> (i64, i64) {
     (used, ctx)
 }
 
-/// AC-063-5 (mesures U₀ et C₀ ; T-140 ajoute la condition U ≤ U₀ − C₀ / 2 et U < U₀).
+/// AC-063-5 : U ≤ U₀ − C₀ / 2 et U < U₀ (U₀ et C₀ mesurés sur la 0.20.0).
 #[test]
 #[ignore]
 fn perf_req063_ac5_taille_du_graphe() {
@@ -626,7 +626,13 @@ fn perf_req063_ac5_taille_du_graphe() {
         timed(&f, &["build", "--no-llm"]);
         let (u, c) = graph_size(&f);
         eprintln!("MESURE {name} : U = {u} octets, C = {c} octets (U0 = {u0}, C0 = {c0})");
-        assert!(c > 0, "{name} : aucun contexte de référence");
+        assert!(c > 0, "{name} : aucun contexte de fichier");
+        assert!(u < u0, "{name} : U = {u} n'est pas < U0 = {u0}");
+        assert!(
+            u <= u0 - c0 / 2,
+            "{name} : U = {u} > U0 - C0 / 2 = {}",
+            u0 - c0 / 2
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

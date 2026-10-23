@@ -37,6 +37,24 @@ const REFS_SQL: &str = "SELECT r.source, r.kind, r.target_name,
 const REFS_LEGACY_SQL: &str =
     "SELECT source, kind, target_name, context, origin FROM refs ORDER BY id";
 
+/// Références avec fichier et origine, sans contexte (REQ-063).
+const FILE_REFS_SQL: &str = "SELECT source, kind, target_name, origin, file FROM refs ORDER BY id";
+/// Contextes d'imports par fichier du schéma 7.
+const FILE_CONTEXTS_SQL: &str = "SELECT file, context FROM file_contexts";
+/// Contextes des schémas 5 et 6, regroupés par fichier (lecture seule).
+const FILE_CONTEXTS_LEGACY_SQL: &str = "SELECT file, min(context) FROM refs
+     WHERE origin = 'parse' AND context IS NOT NULL GROUP BY file";
+
+/// Référence avec son fichier et son origine ; le contexte d'imports est lu à part
+/// (`Store::file_contexts`), une fois par fichier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRef {
+    /// Référence, `context` à `None`.
+    pub r: Ref,
+    pub origin: RefOrigin,
+    pub file: String,
+}
+
 /// Requêtes de résolution d'un nom (DEC-066), toutes sur index.
 pub(crate) const RESOLVE_ID: &str =
     "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes WHERE id = ?1";
@@ -1003,6 +1021,56 @@ impl Store {
             .into_iter()
             .map(|(r, _)| r)
             .collect())
+    }
+
+    /// Références avec leur fichier et leur origine, dans l'ordre d'insertion, sans contexte.
+    pub fn file_refs(&self) -> Result<Vec<FileRef>> {
+        let mut st = self.conn.prepare_cached(FILE_REFS_SQL).map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (source, kind, target_name, origin, file) = row.map_err(db_err)?;
+            out.push(FileRef {
+                r: Ref {
+                    source,
+                    kind: EdgeKind::parse(&kind)?,
+                    target_name,
+                    context: None,
+                },
+                origin: if origin == "llm" {
+                    RefOrigin::Llm
+                } else {
+                    RefOrigin::Parse
+                },
+                file,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Contexte d'imports de chaque fichier qui en a un (`file_contexts` ; sur un schéma 5 ou 6
+    /// en lecture seule, le contexte de ses références d'analyse).
+    pub fn file_contexts(&self) -> Result<std::collections::HashMap<String, String>> {
+        let sql = if self.version < SCHEMA_VERSION {
+            FILE_CONTEXTS_LEGACY_SQL
+        } else {
+            FILE_CONTEXTS_SQL
+        };
+        let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(db_err)
     }
 
     /// Références avec leur origine (`parse` ou `llm`), dans l'ordre d'insertion. Le contexte

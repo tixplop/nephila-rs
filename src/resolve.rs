@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::error::Result;
 use crate::model::{node_id, parse_node_id, Edge, EdgeKind, Node, NodeKind, Ref, RefOrigin};
 use crate::scan::module_of;
-use crate::store::Store;
+use crate::store::{FileRef, Store};
 
 /// Bilan d'une passe de résolution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,7 +26,8 @@ pub struct ResolveStats {
 #[derive(Debug, Clone, Default)]
 pub struct Resolution {
     pub edges: Vec<Edge>,
-    pub unresolved: Vec<Ref>,
+    /// Indices (dans `refs`) des références non résolues : aucune copie de contexte (REQ-063).
+    pub unresolved: Vec<usize>,
     /// Nœuds `dependency` dérivés des références depends_on sans module du dépôt (DEC-020).
     pub dependencies: Vec<Node>,
 }
@@ -45,13 +46,39 @@ pub fn resolve(store: &mut Store) -> Result<ResolveStats> {
 
 /// Références qui ne se résolvent vers aucun nœud.
 pub fn unresolved(store: &Store) -> Result<Vec<Ref>> {
-    Ok(compute_from(store)?.unresolved)
+    let refs = store.file_refs()?;
+    let contexts = store.file_contexts()?;
+    let res = compute(&store.nodes()?, &refs, &contexts, &store.declarations()?);
+    Ok(materialize_unresolved(&res, &refs, &contexts))
+}
+
+/// Rattache à chaque non résolue le contexte de son fichier (références d'analyse seulement).
+fn materialize_unresolved(
+    res: &Resolution,
+    refs: &[FileRef],
+    contexts: &HashMap<String, String>,
+) -> Vec<Ref> {
+    res.unresolved
+        .iter()
+        .map(|&i| {
+            let fr = &refs[i];
+            Ref {
+                context: if fr.origin == RefOrigin::Parse {
+                    contexts.get(&fr.file).cloned()
+                } else {
+                    None
+                },
+                ..fr.r.clone()
+            }
+        })
+        .collect()
 }
 
 fn compute_from(store: &Store) -> Result<Resolution> {
     Ok(compute(
         &store.nodes()?,
-        &store.refs_with_origin()?,
+        &store.file_refs()?,
+        &store.file_contexts()?,
         &store.declarations()?,
     ))
 }
@@ -62,7 +89,15 @@ struct FileContext {
     imports: Vec<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Compteur de test des appels de `parse_context` (AC-063-4).
+    static PARSE_CONTEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn parse_context(ctx: Option<&str>) -> FileContext {
+    #[cfg(test)]
+    PARSE_CONTEXT_CALLS.with(|c| c.set(c.get() + 1));
     let mut out = FileContext::default();
     let Some(ctx) = ctx else { return out };
     for seg in ctx.split(['\n', ';']) {
@@ -175,7 +210,13 @@ fn parent_of(q: &str) -> Option<&str> {
 
 /// Ordre : nom exact, imports, même package, nom simple (ou suffixe qualifié) unique.
 /// Une ambiguïté à une étape laisse la référence non résolue.
-fn resolve_ref(r: &Ref, source_kind: NodeKind, source_q: &str, idx: &Index) -> Option<String> {
+fn resolve_ref(
+    r: &Ref,
+    ctx: &FileContext,
+    source_kind: NodeKind,
+    source_q: &str,
+    idx: &Index,
+) -> Option<String> {
     let ok = |n: &Node| r.kind.allows(source_kind, n.kind);
     let single = |v: Vec<&Node>| -> Option<Option<String>> {
         match v.len() {
@@ -185,7 +226,6 @@ fn resolve_ref(r: &Ref, source_kind: NodeKind, source_q: &str, idx: &Index) -> O
         }
     };
     let name = r.target_name.trim();
-    let ctx = parse_context(r.context.as_deref());
 
     if let Some(res) = single(idx.exact(name, &ok)) {
         return res;
@@ -264,19 +304,28 @@ fn derived_package(kind: NodeKind, q: &str) -> Option<String> {
 }
 
 /// Calcule les liens résolus, les liens `contains` dérivés et les références non résolues.
+/// `contexts` donne le texte d'imports de chaque fichier ; il est analysé une fois par fichier
+/// (REQ-063). Les non résolues sont rendues par indice dans `refs`, sans copie de contexte.
 pub fn compute(
     nodes: &[Node],
-    refs: &[(Ref, RefOrigin)],
+    refs: &[FileRef],
+    contexts: &HashMap<String, String>,
     declarations: &[(String, String)],
 ) -> Resolution {
     let idx = Index::new(nodes);
+    let parsed: HashMap<&str, FileContext> = contexts
+        .iter()
+        .map(|(f, c)| (f.as_str(), parse_context(Some(c))))
+        .collect();
+    let empty = FileContext::default();
     let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     let mut out = Resolution::default();
 
     let mut dependencies: HashMap<String, Node> = HashMap::new();
-    for (r, origin) in refs {
+    for (i, fr) in refs.iter().enumerate() {
+        let (r, origin) = (&fr.r, &fr.origin);
         let Ok((skind, sq)) = parse_node_id(&r.source) else {
-            out.unresolved.push(r.clone());
+            out.unresolved.push(i);
             continue;
         };
         if !ids.contains(r.source.as_str()) {
@@ -311,7 +360,12 @@ pub fn compute(
             });
             continue;
         }
-        match resolve_ref(r, skind, sq, &idx) {
+        let ctx = if *origin == RefOrigin::Parse {
+            parsed.get(fr.file.as_str()).unwrap_or(&empty)
+        } else {
+            &empty
+        };
+        match resolve_ref(r, ctx, skind, sq, &idx) {
             Some(target) => out.edges.push(Edge {
                 source: r.source.clone(),
                 target,
@@ -319,7 +373,7 @@ pub fn compute(
             }),
             // Une mention issue de l'analyse syntaxique non résolue est normale (texte libre).
             None if r.kind == EdgeKind::Mentions && *origin == RefOrigin::Parse => {}
-            None => out.unresolved.push(r.clone()),
+            None => out.unresolved.push(i),
         }
     }
     out.dependencies = dependencies.into_values().collect();
@@ -1418,11 +1472,13 @@ mod tests {
         let src_id = source.id.clone();
         let mut nodes = vec![source];
         nodes.extend(others);
-        let refs = vec![(
-            rf(&src_id, EdgeKind::Calls, target, Some(ctx)),
-            RefOrigin::Parse,
-        )];
-        (compute(&nodes, &refs, &[]), src_id)
+        let refs = vec![FileRef {
+            r: rf(&src_id, EdgeKind::Calls, target, None),
+            origin: RefOrigin::Parse,
+            file: "S".into(),
+        }];
+        let contexts = HashMap::from([("S".to_string(), ctx.to_string())]);
+        (compute(&nodes, &refs, &contexts, &[]), src_id)
     }
     fn calls_of(r: &Resolution, src: &str) -> Vec<String> {
         r.edges
@@ -1488,5 +1544,374 @@ mod tests {
             jvm_nodes(),
         );
         assert_eq!(calls_of(&r, &id), vec![mid("com.b.Foo.bar")]);
+    }
+
+    /// Oracle : `parse_context`, `resolve_ref` et `compute` de la 0.20.0 (contexte par référence).
+    mod oracle {
+        use super::super::*;
+
+        fn parse_context(ctx: Option<&str>) -> FileContext {
+            let mut out = FileContext::default();
+            let Some(ctx) = ctx else { return out };
+            for seg in ctx.split(['\n', ';']) {
+                let seg = seg.trim();
+                if let Some(p) = seg.strip_prefix("package ") {
+                    let p = p.trim();
+                    if !p.is_empty() {
+                        out.package = Some(p.to_string());
+                    }
+                } else if let Some(i) = seg.strip_prefix("import ") {
+                    let i = i.trim();
+                    let i = i.strip_prefix("static ").map_or(i, str::trim);
+                    if !i.is_empty() {
+                        out.imports.push(i.to_string());
+                    }
+                }
+            }
+            out
+        }
+
+        fn resolve_ref(
+            r: &Ref,
+            source_kind: NodeKind,
+            source_q: &str,
+            idx: &Index,
+        ) -> Option<String> {
+            let ok = |n: &Node| r.kind.allows(source_kind, n.kind);
+            let single = |v: Vec<&Node>| -> Option<Option<String>> {
+                match v.len() {
+                    0 => None,
+                    1 => Some(Some(v[0].id.clone())),
+                    _ => Some(None),
+                }
+            };
+            let name = r.target_name.trim();
+            let ctx = parse_context(r.context.as_deref());
+
+            if let Some(res) = single(idx.exact(name, &ok)) {
+                return res;
+            }
+
+            // Imports du fichier : le premier segment du nom désigne le type importé.
+            let first = name.split('.').next().unwrap_or(name);
+            let rest = &name[first.len()..];
+            let mut imported: Vec<String> = Vec::new();
+            for imp in &ctx.imports {
+                if let Some(pkg) = imp.strip_suffix(".*") {
+                    imported.push(format!("{pkg}.{name}"));
+                } else if last_segment(imp) == first {
+                    imported.push(format!("{imp}{rest}"));
+                }
+            }
+            imported.sort();
+            imported.dedup();
+            // Un import explicite l'emporte sur un import à joker.
+            let explicit: Vec<&String> = imported
+                .iter()
+                .filter(|c| {
+                    ctx.imports.iter().any(|i| {
+                        !i.ends_with(".*") && (**c == *i || c.starts_with(&format!("{i}.")))
+                    })
+                })
+                .collect();
+            for group in [explicit, imported.iter().collect()] {
+                let mut found: Vec<&Node> = Vec::new();
+                for cand in group {
+                    found.extend(idx.exact(cand, &ok));
+                }
+                found.sort_by(|a, b| a.id.cmp(&b.id));
+                found.dedup_by(|a, b| a.id == b.id);
+                if let Some(res) = single(found) {
+                    return res;
+                }
+            }
+
+            // Membre d'un type importé (`T.m`) que les imports n'ont pas résolu : si le nom du type
+            // désigne plusieurs types du dépôt, le receveur est ambigu, donc la référence reste non
+            // résolue (un lien manquant plutôt qu'un lien faux, DEC-021).
+            if !rest.is_empty()
+                && ctx
+                    .imports
+                    .iter()
+                    .any(|i| !i.ends_with(".*") && last_segment(i) == first)
+                && idx
+                    .suffix(first, &|n: &Node| n.kind == NodeKind::Type)
+                    .len()
+                    > 1
+            {
+                return None;
+            }
+
+            // Même package que la source.
+            let package = ctx
+                .package
+                .clone()
+                .or_else(|| derived_package(source_kind, source_q));
+            if let Some(pkg) = package.filter(|p| !p.is_empty()) {
+                if let Some(res) = single(idx.exact(&format!("{pkg}.{name}"), &ok)) {
+                    return res;
+                }
+            }
+
+            single(idx.suffix(name, &ok)).flatten()
+        }
+
+        #[derive(Default)]
+        pub struct OracleResolution {
+            pub edges: Vec<Edge>,
+            pub unresolved: Vec<Ref>,
+            pub dependencies: Vec<Node>,
+        }
+
+        pub fn compute(
+            nodes: &[Node],
+            refs: &[(Ref, RefOrigin)],
+            declarations: &[(String, String)],
+        ) -> OracleResolution {
+            let idx = Index::new(nodes);
+            let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+            let mut out = OracleResolution::default();
+
+            let mut dependencies: HashMap<String, Node> = HashMap::new();
+            for (r, origin) in refs {
+                let Ok((skind, sq)) = parse_node_id(&r.source) else {
+                    out.unresolved.push(r.clone());
+                    continue;
+                };
+                if !ids.contains(r.source.as_str()) {
+                    continue;
+                }
+                // depends_on vise des coordonnées : module du dépôt, sinon dépendance dérivée (DEC-020).
+                if r.kind == EdgeKind::DependsOn && skind == NodeKind::Module {
+                    let name = r.target_name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let module = node_id(NodeKind::Module, name);
+                    let target = if ids.contains(module.as_str()) {
+                        module
+                    } else {
+                        let dep = Node::new(
+                            NodeKind::Dependency,
+                            name,
+                            name.rsplit(':').next().unwrap_or(name),
+                            None,
+                            None,
+                            None,
+                        );
+                        let id = dep.id.clone();
+                        dependencies.entry(id.clone()).or_insert(dep);
+                        id
+                    };
+                    out.edges.push(Edge {
+                        source: r.source.clone(),
+                        target,
+                        kind: r.kind,
+                    });
+                    continue;
+                }
+                match resolve_ref(r, skind, sq, &idx) {
+                    Some(target) => out.edges.push(Edge {
+                        source: r.source.clone(),
+                        target,
+                        kind: r.kind,
+                    }),
+                    // Une mention issue de l'analyse syntaxique non résolue est normale (texte libre).
+                    None if r.kind == EdgeKind::Mentions && *origin == RefOrigin::Parse => {}
+                    None => out.unresolved.push(r.clone()),
+                }
+            }
+            out.dependencies = dependencies.into_values().collect();
+            out.dependencies.sort_by(|a, b| a.id.cmp(&b.id));
+
+            derive_contains(nodes, declarations, &idx, &mut out.edges);
+
+            let mut seen = HashSet::new();
+            out.edges
+                .retain(|e| seen.insert((e.source.clone(), e.target.clone(), e.kind)));
+            out
+        }
+    }
+
+    /// Générateur congruentiel à graine fixe (sans dépendance).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % n
+        }
+        fn pick<'a>(&mut self, v: &'a [&'a str]) -> &'a str {
+            v[self.next(v.len())]
+        }
+    }
+
+    const PKGS: [&str; 4] = ["p0", "p1", "p2", "p3"];
+    const NAMES: [&str; 5] = ["A", "B", "C", "D", "E"];
+
+    fn random_context(g: &mut Lcg) -> Option<String> {
+        if g.next(5) == 0 {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if g.next(4) != 0 {
+            parts.push(format!("package {}", g.pick(&PKGS)));
+        }
+        for _ in 0..g.next(4) {
+            let pkg = g.pick(&PKGS);
+            let name = g.pick(&NAMES);
+            parts.push(match g.next(4) {
+                0 => format!("import {pkg}.*"),
+                1 => format!("import static {pkg}.{name}.m1"),
+                _ => format!("import {pkg}.{name}"),
+            });
+        }
+        let sep = if g.next(2) == 0 {
+            "
+"
+        } else {
+            ";"
+        };
+        Some(parts.join(sep))
+    }
+
+    fn random_env(seed: u64) -> Env {
+        let mut g = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7));
+        let nfiles = 3 + g.next(6);
+        let exts = ["java", "kt", "ts"];
+        let files: Vec<String> = (0..nfiles)
+            .map(|i| format!("f{i}.{}", exts[g.next(3)]))
+            .collect();
+        let mut all: Vec<&str> = files.iter().map(String::as_str).collect();
+        all.push("pom.xml");
+        let mut e = env(&all);
+        let targets = [
+            "A", "B", "C", "D", "E", "A.m1", "B.m2", "p0.A", "p1.B.m1", "p2.C", "p3.D.m2", "m1",
+            "Zzz", "E.m1",
+        ];
+        for f in &files {
+            let mut nodes = Vec::new();
+            let mut sources = Vec::new();
+            for _ in 0..1 + g.next(3) {
+                let q = format!("{}.{}", g.pick(&PKGS), g.pick(&NAMES));
+                nodes.push(ty(&q, f));
+                sources.push(tid(&q));
+                for j in 0..g.next(3) {
+                    let mq = format!("{q}.m{}", j + 1);
+                    nodes.push(method(&mq, f));
+                    sources.push(mid(&mq));
+                }
+            }
+            let ctx = random_context(&mut g);
+            let kinds = [EdgeKind::Calls, EdgeKind::Imports, EdgeKind::Extends];
+            let refs: Vec<Ref> = (0..g.next(8))
+                .map(|_| {
+                    let s = sources[g.next(sources.len())].clone();
+                    rf(&s, kinds[g.next(3)], g.pick(&targets), ctx.as_deref())
+                })
+                .collect();
+            e.store.replace_file(f, &nodes, &refs).unwrap();
+            if g.next(3) == 0 {
+                let llm: Vec<Ref> = (0..1 + g.next(2))
+                    .map(|_| {
+                        let s = sources[g.next(sources.len())].clone();
+                        rf(&s, EdgeKind::Calls, g.pick(&targets), None)
+                    })
+                    .collect();
+                e.store
+                    .apply_enrichment(f, "h", "m", &[], &[], &llm)
+                    .unwrap();
+            }
+        }
+        e.store
+            .replace_file(
+                "pom.xml",
+                &[plain(NodeKind::Module, "m", Some("pom.xml"))],
+                &[rf(
+                    &node_id(NodeKind::Module, "m"),
+                    EdgeKind::DependsOn,
+                    "org.x:lib",
+                    None,
+                )],
+            )
+            .unwrap();
+        e
+    }
+
+    #[test]
+    fn req063_ac3_same_result_as_per_reference_context_oracle() {
+        let mut with_ctx = 0;
+        for seed in 0..200 {
+            let e = random_env(seed);
+            let refs = e.store.refs_with_origin().unwrap();
+            if refs.iter().any(|(r, _)| r.context.is_some()) {
+                with_ctx += 1;
+            }
+            let want = oracle::compute(
+                &e.store.nodes().unwrap(),
+                &refs,
+                &e.store.declarations().unwrap(),
+            );
+            let got = compute_from(&e.store).unwrap();
+            let got_unresolved = materialize_unresolved(
+                &got,
+                &e.store.file_refs().unwrap(),
+                &e.store.file_contexts().unwrap(),
+            );
+            assert_eq!(
+                format!("{:?}", got.edges),
+                format!("{:?}", want.edges),
+                "{seed}"
+            );
+            assert_eq!(got_unresolved, want.unresolved, "graine {seed}");
+            assert_eq!(
+                format!("{:?}", got.dependencies),
+                format!("{:?}", want.dependencies),
+                "{seed}"
+            );
+            assert_eq!(unresolved(&e.store).unwrap(), want.unresolved, "{seed}");
+        }
+        assert!(with_ctx > 100, "générateur trop pauvre : {with_ctx}");
+    }
+
+    #[test]
+    fn req063_ac4_context_parsed_once_per_file() {
+        let mut e = env(&[
+            "a1.java", "a2.java", "a3.java", "a4.java", "a5.java", "b1.md", "b2.md",
+        ]);
+        let sizes = [1usize, 7, 40, 3, 12];
+        for (i, n) in sizes.iter().enumerate() {
+            let f = format!("a{}.java", i + 1);
+            let q = format!("p.T{i}");
+            let refs: Vec<Ref> = (0..*n)
+                .map(|k| {
+                    rf(
+                        &tid(&q),
+                        EdgeKind::Imports,
+                        &format!("X{k}"),
+                        Some(
+                            "package p;
+import q.R;",
+                        ),
+                    )
+                })
+                .collect();
+            e.store.replace_file(&f, &[ty(&q, &f)], &refs).unwrap();
+        }
+        for f in ["b1.md", "b2.md"] {
+            let q = format!("p.{f}");
+            e.store
+                .replace_file(
+                    f,
+                    &[ty(&q, f)],
+                    &[rf(&tid(&q), EdgeKind::Imports, "Y", None)],
+                )
+                .unwrap();
+        }
+        PARSE_CONTEXT_CALLS.with(|c| c.set(0));
+        resolve(&mut e.store).unwrap();
+        assert_eq!(PARSE_CONTEXT_CALLS.with(|c| c.get()), 5);
     }
 }
