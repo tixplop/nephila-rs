@@ -25,6 +25,27 @@ pub const SCHEMA_VERSION: i32 = 6;
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
 
+/// Requêtes de résolution d'un nom (DEC-066), toutes sur index.
+pub(crate) const RESOLVE_ID: &str =
+    "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes WHERE id = ?1";
+pub(crate) const RESOLVE_QUALIFIED: &str =
+    "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes WHERE qualified = ?1";
+pub(crate) const RESOLVE_SHORT: &str =
+    "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes WHERE short = ?1";
+/// Suffixe : `?1` = inverse du nom suivi du caractère de frontière, `?2` = le même avec le
+/// caractère suivant (comparaison binaire = ordre des points de code en UTF-8).
+pub(crate) const RESOLVE_SUFFIX: &str =
+    "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes
+     WHERE qualified_rev >= ?1 AND qualified_rev < ?2";
+/// Requête de la 0.18.0, pour un schéma 5 ouvert en lecture seule.
+pub(crate) const RESOLVE_LEGACY: &str =
+    "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes
+     WHERE id = ?1 OR qualified = ?1 OR short = ?1
+        OR (length(qualified) > length(?1) AND substr(qualified, -length(?1)) = ?1)
+     ORDER BY id";
+/// Caractères de frontière de segment et leur successeur immédiat.
+const RESOLVE_BOUNDARIES: [(char, char); 4] = [('.', '/'), ('#', '$'), ('/', '0'), (':', ';')];
+
 const SCHEMA: &str = include_str!("schema.sql");
 
 /// Nom qualifié aux caractères Unicode inversés : valeur de `nodes.qualified_rev`. Seule
@@ -668,18 +689,31 @@ impl Store {
     /// Nœuds susceptibles de correspondre à un nom saisi : identifiant, nom qualifié ou nom court
     /// égal à `name`, ou nom qualifié terminé par `name`. Triés par identifiant. L'appelant
     /// affine (frontière de segment).
+    ///
+    /// Schéma 6 : requêtes séparées sur index, réunies ici (DEC-066). Schéma 5 (lecture seule) :
+    /// requête de la 0.18.0.
     pub fn nodes_matching(&self, name: &str) -> Result<Vec<Node>> {
-        let mut st = self
-            .conn
-            .prepare(
-                "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes
-                 WHERE id = ?1 OR qualified = ?1 OR short = ?1
-                    OR (length(qualified) > length(?1) AND substr(qualified, -length(?1)) = ?1)
-                 ORDER BY id",
-            )
-            .map_err(db_err)?;
+        if self.version < SCHEMA_VERSION {
+            return self.run_resolve(RESOLVE_LEGACY, [name].as_slice());
+        }
+        let mut found = self.run_resolve(RESOLVE_ID, [name].as_slice())?;
+        found.extend(self.run_resolve(RESOLVE_QUALIFIED, [name].as_slice())?);
+        found.extend(self.run_resolve(RESOLVE_SHORT, [name].as_slice())?);
+        let rev = reverse_qualified(name);
+        for (c, next) in RESOLVE_BOUNDARIES {
+            let lo = format!("{rev}{c}");
+            let hi = format!("{rev}{next}");
+            found.extend(self.run_resolve(RESOLVE_SUFFIX, [lo.as_str(), hi.as_str()].as_slice())?);
+        }
+        found.sort_by(|a, b| a.id.cmp(&b.id));
+        found.dedup_by(|a, b| a.id == b.id);
+        Ok(found)
+    }
+
+    pub(crate) fn run_resolve(&self, sql: &str, params: &[&str]) -> Result<Vec<Node>> {
+        let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
         let rows = st
-            .query_map([name], |r| {
+            .query_map(rusqlite::params_from_iter(params.iter()), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -1857,6 +1891,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rev, "bil:ïnü.gro");
+    }
+
+    #[test]
+    fn req057_ac1_resolution_queries_use_indexes() {
+        let dir = tempdir().unwrap();
+        let st = Store::open_or_create(dir.path()).unwrap();
+        let plans = [
+            (RESOLVE_ID, 1, None),
+            (RESOLVE_QUALIFIED, 1, None),
+            (RESOLVE_SHORT, 1, None),
+            (RESOLVE_SUFFIX, 2, Some("idx_nodes_qualified_rev")),
+        ];
+        for (sql, n, index) in plans {
+            let params: Vec<&str> = ["a", "b"][..n].to_vec();
+            let mut stmt = st
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let details: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(params), |r| r.get(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(!details.is_empty());
+            for d in &details {
+                assert!(!d.contains("SCAN nodes"), "{sql} : {d}");
+            }
+            if let Some(i) = index {
+                assert!(details.iter().any(|d| d.contains(i)), "{details:?}");
+            }
+        }
     }
 
     /// Ramène un graphe de schéma 6 au schéma 5.
