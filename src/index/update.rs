@@ -171,7 +171,8 @@ pub fn update(
         &mut store,
         &mut report,
     )?;
-    build::finalize(&mut store, llm, opts, repo, &mut report)?;
+    let abs = build::abs_paths(&d.scanned);
+    build::finalize(&mut store, llm, opts, repo, &abs, &mut report)?;
     Ok(Some(report))
 }
 

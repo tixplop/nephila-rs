@@ -42,6 +42,8 @@ pub struct ScannedFile {
     pub mtime: i64,
     /// Dossier (relatif, `""` = racine) du fichier de build ancêtre le plus proche.
     pub module: Option<String>,
+    /// Chemin réel (celui du parcours), par lequel le fichier est lu (DEC-070).
+    pub abs: PathBuf,
     /// `true` si l'empreinte a été calculée (et non réutilisée).
     pub rehashed: bool,
 }
@@ -203,7 +205,6 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
         excluded: walked.excluded,
         ..ScanResult::default()
     };
-    let mut abs_paths: HashMap<String, PathBuf> = HashMap::new();
     for WalkedFile {
         path: rel,
         abs,
@@ -232,13 +233,13 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
                 (blake3::hash(&bytes).to_hex().to_string(), true)
             }
         };
-        abs_paths.insert(rel.clone(), abs);
         res.files.push(ScannedFile {
             path: rel,
             hash,
             size,
             mtime,
             module: None,
+            abs,
             rehashed,
         });
     }
@@ -263,9 +264,8 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
             )
         })
         .map(|f| {
-            let name = abs_paths
-                .get(&f.path)
-                .and_then(|p| std::fs::read_to_string(p).ok())
+            let name = std::fs::read_to_string(&f.abs)
+                .ok()
                 .and_then(|t| crate::parse::gradle::root_project_name(&t));
             (
                 f.path.rsplit_once('/').map_or("", |(d, _)| d).to_string(),

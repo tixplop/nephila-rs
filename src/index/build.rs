@@ -1,6 +1,7 @@
 //! Commande `build` : reconstruction complète du graphe (REQ-009, REQ-006).
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::{Config, ProjectSettings, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS};
@@ -328,8 +329,17 @@ pub fn build(
         &mut store,
         &mut report,
     )?;
-    finalize(&mut store, llm, opts, repo, &mut report)?;
+    let abs = abs_paths(&scanned.files);
+    finalize(&mut store, llm, opts, repo, &abs, &mut report)?;
     Ok(report)
+}
+
+/// Chemin converti (celui du graphe) vers chemin réel, pour les lectures (DEC-070).
+pub(crate) fn abs_paths(files: &[crate::scan::ScannedFile]) -> HashMap<String, PathBuf> {
+    files
+        .iter()
+        .map(|f| (f.path.clone(), f.abs.clone()))
+        .collect()
 }
 
 /// Fin commune à `build` et `update` : résolution et résumé global (graphe interrogeable), puis
@@ -339,6 +349,7 @@ pub(crate) fn finalize(
     llm: Option<&dyn Llm>,
     opts: &IndexOptions,
     repo: &Path,
+    abs: &HashMap<String, PathBuf>,
     report: &mut BuildReport,
 ) -> Result<()> {
     store.prune_enrichments()?;
@@ -348,7 +359,7 @@ pub(crate) fn finalize(
         let files = store.files_to_enrich()?;
         // Sans fichier à enrichir, le graphe n'a pas changé : pas de seconde résolution.
         if !files.is_empty() {
-            enrich::enrich_all(repo, &files, opts, llm, store, report)?;
+            enrich::enrich_all(repo, abs, &files, opts, llm, store, report)?;
             stats = resolve_pass(store)?;
         }
     }

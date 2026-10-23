@@ -2,7 +2,7 @@
 //! fichiers « à enrichir », avec la politique d'échec de DEC-015 / DEC-022.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -189,11 +189,13 @@ enum Step<'a> {
 }
 
 /// Exécute une unité `Lot` ou `Big`. Un fichier illisible échoue seul et sort du lot.
+#[allow(clippy::too_many_arguments)]
 fn run_unit<'a>(
     unit: &Unit<'a>,
     repo: &Path,
     max_chunk_chars: usize,
     llm: &dyn Llm,
+    abs: &HashMap<String, PathBuf>,
     ids: &HashMap<String, Vec<(String, String)>>,
     retries: u32,
     stop: &AtomicBool,
@@ -206,7 +208,11 @@ fn run_unit<'a>(
     let mut outcomes = Vec::new();
     let mut readable: Vec<(&'a FileRecord, String)> = Vec::new();
     for f in files {
-        match std::fs::read_to_string(repo.join(&f.path)) {
+        let real = abs
+            .get(&f.path)
+            .cloned()
+            .unwrap_or_else(|| repo.join(&f.path));
+        match std::fs::read_to_string(real) {
             Ok(t) => readable.push((f, t)),
             Err(e) => outcomes.push(Outcome::Failed(
                 f.path.clone(),
@@ -773,6 +779,7 @@ fn apply_done(
 /// Pool de threads LLM ; le thread courant écrit une transaction par fichier.
 pub(crate) fn enrich_all(
     repo: &Path,
+    abs: &HashMap<String, PathBuf>,
     files: &[FileRecord],
     opts: &IndexOptions,
     llm: &dyn Llm,
@@ -781,6 +788,7 @@ pub(crate) fn enrich_all(
 ) -> Result<()> {
     enrich_with_stop(
         repo,
+        abs,
         files,
         opts,
         llm,
@@ -792,8 +800,10 @@ pub(crate) fn enrich_all(
 }
 
 /// Corps d'`enrich_all` avec le drapeau d'arrêt injecté (DEC-047) ; rend les fichiers en échec.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn enrich_with_stop(
     repo: &Path,
+    abs: &HashMap<String, PathBuf>,
     files: &[FileRecord],
     opts: &IndexOptions,
     llm: &dyn Llm,
@@ -909,6 +919,7 @@ pub(crate) fn enrich_with_stop(
                                 repo,
                                 max_chunk_chars,
                                 llm,
+                                abs,
                                 ids,
                                 format_retries,
                                 stop,
@@ -1752,6 +1763,7 @@ mod tests {
         };
         let mut failures = enrich_with_stop(
             dir.path(),
+            &HashMap::new(),
             &files,
             &opts,
             &llm,
@@ -1819,6 +1831,7 @@ mod tests {
         progress::take_captured();
         enrich_with_stop(
             dir.path(),
+            &HashMap::new(),
             &files,
             &opts,
             &Lots,
@@ -1974,6 +1987,7 @@ mod tests {
         };
         let failures = enrich_with_stop(
             dir.path(),
+            &HashMap::new(),
             files,
             &opts,
             llm,

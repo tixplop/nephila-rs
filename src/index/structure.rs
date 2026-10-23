@@ -70,7 +70,7 @@ pub(crate) fn analyze(
                     else {
                         break;
                     };
-                    let outcome = match std::fs::read_to_string(repo.join(&file.path)) {
+                    let outcome = match std::fs::read_to_string(&file.abs) {
                         Err(e) => Outcome::Failed(
                             file.path.clone(),
                             Error::Message(format!("lecture de {} impossible : {e}", file.path)),
@@ -326,7 +326,15 @@ mod tests {
             ]
         );
         let opts = IndexOptions::default();
-        finalize(&mut store, None, &opts, repo, &mut report).unwrap();
+        finalize(
+            &mut store,
+            None,
+            &opts,
+            repo,
+            &std::collections::HashMap::new(),
+            &mut report,
+        )
+        .unwrap();
         assert_eq!((report.processed, report.failed, report.pending), (1, 1, 1));
         let state = |store: &Store, p: &str| {
             store
