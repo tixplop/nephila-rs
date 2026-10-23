@@ -9,11 +9,29 @@ pub mod mock;
 pub mod openai;
 pub mod retry;
 
-use crate::config::{Config, Provider};
+use crate::config::{Config, Effort, Provider};
 use crate::error::{Error, Result};
 pub use ask::AskReply;
 pub use enrich::{Enrichment, LotItem};
 pub use retry::with_format_retries;
+
+/// Options de génération communes aux fournisseurs HTTP (REQ-058, DEC-072).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Generation {
+    pub effort: Effort,
+    pub thinking: bool,
+    pub max_output_tokens: u32,
+}
+
+impl Default for Generation {
+    fn default() -> Generation {
+        Generation {
+            effort: crate::config::DEFAULT_EFFORT,
+            thinking: false,
+            max_output_tokens: crate::config::DEFAULT_MAX_OUTPUT_TOKENS,
+        }
+    }
+}
 
 /// Fournisseur LLM. Les implémentations sont partagées entre threads.
 pub trait Llm: Send + Sync {
@@ -138,6 +156,11 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
             );
         }
     }
+    let gen = Generation {
+        effort: config.effort,
+        thinking: config.thinking,
+        max_output_tokens: config.max_output_tokens,
+    };
     match config.provider {
         Provider::Mock => Ok(Box::new(mock::MockLlm::from_env()?)),
         Provider::Anthropic => {
@@ -153,6 +176,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     config.timeout_secs,
                     &tls,
                     config.concurrency,
+                    gen,
                 )
                 .with_retry(retry),
             ))
@@ -167,6 +191,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     config.timeout_secs,
                     &tls,
                     config.concurrency,
+                    gen,
                 )
                 .with_retry(retry),
             ))

@@ -11,7 +11,7 @@ mod fake_server;
 use fake_server::FakeServer;
 
 const LABEL: &str = "réponse tronquée par la limite de jetons";
-const ADVICE: &str = "réduisez max_chunk_chars ou batch_files";
+const ADVICE: &str = "réduisez max_chunk_chars ou batch_files, ou augmentez max_output_tokens";
 const SECRET: &str = "SECRET_REPONSE_42";
 const A_GOOD: &str =
     r#"{"version": 2, "summaries": [{"node": "type:A", "summary": "Classe A."}], "concepts": []}"#;
@@ -304,6 +304,59 @@ fn req046_ac5_lot_tronque_deux_fichiers_nommes() {
     assert_eq!(s.to_enrich_paths(), ["A.java", "B.java"]);
 }
 
+#[test]
+fn req046_ac14_conseil_inchange_avec_thinking_et_sans_fuite_de_champs() {
+    for provider in ["anthropic", "openai"] {
+        let s = Setup::new(
+            provider,
+            many(provider, 10),
+            "thinking = true\neffort = \"high\"\n",
+        );
+        s.write("A.java", A_JAVA);
+        for verbose in [false, true] {
+            let mut args = vec!["build"];
+            if verbose {
+                args.push("--verbose");
+            }
+            let o = s.run(&args);
+            let e = err(&o);
+            let warns: Vec<&str> = e
+                .lines()
+                .filter(|l| l.starts_with("avertissement:"))
+                .collect();
+            assert_eq!(warns, [a5("A.java")], "{provider} {e}");
+            for bad in ["max_tokens", "max_completion_tokens", "reasoning_effort"] {
+                assert!(!e.contains(bad), "{provider} {bad} dans {e}");
+            }
+            for l in e.lines().filter(|l| l.starts_with("trace:")) {
+                if !l.contains("config:") {
+                    assert!(
+                        !l.contains("augmentez") && !l.contains("max_output_tokens"),
+                        "{l}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn req046_ac14_lot_tronque_deux_lignes_dans_l_ordre() {
+    let s = Setup::new("anthropic", many("anthropic", 10), "batch_files = 2\n");
+    s.write("A.java", "public class A {}\n");
+    s.write("B.java", "public class B {}\n");
+    let o = s.run(&["build"]);
+    for bad in ["max_tokens", "max_completion_tokens", "reasoning_effort"] {
+        assert!(!err(&o).contains(bad), "{bad} dans {}", err(&o));
+    }
+    let warns: Vec<String> = err(&o)
+        .lines()
+        .filter(|l| l.starts_with("avertissement:"))
+        .map(String::from)
+        .collect();
+    assert_eq!(warns, [a5("A.java"), a5("B.java")], "{}", err(&o));
+}
+
 fn big_text() -> String {
     let mut text = String::from("public class A {\n");
     for i in 0..60 {
@@ -405,7 +458,7 @@ fn req046_ac9_ligne_a5_identique_quelle_que_soit_la_politique() {
 // ---- T-101 : `query ask`, traces `--verbose` et progression ----
 
 const E11: &str =
-    "erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée";
+    "erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée ou augmentez max_output_tokens";
 
 impl Setup {
     fn run_env(&self, args: &[&str], no_color: bool) -> Output {

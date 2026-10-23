@@ -501,6 +501,9 @@ fn req055_ac2_ask_request_body_identical_to_0_18_0() {
         serde_json::json!({"content":[{"type":"text","text":reply}]}).to_string(),
     )]);
     http_env(&env, &server);
+    let mut cfg = fs::read_to_string(&env.config).unwrap();
+    cfg.push_str("max_output_tokens = 8192\n");
+    fs::write(&env.config, cfg).unwrap();
     let o = env
         .cmd(&["query", "ask", Q])
         .env("NEPHILA_TEST_ASK_KEY", "sk-test")

@@ -38,6 +38,7 @@ fn anthropic(s: &FakeServer) -> AnthropicLlm {
         30,
         &Tls::default(),
         1,
+        Default::default(),
     )
     .with_retry(Retry::from_millis(1))
 }
@@ -50,6 +51,7 @@ fn openai(s: &FakeServer, key: Option<&str>) -> OpenAiLlm {
         30,
         &Tls::default(),
         1,
+        Default::default(),
     )
     .with_retry(Retry::from_millis(1))
 }
@@ -96,8 +98,16 @@ fn req002_ac3_connection_refused_is_network() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://{}", l.local_addr().unwrap())
     };
-    let llm = AnthropicLlm::new(Some(url), "m".into(), "k".into(), 30, &Tls::default(), 1)
-        .with_retry(Retry::from_millis(1));
+    let llm = AnthropicLlm::new(
+        Some(url),
+        "m".into(),
+        "k".into(),
+        30,
+        &Tls::default(),
+        1,
+        Default::default(),
+    )
+    .with_retry(Retry::from_millis(1));
     assert!(matches!(
         llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()),
         Err(Error::Network(_))
@@ -183,6 +193,7 @@ fn req002_ac5_base_url_trailing_slash_is_tolerated() {
         30,
         &Tls::default(),
         1,
+        Default::default(),
     );
     llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()).unwrap();
     assert_eq!(s.requests()[0].path, "/v1/messages");
@@ -260,6 +271,7 @@ fn req002_ac8_slow_server_gives_timeout_error() {
         1,
         &Tls::default(),
         1,
+        Default::default(),
     );
     let t = std::time::Instant::now();
     let r = llm.enrich("A.java", 1, "class A {}", &a_ids(), &a_ids());
@@ -277,6 +289,7 @@ fn req002_ac8_openai_slow_server_gives_timeout_error() {
         1,
         &Tls::default(),
         1,
+        Default::default(),
     );
     let r = llm.enrich("A.java", 1, "x", &a_ids(), &a_ids());
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
@@ -292,6 +305,7 @@ fn req002_ac8_fast_server_succeeds_within_timeout() {
         1,
         &Tls::default(),
         1,
+        Default::default(),
     );
     assert_eq!(
         llm.enrich("A.java", 1, "class A {}", &a_ids(), &a_ids())

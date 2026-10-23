@@ -153,9 +153,9 @@ pub fn answer(
     let stop = AtomicBool::new(false);
     let reply = with_format_retries(format_retries, &stop, |_| llm.ask(question, &context))
         .map_err(|e| match e {
-            Error::Truncated(_) => {
-                Error::Truncated(format!("{TRUNCATED} ; posez une question plus ciblée"))
-            }
+            Error::Truncated(_) => Error::Truncated(format!(
+                "{TRUNCATED} ; posez une question plus ciblée ou augmentez max_output_tokens"
+            )),
             other => other,
         })?;
     match reply {

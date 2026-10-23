@@ -109,7 +109,8 @@ impl Unit<'_> {
 }
 
 /// Nombre maximal de nœuds demandés par appel d'enrichissement (DEC-058) : environ 40 jetons par
-/// résumé, ce qui reste sous `max_tokens = 8192` ; non configurable.
+/// résumé, soit environ 6 000 jetons, sous la limite par défaut
+/// (`DEFAULT_MAX_OUTPUT_TOKENS`) ; un `max_output_tokens` plus bas configuré peut tronquer la réponse.
 const MAX_NODES_PER_CALL: usize = 150;
 
 /// Nombre maximal d'appels d'enrichissement pour un fichier envoyé seul (DEC-059, non
@@ -293,7 +294,7 @@ fn trace_detail(e: &Error) -> String {
 fn truncation_advice(e: Error) -> Error {
     match e {
         Error::Truncated(_) => Error::Truncated(format!(
-            "{TRUNCATED} ; réduisez max_chunk_chars ou batch_files"
+            "{TRUNCATED} ; réduisez max_chunk_chars ou batch_files, ou augmentez max_output_tokens"
         )),
         other => other,
     }
