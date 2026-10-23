@@ -109,15 +109,80 @@ fn perf_req021_ac2_queries() {
     let b = gen_repo::class_name(77);
     let id_a = format!("type:{}.{a}", gen_repo::package_of(4242));
     let id_b = format!("type:{}.{b}", gen_repo::package_of(77));
-    let (d, out) = best(f, &["query", "search", &a]);
-    assert_under("query search", d, 200);
-    assert!(String::from_utf8_lossy(&out.stdout).contains(&a));
-    let (d, out) = best(f, &["query", "neighbors", &id_a, "--depth", "1"]);
-    assert_under("query neighbors", d, 200);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("utilisé par"));
-    let (d, out) = best(f, &["query", "path", &id_a, &id_b]);
-    assert_under("query path", d, 200);
-    assert!(String::from_utf8_lossy(&out.stdout).contains(&b));
+    // AC-021-8 : moins de 100 ms sans `--check-stale`, moins de 200 ms avec.
+    for (flag, max_ms) in [(None, 100), (Some("--check-stale"), 200)] {
+        let with = |mut v: Vec<&'static str>, tail: &[&str]| -> Vec<String> {
+            v.extend(flag);
+            v.into_iter()
+                .map(str::to_string)
+                .chain(tail.iter().map(|t| t.to_string()))
+                .collect()
+        };
+        let label = flag.unwrap_or("sans --check-stale");
+        let run = |head: Vec<&'static str>, tail: &[&str]| {
+            let args = with(head, tail);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            best(f, &refs)
+        };
+        let (d, out) = run(vec!["query", "search"], &[&a]);
+        assert_under(&format!("query search {label}"), d, max_ms);
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&a));
+        let (d, out) = run(vec!["query", "neighbors"], &[&id_a, "--depth", "1"]);
+        assert_under(&format!("query neighbors {label}"), d, max_ms);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("utilisé par"));
+        let (d, out) = run(vec!["query", "path"], &[&id_a, &id_b]);
+        assert_under(&format!("query path {label}"), d, max_ms);
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&b));
+    }
+}
+
+/// AC-055-3 : le temps de `query ask` reste sous 1,5 fois le temps d'un mot-clé pour 32 mots-clés.
+#[test]
+#[ignore]
+fn perf_req055_ac3_ask_keywords() {
+    let _g = serial();
+    let shared = fixture();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-ask");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let config = root.join("config.toml");
+    std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    let mock = root.join("mock");
+    std::fs::create_dir_all(&mock).unwrap();
+    let cited = format!(
+        "{}.{}",
+        gen_repo::package_of(4242),
+        gen_repo::class_name(4242)
+    );
+    std::fs::write(
+        mock.join("_ask.json"),
+        serde_json::json!({"found": true, "answer": "réponse", "nodes": [cited]}).to_string(),
+    )
+    .unwrap();
+    let f = Fixture {
+        repo: shared.repo.clone(),
+        config,
+        mock,
+    };
+    let names: Vec<String> = (0..32)
+        .map(|i| {
+            assert!(100 + i * 250 < gen_repo::CODE_FILES);
+            gen_repo::class_name(100 + i * 250)
+        })
+        .collect();
+    let q1 = format!("Quel rôle joue {} ?", names[0]);
+    let q32 = format!("Quel rôle jouent {} ?", names.join(" "));
+    let (t1, o1) = best(&f, &["query", "ask", &q1]);
+    let (t32, o32) = best(&f, &["query", "ask", &q32]);
+    let ratio = t32.as_secs_f64() / t1.as_secs_f64();
+    eprintln!("ask 1 mot-clé : {t1:?} ; 32 mots-clés : {t32:?} ; rapport {ratio:.2}");
+    assert!(String::from_utf8_lossy(&o1.stdout).contains("réponse"));
+    assert!(String::from_utf8_lossy(&o32.stdout).contains("réponse"));
+    assert!(
+        t32 * 2 < t1 * 3,
+        "1 mot-clé : {t1:?} ; 32 mots-clés : {t32:?} ; rapport {ratio:.2} (seuil 1,5)"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

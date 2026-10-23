@@ -47,17 +47,21 @@ fn keywords(question: &str) -> Vec<String> {
 }
 
 /// Nœuds trouvés par les mots de la question, sans doublon, dans l'ordre de pertinence.
+/// La recherche travaille sur des références ; seuls les nœuds retenus sont copiés.
 fn find_seeds(nodes: &[Node], words: &[String]) -> Vec<Node> {
+    let prepared = search::Prepared::new(nodes);
     let mut seen = HashSet::new();
-    let mut seeds = Vec::new();
+    let mut seeds: Vec<Node> = Vec::new();
     for w in words {
-        for n in search::matches(nodes.to_vec(), w) {
-            if seen.insert(n.id.clone()) {
-                seeds.push(n);
+        for n in prepared.matches(w) {
+            if seeds.len() >= MAX_SEEDS {
+                return seeds;
+            }
+            if seen.insert(n.id.as_str()) {
+                seeds.push(n.clone());
             }
         }
     }
-    seeds.truncate(MAX_SEEDS);
     seeds
 }
 
@@ -204,4 +208,39 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::search::oracle::*;
+    use super::*;
+
+    /// `find_seeds` de la 0.18.0 (copie du graphe par mot-clé), oracle.
+    fn legacy_find_seeds(nodes: &[Node], words: &[String]) -> Vec<Node> {
+        let mut seen = HashSet::new();
+        let mut seeds = Vec::new();
+        for w in words {
+            for n in legacy_matches(nodes.to_vec(), w) {
+                if seen.insert(n.id.clone()) {
+                    seeds.push(n);
+                }
+            }
+        }
+        seeds.truncate(MAX_SEEDS);
+        seeds
+    }
+
+    #[test]
+    fn req055_ac1_find_seeds_same_ids_in_same_order_as_0_18_0() {
+        let mut rng = Lcg(1055);
+        let mut truncated = false;
+        for _ in 0..200 {
+            let nodes = random_nodes(&mut rng);
+            let words = random_words(&mut rng);
+            let old = legacy_find_seeds(&nodes, &words);
+            truncated |= old.len() == MAX_SEEDS;
+            assert_eq!(old, find_seeds(&nodes, &words), "mots {words:?}");
+        }
+        assert!(truncated, "le plafond de 20 nœuds n'est jamais atteint");
+    }
 }

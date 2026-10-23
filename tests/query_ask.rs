@@ -489,3 +489,31 @@ fn req016_ac5_ac6_ask_option_priority_over_config() {
     let o = env.ask_malformed(2, &["--format-retries", "3"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
 }
+
+/// AC-055-2 : le corps de la requête `ask` de la question d'AC-016-1 est identique octet pour
+/// octet à celui produit par la 0.18.0 (figé dans `tests/fixtures/ask_body_ac016_1.json`).
+#[test]
+fn req055_ac2_ask_request_body_identical_to_0_18_0() {
+    let env = Env::new();
+    let reply = r#"{"found":true,"answer":"billing","nodes":["BillingService"]}"#;
+    let server = FakeServer::start(vec![(
+        200,
+        serde_json::json!({"content":[{"type":"text","text":reply}]}).to_string(),
+    )]);
+    http_env(&env, &server);
+    let o = env
+        .cmd(&["query", "ask", Q])
+        .env("NEPHILA_TEST_ASK_KEY", "sk-test")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let reqs = server.requests();
+    let post = reqs
+        .iter()
+        .find(|r| r.method == "POST")
+        .expect("requête ask");
+    assert_eq!(
+        post.body,
+        include_str!("fixtures/ask_body_ac016_1.json").trim_end_matches('\n')
+    );
+}
