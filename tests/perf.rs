@@ -490,3 +490,135 @@ fn perf_req021_ac7_help_with_grammars() {
     let (d, _) = best(&f, &["--help"]);
     assert_under("--help (grammaires JS/TS)", d, 50);
 }
+
+/// Empreintes de l'export JSON des gros dépôts, sur le code de la 0.20.0 (AC-065-2) :
+/// `(dépôt, étape, empreinte BLAKE3)`. Relever de nouvelles valeurs avec `NEPHILA_ORACLE_CAPTURE=1`.
+const ORACLE_GROS_DEPOTS: &[(&str, &str, &str)] = &[
+    (
+        "gen_repo",
+        "build",
+        "697d76e547c3511c98c2dac7fd4bc241e301ad8a35d8ebfe092952b3cf870328",
+    ),
+    (
+        "gen_repo",
+        "update",
+        "df7bf978c1a5c62ad88a41501dafb0c0cd5d6d5725e6e0166b8bd91ccef1680e",
+    ),
+    (
+        "gen_js",
+        "build",
+        "39b2d29cbbf97edf2814c6f2a4ec86a0d21dd624d3608f5710864f3115b6977e",
+    ),
+    (
+        "gen_js",
+        "update",
+        "1b24971293c2e0aa4dbdaedec81518686003b0e7179b172f4deb89f0e383bd21",
+    ),
+];
+
+fn export_hash(f: &Fixture) -> String {
+    let (_, out) = timed(f, &["export", "--format", "json", "--output", "-"]);
+    blake3::hash(&out.stdout).to_hex().to_string()
+}
+
+/// AC-065-2 : l'export des gros dépôts, après `build --no-llm` puis après `update`, est celui de la 0.20.0.
+#[test]
+#[ignore]
+fn perf_req065_ac2_oracle_gros_depots() {
+    let _g = serial();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found: Vec<(&str, &str, String)> = Vec::new();
+    for name in ["gen_repo", "gen_js"] {
+        let root = base.join(format!("target/perf-oracle-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let mock = root.join("mock");
+        let edited = if name == "gen_repo" {
+            gen_repo::generate(&repo, &mock);
+            gen_repo::java_path(1234)
+        } else {
+            gen_js::generate(&repo, &mock);
+            gen_js::path(gen_js::EDITED)
+        };
+        let config = root.join("config.toml");
+        std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        let f = Fixture { repo, config, mock };
+        timed(&f, &["build", "--no-llm"]);
+        found.push((name, "build", export_hash(&f)));
+        let path = f.repo.join(edited);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let extra = if name == "gen_repo" {
+            "\nclass OracleExtra {}\n"
+        } else {
+            "\nexport function oracleExtra(): number {\n  return 1;\n}\n"
+        };
+        std::fs::write(&path, format!("{text}{extra}")).unwrap();
+        timed(&f, &["update"]);
+        found.push((name, "update", export_hash(&f)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    if std::env::var_os("NEPHILA_ORACLE_CAPTURE").is_some_and(|v| v == "1") {
+        for (n, s, h) in &found {
+            eprintln!("ORACLE (\"{n}\", \"{s}\", \"{h}\"),");
+        }
+        return;
+    }
+    assert_eq!(found.len(), ORACLE_GROS_DEPOTS.len(), "oracle non figé");
+    for ((n, s, h), (en, es, eh)) in found.iter().zip(ORACLE_GROS_DEPOTS) {
+        assert_eq!((*n, *s, h.as_str()), (*en, *es, *eh), "écart d'oracle");
+    }
+}
+
+/// Mesures de la 0.20.0 (AC-063-5), figées sur HEAD : place utilisée U₀ et Σ `length(context)` C₀.
+/// U varie de ~0,3 % d'un lancement à l'autre (ordre d'écriture des fils) : on fige le minimum des mesures relevées sur HEAD (six lancements).
+const U0_JS: i64 = 162_426_880;
+const C0_JS: i64 = 84_904_838;
+const U0_JVM: i64 = 153_509_888;
+const C0_JVM: i64 = 3_199_600;
+
+/// Place utilisée `(page_count − freelist_count) × page_size` et Σ `length(context)` de `refs`.
+fn graph_size(f: &Fixture) -> (i64, i64) {
+    let conn = rusqlite::Connection::open(f.repo.join(".nephila/graph.db")).unwrap();
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .unwrap();
+    let pragma = |p: &str| -> i64 {
+        conn.query_row(&format!("PRAGMA {p}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    let used = (pragma("page_count") - pragma("freelist_count")) * pragma("page_size");
+    let ctx: i64 = conn
+        .query_row(
+            "SELECT coalesce(sum(length(context)), 0) FROM refs",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    (used, ctx)
+}
+
+/// AC-063-5 (mesures U₀ et C₀ ; T-140 ajoute la condition U ≤ U₀ − C₀ / 2 et U < U₀).
+#[test]
+#[ignore]
+fn perf_req063_ac5_taille_du_graphe() {
+    let _g = serial();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (name, u0, c0) in [("gen_js", U0_JS, C0_JS), ("gen_repo", U0_JVM, C0_JVM)] {
+        let root = base.join(format!("target/perf-size-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let mock = root.join("mock");
+        if name == "gen_js" {
+            gen_js::generate(&repo, &mock);
+        } else {
+            gen_repo::generate(&repo, &mock);
+        }
+        let config = root.join("config.toml");
+        std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        let f = Fixture { repo, config, mock };
+        timed(&f, &["build", "--no-llm"]);
+        let (u, c) = graph_size(&f);
+        eprintln!("MESURE {name} : U = {u} octets, C = {c} octets (U0 = {u0}, C0 = {c0})");
+        assert!(c > 0, "{name} : aucun contexte de référence");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
