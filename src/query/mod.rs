@@ -15,19 +15,22 @@ use crate::filter::ProjectFilters;
 use crate::store::Store;
 
 /// Ouvre le graphe pour une requête. Sans graphe : erreur invitant à lancer `nephila build`.
-/// Si des fichiers ont changé depuis l'indexation, avertit sur stderr (REQ-017) ; la requête
-/// continue sur le dernier état enregistré.
-pub fn open(repo: &Path) -> Result<Store> {
+/// `.nephila.toml` est toujours lu et validé. Le dépôt n'est parcouru qu'avec `check_stale`
+/// (REQ-017) : si des fichiers diffèrent du graphe par leur taille ou leur date, avertit sur
+/// stderr ; la requête continue sur le dernier état enregistré.
+pub fn open(repo: &Path, check_stale: bool) -> Result<Store> {
     let matcher = ProjectFilters::load_matcher(repo)?;
     let store = Store::open_readonly(repo)?;
-    let n = diff::compute(repo, &store, &matcher)?.changes.len();
-    if n > 0 {
-        let (noun, adj) = if n == 1 {
-            ("fichier", "modifié")
-        } else {
-            ("fichiers", "modifiés")
-        };
-        error::warn(&format!("graphe pas à jour : {n} {noun} {adj}"));
+    if check_stale {
+        let n = diff::quick(repo, &store, &matcher)?;
+        if n > 0 {
+            let (noun, adj) = if n == 1 {
+                ("fichier", "modifié")
+            } else {
+                ("fichiers", "modifiés")
+            };
+            error::warn(&format!("graphe pas à jour : {n} {noun} {adj}"));
+        }
     }
     Ok(store)
 }

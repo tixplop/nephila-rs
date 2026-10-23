@@ -260,9 +260,20 @@ fn req001_ac4_and_req017_on_gradle_repo_without_llm_configuration() {
     env.write("core/build.gradle", "dependencies {\n}\n");
     env.write("build.gradle", "// modifié\n");
     for args in [
-        vec!["query", "search", "Api"],
-        vec!["query", "neighbors", "type:com.acme.api.Api"],
-        vec!["query", "path", "type:com.acme.api.Api", "module::core"],
+        vec!["query", "search", "Api", "--check-stale"],
+        vec![
+            "query",
+            "neighbors",
+            "type:com.acme.api.Api",
+            "--check-stale",
+        ],
+        vec![
+            "query",
+            "path",
+            "type:com.acme.api.Api",
+            "module::core",
+            "--check-stale",
+        ],
     ] {
         let out = env.cmd(&args);
         assert!(

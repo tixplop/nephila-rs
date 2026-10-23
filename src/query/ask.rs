@@ -177,7 +177,13 @@ pub fn answer(
     }
 }
 
-pub fn run(repo: &Path, question: &str, as_json: bool, format_retries: Option<u32>) -> Result<()> {
+pub fn run(
+    repo: &Path,
+    question: &str,
+    as_json: bool,
+    check_stale: bool,
+    format_retries: Option<u32>,
+) -> Result<()> {
     if question.trim().is_empty() {
         return Err(Error::Message("la question est vide".to_string()));
     }
@@ -185,7 +191,7 @@ pub fn run(repo: &Path, question: &str, as_json: bool, format_retries: Option<u3
     let config = Config::load()?;
     let (config, _) = config.with_project(&project.settings, None, format_retries);
     let llm = build_llm(&config)?;
-    let store = super::open(repo)?;
+    let store = super::open(repo, check_stale)?;
     let (answer, cited) = answer(&store, llm.as_ref(), question, config.format_retries)?;
     if as_json {
         let nodes: Vec<Value> = cited.iter().map(to_json).collect();

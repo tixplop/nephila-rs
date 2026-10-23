@@ -29,6 +29,16 @@ pub struct JsonOpt {
     pub json: bool,
 }
 
+/// Option `--check-stale` des requêtes (REQ-017) : juste après `--json`.
+#[derive(Debug, Args)]
+pub struct QueryOpts {
+    #[command(flatten)]
+    pub json: JsonOpt,
+    /// Avertit sur stderr si le graphe n'est pas à jour, d'après la taille et la date de modification des fichiers (parcourt le dépôt sans lire les fichiers déjà indexés ; défaut : aucune vérification ; vérification par le contenu : nephila status)
+    #[arg(long)]
+    pub check_stale: bool,
+}
+
 /// Entier strictement positif (REQ-028).
 fn parse_batch_files(s: &str) -> std::result::Result<usize, String> {
     match s.parse::<usize>() {
@@ -153,7 +163,7 @@ pub enum Query {
         #[arg(long)]
         limit: Option<usize>,
         #[command(flatten)]
-        json: JsonOpt,
+        json: QueryOpts,
     },
     /// Voisins d'un nœud
     Neighbors {
@@ -163,20 +173,20 @@ pub enum Query {
         #[arg(long)]
         limit: Option<usize>,
         #[command(flatten)]
-        json: JsonOpt,
+        json: QueryOpts,
     },
     /// Chemin entre deux nœuds
     Path {
         source: String,
         cible: String,
         #[command(flatten)]
-        json: JsonOpt,
+        json: QueryOpts,
     },
     /// Question en langage naturel
     Ask {
         question: String,
         #[command(flatten)]
-        json: JsonOpt,
+        json: QueryOpts,
         #[arg(help = FORMAT_RETRIES_HELP, long, value_name = "N", value_parser = parse_format_retries, allow_hyphen_values = true)]
         format_retries: Option<u32>,
     },
@@ -215,24 +225,37 @@ pub fn run(cli: Cli) -> Result<()> {
             crate::export::run(&cli.repo, output.as_deref(), *format)
         }
         Command::Query(Query::Search { terme, limit, json }) => {
-            crate::query::search::run(&cli.repo, terme, *limit, json.json)
+            crate::query::search::run(&cli.repo, terme, *limit, json.json.json, json.check_stale)
         }
         Command::Query(Query::Neighbors {
             nœud,
             depth,
             limit,
             json,
-        }) => crate::query::neighbors::run(&cli.repo, nœud, *depth, *limit, json.json),
+        }) => crate::query::neighbors::run(
+            &cli.repo,
+            nœud,
+            *depth,
+            *limit,
+            json.json.json,
+            json.check_stale,
+        ),
         Command::Query(Query::Path {
             source,
             cible,
             json,
-        }) => crate::query::path::run(&cli.repo, source, cible, json.json),
+        }) => crate::query::path::run(&cli.repo, source, cible, json.json.json, json.check_stale),
         Command::Query(Query::Ask {
             question,
             json,
             format_retries,
-        }) => crate::query::ask::run(&cli.repo, question, json.json, *format_retries),
+        }) => crate::query::ask::run(
+            &cli.repo,
+            question,
+            json.json.json,
+            json.check_stale,
+            *format_retries,
+        ),
     }
 }
 

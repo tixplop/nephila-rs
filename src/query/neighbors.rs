@@ -117,6 +117,7 @@ pub fn run(
     depth: usize,
     limit: Option<usize>,
     as_json: bool,
+    check_stale: bool,
 ) -> Result<()> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 {
@@ -125,7 +126,7 @@ pub fn run(
     if depth == 0 {
         return Err(Error::Message("--depth doit valoir au moins 1".to_string()));
     }
-    let store = super::open(repo)?;
+    let store = super::open(repo, check_stale)?;
     let start = lookup::require(&store, name)?;
     let graph = Lazy::new(&store);
     let uses = explore(&start, Direction::Out, depth, &graph)?;

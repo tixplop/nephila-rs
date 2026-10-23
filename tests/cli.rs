@@ -71,3 +71,35 @@ fn req001_ac2_error_exits_nonzero_with_prefix_on_stderr_only() {
         .unwrap()
         .starts_with("erreur:"));
 }
+
+// ---- Option --check-stale (REQ-017, AC-017-7, AC-017-8) ----
+
+const CHECK_STALE_HELP: &str = "--check-stale Avertit sur stderr si le graphe n'est pas à jour, d'après la taille et la date de modification des fichiers (parcourt le dépôt sans lire les fichiers déjà indexés ; défaut : aucune vérification ; vérification par le contenu : nephila status)";
+
+fn normalized_help(args: &[&str]) -> String {
+    let out = nephila().args(args).arg("--help").assert().success();
+    let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn req017_ac7_ac8_check_stale_help_of_query_subcommands() {
+    for sub in ["search", "neighbors", "path", "ask"] {
+        let h = normalized_help(&["query", sub]);
+        assert!(h.contains(CHECK_STALE_HELP), "{sub} : {h}");
+        let from = h.find("--check-stale").unwrap();
+        let entry_end = from + CHECK_STALE_HELP.len();
+        assert!(!h[from..entry_end + 20.min(h.len() - entry_end)].contains("[default:"));
+        assert!(h.find("--json").unwrap() < from, "{sub}");
+        if sub == "ask" {
+            assert!(from < h.find("--format-retries").unwrap());
+        }
+    }
+}
+
+#[test]
+fn req017_ac7_check_stale_absent_from_other_commands() {
+    for cmd in ["status", "build", "update", "export", "summary"] {
+        assert!(!normalized_help(&[cmd]).contains("--check-stale"), "{cmd}");
+    }
+}

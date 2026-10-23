@@ -205,7 +205,7 @@ fn req016_stale_graph_warns_and_still_answers() {
     let env = Env::new();
     env.fixture(r#"{"found":true,"answer":"ok","nodes":["Ledger"]}"#);
     fs::write(env.repo.join("docs.md"), "# nouveau\n").unwrap();
-    let o = env.ask(Q, &[]);
+    let o = env.ask(Q, &["--check-stale"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert!(
         text(&o.stderr).contains("graphe pas à jour"),

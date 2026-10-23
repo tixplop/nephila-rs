@@ -124,3 +124,32 @@ pub fn compute(repo: &Path, store: &Store, matcher: &Matcher) -> Result<Diff> {
         excluded,
     })
 }
+
+/// Nombre de fichiers qui diffèrent du graphe d'après leur seule taille et leur date de
+/// modification (millisecondes) : ajoutés, supprimés, en attente, ou indexés dont l'une des deux
+/// valeurs diffère de `files`. Seuls les fichiers absents de `files` sont lus (pour écarter ceux
+/// que `update` écarterait, DEC-068) ; ni empreinte, ni `settings.gradle`
+/// (REQ-017, DEC-067).
+pub fn quick(repo: &Path, store: &Store, matcher: &Matcher) -> Result<usize> {
+    let known = store.files()?;
+    let walked = scan::walk(repo, matcher)?;
+    let on_disk: HashMap<&str, &scan::WalkedFile> =
+        walked.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut count = 0;
+    for k in &known {
+        let changed = match (on_disk.get(k.path.as_str()), k.state) {
+            (None, _) | (Some(_), FileState::Pending) => true,
+            (Some(f), FileState::Indexed) => f.size != k.size || f.mtime != k.mtime,
+        };
+        count += usize::from(changed);
+    }
+    let seen: HashSet<&str> = known.iter().map(|k| k.path.as_str()).collect();
+    count += walked
+        .files
+        .iter()
+        .filter(|f| !seen.contains(f.path.as_str()))
+        // Un fichier que `update` écarterait (illisible, non UTF-8) n'est pas « ajouté » (DEC-068).
+        .filter(|f| scan::read_utf8(&f.abs, &f.path).is_ok())
+        .count();
+    Ok(count)
+}

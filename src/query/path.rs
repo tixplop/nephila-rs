@@ -147,8 +147,8 @@ fn shortest(from: &Node, to: &Node, g: &Lazy) -> Result<Option<Vec<Step>>> {
     Ok(Some(steps))
 }
 
-pub fn run(repo: &Path, from: &str, to: &str, as_json: bool) -> Result<()> {
-    let store = super::open(repo)?;
+pub fn run(repo: &Path, from: &str, to: &str, as_json: bool, check_stale: bool) -> Result<()> {
+    let store = super::open(repo, check_stale)?;
     let a = lookup::require(&store, from)?;
     let b = lookup::require(&store, to)?;
     let graph = Lazy::new(&store);

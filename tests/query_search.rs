@@ -279,7 +279,7 @@ fn req017_ac1_stale_graph_warns_on_stderr_but_answers() {
         c.push_str("// modifié\n");
         fs::write(path, c).unwrap();
     }
-    let out = env.q(&["OrderService"]);
+    let out = env.q(&["OrderService", "--check-stale"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(lines(&out).len(), 2);
     assert!(
@@ -288,7 +288,7 @@ fn req017_ac1_stale_graph_warns_on_stderr_but_answers() {
         text(&out.stderr)
     );
     // Avertissement aussi avec --json, sans polluer stdout.
-    let out = env.q(&["OrderService", "--json"]);
+    let out = env.q(&["OrderService", "--json", "--check-stale"]);
     assert!(text(&out.stderr).contains("graphe pas à jour : 3 fichiers modifiés"));
     json(&out);
 }
@@ -297,7 +297,7 @@ fn req017_ac1_stale_graph_warns_on_stderr_but_answers() {
 fn req017_ac1_warning_also_given_when_no_result() {
     let env = Env::built();
     fs::write(env.repo.join("docs/new.md"), "# Nouveau\n").unwrap();
-    let out = env.q(&["zzzabsent"]);
+    let out = env.q(&["zzzabsent", "--check-stale"]);
     assert!(!out.status.success());
     let err = text(&out.stderr);
     assert!(

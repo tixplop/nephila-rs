@@ -5,7 +5,7 @@ use crate::filter::{FileType, Matcher};
 use crate::model::FileRecord;
 use ignore::WalkBuilder;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 /// Règle « racy-clean » : l'empreinte enregistrée n'est réutilisée que si la date de modification
@@ -80,10 +80,29 @@ pub fn module_of(path: &str, build_dirs: &HashSet<String>) -> Option<String> {
     }
 }
 
-/// Parcourt `root`. `known` : enregistrements de la table `files`, dont l'empreinte est
-/// réutilisée quand taille et mtime n'ont pas changé. `matcher` : filtres de REQ-037, appliqués
-/// après les exclusions de REQ-004 et avant toute lecture.
-pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<ScanResult> {
+/// Fichier retenu par le parcours, sans lecture de son contenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkedFile {
+    /// Chemin relatif à la racine, séparateur `/`.
+    pub path: String,
+    /// Chemin réel sur le disque (peut ne pas être de l'UTF-8 valide) : c'est lui qu'on lit.
+    pub abs: PathBuf,
+    pub size: u64,
+    /// Date de modification en millisecondes depuis l'epoch.
+    pub mtime: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct WalkResult {
+    pub files: Vec<WalkedFile>,
+    pub warnings: Vec<String>,
+    /// Fichiers que le parcours aurait retenus sans filtre (REQ-037).
+    pub excluded: usize,
+}
+
+/// Parcourt `root` sans rien lire : dossiers exclus (REQ-004), types pris en charge, export
+/// `<slug>.json` écarté, filtres de REQ-037 puis métadonnées (chemin, taille, date).
+pub fn walk(root: &Path, matcher: &Matcher) -> Result<WalkResult> {
     if !root.is_dir() {
         return Err(Error::Message(format!(
             "{} n'est pas un dossier lisible",
@@ -92,7 +111,6 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
     }
     // L'export par défaut (`<slug>.json`) peut être écrit dans le dépôt : jamais indexé (AC-004-5).
     let export_name = format!("{}.json", crate::export::slug(root));
-    let known: HashMap<&str, &FileRecord> = known.iter().map(|r| (r.path.as_str(), r)).collect();
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
@@ -109,7 +127,7 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
         })
         .build();
 
-    let mut res = ScanResult::default();
+    let mut res = WalkResult::default();
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
@@ -148,12 +166,51 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
                 continue;
             }
         };
-        let size = meta.len();
         let mtime = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_millis() as i64);
+        res.files.push(WalkedFile {
+            path: rel,
+            abs: entry.path().to_path_buf(),
+            size: meta.len(),
+            mtime,
+        });
+    }
+    Ok(res)
+}
+
+/// Lit `rel` sous `root` ; refuse (message d'avertissement) un fichier illisible ou non UTF-8.
+/// Critère unique de `scan` et de `diff::quick` (DEC-068).
+pub fn read_utf8(abs: &Path, rel: &str) -> std::result::Result<Vec<u8>, String> {
+    let bytes =
+        std::fs::read(abs).map_err(|e| format!("{rel} ignoré : lecture impossible ({e})"))?;
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err(format!("{rel} ignoré : fichier non UTF-8"));
+    }
+    Ok(bytes)
+}
+
+/// Parcourt `root`. `known` : enregistrements de la table `files`, dont l'empreinte est
+/// réutilisée quand taille et mtime n'ont pas changé. `matcher` : filtres de REQ-037, appliqués
+/// après les exclusions de REQ-004 et avant toute lecture.
+pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<ScanResult> {
+    let walked = walk(root, matcher)?;
+    let known: HashMap<&str, &FileRecord> = known.iter().map(|r| (r.path.as_str(), r)).collect();
+    let mut res = ScanResult {
+        warnings: walked.warnings,
+        excluded: walked.excluded,
+        ..ScanResult::default()
+    };
+    let mut abs_paths: HashMap<String, PathBuf> = HashMap::new();
+    for WalkedFile {
+        path: rel,
+        abs,
+        size,
+        mtime,
+    } in walked.files
+    {
         let (hash, rehashed) = match known.get(rel.as_str()) {
             Some(k)
                 if k.size == size
@@ -164,24 +221,18 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
                 (k.hash.clone(), false)
             }
             _ => {
-                let bytes = match std::fs::read(entry.path()) {
+                let bytes = match read_utf8(&abs, &rel) {
                     Ok(b) => b,
-                    Err(e) => {
-                        let msg = format!("{rel} ignoré : lecture impossible ({e})");
+                    Err(msg) => {
                         warn(&msg);
                         res.warnings.push(msg);
                         continue;
                     }
                 };
-                if std::str::from_utf8(&bytes).is_err() {
-                    let msg = format!("{rel} ignoré : fichier non UTF-8");
-                    warn(&msg);
-                    res.warnings.push(msg);
-                    continue;
-                }
                 (blake3::hash(&bytes).to_hex().to_string(), true)
             }
         };
+        abs_paths.insert(rel.clone(), abs);
         res.files.push(ScannedFile {
             path: rel,
             hash,
@@ -212,8 +263,9 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
             )
         })
         .map(|f| {
-            let name = std::fs::read_to_string(root.join(&f.path))
-                .ok()
+            let name = abs_paths
+                .get(&f.path)
+                .and_then(|p| std::fs::read_to_string(p).ok())
                 .and_then(|t| crate::parse::gradle::root_project_name(&t));
             (
                 f.path.rsplit_once('/').map_or("", |(d, _)| d).to_string(),
@@ -227,6 +279,19 @@ pub fn scan(root: &Path, known: &[FileRecord], matcher: &Matcher) -> Result<Scan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_lit_un_fichier_au_nom_non_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"A\xff.java");
+        std::fs::write(dir.path().join(name), "class A {}\n").unwrap();
+        let res = scan(dir.path(), &[], &Matcher::none()).unwrap();
+        assert_eq!(res.files.len(), 1, "{:?}", res.warnings);
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+        assert!(res.files[0].rehashed);
+    }
 
     #[test]
     fn scan_remplit_root_project_name_des_settings() {

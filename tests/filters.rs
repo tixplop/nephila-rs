@@ -632,7 +632,7 @@ fn req037_ac6_options_transitoires_et_update_sans_appel_llm() {
         st.contains(&"ajouté\tconfig/app.json".to_string()),
         "{st:?}"
     );
-    let (_, err) = e.ok(&["query", "search", "Garde"]);
+    let (_, err) = e.ok(&["query", "search", "Garde", "--check-stale"]);
     assert!(err.contains("pas à jour"), "{err}");
     e.ok(&["update"]);
     assert!(e.export().contains("\"clef\""));

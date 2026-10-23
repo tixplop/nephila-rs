@@ -77,7 +77,13 @@ fn to_json(n: &Node) -> Value {
     })
 }
 
-pub fn run(repo: &Path, term: &str, limit: Option<usize>, as_json: bool) -> Result<()> {
+pub fn run(
+    repo: &Path,
+    term: &str,
+    limit: Option<usize>,
+    as_json: bool,
+    check_stale: bool,
+) -> Result<()> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 {
         return Err(Error::Message("--limit doit valoir au moins 1".to_string()));
@@ -85,7 +91,7 @@ pub fn run(repo: &Path, term: &str, limit: Option<usize>, as_json: bool) -> Resu
     if term.trim().is_empty() {
         return Err(Error::Message("le terme de recherche est vide".to_string()));
     }
-    let store = super::open(repo)?;
+    let store = super::open(repo, check_stale)?;
     let hits = matches(store.nodes()?, term);
     if hits.is_empty() {
         return Err(Error::Message(format!("aucun résultat pour « {term} »")));

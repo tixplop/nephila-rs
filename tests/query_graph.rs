@@ -387,10 +387,10 @@ fn req017_ac1_stale_graph_warns_for_neighbors_and_path() {
     let env = Env::built();
     fs::write(env.repo.join("core/OrderService.java"), "// modifié\n").unwrap();
     fs::write(env.repo.join("iso/Island.java"), "// modifié\n").unwrap();
-    let out = env.neighbors(&["OrderService"]);
+    let out = env.neighbors(&["OrderService", "--check-stale"]);
     assert!(out.status.success());
     assert!(text(&out.stderr).contains("graphe pas à jour : 2 fichiers modifiés"));
-    let out = env.path(&["ApiController", "OrderRepository"]);
+    let out = env.path(&["ApiController", "OrderRepository", "--check-stale"]);
     assert!(out.status.success());
     assert!(text(&out.stderr).contains("graphe pas à jour : 2 fichiers modifiés"));
 }
