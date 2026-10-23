@@ -63,7 +63,11 @@ fn fixture() -> &'static Fixture {
         let mock = root.join("mock");
         gen_repo::generate(&repo, &mock);
         let config = root.join("config.toml");
-        std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        std::fs::write(
+            &config,
+            "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\n",
+        )
+        .unwrap();
         let f = Fixture { repo, config, mock };
         let (d, out) = timed(&f, &["build"]);
         eprintln!(
@@ -430,7 +434,11 @@ fn js_fixture() -> Fixture {
     let mock = root.join("mock");
     gen_js::generate(&repo, &mock);
     let config = root.join("config.toml");
-    std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    std::fs::write(
+        &config,
+        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\n",
+    )
+    .unwrap();
     Fixture { repo, config, mock }
 }
 
