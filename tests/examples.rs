@@ -728,7 +728,7 @@ fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
     assert!(line.contains("0.17"));
     let at = |needle: &str| readme.find(needle).unwrap();
     assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.19.1", "git tag v0.19.1 && git push origin v0.19.1"] {
+    for needle in ["V=v0.19.2", "git tag v0.19.2 && git push origin v0.19.2"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
     assert!(!readme.contains("0.17.6"));
@@ -936,8 +936,8 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
         "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
         "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.19.1 ",
-        "git tag v0.19.1 && git push origin v0.19.1",
+        "V=v0.19.2 ",
+        "git tag v0.19.2 && git push origin v0.19.2",
     ] {
         assert!(readme.contains(expected), "absent : {expected}");
     }
@@ -953,6 +953,11 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         .position(|l| l.starts_with("| 0.18 |"))
         .expect("ligne 0.18 absente");
     assert_eq!(i19 + 1, i18);
+    let i192 = lines
+        .iter()
+        .position(|l| l.starts_with("| 0.19.2 |"))
+        .expect("ligne 0.19.2 absente");
+    assert_eq!(i192 + 1, i19);
     let v19 = readme.find("- **Vers 0.19**").expect("puce Vers 0.19");
     let v18 = readme.find("- **Vers 0.18**").expect("puce Vers 0.18");
     assert!(v19 < v18);

@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.19.1                                      # version voulue
+V=v0.19.2                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -697,6 +697,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.19.2 | Fichiers aux noms non UTF-8 lus par leur chemin réel (ils ne restent plus en attente) ; deux noms identiques après conversion : un seul est indexé, l'autre est nommé par un avertissement, au lieu d'un échec de build |
 | 0.19 | Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers. `query ask` ne copie plus le graphe pour chercher les mots-clés, `neighbors` et `path` restent linéaires autour d'un nœud très relié, la résolution d'un nom passe par un index. Le schéma 6 est migré sur place. |
 | 0.18 | Rupture : seuls les documents Markdown sont enrichis par défaut ; enrich_code = true dans la configuration personnelle, ou --enrich-code, rétablit le comportement de la 0.17. Les résumés sont conservés d'un build à l'autre : le premier build en 0.18 remplace le graphe et enrichit une fois tous les fichiers de la portée, les suivants n'envoient que les fichiers nouveaux ou modifiés. Une clé d'API refusée est constatée au premier appel, après l'extraction. Lots de 10 fichiers par défaut (`batch_files = 10`), morceaux d'un gros fichier envoyés en parallèle, nouveaux essais HTTP avec attente progressive, connexions réutilisées. |
 | 0.17.5 | Liste de nœuds propre à chaque morceau d'un gros fichier ; au plus 50 appels d'enrichissement par fichier, au-delà le fichier est nommé et laissé à enrichir |
@@ -727,7 +728,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.19.1 && git push origin v0.19.1
+git tag v0.19.2 && git push origin v0.19.2
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
