@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde_json::json;
 
-use super::graph::Lazy;
+use super::graph::{Graph, Lazy};
 use super::lookup;
 use crate::error::{Error, Result};
 use crate::model::{EdgeKind, Node};
@@ -37,7 +37,7 @@ fn passive(kind: EdgeKind) -> &'static str {
 
 /// Voisins de `cur` sans tenir compte du sens, triés (résultat déterministe) : (voisin, genre,
 /// vrai si le lien réel va du voisin vers `cur`).
-fn undirected(g: &Lazy, cur: &str) -> Result<Vec<(String, EdgeKind, bool)>> {
+fn undirected(g: &impl Graph, cur: &str) -> Result<Vec<(String, EdgeKind, bool)>> {
     let mut adj: Vec<(String, EdgeKind, bool)> = g
         .edges_at(cur, true)?
         .into_iter()
@@ -78,7 +78,7 @@ impl Side {
 /// Plus court chemin par recherche en largeur bidirectionnelle (le côté à la plus petite
 /// frontière avance d'un niveau). Au premier niveau où les deux côtés se rejoignent, le nœud de
 /// jonction d'identifiant minimal est retenu.
-fn shortest(from: &Node, to: &Node, g: &Lazy) -> Result<Option<Vec<Step>>> {
+fn shortest(from: &Node, to: &Node, g: &impl Graph) -> Result<Option<Vec<Step>>> {
     if from.id == to.id {
         return Ok(Some(Vec::new()));
     }

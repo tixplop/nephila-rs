@@ -10,6 +10,15 @@ use crate::store::Store;
 
 type Adjacent = Vec<(String, EdgeKind)>;
 
+/// Lecture du graphe nécessaire aux parcours (`neighbors`, `path`) ; `Lazy` la fournit depuis
+/// le stockage, les tests depuis un graphe en mémoire.
+pub trait Graph {
+    fn node(&self, id: &str) -> Result<Option<Node>>;
+    /// Liens sortants (`outgoing`) ou entrants de `id` : (autre extrémité, genre), dans l'ordre
+    /// du stockage (autre extrémité, puis genre).
+    fn edges_at(&self, id: &str, outgoing: bool) -> Result<Vec<(String, EdgeKind)>>;
+}
+
 pub struct Lazy<'s> {
     store: &'s Store,
     nodes: RefCell<HashMap<String, Option<Node>>>,
@@ -24,8 +33,10 @@ impl<'s> Lazy<'s> {
             edges: RefCell::new(HashMap::new()),
         }
     }
+}
 
-    pub fn node(&self, id: &str) -> Result<Option<Node>> {
+impl Graph for Lazy<'_> {
+    fn node(&self, id: &str) -> Result<Option<Node>> {
         if let Some(n) = self.nodes.borrow().get(id) {
             return Ok(n.clone());
         }
@@ -34,8 +45,7 @@ impl<'s> Lazy<'s> {
         Ok(n)
     }
 
-    /// Liens sortants (`outgoing`) ou entrants de `id` : (autre extrémité, genre).
-    pub fn edges_at(&self, id: &str, outgoing: bool) -> Result<Vec<(String, EdgeKind)>> {
+    fn edges_at(&self, id: &str, outgoing: bool) -> Result<Vec<(String, EdgeKind)>> {
         let key = (id.to_string(), outgoing);
         if let Some(e) = self.edges.borrow().get(&key) {
             return Ok(e.clone());

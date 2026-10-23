@@ -136,6 +136,129 @@ fn perf_req021_ac2_queries() {
     }
 }
 
+/// Graphe écrit par l'API `Store` : un type `Hub` (avec sa méthode `run`) qui reçoit `n` liens
+/// `imports` de `n` types feuilles et émet `n` liens `calls` vers `n` méthodes.
+fn hub_fixture(n: usize) -> Fixture {
+    use nephila::model::{Edge, EdgeKind, FileRecord, FileState, Node, NodeKind, SubKind};
+    use nephila::store::Store;
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("target/perf-hub-{n}"));
+    let _ = std::fs::remove_dir_all(&root);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let config = root.join("config.toml");
+    std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    let path = "src/Hub.java";
+    let ty = |q: &str| {
+        Node::new(
+            NodeKind::Type,
+            q,
+            q.rsplit('.').next().unwrap(),
+            Some(path),
+            Some(SubKind::Class),
+            None,
+        )
+    };
+    let method = |q: &str| {
+        Node::new(
+            NodeKind::Method,
+            q,
+            q.rsplit('.').next().unwrap(),
+            Some(path),
+            None,
+            None,
+        )
+    };
+    let mut nodes = vec![ty("hub.Hub"), method("hub.Hub.run")];
+    let mut edges = vec![Edge {
+        source: "type:hub.Hub".into(),
+        target: "method:hub.Hub.run".into(),
+        kind: EdgeKind::Contains,
+    }];
+    for i in 0..n {
+        let leaf = ty(&format!("hub.Leaf{i:06}"));
+        let callee = method(&format!("hub.Callee{i:06}.m"));
+        edges.push(Edge {
+            source: leaf.id.clone(),
+            target: "type:hub.Hub".into(),
+            kind: EdgeKind::Imports,
+        });
+        edges.push(Edge {
+            source: "method:hub.Hub.run".into(),
+            target: callee.id.clone(),
+            kind: EdgeKind::Calls,
+        });
+        nodes.push(leaf);
+        nodes.push(callee);
+    }
+    let mut store = Store::open_or_create(&repo).unwrap();
+    store
+        .insert_pending_files(&[FileRecord {
+            path: path.into(),
+            hash: "h".into(),
+            size: 1,
+            mtime: 1,
+            recorded_at: 0,
+            state: FileState::Pending,
+        }])
+        .unwrap();
+    store.replace_structure(path, &nodes, &[]).unwrap();
+    store.replace_edges(&edges).unwrap();
+    drop(store);
+    Fixture {
+        repo,
+        config,
+        mock: root.join("mock"),
+    }
+}
+
+/// AC-056-2 : `neighbors` et `path` autour d'un nœud très relié, en temps linéaire.
+#[test]
+#[ignore]
+fn perf_req056_ac2_hub() {
+    let _g = serial();
+    let mut times: Vec<[Duration; 3]> = Vec::new();
+    for n in [10_000usize, 40_000] {
+        let f = hub_fixture(n);
+        let leaf_a = "type:hub.Leaf000007";
+        let leaf_b = "type:hub.Leaf000042";
+        let (d1, out) = best(&f, &["query", "neighbors", "Hub"]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(text.lines().filter(|l| l.starts_with("  ")).count(), 50);
+        assert_eq!(
+            text.lines().last().unwrap(),
+            format!("{} résultats supplémentaires", 2 * n - 50)
+        );
+        let (d2, out) = best(&f, &["query", "neighbors", leaf_a, "--depth", "2"]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(text.lines().filter(|l| l.starts_with("  ")).count(), 50);
+        assert_eq!(
+            text.lines().last().unwrap(),
+            format!("{} résultats supplémentaires", n + 1 - 50)
+        );
+        let (d3, out) = best(&f, &["query", "path", leaf_a, leaf_b]);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 2);
+        eprintln!(
+            "N = {n} : neighbors Hub {d1:?}, neighbors feuille --depth 2 {d2:?}, path {d3:?}"
+        );
+        times.push([d1, d2, d3]);
+    }
+    for (i, label) in ["neighbors Hub", "neighbors feuille --depth 2", "path"]
+        .iter()
+        .enumerate()
+    {
+        let (small, big) = (times[0][i], times[1][i]);
+        assert!(
+            big < Duration::from_millis(1_000),
+            "{label} : {big:?} (40 000)"
+        );
+        assert!(
+            big < small * 6,
+            "{label} : {big:?} (40 000) pour {small:?} (10 000)"
+        );
+    }
+}
+
 /// AC-055-3 : le temps de `query ask` reste sous 1,5 fois le temps d'un mot-clé pour 32 mots-clés.
 #[test]
 #[ignore]
