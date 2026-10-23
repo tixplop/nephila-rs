@@ -31,10 +31,14 @@ CREATE TABLE nodes (
     subkind   TEXT,
     summary   TEXT,
     -- Fichier ayant posé le résumé (un nœud partagé peut avoir plusieurs déclarants).
-    summary_file TEXT
+    summary_file TEXT,
+    -- Nom qualifié aux caractères inversés (DEC-066), écrit par nephila à chaque écriture d'un
+    -- nœud : la recherche par suffixe devient un intervalle de préfixe sur l'index ci-dessous.
+    qualified_rev TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX idx_nodes_short ON nodes(short);
 CREATE INDEX idx_nodes_qualified ON nodes(qualified);
+CREATE INDEX idx_nodes_qualified_rev ON nodes(qualified_rev);
 CREATE INDEX idx_nodes_file ON nodes(file);
 
 -- Déclarations (fichier, nœud) : un nœud existe tant qu'au moins un fichier le déclare (DEC-014).

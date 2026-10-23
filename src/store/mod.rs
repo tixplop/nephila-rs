@@ -20,9 +20,18 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
+
+/// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
+const SCHEMA_WITHOUT_REV: i32 = 5;
 
 const SCHEMA: &str = include_str!("schema.sql");
+
+/// Nom qualifié aux caractères Unicode inversés : valeur de `nodes.qualified_rev`. Seule
+/// fonction de calcul, appelée à chaque écriture d'un nœud.
+pub fn reverse_qualified(qualified: &str) -> String {
+    qualified.chars().rev().collect()
+}
 
 fn db_err(e: rusqlite::Error) -> Error {
     Error::Message(format!("base du graphe : {e}"))
@@ -36,6 +45,8 @@ pub fn db_path(repo: &Path) -> PathBuf {
 pub struct Store {
     conn: Connection,
     read_only: bool,
+    /// Version du schéma lue à l'ouverture (5 possible en lecture seule, DEC-066).
+    version: i32,
 }
 
 impl Store {
@@ -61,10 +72,12 @@ impl Store {
         let store = Store {
             conn,
             read_only: false,
+            version: SCHEMA_VERSION,
         };
         match store.user_version()? {
             0 => store.create_schema()?,
             v if v == SCHEMA_VERSION => {}
+            SCHEMA_WITHOUT_REV => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -94,9 +107,14 @@ impl Store {
         let store = Store {
             conn,
             read_only: false,
+            version: SCHEMA_VERSION,
         };
         match store.user_version()? {
             v if v == SCHEMA_VERSION => Ok(store),
+            SCHEMA_WITHOUT_REV => {
+                store.migrate_to_current()?;
+                Ok(store)
+            }
             v => Err(Error::Message(format!(
                 "graphe de schéma {v} incompatible (attendu {SCHEMA_VERSION}) dans {} : lancez `nephila build`",
                 path.display()
@@ -122,9 +140,10 @@ impl Store {
             .map_err(db_err)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(db_err)?;
-        let store = Store {
+        let mut store = Store {
             conn,
             read_only: true,
+            version: SCHEMA_VERSION,
         };
         match store.user_version()? {
             0 => {
@@ -133,10 +152,57 @@ impl Store {
                     path.display()
                 )))
             }
-            v if v == SCHEMA_VERSION => {}
+            v if v == SCHEMA_VERSION || v == SCHEMA_WITHOUT_REV => store.version = v,
             v => return Err(version_error(v)),
         }
         Ok(store)
+    }
+
+    /// Version du schéma du graphe ouvert (5 : pas de `qualified_rev`, lecture seule seulement).
+    pub fn opened_schema_version(&self) -> i32 {
+        self.version
+    }
+
+    /// Migre un schéma 5 en schéma 6 sur place, en une seule transaction : colonne, remplissage
+    /// (inverse calculé en Rust), index, `meta.schema_version`, `user_version`. Rien n'est perdu.
+    fn migrate_to_current(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_REV {
+            return Ok(());
+        }
+        tx.execute_batch("ALTER TABLE nodes ADD COLUMN qualified_rev TEXT NOT NULL DEFAULT ''")
+            .map_err(db_err)?;
+        let rows: Vec<(String, String)> = {
+            let mut st = tx
+                .prepare("SELECT id, qualified FROM nodes")
+                .map_err(db_err)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(db_err)?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?
+        };
+        {
+            let mut up = tx
+                .prepare("UPDATE nodes SET qualified_rev = ?2 WHERE id = ?1")
+                .map_err(db_err)?;
+            for (id, q) in rows {
+                up.execute(params![id, reverse_qualified(&q)])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.execute_batch(&format!(
+            "CREATE INDEX idx_nodes_qualified_rev ON nodes(qualified_rev);
+             UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
     }
 
     fn user_version(&self) -> Result<i32> {
@@ -820,13 +886,18 @@ impl Store {
         {
             let mut ins = tx
                 .prepare(
-                    "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary)
-                     VALUES (?1, 'dependency', ?2, ?3, NULL, NULL, NULL)",
+                    "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary, qualified_rev)
+                     VALUES (?1, 'dependency', ?2, ?3, NULL, NULL, NULL, ?4)",
                 )
                 .map_err(db_err)?;
             for n in deps {
-                ins.execute(params![n.id, n.qualified, n.short])
-                    .map_err(db_err)?;
+                ins.execute(params![
+                    n.id,
+                    n.qualified,
+                    n.short,
+                    reverse_qualified(&n.qualified)
+                ])
+                .map_err(db_err)?;
             }
         }
         tx.commit().map_err(db_err)
@@ -1021,7 +1092,7 @@ fn insert_nodes(
     origin: &str,
 ) -> Result<()> {
     let mut ins = tx
-        .prepare("INSERT OR IGNORE INTO nodes(id, kind, qualified, short) VALUES (?1, ?2, ?3, ?4)")
+        .prepare("INSERT OR IGNORE INTO nodes(id, kind, qualified, short, qualified_rev) VALUES (?1, ?2, ?3, ?4, ?5)")
         .map_err(db_err)?;
     let mut decl = tx
         .prepare(
@@ -1037,8 +1108,14 @@ fn insert_nodes(
                 n.id
             )));
         }
-        ins.execute(params![n.id, n.kind.as_str(), n.qualified, n.short])
-            .map_err(db_err)?;
+        ins.execute(params![
+            n.id,
+            n.kind.as_str(),
+            n.qualified,
+            n.short,
+            reverse_qualified(&n.qualified)
+        ])
+        .map_err(db_err)?;
         decl.execute(params![
             path,
             n.id,
@@ -1712,14 +1789,214 @@ mod tests {
         let dir = tempdir().unwrap();
         drop(Store::open_or_create(dir.path()).unwrap());
         let c = Connection::open(db_path(dir.path())).unwrap();
-        c.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-            .unwrap();
+        c.pragma_update(None, "user_version", 4).unwrap();
         drop(c);
         let e = Store::open_readonly(dir.path()).err().unwrap();
         assert!(e.to_string().contains("nephila build"), "{e}");
         let st = Store::open_or_create(dir.path()).unwrap();
         assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(st.files_to_enrich().unwrap().is_empty());
+    }
+
+    // --- REQ-057 : colonne qualified_rev (schéma 6) ---
+
+    fn rev_of(q: &str) -> String {
+        q.chars().rev().collect()
+    }
+
+    /// Chaque nœud porte son nom qualifié inversé ; rend le nombre de nœuds vérifiés.
+    fn assert_all_rev(st: &Store) -> usize {
+        let mut q = st
+            .conn
+            .prepare("SELECT qualified, qualified_rev FROM nodes")
+            .unwrap();
+        let rows: Vec<(String, String)> = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for (qualified, rev) in &rows {
+            assert_eq!(rev, &rev_of(qualified), "{qualified}");
+            assert!(!rev.is_empty());
+        }
+        rows.len()
+    }
+
+    #[test]
+    fn req057_qualified_rev_is_written_by_every_node_write_path() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(st.schema_version().unwrap(), 6);
+        st.insert_pending_files(&[file("a.md"), file("b.md")])
+            .unwrap();
+        // Structure d'un fichier, noms non ASCII compris.
+        st.replace_structure(
+            "a.md",
+            &[ty("p.Écran.Tâche", "a.md"), ty("p.A", "a.md")],
+            &[],
+        )
+        .unwrap();
+        // Nœud partagé déclaré par deux fichiers.
+        let shared = Node::new(NodeKind::Package, "p.partagé", "partagé", None, None, None);
+        st.replace_structure("b.md", std::slice::from_ref(&shared), &[])
+            .unwrap();
+        // Dépendances dérivées.
+        let dep = Node::new(NodeKind::Dependency, "org.ünï:lib", "lib", None, None, None);
+        st.replace_derived_dependencies(&[dep]).unwrap();
+        assert!(assert_all_rev(&st) >= 4);
+        // Mise à jour d'un nœud : la colonne reste juste.
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        assert!(assert_all_rev(&st) >= 3);
+        let rev: String = st
+            .conn
+            .query_row(
+                "SELECT qualified_rev FROM nodes WHERE id = 'dependency:org.ünï:lib'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rev, "bil:ïnü.gro");
+    }
+
+    /// Ramène un graphe de schéma 6 au schéma 5.
+    fn downgrade_to_5(repo: &Path) {
+        let c = Connection::open(db_path(repo)).unwrap();
+        c.execute_batch(
+            "DROP INDEX idx_nodes_qualified_rev; ALTER TABLE nodes DROP COLUMN qualified_rev;
+             UPDATE meta SET value = '5' WHERE key = 'schema_version'; PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    }
+
+    fn dump(st: &Store, table: &str, cols: &str) -> Vec<Vec<Option<String>>> {
+        let n = cols.split(',').count();
+        let mut q = st
+            .conn
+            .prepare(&format!("SELECT {cols} FROM {table} ORDER BY 1, 2"))
+            .unwrap();
+        q.query_map([], |r| {
+            (0..n)
+                .map(|i| {
+                    Ok(match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => None,
+                        v => Some(format!("{v:?}")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    fn populated(repo: &Path) -> Store {
+        let mut st = Store::open_or_create(repo).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        st.replace_structure("a.md", &[ty("p.Écran", "a.md"), ty("p.B", "a.md")], &[])
+            .unwrap();
+        st.replace_derived_dependencies(&[Node::new(
+            NodeKind::Dependency,
+            "g:lib",
+            "lib",
+            None,
+            None,
+            None,
+        )])
+        .unwrap();
+        st
+    }
+
+    const SNAP: [(&str, &str); 5] = [
+        ("files", "path,hash,size,mtime,recorded_at,state"),
+        (
+            "nodes",
+            "id,kind,qualified,short,file,subkind,summary,summary_file",
+        ),
+        ("refs", "id,source,file,kind,target_name,context"),
+        ("edges", "source,target,kind"),
+        (
+            "enrichments",
+            "path,content_hash,model,prompt_version,payload",
+        ),
+    ];
+
+    fn snapshot5(st: &Store) -> Vec<Vec<Vec<Option<String>>>> {
+        SNAP.iter().map(|(t, c)| dump(st, t, c)).collect()
+    }
+
+    #[test]
+    fn req057_schema5_is_migrated_in_place_by_open_or_create_and_open_existing() {
+        for existing in [false, true] {
+            let dir = tempdir().unwrap();
+            drop(populated(dir.path()));
+            downgrade_to_5(dir.path());
+            let before = {
+                let st = Store::open_readonly(dir.path()).unwrap();
+                snapshot5(&st)
+            };
+            let st = if existing {
+                Store::open_existing(dir.path()).unwrap()
+            } else {
+                Store::open_or_create(dir.path()).unwrap()
+            };
+            assert_eq!(st.schema_version().unwrap(), 6);
+            assert_eq!(assert_all_rev(&st), 3);
+            let idx: i64 = st
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_nodes_qualified_rev'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(idx, 1);
+            let v: String = st
+                .conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(v, "6");
+            assert_eq!(snapshot5(&st), before);
+        }
+    }
+
+    #[test]
+    fn req057_open_readonly_accepts_schema5_without_touching_the_file() {
+        let dir = tempdir().unwrap();
+        drop(populated(dir.path()));
+        downgrade_to_5(dir.path());
+        let bytes = std::fs::read(db_path(dir.path())).unwrap();
+        let st = Store::open_readonly(dir.path()).unwrap();
+        assert_eq!(st.schema_version().unwrap(), 5);
+        assert_eq!(st.count_nodes().unwrap(), 3);
+        drop(st);
+        assert_eq!(st_user_version(dir.path()), 5);
+        assert_eq!(std::fs::read(db_path(dir.path())).unwrap(), bytes);
+    }
+
+    fn st_user_version(repo: &Path) -> i32 {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn req057_schema4_still_recreated_by_build_and_refused_by_open_existing() {
+        let dir = tempdir().unwrap();
+        drop(populated(dir.path()));
+        Connection::open(db_path(dir.path()))
+            .unwrap()
+            .pragma_update(None, "user_version", 4)
+            .unwrap();
+        assert!(Store::open_existing(dir.path()).is_err());
+        let st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(st.schema_version().unwrap(), 6);
+        assert_eq!(st.count_nodes().unwrap(), 0);
     }
 
     #[test]

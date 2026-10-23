@@ -289,7 +289,7 @@ fn req049_ac8_schema4_graph_is_replaced_by_build_and_refused_elsewhere() {
         env.store().files().unwrap().len()
     };
     assert_eq!(env.store().schema_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 5);
+    assert_eq!(SCHEMA_VERSION, 6);
     assert_eq!(env.logged().len(), n_files, "{:?}", env.logged());
 }
 
