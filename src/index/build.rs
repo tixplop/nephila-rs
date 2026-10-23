@@ -129,10 +129,13 @@ pub(crate) fn setup(
                 tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
             }
             trace!(
-                "config: llm={} model={} enrich_code={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}",
+                "config: llm={} model={} enrich_code={} thinking={} effort={} max_output_tokens={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}",
                 config.provider.as_str(),
                 config.model,
                 config.enrich_code,
+                config.thinking,
+                config.effort.as_str(),
+                config.max_output_tokens,
                 config.concurrency,
                 config.timeout_secs,
                 config.max_chunk_chars,

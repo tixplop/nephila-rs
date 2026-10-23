@@ -185,7 +185,7 @@ fn REQ041_AC4_valeurs_par_defaut_documentees_egales_aux_valeurs_reelles() {
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| key_of(l))
         .collect();
-    assert_eq!(active.len(), 7, "options communes réactivées : {active:?}");
+    assert_eq!(active.len(), 10, "options communes réactivées : {active:?}");
 }
 
 #[test]

@@ -109,6 +109,34 @@ api_key_env = "ANTHROPIC_API_KEY"
 # Priorité : --enrich-code > ce fichier > défaut.
 # enrich_code = false
 
+# Demande au modèle de réfléchir avant de répondre. Booléen ; défaut : false. true : nephila
+# envoie à « anthropic » "thinking": {"type": "adaptive"} et "output_config": {"effort": ...},
+# et à « openai » "reasoning_effort" ; le niveau est celui de effort. false : aucun champ de
+# réflexion n'est envoyé, mais un modèle qui réfléchit toujours (certains modèles Claude, les
+# modèles de raisonnement d'OpenAI) le fait quand même, à son niveau par défaut ; pour limiter
+# sa réflexion, mettez thinking à true et effort à "low". Un modèle qui ne prend pas en charge
+# la réflexion refuse la requête (HTTP 400) : ses fichiers restent à enrichir. La réflexion
+# n'est jamais affichée ni enregistrée. Sans effet avec « mock ». Lue ici seulement :
+# .nephila.toml la refuse.
+# thinking = false
+
+# Niveau de la réflexion demandée quand thinking vaut true. Texte : "low", "medium" ou "high",
+# en minuscules ; défaut : "low". Envoyé à « anthropic » dans "output_config" et à « openai »
+# dans "reasoning_effort". Sans effet quand thinking vaut false (rien n'est envoyé) et avec
+# « mock ». Un niveau plus haut donne des réponses plus lentes et plus coûteuses, et sa
+# réflexion compte dans max_output_tokens. Lue ici seulement :
+# .nephila.toml la refuse.
+# effort = "low"
+
+# Nombre maximal de jetons de la réponse du modèle, réflexion comprise. Entier > 0 ; défaut :
+# 16384. Envoyé à « anthropic » en max_tokens et à « openai » en max_completion_tokens ; sans
+# effet avec « mock ». Une réponse qui l'atteint est refusée (« réponse tronquée par la limite
+# de jetons ») et ses fichiers restent à enrichir : augmentez cette valeur, ou réduisez
+# max_chunk_chars ou batch_files. Un modèle dont la réponse maximale est plus courte, ou un
+# serveur local au contexte trop petit, refuse la requête (HTTP 400) : baissez-la. Lue ici seulement :
+# .nephila.toml la refuse.
+# max_output_tokens = 16384
+
 # Taille maximale, en caractères, d'un morceau de fichier envoyé au LLM. Entier > 0.
 # Défaut : 60000. Un lot de fichiers (voir batch_files) ne dépasse jamais cette taille.
 # Un dépôt peut le remplacer par son .nephila.toml.

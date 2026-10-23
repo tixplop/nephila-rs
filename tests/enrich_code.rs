@@ -206,16 +206,16 @@ fn REQ050_AC8_ligne_config_donne_la_valeur_effective() {
     let o = env.run(&["build", "--verbose"]);
     let l = config_line(&o);
     assert!(
-        l.contains("config: llm=mock model=mock enrich_code=false concurrency="),
+        l.contains("config: llm=mock model=mock enrich_code=false thinking=false effort=low max_output_tokens=16384 concurrency="),
         "{l}"
     );
     let o = env.run(&["build", "--verbose", "--enrich-code"]);
-    assert!(config_line(&o).contains(" model=mock enrich_code=true concurrency="));
+    assert!(config_line(&o).contains(" model=mock enrich_code=true thinking=false effort=low max_output_tokens=16384 concurrency="));
     let o = env.run(&["update", "--verbose", "--enrich-code"]);
     assert!(config_line(&o).contains(" enrich_code=true "));
     env.write_config(&format!("{MOCK}enrich_code = true\n"));
     let o = env.run(&["build", "--verbose"]);
-    assert!(config_line(&o).contains(" model=mock enrich_code=true concurrency="));
+    assert!(config_line(&o).contains(" model=mock enrich_code=true thinking=false effort=low max_output_tokens=16384 concurrency="));
     env.write_config(&format!("{MOCK}enrich_code = false\n"));
     let o = env.run(&["build", "--verbose"]);
     assert!(config_line(&o).contains(" enrich_code=false "));
@@ -232,7 +232,7 @@ fn REQ050_AC8_fin_de_ligne_et_fichier_de_projet() {
     let o = env.run(&["build", "--verbose", "--enrich-code"]);
     let l = config_line(&o);
     assert!(
-        l.contains(" model=m-projet enrich_code=true concurrency="),
+        l.contains(" model=m-projet enrich_code=true thinking=false effort=low max_output_tokens=16384 concurrency="),
         "{l}"
     );
     assert!(l.ends_with(" (.nephila.toml : model)"), "{l}");

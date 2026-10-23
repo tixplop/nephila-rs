@@ -129,6 +129,27 @@ impl Provider {
     }
 }
 
+/// Niveau de la réflexion du modèle (REQ-058).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+pub const DEFAULT_EFFORT: Effort = Effort::Low;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub provider: Provider,
@@ -145,6 +166,12 @@ pub struct Config {
     pub format_retries: u32,
     /// Enrichit aussi les fichiers de code, pas seulement les documents (REQ-050).
     pub enrich_code: bool,
+    /// Demande la réflexion au modèle (REQ-058).
+    pub thinking: bool,
+    /// Niveau de la réflexion, utilisé seulement avec `thinking` (REQ-058).
+    pub effort: Effort,
+    /// Limite de jetons de la réponse, réflexion comprise (REQ-058).
+    pub max_output_tokens: u32,
     /// Chemin résolu du PEM d'autorités ajoutées aux autorités publiques (REQ-036).
     pub tls_ca_cert: Option<PathBuf>,
     /// Certificats d'autorité (DER) lus dans `tls_ca_cert`, déjà validés.
@@ -166,6 +193,9 @@ struct RawConfig {
     batch_files: Option<i64>,
     format_retries: Option<toml::Value>,
     enrich_code: Option<toml::Value>,
+    thinking: Option<toml::Value>,
+    effort: Option<toml::Value>,
+    max_output_tokens: Option<toml::Value>,
     tls_ca_cert: Option<String>,
     tls_insecure: Option<bool>,
 }
@@ -391,6 +421,36 @@ impl Config {
                 )))
             }
         };
+        let invalid = |key: &str, expected: &str, v: &toml::Value| {
+            Error::Message(format!(
+                "configuration invalide ({at}) : clé « {key} » doit être {expected} (reçu : {v})"
+            ))
+        };
+        let thinking = match &raw.thinking {
+            None => false,
+            Some(toml::Value::Boolean(b)) => *b,
+            Some(v) => return Err(invalid("thinking", "un booléen, true ou false", v)),
+        };
+        let effort = match &raw.effort {
+            None => DEFAULT_EFFORT,
+            Some(toml::Value::String(s)) if s == "low" => Effort::Low,
+            Some(toml::Value::String(s)) if s == "medium" => Effort::Medium,
+            Some(toml::Value::String(s)) if s == "high" => Effort::High,
+            Some(v) => {
+                return Err(invalid("effort", "\"low\", \"medium\" ou \"high\"", v));
+            }
+        };
+        let max_output_tokens = match &raw.max_output_tokens {
+            None => DEFAULT_MAX_OUTPUT_TOKENS,
+            Some(toml::Value::Integer(n)) if (1..=i64::from(u32::MAX)).contains(n) => *n as u32,
+            Some(v) => {
+                return Err(invalid(
+                    "max_output_tokens",
+                    "un entier strictement positif",
+                    v,
+                ))
+            }
+        };
         Ok(Config {
             provider,
             model,
@@ -410,6 +470,9 @@ impl Config {
             batch_files: positive("batch_files", raw.batch_files, DEFAULT_BATCH_FILES)?,
             format_retries,
             enrich_code,
+            thinking,
+            effort,
+            max_output_tokens,
             tls_ca_cert,
             tls_ca_certs,
             tls_insecure: raw.tls_insecure.unwrap_or(false),
@@ -503,6 +566,9 @@ mod project_tests {
             batch_files: 3,
             format_retries: 1,
             enrich_code: false,
+            thinking: false,
+            effort: DEFAULT_EFFORT,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             tls_ca_cert: None,
             tls_ca_certs: Vec::new(),
             tls_insecure: true,
@@ -769,5 +835,127 @@ mod project_tests {
     fn req042_premier_reglage_invalide_dans_l_ordre_de_la_liste() {
         let e = ProjectSettings::from_table(&table("concurrency = 0\nmodel = 1"), "f").unwrap_err();
         assert!(e.to_string().contains("clé `model`"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod llm_options_tests {
+    use super::*;
+
+    fn parse(extra: &str) -> Result<Config> {
+        Config::parse(
+            &format!("provider = \"mock\"\n{extra}"),
+            Path::new("/x/config.toml"),
+        )
+    }
+
+    #[test]
+    fn req058_ac1_defauts() {
+        let c = parse("").unwrap();
+        assert_eq!(c.effort, Effort::Low);
+        assert!(!c.thinking);
+        assert_eq!(c.max_output_tokens, 16384);
+    }
+
+    #[test]
+    fn req058_ac1_valeurs_acceptees() {
+        assert_eq!(
+            parse("effort = \"medium\"").unwrap().effort.as_str(),
+            "medium"
+        );
+        assert_eq!(parse("effort = \"high\"").unwrap().effort, Effort::High);
+        assert!(parse("thinking = true").unwrap().thinking);
+        assert_eq!(parse("max_output_tokens = 1").unwrap().max_output_tokens, 1);
+        assert_eq!(
+            parse("max_output_tokens = 200000")
+                .unwrap()
+                .max_output_tokens,
+            200000
+        );
+    }
+
+    #[test]
+    fn req058_ac1_cles_dans_l_erreur_de_cle_inconnue() {
+        let msg = parse("zz_inconnue = 1").unwrap_err().to_string();
+        for k in ["`effort`", "`thinking`", "`max_output_tokens`"] {
+            assert!(msg.contains(k), "{msg}");
+        }
+    }
+
+    #[test]
+    fn req058_ac2_valeurs_invalides() {
+        let cases = [
+            (
+                "effort = \"max\"",
+                "effort",
+                "\"low\", \"medium\" ou \"high\"",
+                "\"max\"",
+            ),
+            (
+                "effort = \"\"",
+                "effort",
+                "\"low\", \"medium\" ou \"high\"",
+                "\"\"",
+            ),
+            (
+                "effort = \"LOW\"",
+                "effort",
+                "\"low\", \"medium\" ou \"high\"",
+                "\"LOW\"",
+            ),
+            (
+                "effort = 1",
+                "effort",
+                "\"low\", \"medium\" ou \"high\"",
+                "1",
+            ),
+            (
+                "thinking = \"oui\"",
+                "thinking",
+                "un booléen, true ou false",
+                "\"oui\"",
+            ),
+            ("thinking = 1", "thinking", "un booléen, true ou false", "1"),
+            (
+                "max_output_tokens = 0",
+                "max_output_tokens",
+                "un entier strictement positif",
+                "0",
+            ),
+            (
+                "max_output_tokens = -5",
+                "max_output_tokens",
+                "un entier strictement positif",
+                "-5",
+            ),
+            (
+                "max_output_tokens = 1.5",
+                "max_output_tokens",
+                "un entier strictement positif",
+                "1.5",
+            ),
+            (
+                "max_output_tokens = \"16384\"",
+                "max_output_tokens",
+                "un entier strictement positif",
+                "\"16384\"",
+            ),
+            (
+                "max_output_tokens = 4294967296",
+                "max_output_tokens",
+                "un entier strictement positif",
+                "4294967296",
+            ),
+        ];
+        for (line, key, expected, got) in cases {
+            let msg = parse(line).unwrap_err().to_string();
+            assert_eq!(
+                msg,
+                format!(
+                    "configuration invalide (/x/config.toml) : clé « {key} » doit être {expected} (reçu : {got})"
+                ),
+                "{line}"
+            );
+        }
     }
 }
