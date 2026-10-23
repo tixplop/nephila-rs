@@ -5,6 +5,7 @@ use assert_cmd::cargo::cargo_bin;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::time::{Duration, SystemTime};
 
 const SERVICE: &str = "core/OrderService.java";
 const REPO_JAVA: &str = "core/OrderRepository.java";
@@ -17,12 +18,35 @@ struct Env {
     config: PathBuf,
 }
 
+fn set_mtime(p: &std::path::Path, t: SystemTime) {
+    let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+    f.set_modified(t).unwrap();
+}
+
+fn first_line(b: &[u8]) -> String {
+    text(b).lines().next().unwrap_or("").to_string()
+}
+
+fn warn_count(b: &[u8]) -> usize {
+    text(b).lines().filter(|l| l.contains("pas à jour")).count()
+}
+
 fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
 impl Env {
     fn new() -> Env {
+        Env::create(false)
+    }
+
+    /// Fixture dont les fichiers sont reculés de 60 s avant le `build` : l'indexation tombe à
+    /// plus de 2 s de leur date (hors fenêtre « racy »).
+    fn new_aged() -> Env {
+        Env::create(true)
+    }
+
+    fn create(aged: bool) -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let env = Env {
             repo: tmp.path().join("repo"),
@@ -49,6 +73,12 @@ impl Env {
             r#"{"found":true,"answer":"ok","nodes":["OrderService"]}"#,
         )
         .unwrap();
+        if aged {
+            let old = SystemTime::now() - Duration::from_secs(60);
+            for p in [SERVICE, REPO_JAVA, API] {
+                set_mtime(&env.repo.join(p), old);
+            }
+        }
         let out = env.cmd(&["build", "--no-llm"]).output().unwrap();
         assert!(out.status.success(), "{}", text(&out.stderr));
         env
@@ -233,4 +263,140 @@ fn req017_ac14_non_utf8_file_outside_graph_is_not_counted_as_added() {
         text(&o.stderr).lines().next(),
         Some("avertissement: graphe pas à jour : 1 fichier modifié")
     );
+}
+
+#[test]
+fn req017_ac6_same_size_content_with_original_date_is_not_counted() {
+    let env = Env::new_aged();
+    let p = env.repo.join(SERVICE);
+    let orig = fs::metadata(&p).unwrap().modified().unwrap();
+    let mut c = fs::read_to_string(&p).unwrap();
+    c = c.replace("OrderRepository repo", "OrderRepository rep2");
+    fs::write(&p, &c).unwrap();
+    set_mtime(&p, orig);
+    for o in env.queries(true, false) {
+        assert!(o.status.success(), "{}", text(&o.stderr));
+        assert!(o.stderr.is_empty(), "{}", text(&o.stderr));
+    }
+}
+
+#[test]
+fn req017_ac6_date_only_change_is_counted_while_status_says_up_to_date() {
+    let env = Env::new_aged();
+    set_mtime(&env.repo.join(SERVICE), SystemTime::now());
+    let o = env.run(&["query", "search", "OrderService", "--check-stale"]);
+    assert!(o.status.success());
+    assert_eq!(
+        first_line(&o.stderr),
+        "avertissement: graphe pas à jour : 1 fichier modifié"
+    );
+    let s = env.run(&["status"]);
+    assert!(s.status.success());
+    assert_eq!(first_line(&s.stdout), "graphe à jour");
+}
+
+#[test]
+fn req017_ac9_first_stderr_line_is_the_only_warning() {
+    let env = Env::new_aged();
+    env.modify_three();
+    let o = env.run(&["query", "search", "OrderService", "--check-stale"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(
+        first_line(&o.stderr),
+        "avertissement: graphe pas à jour : 3 fichiers modifiés"
+    );
+    assert_eq!(warn_count(&o.stderr), 1);
+
+    let j = env.run(&["query", "search", "OrderService", "--json", "--check-stale"]);
+    assert_eq!(
+        first_line(&j.stderr),
+        "avertissement: graphe pas à jour : 3 fichiers modifiés"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&j.stdout).unwrap();
+    assert!(!v.to_string().contains("pas à jour"));
+    assert!(!text(&j.stdout).contains("pas à jour"));
+
+    let n = env.run(&["query", "search", "zzzinexistant", "--check-stale"]);
+    assert!(!n.status.success());
+    let err = text(&n.stderr);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(
+        lines[0],
+        "avertissement: graphe pas à jour : 3 fichiers modifiés"
+    );
+    assert!(
+        lines[1..].iter().any(|l| l.contains("aucun résultat")),
+        "{err}"
+    );
+
+    let plain = env.run(&["query", "ask", "Que fait OrderService ?"]);
+    let ask = env.run(&["query", "ask", "Que fait OrderService ?", "--check-stale"]);
+    assert!(ask.status.success(), "{}", text(&ask.stderr));
+    assert_eq!(ask.stdout, plain.stdout);
+    assert_eq!(
+        first_line(&ask.stderr),
+        "avertissement: graphe pas à jour : 3 fichiers modifiés"
+    );
+}
+
+#[test]
+fn req017_ac9_singular_for_one_file() {
+    let env = Env::new_aged();
+    let mut c = fs::read_to_string(env.repo.join(API)).unwrap();
+    c.push_str("// x\n");
+    fs::write(env.repo.join(API), c).unwrap();
+    let o = env.run(&["query", "search", "OrderService", "--check-stale"]);
+    assert_eq!(
+        first_line(&o.stderr),
+        "avertissement: graphe pas à jour : 1 fichier modifié"
+    );
+}
+
+#[test]
+fn req017_ac10_up_to_date_outputs_are_byte_identical_with_option() {
+    let env = Env::new_aged();
+    let sets: [&[&str]; 3] = [
+        &["query", "search", "OrderService"],
+        &["query", "neighbors", "OrderService"],
+        &["query", "path", "ApiController", "OrderRepository"],
+    ];
+    for s in sets {
+        let a = env.run(s);
+        let mut w = s.to_vec();
+        w.push("--check-stale");
+        let b = env.run(&w);
+        assert_eq!(a.stdout, b.stdout);
+        assert_eq!(a.stderr, b.stderr);
+        assert_eq!(a.status.code(), b.status.code());
+        assert!(b.stderr.is_empty(), "{}", text(&b.stderr));
+    }
+}
+
+#[test]
+fn req017_ac11_update_records_new_date_and_clears_warning() {
+    let env = Env::new_aged();
+    set_mtime(&env.repo.join(SERVICE), SystemTime::now());
+    let q = ["query", "search", "OrderService", "--check-stale"];
+    let o = env.run(&q);
+    assert_eq!(
+        first_line(&o.stderr),
+        "avertissement: graphe pas à jour : 1 fichier modifié"
+    );
+    let u = env.run(&["update", "--no-llm"]);
+    assert_eq!(u.status.code(), Some(0), "{}", text(&u.stderr));
+    assert_eq!(text(&u.stdout).trim_end(), "graphe à jour");
+    let o = env.run(&q);
+    assert!(o.status.success());
+    assert!(o.stderr.is_empty(), "{}", text(&o.stderr));
+}
+
+#[test]
+fn req017_ac12_option_is_refused_outside_query() {
+    let env = Env::new();
+    for cmd in ["status", "summary"] {
+        let o = env.run(&[cmd, "--check-stale"]);
+        assert_eq!(o.status.code(), Some(2), "{cmd}");
+        assert!(o.stdout.is_empty(), "{cmd}");
+        assert!(text(&o.stderr).contains("--check-stale"), "{cmd}");
+    }
 }
