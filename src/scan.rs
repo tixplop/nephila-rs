@@ -286,7 +286,14 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
         let name = std::ffi::OsStr::from_bytes(b"A\xff.java");
-        std::fs::write(dir.path().join(name), "class A {}\n").unwrap();
+        // APFS refuse les noms non UTF-8 (EILSEQ) : le cas ne peut pas exister sur ce système.
+        if let Err(e) = std::fs::write(dir.path().join(name), "class A {}\n") {
+            if !cfg!(target_os = "macos") {
+                panic!("création de A\\xff.java refusée hors macOS : {e}");
+            }
+            eprintln!("test non applicable : le système de fichiers refuse un nom non UTF-8 ({e})");
+            return;
+        }
         let res = scan(dir.path(), &[], &Matcher::none()).unwrap();
         assert_eq!(res.files.len(), 1, "{:?}", res.warnings);
         assert!(res.warnings.is_empty(), "{:?}", res.warnings);
