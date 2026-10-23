@@ -54,6 +54,83 @@ pub fn reverse_qualified(qualified: &str) -> String {
     qualified.chars().rev().collect()
 }
 
+/// Capacité du cache de requêtes préparées de chaque connexion (REQ-061).
+const STATEMENT_CACHE_CAPACITY: usize = 64;
+
+/// Attente maximale d'un verrou SQLite.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Réglages communs des ouvertures en écriture (REQ-059), posés avant tout contrôle de version
+/// ou migration. En WAL, `synchronous = NORMAL` ne perd jamais la cohérence de la base (au pire
+/// les dernières transactions en cas de coupure) et évite un fsync par transaction.
+fn configure_write(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(db_err)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(db_err)?;
+    conn.pragma_update(None, "cache_size", -262_144)
+        .map_err(db_err)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")
+        .map_err(db_err)?;
+    conn.pragma_update(None, "mmap_size", 268_435_456_i64)
+        .map_err(db_err)?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(db_err)?;
+    Ok(())
+}
+
+thread_local! {
+    static COMMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PROJECTIONS: std::cell::RefCell<std::collections::HashMap<String, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Compteurs de diagnostic du fil courant, lus par les tests seulement.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Diagnostics {
+    commits: u64,
+    projections: std::collections::HashMap<String, u64>,
+}
+
+impl Diagnostics {
+    /// Transactions d'écriture du `Store` validées depuis la dernière remise à zéro.
+    pub fn commits(&self) -> u64 {
+        self.commits
+    }
+
+    /// Nombre de projections exécutées pour le nœud `id`.
+    pub fn projections(&self, id: &str) -> u64 {
+        self.projections.get(id).copied().unwrap_or(0)
+    }
+
+    /// Nombre total de projections exécutées.
+    pub fn total_projections(&self) -> u64 {
+        self.projections.values().sum()
+    }
+}
+
+#[doc(hidden)]
+pub fn diagnostics() -> Diagnostics {
+    Diagnostics {
+        commits: COMMITS.with(std::cell::Cell::get),
+        projections: PROJECTIONS.with(|p| p.borrow().clone()),
+    }
+}
+
+#[doc(hidden)]
+pub fn reset_diagnostics() {
+    COMMITS.with(|c| c.set(0));
+    PROJECTIONS.with(|p| p.borrow_mut().clear());
+}
+
+/// Valide une transaction d'écriture et la compte.
+fn commit_counted(tx: rusqlite::Transaction<'_>) -> Result<()> {
+    tx.commit().map_err(db_err)?;
+    COMMITS.with(|c| c.set(c.get() + 1));
+    Ok(())
+}
+
 fn db_err(e: rusqlite::Error) -> Error {
     Error::Message(format!("base du graphe : {e}"))
 }
@@ -80,16 +157,11 @@ impl Store {
             })?;
         }
         let conn = Connection::open(&path).map_err(db_err)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(db_err)?;
+        // Avant le passage en WAL, qui peut lui-même rencontrer un verrou.
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(db_err)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;
-        // En WAL, NORMAL ne perd jamais la cohérence de la base (au pire les dernières
-        // transactions en cas de coupure) et évite un fsync par transaction de fichier.
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(db_err)?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(db_err)?;
+        configure_write(&conn)?;
         let store = Store {
             conn,
             read_only: false,
@@ -121,10 +193,7 @@ impl Store {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(db_err)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(db_err)?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(db_err)?;
+        configure_write(&conn)?;
         let store = Store {
             conn,
             read_only: false,
@@ -161,6 +230,7 @@ impl Store {
             .map_err(db_err)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(db_err)?;
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         let mut store = Store {
             conn,
             read_only: true,
@@ -200,7 +270,7 @@ impl Store {
             .map_err(db_err)?;
         let rows: Vec<(String, String)> = {
             let mut st = tx
-                .prepare("SELECT id, qualified FROM nodes")
+                .prepare_cached("SELECT id, qualified FROM nodes")
                 .map_err(db_err)?;
             let rows = st
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -210,7 +280,7 @@ impl Store {
         };
         {
             let mut up = tx
-                .prepare("UPDATE nodes SET qualified_rev = ?2 WHERE id = ?1")
+                .prepare_cached("UPDATE nodes SET qualified_rev = ?2 WHERE id = ?1")
                 .map_err(db_err)?;
             for (id, q) in rows {
                 up.execute(params![id, reverse_qualified(&q)])
@@ -223,7 +293,7 @@ impl Store {
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
         .map_err(db_err)?;
-        tx.commit().map_err(db_err)
+        commit_counted(tx)
     }
 
     fn user_version(&self) -> Result<i32> {
@@ -237,7 +307,7 @@ impl Store {
         let names: Vec<String> = {
             let mut st = self
                 .conn
-                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+                .prepare_cached("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
                 .map_err(db_err)?;
             let rows = st.query_map([], |r| r.get(0)).map_err(db_err)?;
             rows.collect::<std::result::Result<_, _>>()
@@ -280,7 +350,7 @@ impl Store {
              DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
         )
         .map_err(db_err)?;
-        tx.commit().map_err(db_err)
+        commit_counted(tx)
     }
 
     /// Vide le graphe et enregistre `files` « en attente » en une seule transaction : le graphe
@@ -295,7 +365,7 @@ impl Store {
         .map_err(db_err)?;
         {
             let mut st = tx
-                .prepare("INSERT INTO files(path, hash, size, mtime, recorded_at, state) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')")
+                .prepare_cached("INSERT INTO files(path, hash, size, mtime, recorded_at, state) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')")
                 .map_err(db_err)?;
             for f in files {
                 let size = i64::try_from(f.size)
@@ -304,7 +374,7 @@ impl Store {
                     .map_err(db_err)?;
             }
         }
-        tx.commit().map_err(db_err)
+        commit_counted(tx)
     }
 
     /// Enregistre ou met à jour des fichiers (état d'origine conservé dans chaque enregistrement),
@@ -314,7 +384,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         {
             let mut st = tx
-                .prepare(
+                .prepare_cached(
                     "INSERT INTO files(path, hash, size, mtime, recorded_at, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, size = excluded.size,
                          mtime = excluded.mtime, recorded_at = excluded.recorded_at,
@@ -335,7 +405,7 @@ impl Store {
                 .map_err(db_err)?;
             }
         }
-        tx.commit().map_err(db_err)
+        commit_counted(tx)
     }
 
     /// Insère des fichiers à l'état « en attente ».
@@ -393,13 +463,15 @@ impl Store {
             release_file(&tx, path, None)?;
             insert_nodes(&tx, path, nodes, "parse")?;
             insert_refs(&tx, path, refs, "parse")?;
-            tx.execute("UPDATE files SET state = 'indexed' WHERE path = ?1", [path])
+            tx.prepare_cached("UPDATE files SET state = 'indexed' WHERE path = ?1")
+                .map_err(db_err)?
+                .execute([path])
                 .map_err(db_err)?;
             if reapply_enrichment(&tx, path)? {
                 reapplied += 1;
             }
         }
-        tx.commit().map_err(db_err)?;
+        commit_counted(tx)?;
         Ok(reapplied)
     }
 
@@ -442,16 +514,17 @@ impl Store {
         };
         let json = serde_json::to_string(&payload)
             .map_err(|e| Error::Message(format!("enrichissement non sérialisable : {e}")))?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET content_hash = excluded.content_hash,
                  model = excluded.model, prompt_version = excluded.prompt_version,
                  payload = excluded.payload",
-            params![path, hash, model, ENRICH_PROMPT_VERSION, json],
         )
+        .map_err(db_err)?
+        .execute(params![path, hash, model, ENRICH_PROMPT_VERSION, json])
         .map_err(db_err)?;
-        tx.commit().map_err(db_err)
+        commit_counted(tx)
     }
 
     /// Fichiers indexés à enrichir : dans la portée de l'enrichissement (documents, plus les
@@ -464,7 +537,7 @@ impl Store {
         let code = self.enrich_code()?;
         let mut st = self
             .conn
-            .prepare(&format!(
+            .prepare_cached(&format!(
                 "SELECT f.path FROM files f WHERE f.state = 'indexed' AND NOT EXISTS ({UP_TO_DATE}) ORDER BY f.path"
             ))
             .map_err(db_err)?;
@@ -491,11 +564,12 @@ impl Store {
 
     /// Portée enregistrée par le dernier `build`/`update` LLM actif (`false` : documents seuls).
     pub fn enrich_code(&self) -> Result<bool> {
-        match self.conn.query_row(
-            "SELECT value FROM meta WHERE key = 'enrich_code'",
-            [],
-            |r| r.get::<_, String>(0),
-        ) {
+        match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'enrich_code'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get::<_, String>(0))
+        {
             Ok(v) => Ok(v == "true"),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
             Err(e) => Err(db_err(e)),
@@ -506,11 +580,12 @@ impl Store {
     pub fn set_enrich_code(&mut self, code: bool) -> Result<()> {
         self.ensure_writable()?;
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT INTO meta(key, value) VALUES ('enrich_code', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [if code { "true" } else { "false" }],
             )
+            .map_err(db_err)?
+            .execute([if code { "true" } else { "false" }])
             .map_err(db_err)?;
         Ok(())
     }
@@ -518,11 +593,12 @@ impl Store {
     /// Modèle effectif du dernier `build`/`update` LLM actif (`None` : aucun depuis la
     /// réinitialisation).
     pub fn enrich_model(&self) -> Result<Option<String>> {
-        match self.conn.query_row(
-            "SELECT value FROM meta WHERE key = 'enrich_model'",
-            [],
-            |r| r.get::<_, String>(0),
-        ) {
+        match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'enrich_model'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get::<_, String>(0))
+        {
             Ok(m) => Ok(Some(m)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(db_err(e)),
@@ -533,11 +609,12 @@ impl Store {
     pub fn set_enrich_model(&mut self, model: &str) -> Result<()> {
         self.ensure_writable()?;
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT INTO meta(key, value) VALUES ('enrich_model', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [model],
             )
+            .map_err(db_err)?
+            .execute([model])
             .map_err(db_err)?;
         Ok(())
     }
@@ -549,17 +626,19 @@ impl Store {
 
     /// Entrée d'enrichissement conservée d'un chemin, sans son contenu.
     pub fn enrichment_entry(&self, path: &str) -> Result<Option<EnrichmentEntry>> {
-        match self.conn.query_row(
-            "SELECT content_hash, model, prompt_version FROM enrichments WHERE path = ?1",
-            [path],
-            |r| {
+        match self
+            .conn
+            .prepare_cached(
+                "SELECT content_hash, model, prompt_version FROM enrichments WHERE path = ?1",
+            )
+            .map_err(db_err)?
+            .query_row([path], |r| {
                 Ok(EnrichmentEntry {
                     content_hash: r.get(0)?,
                     model: r.get(1)?,
                     prompt_version: r.get(2)?,
                 })
-            },
-        ) {
+            }) {
             Ok(e) => Ok(Some(e)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(db_err(e)),
@@ -571,12 +650,13 @@ impl Store {
     pub fn prune_enrichments(&mut self) -> Result<usize> {
         self.ensure_writable()?;
         self.conn
-            .execute(
+            .prepare_cached(
                 "DELETE FROM enrichments WHERE NOT EXISTS
                    (SELECT 1 FROM files f WHERE f.path = enrichments.path
                     AND f.hash = enrichments.content_hash)",
-                [],
             )
+            .map_err(db_err)?
+            .execute([])
             .map_err(db_err)
     }
 
@@ -586,12 +666,16 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         clear_summaries(&tx, path)?;
         release_file(&tx, path, None)?;
-        tx.execute("DELETE FROM enrichments WHERE path = ?1", [path])
+        tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
+            .map_err(db_err)?
+            .execute([path])
             .map_err(db_err)?;
         let n = tx
-            .execute("DELETE FROM files WHERE path = ?1", [path])
+            .prepare_cached("DELETE FROM files WHERE path = ?1")
+            .map_err(db_err)?
+            .execute([path])
             .map_err(db_err)?;
-        tx.commit().map_err(db_err)?;
+        commit_counted(tx)?;
         Ok(n > 0)
     }
 
@@ -607,7 +691,7 @@ impl Store {
             .collect();
         let stale: Vec<(String, String, String)> = {
             let mut st = tx
-                .prepare("SELECT source, target, kind FROM edges")
+                .prepare_cached("SELECT source, target, kind FROM edges")
                 .map_err(db_err)?;
             let rows = st
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -625,7 +709,9 @@ impl Store {
             }
             drop(st);
             let mut ins = tx
-                .prepare("INSERT OR IGNORE INTO edges(source, target, kind) VALUES (?1, ?2, ?3)")
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO edges(source, target, kind) VALUES (?1, ?2, ?3)",
+                )
                 .map_err(db_err)?;
             for e in edges {
                 let key = (
@@ -641,19 +727,19 @@ impl Store {
             stale
         };
         let mut del = tx
-            .prepare("DELETE FROM edges WHERE source = ?1 AND target = ?2 AND kind = ?3")
+            .prepare_cached("DELETE FROM edges WHERE source = ?1 AND target = ?2 AND kind = ?3")
             .map_err(db_err)?;
         for (s, t, k) in &stale {
             del.execute(params![s, t, k]).map_err(db_err)?;
         }
         drop(del);
-        tx.commit().map_err(db_err)
+        commit_counted(tx)
     }
 
     pub fn nodes(&self) -> Result<Vec<Node>> {
         let mut st = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes ORDER BY id",
             )
             .map_err(db_err)?;
@@ -807,9 +893,9 @@ impl Store {
 
     fn count(&self, table: &str) -> Result<usize> {
         self.conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
-                r.get::<_, i64>(0)
-            })
+            .prepare_cached(&format!("SELECT COUNT(*) FROM {table}"))
+            .map_err(db_err)?
+            .query_row([], |r| r.get::<_, i64>(0))
             .map(|n| n as usize)
             .map_err(db_err)
     }
@@ -817,7 +903,7 @@ impl Store {
     pub fn edges(&self) -> Result<Vec<Edge>> {
         let mut st = self
             .conn
-            .prepare("SELECT source, target, kind FROM edges ORDER BY source, target, kind")
+            .prepare_cached("SELECT source, target, kind FROM edges ORDER BY source, target, kind")
             .map_err(db_err)?;
         let rows = st
             .query_map([], |r| {
@@ -843,7 +929,7 @@ impl Store {
     pub fn refs(&self) -> Result<Vec<Ref>> {
         let mut st = self
             .conn
-            .prepare("SELECT source, kind, target_name, context FROM refs ORDER BY id")
+            .prepare_cached("SELECT source, kind, target_name, context FROM refs ORDER BY id")
             .map_err(db_err)?;
         let rows = st
             .query_map([], |r| {
@@ -872,7 +958,9 @@ impl Store {
     pub fn refs_with_origin(&self) -> Result<Vec<(Ref, RefOrigin)>> {
         let mut st = self
             .conn
-            .prepare("SELECT source, kind, target_name, context, origin FROM refs ORDER BY id")
+            .prepare_cached(
+                "SELECT source, kind, target_name, context, origin FROM refs ORDER BY id",
+            )
             .map_err(db_err)?;
         let rows = st
             .query_map([], |r| {
@@ -911,15 +999,16 @@ impl Store {
     pub fn replace_derived_dependencies(&mut self, deps: &[Node]) -> Result<()> {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM nodes WHERE kind = 'dependency'
              AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
-            [],
         )
+        .map_err(db_err)?
+        .execute([])
         .map_err(db_err)?;
         {
             let mut ins = tx
-                .prepare(
+                .prepare_cached(
                     "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary, qualified_rev)
                      VALUES (?1, 'dependency', ?2, ?3, NULL, NULL, NULL, ?4)",
                 )
@@ -934,14 +1023,14 @@ impl Store {
                 .map_err(db_err)?;
             }
         }
-        tx.commit().map_err(db_err)
+        commit_counted(tx)
     }
 
     /// Couples (fichier, identifiant de nœud) des déclarations.
     pub fn declarations(&self) -> Result<Vec<(String, String)>> {
         let mut st = self
             .conn
-            .prepare("SELECT file, node FROM declarations ORDER BY file, node")
+            .prepare_cached("SELECT file, node FROM declarations ORDER BY file, node")
             .map_err(db_err)?;
         let rows = st
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -954,7 +1043,7 @@ impl Store {
     pub fn declared_short_names(&self) -> Result<Vec<(String, String, String)>> {
         let mut st = self
             .conn
-            .prepare("SELECT file, node, short FROM declarations ORDER BY file, node")
+            .prepare_cached("SELECT file, node, short FROM declarations ORDER BY file, node")
             .map_err(db_err)?;
         let rows = st
             .query_map([], |r| {
@@ -973,7 +1062,7 @@ impl Store {
     pub fn files_declaring_document(&self, files: &[&str]) -> Result<Vec<String>> {
         let mut st = self
             .conn
-            .prepare("SELECT 1 FROM declarations WHERE file = ?1 AND node = ?2")
+            .prepare_cached("SELECT 1 FROM declarations WHERE file = ?1 AND node = ?2")
             .map_err(db_err)?;
         let mut found = Vec::new();
         for f in files {
@@ -990,7 +1079,9 @@ impl Store {
     pub fn files(&self) -> Result<Vec<FileRecord>> {
         let mut st = self
             .conn
-            .prepare("SELECT path, hash, size, mtime, recorded_at, state FROM files ORDER BY path")
+            .prepare_cached(
+                "SELECT path, hash, size, mtime, recorded_at, state FROM files ORDER BY path",
+            )
             .map_err(db_err)?;
         let rows = st
             .query_map([], |r| {
@@ -1035,11 +1126,12 @@ impl Store {
 
     /// Résumé global du dépôt et son horodatage (millisecondes Unix), s'il existe.
     pub fn summary(&self) -> Result<Option<(String, i64)>> {
-        match self.conn.query_row(
-            "SELECT text, computed_at FROM summary WHERE id = 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ) {
+        match self
+            .conn
+            .prepare_cached("SELECT text, computed_at FROM summary WHERE id = 1")
+            .map_err(db_err)?
+            .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+        {
             Ok(t) => Ok(Some(t)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(db_err(e)),
@@ -1049,11 +1141,8 @@ impl Store {
     pub fn set_summary(&mut self, text: &str, computed_at: i64) -> Result<()> {
         self.ensure_writable()?;
         self.conn
-            .execute(
-                "INSERT INTO summary(id, text, computed_at) VALUES (1, ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET text = excluded.text, computed_at = excluded.computed_at",
-                params![text, computed_at],
-            )
+            .prepare_cached("INSERT INTO summary(id, text, computed_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET text = excluded.text, computed_at = excluded.computed_at").map_err(db_err)?.execute(params![text, computed_at])
             .map_err(db_err)?;
         Ok(())
     }
@@ -1061,7 +1150,9 @@ impl Store {
 
 fn require_known(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
     let known: bool = tx
-        .query_row("SELECT 1 FROM files WHERE path = ?1", [path], |_| Ok(true))
+        .prepare_cached("SELECT 1 FROM files WHERE path = ?1")
+        .map_err(db_err)?
+        .query_row([path], |_| Ok(true))
         .unwrap_or(false);
     if known {
         Ok(())
@@ -1075,10 +1166,11 @@ fn require_known(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
 /// Efface les résumés posés par un fichier dans ses déclarations (ceux d'autres déclarants d'un
 /// nœud partagé restent) puis recalcule les lignes des nœuds concernés.
 fn clear_summaries(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE declarations SET summary = NULL WHERE file = ?1 AND summary IS NOT NULL",
-        [path],
     )
+    .map_err(db_err)?
+    .execute([path])
     .map_err(db_err)?;
     let ids = declared_by(tx, path)?;
     refresh_nodes(tx, &ids)
@@ -1086,7 +1178,7 @@ fn clear_summaries(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
 
 fn declared_by(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Vec<String>> {
     let mut st = tx
-        .prepare("SELECT node FROM declarations WHERE file = ?1")
+        .prepare_cached("SELECT node FROM declarations WHERE file = ?1")
         .map_err(db_err)?;
     let rows = st
         .query_map([path], |r| r.get::<_, String>(0))
@@ -1100,7 +1192,7 @@ fn declared_by(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Vec<String>
 /// petit chemin ayant un résumé. Les nœuds non déclarés sont ignorés.
 fn refresh_nodes<S: AsRef<str>>(tx: &rusqlite::Transaction<'_>, ids: &[S]) -> Result<()> {
     let mut up = tx
-        .prepare(
+        .prepare_cached(
             "UPDATE nodes SET
                short = (SELECT short FROM declarations WHERE node = nodes.id ORDER BY file LIMIT 1),
                subkind = (SELECT subkind FROM declarations WHERE node = nodes.id ORDER BY file LIMIT 1),
@@ -1115,6 +1207,9 @@ fn refresh_nodes<S: AsRef<str>>(tx: &rusqlite::Transaction<'_>, ids: &[S]) -> Re
         .map_err(db_err)?;
     for id in ids {
         up.execute([id.as_ref()]).map_err(db_err)?;
+        PROJECTIONS.with(|p| {
+            *p.borrow_mut().entry(id.as_ref().to_string()).or_insert(0) += 1;
+        });
     }
     Ok(())
 }
@@ -1126,10 +1221,10 @@ fn insert_nodes(
     origin: &str,
 ) -> Result<()> {
     let mut ins = tx
-        .prepare("INSERT OR IGNORE INTO nodes(id, kind, qualified, short, qualified_rev) VALUES (?1, ?2, ?3, ?4, ?5)")
+        .prepare_cached("INSERT OR IGNORE INTO nodes(id, kind, qualified, short, qualified_rev) VALUES (?1, ?2, ?3, ?4, ?5)")
         .map_err(db_err)?;
     let mut decl = tx
-        .prepare(
+        .prepare_cached(
             "INSERT OR IGNORE INTO declarations(file, node, origin, short, subkind, located, summary)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
@@ -1173,7 +1268,7 @@ fn insert_refs(
     origin: &str,
 ) -> Result<()> {
     let mut insr = tx
-        .prepare(
+        .prepare_cached(
             "INSERT INTO refs(source, file, kind, target_name, context, origin)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS
                (SELECT 1 FROM declarations WHERE node = ?1 AND file = ?2)",
@@ -1208,7 +1303,7 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
     // `replace_derived_dependencies` ; seuls ceux que ce fichier déclarait suivent ses déclarations.
     let released: Vec<String> = {
         let mut st = tx
-            .prepare(
+            .prepare_cached(
                 "SELECT node FROM declarations WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
             )
             .map_err(db_err)?;
@@ -1218,19 +1313,17 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_err)?
     };
-    tx.execute(
-        "DELETE FROM refs WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
-        params![path, origin],
-    )
-    .map_err(db_err)?;
-    tx.execute(
-        "DELETE FROM declarations WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
-        params![path, origin],
-    )
-    .map_err(db_err)?;
+    tx.prepare_cached("DELETE FROM refs WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)")
+        .map_err(db_err)?
+        .execute(params![path, origin])
+        .map_err(db_err)?;
+    tx.prepare_cached("DELETE FROM declarations WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)")
+        .map_err(db_err)?
+        .execute(params![path, origin])
+        .map_err(db_err)?;
     refresh_nodes(tx, &released)?;
     let mut del = tx
-        .prepare(
+        .prepare_cached(
             "DELETE FROM nodes WHERE id = ?1
              AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
         )
@@ -1286,10 +1379,9 @@ fn apply_enrichment_tx(
     insert_nodes(tx, path, concept_nodes, "llm")?;
     for (id, text) in summaries {
         let n = tx
-            .execute(
-                "UPDATE declarations SET summary = ?2 WHERE node = ?1 AND file = ?3",
-                params![id, text, path],
-            )
+            .prepare_cached("UPDATE declarations SET summary = ?2 WHERE node = ?1 AND file = ?3")
+            .map_err(db_err)?
+            .execute(params![id, text, path])
             .map_err(db_err)?;
         if n == 0 {
             return Err(Error::Message(format!(
@@ -1306,11 +1398,11 @@ fn apply_enrichment_tx(
 /// son empreinte de contenu est celle du fichier ; une entrée de contenu différent est
 /// supprimée. Les éléments sans nœud correspondant sont écartés en silence.
 fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<bool> {
-    let row: Option<(String, String)> = match tx.query_row(
-        "SELECT e.content_hash, e.payload FROM enrichments e WHERE e.path = ?1",
-        [path],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    ) {
+    let row: Option<(String, String)> = match tx
+        .prepare_cached("SELECT e.content_hash, e.payload FROM enrichments e WHERE e.path = ?1")
+        .map_err(db_err)?
+        .query_row([path], |r| Ok((r.get(0)?, r.get(1)?)))
+    {
         Ok(v) => Some(v),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
         Err(e) => return Err(db_err(e)),
@@ -1319,9 +1411,9 @@ fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<bool
         return Ok(false);
     };
     let file_hash: String = tx
-        .query_row("SELECT hash FROM files WHERE path = ?1", [path], |r| {
-            r.get(0)
-        })
+        .prepare_cached("SELECT hash FROM files WHERE path = ?1")
+        .map_err(db_err)?
+        .query_row([path], |r| r.get(0))
         .map_err(db_err)?;
     let payload: Option<Payload> = if entry_hash == file_hash {
         serde_json::from_str(&json).ok()
@@ -1329,7 +1421,9 @@ fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<bool
         None
     };
     let Some(payload) = payload else {
-        tx.execute("DELETE FROM enrichments WHERE path = ?1", [path])
+        tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
+            .map_err(db_err)?
+            .execute([path])
             .map_err(db_err)?;
         return Ok(false);
     };
@@ -2489,5 +2583,129 @@ mod tests {
         let n = &st.nodes().unwrap()[0];
         assert_eq!(n.file, None);
         assert_eq!(n.summary.as_deref(), Some("r-a.md"));
+    }
+
+    fn pragma_i64(st: &Store, name: &str) -> i64 {
+        st.conn
+            .pragma_query_value(None, name, |r| r.get(0))
+            .unwrap()
+    }
+
+    fn assert_write_pragmas(st: &Store) {
+        assert_eq!(pragma_i64(st, "synchronous"), 1);
+        assert_eq!(pragma_i64(st, "cache_size"), -262_144);
+        assert_eq!(pragma_i64(st, "temp_store"), 2);
+        assert_eq!(pragma_i64(st, "mmap_size"), 268_435_456);
+        assert_eq!(st.journal_mode().unwrap(), "wal");
+        assert_eq!(pragma_i64(st, "foreign_keys"), 1);
+    }
+
+    #[test]
+    fn req059_ac1_write_openings_set_the_six_pragmas() {
+        let dir = tempdir().unwrap();
+        assert_write_pragmas(&Store::open_or_create(dir.path()).unwrap());
+        assert_write_pragmas(&Store::open_or_create(dir.path()).unwrap());
+        assert_write_pragmas(&Store::open_existing(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn req059_ac2_pragmas_hold_after_migration_of_older_schemas() {
+        let dir = tempdir().unwrap();
+        drop(populated(dir.path()));
+        assert_write_pragmas(&Store::open_existing(dir.path()).unwrap());
+        assert_write_pragmas(&Store::open_or_create(dir.path()).unwrap());
+        downgrade_to_5(dir.path());
+        assert_write_pragmas(&Store::open_existing(dir.path()).unwrap());
+        downgrade_to_5(dir.path());
+        assert_write_pragmas(&Store::open_or_create(dir.path()).unwrap());
+    }
+
+    /// Code hors tests de `mod.rs`, blancs réduits à une espace.
+    fn production_source_reduced() -> String {
+        let src = include_str!("mod.rs");
+        let cut = src
+            .match_indices("#[cfg(test)]")
+            .find(|(i, _)| *i == 0 || src.as_bytes()[i - 1] == b'\n')
+            .map(|(i, _)| i)
+            .unwrap();
+        src[..cut].split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Occurrences de `.prepare` suivi (blancs admis) de `(`.
+    fn prepare_calls(text: &str) -> usize {
+        let mut n = 0;
+        for (i, _) in text.match_indices("prepare") {
+            let dotted = text[..i].trim_end().ends_with('.');
+            if dotted && text[i + "prepare".len()..].trim_start().starts_with('(') {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Occurrences de `conn|tx` (frontière de mot) `.` `execute|query_row|query_map` `(`.
+    fn direct_calls(text: &str) -> usize {
+        let b = text.as_bytes();
+        let mut n = 0;
+        for word in ["conn", "tx"] {
+            for (i, _) in text.match_indices(word) {
+                let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                if !before_ok {
+                    continue;
+                }
+                let Some(rest) = text[i + word.len()..].trim_start().strip_prefix('.') else {
+                    continue;
+                };
+                let rest = rest.trim_start();
+                for m in ["execute", "query_row", "query_map"] {
+                    if let Some(r) = rest.strip_prefix(m) {
+                        if r.trim_start().starts_with('(') {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn req061_ac1_no_uncached_sql_in_production_code() {
+        let text = production_source_reduced();
+        assert_eq!(prepare_calls(&text), 0, "`.prepare(` hors cache");
+        assert_eq!(
+            direct_calls(&text),
+            0,
+            "execute/query_row/query_map directs"
+        );
+        assert_eq!(prepare_calls("a . prepare ( x"), 1);
+        assert_eq!(direct_calls("self.conn . execute ( x"), 1);
+        assert_eq!(direct_calls("tx.prepare_cached(x).execute(y)"), 0);
+    }
+
+    #[test]
+    fn diagnostics_count_commits_and_projections() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        reset_diagnostics();
+        assert_eq!(diagnostics().commits(), 0);
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        st.apply_enrichment(
+            "a.md",
+            "h",
+            "m",
+            &[(node_id(NodeKind::Type, "p.A"), "r".to_string())],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let d = diagnostics();
+        assert_eq!(d.commits(), 2);
+        assert!(d.total_projections() >= 2);
+        assert!(d.projections(&node_id(NodeKind::Type, "p.A")) >= 2);
+        reset_diagnostics();
+        assert_eq!(diagnostics(), Diagnostics::default());
     }
 }
