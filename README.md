@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.19.2                                      # version voulue
+V=v0.20.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -456,11 +456,26 @@ Six de ces réglages (`model`, `max_chunk_chars`, `concurrency`, `timeout_secs`,
 | `max_chunk_chars` | Taille maximale d'un morceau envoyé au LLM | 60000 |
 | `concurrency` | Appels simultanés | 4 |
 | `enrich_code` | Booléen. `true` enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown ; configuration personnelle seulement, `--enrich-code` le demande pour une commande | `false` |
+| `thinking` | Booléen. `true` demande au modèle de réfléchir avant de répondre (réflexion jamais affichée ni enregistrée) ; configuration personnelle seulement | `false` |
+| `effort` | `"low"`, `"medium"` ou `"high"` : niveau de la réflexion. N'a d'effet qu'avec `thinking = true` ; configuration personnelle seulement | `"low"` |
+| `max_output_tokens` | Limite de jetons de la réponse du modèle, réflexion comprise, entier > 0 ; configuration personnelle seulement | 16384 |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |
 | `format_retries` | Nouveaux essais d'un appel dont la réponse est non conforme, entier ≥ 0 (2 = au plus 3 appels pour une même requête ; 0 = aucun nouvel essai, comme en 0.12.0) | 2 |
 | `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 (la connexion reste limitée à 10 s) | 300 |
 | `tls_ca_cert` | Chemin d'un fichier PEM d'autorités de certification, **ajoutées** aux autorités publiques embarquées. Absolu, `~/…`, ou relatif au dossier du fichier de configuration. Le magasin du système n'est pas lu (pour s'y fier : `/etc/ssl/certs/ca-certificates.crt`) | aucun |
 | `tls_insecure` | Booléen. `true` désactive tout contrôle du certificat du serveur, comme `curl -k` ; un avertissement est écrit à chaque commande | `false` |
+
+Ce que chaque clé envoie à chaque fournisseur :
+
+| Clé | `anthropic` | `openai` | `mock` |
+|---|---|---|---|
+| `max_output_tokens` | `max_tokens` | `max_completion_tokens` | sans effet |
+| `thinking = true` | `"thinking": {"type": "adaptive"}` | aucun champ propre (voir `effort`) | sans effet |
+| `effort` (avec `thinking = true` seulement) | `output_config.effort` | `reasoning_effort` | sans effet |
+
+Avec thinking = false, aucun champ de réflexion n'est envoyé ; un modèle qui réfléchit toujours le fait quand même. Pour limiter sa réflexion : thinking = true et effort = "low". Un modèle qui ne prend pas en charge ces champs refuse la requête (HTTP 400). Ces trois clés ne sont lues que dans la configuration personnelle : .nephila.toml les refuse.
+
+Un modèle ou un serveur local dont la réponse maximale est plus courte que 16384 jetons refuse aussi la requête (HTTP 400) : baissez `max_output_tokens`. Les fichiers de la requête refusée restent « à enrichir ».
 
 La clé d'API n'est jamais écrite dans le fichier. `nephila` ne la vérifie pas avant le traitement : une clé refusée est constatée au premier appel, après l'extraction (voir [`nephila build` et `nephila update`](#nephila-build-et-nephila-update)).
 
@@ -570,16 +585,16 @@ Un modèle qui échoue souvent au format se règle mieux en changeant de modèle
 Le fournisseur signale la troncature de la réponse (`stop_reason`, `finish_reason`). `nephila` ne la renvoie jamais, quelle que soit `format_retries` : la même requête rendrait la même réponse. Le fichier reste « à enrichir », une seule ligne le nomme, sans suffixe d'essais, et la commande sort avec le code 1 :
 
 ```
-avertissement: db/schema.sql : réponse tronquée par la limite de jetons ; réduisez max_chunk_chars ou batch_files
+avertissement: db/schema.sql : réponse tronquée par la limite de jetons ; réduisez max_chunk_chars ou batch_files, ou augmentez max_output_tokens
 ```
 
 Pour `nephila query ask`, une seule ligne sur stderr, stdout vide :
 
 ```
-erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée
+erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée ou augmentez max_output_tokens
 ```
 
-Que faire : relancer le seul fichier avec `nephila update --batch-files 1`, ou donner à `max_chunk_chars` ou à `batch_files` une valeur plus petite dans `.nephila.toml` ou dans la configuration personnelle. Une troncature n'arrête jamais l'envoi : les autres fichiers continuent. Avec `--verbose`, l'appel se termine par le résultat `tronquée`.
+Que faire : relancer le seul fichier avec `nephila update --batch-files 1`, ou donner à `max_chunk_chars` ou à `batch_files` une valeur plus petite dans `.nephila.toml` ou dans la configuration personnelle, ou augmenter `max_output_tokens` dans la configuration personnelle (la réflexion compte dans cette limite). Une troncature n'arrête jamais l'envoi : les autres fichiers continuent. Avec `--verbose`, l'appel se termine par le résultat `tronquée`.
 
 ## Ce que l'analyse extrait
 
@@ -697,6 +712,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.20 | Options LLM thinking, effort et max_output_tokens dans la configuration personnelle. Rupture : une limite de sortie de 16384 jetons est envoyée par défaut, à anthropic (au lieu de 8192) et désormais à openai ; un modèle ou un serveur qui ne l'accepte pas refuse la requête (HTTP 400) : baissez max_output_tokens. Une réponse tronquée conseille aussi d'augmenter max_output_tokens. |
 | 0.19.2 | Fichiers aux noms non UTF-8 lus par leur chemin réel (ils ne restent plus en attente) ; deux noms identiques après conversion : un seul est indexé, l'autre est nommé par un avertissement, au lieu d'un échec de build |
 | 0.19 | Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers. `query ask` ne copie plus le graphe pour chercher les mots-clés, `neighbors` et `path` restent linéaires autour d'un nœud très relié, la résolution d'un nom passe par un index. Le schéma 6 est migré sur place. |
 | 0.18 | Rupture : seuls les documents Markdown sont enrichis par défaut ; enrich_code = true dans la configuration personnelle, ou --enrich-code, rétablit le comportement de la 0.17. Les résumés sont conservés d'un build à l'autre : le premier build en 0.18 remplace le graphe et enrichit une fois tous les fichiers de la portée, les suivants n'envoient que les fichiers nouveaux ou modifiés. Une clé d'API refusée est constatée au premier appel, après l'extraction. Lots de 10 fichiers par défaut (`batch_files = 10`), morceaux d'un gros fichier envoyés en parallèle, nouveaux essais HTTP avec attente progressive, connexions réutilisées. |
@@ -728,7 +744,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.19.2 && git push origin v0.19.2
+git tag v0.20.0 && git push origin v0.20.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.

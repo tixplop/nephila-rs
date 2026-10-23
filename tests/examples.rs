@@ -728,7 +728,7 @@ fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
     assert!(line.contains("0.17"));
     let at = |needle: &str| readme.find(needle).unwrap();
     assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.19.2", "git tag v0.19.2 && git push origin v0.19.2"] {
+    for needle in ["V=v0.20.0", "git tag v0.20.0 && git push origin v0.20.0"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
     assert!(!readme.contains("0.17.6"));
@@ -936,8 +936,8 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
         "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
         "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.19.2 ",
-        "git tag v0.19.2 && git push origin v0.19.2",
+        "V=v0.20.0 ",
+        "git tag v0.20.0 && git push origin v0.20.0",
     ] {
         assert!(readme.contains(expected), "absent : {expected}");
     }
@@ -958,6 +958,11 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         .position(|l| l.starts_with("| 0.19.2 |"))
         .expect("ligne 0.19.2 absente");
     assert_eq!(i192 + 1, i19);
+    let i20 = lines
+        .iter()
+        .position(|l| l.starts_with("| 0.20 |"))
+        .expect("ligne 0.20 absente");
+    assert_eq!(i20 + 1, i192);
     let v19 = readme.find("- **Vers 0.19**").expect("puce Vers 0.19");
     let v18 = readme.find("- **Vers 0.18**").expect("puce Vers 0.18");
     assert!(v19 < v18);
@@ -975,5 +980,106 @@ fn REQ055_AC1_readme_0_19_migration_sur_place() {
         .expect("ligne 0.19");
     for w in ["query ask", "neighbors", "path", "schéma 6"] {
         assert!(row.contains(w), "{w}");
+    }
+}
+
+#[test]
+fn REQ041_AC11_blocs_des_options_llm_de_l_exemple_de_config() {
+    let text = example("config.toml");
+    let lines: Vec<&str> = text.lines().collect();
+    let at = |wanted: &str| position_of(&lines, wanted);
+    let title = at("# --- Options communes ---");
+    let enrich = at("# enrich_code = false");
+    let thinking = at("# thinking = false");
+    let effort = at("# effort = \"low\"");
+    let max_out = at("# max_output_tokens = 16384");
+    let chunk = lines
+        .iter()
+        .position(|l| l.starts_with("# max_chunk_chars ="))
+        .unwrap();
+    assert!(title < enrich);
+    assert_eq!(lines[enrich + 1], "");
+    assert!(enrich < thinking && thinking < effort && effort < max_out && max_out < chunk);
+    assert_eq!(lines[thinking + 1], "");
+    assert_eq!(lines[effort + 1], "");
+    assert_eq!(lines[max_out + 1], "");
+    for (key, extra) in [
+        (thinking, vec!["adaptive", "reasoning_effort"]),
+        (effort, vec![]),
+        (max_out, vec!["max_tokens", "max_completion_tokens"]),
+    ] {
+        let block = exact_doc_of(&lines, key);
+        let joined = block.join("\n");
+        assert!(joined.contains("défaut :"), "défaut : absent");
+        assert!(block.iter().any(|l| l == "# .nephila.toml la refuse."));
+        assert!(!joined.contains(".nephila.toml du dépôt"));
+        assert!(!joined.contains("--"));
+        for w in extra {
+            assert!(joined.contains(w), "absent : {w}");
+        }
+    }
+    let project = example("nephila.toml");
+    for k in ["effort", "thinking", "max_output_tokens"] {
+        assert!(!project.contains(k), "{k} dans nephila.toml");
+    }
+}
+
+#[test]
+fn REQ058_AC12_readme_options_llm_table_et_phrase() {
+    let readme = repo_file("README.md");
+    let lines: Vec<&str> = readme.lines().collect();
+    for k in [
+        "effort",
+        "thinking",
+        "max_output_tokens",
+        "max_completion_tokens",
+        "reasoning_effort",
+        "output_config",
+    ] {
+        assert!(readme.contains(k), "absent : {k}");
+    }
+    let rows = [
+        "| `max_output_tokens` | `max_tokens` | `max_completion_tokens` | sans effet |",
+        "| `thinking = true` | `\"thinking\": {\"type\": \"adaptive\"}` | aucun champ propre (voir `effort`) | sans effet |",
+        "| `effort` (avec `thinking = true` seulement) | `output_config.effort` | `reasoning_effort` | sans effet |",
+    ];
+    let first = lines
+        .iter()
+        .position(|l| *l == rows[0])
+        .expect("première ligne de la table absente");
+    assert_eq!(
+        lines[first - 2],
+        "| Clé | `anthropic` | `openai` | `mock` |"
+    );
+    assert_eq!(lines[first - 1], "|---|---|---|---|");
+    assert_eq!(lines[first + 1], rows[1]);
+    assert_eq!(lines[first + 2], rows[2]);
+    assert_eq!(lines[first + 3], "");
+    assert_eq!(
+        lines[first + 4],
+        "Avec thinking = false, aucun champ de réflexion n'est envoyé ; un modèle qui réfléchit toujours le fait quand même. Pour limiter sa réflexion : thinking = true et effort = \"low\". Un modèle qui ne prend pas en charge ces champs refuse la requête (HTTP 400). Ces trois clés ne sont lues que dans la configuration personnelle : .nephila.toml les refuse."
+    );
+    let expected = "| 0.20 | Options LLM thinking, effort et max_output_tokens dans la configuration personnelle. Rupture : une limite de sortie de 16384 jetons est envoyée par défaut, à anthropic (au lieu de 8192) et désormais à openai ; un modèle ou un serveur qui ne l'accepte pas refuse la requête (HTTP 400) : baissez max_output_tokens. Une réponse tronquée conseille aussi d'augmenter max_output_tokens. |";
+    assert_eq!(lines.iter().filter(|l| **l == expected).count(), 1);
+    let sec = readme_section(&readme, "## Configuration du LLM");
+    for w in ["16384", "HTTP 400", "\"low\""] {
+        assert!(sec.contains(w), "section sans : {w}");
+    }
+    assert!(!readme.contains("- **Vers 0.20**"));
+    let cfg = readme
+        .lines()
+        .filter(|l| l.starts_with("| `thinking` |") || l.starts_with("| `effort` |"))
+        .count();
+    assert_eq!(cfg, 2);
+}
+
+#[test]
+fn REQ058_AC15_readme_textes_de_la_reponse_tronquee_revises() {
+    let readme = repo_file("README.md");
+    for expected in [
+        "avertissement: db/schema.sql : réponse tronquée par la limite de jetons ; réduisez max_chunk_chars ou batch_files, ou augmentez max_output_tokens",
+        "erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée ou augmentez max_output_tokens",
+    ] {
+        assert!(readme.lines().any(|l| l == expected), "absent : {expected}");
     }
 }
