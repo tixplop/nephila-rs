@@ -20,10 +20,22 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
+
+/// Dernier schéma avec `refs.context`, `AUTOINCREMENT` et les index allégés au schéma 7, migré
+/// sur place (DEC-073).
+const SCHEMA_WITH_REF_CONTEXT: i32 = 6;
+
+/// Références du schéma 7 : le contexte d'une référence d'analyse est celui de son fichier.
+const REFS_SQL: &str = "SELECT r.source, r.kind, r.target_name,
+        CASE WHEN r.origin = 'parse' THEN c.context END, r.origin
+     FROM refs r LEFT JOIN file_contexts c ON c.file = r.file ORDER BY r.id";
+/// Références des schémas 5 et 6 (0.20.0), pour l'ouverture en lecture seule.
+const REFS_LEGACY_SQL: &str =
+    "SELECT source, kind, target_name, context, origin FROM refs ORDER BY id";
 
 /// Requêtes de résolution d'un nom (DEC-066), toutes sur index.
 pub(crate) const RESOLVE_ID: &str =
@@ -170,7 +182,7 @@ impl Store {
         match store.user_version()? {
             0 => store.create_schema()?,
             v if v == SCHEMA_VERSION => {}
-            SCHEMA_WITHOUT_REV => store.migrate_to_current()?,
+            SCHEMA_WITHOUT_REV | SCHEMA_WITH_REF_CONTEXT => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -201,7 +213,7 @@ impl Store {
         };
         match store.user_version()? {
             v if v == SCHEMA_VERSION => Ok(store),
-            SCHEMA_WITHOUT_REV => {
+            SCHEMA_WITHOUT_REV | SCHEMA_WITH_REF_CONTEXT => {
                 store.migrate_to_current()?;
                 Ok(store)
             }
@@ -243,20 +255,79 @@ impl Store {
                     path.display()
                 )))
             }
-            v if v == SCHEMA_VERSION || v == SCHEMA_WITHOUT_REV => store.version = v,
+            v if v == SCHEMA_VERSION || v == SCHEMA_WITHOUT_REV || v == SCHEMA_WITH_REF_CONTEXT => {
+                store.version = v
+            }
             v => return Err(version_error(v)),
         }
         Ok(store)
     }
 
-    /// Version du schéma du graphe ouvert (5 : pas de `qualified_rev`, lecture seule seulement).
+    /// Version du schéma du graphe ouvert (5 ou 6 en lecture seule seulement : DEC-066, DEC-073).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
+    /// Migre un schéma 5 ou 6 en schéma 7 sur place : 5 -> 6, puis 6 -> 7, chacune en une seule
+    /// transaction. Rien n'est perdu.
+    fn migrate_to_current(&self) -> Result<()> {
+        if self.user_version()? == SCHEMA_WITHOUT_REV {
+            self.migrate_5_to_6()?;
+        }
+        self.migrate_6_to_7()
+    }
+
+    /// Migre un schéma 6 en schéma 7 en une transaction `IMMEDIATE` (DEC-073) : `refs` reconstruite
+    /// avec les mêmes identifiants dans le même ordre, contextes reportés dans `file_contexts`,
+    /// index supprimés et créés, versions. Sans `IF NOT EXISTS` : un objet en conflit fait
+    /// échouer la migration, qui est alors annulée en entier.
+    fn migrate_6_to_7(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITH_REF_CONTEXT {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "CREATE TABLE file_contexts (
+                 file    TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE,
+                 context TEXT NOT NULL
+             );
+             INSERT INTO file_contexts(file, context)
+                 SELECT file, context FROM (
+                     SELECT file, context, min(id) FROM refs
+                     WHERE origin = 'parse' AND context IS NOT NULL GROUP BY file);
+             CREATE TABLE refs_v7 (
+                 id          INTEGER PRIMARY KEY,
+                 source      TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                 file        TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+                 kind        TEXT NOT NULL,
+                 target_name TEXT NOT NULL,
+                 origin      TEXT NOT NULL DEFAULT 'parse' CHECK (origin IN ('parse', 'llm'))
+             );
+             INSERT INTO refs_v7(id, source, file, kind, target_name, origin)
+                 SELECT id, source, file, kind, target_name, origin FROM refs ORDER BY id;
+             DROP TABLE refs;
+             ALTER TABLE refs_v7 RENAME TO refs;
+             CREATE INDEX idx_refs_source ON refs(source);
+             CREATE INDEX idx_refs_file ON refs(file);
+             DELETE FROM sqlite_sequence WHERE name = 'refs';
+             DROP INDEX idx_edges_source;
+             DROP INDEX idx_declarations_node;
+             CREATE INDEX idx_declarations_node_file ON declarations(node, file);
+             UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
+    }
+
     /// Migre un schéma 5 en schéma 6 sur place, en une seule transaction : colonne, remplissage
     /// (inverse calculé en Rust), index, `meta.schema_version`, `user_version`. Rien n'est perdu.
-    fn migrate_to_current(&self) -> Result<()> {
+    fn migrate_5_to_6(&self) -> Result<()> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
@@ -289,8 +360,8 @@ impl Store {
         }
         tx.execute_batch(&format!(
             "CREATE INDEX idx_nodes_qualified_rev ON nodes(qualified_rev);
-             UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
-             PRAGMA user_version = {SCHEMA_VERSION};"
+             UPDATE meta SET value = '{SCHEMA_WITH_REF_CONTEXT}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITH_REF_CONTEXT};"
         ))
         .map_err(db_err)?;
         commit_counted(tx)
@@ -346,7 +417,7 @@ impl Store {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
-            "DELETE FROM edges; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
+            "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
              DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
         )
         .map_err(db_err)?;
@@ -359,7 +430,7 @@ impl Store {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
-            "DELETE FROM edges; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
+            "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
              DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
         )
         .map_err(db_err)?;
@@ -927,41 +998,23 @@ impl Store {
     }
 
     pub fn refs(&self) -> Result<Vec<Ref>> {
-        let mut st = self
-            .conn
-            .prepare_cached("SELECT source, kind, target_name, context FROM refs ORDER BY id")
-            .map_err(db_err)?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                ))
-            })
-            .map_err(db_err)?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (source, kind, target_name, context) = row.map_err(db_err)?;
-            out.push(Ref {
-                source,
-                kind: EdgeKind::parse(&kind)?,
-                target_name,
-                context,
-            });
-        }
-        Ok(out)
+        Ok(self
+            .refs_with_origin()?
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect())
     }
 
-    /// Références avec leur origine (`parse` ou `llm`), dans l'ordre d'insertion.
+    /// Références avec leur origine (`parse` ou `llm`), dans l'ordre d'insertion. Le contexte
+    /// d'une référence d'analyse est celui de son fichier (`file_contexts`), une référence `llm`
+    /// n'en a pas ; sur un schéma 5 ou 6 (lecture seule), il vient de `refs.context`.
     pub fn refs_with_origin(&self) -> Result<Vec<(Ref, RefOrigin)>> {
-        let mut st = self
-            .conn
-            .prepare_cached(
-                "SELECT source, kind, target_name, context, origin FROM refs ORDER BY id",
-            )
-            .map_err(db_err)?;
+        let sql = if self.version < SCHEMA_VERSION {
+            REFS_LEGACY_SQL
+        } else {
+            REFS_SQL
+        };
+        let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
         let rows = st
             .query_map([], |r| {
                 Ok((
@@ -1267,10 +1320,23 @@ fn insert_refs(
     refs: &[Ref],
     origin: &str,
 ) -> Result<()> {
+    // Contexte unique des références d'analyse du fichier (DEC-073) ; aucun pour l'origine `llm`.
+    let context = refs.first().and_then(|r| r.context.as_deref());
+    if origin == "llm" {
+        if refs.iter().any(|r| r.context.is_some()) {
+            return Err(Error::Message(format!(
+                "référence d'enrichissement avec contexte d'imports dans {path}"
+            )));
+        }
+    } else if refs.iter().any(|r| r.context.as_deref() != context) {
+        return Err(Error::Message(format!(
+            "références aux contextes d'imports différents dans {path}"
+        )));
+    }
     let mut insr = tx
         .prepare_cached(
-            "INSERT INTO refs(source, file, kind, target_name, context, origin)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS
+            "INSERT INTO refs(source, file, kind, target_name, origin)
+             SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS
                (SELECT 1 FROM declarations WHERE node = ?1 AND file = ?2)",
         )
         .map_err(db_err)?;
@@ -1281,7 +1347,6 @@ fn insert_refs(
                 path,
                 r.kind.as_str(),
                 r.target_name,
-                r.context,
                 origin
             ])
             .map_err(db_err)?;
@@ -1291,6 +1356,15 @@ fn insert_refs(
                 r.source
             )));
         }
+    }
+    if let Some(context) = context {
+        tx.prepare_cached(
+            "INSERT INTO file_contexts(file, context) VALUES (?1, ?2)
+             ON CONFLICT(file) DO UPDATE SET context = excluded.context",
+        )
+        .map_err(db_err)?
+        .execute(params![path, context])
+        .map_err(db_err)?;
     }
     Ok(())
 }
@@ -1317,6 +1391,13 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
         .map_err(db_err)?
         .execute(params![path, origin])
         .map_err(db_err)?;
+    // Le contexte d'imports est celui des références d'analyse : l'enrichissement n'y touche pas.
+    if origin != Some("llm") {
+        tx.prepare_cached("DELETE FROM file_contexts WHERE file = ?1")
+            .map_err(db_err)?
+            .execute([path])
+            .map_err(db_err)?;
+    }
     tx.prepare_cached("DELETE FROM declarations WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)")
         .map_err(db_err)?
         .execute(params![path, origin])
@@ -1954,7 +2035,7 @@ mod tests {
     fn req057_qualified_rev_is_written_by_every_node_write_path() {
         let dir = tempdir().unwrap();
         let mut st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(st.schema_version().unwrap(), 6);
+        assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION);
         st.insert_pending_files(&[file("a.md"), file("b.md")])
             .unwrap();
         // Structure d'un fichier, noms non ASCII compris.
@@ -2018,8 +2099,48 @@ mod tests {
         }
     }
 
-    /// Ramène un graphe de schéma 6 au schéma 5.
+    /// Assistant « schéma 6 de la 0.20.0 » (DEC-073 point 6), en SQL écrit en dur : `refs`
+    /// recréée avec `AUTOINCREMENT` et `context` rempli depuis `file_contexts`, index de la
+    /// 0.20.0, `file_contexts` et `idx_declarations_node_file` supprimés, versions 6.
+    const SCHEMA6_DOWNGRADE: &str = "BEGIN;
+        CREATE TABLE refs_old (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            file TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            context TEXT,
+            origin TEXT NOT NULL DEFAULT 'parse' CHECK (origin IN ('parse', 'llm'))
+        );
+        INSERT INTO refs_old(id, source, file, kind, target_name, context, origin)
+            SELECT r.id, r.source, r.file, r.kind, r.target_name,
+                   (SELECT c.context FROM file_contexts c WHERE c.file = r.file AND r.origin = 'parse'),
+                   r.origin
+            FROM refs r ORDER BY r.id;
+        DROP TABLE refs;
+        ALTER TABLE refs_old RENAME TO refs;
+        CREATE INDEX idx_refs_source ON refs(source);
+        CREATE INDEX idx_refs_file ON refs(file);
+        CREATE INDEX idx_refs_target ON refs(target_name);
+        CREATE INDEX idx_edges_source ON edges(source);
+        CREATE INDEX idx_declarations_node ON declarations(node);
+        DROP INDEX idx_declarations_node_file;
+        DROP TABLE file_contexts;
+        UPDATE meta SET value = '6' WHERE key = 'schema_version';
+        PRAGMA user_version = 6;
+        COMMIT;";
+
+    /// Ramène un graphe de schéma 7 au schéma 6 de la 0.20.0.
+    fn downgrade_to_6(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA6_DOWNGRADE)
+            .unwrap();
+    }
+
+    /// Ramène un graphe de schéma 7 au schéma 5 (6, puis 6 -> 5).
     fn downgrade_to_5(repo: &Path) {
+        downgrade_to_6(repo);
         let c = Connection::open(db_path(repo)).unwrap();
         c.execute_batch(
             "DROP INDEX idx_nodes_qualified_rev; ALTER TABLE nodes DROP COLUMN qualified_rev;
@@ -2066,13 +2187,12 @@ mod tests {
         st
     }
 
-    const SNAP: [(&str, &str); 5] = [
+    const SNAP: [(&str, &str); 4] = [
         ("files", "path,hash,size,mtime,recorded_at,state"),
         (
             "nodes",
             "id,kind,qualified,short,file,subkind,summary,summary_file",
         ),
-        ("refs", "id,source,file,kind,target_name,context"),
         ("edges", "source,target,kind"),
         (
             "enrichments",
@@ -2081,7 +2201,25 @@ mod tests {
     ];
 
     fn snapshot5(st: &Store) -> Vec<Vec<Vec<Option<String>>>> {
-        SNAP.iter().map(|(t, c)| dump(st, t, c)).collect()
+        let mut out: Vec<Vec<Vec<Option<String>>>> =
+            SNAP.iter().map(|(t, c)| dump(st, t, c)).collect();
+        // Les références (contexte compris) se lisent par l'API, quel que soit le schéma.
+        out.push(
+            st.refs_with_origin()
+                .unwrap()
+                .into_iter()
+                .map(|(r, o)| {
+                    vec![
+                        Some(r.source),
+                        Some(r.kind.as_str().to_string()),
+                        Some(r.target_name),
+                        r.context,
+                        Some(format!("{o:?}")),
+                    ]
+                })
+                .collect(),
+        );
+        out
     }
 
     #[test]
@@ -2099,7 +2237,7 @@ mod tests {
             } else {
                 Store::open_or_create(dir.path()).unwrap()
             };
-            assert_eq!(st.schema_version().unwrap(), 6);
+            assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION);
             assert_eq!(assert_all_rev(&st), 3);
             let idx: i64 = st
                 .conn
@@ -2118,7 +2256,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(v, "6");
+            assert_eq!(v, SCHEMA_VERSION.to_string());
             assert_eq!(snapshot5(&st), before);
         }
     }
@@ -2154,7 +2292,7 @@ mod tests {
             .unwrap();
         assert!(Store::open_existing(dir.path()).is_err());
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(st.schema_version().unwrap(), 6);
+        assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(st.count_nodes().unwrap(), 0);
     }
 
@@ -2614,6 +2752,10 @@ mod tests {
         drop(populated(dir.path()));
         assert_write_pragmas(&Store::open_existing(dir.path()).unwrap());
         assert_write_pragmas(&Store::open_or_create(dir.path()).unwrap());
+        downgrade_to_6(dir.path());
+        assert_write_pragmas(&Store::open_existing(dir.path()).unwrap());
+        downgrade_to_6(dir.path());
+        assert_write_pragmas(&Store::open_or_create(dir.path()).unwrap());
         downgrade_to_5(dir.path());
         assert_write_pragmas(&Store::open_existing(dir.path()).unwrap());
         downgrade_to_5(dir.path());
@@ -2707,5 +2849,459 @@ mod tests {
         assert!(d.projections(&node_id(NodeKind::Type, "p.A")) >= 2);
         reset_diagnostics();
         assert_eq!(diagnostics(), Diagnostics::default());
+    }
+
+    // --- REQ-062, REQ-063 : schéma 7, contexte d'imports par fichier ---
+
+    const CTX: &str = "package p;\nimport q.R;";
+
+    fn pref(src: &str, target: &str, ctx: Option<&str>) -> Ref {
+        Ref {
+            source: src.into(),
+            kind: EdgeKind::Imports,
+            target_name: target.into(),
+            context: ctx.map(String::from),
+        }
+    }
+
+    /// Graphe peuplé : fichiers, nœud partagé, références d'analyse avec contextes, références
+    /// `llm` sans contexte (insérées après celles de B), liens, résumés, résumé global.
+    fn rich(repo: &Path) -> Store {
+        let mut st = Store::open_or_create(repo).unwrap();
+        st.insert_pending_files(&[file("A.java"), file("B.java"), file("C.md")])
+            .unwrap();
+        let (a, b, c, shared) = (
+            ty("p.A", "A.java"),
+            ty("p.B", "B.java"),
+            ty("p.C", "C.md"),
+            ty("p.Shared", "A.java"),
+        );
+        let mut shared_b = shared.clone();
+        shared_b.file = Some("B.java".into());
+        st.replace_structures(&[
+            (
+                "A.java".to_string(),
+                vec![a.clone(), shared.clone()],
+                vec![
+                    pref(&a.id, "R", Some(CTX)),
+                    pref(&a.id, "S", Some(CTX)),
+                    pref(&shared.id, "R", Some(CTX)),
+                ],
+            ),
+            (
+                "B.java".to_string(),
+                vec![b.clone(), shared_b],
+                vec![
+                    pref(&b.id, "R", Some("package p;")),
+                    pref(&shared.id, "T", Some("package p;")),
+                ],
+            ),
+            (
+                "C.md".to_string(),
+                vec![c.clone()],
+                vec![pref(&c.id, "Z", None)],
+            ),
+        ])
+        .unwrap();
+        st.apply_enrichment(
+            "A.java",
+            "h",
+            "m",
+            &[(a.id.clone(), "résumé de A".to_string())],
+            &[concept("facturation")],
+            &[mention(&a.id, "facturation"), mention(&a.id, "autre")],
+        )
+        .unwrap();
+        st.replace_edges(&[Edge {
+            source: a.id.clone(),
+            target: b.id.clone(),
+            kind: EdgeKind::Imports,
+        }])
+        .unwrap();
+        st.set_summary("résumé global", 42).unwrap();
+        st
+    }
+
+    type Rows = Vec<Vec<Option<String>>>;
+    type Snapshot7 = (Vec<Rows>, Rows, Vec<(Ref, RefOrigin)>);
+
+    fn objects(st: &Store) -> std::collections::BTreeSet<(String, String, String)> {
+        let mut q = st
+            .conn
+            .prepare(
+                "SELECT type, name, tbl_name FROM sqlite_master WHERE name <> 'sqlite_sequence'",
+            )
+            .unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// Tables conservées par la migration (meta hors version), refs par l'API et par identifiant.
+    fn snapshot7(st: &Store) -> Snapshot7 {
+        let tables = [
+            ("files", "path,hash,size,mtime,recorded_at,state"),
+            (
+                "nodes",
+                "id,kind,qualified,short,file,subkind,summary,summary_file,qualified_rev",
+            ),
+            (
+                "declarations",
+                "file,node,origin,short,subkind,located,summary",
+            ),
+            ("edges", "source,target,kind"),
+            (
+                "enrichments",
+                "path,content_hash,model,prompt_version,payload",
+            ),
+            ("summary", "id,text,computed_at"),
+            (
+                "(SELECT * FROM meta WHERE key <> 'schema_version')",
+                "key,value",
+            ),
+        ];
+        let ids = dump(st, "refs", "id,source,file,kind,target_name,origin");
+        (
+            tables.iter().map(|(t, c)| dump(st, t, c)).collect(),
+            ids,
+            st.refs_with_origin().unwrap(),
+        )
+    }
+
+    #[test]
+    fn req062_ac1_fresh_graph_has_the_schema_7_objects() {
+        let dir = tempdir().unwrap();
+        let st = Store::open_or_create(dir.path()).unwrap();
+        let names: Vec<String> = objects(&st).into_iter().map(|o| o.1).collect();
+        for gone in [
+            "idx_refs_target",
+            "idx_edges_source",
+            "idx_declarations_node",
+        ] {
+            assert!(!names.iter().any(|n| n == gone), "{gone}");
+        }
+        assert!(names.iter().any(|n| n == "idx_declarations_node_file"));
+        assert!(names.iter().any(|n| n == "file_contexts"));
+        let cols: Vec<String> = {
+            let mut q = st
+                .conn
+                .prepare("SELECT name FROM pragma_index_info('idx_declarations_node_file') ORDER BY seqno")
+                .unwrap();
+            q.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(cols, ["node", "file"]);
+        let refs_sql: String = st
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'refs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !refs_sql.to_uppercase().contains("AUTOINCREMENT"),
+            "{refs_sql}"
+        );
+        let ref_cols: Vec<String> = {
+            let mut q = st
+                .conn
+                .prepare("SELECT name FROM pragma_table_info('refs')")
+                .unwrap();
+            q.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(!ref_cols.iter().any(|c| c == "context"), "{ref_cols:?}");
+        assert_eq!(st_user_version(dir.path()), 7);
+        let v: String = st
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, "7");
+        assert_eq!(SCHEMA_VERSION, 7);
+    }
+
+    #[test]
+    fn req062_ac3_new_ref_ids_exceed_every_present_id() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let files = ["a.java", "b.java", "c.java", "d.java"];
+        st.insert_pending_files(&files.map(file)).unwrap();
+        // Plus grand identifiant des références des autres fichiers : celles du fichier réécrit
+        // sont supprimées avant l'insertion des nouvelles.
+        let max_id = |st: &Store, f: &str| -> i64 {
+            st.conn
+                .query_row(
+                    "SELECT coalesce(max(id), 0) FROM refs WHERE file <> ?1",
+                    [f],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let ids = |st: &Store, f: &str| -> Vec<i64> {
+            let mut q = st
+                .conn
+                .prepare("SELECT id FROM refs WHERE file = ?1 ORDER BY id")
+                .unwrap();
+            q.query_map([f], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let write = |st: &mut Store, f: &str, tag: &str| {
+            let n = ty(&format!("p.{tag}"), f);
+            let refs: Vec<Ref> = (0..3)
+                .map(|i| pref(&n.id, &format!("{tag}{i}"), None))
+                .collect();
+            let before = max_id(st, f);
+            st.replace_structure(f, &[n], &refs).unwrap();
+            let got = ids(st, f);
+            assert_eq!(got.len(), 3);
+            assert!(got.iter().all(|i| *i > before), "{got:?} > {before}");
+        };
+        write(&mut st, "a.java", "A");
+        write(&mut st, "b.java", "B");
+        write(&mut st, "c.java", "C");
+        // Le dernier écrit est remplacé : ses identifiants sont libérés, les nouveaux dépassent
+        // tous ceux qui restent.
+        write(&mut st, "c.java", "C2");
+        write(&mut st, "d.java", "D");
+        let order: Vec<String> = st
+            .refs()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.target_name)
+            .collect();
+        let expected: Vec<String> = ["A", "B", "C2", "D"]
+            .iter()
+            .flat_map(|t| (0..3).map(move |i| format!("{t}{i}")))
+            .collect();
+        assert_eq!(order, expected);
+    }
+
+    fn migrated_from(version: u32, existing: bool) -> (tempfile::TempDir, Store, Snapshot7) {
+        let dir = tempdir().unwrap();
+        let fresh_objects;
+        let before = {
+            let st = rich(dir.path());
+            fresh_objects = objects(&st);
+            snapshot7(&st)
+        };
+        if version == 5 {
+            downgrade_to_5(dir.path());
+        } else {
+            downgrade_to_6(dir.path());
+        }
+        let st = if existing {
+            Store::open_existing(dir.path()).unwrap()
+        } else {
+            Store::open_or_create(dir.path()).unwrap()
+        };
+        assert_eq!(objects(&st), fresh_objects);
+        (dir, st, before)
+    }
+
+    #[test]
+    fn req062_ac4_schema6_and_schema5_are_migrated_in_place() {
+        for version in [6, 5] {
+            for existing in [false, true] {
+                let (dir, st, before) = migrated_from(version, existing);
+                assert_eq!(st.schema_version().unwrap(), 7, "depuis {version}");
+                assert_eq!(st_user_version(dir.path()), 7);
+                let v: String = st
+                    .conn
+                    .query_row(
+                        "SELECT value FROM meta WHERE key = 'schema_version'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(v, "7");
+                assert_eq!(
+                    snapshot7(&st),
+                    before,
+                    "depuis {version}, existing={existing}"
+                );
+                let seq: i64 = st
+                    .conn
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_sequence'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                if seq == 1 {
+                    let rows: i64 = st
+                        .conn
+                        .query_row(
+                            "SELECT count(*) FROM sqlite_sequence WHERE name = 'refs'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(rows, 0);
+                }
+                assert!(before.2.iter().any(|(r, _)| r.context.is_some()));
+            }
+        }
+    }
+
+    #[test]
+    fn req062_open_readonly_accepts_schemas_5_6_and_7_without_touching_the_file() {
+        for version in [7, 6, 5] {
+            let dir = tempdir().unwrap();
+            let before = snapshot7(&rich(dir.path()));
+            match version {
+                6 => downgrade_to_6(dir.path()),
+                5 => downgrade_to_5(dir.path()),
+                _ => {}
+            }
+            let bytes = std::fs::read(db_path(dir.path())).unwrap();
+            let st = Store::open_readonly(dir.path()).unwrap();
+            assert_eq!(st.schema_version().unwrap(), version);
+            assert_eq!(st.refs_with_origin().unwrap(), before.2, "schéma {version}");
+            assert_eq!(
+                st.refs().unwrap(),
+                before.2.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
+            );
+            drop(st);
+            assert_eq!(st_user_version(dir.path()), version);
+            assert_eq!(std::fs::read(db_path(dir.path())).unwrap(), bytes);
+        }
+    }
+
+    fn contexts(st: &Store) -> Vec<(String, String)> {
+        let mut q = st
+            .conn
+            .prepare("SELECT file, context FROM file_contexts ORDER BY file")
+            .unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn req063_ac1_one_context_row_per_file() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("A.java"), file("B.java")])
+            .unwrap();
+        let a = ty("p.A", "A.java");
+        let refs: Vec<Ref> = ["x", "y", "z"]
+            .iter()
+            .map(|t| pref(&a.id, t, Some(CTX)))
+            .collect();
+        st.replace_structure("A.java", std::slice::from_ref(&a), &refs)
+            .unwrap();
+        st.apply_enrichment(
+            "A.java",
+            "h",
+            "m",
+            &[],
+            &[concept("c")],
+            &[mention(&a.id, "c"), mention(&a.id, "d")],
+        )
+        .unwrap();
+        assert_eq!(contexts(&st), [("A.java".to_string(), CTX.to_string())]);
+        let all = st.refs_with_origin().unwrap();
+        assert_eq!(all.len(), 5);
+        for (i, (r, o)) in all.iter().enumerate() {
+            if i < 3 {
+                assert_eq!(
+                    (r.context.as_deref(), *o),
+                    (Some(CTX), RefOrigin::Parse),
+                    "{i}"
+                );
+            } else {
+                assert_eq!((r.context.as_deref(), *o), (None, RefOrigin::Llm), "{i}");
+            }
+        }
+        // Enrichissement remplacé : la ligne n'est pas touchée.
+        st.apply_enrichment("A.java", "h", "m", &[], &[], &[mention(&a.id, "e")])
+            .unwrap();
+        assert_eq!(contexts(&st), [("A.java".to_string(), CTX.to_string())]);
+        // Nouvelle structure (même empreinte) : l'enrichissement conservé est réappliqué, la
+        // ligne est identique.
+        st.replace_structure("A.java", std::slice::from_ref(&a), &refs)
+            .unwrap();
+        assert_eq!(contexts(&st), [("A.java".to_string(), CTX.to_string())]);
+        // Références sans contexte : la ligne disparaît.
+        let plain: Vec<Ref> = vec![pref(&a.id, "x", None)];
+        st.replace_structure("A.java", std::slice::from_ref(&a), &plain)
+            .unwrap();
+        assert!(contexts(&st).is_empty());
+        // Suppression du fichier.
+        st.replace_structure("A.java", std::slice::from_ref(&a), &refs)
+            .unwrap();
+        assert_eq!(contexts(&st).len(), 1);
+        st.remove_file("A.java").unwrap();
+        assert!(contexts(&st).is_empty());
+        // Réinitialisation.
+        st.insert_pending_files(&[file("B.java")]).unwrap();
+        let b = ty("p.B", "B.java");
+        st.replace_structure(
+            "B.java",
+            std::slice::from_ref(&b),
+            &[pref(&b.id, "x", Some("package b;"))],
+        )
+        .unwrap();
+        assert_eq!(contexts(&st).len(), 1);
+        st.reset().unwrap();
+        assert!(contexts(&st).is_empty());
+    }
+
+    #[test]
+    fn req063_ac2_inconsistent_contexts_are_refused_and_leave_the_graph_unchanged() {
+        let dir = tempdir().unwrap();
+        let mut st = rich(dir.path());
+        let before = snapshot7(&st);
+        let ctxs = contexts(&st);
+        let a = ty("p.A", "A.java");
+        for refs in [
+            vec![
+                pref(&a.id, "x", Some("package a;")),
+                pref(&a.id, "y", Some("package b;")),
+            ],
+            vec![pref(&a.id, "x", Some("package a;")), pref(&a.id, "y", None)],
+            vec![pref(&a.id, "x", None), pref(&a.id, "y", Some("package a;"))],
+        ] {
+            let e = st
+                .replace_structure("A.java", std::slice::from_ref(&a), &refs)
+                .unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("références aux contextes d'imports différents dans A.java"),
+                "{e}"
+            );
+            assert_eq!(snapshot7(&st), before);
+            assert_eq!(contexts(&st), ctxs);
+        }
+        let e = st
+            .apply_enrichment(
+                "A.java",
+                "h",
+                "m",
+                &[],
+                &[],
+                &[pref(&a.id, "x", Some("package a;"))],
+            )
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("référence d'enrichissement avec contexte d'imports dans A.java"),
+            "{e}"
+        );
+        assert_eq!(snapshot7(&st), before);
+        assert_eq!(contexts(&st), ctxs);
     }
 }

@@ -53,20 +53,26 @@ CREATE TABLE declarations (
     summary TEXT,
     PRIMARY KEY (file, node)
 );
-CREATE INDEX idx_declarations_node ON declarations(node);
+CREATE INDEX idx_declarations_node_file ON declarations(node, file);
 
+-- Contexte d'imports (package, imports) des références d'analyse d'un fichier, stocké une seule
+-- fois par fichier (DEC-073) ; les références `llm` n'ont pas de contexte.
+CREATE TABLE file_contexts (
+    file    TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE,
+    context TEXT NOT NULL
+);
+
+-- `id` = rowid : un identifiant nouveau vaut le plus grand présent plus un (ordre d'insertion).
 CREATE TABLE refs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          INTEGER PRIMARY KEY,
     source      TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     file        TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
     kind        TEXT NOT NULL,
     target_name TEXT NOT NULL,
-    context     TEXT,
     origin      TEXT NOT NULL DEFAULT 'parse' CHECK (origin IN ('parse', 'llm'))
 );
 CREATE INDEX idx_refs_source ON refs(source);
 CREATE INDEX idx_refs_file ON refs(file);
-CREATE INDEX idx_refs_target ON refs(target_name);
 
 CREATE TABLE edges (
     source TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -74,7 +80,6 @@ CREATE TABLE edges (
     kind   TEXT NOT NULL,
     PRIMARY KEY (source, target, kind)
 );
-CREATE INDEX idx_edges_source ON edges(source);
 CREATE INDEX idx_edges_target ON edges(target);
 
 CREATE TABLE summary (
