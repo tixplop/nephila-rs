@@ -175,9 +175,21 @@ pub struct Store {
     read_only: bool,
     /// Version du schéma lue à l'ouverture (5 possible en lecture seule, DEC-066).
     version: i32,
+    /// Base fraîche (DEC-075) : posé par `reset_with_pending_files`, tombe à la première écriture
+    /// qui n'est pas une écriture de structure.
+    fresh: bool,
+    /// Fichiers dont la structure a été écrite depuis le vidage (base fraîche seulement).
+    written: std::collections::HashSet<String>,
 }
 
+type Touched = std::collections::BTreeSet<String>;
+
 impl Store {
+    fn end_fresh(&mut self) {
+        self.fresh = false;
+        self.written.clear();
+    }
+
     /// Ouvre le graphe en écriture, en le créant (dossier `.nephila/`, schéma, WAL) si besoin.
     pub fn open_or_create(repo: &Path) -> Result<Store> {
         let path = db_path(repo);
@@ -196,6 +208,8 @@ impl Store {
             conn,
             read_only: false,
             version: SCHEMA_VERSION,
+            fresh: false,
+            written: std::collections::HashSet::new(),
         };
         match store.user_version()? {
             0 => store.create_schema()?,
@@ -228,6 +242,8 @@ impl Store {
             conn,
             read_only: false,
             version: SCHEMA_VERSION,
+            fresh: false,
+            written: std::collections::HashSet::new(),
         };
         match store.user_version()? {
             v if v == SCHEMA_VERSION => Ok(store),
@@ -265,6 +281,8 @@ impl Store {
             conn,
             read_only: true,
             version: SCHEMA_VERSION,
+            fresh: false,
+            written: std::collections::HashSet::new(),
         };
         match store.user_version()? {
             0 => {
@@ -433,6 +451,7 @@ impl Store {
     /// Vide entièrement le graphe (fichiers, nœuds, références, liens, résumé, meta sauf version).
     pub fn reset(&mut self) -> Result<()> {
         self.ensure_writable()?;
+        self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
@@ -446,6 +465,7 @@ impl Store {
     /// précédent n'est remplacé que si l'ensemble réussit.
     pub fn reset_with_pending_files(&mut self, files: &[FileRecord]) -> Result<()> {
         self.ensure_writable()?;
+        self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
@@ -463,13 +483,16 @@ impl Store {
                     .map_err(db_err)?;
             }
         }
-        commit_counted(tx)
+        commit_counted(tx)?;
+        self.fresh = true;
+        Ok(())
     }
 
     /// Enregistre ou met à jour des fichiers (état d'origine conservé dans chaque enregistrement),
     /// en une seule transaction. Un fichier déjà connu garde ses nœuds.
     pub fn insert_files(&mut self, files: &[FileRecord]) -> Result<()> {
         self.ensure_writable()?;
+        self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
         {
             let mut st = tx
@@ -546,21 +569,37 @@ impl Store {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
         let mut reapplied = 0;
+        let mut newly: Vec<&str> = Vec::new();
         for (path, nodes, refs) in items {
             require_known(&tx, path)?;
-            clear_summaries(&tx, path)?;
-            release_file(&tx, path, None)?;
-            insert_nodes(&tx, path, nodes, "parse")?;
+            let fresh = self.fresh
+                && !self.written.contains(path.as_str())
+                && !newly.contains(&path.as_str());
+            if fresh {
+                if write_structure_fresh(&tx, path, nodes, refs)? {
+                    reapplied += 1;
+                }
+                newly.push(path);
+                continue;
+            }
+            let mut touched = Touched::new();
+            clear_summaries(&tx, path, &mut touched)?;
+            release_file(&tx, path, None, &mut touched)?;
+            insert_nodes(&tx, path, nodes, "parse", &mut touched)?;
             insert_refs(&tx, path, refs, "parse")?;
             tx.prepare_cached("UPDATE files SET state = 'indexed' WHERE path = ?1")
                 .map_err(db_err)?
                 .execute([path])
                 .map_err(db_err)?;
-            if reapply_enrichment(&tx, path)? {
+            if reapply_enrichment(&tx, path, &mut touched)? {
                 reapplied += 1;
             }
+            finish_file(&tx, &touched)?;
         }
         commit_counted(tx)?;
+        if self.fresh {
+            self.written.extend(items.iter().map(|(p, _, _)| p.clone()));
+        }
         Ok(reapplied)
     }
 
@@ -580,9 +619,12 @@ impl Store {
         refs: &[Ref],
     ) -> Result<()> {
         self.ensure_writable()?;
+        self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
         require_known(&tx, path)?;
-        apply_enrichment_tx(&tx, path, summaries, concept_nodes, refs)?;
+        let mut touched = Touched::new();
+        apply_enrichment_tx(&tx, path, summaries, concept_nodes, refs, &mut touched)?;
+        finish_file(&tx, &touched)?;
         let payload = Payload {
             summaries: summaries.to_vec(),
             concepts: concept_nodes
@@ -738,6 +780,7 @@ impl Store {
     /// le contenu a changé. Renvoie le nombre d'entrées supprimées.
     pub fn prune_enrichments(&mut self) -> Result<usize> {
         self.ensure_writable()?;
+        self.end_fresh();
         self.conn
             .prepare_cached(
                 "DELETE FROM enrichments WHERE NOT EXISTS
@@ -752,9 +795,12 @@ impl Store {
     /// Supprime un fichier, ses nœuds, références et les liens attachés. Renvoie `false` si inconnu.
     pub fn remove_file(&mut self, path: &str) -> Result<bool> {
         self.ensure_writable()?;
+        self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
-        clear_summaries(&tx, path)?;
-        release_file(&tx, path, None)?;
+        let mut touched = Touched::new();
+        clear_summaries(&tx, path, &mut touched)?;
+        release_file(&tx, path, None, &mut touched)?;
+        finish_file(&tx, &touched)?;
         tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
             .map_err(db_err)?
             .execute([path])
@@ -771,6 +817,7 @@ impl Store {
     /// Remplace l'ensemble des liens dérivés (résolution, REQ-008).
     pub fn replace_edges(&mut self, edges: &[Edge]) -> Result<()> {
         self.ensure_writable()?;
+        self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
         // Seule la différence avec les liens stockés est écrite : après une mise à jour, presque
         // tous les liens sont inchangés et les réécrire tous coûterait plusieurs secondes.
@@ -1119,6 +1166,7 @@ impl Store {
     /// ceux qui ne sont plus visés disparaissent, les autres sont créés ou conservés.
     pub fn replace_derived_dependencies(&mut self, deps: &[Node]) -> Result<()> {
         self.ensure_writable()?;
+        self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.prepare_cached(
             "DELETE FROM nodes WHERE kind = 'dependency'
@@ -1261,6 +1309,7 @@ impl Store {
 
     pub fn set_summary(&mut self, text: &str, computed_at: i64) -> Result<()> {
         self.ensure_writable()?;
+        self.end_fresh();
         self.conn
             .prepare_cached("INSERT INTO summary(id, text, computed_at) VALUES (1, ?1, ?2)
                  ON CONFLICT(id) DO UPDATE SET text = excluded.text, computed_at = excluded.computed_at").map_err(db_err)?.execute(params![text, computed_at])
@@ -1285,16 +1334,37 @@ fn require_known(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
 }
 
 /// Efface les résumés posés par un fichier dans ses déclarations (ceux d'autres déclarants d'un
-/// nœud partagé restent) puis recalcule les lignes des nœuds concernés.
-fn clear_summaries(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
+/// nœud partagé restent) et note les nœuds concernés ; la projection est faite par `finish_file`.
+fn clear_summaries(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    touched: &mut Touched,
+) -> Result<()> {
     tx.prepare_cached(
         "UPDATE declarations SET summary = NULL WHERE file = ?1 AND summary IS NOT NULL",
     )
     .map_err(db_err)?
     .execute([path])
     .map_err(db_err)?;
-    let ids = declared_by(tx, path)?;
-    refresh_nodes(tx, &ids)
+    touched.extend(declared_by(tx, path)?);
+    Ok(())
+}
+
+/// Fin du travail d'un fichier (DEC-075) : projection unique de chaque nœud touché, puis
+/// suppression de ceux qui n'ont plus de déclaration (liens attachés compris).
+fn finish_file(tx: &rusqlite::Transaction<'_>, touched: &Touched) -> Result<()> {
+    let ids: Vec<&String> = touched.iter().collect();
+    refresh_nodes(tx, &ids)?;
+    let mut del = tx
+        .prepare_cached(
+            "DELETE FROM nodes WHERE id = ?1
+             AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+        )
+        .map_err(db_err)?;
+    for id in &ids {
+        del.execute([id]).map_err(db_err)?;
+    }
+    Ok(())
 }
 
 fn declared_by(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Vec<String>> {
@@ -1340,6 +1410,7 @@ fn insert_nodes(
     path: &str,
     nodes: &[Node],
     origin: &str,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut ins = tx
         .prepare_cached("INSERT OR IGNORE INTO nodes(id, kind, qualified, short, qualified_rev) VALUES (?1, ?2, ?3, ?4, ?5)")
@@ -1350,7 +1421,6 @@ fn insert_nodes(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .map_err(db_err)?;
-    let mut ids: Vec<String> = Vec::new();
     for n in nodes {
         if n.file.as_deref().is_some_and(|f| f != path) {
             return Err(Error::Message(format!(
@@ -1376,9 +1446,66 @@ fn insert_nodes(
             n.summary
         ])
         .map_err(db_err)?;
-        ids.push(n.id.clone());
+        touched.insert(n.id.clone());
     }
-    refresh_nodes(tx, &ids)?;
+    Ok(())
+}
+
+/// Insertion d'un nœud en base fraîche : le nœud absent est inséré avec ses attributs définitifs
+/// (la projection de sa seule déclaration), le nœud déjà présent est noté pour projection.
+fn insert_nodes_fresh(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    nodes: &[Node],
+    origin: &str,
+    touched: &mut Touched,
+) -> Result<()> {
+    let mut ins = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary, summary_file, qualified_rev)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .map_err(db_err)?;
+    let mut decl = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO declarations(file, node, origin, short, subkind, located, summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .map_err(db_err)?;
+    for n in nodes {
+        if n.file.as_deref().is_some_and(|f| f != path) {
+            return Err(Error::Message(format!(
+                "le nœud {} n'appartient pas au fichier {path}",
+                n.id
+            )));
+        }
+        let inserted = ins
+            .execute(params![
+                n.id,
+                n.kind.as_str(),
+                n.qualified,
+                n.short,
+                n.file.as_deref().map(|_| path),
+                n.subkind.map(SubKind::as_str),
+                n.summary,
+                n.summary.as_deref().map(|_| path),
+                reverse_qualified(&n.qualified)
+            ])
+            .map_err(db_err)?;
+        decl.execute(params![
+            path,
+            n.id,
+            origin,
+            n.short,
+            n.subkind.map(SubKind::as_str),
+            n.file.is_some(),
+            n.summary
+        ])
+        .map_err(db_err)?;
+        if inserted == 0 {
+            touched.insert(n.id.clone());
+        }
+    }
     Ok(())
 }
 
@@ -1438,9 +1565,15 @@ fn insert_refs(
 }
 
 /// Retire les déclarations et références d'un fichier (d'une seule origine si `origin` est
-/// donnée), rattache ses nœuds partagés à un autre déclarant, et supprime les nœuds devenus
-/// orphelins (liens attachés compris), sauf les dépendances dérivées par la résolution.
-fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>) -> Result<()> {
+/// donnée) et note les nœuds qu'il déclarait ; `finish_file` projette les nœuds partagés et
+/// supprime ceux devenus orphelins (liens attachés compris). Les dépendances dérivées par la
+/// résolution ne sont pas touchées.
+fn release_file(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    origin: Option<&str>,
+    touched: &mut Touched,
+) -> Result<()> {
     // Les nœuds `dependency` dérivés (sans déclaration, DEC-020) ne sont nettoyés que par
     // `replace_derived_dependencies` ; seuls ceux que ce fichier déclarait suivent ses déclarations.
     let released: Vec<String> = {
@@ -1470,16 +1603,7 @@ fn release_file(tx: &rusqlite::Transaction<'_>, path: &str, origin: Option<&str>
         .map_err(db_err)?
         .execute(params![path, origin])
         .map_err(db_err)?;
-    refresh_nodes(tx, &released)?;
-    let mut del = tx
-        .prepare_cached(
-            "DELETE FROM nodes WHERE id = ?1
-             AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
-        )
-        .map_err(db_err)?;
-    for id in &released {
-        del.execute([id]).map_err(db_err)?;
-    }
+    touched.extend(released);
     Ok(())
 }
 
@@ -1522,10 +1646,11 @@ fn apply_enrichment_tx(
     summaries: &[(String, String)],
     concept_nodes: &[Node],
     refs: &[Ref],
+    touched: &mut Touched,
 ) -> Result<()> {
-    clear_summaries(tx, path)?;
-    release_file(tx, path, Some("llm"))?;
-    insert_nodes(tx, path, concept_nodes, "llm")?;
+    clear_summaries(tx, path, touched)?;
+    release_file(tx, path, Some("llm"), touched)?;
+    insert_nodes(tx, path, concept_nodes, "llm", touched)?;
     for (id, text) in summaries {
         let n = tx
             .prepare_cached("UPDATE declarations SET summary = ?2 WHERE node = ?1 AND file = ?3")
@@ -1538,15 +1663,13 @@ fn apply_enrichment_tx(
             )));
         }
     }
-    let ids = declared_by(tx, path)?;
-    refresh_nodes(tx, &ids)?;
     insert_refs(tx, path, refs, "llm")
 }
 
-/// Réapplique l'enrichissement conservé d'un fichier dont la structure vient d'être écrite si
-/// son empreinte de contenu est celle du fichier ; une entrée de contenu différent est
-/// supprimée. Les éléments sans nœud correspondant sont écartés en silence.
-fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<bool> {
+/// Lit l'enrichissement conservé d'un fichier dont la structure vient d'être écrite : son contenu
+/// si l'empreinte est celle du fichier ; une entrée de contenu différent (ou illisible) est
+/// supprimée.
+fn load_kept_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Option<Payload>> {
     let row: Option<(String, String)> = match tx
         .prepare_cached("SELECT e.content_hash, e.payload FROM enrichments e WHERE e.path = ?1")
         .map_err(db_err)?
@@ -1557,7 +1680,7 @@ fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<bool
         Err(e) => return Err(db_err(e)),
     };
     let Some((entry_hash, json)) = row else {
-        return Ok(false);
+        return Ok(None);
     };
     let file_hash: String = tx
         .prepare_cached("SELECT hash FROM files WHERE path = ?1")
@@ -1569,14 +1692,21 @@ fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<bool
     } else {
         None
     };
-    let Some(payload) = payload else {
+    if payload.is_none() {
         tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
             .map_err(db_err)?
             .execute([path])
             .map_err(db_err)?;
-        return Ok(false);
-    };
-    let declared: std::collections::HashSet<String> = declared_by(tx, path)?.into_iter().collect();
+    }
+    Ok(payload)
+}
+
+/// Éléments de l'enrichissement conservé qui ont un nœud correspondant (les autres sont écartés
+/// en silence) : résumés, concepts, références.
+fn filter_payload(
+    payload: Payload,
+    declared: &std::collections::HashSet<String>,
+) -> (Vec<(String, String)>, Vec<Node>, Vec<Ref>) {
     let summaries: Vec<(String, String)> = payload
         .summaries
         .into_iter()
@@ -1615,8 +1745,67 @@ fn reapply_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<bool
             )
         })
         .collect();
-    apply_enrichment_tx(tx, path, &summaries, &concepts, &refs)?;
+    (summaries, concepts, refs)
+}
+
+/// Réapplique l'enrichissement conservé d'un fichier dont la structure vient d'être écrite si
+/// son empreinte de contenu est celle du fichier ; une entrée de contenu différent est
+/// supprimée. Les éléments sans nœud correspondant sont écartés en silence.
+fn reapply_enrichment(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    touched: &mut Touched,
+) -> Result<bool> {
+    let Some(payload) = load_kept_enrichment(tx, path)? else {
+        return Ok(false);
+    };
+    let declared: std::collections::HashSet<String> = declared_by(tx, path)?.into_iter().collect();
+    let (summaries, concepts, refs) = filter_payload(payload, &declared);
+    apply_enrichment_tx(tx, path, &summaries, &concepts, &refs, touched)?;
     Ok(true)
+}
+
+/// Écriture de la structure d'un fichier pas encore écrit sur une base fraîche (DEC-075) : rien
+/// à libérer ni à effacer ; l'enrichissement conservé est fusionné dans les enregistrements avant
+/// leur insertion. Renvoie `true` si un enrichissement conservé a été réappliqué.
+fn write_structure_fresh(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    nodes: &[Node],
+    refs: &[Ref],
+) -> Result<bool> {
+    let mut touched = Touched::new();
+    let mut parse_nodes = nodes.to_vec();
+    let mut kept: Option<(Vec<Node>, Vec<Ref>)> = None;
+    if let Some(payload) = load_kept_enrichment(tx, path)? {
+        let declared: std::collections::HashSet<String> =
+            nodes.iter().map(|n| n.id.clone()).collect();
+        let (summaries, concepts, llm_refs) = filter_payload(payload, &declared);
+        // Les résumés du fichier sont effacés puis remplacés par ceux de l'enrichissement.
+        for n in &mut parse_nodes {
+            n.summary = None;
+        }
+        for (id, text) in &summaries {
+            for n in parse_nodes.iter_mut().filter(|n| n.id == *id) {
+                n.summary = Some(text.clone());
+            }
+        }
+        kept = Some((concepts, llm_refs));
+    }
+    insert_nodes_fresh(tx, path, &parse_nodes, "parse", &mut touched)?;
+    insert_refs(tx, path, refs, "parse")?;
+    tx.prepare_cached("UPDATE files SET state = 'indexed' WHERE path = ?1")
+        .map_err(db_err)?
+        .execute([path])
+        .map_err(db_err)?;
+    let reapplied = kept.is_some();
+    if let Some((concepts, llm_refs)) = kept {
+        insert_nodes_fresh(tx, path, &concepts, "llm", &mut touched)?;
+        insert_refs(tx, path, &llm_refs, "llm")?;
+    }
+    let ids: Vec<&String> = touched.iter().collect();
+    refresh_nodes(tx, &ids)?;
+    Ok(reapplied)
 }
 
 fn version_error(v: i32) -> Error {
@@ -3371,5 +3560,475 @@ mod tests {
         );
         assert_eq!(snapshot7(&st), before);
         assert_eq!(contexts(&st), ctxs);
+    }
+    // --- REQ-064 : base fraîche, une projection par nœud touché ---
+
+    const NODES_COLS: &str =
+        "id,kind,qualified,short,file,subkind,summary,summary_file,qualified_rev";
+
+    /// Tables comparées entre chemin base fraîche et chemin général.
+    fn graph_dump(st: &Store) -> Vec<Rows> {
+        vec![
+            dump(st, "nodes", NODES_COLS),
+            dump(
+                st,
+                "declarations",
+                "file,node,origin,short,subkind,located,summary",
+            ),
+            dump(st, "refs", "id,source,file,kind,target_name,origin"),
+            dump(st, "file_contexts", "file,context"),
+            dump(
+                st,
+                "enrichments",
+                "path,content_hash,model,prompt_version,payload",
+            ),
+        ]
+    }
+
+    /// Requête de projection de la 0.20.0, copiée en dur.
+    fn project_like_0_20(st: &Store) {
+        let ids: Vec<String> = st.nodes().unwrap().into_iter().map(|n| n.id).collect();
+        let mut up = st
+            .conn
+            .prepare(
+                "UPDATE nodes SET
+                   short = (SELECT short FROM declarations WHERE node = nodes.id ORDER BY file LIMIT 1),
+                   subkind = (SELECT subkind FROM declarations WHERE node = nodes.id ORDER BY file LIMIT 1),
+                   file = (SELECT CASE WHEN located <> 0 THEN file END FROM declarations
+                           WHERE node = nodes.id ORDER BY file LIMIT 1),
+                   summary = (SELECT summary FROM declarations
+                              WHERE node = nodes.id AND summary IS NOT NULL ORDER BY file LIMIT 1),
+                   summary_file = (SELECT file FROM declarations
+                              WHERE node = nodes.id AND summary IS NOT NULL ORDER BY file LIMIT 1)
+                 WHERE id = ?1 AND EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+            )
+            .unwrap();
+        for id in ids {
+            up.execute([id]).unwrap();
+        }
+    }
+
+    fn typed(q: &str, f: &str, sub: SubKind, sum: Option<&str>) -> Node {
+        Node::new(
+            NodeKind::Type,
+            q,
+            q.rsplit('.').next().unwrap(),
+            Some(f),
+            Some(sub),
+            sum,
+        )
+    }
+
+    fn many_files(n: usize) -> Vec<FileRecord> {
+        (0..n).map(|i| file(&format!("d{i:02}.md"))).collect()
+    }
+
+    /// Structure du fichier `i` : deux types, une référence d'analyse avec contexte.
+    fn item_of(i: usize) -> (String, Vec<Node>, Vec<Ref>) {
+        let f = format!("d{i:02}.md");
+        let a = typed(&format!("p.T{i}"), &f, SubKind::Class, Some("analyse"));
+        let b = typed(&format!("p.U{i}"), &f, SubKind::Interface, None);
+        let refs = vec![pref(&a.id, "X", Some(CTX)), pref(&b.id, "Y", Some(CTX))];
+        (f, vec![a, b], refs)
+    }
+
+    /// Graphe de 50 fichiers dont 10 ont un enrichissement conservé (résumé, concept, mention).
+    fn with_kept_enrichments(repo: &Path) -> Store {
+        let mut st = Store::open_or_create(repo).unwrap();
+        st.insert_pending_files(&many_files(50)).unwrap();
+        let items: Vec<_> = (0..50).map(item_of).collect();
+        st.replace_structures(&items).unwrap();
+        for i in 0..10 {
+            let (f, nodes, _) = item_of(i);
+            st.apply_enrichment(
+                &f,
+                "h",
+                "m",
+                &[(nodes[1].id.clone(), format!("résumé {i}"))],
+                &[concept(&format!("idée{i}"))],
+                &[mention(&nodes[0].id, &format!("idée{i}"))],
+            )
+            .unwrap();
+        }
+        st
+    }
+
+    #[test]
+    fn req064_ac1_fresh_base_writes_without_projection_and_matches_general_path() {
+        let d1 = tempdir().unwrap();
+        let d2 = tempdir().unwrap();
+        let mut fresh = with_kept_enrichments(d1.path());
+        let mut general = with_kept_enrichments(d2.path());
+        let items: Vec<_> = (0..50).map(item_of).collect();
+        fresh.reset_with_pending_files(&many_files(50)).unwrap();
+        general.reset().unwrap();
+        general.insert_pending_files(&many_files(50)).unwrap();
+        reset_diagnostics();
+        let mut reapplied = 0;
+        for it in &items {
+            reapplied += fresh
+                .replace_structures_counted(std::slice::from_ref(it))
+                .unwrap();
+        }
+        let d = diagnostics();
+        assert_eq!(d.total_projections(), 0, "{d:?}");
+        assert_eq!(reapplied, 10);
+        let mut reapplied_general = 0;
+        for it in &items {
+            reapplied_general += general
+                .replace_structures_counted(std::slice::from_ref(it))
+                .unwrap();
+        }
+        assert_eq!(reapplied_general, 10);
+        assert_eq!(graph_dump(&fresh), graph_dump(&general));
+    }
+
+    #[test]
+    fn req064_ac1_fresh_base_without_shared_nodes_projects_nothing() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.reset_with_pending_files(&many_files(50)).unwrap();
+        reset_diagnostics();
+        let items: Vec<_> = (0..50).map(item_of).collect();
+        st.replace_structures(&items).unwrap();
+        assert_eq!(diagnostics().total_projections(), 0);
+        assert_eq!(st.count_nodes().unwrap(), 100);
+    }
+
+    #[test]
+    fn req064_ac2_shared_node_on_fresh_base_follows_the_smallest_path() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let files: Vec<FileRecord> = ["a", "b", "c", "d1.md", "d2.md"]
+            .iter()
+            .map(|f| file(f))
+            .collect();
+        st.reset_with_pending_files(&files).unwrap();
+        reset_diagnostics();
+        let sh = |f: &str, short: &str, sub: SubKind, sum: Option<&str>| {
+            Node::new(NodeKind::Type, "p.A", short, Some(f), Some(sub), sum)
+        };
+        st.replace_structure("c", &[sh("c", "Cc", SubKind::Enum, Some("sc"))], &[])
+            .unwrap();
+        st.replace_structure("a", &[sh("a", "Aa", SubKind::Class, None)], &[])
+            .unwrap();
+        st.replace_structure("b", &[sh("b", "Bb", SubKind::Interface, Some("sb"))], &[])
+            .unwrap();
+        st.replace_structure("d1.md", &[concept("idée")], &[])
+            .unwrap();
+        st.replace_structure("d2.md", &[concept("idée")], &[])
+            .unwrap();
+        let n = st.node_by_id("type:p.A").unwrap().unwrap();
+        assert_eq!(n.short, "Aa");
+        assert_eq!(n.subkind, Some(SubKind::Class));
+        assert_eq!(n.file.as_deref(), Some("a"));
+        assert_eq!(n.summary.as_deref(), Some("sb"));
+        let summary_file: Option<String> = st
+            .conn
+            .query_row(
+                "SELECT summary_file FROM nodes WHERE id = 'type:p.A'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(summary_file.as_deref(), Some("b"));
+        let d = diagnostics();
+        assert!(d.projections("type:p.A") <= 2, "{d:?}");
+        assert!(d.projections("concept:idée") <= 1, "{d:?}");
+        assert_eq!(st.node_by_id("concept:idée").unwrap().unwrap().file, None);
+    }
+
+    fn assert_no_double_projection(d: &Diagnostics, ids: &[String], max_total: usize) {
+        for id in ids {
+            assert!(
+                d.projections(id) <= 1,
+                "{id} projeté {} fois",
+                d.projections(id)
+            );
+        }
+        assert!(d.total_projections() as usize <= max_total, "{d:?}");
+    }
+
+    #[test]
+    fn req064_ac3_general_path_projects_each_touched_node_once() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("x.md")]).unwrap();
+        let mk = |range: std::ops::Range<usize>| -> Vec<Node> {
+            range
+                .map(|i| typed(&format!("p.N{i}"), "x.md", SubKind::Class, Some("a")))
+                .collect()
+        };
+        let old = mk(0..30);
+        st.replace_structure("x.md", &old, &[]).unwrap();
+        let sums: Vec<(String, String)> = old
+            .iter()
+            .map(|n| (n.id.clone(), format!("r {}", n.short)))
+            .collect();
+        st.apply_enrichment("x.md", "h", "m", &sums, &[], &[])
+            .unwrap();
+        let all: Vec<String> = mk(0..40).into_iter().map(|n| n.id).collect();
+
+        // Réécriture avec enrichissement conservé réappliqué : 30 avant, 30 après, 20 communs.
+        reset_diagnostics();
+        let n = st
+            .replace_structures_counted(&[("x.md".to_string(), mk(10..40), vec![])])
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_no_double_projection(&diagnostics(), &all, 40);
+        assert_eq!(st.count_nodes().unwrap(), 30);
+        let kept = st.node_by_id("type:p.N15").unwrap().unwrap();
+        assert_eq!(kept.summary.as_deref(), Some("r N15"));
+        assert!(st.node_by_id("type:p.N5").unwrap().is_none());
+
+        // Enrichissement.
+        let new_nodes = mk(10..40);
+        let sums: Vec<(String, String)> = new_nodes
+            .iter()
+            .map(|n| (n.id.clone(), "s".into()))
+            .collect();
+        reset_diagnostics();
+        st.apply_enrichment("x.md", "h", "m", &sums, &[concept("c")], &[])
+            .unwrap();
+        let mut ids = all.clone();
+        ids.push("concept:c".into());
+        assert_no_double_projection(&diagnostics(), &ids, 31);
+
+        // Suppression.
+        reset_diagnostics();
+        assert!(st.remove_file("x.md").unwrap());
+        assert_no_double_projection(&diagnostics(), &ids, 31);
+        assert_eq!(st.count_nodes().unwrap(), 0);
+    }
+
+    // Générateur congruentiel : séquences reproductibles.
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % n
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Write(String, Vec<Node>, Vec<Ref>),
+        Enrich(String, String, Vec<(String, String)>, Vec<Node>, Vec<Ref>),
+        Remove(String),
+        Add(String, String),
+        Deps(Vec<Node>),
+    }
+
+    fn run_op(st: &mut Store, op: &Op) {
+        match op {
+            Op::Write(f, n, r) => st.replace_structure(f, n, r).unwrap(),
+            Op::Enrich(f, h, s, c, r) => st.apply_enrichment(f, h, "m", s, c, r).unwrap(),
+            Op::Remove(f) => {
+                st.remove_file(f).unwrap();
+            }
+            Op::Add(f, h) => {
+                let mut rec = file(f);
+                rec.hash = h.clone();
+                st.insert_files(&[rec]).unwrap();
+            }
+            Op::Deps(d) => st.replace_derived_dependencies(d).unwrap(),
+        }
+    }
+
+    struct Gen {
+        rng: Lcg,
+        files: Vec<String>,
+        hash: Vec<String>,
+        known: Vec<bool>,
+        declared: Vec<Vec<Node>>,
+    }
+
+    impl Gen {
+        fn write(&mut self, i: usize) -> Op {
+            let f = self.files[i].clone();
+            let mut nodes: Vec<Node> = Vec::new();
+            for _ in 0..self.rng.below(5) {
+                let k = self.rng.below(6);
+                let sub = [SubKind::Class, SubKind::Interface, SubKind::Enum][self.rng.below(3)];
+                let sum = (self.rng.below(2) == 0).then(|| format!("p{i}{k}"));
+                let n = if self.rng.below(5) == 0 {
+                    Node::new(
+                        NodeKind::Concept,
+                        &format!("c{}", self.rng.below(3)),
+                        "c",
+                        None,
+                        None,
+                        sum.as_deref(),
+                    )
+                } else {
+                    let q = format!("p.T{k}");
+                    Node::new(
+                        NodeKind::Type,
+                        &q,
+                        &format!("S{i}{k}"),
+                        Some(&f),
+                        Some(sub),
+                        sum.as_deref(),
+                    )
+                };
+                nodes.push(n);
+            }
+            let ctx = (self.rng.below(2) == 0).then_some(CTX);
+            let mut refs = Vec::new();
+            if !nodes.is_empty() {
+                for _ in 0..self.rng.below(4) {
+                    let s = &nodes[self.rng.below(nodes.len())];
+                    refs.push(pref(&s.id, &format!("R{}", self.rng.below(4)), ctx));
+                }
+            }
+            self.declared[i] = nodes.clone();
+            Op::Write(f, nodes, refs)
+        }
+
+        fn enrich(&mut self, i: usize) -> Op {
+            let f = self.files[i].clone();
+            let decl = self.declared[i].clone();
+            let mut sums: Vec<(String, String)> = Vec::new();
+            for n in &decl {
+                if self.rng.below(2) == 0 && !sums.iter().any(|(id, _)| *id == n.id) {
+                    sums.push((n.id.clone(), format!("e{i}")));
+                }
+            }
+            let mut concepts: Vec<Node> = Vec::new();
+            for _ in 0..self.rng.below(3) {
+                let name = format!("c{}", self.rng.below(4));
+                let sum = (self.rng.below(2) == 0).then(|| format!("cs{i}"));
+                let c = Node::new(NodeKind::Concept, &name, &name, None, None, sum.as_deref());
+                if !concepts.iter().any(|x| x.id == c.id) {
+                    concepts.push(c);
+                }
+            }
+            let mut refs = Vec::new();
+            if !decl.is_empty() {
+                for c in &concepts {
+                    if self.rng.below(2) == 0 {
+                        refs.push(mention(&decl[self.rng.below(decl.len())].id, &c.qualified));
+                    }
+                }
+                if self.rng.below(3) == 0 {
+                    refs.push(mention(&decl[0].id, "inconnu"));
+                }
+            }
+            Op::Enrich(f, self.hash[i].clone(), sums, concepts, refs)
+        }
+
+        fn random_op(&mut self) -> Op {
+            let i = self.rng.below(self.files.len());
+            match self.rng.below(7) {
+                0 | 1 if self.known[i] => self.write(i),
+                2 | 3 if self.known[i] && !self.declared[i].is_empty() => self.enrich(i),
+                4 if self.known[i] => {
+                    self.known[i] = false;
+                    self.declared[i].clear();
+                    Op::Remove(self.files[i].clone())
+                }
+                5 => {
+                    self.known[i] = true;
+                    self.hash[i] = ["h", "h2"][self.rng.below(2)].to_string();
+                    Op::Add(self.files[i].clone(), self.hash[i].clone())
+                }
+                _ => Op::Deps(vec![Node::new(
+                    NodeKind::Dependency,
+                    &format!("g:{}", self.rng.below(3)),
+                    "lib",
+                    None,
+                    None,
+                    None,
+                )]),
+            }
+        }
+    }
+
+    #[test]
+    fn req064_ac4_random_sequences_leave_a_consistent_graph_identical_to_the_general_path() {
+        for seed in 0..200u64 {
+            let nfiles = 4;
+            let mut g = Gen {
+                rng: Lcg(seed * 7919 + 1),
+                files: (0..nfiles).map(|i| format!("f{i}.md")).collect(),
+                hash: vec!["h".to_string(); nfiles],
+                known: vec![true; nfiles],
+                declared: vec![Vec::new(); nfiles],
+            };
+            let records = |g: &Gen| -> Vec<FileRecord> {
+                g.files
+                    .iter()
+                    .zip(&g.hash)
+                    .map(|(f, h)| {
+                        let mut r = file(f);
+                        r.hash = h.clone();
+                        r
+                    })
+                    .collect()
+            };
+            // Phase 1 : graphe peuplé avec enrichissements conservés (hash « h »).
+            let d1 = tempdir().unwrap();
+            let d2 = tempdir().unwrap();
+            let mut fresh = Store::open_or_create(d1.path()).unwrap();
+            let mut general = Store::open_or_create(d2.path()).unwrap();
+            let mut prelude = Vec::new();
+            for st in [&mut fresh, &mut general] {
+                st.insert_pending_files(&records(&g)).unwrap();
+            }
+            for i in 0..nfiles {
+                prelude.push(g.write(i));
+                if !g.declared[i].is_empty() {
+                    prelude.push(g.enrich(i));
+                }
+            }
+            for op in &prelude {
+                run_op(&mut fresh, op);
+                run_op(&mut general, op);
+            }
+            // Phase 2 : graphe vidé (hash éventuellement changés), puis écritures.
+            for i in 0..nfiles {
+                g.hash[i] = ["h", "h2"][g.rng.below(2)].to_string();
+                g.declared[i].clear();
+            }
+            fresh.reset_with_pending_files(&records(&g)).unwrap();
+            general.reset().unwrap();
+            general.insert_pending_files(&records(&g)).unwrap();
+            let mut ops = Vec::new();
+            for i in 0..nfiles {
+                if g.rng.below(5) != 0 {
+                    ops.push(g.write(i));
+                }
+            }
+            for _ in 0..g.rng.below(7) {
+                ops.push(g.random_op());
+            }
+            for (k, op) in ops.iter().enumerate() {
+                run_op(&mut fresh, op);
+                run_op(&mut general, op);
+                assert_eq!(
+                    graph_dump(&fresh),
+                    graph_dump(&general),
+                    "graine {seed}, après l'opération {k} : {op:?}"
+                );
+            }
+            // (a) la projection de la 0.20.0 ne change aucune ligne.
+            let before = dump(&fresh, "nodes", NODES_COLS);
+            project_like_0_20(&fresh);
+            assert_eq!(before, dump(&fresh, "nodes", NODES_COLS), "graine {seed}");
+            // (b) aucun nœud sans déclaration hors dépendances dérivées.
+            let orphans: i64 = fresh
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM nodes WHERE kind <> 'dependency'
+                     AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphans, 0, "graine {seed}");
+        }
     }
 }
