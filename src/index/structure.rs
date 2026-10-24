@@ -28,13 +28,13 @@ enum Outcome {
     Failed(String, Error),
 }
 
-/// Analyse `files` avec `concurrency` fils et enregistre leur structure. Un fichier illisible ou
+/// Analyse `files` avec `jobs` fils et enregistre leur structure. Un fichier illisible ou
 /// dont l'analyse échoue reste « en attente » (avertissement nommant la cause) ; les autres
 /// continuent. `gradle_settings` : table des `settings.gradle(.kts)` du parcours.
 pub(crate) fn analyze(
     repo: &Path,
     files: &[ScannedFile],
-    concurrency: usize,
+    jobs: usize,
     gradle_settings: &HashMap<String, Option<String>>,
     store: &mut Store,
     report: &mut BuildReport,
@@ -46,7 +46,7 @@ pub(crate) fn analyze(
     };
     let queue: Mutex<VecDeque<&ScannedFile>> = Mutex::new(files.iter().collect());
     let (tx, rx) = mpsc::channel::<Outcome>();
-    let workers = concurrency.clamp(1, files.len().max(1));
+    let workers = jobs.clamp(1, files.len().max(1));
     let mut write_error: Option<Error> = None;
     let started = std::time::Instant::now();
     let failed_before = report.failed;
@@ -85,7 +85,11 @@ pub(crate) fn analyze(
                     }
                 });
             match spawned {
-                Ok(_) => started_workers += 1,
+                Ok(_) => {
+                    started_workers += 1;
+                    #[cfg(test)]
+                    tests::EXTRACT_THREADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 Err(e) => {
                     if started_workers == 0 {
                         queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
@@ -229,6 +233,61 @@ fn to_records(path: &str, x: &FileStructure) -> (Vec<Node>, Vec<Ref>, usize) {
 mod tests {
     use super::*;
     use crate::parse::Declared;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Compteur de diagnostic (AC-071-3) : fils d'extraction lancés, tous appels confondus.
+    pub(super) static EXTRACT_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Fils d'extraction lancés par `analyze` sur `n` fichiers avec `jobs`.
+    fn threads_for(n: usize, jobs: usize) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for i in 0..n {
+            std::fs::write(
+                repo.join(format!("C{i}.java")),
+                format!("package p;\npublic class C{i} {{}}\n"),
+            )
+            .unwrap();
+        }
+        let scanned = crate::scan::scan(repo, &[], &crate::filter::Matcher::none()).unwrap();
+        assert_eq!(scanned.files.len(), n);
+        let mut store = Store::open_or_create(repo).unwrap();
+        let records: Vec<crate::model::FileRecord> = scanned
+            .files
+            .iter()
+            .map(|f| crate::model::FileRecord {
+                path: f.path.clone(),
+                hash: f.hash.clone(),
+                size: f.size,
+                mtime: f.mtime,
+                recorded_at: 0,
+                state: crate::model::FileState::Pending,
+            })
+            .collect();
+        store.reset_with_pending_files(&records).unwrap();
+        let before = EXTRACT_THREADS.load(Ordering::SeqCst);
+        let mut report = BuildReport::default();
+        analyze(
+            repo,
+            &scanned.files,
+            jobs,
+            &scanned.gradle_settings,
+            &mut store,
+            &mut report,
+        )
+        .unwrap();
+        EXTRACT_THREADS.load(Ordering::SeqCst) - before
+    }
+
+    /// AC-071-3 : le nombre de fils lancés vaut min(jobs, fichiers), au moins 1.
+    #[test]
+    fn req071_ac3_fils_d_extraction_lances() {
+        assert_eq!(threads_for(30, 3), 3);
+        assert_eq!(threads_for(5, 50), 5);
+        assert_eq!(threads_for(30, 1), 1);
+        let d = crate::index::default_jobs();
+        assert!((1..=crate::index::MAX_JOBS).contains(&d), "{d}");
+    }
 
     fn module(q: &str, short: Option<&str>) -> FileStructure {
         FileStructure {

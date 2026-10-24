@@ -47,6 +47,17 @@ fn parse_batch_files(s: &str) -> std::result::Result<usize, String> {
     }
 }
 
+/// Entier de 1 à `MAX_JOBS` (REQ-071).
+fn parse_jobs(s: &str) -> std::result::Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if (1..=crate::index::MAX_JOBS).contains(&n) => Ok(n),
+        _ => Err(format!(
+            "`{s}` n'est pas un entier de 1 à {}",
+            crate::index::MAX_JOBS
+        )),
+    }
+}
+
 /// Entier positif ou nul tenant sur 32 bits (REQ-038).
 fn parse_format_retries(s: &str) -> std::result::Result<u32, String> {
     s.parse::<u32>()
@@ -101,6 +112,9 @@ pub struct IndexOpts {
     /// Avancement des phases extraction et enrichissement sur stderr, par paliers de 10 % (préfixe `progression:` ; incompatible avec --verbose)
     #[arg(long, conflicts_with = "verbose")]
     pub show_progress: bool,
+    /// Nombre de fils du parcours du dépôt et de l'extraction, de 1 à 256 (défaut : nombre de cœurs disponibles ; indépendant de `concurrency`, qui ne règle que les appels LLM)
+    #[arg(long, value_name = "N", value_parser = parse_jobs, allow_hyphen_values = true)]
+    pub jobs: Option<usize>,
     /// Nombre maximal de fichiers par appel d'enrichissement (remplace `batch_files` de la configuration)
     #[arg(long, value_name = "N", value_parser = parse_batch_files, allow_hyphen_values = true)]
     pub batch_files: Option<usize>,
@@ -202,8 +216,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 o.no_llm,
                 o.enrich_code,
                 o.verbose,
-                o.batch_files,
-                o.format_retries,
+                crate::index::build::Overrides {
+                    jobs: o.jobs,
+                    batch_files: o.batch_files,
+                    format_retries: o.format_retries,
+                },
                 o.filters(),
             )
         }
@@ -214,8 +231,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 o.no_llm,
                 o.enrich_code,
                 o.verbose,
-                o.batch_files,
-                o.format_retries,
+                crate::index::build::Overrides {
+                    jobs: o.jobs,
+                    batch_files: o.batch_files,
+                    format_retries: o.format_retries,
+                },
                 o.filters(),
             )
         }

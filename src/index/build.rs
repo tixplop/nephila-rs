@@ -43,8 +43,10 @@ pub struct BuildReport {
 /// Réglages de l'indexation : ceux de la configuration, ou les défauts sans configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexOptions {
-    /// Nombre de fils d'analyse et d'appels LLM simultanés.
+    /// Nombre d'appels LLM simultanés.
     pub concurrency: usize,
+    /// Nombre de fils d'extraction (REQ-071) : `--jobs`, sinon `default_jobs()`.
+    pub jobs: usize,
     pub max_chunk_chars: usize,
     /// Nombre maximal de fichiers par appel LLM (REQ-027).
     pub batch_files: usize,
@@ -58,6 +60,7 @@ impl Default for IndexOptions {
     fn default() -> Self {
         IndexOptions {
             concurrency: DEFAULT_CONCURRENCY,
+            jobs: crate::index::default_jobs(),
             max_chunk_chars: DEFAULT_MAX_CHUNK_CHARS,
             batch_files: crate::config::DEFAULT_BATCH_FILES,
             format_retries: crate::config::DEFAULT_FORMAT_RETRIES,
@@ -70,6 +73,7 @@ impl From<&Config> for IndexOptions {
     fn from(c: &Config) -> Self {
         IndexOptions {
             concurrency: c.concurrency,
+            jobs: crate::index::default_jobs(),
             max_chunk_chars: c.max_chunk_chars,
             batch_files: c.batch_files,
             format_retries: c.format_retries,
@@ -172,14 +176,21 @@ impl BuildReport {
     }
 }
 
+/// Options de la ligne de commande qui remplacent les réglages (REQ-071, REQ-028, REQ-038).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Overrides {
+    pub jobs: Option<usize>,
+    pub batch_files: Option<usize>,
+    pub format_retries: Option<u32>,
+}
+
 /// Point d'entrée de `nephila build` : valide le dépôt, la configuration et la clé, puis construit.
 pub fn run(
     repo: &Path,
     no_llm: bool,
     enrich_code: bool,
     verbose: bool,
-    batch_files: Option<usize>,
-    format_retries: Option<u32>,
+    over: Overrides,
     cli_filters: Filters,
 ) -> Result<()> {
     trace::init(verbose);
@@ -187,13 +198,16 @@ pub fn run(
     // Le fichier de projet est lu avant la configuration LLM, le verrou et toute écriture.
     let project = ProjectFile::load(repo)?;
     let matcher = effective_matcher(repo, &project.filters, &cli_filters)?;
-    let setup = setup(
+    let mut setup = setup(
         no_llm,
         enrich_code,
         &project.settings,
-        batch_files,
-        format_retries,
+        over.batch_files,
+        over.format_retries,
     )?;
+    if let Some(j) = over.jobs {
+        setup.opts.jobs = j;
+    }
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
     let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
@@ -326,7 +340,7 @@ pub fn build(
     structure::analyze(
         repo,
         &scanned.files,
-        opts.concurrency,
+        opts.jobs,
         &scanned.gradle_settings,
         &mut store,
         &mut report,

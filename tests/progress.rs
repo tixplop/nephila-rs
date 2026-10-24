@@ -231,7 +231,7 @@ fn req043_ac11_help_text() {
         let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
         let verbose = "-v, --verbose Traces synthétiques des étapes et des appels LLM sur stderr (préfixe `trace:` ; incompatible avec --show-progress) ";
         let progress = "--show-progress Avancement des phases extraction et enrichissement sur stderr, par paliers de 10 % (préfixe `progression:` ; incompatible avec --verbose) ";
-        let both = format!("{verbose}{progress}--batch-files");
+        let both = format!("{verbose}{progress}--jobs");
         assert!(flat.contains(&both), "{sub}: {flat}");
         assert!(!flat.contains("-s, --show-progress"));
         assert!(!flat.contains("--show-progress <"));

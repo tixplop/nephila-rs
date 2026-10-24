@@ -628,7 +628,11 @@ fn req042_ac4_fils_morceaux_et_delai() {
     for needle in ["concurrency=3", "timeout_secs=7", "max_chunk_chars=1000"] {
         assert!(config.contains(needle), "{config}");
     }
-    assert!(err.contains("structure: début 4 fichiers, 3 fils"), "{err}");
+    let w = nephila::index::default_jobs().min(4);
+    assert!(
+        err.contains(&format!("structure: début 4 fichiers, {w} fils")),
+        "{err}"
+    );
     let enrich = err
         .lines()
         .find(|l| l.contains("enrichissement: début"))
@@ -681,8 +685,10 @@ fn req042_ac7_llm_inactif_reglages_sans_effet() {
             .any(|l| l.ends_with("] config: llm inactif (aucune configuration)")),
         "{err}"
     );
+    // Le dépôt compte 10 fichiers : min(défaut, 10) fils (le « 4 » de la note valait pour 4 fichiers).
+    let w = nephila::index::default_jobs().min(10);
     assert!(
-        err.contains("structure: début") && err.contains(", 4 fils"),
+        err.contains(&format!("structure: début 10 fichiers, {w} fils")),
         "{err}"
     );
     assert!(!err.contains("(.nephila.toml :"));

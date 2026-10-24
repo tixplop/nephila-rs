@@ -834,6 +834,7 @@ pub(crate) fn enrich_with_stop(
         batch_files,
         format_retries,
         enrich_code: _,
+        jobs: _,
     } = *opts;
     let ids = nodes_by_file(store)?;
     let started = Instant::now();
@@ -1780,6 +1781,7 @@ mod tests {
         let mut store = Store::open_or_create(dir.path()).unwrap();
         let mut report = BuildReport::default();
         let opts = IndexOptions {
+            jobs: 1,
             concurrency: 2,
             max_chunk_chars: 1000,
             batch_files: 1,
@@ -1857,6 +1859,7 @@ mod tests {
         store.insert_files(&files).unwrap();
         let mut report = BuildReport::default();
         let opts = IndexOptions {
+            jobs: 1,
             concurrency: 1,
             max_chunk_chars: 1000,
             batch_files: 4,
@@ -2015,6 +2018,7 @@ mod tests {
         }
         let mut report = BuildReport::default();
         let opts = IndexOptions {
+            jobs: 1,
             concurrency,
             max_chunk_chars: 10,
             batch_files,
