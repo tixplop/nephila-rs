@@ -450,6 +450,14 @@ fn perf_req021_ac6_export() {
 
 /// Dépôt JavaScript/TypeScript de 3 000 fichiers sous `target/perf-fixture-js` (AC-021-7).
 fn js_fixture() -> Fixture {
+    js_fixture_with(Some(
+        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\n",
+    ))
+}
+
+/// Génère et antidate la fixture JS ; `config` = contenu du fichier de configuration, ou `None`
+/// pour un chemin de configuration absent (aucun LLM).
+fn js_fixture_with(config_text: Option<&str>) -> Fixture {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-fixture-js");
     let _ = std::fs::remove_dir_all(&root);
     let repo = root.join("repo");
@@ -457,11 +465,9 @@ fn js_fixture() -> Fixture {
     gen_js::generate(&repo, &mock);
     backdate(&repo);
     let config = root.join("config.toml");
-    std::fs::write(
-        &config,
-        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\n",
-    )
-    .unwrap();
+    if let Some(text) = config_text {
+        std::fs::write(&config, text).unwrap();
+    }
     Fixture { repo, config, mock }
 }
 
@@ -819,4 +825,180 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
             std::fs::copy(e.path(), dest).unwrap();
         }
     }
+}
+
+/// Empreinte BLAKE3 de l'arbre : chemins triés (relatifs, `/`) et contenus, avec longueurs.
+fn tree_fingerprint(dir: &std::path::Path) -> String {
+    fn files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if std::fs::symlink_metadata(&p).unwrap().file_type().is_dir() {
+                files(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut all = Vec::new();
+    files(dir, &mut all);
+    let mut rel: Vec<String> = all
+        .iter()
+        .map(|p| {
+            p.strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    rel.sort();
+    let mut h = blake3::Hasher::new();
+    for r in &rel {
+        let body = std::fs::read(dir.join(r)).unwrap();
+        h.update(&(r.len() as u64).to_le_bytes());
+        h.update(r.as_bytes());
+        h.update(&(body.len() as u64).to_le_bytes());
+        h.update(&body);
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// Mesures d'un lancement du banc, en millisecondes.
+struct Sample {
+    parcours: u64,
+    structure: u64,
+    resolution: u64,
+    autres: u64,
+    total: u64,
+    files: u64,
+    jobs: u64,
+}
+
+/// Premier nombre entier qui suit `marker` dans la première ligne de `err` qui le contient.
+fn number_after(err: &str, line_key: &str, marker: &str) -> Option<u64> {
+    let line = err.lines().find(|l| l.contains(line_key))?;
+    let rest = line.split(marker).nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// `[<s>.<mmm>s]` de la ligne `parcours:` en millisecondes.
+fn parcours_ms(err: &str) -> Option<u64> {
+    let line = err.lines().find(|l| l.contains("parcours:"))?;
+    let t = line.split_once('[')?.1.split_once("s]")?.0;
+    let (s, ms) = t.split_once('.')?;
+    Some(s.parse::<u64>().ok()? * 1000 + ms.parse::<u64>().ok()?)
+}
+
+fn bench_run(f: &Fixture, cmd_name: &str) -> Sample {
+    let t = Instant::now();
+    let out = cmd(f, &[cmd_name, "--no-llm", "--verbose"])
+        .output()
+        .unwrap();
+    let total = t.elapsed().as_millis() as u64;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{cmd_name} : {err}");
+    let need = |v: Option<u64>, what: &str| {
+        v.unwrap_or_else(|| {
+            panic!("{cmd_name} : ligne `{what}` absente ou illisible, stderr :\n{err}")
+        })
+    };
+    let parcours = need(parcours_ms(&err), "parcours:");
+    let structure = need(
+        number_after(&err, "structure: fin", "structure: fin "),
+        "structure: fin",
+    );
+    let resolution = need(
+        number_after(&err, "résolution:", "résolution: "),
+        "résolution:",
+    );
+    let files = need(
+        number_after(&err, "structure: début", "structure: début "),
+        "structure: début",
+    );
+    let jobs = need(
+        number_after(&err, "structure: début", " fichiers, "),
+        "structure: début",
+    );
+    let autres = total.saturating_sub(parcours + structure + resolution);
+    Sample {
+        parcours,
+        structure,
+        resolution,
+        autres,
+        total,
+        files,
+        jobs,
+    }
+}
+
+fn median(v: &mut [u64]) -> u64 {
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
+fn bench_line(label: &str, runs: &[Sample]) -> String {
+    let m = |g: fn(&Sample) -> u64| median(&mut runs.iter().map(g).collect::<Vec<_>>());
+    format!(
+        "banc: {label} --no-llm : parcours {} ms, structure {} ms, résolution {} ms, autres {} ms, total {} ms (médiane de 3, {} fichiers, {} fils)",
+        m(|s| s.parcours),
+        m(|s| s.structure),
+        m(|s| s.resolution),
+        m(|s| s.autres),
+        m(|s| s.total),
+        runs[0].files,
+        runs[0].jobs
+    )
+}
+
+/// REQ-082 : banc de `build --no-llm` et `update --no-llm` sur `target/perf-fixture-js`, par phase.
+/// Commande `banc` du plan (AC-082-1) ; aucun seuil, sauf l'exactitude du graphe (AC-082-2).
+#[test]
+#[ignore]
+fn perf_banc_js() {
+    let _g = serial();
+    let f = js_fixture_with(None);
+    assert!(!f.config.exists());
+    eprintln!(
+        "banc: fixture {}",
+        tree_fingerprint(f.repo.parent().unwrap())
+    );
+    let nephila = f.repo.join(".nephila");
+    let mut builds = Vec::new();
+    for _ in 0..3 {
+        let _ = std::fs::remove_dir_all(&nephila);
+        builds.push(bench_run(&f, "build"));
+    }
+    let oracle = ORACLE_GROS_DEPOTS
+        .iter()
+        .find(|(n, s, _)| *n == "gen_js" && *s == "build")
+        .unwrap();
+    assert_eq!(
+        export_hash(&f),
+        oracle.2,
+        "AC-082-2 : écart d'oracle après build"
+    );
+    let edited = f.repo.join(gen_js::path(gen_js::EDITED));
+    let original = std::fs::read_to_string(&edited).unwrap();
+    let mut updates = Vec::new();
+    for k in 0..3u64 {
+        std::fs::write(&edited, format!("{original}\n// banc {k}\n")).unwrap();
+        let t = std::time::SystemTime::now() - Duration::from_secs(8) + Duration::from_secs(k);
+        std::fs::File::options()
+            .write(true)
+            .open(&edited)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(t).set_accessed(t))
+            .unwrap();
+        updates.push(bench_run(&f, "update"));
+    }
+    eprintln!("{}", bench_line("build", &builds));
+    eprintln!("{}", bench_line("update", &updates));
+    let after_update = export_hash(&f);
+    let _ = std::fs::remove_dir_all(&nephila);
+    timed(&f, &["build", "--no-llm"]);
+    assert_eq!(
+        after_update,
+        export_hash(&f),
+        "AC-082-2 : update différent d'un build neuf"
+    );
 }
