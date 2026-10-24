@@ -121,9 +121,22 @@ pub(crate) const DELETE_DEPENDENCY: &str = "DELETE FROM nodes WHERE id = ?1 AND 
 pub(crate) const SET_UNRESOLVED: &str = "UPDATE refs SET unresolved = ?2 WHERE id = ?1";
 pub(crate) const COUNT_EDGES: &str = "SELECT COUNT(*) FROM edges";
 pub(crate) const COUNT_UNRESOLVED: &str = "SELECT count(*) FROM refs WHERE unresolved = 1";
+/// Liens `depends_on` sortants d'un module (clé primaire).
+pub(crate) const SUMMARY_DEPENDS_ON: &str =
+    "SELECT target FROM edges WHERE source = ?1 AND kind = 'depends_on'";
+/// Les dix nœuds de plus haut degré (agrégat sur les deux index couvrants de `edges` ; un lien
+/// d'un nœud vers lui-même compte deux fois), égalités départagées par identifiant.
+pub(crate) const SUMMARY_TOP_DEGREES: &str = "SELECT id, SUM(n) AS degree FROM (
+         SELECT source AS id, COUNT(*) AS n FROM edges GROUP BY source
+         UNION ALL
+         SELECT target AS id, COUNT(*) AS n FROM edges GROUP BY target)
+     GROUP BY id ORDER BY degree DESC, id LIMIT ?1";
+/// Nombre de mentions de chaque concept mentionné (intervalle `concept:` de `idx_edges_target`).
+pub(crate) const SUMMARY_MENTIONS: &str = "SELECT target, COUNT(*) FROM edges
+     WHERE target >= 'concept:' AND target < 'concept;' AND kind = 'mentions' GROUP BY target";
 /// Toutes les requêtes ci-dessus, nommées.
 #[cfg(test)]
-pub(crate) const INCREMENTAL_QUERIES: [(&str, &str); 18] = [
+pub(crate) const INCREMENTAL_QUERIES: [(&str, &str); 21] = [
     ("RESOLVE_NODES", RESOLVE_NODES),
     ("REF_SOURCES_BY_KEY", REF_SOURCES_BY_KEY),
     ("REF_SOURCES_BY_HEAD", REF_SOURCES_BY_HEAD),
@@ -142,6 +155,9 @@ pub(crate) const INCREMENTAL_QUERIES: [(&str, &str); 18] = [
     ("SET_UNRESOLVED", SET_UNRESOLVED),
     ("COUNT_EDGES", COUNT_EDGES),
     ("COUNT_UNRESOLVED", COUNT_UNRESOLVED),
+    ("SUMMARY_DEPENDS_ON", SUMMARY_DEPENDS_ON),
+    ("SUMMARY_TOP_DEGREES", SUMMARY_TOP_DEGREES),
+    ("SUMMARY_MENTIONS", SUMMARY_MENTIONS),
 ];
 
 /// Ce qu'une passe incrémentale écrit (DEC-077 point 3), calculé par `resolve`.
@@ -1782,6 +1798,55 @@ impl Store {
         self.stale = false;
         self.log = Some(log);
         Ok(())
+    }
+
+    /// Cibles des liens `depends_on` d'un module (résumé d'une passe incrémentale, DEC-078).
+    pub(crate) fn module_dependencies(&self, module: &str) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare_cached(SUMMARY_DEPENDS_ON)
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([module], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        let out: Vec<String> = rows
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        note_edge_rows(out.len());
+        Ok(out)
+    }
+
+    /// Les `limit` nœuds de plus haut degré, par agrégat SQLite (DEC-078).
+    pub(crate) fn top_degrees(&self, limit: usize) -> Result<Vec<(String, u64)>> {
+        let mut st = self
+            .conn
+            .prepare_cached(SUMMARY_TOP_DEGREES)
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .map_err(db_err)?;
+        let out: Vec<(String, u64)> = rows
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        note_edge_rows(out.len());
+        Ok(out)
+    }
+
+    /// Nombre de mentions de chaque concept mentionné, par agrégat SQLite (DEC-078).
+    pub(crate) fn concept_mentions(&self) -> Result<Vec<(String, u64)>> {
+        let mut st = self.conn.prepare_cached(SUMMARY_MENTIONS).map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .map_err(db_err)?;
+        let out: Vec<(String, u64)> = rows
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        note_edge_rows(out.len());
+        Ok(out)
     }
 
     /// Références comptées non résolues par la dernière passe (index partiel, DEC-076).
@@ -5295,7 +5360,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let st = Store::open_or_create(dir.path()).unwrap();
         let scans_nodes = ["RESOLVE_NODES"];
-        let scans_edges = ["COUNT_EDGES"];
+        let scans_edges = ["COUNT_EDGES", "SUMMARY_TOP_DEGREES"];
         for (name, sql) in INCREMENTAL_QUERIES {
             let mut stmt = st
                 .conn
@@ -5966,9 +6031,10 @@ mod tests {
         st.log = None;
         crate::resolve::resolve(&mut st).unwrap();
         let d = diagnostics();
-        // Nœuds : 4 (`nodes()` de la passe) + 4 (`nodes()` du résumé) + 0 (aucun nœud
+        // Nœuds : 4 (`nodes()` de la passe, le résumé n'en relit aucun) + 0 (aucun nœud
         // `dependency` lu par `replace_dependencies_tx`). Liens : 0 (diff de `replace_edges_tx` :
-        // `replace_edges(&[])` les a tous supprimés) + 3 (`edges()` du résumé, sur les liens écrits).
-        assert_eq!((d.node_rows_read(), d.edge_rows_read()), (8, 3));
+        // `replace_edges(&[])` les a tous supprimés ; le résumé de la passe complète est calculé
+        // sur les liens de la passe, DEC-078).
+        assert_eq!((d.node_rows_read(), d.edge_rows_read()), (4, 0));
     }
 }

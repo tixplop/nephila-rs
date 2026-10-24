@@ -60,21 +60,19 @@ fn resolve_full(store: &mut Store) -> Result<ResolveStats> {
     crate::store::note_pass(false);
     let refs = store.file_refs()?;
     crate::store::note_refs_reevaluated(refs.len());
+    let nodes = store.nodes()?;
     let r = compute(
-        &store.nodes()?,
+        &nodes,
         &refs,
         &store.file_contexts()?,
         &store.declarations()?,
     );
     let unresolved: Vec<i64> = r.unresolved.iter().map(|&i| refs[i].id).collect();
+    // Résumé tiré des nœuds chargés et des liens calculés : aucune relecture (DEC-078).
+    let stamped = crate::summary::stamped(&crate::summary::from_pass(&nodes, &r.edges));
     // Dépendances dérivées, liens, statut des références, résumé global et marqueur : une seule
     // transaction (DEC-074, DEC-076).
-    store.write_resolution(
-        &r.dependencies,
-        &r.edges,
-        &unresolved,
-        crate::summary::compute_stamped,
-    )?;
+    store.write_resolution(&r.dependencies, &r.edges, &unresolved, |_| Ok(stamped))?;
     // Les liens sont dédupliqués par la clé primaire : on compte ce qui est stocké.
     Ok(ResolveStats {
         edges: store.count_edges()?,
@@ -207,7 +205,11 @@ fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStat
         write.contained.push((n.id.clone(), wanted));
     }
 
-    store.write_incremental(&write, crate::summary::compute_stamped)?;
+    store.write_incremental(&write, |s| {
+        Ok(crate::summary::stamped(&crate::summary::from_store(
+            s, &nodes,
+        )?))
+    })?;
     Ok(ResolveStats {
         edges: store.count_edges()?,
         unresolved: store.count_unresolved()?,
@@ -2147,8 +2149,249 @@ import q.R;",
         let r = compute_from(store).unwrap();
         store.replace_derived_dependencies(&r.dependencies).unwrap();
         store.replace_edges(&r.edges).unwrap();
-        let v = crate::summary::compute(store).unwrap();
+        let v = summary_oracle(store);
         store.set_summary(&v.to_string(), 1).unwrap();
+    }
+
+    /// `summary::compute(store)` de la 0.21.0, conservé comme oracle (AC-067-1) : relit tous les
+    /// nœuds et tous les liens du stockage.
+    fn summary_oracle(store: &Store) -> serde_json::Value {
+        use serde_json::json;
+        let nodes = store.nodes().unwrap();
+        let edges = store.edges().unwrap();
+        let mut deps: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut degree: HashMap<&str, u64> = HashMap::new();
+        let mut mentions: HashMap<&str, u64> = HashMap::new();
+        for e in &edges {
+            *degree.entry(&e.source).or_default() += 1;
+            *degree.entry(&e.target).or_default() += 1;
+            match e.kind {
+                EdgeKind::DependsOn => deps.entry(&e.source).or_default().push(&e.target),
+                EdgeKind::Mentions => *mentions.entry(&e.target).or_default() += 1,
+                _ => {}
+            }
+        }
+        let modules: Vec<serde_json::Value> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Module)
+            .map(|n| {
+                let mut d = deps.get(n.id.as_str()).cloned().unwrap_or_default();
+                d.sort_unstable();
+                json!({"id": n.id, "name": n.short, "depends_on": d})
+            })
+            .collect();
+        let mut ranked: Vec<(&str, u64)> = degree.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let top_nodes: Vec<serde_json::Value> = ranked
+            .iter()
+            .take(10)
+            .map(|(id, d)| json!({"id": id, "degree": d}))
+            .collect();
+        let mut themes: Vec<(&str, u64)> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Concept)
+            .filter_map(|n| mentions.get(n.id.as_str()).map(|c| (n.id.as_str(), *c)))
+            .collect();
+        themes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let themes: Vec<serde_json::Value> = themes
+            .iter()
+            .take(10)
+            .map(|(id, c)| json!({"concept": id, "mentions": c}))
+            .collect();
+        json!({"modules": modules, "top_nodes": top_nodes, "themes": themes})
+    }
+
+    fn stored_summary(st: &Store) -> String {
+        st.summary().unwrap().unwrap().0
+    }
+
+    /// AC-067-1 : 200 graphes aléatoires ; après chaque passe, complète ou incrémentale, le
+    /// résumé stocké est celui de l'oracle de la 0.21.0 exécuté sur le graphe écrit.
+    #[test]
+    fn req067_ac1_summary_equals_the_0_21_0_oracle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let (mut full, mut incremental, mut skipped, mut themes, mut deps) = (0, 0, 0, 0, 0);
+        for seed in 0..200u64 {
+            st.reset().unwrap();
+            let mut seq = Seq {
+                g: Lcg(seed * 104729 + 7),
+                known: Default::default(),
+                specs: Default::default(),
+                modules: Default::default(),
+                module_touched: false,
+            };
+            for _ in 0..3 + seq.g.next(6) {
+                seq.step(&mut st);
+            }
+            for round in 0..3 {
+                crate::store::reset_diagnostics();
+                // Cas sans oracle (limite connue de la passe complète, voir AC-066-1).
+                if resolve(&mut st).is_err() {
+                    skipped += 1;
+                    break;
+                }
+                let d = crate::store::diagnostics();
+                full += d.full_passes();
+                incremental += d.incremental_passes();
+                let want = summary_oracle(&st);
+                assert_eq!(
+                    stored_summary(&st),
+                    want.to_string(),
+                    "séquence {seed}, pas {round}"
+                );
+                themes += want["themes"].as_array().unwrap().len();
+                deps += want["modules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| m["depends_on"].as_array().unwrap().len())
+                    .sum::<usize>();
+                for _ in 0..1 + seq.g.next(5) {
+                    seq.step(&mut st);
+                }
+            }
+        }
+        assert!(full > 150, "{full} passes complètes");
+        assert!(incremental > 150, "{incremental} passes incrémentales");
+        assert!(skipped < 10, "{skipped} séquences sans oracle");
+        assert!(themes > 10, "{themes} thèmes comparés");
+        assert!(deps > 100, "{deps} dépendances comparées");
+    }
+
+    /// AC-067-1 : plus de dix nœuds de même degré, lien d'un nœud vers lui-même, concept sans
+    /// mention, module sans dépendance.
+    #[test]
+    fn req067_ac1_ties_self_links_and_unmentioned_concepts() {
+        let mut e = env(&["T.java", "pom.xml"]);
+        let mut nodes = vec![ty("p.T", "T.java")];
+        let mut refs = vec![rf(&tid("p.T"), EdgeKind::Imports, "T", Some("package p;"))];
+        for i in 0..15 {
+            let q = format!("p.U{i:02}");
+            refs.push(rf(&tid(&q), EdgeKind::Imports, "T", Some("package p;")));
+            nodes.push(ty(&q, "T.java"));
+        }
+        e.store.replace_file("T.java", &nodes, &refs).unwrap();
+        build_module(&mut e, "pom.xml", "com.acme:alone", &[]);
+        e.store
+            .apply_enrichments(
+                "m",
+                &[crate::store::EnrichmentWrite {
+                    path: "T.java".into(),
+                    hash: "h".into(),
+                    summaries: vec![],
+                    concepts: vec![concept("Orphelin")],
+                    refs: vec![],
+                }],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        let want = summary_oracle(&e.store);
+        assert_eq!(stored_summary(&e.store), want.to_string());
+        // 16 liens entrants, 1 lien vers soi-même.
+        assert_eq!(want["top_nodes"][0]["degree"], 17);
+        // Passe incrémentale qui suit une écriture.
+        e.store
+            .replace_file(
+                "T.java",
+                &[nodes[0].clone(), ty("p.V", "T.java")],
+                &[rf(&tid("p.V"), EdgeKind::Imports, "T", Some("package p;"))],
+            )
+            .unwrap();
+        crate::store::reset_diagnostics();
+        resolve(&mut e.store).unwrap();
+        assert_eq!(crate::store::diagnostics().incremental_passes(), 1);
+        assert_eq!(
+            stored_summary(&e.store),
+            summary_oracle(&e.store).to_string()
+        );
+    }
+
+    /// AC-067-2 : passe complète sur une base fraîche, aucun lien relu et un seul chargement des
+    /// nœuds.
+    #[test]
+    fn req067_ac2_full_pass_reads_no_edge_and_loads_nodes_once() {
+        let mut e = env(&["T.java", "pom.xml"]);
+        let mut nodes = vec![ty("p.T", "T.java")];
+        let mut refs = Vec::new();
+        for i in 0..12 {
+            let q = format!("p.U{i:02}");
+            refs.push(rf(&tid(&q), EdgeKind::Imports, "T", Some("package p;")));
+            nodes.push(ty(&q, "T.java"));
+        }
+        e.store.replace_file("T.java", &nodes, &refs).unwrap();
+        build_module(&mut e, "pom.xml", "com.acme:m", &["org.x:lib"]);
+        crate::store::reset_diagnostics();
+        resolve(&mut e.store).unwrap();
+        let d = crate::store::diagnostics();
+        assert_eq!(d.full_passes(), 1);
+        assert_eq!(d.edge_rows_read(), 0);
+        // 13 types + 1 module + 1 dépendance dérivée (créée par la passe, non chargée).
+        assert_eq!(d.node_rows_read(), 14);
+        assert_eq!(
+            stored_summary(&e.store),
+            summary_oracle(&e.store).to_string()
+        );
+    }
+
+    /// AC-067-2 : passe incrémentale, les liens relus par le résumé sont ceux des dépendances des
+    /// modules (plus dix au plus pour le classement et une ligne par concept mentionné).
+    #[test]
+    fn req067_ac2_incremental_pass_summary_reads_few_edges() {
+        let mut e = env(&["T.java", "a/pom.xml", "b/pom.xml", "N.java"]);
+        let sec = node_id(NodeKind::Section, "T.java#s");
+        let mut nodes = vec![
+            ty("p.T", "T.java"),
+            plain(NodeKind::Section, "T.java#s", Some("T.java")),
+        ];
+        let mut refs = Vec::new();
+        for i in 0..40 {
+            let q = format!("p.U{i:02}");
+            refs.push(rf(&tid(&q), EdgeKind::Imports, "T", Some("package p;")));
+            nodes.push(ty(&q, "T.java"));
+        }
+        e.store.replace_file("T.java", &nodes, &refs).unwrap();
+        build_module(
+            &mut e,
+            "a/pom.xml",
+            "com.acme:a",
+            &["com.acme:b", "org.x:lib"],
+        );
+        build_module(&mut e, "b/pom.xml", "com.acme:b", &["org.x:lib"]);
+        e.store
+            .apply_enrichments(
+                "m",
+                &[crate::store::EnrichmentWrite {
+                    path: "T.java".into(),
+                    hash: "h".into(),
+                    summaries: vec![],
+                    concepts: vec![concept("Cache")],
+                    refs: vec![rf(&sec, EdgeKind::Mentions, "Cache", None)],
+                }],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(e.store.count_edges().unwrap() > 40);
+        // Un fichier d'un seul nœud sans lien : la passe ne relit que les liens des modules.
+        e.store
+            .replace_file(
+                "N.java",
+                &[plain(NodeKind::Package, "zz", Some("N.java"))],
+                &[],
+            )
+            .unwrap();
+        crate::store::reset_diagnostics();
+        resolve(&mut e.store).unwrap();
+        let d = crate::store::diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (0, 1));
+        // La passe relit les 3 liens `depends_on` stockés des modules (leurs références sont
+        // réévaluées) ; le résumé lit 3 liens de dépendances, 1 concept mentionné et 10 du
+        // classement.
+        assert_eq!(d.edge_rows_read(), 3 + 3 + 1 + 10);
+        assert_eq!(
+            stored_summary(&e.store),
+            summary_oracle(&e.store).to_string()
+        );
     }
 
     fn seed_modules(e: &mut Env) {
@@ -2845,18 +3088,27 @@ import q.R;",
         let d = crate::store::diagnostics();
         assert_eq!((d.full_passes(), d.incremental_passes()), (0, 1));
         assert_eq!(d.refs_reevaluated(), sources);
-        // Le résumé global relit encore tous les liens et tous les nœuds (remplacé en T-149) :
-        // on les retire des compteurs pour ne mesurer que la passe.
-        let edges_read = d.edge_rows_read() - e.store.count_edges().unwrap() as u64;
+        // Le résumé ne relit que les liens `depends_on` des modules (DEC-078) : on les retire des
+        // compteurs pour ne mesurer que la passe.
+        let summary_edges: u64 = e
+            .store
+            .nodes()
+            .unwrap()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Module)
+            .map(|n| e.store.module_dependencies(&n.id).unwrap().len() as u64)
+            .sum();
+        let summary_edges = summary_edges
+            + e.store.top_degrees(10).unwrap().len() as u64
+            + e.store.concept_mentions().unwrap().len() as u64;
+        let edges_read = d.edge_rows_read() - summary_edges;
         assert!(edges_read <= outgoing + contained, "{edges_read} liens lus");
         assert!(
             edges_read * 20 < total_edges,
             "{edges_read} / {total_edges}"
         );
-        assert_eq!(
-            d.node_rows_read() - e.store.count_nodes().unwrap() as u64,
-            nodes + 1
-        );
+        // Un seul chargement des nœuds : celui de la passe.
+        assert_eq!(d.node_rows_read(), nodes + 1);
     }
 
     /// AC-066-2 (b) : un fichier ajouté qui rend 5 références résolubles.

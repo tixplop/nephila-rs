@@ -655,9 +655,8 @@ fn resolution_ms(out: &Output) -> Vec<u64> {
         .collect()
 }
 
-/// AC-066-6 : mesures de départ de la résolution après un fichier modifié (`build` puis `update`).
-/// Sur HEAD (0.21.0), seule l'égalité des empreintes est affirmée ; le rapport des durées (≤ ¼)
-/// est ajouté avec la passe incrémentale.
+/// AC-066-6 : résolution après un fichier modifié (`build` puis `update`) : export identique à
+/// celui d'un `build` neuf, durée de la résolution de l'`update` au plus le quart de celle du `build`.
 #[test]
 #[ignore]
 fn perf_req066_ac6_resolution_incrementale() {
@@ -707,6 +706,12 @@ fn perf_req066_ac6_resolution_incrementale() {
         eprintln!(
             "MESURE {name} : résolution build = {} ms, update = {} ms",
             build_ms[0], update_ms[0]
+        );
+        assert!(
+            update_ms[0] * 4 <= build_ms[0],
+            "{name} : résolution de l'update ({} ms) > le quart de celle du build ({} ms)",
+            update_ms[0],
+            build_ms[0]
         );
         let inc = normalized_hash(&f);
         let copy = root.join("fresh");
