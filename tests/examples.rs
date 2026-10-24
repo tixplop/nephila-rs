@@ -728,7 +728,7 @@ fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
     assert!(line.contains("0.17"));
     let at = |needle: &str| readme.find(needle).unwrap();
     assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.20.0", "git tag v0.20.0 && git push origin v0.20.0"] {
+    for needle in ["V=v0.21.0", "git tag v0.21.0 && git push origin v0.21.0"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
     assert!(!readme.contains("0.17.6"));
@@ -936,8 +936,8 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
         "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
         "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.20.0 ",
-        "git tag v0.20.0 && git push origin v0.20.0",
+        "V=v0.21.0 ",
+        "git tag v0.21.0 && git push origin v0.21.0",
     ] {
         assert!(readme.contains(expected), "absent : {expected}");
     }
@@ -1082,4 +1082,24 @@ fn REQ058_AC15_readme_textes_de_la_reponse_tronquee_revises() {
     ] {
         assert!(readme.lines().any(|l| l == expected), "absent : {expected}");
     }
+}
+
+#[test]
+fn REQ065_AC1_readme_0_21_stockage_allege() {
+    let readme = repo_file("README.md");
+    let row = "| 0.21 | Stockage SQLite allégé : contexte d'imports stocké une fois par fichier, index inutiles retirés, cache SQLite agrandi à chaque ouverture en écriture, écritures regroupées, build neuf sans recalcul répété des nœuds. Même graphe qu'en 0.20 ; le schéma 7 est migré sur place. |";
+    let bullet = "- **Vers 0.21** : le graphe passe au schéma 7 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.20 tel quel. La place libérée n'est rendue au disque que par `sqlite3 .nephila/graph.db 'VACUUM'`. Un binaire 0.20 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).";
+    let lines: Vec<&str> = readme.lines().collect();
+    assert_eq!(lines.iter().filter(|l| **l == row).count(), 1);
+    let i21 = lines.iter().position(|l| *l == row).unwrap();
+    let i20 = lines
+        .iter()
+        .position(|l| l.starts_with("| 0.20 |"))
+        .expect("ligne 0.20 absente");
+    assert_eq!(i21 + 1, i20);
+    let sec = readme_section(&readme, "## Mise à niveau");
+    let b = sec.find(bullet).expect("puce Vers 0.21 absente");
+    let v19 = sec.find("- **Vers 0.19**").expect("puce Vers 0.19");
+    assert!(b < v19);
+    assert_eq!(sec[b..v19].trim_end(), bullet);
 }
