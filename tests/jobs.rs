@@ -329,3 +329,22 @@ fn req071_ac10_jobs_n_est_pas_une_cle_de_configuration() {
     let o = e.run(&["build", "--no-llm"]);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
 }
+
+#[test]
+fn req071_ac9_deux_fichiers_non_utf8_stderr_identique() {
+    let e = Env::new(1);
+    fs::write(e.repo.join("z.md"), [0xff, 0xfe, b'z']).unwrap();
+    fs::write(e.repo.join("a.md"), [0xff, 0xfe, b'a']).unwrap();
+    let a = e.run(&["build", "--jobs", "1"]);
+    e.reset();
+    let b = e.run(&["build", "--jobs", "8"]);
+    assert_eq!(a.status.code(), b.status.code());
+    assert_eq!(a.stdout, b.stdout);
+    assert_eq!(a.stderr, b.stderr);
+    let err = text(&a.stderr);
+    let (pa, pz) = (
+        err.find("a.md ignoré : fichier non UTF-8"),
+        err.find("z.md ignoré : fichier non UTF-8"),
+    );
+    assert!(pa.is_some() && pz.is_some() && pa < pz, "{err}");
+}

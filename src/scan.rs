@@ -371,6 +371,66 @@ pub fn read_utf8(abs: &Path, rel: &str) -> std::result::Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
+/// Fils d'empreintes lancés (diagnostic des tests, AC-072-2).
+#[cfg(test)]
+pub(crate) static HASH_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Lit et empreinte `files[i]` pour chaque `i` de `todo`, par min(`jobs`, n) fils qui prennent
+/// leurs indices dans une file partagée ; résultat à la position de `todo`. Avec `jobs` = 1 ou un
+/// seul fichier, lecture dans le fil appelant.
+fn hash_files(
+    files: &[WalkedFile],
+    todo: &[usize],
+    jobs: usize,
+) -> Vec<std::result::Result<String, String>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut out: Vec<(usize, std::result::Result<String, String>)> = Vec::new();
+        loop {
+            let k = next.fetch_add(1, Ordering::SeqCst);
+            let Some(&i) = todo.get(k) else { break };
+            let f = &files[i];
+            out.push((
+                k,
+                read_utf8(&f.abs, &f.path).map(|b| blake3::hash(&b).to_hex().to_string()),
+            ));
+        }
+        out
+    };
+    let workers = jobs.min(todo.len());
+    let mut done: Vec<(usize, std::result::Result<String, String>)> = Vec::new();
+    if workers > 1 {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..workers {
+                match std::thread::Builder::new()
+                    .name("nephila-hash".into())
+                    .spawn_scoped(scope, work)
+                {
+                    Ok(h) => {
+                        #[cfg(test)]
+                        HASH_THREADS.fetch_add(1, Ordering::SeqCst);
+                        handles.push(h);
+                    }
+                    Err(_) => break,
+                }
+            }
+            for h in handles {
+                match h.join() {
+                    Ok(v) => done.extend(v),
+                    Err(p) => std::panic::resume_unwind(p),
+                }
+            }
+        });
+    }
+    // Reste éventuel (jobs = 1, un seul fichier, ou création de fil impossible).
+    done.extend(work());
+    done.sort_by_key(|(k, _)| *k);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
 /// Parcourt `root`. `known` : enregistrements de la table `files`, dont l'empreinte est
 /// réutilisée quand taille et mtime n'ont pas changé. `matcher` : filtres de REQ-037, appliqués
 /// après les exclusions de REQ-004 et avant toute lecture.
@@ -397,43 +457,55 @@ pub fn scan(
         warn(&msg);
         res.warnings.push(msg);
     }
-    for WalkedFile {
-        path: rel,
-        abs,
-        size,
-        mtime,
-    } in walked.files
-    {
-        let (hash, rehashed) = match known.get(rel.as_str()) {
+    // Fichiers dont l'empreinte n'est pas réutilisable (règle taille, date, « racy-clean »).
+    let reusable = |rel: &str, size: u64, mtime: i64| -> Option<String> {
+        match known.get(rel) {
             Some(k)
                 if k.size == size
                     && k.mtime == mtime
                     && !k.hash.is_empty()
                     && k.recorded_at.saturating_sub(k.mtime) >= RACY_WINDOW_MS =>
             {
-                (k.hash.clone(), false)
+                Some(k.hash.clone())
             }
-            _ => {
-                let bytes = match read_utf8(&abs, &rel) {
-                    Ok(b) => b,
-                    Err(msg) => {
-                        warn(&msg);
-                        res.warnings.push(msg);
-                        continue;
-                    }
-                };
-                (blake3::hash(&bytes).to_hex().to_string(), true)
-            }
+            _ => None,
+        }
+    };
+    let mut hashes: Vec<Option<String>> = walked
+        .files
+        .iter()
+        .map(|f| reusable(&f.path, f.size, f.mtime))
+        .collect();
+    let to_read: Vec<usize> = (0..hashes.len()).filter(|&i| hashes[i].is_none()).collect();
+    let read = hash_files(&walked.files, &to_read, jobs);
+    let mut fresh: HashMap<usize, std::result::Result<String, String>> =
+        to_read.iter().copied().zip(read).collect();
+    let mut read_warnings: Vec<(String, String)> = Vec::new();
+    for (i, f) in walked.files.into_iter().enumerate() {
+        let (hash, rehashed) = match hashes[i].take() {
+            Some(h) => (h, false),
+            None => match fresh.remove(&i).expect("résultat de lecture") {
+                Ok(h) => (h, true),
+                Err(msg) => {
+                    read_warnings.push((f.path, msg));
+                    continue;
+                }
+            },
         };
         res.files.push(ScannedFile {
-            path: rel,
+            path: f.path,
             hash,
-            size,
-            mtime,
+            size: f.size,
+            mtime: f.mtime,
             module: None,
-            abs,
+            abs: f.abs,
             rehashed,
         });
+    }
+    read_warnings.sort();
+    for (_, msg) in read_warnings {
+        warn(&msg);
+        res.warnings.push(msg);
     }
     res.files.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -983,5 +1055,115 @@ mod tests {
             }
             unlock(&locked);
         }
+    }
+
+    #[test]
+    fn req072_ac1_scan_with_known_equals_sequential_oracle_for_any_jobs() {
+        use crate::model::FileState;
+        for seed in 0..100u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(&root).unwrap();
+            let (filters, locked) = gen_tree(seed, &root);
+            let matcher = filters.compile(&root).unwrap();
+            let base = oracle_scan(&root, &[], &matcher).unwrap();
+            // Variantes : réutilisable, taille périmée, date périmée, « racy ».
+            let known: Vec<FileRecord> = base
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let (size, mtime, recorded_at) = match i % 4 {
+                        0 => (f.size, f.mtime, f.mtime + 10_000),
+                        1 => (f.size + 1, f.mtime, f.mtime + 10_000),
+                        2 => (f.size, f.mtime - 5_000, f.mtime + 10_000),
+                        _ => (f.size, f.mtime, f.mtime),
+                    };
+                    FileRecord {
+                        path: f.path.clone(),
+                        hash: format!("faux-{i}"),
+                        size,
+                        mtime,
+                        recorded_at,
+                        state: FileState::Indexed,
+                    }
+                })
+                .collect();
+            let want = oracle_scan(&root, &known, &matcher).unwrap();
+            for jobs in [1, 2, 8] {
+                let got = scan(&root, &known, &matcher, jobs).unwrap();
+                assert_eq!(got.files, want.files, "seed {seed}, jobs {jobs}");
+                assert_eq!(got.gradle_settings, want.gradle_settings, "seed {seed}");
+                assert_eq!(got.excluded, want.excluded, "seed {seed}");
+                assert_eq!(
+                    sorted(got.warnings.clone()),
+                    sorted(want.warnings.clone()),
+                    "seed {seed}, jobs {jobs}"
+                );
+                // Groupe des lectures trié par chemin puis texte.
+                let reads: Vec<&String> = got
+                    .warnings
+                    .iter()
+                    .filter(|w| w.contains("lecture impossible") || w.contains("non UTF-8"))
+                    .collect();
+                let mut again = reads.clone();
+                again.sort();
+                assert_eq!(reads, again, "seed {seed}, jobs {jobs}");
+            }
+            unlock(&locked);
+        }
+    }
+
+    /// 40 fichiers dont `reusable` à empreinte réutilisable ; fils d'empreintes lancés.
+    fn hash_threads_for(reusable: usize, jobs: usize) -> usize {
+        use crate::model::FileState;
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..40 {
+            put(&root.join(format!("f{i:02}.md")), b"contenu");
+        }
+        let base = oracle_scan(root, &[], &Matcher::none()).unwrap();
+        let known: Vec<FileRecord> = base
+            .files
+            .iter()
+            .take(reusable)
+            .map(|f| FileRecord {
+                path: f.path.clone(),
+                hash: f.hash.clone(),
+                size: f.size,
+                mtime: f.mtime,
+                recorded_at: f.mtime + 10_000,
+                state: FileState::Indexed,
+            })
+            .collect();
+        HASH_THREADS.store(0, Ordering::SeqCst);
+        let got = scan(root, &known, &Matcher::none(), jobs).unwrap();
+        assert_eq!(got.files.len(), 40);
+        assert_eq!(
+            got.files.iter().filter(|f| f.rehashed).count(),
+            40 - reusable
+        );
+        HASH_THREADS.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn req072_ac2_hash_threads_are_min_jobs_and_files_to_read() {
+        assert_eq!(hash_threads_for(0, 3), 3);
+    }
+
+    #[test]
+    fn req072_ac2_two_files_to_read_two_threads() {
+        assert_eq!(hash_threads_for(38, 3), 2);
+    }
+
+    #[test]
+    fn req072_ac2_jobs_one_spawns_no_thread() {
+        assert_eq!(hash_threads_for(0, 1), 0);
+    }
+
+    #[test]
+    fn req072_ac2_single_file_to_read_spawns_no_thread() {
+        assert_eq!(hash_threads_for(39, 8), 0);
     }
 }

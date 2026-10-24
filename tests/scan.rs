@@ -408,3 +408,28 @@ fn req004_ac7_node_modules_et_verrous_exclus() {
         vec!["web/other-lock.json", "web/package.json"]
     );
 }
+
+#[test]
+fn req072_ac3_non_utf8_warnings_sorted_over_20_builds() {
+    use assert_cmd::cargo::cargo_bin;
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    put(r, "z.md", &[0xff, 0xfe, b'z']);
+    put(r, "a.md", &[0xff, 0xfe, b'a']);
+    put(r, "ok.md", b"# ok\n");
+    for run in 0..20 {
+        let _ = fs::remove_dir_all(r.join(".nephila"));
+        let out = std::process::Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(r)
+            .args(["build", "--no-llm"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "run {run}");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        let a = err.find("a.md ignoré : fichier non UTF-8");
+        let z = err.find("z.md ignoré : fichier non UTF-8");
+        assert!(a.is_some() && z.is_some(), "run {run}: {err}");
+        assert!(a < z, "run {run}: {err}");
+    }
+}
