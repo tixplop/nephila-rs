@@ -112,3 +112,52 @@ fn req077_ac3_aucune_deduplication_par_liste() {
     found.sort();
     assert!(found.is_empty(), "déduplications par liste : {found:?}");
 }
+
+#[test]
+fn req081_ac1_profil_release() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let text = std::fs::read_to_string(path).unwrap();
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let profile = table["profile"].as_table().expect("table profile");
+    let release = profile["release"].as_table().expect("profile.release");
+    assert_eq!(release.get("lto").and_then(|v| v.as_str()), Some("fat"));
+    assert_eq!(
+        release.get("codegen-units").and_then(|v| v.as_integer()),
+        Some(1)
+    );
+    assert_eq!(release.get("panic").and_then(|v| v.as_str()), Some("abort"));
+    assert!(!profile.contains_key("dev"), "table profile.dev interdite");
+    assert!(
+        !profile.contains_key("test"),
+        "table profile.test interdite"
+    );
+}
+
+fn cherche_catch_unwind(dir: &Path, root: &Path, found: &mut Vec<String>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            cherche_catch_unwind(&p, root, found);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&p).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                if line.contains("catch_unwind") {
+                    let rel = p.strip_prefix(root).unwrap().display();
+                    found.push(format!("{rel}:{}", i + 1));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn req081_ac2_pas_de_catch_unwind() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found = Vec::new();
+    cherche_catch_unwind(&root.join("src"), root, &mut found);
+    assert!(found.is_empty(), "catch_unwind : {found:?}");
+}
