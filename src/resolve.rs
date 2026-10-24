@@ -2865,15 +2865,22 @@ import q.R;",
         Store::open_or_create(oracle).unwrap()
     }
 
-    /// AC-066-1 : 300 séquences aléatoires, après chaque passe le graphe est celui de la passe
-    /// complète sur une copie du même graphe.
-    #[test]
-    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy() {
+    /// Compteurs d'une série de séquences d'AC-066-1.
+    struct Ac066_1Counts {
+        incremental: usize,
+        full: usize,
+        skipped: usize,
+        edges_seen: usize,
+    }
+
+    /// AC-066-1 (DEC-087) : pour chaque graine de `seeds`, séquence aléatoire dont chaque passe
+    /// donne le graphe de la passe complète sur une copie du même graphe.
+    fn ac066_1_run(seeds: std::ops::Range<u64>) -> Ac066_1Counts {
         let main_dir = tempfile::tempdir().unwrap();
         let oracle_dir = tempfile::tempdir().unwrap();
         let (mut incremental, mut full, mut skipped, mut edges_seen) = (0, 0, 0, 0);
         let mut st = Store::open_or_create(main_dir.path()).unwrap();
-        for seed in 0..300u64 {
+        for seed in seeds {
             st.reset().unwrap();
             let mut seq = Seq {
                 g: Lcg(seed * 7919 + 13),
@@ -2930,10 +2937,54 @@ import q.R;",
                 edges_seen += got.1.len();
             }
         }
-        assert!(incremental > 500, "{incremental} passes incrémentales");
-        assert!(full > 15, "{full} passes complètes");
-        assert!(skipped < 25, "{skipped} pas sans oracle");
-        assert!(edges_seen > 3000, "{edges_seen} liens comparés");
+        Ac066_1Counts {
+            incremental,
+            full,
+            skipped,
+            edges_seen,
+        }
+    }
+
+    const AC066_1_SEQUENCES: u64 = 300;
+    const AC066_1_PARTS: u64 = 4;
+
+    /// AC-066-1 (DEC-087) : le quart `k` (de 1 à 4) des 300 séquences, soit 75 séquences ; les
+    /// quatre quarts couvrent 0..300 sans recouvrement ni trou.
+    fn ac066_1_part(k: u64) {
+        let size = AC066_1_SEQUENCES / AC066_1_PARTS;
+        let c = ac066_1_run((k - 1) * size..k * size);
+        assert!(
+            c.incremental > 125,
+            "quart {k} : {} passes incrémentales",
+            c.incremental
+        );
+        assert!(c.full > 3, "quart {k} : {} passes complètes", c.full);
+        assert!(c.skipped < 7, "quart {k} : {} pas sans oracle", c.skipped);
+        assert!(
+            c.edges_seen > 750,
+            "quart {k} : {} liens comparés",
+            c.edges_seen
+        );
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_1_of_4() {
+        ac066_1_part(1);
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_2_of_4() {
+        ac066_1_part(2);
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_3_of_4() {
+        ac066_1_part(3);
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_4_of_4() {
+        ac066_1_part(4);
     }
 
     /// Comparaison d'un graphe réel et d'une copie passée par la passe complète.
