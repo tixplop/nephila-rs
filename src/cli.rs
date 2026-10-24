@@ -93,6 +93,7 @@ const FILTERS_HELP: &str =
 Filtres durables (lus aussi par status et query) : fichier .nephila.toml à la racine du dépôt
   exclude = [\"docs/legacy/\", \"*.min.js\"]
   exclude_types = [\"json\"]
+Exclus par défaut, à tout niveau : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ; pour les analyser : exclude_defaults = false dans le même fichier
 Réglages LLM du dépôt, dans le même fichier (prioritaires sur la configuration personnelle) :
   model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries
 Exemple : nephila build --exclude '*.min.js' --exclude-type json,yaml";
@@ -134,6 +135,7 @@ impl IndexOpts {
         Filters {
             patterns: self.exclude.clone(),
             types: self.exclude_type.iter().flatten().copied().collect(),
+            ..Filters::default()
         }
     }
 }

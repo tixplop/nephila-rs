@@ -149,6 +149,8 @@ pub fn compile_pattern(root: &Path, pattern: &str) -> std::result::Result<Gitign
 pub struct Filters {
     pub patterns: Vec<String>,
     pub types: BTreeSet<FileType>,
+    /// `exclude_defaults = false` : les exclusions par défaut (REQ-079) sont désactivées.
+    pub defaults_off: bool,
 }
 
 impl Filters {
@@ -156,6 +158,7 @@ impl Filters {
     pub fn merge(mut self, other: Filters) -> Filters {
         self.patterns.extend(other.patterns);
         self.types.extend(other.types);
+        self.defaults_off |= other.defaults_off;
         self
     }
 
@@ -173,6 +176,7 @@ impl Filters {
             rules,
             types: self.types.clone(),
             patterns: self.patterns.len(),
+            defaults_off: self.defaults_off,
         })
     }
 }
@@ -183,12 +187,18 @@ pub struct Matcher {
     rules: Vec<Gitignore>,
     types: BTreeSet<FileType>,
     patterns: usize,
+    defaults_off: bool,
 }
 
 impl Matcher {
-    /// Aucun filtre.
+    /// Aucun filtre ; les exclusions par défaut restent actives.
     pub fn none() -> Matcher {
         Matcher::default()
+    }
+
+    /// Les exclusions par défaut de REQ-079 (dossiers, `*.min.js`) s'appliquent-elles ?
+    pub fn default_excludes(&self) -> bool {
+        !self.defaults_off
     }
 
     pub fn is_active(&self) -> bool {
@@ -240,11 +250,26 @@ impl Matcher {
 }
 
 /// Contenu validé du fichier de projet `<dépôt>/.nephila.toml` : filtres et réglages LLM.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectFile {
     pub filters: Filters,
     pub settings: ProjectSettings,
+    /// Clé `exclude_defaults` (défaut `true`).
+    pub exclude_defaults: bool,
 }
+
+impl Default for ProjectFile {
+    fn default() -> Self {
+        ProjectFile {
+            filters: Filters::default(),
+            settings: ProjectSettings::default(),
+            exclude_defaults: true,
+        }
+    }
+}
+
+/// Clés de filtre et d'exclusion du fichier de projet, dans l'ordre de la liste d'E-2.
+const FILTER_KEYS: [&str; 3] = ["exclude", "exclude_types", "exclude_defaults"];
 
 const EXAMPLES: [(&str, &str); 2] = [
     ("exclude", "exclude = [\"docs/legacy/\"]"),
@@ -283,8 +308,8 @@ impl ProjectFile {
                     "{shown} : clé `{key}` permise seulement dans la configuration personnelle ({at})"
                 )));
             }
-            if key != "exclude" && key != "exclude_types" && !PROJECT_SETTINGS.contains(&key) {
-                let allowed = ["exclude", "exclude_types"]
+            if !FILTER_KEYS.contains(&key) && !PROJECT_SETTINGS.contains(&key) {
+                let allowed = FILTER_KEYS
                     .into_iter()
                     .chain(PROJECT_SETTINGS)
                     .collect::<Vec<_>>()
@@ -322,8 +347,22 @@ impl ProjectFile {
                 }
             }
         }
+        let exclude_defaults = match table.get("exclude_defaults") {
+            None => true,
+            Some(toml::Value::Boolean(b)) => *b,
+            Some(_) => {
+                return Err(Error::Message(format!(
+                "{shown} : clé `exclude_defaults` : booléen attendu, ex. exclude_defaults = false"
+            )))
+            }
+        };
+        filters.defaults_off = !exclude_defaults;
         let settings = ProjectSettings::from_table(&table, &shown)?;
-        Ok(ProjectFile { filters, settings })
+        Ok(ProjectFile {
+            filters,
+            settings,
+            exclude_defaults,
+        })
     }
 }
 
@@ -349,6 +388,7 @@ mod tests {
         Filters {
             patterns: patterns.iter().map(|s| s.to_string()).collect(),
             types: types.iter().copied().collect(),
+            defaults_off: false,
         }
         .compile(Path::new("/r"))
         .unwrap()
@@ -440,6 +480,7 @@ mod tests {
         let e = Filters {
             patterns: vec!["a[b".into()],
             types: BTreeSet::new(),
+            defaults_off: false,
         }
         .compile(Path::new("/r"))
         .unwrap_err();

@@ -386,7 +386,7 @@ fn req037_ac18_aide_et_cle_proche_inconnue() {
     assert_eq!(
         text(&o.stderr),
         format!(
-            "erreur: {} : clé inconnue `modele` (clés permises : exclude, exclude_types, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries)\n",
+            "erreur: {} : clé inconnue `modele` (clés permises : exclude, exclude_types, exclude_defaults, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries)\n",
             e.shown()
         )
     );

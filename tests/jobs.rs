@@ -305,7 +305,7 @@ fn req071_ac10_jobs_n_est_pas_une_cle_de_configuration() {
     let toml = e.repo.join(".nephila.toml");
     fs::write(&toml, "jobs = 4\n").unwrap();
     let want = format!(
-        "erreur: {} : clé inconnue `jobs` (clés permises : exclude, exclude_types, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries)\n",
+        "erreur: {} : clé inconnue `jobs` (clés permises : exclude, exclude_types, exclude_defaults, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries)\n",
         toml.display()
     );
     for args in [

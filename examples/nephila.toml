@@ -61,6 +61,15 @@
 # --exclude-type <TYPE>[,<TYPE>...].
 # exclude_types = ["json"]
 
+# Exclusions par défaut : les dossiers dist/, out/, coverage/, .next/, .nuxt/, vendor/ et .idea/,
+# à tout niveau du dépôt, et les fichiers *.min.js ne sont pas analysés. Booléen ; défaut : true.
+# false : ces chemins sont analysés comme les autres fichiers (types pris en charge, .gitignore,
+# exclude et exclude_types) ; utile quand l'un de ces dossiers contient votre code. Pour en
+# garder certains exclus, ajoutez-les à exclude. Ce ne sont pas des filtres : ils ne comptent
+# pas dans « fichiers exclus par les filtres », et !motif ne les réinclut pas. Pas d'option de
+# ligne de commande : la clé vaut pour toutes les commandes, status compris.
+# exclude_defaults = false
+
 # --- Réglages LLM du dépôt ---
 # Ils remplacent, clé par clé, la configuration personnelle (NEPHILA_CONFIG, sinon ~/.config/nephila/config.toml).
 # Elle seule active le LLM : sans elle, ou avec --no-llm, ces réglages n'ont aucun effet et rien n'est affiché.

@@ -21,6 +21,10 @@ const EXCLUDED_DIRS: [&str; 6] = [
     ".nephila",
     "node_modules",
 ];
+/// Dossiers exclus par défaut, à tout niveau, nom exact (REQ-079, DEC-091).
+pub const DEFAULT_EXCLUDED_DIRS: [&str; 7] = [
+    "dist", "out", "coverage", ".next", ".nuxt", "vendor", ".idea",
+];
 const BUILD_FILES: [&str; 7] = [
     "package.json",
     "pom.xml",
@@ -330,7 +334,10 @@ fn walk_entry(
         return;
     }
     let name = entry.file_name().to_string_lossy();
-    if !is_supported(&name) || name == export_name {
+    if !is_supported(&name)
+        || name == export_name
+        || (matcher.default_excludes() && name.ends_with(".min.js"))
+    {
         return;
     }
     let real_rel = match entry.path().strip_prefix(root) {
@@ -420,6 +427,7 @@ pub fn walk(root: &Path, matcher: &Matcher, jobs: usize) -> Result<WalkResult> {
     }
     // L'export par défaut (`<slug>.json`) peut être écrit dans le dépôt : jamais indexé (AC-004-5).
     let export_name = format!("{}.json", crate::export::slug(root));
+    let defaults = matcher.default_excludes();
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
@@ -429,11 +437,13 @@ pub fn walk(root: &Path, matcher: &Matcher, jobs: usize) -> Result<WalkResult> {
         .require_git(false)
         .follow_links(false)
         .threads(jobs.max(1))
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
             let is_dir = e.file_type().is_some_and(|t| t.is_dir());
-            !(is_dir
-                && e.depth() > 0
-                && EXCLUDED_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+            !(is_dir && e.depth() > 0 && {
+                let name = e.file_name().to_string_lossy();
+                EXCLUDED_DIRS.contains(&name.as_ref())
+                    || (defaults && DEFAULT_EXCLUDED_DIRS.contains(&name.as_ref()))
+            })
         })
         .build_parallel();
 
@@ -782,6 +792,39 @@ mod tests {
         let res = scan(dir.path(), &[], &Matcher::none(), 1).unwrap();
         assert_eq!(res.gradle_settings.get(""), Some(&Some("app".to_string())));
         assert_eq!(res.gradle_settings.get("t"), Some(&None));
+    }
+
+    // ---- AC-079-5 : exclusions par défaut non parcourues ----
+
+    #[cfg(unix)]
+    #[test]
+    fn req079_ac5_dossiers_exclus_par_defaut_non_parcourus() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        put(&root.join("A.java"), b"class A {}\n");
+        let locked = root.join("sub/vendor");
+        put(&locked.join("V.java"), b"class V {}\n");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let on = walk(root, &Matcher::none(), 2).unwrap();
+        let off_matcher = crate::filter::Filters {
+            defaults_off: true,
+            ..Default::default()
+        }
+        .compile(root)
+        .unwrap();
+        let off = walk(root, &off_matcher, 2).unwrap();
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+        assert!(on.warnings.is_empty(), "{:?}", on.warnings);
+        assert_eq!(on.excluded, 0);
+        let paths: Vec<_> = on.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["A.java"]);
+        if unreadable {
+            assert!(!off.warnings.is_empty(), "avertissement attendu");
+        } else {
+            assert!(off.files.iter().any(|f| f.path == "sub/vendor/V.java"));
+        }
     }
 
     // ---- AC-072-1 : oracles (0.22.0, HEAD avant T-154) et générateur d'arbres à graine fixe ----

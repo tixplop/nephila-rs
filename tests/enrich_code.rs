@@ -271,7 +271,7 @@ fn REQ050_AC11_nephila_toml_erreur_e2_exacte() {
         .unwrap();
     assert_eq!(
         stderr(&o),
-        "erreur: ./.nephila.toml : clé inconnue `enrich_code` (clés permises : exclude, exclude_types, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries)\n"
+        "erreur: ./.nephila.toml : clé inconnue `enrich_code` (clés permises : exclude, exclude_types, exclude_defaults, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries)\n"
     );
 }
 
