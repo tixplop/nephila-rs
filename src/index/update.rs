@@ -504,4 +504,168 @@ mod tests {
         }));
         assert_same_as_fresh_build(&repo, dir.path(), "pom modifié");
     }
+
+    /// Dépôt `maven2` et fixtures du mock : (dépôt, dossier du mock).
+    fn maven2_with_mock(dir: &Path) -> (PathBuf, PathBuf) {
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let repo = dir.join("repo");
+        let mock = dir.join("mock");
+        copy_dir(&fx.join("maven2"), &repo);
+        copy_dir(&fx.join("mock"), &mock);
+        (repo, mock)
+    }
+
+    fn mock_llm(mock: &Path) -> MockLlm {
+        MockLlm::new(MockOptions {
+            dir: Some(mock.to_path_buf()),
+            ..MockOptions::default()
+        })
+    }
+
+    fn db(repo: &Path) -> rusqlite::Connection {
+        rusqlite::Connection::open(db_path(repo)).unwrap()
+    }
+
+    /// Identifiants des références comptées non résolues.
+    fn unresolved_ids(repo: &Path) -> Vec<i64> {
+        let c = db(repo);
+        let mut st = c
+            .prepare("SELECT id FROM refs WHERE unresolved = 1 ORDER BY id")
+            .unwrap();
+        let rows = st.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// Le graphe de `repo` est celui d'une passe complète sur une copie de ce même graphe.
+    fn assert_same_as_full_pass(repo: &Path, dir: &Path, what: &str) {
+        let copy = dir.join("full");
+        let _ = std::fs::remove_dir_all(&copy);
+        copy_dir(repo, &copy);
+        db(&copy)
+            .execute(
+                "UPDATE meta SET value = 'à résoudre' WHERE key = 'resolution'",
+                [],
+            )
+            .unwrap();
+        reset_diagnostics();
+        {
+            let mut store = Store::open_existing(&copy).unwrap();
+            crate::resolve::resolve(&mut store).unwrap();
+        }
+        assert_eq!(diagnostics().full_passes(), 1, "{what} : passe de contrôle");
+        let (a, b) = (
+            Store::open_readonly(repo).unwrap(),
+            Store::open_readonly(&copy).unwrap(),
+        );
+        assert_eq!(a.nodes().unwrap(), b.nodes().unwrap(), "{what} : nœuds");
+        assert_eq!(a.edges().unwrap(), b.edges().unwrap(), "{what} : liens");
+        assert_eq!(
+            unresolved_ids(repo),
+            unresolved_ids(&copy),
+            "{what} : non résolues"
+        );
+        assert_eq!(
+            a.summary().unwrap().unwrap().0,
+            b.summary().unwrap().unwrap().0,
+            "{what} : résumé"
+        );
+    }
+
+    /// AC-068-1 : `build` avec le mock : une passe complète, une incrémentale, bornée.
+    #[test]
+    fn req068_ac1_build_with_llm_runs_one_full_and_one_incremental_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, mock) = maven2_with_mock(dir.path());
+        let llm = mock_llm(&mock);
+        let lock = RepoLock::acquire(&repo).unwrap();
+        reset_diagnostics();
+        build::build(
+            &repo,
+            &IndexOptions::default(),
+            Some(&llm),
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap();
+        let d = diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (1, 1));
+
+        let c = db(&repo);
+        let count =
+            |sql: &str| -> usize { c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap() as usize };
+        let parse_refs = count("SELECT count(*) FROM refs WHERE origin = 'parse'");
+        let llm_refs = count("SELECT count(*) FROM refs WHERE origin = 'llm'");
+        assert!(llm_refs > 0, "le mock doit écrire des références");
+        let total = count("SELECT count(*) FROM refs");
+        // Clés des nœuds `concept` et `dependency` du graphe final (DEC-082).
+        let store = crate::store::Store::open_readonly(&repo).unwrap();
+        let keys: Vec<String> = store
+            .nodes()
+            .unwrap()
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.kind,
+                    crate::model::NodeKind::Concept | crate::model::NodeKind::Dependency
+                )
+            })
+            .map(|n| crate::resolve::name_keys(&n.qualified).0)
+            .collect();
+        drop(store);
+        let marks = vec!["?"; keys.len()].join(",");
+        let sql = format!(
+            "SELECT count(*) FROM refs WHERE source IN (SELECT source FROM refs WHERE file IN \
+             (SELECT file FROM refs WHERE origin = 'llm') OR target_key IN ({marks}) \
+             OR target_head IN ({marks}))"
+        );
+        let params: Vec<&String> = keys.iter().chain(keys.iter()).collect();
+        let expected = c
+            .query_row(&sql, rusqlite::params_from_iter(params), |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap() as usize;
+        // La première passe relit exactement les références de la phase structure.
+        let second = d.refs_reevaluated() as usize - parse_refs;
+        assert_eq!(
+            second, expected,
+            "références réévaluées par la seconde passe"
+        );
+        assert!(second < total, "{second} >= {total}");
+        drop(c);
+        assert_same_as_full_pass(&repo, dir.path(), "build avec le mock");
+    }
+
+    /// AC-068-2 : `update` après modification d'un document : deux passes incrémentales.
+    #[test]
+    fn req068_ac2_update_with_llm_runs_two_incremental_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, mock) = maven2_with_mock(dir.path());
+        let llm = mock_llm(&mock);
+        let lock = RepoLock::acquire(&repo).unwrap();
+        build::build(
+            &repo,
+            &IndexOptions::default(),
+            Some(&llm),
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap();
+        let guide = repo.join("docs/guide.md");
+        let mut text = std::fs::read_to_string(&guide).unwrap();
+        text.push_str("\nUn paragraphe de plus.\n");
+        std::fs::write(&guide, text).unwrap();
+        reset_diagnostics();
+        update(
+            &repo,
+            &IndexOptions::default(),
+            Some(&llm),
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap()
+        .expect("le document a changé");
+        let d = diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (0, 2));
+        assert_same_as_full_pass(&repo, dir.path(), "update avec le mock");
+    }
 }

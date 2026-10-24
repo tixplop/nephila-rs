@@ -975,3 +975,177 @@ fn req069_ac6_failed_migration_leaves_the_schema_7_graph_untouched() {
     assert_eq!(dump(master, 4), master_before);
     assert_eq!(dump(refs, 6), refs_before);
 }
+
+/// Commande de l'`Env` avec des variables d'environnement du mock en plus (les autres, retirées).
+fn run_env(env: &Env, repo: &Path, args: &[&str], vars: &[(&str, &str)]) -> std::process::Output {
+    let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"));
+    c.arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("NEPHILA_CONFIG", &env.config)
+        .env_remove("NEPHILA_MOCK_LOG")
+        .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+        .env_remove("NEPHILA_MOCK_DELAY_MS")
+        .env_remove("NEPHILA_MOCK_INVALID_KEY");
+    match &env.mock {
+        Some(m) => c.env("NEPHILA_MOCK_DIR", m),
+        None => c.env_remove("NEPHILA_MOCK_DIR"),
+    };
+    c.envs(vars.iter().copied());
+    c.output().unwrap()
+}
+
+/// Nombre de lignes `résolution:` de la sortie d'erreur.
+fn resolution_lines(out: &std::process::Output) -> usize {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.contains("résolution:"))
+        .count()
+}
+
+/// Liens (`genre source -> cible`) de l'export JSON.
+fn edge_set(raw: &str) -> std::collections::BTreeSet<String> {
+    let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
+    doc["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| format!("{} {} -> {}", e["kind"], e["source"], e["target"]))
+        .collect()
+}
+
+fn export_raw(env: &Env, repo: &Path, ctx: &str) -> String {
+    ok(
+        env,
+        repo,
+        ctx,
+        &["export", "--format", "json", "--output", "-"],
+    )
+}
+
+/// AC-068-3 : nombre de lignes `résolution:` selon la commande.
+#[test]
+fn req068_ac3_resolution_trace_lines() {
+    let env = Env::new("maven2", Some("mock"));
+    let repo = env.repo();
+    let out = run_env(&env, &repo, &["build", "--verbose"], &[]);
+    assert!(out.status.success());
+    assert_eq!(resolution_lines(&out), 2, "build avec le mock");
+
+    let out = run_env(&env, &repo, &["build", "--no-llm", "--verbose"], &[]);
+    assert!(out.status.success());
+    assert_eq!(resolution_lines(&out), 1, "build --no-llm");
+
+    let doc = repo.join("docs/guide.md");
+    let mut text = fs::read_to_string(&doc).unwrap();
+    text.push_str("\nUne ligne de plus.\n");
+    fs::write(&doc, text).unwrap();
+    let out = run_env(&env, &repo, &["update", "--no-llm", "--verbose"], &[]);
+    assert!(out.status.success());
+    assert_eq!(resolution_lines(&out), 1, "update --no-llm");
+
+    let mut text = fs::read_to_string(&doc).unwrap();
+    text.push_str("\nEncore une ligne.\n");
+    fs::write(&doc, text).unwrap();
+    let out = run_env(&env, &repo, &["update", "--verbose"], &[]);
+    assert!(out.status.success());
+    assert_eq!(resolution_lines(&out), 2, "update avec le mock");
+}
+
+/// AC-068-3 : enrichissement arrêté en cours (`NEPHILA_MOCK_FAIL_AFTER=2`) : liens présents.
+#[test]
+fn req068_ac3_failed_enrichment_keeps_the_links_of_every_file() {
+    let env = Env::new("maven2", Some("mock"));
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\nbatch_files = 1\nconcurrency = 1\n",
+    )
+    .unwrap();
+    let repo = env.repo();
+    ok(&env, &repo, "build --no-llm", &["build", "--no-llm"]);
+    let structure = edge_set(&export_raw(&env, &repo, "export --no-llm"));
+    assert!(structure.iter().any(|e| e.starts_with("\"calls\"")));
+
+    let other = env.root.join("other");
+    copy_tree(&repo, &other, false);
+    let out = run_env(
+        &env,
+        &other,
+        &["build"],
+        &[("NEPHILA_MOCK_FAIL_AFTER", "2")],
+    );
+    assert!(!out.status.success(), "l'enrichissement doit s'arrêter");
+    let after = edge_set(&export_raw(&env, &other, "export après arrêt"));
+    let missing: Vec<&String> = structure.difference(&after).collect();
+    assert!(
+        missing.is_empty(),
+        "liens absents après l'arrêt : {missing:?}"
+    );
+}
+
+/// AC-068-3 : `build` tué pendant l'enrichissement : liens présents, puis `update` = `build` neuf.
+#[test]
+fn req068_ac3_killed_build_then_update_equals_a_fresh_build() {
+    let env = Env::new("maven2", Some("mock"));
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\nbatch_files = 1\nconcurrency = 1\n",
+    )
+    .unwrap();
+    let repo = env.repo();
+    let fresh = env.root.join("fresh");
+    copy_tree(&repo, &fresh, false);
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+        .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+        .env("NEPHILA_MOCK_DELAY_MS", "300")
+        .env("NEPHILA_CONFIG", &env.config)
+        .env("NEPHILA_MOCK_DIR", env.mock.as_ref().unwrap())
+        .arg("-C")
+        .arg(&repo)
+        .arg("build")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        assert!(
+            start.elapsed().as_secs() < 30,
+            "aucun enrichissement enregistré"
+        );
+        if let Ok(store) = nephila::store::Store::open_readonly(&repo) {
+            let files = store.files().unwrap_or_default();
+            if files
+                .iter()
+                .any(|f| store.enrichment_entry(&f.path).ok().flatten().is_some())
+            {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "le build était déjà terminé avant le kill"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let out = ok(
+        &env,
+        &repo,
+        "neighbors",
+        &["query", "neighbors", "OrderRepository.save"],
+    );
+    assert!(
+        out.contains("calls com.acme.core.OrderService.place"),
+        "{out}"
+    );
+
+    ok(&env, &repo, "update", &["update"]);
+    ok(&env, &fresh, "build", &["build"]);
+    let a = normalized_export(export_raw(&env, &repo, "export mis à jour").as_bytes());
+    let b = normalized_export(export_raw(&env, &fresh, "export neuf").as_bytes());
+    assert!(a == b, "{}", export_gap(&a, &b));
+}
