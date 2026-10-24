@@ -728,7 +728,7 @@ fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
     assert!(line.contains("0.17"));
     let at = |needle: &str| readme.find(needle).unwrap();
     assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.23.2", "git tag v0.23.2 && git push origin v0.23.2"] {
+    for needle in ["V=v0.24.0", "git tag v0.24.0 && git push origin v0.24.0"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
     assert!(!readme.contains("0.17.6"));
@@ -936,8 +936,8 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
         "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
         "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.23.2 ",
-        "git tag v0.23.2 && git push origin v0.23.2",
+        "V=v0.24.0 ",
+        "git tag v0.24.0 && git push origin v0.24.0",
     ] {
         assert!(readme.contains(expected), "absent : {expected}");
     }
@@ -1198,8 +1198,8 @@ fn REQ071_AC6_exemples_et_readme_sans_fils_d_analyse() {
 #[test]
 fn REQ071_AC11_readme_option_jobs() {
     let readme = repo_file("README.md");
-    let version = cargo_minor();
-    assert_eq!(version, "0.23");
+    // Les textes de la 0.23 restent dans la puce et la ligne de ce numéro (la 0.24 les suit).
+    let version = "0.23";
     let lines: Vec<&str> = readme.lines().collect();
     for cmd in ["build ", "update"] {
         let prefix = format!("nephila {cmd}");
@@ -1248,4 +1248,164 @@ fn req076_ac2_readme_prerequis_rust_1_99() {
         "ligne absente : {expected}"
     );
     assert!(!readme.contains("une chaîne Rust stable récente"));
+}
+
+const EXCLUDE_DEFAULTS_BLOCK: &str = "# Exclusions par défaut : les dossiers dist/, out/, coverage/, .next/, .nuxt/, vendor/ et .idea/,
+# à tout niveau du dépôt, et les fichiers *.min.js ne sont pas analysés. Booléen ; défaut : true.
+# false : ces chemins sont analysés comme les autres fichiers (types pris en charge, .gitignore,
+# exclude et exclude_types) ; utile quand l'un de ces dossiers contient votre code. Pour en
+# garder certains exclus, ajoutez-les à exclude. Ce ne sont pas des filtres : ils ne comptent
+# pas dans « fichiers exclus par les filtres », et !motif ne les réinclut pas. Pas d'option de
+# ligne de commande : la clé vaut pour toutes les commandes, status compris.
+# exclude_defaults = false
+";
+
+#[test]
+fn REQ079_AC7_exemple_de_projet_entete_filtres() {
+    let text = example("nephila.toml");
+    assert!(text.contains(
+        "# Un filtre s'ajoute à ce que nephila ignore déjà (.gitignore, target/, build/, .gradle/, .git/,
+# .nephila/, node_modules/) et à ce qu'il exclut par défaut (voir exclude_defaults) ; il ne peut
+# jamais réinclure un fichier ignoré ou exclu par défaut.
+"
+    ));
+    assert!(!text.contains("# .nephila/) et ne peut jamais réinclure un fichier ignoré."));
+}
+
+/// Graphe construit sans LLM sur un dépôt dont `dist/app.js` est du code : l'export le cite ou non.
+fn exports_dist_with(project_file: &str) -> bool {
+    let (tmp, repo) = repo_with_project_file(project_file);
+    fs::create_dir_all(repo.join("dist")).unwrap();
+    fs::write(
+        repo.join("dist/app.js"),
+        "export function f() { return 1; }\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("nephila")
+            .unwrap()
+            .env("NEPHILA_CONFIG", tmp.path().join("absent.toml"))
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    run(&["build", "--no-llm"]);
+    run(&["export", "--format", "json", "--output", "-"]).contains("dist/app.js")
+}
+
+#[test]
+fn REQ079_AC7_exemple_de_projet_exclude_defaults_reactivee_analyse_dist() {
+    let text = example("nephila.toml");
+    assert!(!exports_dist_with(&text), "copié tel quel : dist/ exclu");
+    let activated = text.replace("# exclude_defaults = false", "exclude_defaults = false");
+    assert_ne!(activated, text);
+    let (_tmp, repo) = repo_with_project_file(&activated);
+    ProjectFile::load(&repo).expect("ligne réactivée acceptée");
+    assert!(exports_dist_with(&activated), "dist/ analysé");
+}
+
+#[test]
+fn REQ079_AC7_exemple_de_projet_bloc_exclude_defaults() {
+    let text = example("nephila.toml");
+    assert!(text.contains(EXCLUDE_DEFAULTS_BLOCK));
+    let n = text
+        .lines()
+        .filter(|l| l.starts_with("# exclude_defaults ="))
+        .count();
+    assert_eq!(n, 1);
+    let at = |needle: &str| text.find(needle).unwrap();
+    assert!(at("# exclude_types = [") < at("# Exclusions par défaut :"));
+    assert!(at("# exclude_defaults = false") < at("# --- Réglages LLM du dépôt ---"));
+    assert!(!text.contains("exclude_defaults = true"));
+}
+
+#[test]
+fn REQ079_AC7_readme_sous_section_exclusions_par_defaut() {
+    let readme = repo_file("README.md");
+    assert!(readme.contains("Par défaut, `nephila` analyse tout ce qu'il prend en charge, hors des [exclusions par défaut](#exclusions-par-défaut) (sorties de build, dépendances copiées, réglages d'IDE, JavaScript minifié)."));
+    let sec = readme_section(&readme, "### Exclusions par défaut");
+    for needle in [
+        "Sans réglage, `nephila` n'analyse pas ces chemins, à tout niveau du dépôt (`web/dist/` comme `dist/`) :",
+        "| Exclu par défaut | Contenu habituel |",
+        "| `dist/`, `out/` | sorties de build |",
+        "| `coverage/` | rapports de couverture des tests |",
+        "| `.next/`, `.nuxt/` | sorties de Next.js et de Nuxt |",
+        "| `vendor/` | dépendances copiées dans le dépôt |",
+        "| `.idea/` | réglages des IDE JetBrains |",
+        "| `*.min.js` | JavaScript minifié |",
+        "Le nom doit être exact, casse comprise : `distrib/`, `outils/` et `Dist/` sont analysés, comme `app.min.mjs`. Ces exclusions ne sont pas des filtres : elles ne comptent pas dans « fichiers exclus par les filtres », et `!motif` ne les annule pas.",
+        "Si l'un de ces dossiers contient votre code (un package Java `out` ou `vendor`, par exemple), désactivez-les toutes dans `.nephila.toml` :",
+        "```toml\nexclude_defaults = false\n```",
+        "Ces chemins sont alors analysés comme les autres (types pris en charge, `.gitignore`, filtres). Pour en garder certains exclus, ajoutez-les à `exclude` : `exclude = [\"dist/\", \"*.min.js\"]`. Il n'y a pas d'option de ligne de commande : la clé est lue par toutes les commandes qui parcourent le dépôt, `status` compris. `target/`, `build/`, `.gradle/`, `node_modules/` et les fichiers de verrouillage restent toujours exclus.",
+    ] {
+        assert!(sec.contains(needle), "absent : {needle}");
+    }
+    let at = |needle: &str| readme.find(needle).unwrap();
+    assert!(at("### Exclusions par défaut") < at("### Motifs"));
+    assert!(at("## Filtrer l'analyse") < at("### Exclusions par défaut"));
+    assert!(readme.contains("Les filtres (`exclude`, `exclude_types`), `exclude_defaults` (voir [Exclusions par défaut](#exclusions-par-défaut)) et les six réglages sont facultatifs"));
+}
+
+#[test]
+fn REQ079_AC7_readme_puce_vers_024_et_ligne_du_tableau() {
+    let readme = repo_file("README.md");
+    assert_eq!(cargo_minor(), "0.24");
+    let sec = readme_section(&readme, "## Mise à niveau");
+    let bullet = "- **Vers 0.24** : les dossiers dist/, out/, coverage/, .next/, .nuxt/, vendor/ et .idea/, à tout niveau, et les fichiers *.min.js sont exclus par défaut. nephila status liste comme supprimé chaque fichier du graphe qu'ils contiennent, et le premier nephila update les retire, sans appel LLM. Pour les garder : exclude_defaults = false dans .nephila.toml.";
+    let b = sec.find(bullet).expect("puce Vers 0.24 absente");
+    let ren = sec.find("- **Renommage `rkg`").expect("puce du renommage");
+    let v23 = sec.find("- **Vers 0.23**").expect("puce Vers 0.23");
+    assert!(ren < b && b < v23);
+    assert_eq!(sec[b..v23].trim_end(), bullet);
+    let lines: Vec<&str> = readme.lines().collect();
+    let i = lines
+        .iter()
+        .position(|l| l.starts_with("| 0.24 |"))
+        .expect("ligne 0.24");
+    assert!(lines[i + 1].starts_with("| 0.23 |"));
+    let row = lines[i];
+    assert!(row.starts_with("| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit."));
+    assert!(row.contains("Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe."));
+    for w in [
+        "déduplications linéaires",
+        "un parser par fil",
+        "export en flux sans nouvelle résolution",
+        "profil release optimisé",
+        "banc de performance",
+    ] {
+        assert!(row.contains(w), "ligne 0.24 sans : {w}");
+    }
+}
+
+#[test]
+fn REQ080_AC1_readme_paragraphe_de_l_export_en_flux() {
+    let readme = repo_file("README.md");
+    let json = "**Format JSON** : objet avec `version`, `nodes`, `edges` et `unresolved`.";
+    let para = "Le document est écrit au fil de la lecture du graphe, sans le charger en mémoire. Si l'export échoue en cours de route (disque plein, sortie fermée par le lecteur), la commande s'arrête sur une ligne erreur: et un code non nul : le fichier commencé est supprimé, y compris un export précédent du même nom, et avec --output - stdout peut contenir un début de document. Seul le code de sortie 0 garantit un document complet.";
+    let sec = readme_section(&readme, "## Export et vue HTML");
+    let a = sec.find(json).expect("phrase du format JSON");
+    let b = sec.find(para).expect("paragraphe de l'export en flux");
+    assert!(a < b);
+    assert_eq!(sec[a + json.len()..b].trim(), "");
+}
+
+#[test]
+fn REQ082_AC4_readme_commande_du_banc_et_lignes_banc() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "## Développement");
+    let cmd = "cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf_banc";
+    assert!(sec.lines().any(|l| l.starts_with(cmd)), "commande du banc");
+    for needle in [
+        "banc: <commande> --no-llm : parcours",
+        "structure",
+        "résolution",
+        "médiane de 3",
+        "banc: fixture",
+    ] {
+        assert!(sec.contains(needle), "lecture des lignes banc : {needle}");
+    }
 }

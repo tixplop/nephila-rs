@@ -16,7 +16,8 @@
 # Copié tel quel, ce fichier n'a aucun effet : toutes les clés sont désactivées.
 #
 # Un filtre s'ajoute à ce que nephila ignore déjà (.gitignore, target/, build/, .gradle/, .git/,
-# .nephila/) et ne peut jamais réinclure un fichier ignoré.
+# .nephila/, node_modules/) et à ce qu'il exclut par défaut (voir exclude_defaults) ; il ne peut
+# jamais réinclure un fichier ignoré ou exclu par défaut.
 #
 # Les options `--exclude` et `--exclude-type` de `build` et `update` s'ajoutent à ces clés, pour
 # la commande seulement : les types sont réunis, les motifs forment une seule liste (ceux de ce

@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.23.2                                      # version voulue
+V=v0.24.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -285,7 +285,30 @@ build terminé : 10 fichiers traités, 11 nœuds, 10 liens, 0 références non r
 
 ## Filtrer l'analyse
 
-Par défaut, `nephila` analyse tout ce qu'il prend en charge. Les filtres retirent de l'analyse des fichiers sans intérêt (code généré, fichiers minifiés, données). Ils ne font qu'exclure : aucun filtre ne fait indexer un fichier que `.gitignore` ou les exclusions fixes (dossiers `.git/`, `target/`, `node_modules/`, fichiers de verrouillage…) écartent déjà.
+Par défaut, `nephila` analyse tout ce qu'il prend en charge, hors des [exclusions par défaut](#exclusions-par-défaut) (sorties de build, dépendances copiées, réglages d'IDE, JavaScript minifié). Les filtres retirent de l'analyse des fichiers sans intérêt (code généré, fichiers minifiés, données). Ils ne font qu'exclure : aucun filtre ne fait indexer un fichier que `.gitignore` ou les exclusions fixes (dossiers `.git/`, `target/`, `node_modules/`, fichiers de verrouillage…) écartent déjà.
+
+### Exclusions par défaut
+
+Sans réglage, `nephila` n'analyse pas ces chemins, à tout niveau du dépôt (`web/dist/` comme `dist/`) :
+
+| Exclu par défaut | Contenu habituel |
+|---|---|
+| `dist/`, `out/` | sorties de build |
+| `coverage/` | rapports de couverture des tests |
+| `.next/`, `.nuxt/` | sorties de Next.js et de Nuxt |
+| `vendor/` | dépendances copiées dans le dépôt |
+| `.idea/` | réglages des IDE JetBrains |
+| `*.min.js` | JavaScript minifié |
+
+Le nom doit être exact, casse comprise : `distrib/`, `outils/` et `Dist/` sont analysés, comme `app.min.mjs`. Ces exclusions ne sont pas des filtres : elles ne comptent pas dans « fichiers exclus par les filtres », et `!motif` ne les annule pas.
+
+Si l'un de ces dossiers contient votre code (un package Java `out` ou `vendor`, par exemple), désactivez-les toutes dans `.nephila.toml` :
+
+```toml
+exclude_defaults = false
+```
+
+Ces chemins sont alors analysés comme les autres (types pris en charge, `.gitignore`, filtres). Pour en garder certains exclus, ajoutez-les à `exclude` : `exclude = ["dist/", "*.min.js"]`. Il n'y a pas d'option de ligne de commande : la clé est lue par toutes les commandes qui parcourent le dépôt, `status` compris. `target/`, `build/`, `.gradle/`, `node_modules/` et les fichiers de verrouillage restent toujours exclus.
 
 ### Motifs
 
@@ -339,7 +362,7 @@ exclude = ["docs/legacy/", "*.min.js"]   # motifs .gitignore, relatifs à la rac
 exclude_types = ["json"]                 # types : voir nephila build --help
 ```
 
-Les filtres (`exclude`, `exclude_types`) et les six réglages sont facultatifs ; toute autre clé est une erreur (`enrich_code` comprise : elle reste dans la configuration personnelle). Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour » et, avec `query ask`, pour les réglages ci-dessous), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé.
+Les filtres (`exclude`, `exclude_types`), `exclude_defaults` (voir [Exclusions par défaut](#exclusions-par-défaut)) et les six réglages sont facultatifs ; toute autre clé est une erreur (`enrich_code` comprise : elle reste dans la configuration personnelle). Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour » et, avec `query ask`, pour les réglages ci-dessous), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé.
 
 Le même fichier porte aussi les réglages LLM du dépôt, au premier niveau, avec le même nom et le même type que dans la configuration personnelle : on copie une ligne d'un fichier à l'autre.
 
@@ -425,6 +448,8 @@ $ xdg-open "$(nephila export --format html)"
 Le slug est le nom du dossier analysé en minuscules ASCII. Chaque suite de caractères hors `[a-z0-9]` y devient un seul `-` : `Mon Dépôt_2` donne `mon-d-p-t-2`. Si le nom est vide, le slug vaut `graphe`. Les fichiers `.json` et `.html` ne sont pas analysés : un export écrit dans le dépôt ne change ni le graphe ni `status`.
 
 **Format JSON** : objet avec `version`, `nodes`, `edges` et `unresolved`.
+
+Le document est écrit au fil de la lecture du graphe, sans le charger en mémoire. Si l'export échoue en cours de route (disque plein, sortie fermée par le lecteur), la commande s'arrête sur une ligne erreur: et un code non nul : le fichier commencé est supprimé, y compris un export précédent du même nom, et avec --output - stdout peut contenir un début de document. Seul le code de sortie 0 garantit un document complet.
 
 **Page HTML** : fichier unique, CSS et JS embarqués, sans aucune ressource externe ni requête réseau. Elle s'ouvre en `file://`. Elle n'affiche jamais tout le graphe, mais une vue partielle que l'on étend :
 
@@ -704,6 +729,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 ## Mise à niveau
 
 - **Renommage `rkg` → `nephila`** : le binaire s'appelle `nephila`, le graphe est stocké dans `.nephila/` (au lieu de `.rkg/`), la configuration dans `~/.config/nephila/config.toml` et les variables d'environnement sont préfixées `NEPHILA_` (`NEPHILA_CONFIG`, `NEPHILA_MOCK_DIR`…). Déplacez votre configuration (`mv ~/.config/rkg ~/.config/nephila`), puis reconstruisez le graphe avec `nephila build` et supprimez l'ancien dossier `.rkg/`.
+- **Vers 0.24** : les dossiers dist/, out/, coverage/, .next/, .nuxt/, vendor/ et .idea/, à tout niveau, et les fichiers *.min.js sont exclus par défaut. nephila status liste comme supprimé chaque fichier du graphe qu'ils contiennent, et le premier nephila update les retire, sans appel LLM. Pour les garder : exclude_defaults = false dans .nephila.toml.
 - **Vers 0.23** : le parcours du dépôt et l'extraction utilisent par défaut un fil par cœur disponible, quelle que soit concurrency, qui ne règle plus que les appels LLM. Pour limiter ces fils comme concurrency = 1 le faisait, ajoutez --jobs 1 à nephila build et nephila update.
 - **Vers 0.22** : le graphe passe au schéma 8 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, et la première résolution qui suit est complète ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.21 tel quel. Un binaire 0.21 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).
 - **Vers 0.21** : le graphe passe au schéma 7 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.20 tel quel. La place libérée n'est rendue au disque que par `sqlite3 .nephila/graph.db 'VACUUM'`. Un binaire 0.20 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).
@@ -716,6 +742,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit. Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe. Nouveautés : déduplications linéaires, un parser par fil, export en flux sans nouvelle résolution, profil release optimisé, banc de performance. |
 | 0.23 | Option --jobs de build et update : nombre de fils du parcours du dépôt et de l'extraction, par défaut le nombre de cœurs disponibles ; concurrency ne règle plus que les appels LLM. Parcours du dépôt et empreintes en parallèle, fichier lu une seule fois pour son empreinte et son analyse, écriture SQLite allégée, même graphe qu'en 0.22 quel que soit le nombre de fils. |
 | 0.22 | Mise à jour incrémentale : `update` ne résout plus que les références touchées par les fichiers changés et ne relit plus toute la table des liens ; résumé global calculé sans relire le graphe ; une seule résolution complète par commande avec LLM. Même graphe qu'en 0.21 ; le schéma 8 est migré sur place. |
 | 0.21 | Stockage SQLite allégé : contexte d'imports stocké une fois par fichier, index inutiles retirés, cache SQLite agrandi à chaque ouverture en écriture, écritures regroupées, build neuf sans recalcul répété des nœuds. Même graphe qu'en 0.20 ; le schéma 7 est migré sur place. |
@@ -751,7 +778,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.23.2 && git push origin v0.23.2
+git tag v0.24.0 && git push origin v0.24.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
@@ -763,6 +790,14 @@ cargo clippy -q --all-targets --color never -- -D warnings      # lint
 cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf       # performances (dépôt de 10 000 fichiers)
 node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests/view/*.test.js'   # logique de la vue HTML
 ```
+
+Le banc de performance mesure `build --no-llm` et `update --no-llm` sur une fixture JavaScript générée sous `target/` (générateur déterministe), sans seuil de temps :
+
+```sh
+cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf_banc   # banc
+```
+
+La première ligne, `banc: fixture <empreinte>`, donne l'empreinte BLAKE3 de l'arbre de la fixture : deux lancements doivent la retrouver à l'identique. Chaque ligne `banc: <commande> --no-llm : parcours … ms, structure … ms, résolution … ms, autres … ms, total … ms (médiane de 3, <n> fichiers, <w> fils)` donne la durée de chaque phase, médiane de trois exécutions, pour le nombre de fichiers et de fils indiqués. Comparez ces lignes d'une version à l'autre sur la même machine.
 
 `NEPHILA_RETRY_BASE_MS` (entier ≥ 0, en millisecondes) remplace la base de 1 s de l'attente entre deux envois HTTP, pour des tests rapides ; `retry-after` reste respecté. Une valeur mal formée donne `erreur: NEPHILA_RETRY_BASE_MS : entier attendu, reçu « abc »`.
 
