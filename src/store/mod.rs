@@ -124,6 +124,54 @@ thread_local! {
     static COMMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static PROJECTIONS: std::cell::RefCell<std::collections::HashMap<String, u64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Lignes de `nodes`, lignes de `edges`, passes complètes, passes incrémentales, références
+    /// réévaluées (REQ-066, hypothèse « mesure »).
+    static READS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
+}
+
+const NODE_ROWS: usize = 0;
+const EDGE_ROWS: usize = 1;
+const FULL_PASSES: usize = 2;
+const INCREMENTAL_PASSES: usize = 3;
+const REFS_REEVALUATED: usize = 4;
+
+/// Ajoute `n` au compteur de diagnostic `slot`.
+fn bump(slot: usize, n: usize) {
+    READS.with(|c| {
+        let mut v = c.get();
+        v[slot] += n as u64;
+        c.set(v);
+    });
+}
+
+/// Compte des lignes de `nodes` rendues par une lecture du stockage (lecture de la passe
+/// comprise ; un agrégat ne compte pas).
+pub(crate) fn note_node_rows(n: usize) {
+    bump(NODE_ROWS, n);
+}
+
+/// Compte des lignes de `edges` rendues par une lecture du stockage.
+pub(crate) fn note_edge_rows(n: usize) {
+    bump(EDGE_ROWS, n);
+}
+
+/// Une passe de résolution a eu lieu (`incremental` : passe incrémentale, sinon complète).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_pass(incremental: bool) {
+    bump(
+        if incremental {
+            INCREMENTAL_PASSES
+        } else {
+            FULL_PASSES
+        },
+        1,
+    );
+}
+
+/// `n` références réévaluées par une passe.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn note_refs_reevaluated(n: usize) {
+    bump(REFS_REEVALUATED, n);
 }
 
 /// Compteurs de diagnostic du fil courant, lus par les tests seulement.
@@ -132,6 +180,7 @@ thread_local! {
 pub struct Diagnostics {
     commits: u64,
     projections: std::collections::HashMap<String, u64>,
+    counters: [u64; 5],
 }
 
 impl Diagnostics {
@@ -149,6 +198,31 @@ impl Diagnostics {
     pub fn total_projections(&self) -> u64 {
         self.projections.values().sum()
     }
+
+    /// Lignes de la table `nodes` rendues par les lectures du stockage.
+    pub fn node_rows_read(&self) -> u64 {
+        self.counters[NODE_ROWS]
+    }
+
+    /// Lignes de la table `edges` rendues par les lectures du stockage.
+    pub fn edge_rows_read(&self) -> u64 {
+        self.counters[EDGE_ROWS]
+    }
+
+    /// Passes de résolution complètes.
+    pub fn full_passes(&self) -> u64 {
+        self.counters[FULL_PASSES]
+    }
+
+    /// Passes de résolution incrémentales.
+    pub fn incremental_passes(&self) -> u64 {
+        self.counters[INCREMENTAL_PASSES]
+    }
+
+    /// Références réévaluées par les passes.
+    pub fn refs_reevaluated(&self) -> u64 {
+        self.counters[REFS_REEVALUATED]
+    }
 }
 
 #[doc(hidden)]
@@ -156,6 +230,7 @@ pub fn diagnostics() -> Diagnostics {
     Diagnostics {
         commits: COMMITS.with(std::cell::Cell::get),
         projections: PROJECTIONS.with(|p| p.borrow().clone()),
+        counters: READS.with(std::cell::Cell::get),
     }
 }
 
@@ -163,6 +238,7 @@ pub fn diagnostics() -> Diagnostics {
 pub fn reset_diagnostics() {
     COMMITS.with(|c| c.set(0));
     PROJECTIONS.with(|p| p.borrow_mut().clear());
+    READS.with(|c| c.set([0; 5]));
 }
 
 /// Valide une transaction d'écriture et la compte.
@@ -194,9 +270,74 @@ pub struct Store {
     /// `meta.resolution` vaut déjà `à résoudre` (DEC-076) : la première écriture après une passe
     /// ou l'ouverture l'écrit, les suivantes non.
     stale: bool,
+    /// Journal des changements écrits depuis la dernière passe terminée (DEC-077) : `None` quand
+    /// le graphe n'est pas marqué `à jour`.
+    log: Option<ChangeLog>,
 }
 
-type Touched = std::collections::BTreeSet<String>;
+/// Ce que le stockage retient des écritures faites depuis la dernière passe terminée (DEC-077,
+/// point 1). Les ensembles se cumulent d'une transaction validée à l'autre, sans annulation
+/// mutuelle (un nœud inséré puis supprimé figure dans les deux : la passe lit plus, jamais moins).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ChangeLog {
+    /// Identifiants insérés dans `nodes` (dépendances dérivées créées par une passe comprises).
+    pub(crate) inserted: std::collections::BTreeSet<String>,
+    /// Identifiants supprimés de `nodes` (dépendances dérivées supprimées par une passe comprises).
+    pub(crate) deleted: std::collections::BTreeSet<String>,
+    /// Identifiants dont l'ensemble des déclarations a changé : différence nette par transaction
+    /// de fichier entre les nœuds déclarés avant et après (un résumé seul ne compte pas ; un nœud
+    /// inséré ou supprimé y figure aussi).
+    pub(crate) declarations_changed: std::collections::BTreeSet<String>,
+    /// Fichiers dont des références ont été écrites ou retirées.
+    pub(crate) files: std::collections::BTreeSet<String>,
+    /// Sources distinctes des références retirées.
+    pub(crate) removed_sources: std::collections::BTreeSet<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ChangeLog {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == ChangeLog::default()
+    }
+
+    fn merge(&mut self, other: ChangeLog) {
+        self.inserted.extend(other.inserted);
+        self.deleted.extend(other.deleted);
+        self.declarations_changed.extend(other.declarations_changed);
+        self.files.extend(other.files);
+        self.removed_sources.extend(other.removed_sources);
+    }
+}
+
+/// État d'une transaction de fichier : identifiants touchés (à projeter, DEC-075) et, si le
+/// journal est tenu (`track`), les changements qu'elle apporte.
+struct Touched {
+    ids: std::collections::BTreeSet<String>,
+    track: bool,
+    /// Nœuds déclarés par le fichier avant la première libération (journal seulement).
+    declared_before: Option<std::collections::BTreeSet<String>>,
+    log: ChangeLog,
+}
+
+impl Touched {
+    fn new(track: bool) -> Touched {
+        Touched {
+            ids: std::collections::BTreeSet::new(),
+            track,
+            declared_before: None,
+            log: ChangeLog::default(),
+        }
+    }
+
+    fn insert(&mut self, id: String) {
+        self.ids.insert(id);
+    }
+
+    fn extend<I: IntoIterator<Item = String>>(&mut self, ids: I) {
+        self.ids.extend(ids);
+    }
+}
 
 impl Store {
     fn new(conn: Connection, read_only: bool) -> Store {
@@ -207,6 +348,7 @@ impl Store {
             fresh: false,
             written: std::collections::HashSet::new(),
             stale: true,
+            log: None,
         }
     }
 
@@ -224,7 +366,21 @@ impl Store {
             Err(e) => return Err(db_err(e)),
         };
         self.stale = value.as_deref() != Some(RESOLUTION_DONE);
+        self.log = (!self.stale).then(ChangeLog::default);
         Ok(())
+    }
+
+    /// Journal des changements depuis la dernière passe terminée ; `None` si le graphe n'est pas
+    /// marqué `à jour` (ouverture d'un graphe `à résoudre`, vidage d'un `build`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn change_log(&self) -> Option<&ChangeLog> {
+        self.log.as_ref()
+    }
+
+    fn merge_log(&mut self, log: ChangeLog) {
+        if let Some(l) = &mut self.log {
+            l.merge(log);
+        }
     }
 
     fn end_fresh(&mut self) {
@@ -549,6 +705,7 @@ impl Store {
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
         commit_counted(tx)?;
         self.stale = true;
+        self.log = None;
         Ok(())
     }
 
@@ -577,6 +734,7 @@ impl Store {
         }
         commit_counted(tx)?;
         self.stale = true;
+        self.log = None;
         self.fresh = true;
         Ok(())
     }
@@ -666,6 +824,8 @@ impl Store {
         }
         let mut reapplied = 0;
         let mut newly: Vec<&str> = Vec::new();
+        let track = self.log.is_some();
+        let mut pending = ChangeLog::default();
         for (path, nodes, refs) in items {
             require_known(&tx, path)?;
             let fresh = self.fresh
@@ -678,11 +838,11 @@ impl Store {
                 newly.push(path);
                 continue;
             }
-            let mut touched = Touched::new();
+            let mut touched = Touched::new(track);
             clear_summaries(&tx, path, &mut touched)?;
             release_file(&tx, path, None, &mut touched)?;
             insert_nodes(&tx, path, nodes, "parse", &mut touched)?;
-            insert_refs(&tx, path, refs, "parse")?;
+            insert_refs(&tx, path, refs, "parse", &mut touched)?;
             tx.prepare_cached("UPDATE files SET state = 'indexed' WHERE path = ?1")
                 .map_err(db_err)?
                 .execute([path])
@@ -690,9 +850,11 @@ impl Store {
             if reapply_enrichment(&tx, path, &mut touched)? {
                 reapplied += 1;
             }
-            finish_file(&tx, &touched)?;
+            finish_file(&tx, path, &mut touched)?;
+            pending.merge(touched.log);
         }
         commit_counted(tx)?;
+        self.merge_log(pending);
         if !items.is_empty() {
             self.stale = true;
         }
@@ -739,10 +901,13 @@ impl Store {
         }
         let tx = self.conn.transaction().map_err(db_err)?;
         mark_stale_tx(self.stale, &tx)?;
+        let track = self.log.is_some();
+        let mut pending = ChangeLog::default();
         for item in items {
-            write_enrichment(&tx, model, item)?;
+            pending.merge(write_enrichment(&tx, model, item, track)?);
         }
         commit_counted(tx)?;
+        self.merge_log(pending);
         self.stale = true;
         Ok(())
     }
@@ -897,11 +1062,14 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         mark_stale_tx(self.stale, &tx)?;
         let mut removed = 0;
+        let track = self.log.is_some();
+        let mut pending = ChangeLog::default();
         for path in paths {
-            let mut touched = Touched::new();
+            let mut touched = Touched::new(track);
             clear_summaries(&tx, path, &mut touched)?;
             release_file(&tx, path, None, &mut touched)?;
-            finish_file(&tx, &touched)?;
+            finish_file(&tx, path, &mut touched)?;
+            pending.merge(touched.log);
             tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
                 .map_err(db_err)?
                 .execute([path])
@@ -913,6 +1081,7 @@ impl Store {
                 .map_err(db_err)?;
         }
         commit_counted(tx)?;
+        self.merge_log(pending);
         self.stale = true;
         Ok(removed)
     }
@@ -959,6 +1128,7 @@ impl Store {
                 summary,
             });
         }
+        note_node_rows(out.len());
         Ok(out)
     }
 
@@ -1014,6 +1184,7 @@ impl Store {
                 summary,
             });
         }
+        note_node_rows(out.len());
         Ok(out)
     }
 
@@ -1037,15 +1208,18 @@ impl Store {
             ))
         });
         match row {
-            Ok((id, kind, qualified, short, file, subkind, summary)) => Ok(Some(Node {
-                id,
-                kind: NodeKind::parse(&kind)?,
-                qualified,
-                short,
-                file,
-                subkind: subkind.as_deref().map(SubKind::parse).transpose()?,
-                summary,
-            })),
+            Ok((id, kind, qualified, short, file, subkind, summary)) => {
+                note_node_rows(1);
+                Ok(Some(Node {
+                    id,
+                    kind: NodeKind::parse(&kind)?,
+                    qualified,
+                    short,
+                    file,
+                    subkind: subkind.as_deref().map(SubKind::parse).transpose()?,
+                    summary,
+                }))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(db_err(e)),
         }
@@ -1070,6 +1244,7 @@ impl Store {
             let (other, kind) = row.map_err(db_err)?;
             out.push((other, EdgeKind::parse(&kind)?));
         }
+        note_edge_rows(out.len());
         Ok(out)
     }
 
@@ -1113,6 +1288,7 @@ impl Store {
                 kind: EdgeKind::parse(&kind)?,
             });
         }
+        note_edge_rows(out.len());
         Ok(out)
     }
 
@@ -1224,8 +1400,10 @@ impl Store {
         self.ensure_writable()?;
         self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
-        replace_dependencies_tx(&tx, deps)?;
-        commit_counted(tx)
+        let changes = replace_dependencies_tx(&tx, deps)?;
+        commit_counted(tx)?;
+        self.merge_log(changes);
+        Ok(())
     }
 
     /// Écrit en une seule transaction les dépendances dérivées, les liens et le résumé global
@@ -1251,7 +1429,7 @@ impl Store {
             rusqlite::TransactionBehavior::Deferred,
         )
         .map_err(db_err)?;
-        replace_dependencies_tx(&tx, deps)?;
+        let changes = replace_dependencies_tx(&tx, deps)?;
         replace_edges_tx(&tx, edges)?;
         tx.prepare_cached("UPDATE refs SET unresolved = 0 WHERE unresolved = 1")
             .map_err(db_err)?
@@ -1271,6 +1449,9 @@ impl Store {
         set_resolution_tx(&tx, RESOLUTION_DONE)?;
         commit_counted(tx)?;
         self.stale = false;
+        // La passe remet le journal à vide ; ses nœuds `dependency` créés ou supprimés sont ce
+        // que la passe suivante doit relire.
+        self.log = Some(changes);
         Ok(())
     }
 
@@ -1424,6 +1605,7 @@ fn replace_edges_tx(tx: &rusqlite::Connection, edges: &[Edge]) -> Result<()> {
             std::collections::HashSet::new();
         for row in rows {
             let (s, t, k): (String, String, String) = row.map_err(db_err)?;
+            note_edge_rows(1);
             if wanted.contains(&(s.as_str(), t.as_str(), k.as_str())) {
                 present.insert((s, t, k));
             } else {
@@ -1457,8 +1639,27 @@ fn replace_edges_tx(tx: &rusqlite::Connection, edges: &[Edge]) -> Result<()> {
     Ok(())
 }
 
-/// Remplace dans `tx` les nœuds `dependency` dérivés.
-fn replace_dependencies_tx(tx: &rusqlite::Connection, deps: &[Node]) -> Result<()> {
+/// Remplace dans `tx` les nœuds `dependency` dérivés. Renvoie ceux que l'opération crée et ceux
+/// qu'elle supprime, nets (un nœud supprimé puis recréé à l'identique n'est ni l'un ni l'autre).
+fn replace_dependencies_tx(tx: &rusqlite::Connection, deps: &[Node]) -> Result<ChangeLog> {
+    let before: std::collections::BTreeSet<String> = {
+        let mut st = tx
+            .prepare_cached(
+                "SELECT id FROM nodes WHERE kind = 'dependency'
+                 AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        let ids: std::collections::BTreeSet<String> = rows
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        // Lecture de lignes de `nodes` (les dépendances actuelles) : comptée.
+        note_node_rows(ids.len());
+        ids
+    };
+    let mut log = ChangeLog::default();
     tx.prepare_cached(
         "DELETE FROM nodes WHERE kind = 'dependency'
              AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
@@ -1473,17 +1674,26 @@ fn replace_dependencies_tx(tx: &rusqlite::Connection, deps: &[Node]) -> Result<(
                      VALUES (?1, 'dependency', ?2, ?3, NULL, NULL, NULL, ?4)",
                 )
                 .map_err(db_err)?;
+        let mut kept = std::collections::BTreeSet::new();
         for n in deps {
-            ins.execute(params![
-                n.id,
-                n.qualified,
-                n.short,
-                reverse_qualified(&n.qualified)
-            ])
-            .map_err(db_err)?;
+            let inserted = ins
+                .execute(params![
+                    n.id,
+                    n.qualified,
+                    n.short,
+                    reverse_qualified(&n.qualified)
+                ])
+                .map_err(db_err)?;
+            if inserted > 0 {
+                kept.insert(n.id.clone());
+                if !before.contains(&n.id) {
+                    log.inserted.insert(n.id.clone());
+                }
+            }
         }
+        log.deleted = before.difference(&kept).cloned().collect();
     }
-    Ok(())
+    Ok(log)
 }
 
 /// Dans la transaction d'une écriture de nœuds, de déclarations ou de références : écrit
@@ -1536,7 +1746,8 @@ fn write_enrichment(
     tx: &rusqlite::Transaction<'_>,
     model: &str,
     item: &EnrichmentWrite,
-) -> Result<()> {
+    track: bool,
+) -> Result<ChangeLog> {
     let EnrichmentWrite {
         path,
         hash,
@@ -1545,9 +1756,9 @@ fn write_enrichment(
         refs,
     } = item;
     require_known(tx, path)?;
-    let mut touched = Touched::new();
+    let mut touched = Touched::new(track);
     apply_enrichment_tx(tx, path, summaries, concept_nodes, refs, &mut touched)?;
-    finish_file(tx, &touched)?;
+    finish_file(tx, path, &mut touched)?;
     let payload = Payload {
         summaries: summaries.to_vec(),
         concepts: concept_nodes
@@ -1578,7 +1789,7 @@ fn write_enrichment(
     .map_err(db_err)?
     .execute(params![path, hash, model, ENRICH_PROMPT_VERSION, json])
     .map_err(db_err)?;
-    Ok(())
+    Ok(touched.log)
 }
 
 fn require_known(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
@@ -1609,23 +1820,43 @@ fn clear_summaries(
     .map_err(db_err)?
     .execute([path])
     .map_err(db_err)?;
-    touched.extend(declared_by(tx, path)?);
+    let declared = declared_by(tx, path)?;
+    if touched.track && touched.declared_before.is_none() {
+        touched.declared_before = Some(declared.iter().cloned().collect());
+    }
+    touched.extend(declared);
     Ok(())
 }
 
 /// Fin du travail d'un fichier (DEC-075) : projection unique de chaque nœud touché, puis
 /// suppression de ceux qui n'ont plus de déclaration (liens attachés compris).
-fn finish_file(tx: &rusqlite::Transaction<'_>, touched: &Touched) -> Result<()> {
-    let ids: Vec<&String> = touched.iter().collect();
+fn finish_file(tx: &rusqlite::Transaction<'_>, path: &str, touched: &mut Touched) -> Result<()> {
+    let ids: Vec<&String> = touched.ids.iter().collect();
     refresh_nodes(tx, &ids)?;
-    let mut del = tx
-        .prepare_cached(
-            "DELETE FROM nodes WHERE id = ?1
-             AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
-        )
-        .map_err(db_err)?;
-    for id in &ids {
-        del.execute([id]).map_err(db_err)?;
+    let mut deleted = Vec::new();
+    {
+        let mut del = tx
+            .prepare_cached(
+                "DELETE FROM nodes WHERE id = ?1
+                 AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+            )
+            .map_err(db_err)?;
+        for id in &ids {
+            if del.execute([id]).map_err(db_err)? > 0 {
+                deleted.push((*id).clone());
+            }
+        }
+    }
+    if touched.track {
+        // Différence nette des nœuds déclarés par le fichier (DEC-077 point 1).
+        let before = touched.declared_before.take().unwrap_or_default();
+        let after: std::collections::BTreeSet<String> =
+            declared_by(tx, path)?.into_iter().collect();
+        touched
+            .log
+            .declarations_changed
+            .extend(before.symmetric_difference(&after).cloned());
+        touched.log.deleted.extend(deleted);
     }
     Ok(())
 }
@@ -1691,14 +1922,18 @@ fn insert_nodes(
                 n.id
             )));
         }
-        ins.execute(params![
-            n.id,
-            n.kind.as_str(),
-            n.qualified,
-            n.short,
-            reverse_qualified(&n.qualified)
-        ])
-        .map_err(db_err)?;
+        let inserted = ins
+            .execute(params![
+                n.id,
+                n.kind.as_str(),
+                n.qualified,
+                n.short,
+                reverse_qualified(&n.qualified)
+            ])
+            .map_err(db_err)?;
+        if inserted > 0 && touched.track {
+            touched.log.inserted.insert(n.id.clone());
+        }
         decl.execute(params![
             path,
             n.id,
@@ -1777,6 +2012,7 @@ fn insert_refs(
     path: &str,
     refs: &[Ref],
     origin: &str,
+    touched: &mut Touched,
 ) -> Result<()> {
     // Aucun lien `contains` n'est produit par des références : ils sont dérivés (DEC-077).
     if refs.iter().any(|r| r.kind == EdgeKind::Contains) {
@@ -1824,6 +2060,9 @@ fn insert_refs(
             )));
         }
     }
+    if touched.track && !refs.is_empty() {
+        touched.log.files.insert(path.to_string());
+    }
     if let Some(context) = context {
         tx.prepare_cached(
             "INSERT INTO file_contexts(file, context) VALUES (?1, ?2)
@@ -1860,6 +2099,23 @@ fn release_file(
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_err)?
     };
+    if touched.track {
+        // Sources des références retirées, lues avant leur retrait (DEC-077 point 1).
+        let mut st = tx
+            .prepare_cached(
+                "SELECT DISTINCT source FROM refs WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)",
+            )
+            .map_err(db_err)?;
+        let sources = st
+            .query_map(params![path, origin], |r| r.get::<_, String>(0))
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        if !sources.is_empty() {
+            touched.log.files.insert(path.to_string());
+            touched.log.removed_sources.extend(sources);
+        }
+    }
     tx.prepare_cached("DELETE FROM refs WHERE file = ?1 AND (?2 IS NULL OR origin = ?2)")
         .map_err(db_err)?
         .execute(params![path, origin])
@@ -1935,7 +2191,7 @@ fn apply_enrichment_tx(
             )));
         }
     }
-    insert_refs(tx, path, refs, "llm")
+    insert_refs(tx, path, refs, "llm", touched)
 }
 
 /// Lit l'enrichissement conservé d'un fichier dont la structure vient d'être écrite : son contenu
@@ -2050,7 +2306,8 @@ fn write_structure_fresh(
     nodes: &[Node],
     refs: &[Ref],
 ) -> Result<bool> {
-    let mut touched = Touched::new();
+    // Base fraîche : le journal n'est pas tenu (DEC-077 point 1).
+    let mut touched = Touched::new(false);
     let mut parse_nodes = nodes.to_vec();
     let mut kept: Option<(Vec<Node>, Vec<Ref>)> = None;
     if let Some(payload) = load_kept_enrichment(tx, path)? {
@@ -2069,7 +2326,7 @@ fn write_structure_fresh(
         kept = Some((concepts, llm_refs));
     }
     insert_nodes_fresh(tx, path, &parse_nodes, "parse", &mut touched)?;
-    insert_refs(tx, path, refs, "parse")?;
+    insert_refs(tx, path, refs, "parse", &mut touched)?;
     tx.prepare_cached("UPDATE files SET state = 'indexed' WHERE path = ?1")
         .map_err(db_err)?
         .execute([path])
@@ -2077,9 +2334,9 @@ fn write_structure_fresh(
     let reapplied = kept.is_some();
     if let Some((concepts, llm_refs)) = kept {
         insert_nodes_fresh(tx, path, &concepts, "llm", &mut touched)?;
-        insert_refs(tx, path, &llm_refs, "llm")?;
+        insert_refs(tx, path, &llm_refs, "llm", &mut touched)?;
     }
-    let ids: Vec<&String> = touched.iter().collect();
+    let ids: Vec<&String> = touched.ids.iter().collect();
     refresh_nodes(tx, &ids)?;
     Ok(reapplied)
 }
@@ -4847,5 +5104,417 @@ mod tests {
             )
             .is_err());
         assert_eq!(all(&st), before);
+    }
+
+    // --- REQ-066 : journal des changements et compteurs de lecture (DEC-077 point 1) ---
+
+    type Ids = std::collections::BTreeSet<String>;
+
+    fn ids(v: &[&str]) -> Ids {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn log_of(st: &Store) -> ChangeLog {
+        st.change_log().expect("journal tenu").clone()
+    }
+
+    fn expected(
+        inserted: &[&str],
+        deleted: &[&str],
+        changed: &[&str],
+        files: &[&str],
+        sources: &[&str],
+    ) -> ChangeLog {
+        ChangeLog {
+            inserted: ids(inserted),
+            deleted: ids(deleted),
+            declarations_changed: ids(changed),
+            files: ids(files),
+            removed_sources: ids(sources),
+        }
+    }
+
+    fn settle(st: &mut Store) {
+        crate::resolve::resolve(st).unwrap();
+        assert_eq!(log_of(st), ChangeLog::default());
+    }
+
+    fn jref(src: &Node, target: &str) -> Ref {
+        pref(&src.id, target, Some(CTX))
+    }
+
+    /// a.java : A, B, S (partagé) ; c.java : S, C. Graphe résolu, journal vide.
+    fn shared_graph(repo: &Path) -> Store {
+        let mut st = Store::open_or_create(repo).unwrap();
+        st.insert_pending_files(&[file("a.java"), file("c.java")])
+            .unwrap();
+        let (a, b, s) = (
+            ty("p.A", "a.java"),
+            ty("p.B", "a.java"),
+            ty("p.S", "a.java"),
+        );
+        let (s2, c) = (ty("p.S", "c.java"), ty("p.C", "c.java"));
+        st.replace_structure(
+            "a.java",
+            &[a.clone(), b.clone(), s],
+            &[jref(&a, "p.C"), jref(&b, "p.S")],
+        )
+        .unwrap();
+        st.replace_structure("c.java", &[s2, c.clone()], &[jref(&c, "p.A")])
+            .unwrap();
+        settle(&mut st);
+        st
+    }
+
+    #[test]
+    fn req066_journal_is_none_or_empty_according_to_the_marker() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        assert!(st.change_log().is_none());
+        st.insert_pending_files(&[file("a.java")]).unwrap();
+        st.reset_with_pending_files(&[file("a.java")]).unwrap();
+        assert!(st.change_log().is_none());
+        // Base fraîche : le journal n'est pas tenu.
+        let a = ty("p.A", "a.java");
+        st.replace_structure("a.java", std::slice::from_ref(&a), &[jref(&a, "x")])
+            .unwrap();
+        assert!(st.change_log().is_none());
+        drop(st);
+        // Graphe `à résoudre` à l'ouverture.
+        let mut st = Store::open_existing(dir.path()).unwrap();
+        assert!(st.change_log().is_none());
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(log_of(&st), ChangeLog::default());
+        st.replace_structure("a.java", std::slice::from_ref(&a), &[])
+            .unwrap();
+        assert!(!log_of(&st).is_empty());
+        drop(st);
+        // Écriture sans passe : le marqueur est `à résoudre`.
+        let mut st = Store::open_existing(dir.path()).unwrap();
+        assert!(st.change_log().is_none());
+        crate::resolve::resolve(&mut st).unwrap();
+        drop(st);
+        // Graphe `à jour` à l'ouverture : journal vide.
+        let mut st = Store::open_existing(dir.path()).unwrap();
+        assert_eq!(st.change_log(), Some(&ChangeLog::default()));
+        st.reset().unwrap();
+        assert!(st.change_log().is_none());
+        // Un graphe créé est `à résoudre`.
+        let other = tempdir().unwrap();
+        let st = Store::open_or_create(other.path()).unwrap();
+        assert!(st.change_log().is_none());
+    }
+
+    #[test]
+    fn req066_journal_of_a_new_file() {
+        let dir = tempdir().unwrap();
+        let mut st = shared_graph(dir.path());
+        st.insert_pending_files(&[file("d.java")]).unwrap();
+        assert_eq!(log_of(&st), ChangeLog::default());
+        let d = ty("p.D", "d.java");
+        st.replace_structure("d.java", std::slice::from_ref(&d), &[jref(&d, "p.A")])
+            .unwrap();
+        assert_eq!(
+            log_of(&st),
+            expected(&["type:p.D"], &[], &["type:p.D"], &["d.java"], &[])
+        );
+        // Sans référence, le fichier n'est pas dans le journal.
+        st.insert_pending_files(&[file("e.java")]).unwrap();
+        st.replace_structure("e.java", &[ty("p.E", "e.java")], &[])
+            .unwrap();
+        let log = log_of(&st);
+        assert!(log.inserted.contains("type:p.E"));
+        assert!(!log.files.contains("e.java"));
+    }
+
+    #[test]
+    fn req066_journal_of_a_modified_file() {
+        let dir = tempdir().unwrap();
+        let mut st = shared_graph(dir.path());
+        let (a, s) = (ty("p.A", "a.java"), ty("p.S", "a.java"));
+        let d = ty("p.D", "a.java");
+        // B retiré, D ajouté, A et S redéclarés à l'identique, références réécrites.
+        st.replace_structure(
+            "a.java",
+            &[a.clone(), s, d],
+            &[jref(&a, "p.C"), jref(&a, "p.D")],
+        )
+        .unwrap();
+        assert_eq!(
+            log_of(&st),
+            expected(
+                &["type:p.D"],
+                &["type:p.B"],
+                &["type:p.B", "type:p.D"],
+                &["a.java"],
+                &["type:p.A", "type:p.B"]
+            )
+        );
+    }
+
+    #[test]
+    fn req066_journal_shared_node_kept_but_declarations_changed() {
+        let dir = tempdir().unwrap();
+        let mut st = shared_graph(dir.path());
+        let (a, b) = (ty("p.A", "a.java"), ty("p.B", "a.java"));
+        st.replace_structure("a.java", &[a.clone(), b.clone()], &[jref(&a, "p.C")])
+            .unwrap();
+        // S n'est plus déclaré par a.java mais l'est encore par c.java : conservé.
+        assert_eq!(
+            log_of(&st),
+            expected(
+                &[],
+                &[],
+                &["type:p.S"],
+                &["a.java"],
+                &["type:p.A", "type:p.B"]
+            )
+        );
+        assert!(st.node_by_id("type:p.S").unwrap().is_some());
+    }
+
+    #[test]
+    fn req066_journal_ignores_a_summary_only_change() {
+        let dir = tempdir().unwrap();
+        let mut st = shared_graph(dir.path());
+        st.apply_enrichment(
+            "a.java",
+            "h",
+            "m",
+            &[("type:p.A".into(), "résumé".into())],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(log_of(&st).is_empty(), "{:?}", log_of(&st));
+        // Même chose en réécrivant la structure : seules les références y figurent.
+        let (a, b, s) = (
+            ty("p.A", "a.java"),
+            ty("p.B", "a.java"),
+            ty("p.S", "a.java"),
+        );
+        st.replace_structure("a.java", &[a.clone(), b.clone(), s], &[jref(&a, "p.C")])
+            .unwrap();
+        let log = log_of(&st);
+        assert!(log.declarations_changed.is_empty() && log.inserted.is_empty());
+        assert!(log.deleted.is_empty());
+    }
+
+    #[test]
+    fn req066_journal_of_enrichments() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        let d = ty("p.D", "a.md");
+        st.replace_structure("a.md", std::slice::from_ref(&d), &[])
+            .unwrap();
+        settle(&mut st);
+        let write = |st: &mut Store, concepts: &[&str], refs: &[(&str, &str)]| {
+            st.apply_enrichments(
+                "m",
+                &[EnrichmentWrite {
+                    path: "a.md".into(),
+                    hash: "h".into(),
+                    summaries: vec![],
+                    concepts: concepts.iter().map(|c| concept(c)).collect(),
+                    refs: refs.iter().map(|(s, t)| mention(s, t)).collect(),
+                }],
+            )
+            .unwrap();
+        };
+        // Concept ajouté.
+        write(&mut st, &["c1"], &[("type:p.D", "c1")]);
+        assert_eq!(
+            log_of(&st),
+            expected(&["concept:c1"], &[], &["concept:c1"], &["a.md"], &[])
+        );
+        settle(&mut st);
+        // Concept remplacé : c1 retiré, c2 ajouté, références `llm` remplacées.
+        write(&mut st, &["c2"], &[("type:p.D", "c2")]);
+        assert_eq!(
+            log_of(&st),
+            expected(
+                &["concept:c2"],
+                &["concept:c1"],
+                &["concept:c1", "concept:c2"],
+                &["a.md"],
+                &["type:p.D"]
+            )
+        );
+        settle(&mut st);
+        // Concept conservé, référence `llm` remplacée seule.
+        write(
+            &mut st,
+            &["c2"],
+            &[("type:p.D", "c2"), ("type:p.D", "c2 bis")],
+        );
+        assert_eq!(
+            log_of(&st),
+            expected(&[], &[], &[], &["a.md"], &["type:p.D"])
+        );
+        settle(&mut st);
+        // Concept retiré, plus aucune référence.
+        write(&mut st, &[], &[]);
+        assert_eq!(
+            log_of(&st),
+            expected(
+                &[],
+                &["concept:c2"],
+                &["concept:c2"],
+                &["a.md"],
+                &["type:p.D"]
+            )
+        );
+        // Un enregistrement vide ne change rien.
+        settle(&mut st);
+        write(&mut st, &[], &[]);
+        assert!(log_of(&st).is_empty());
+    }
+
+    #[test]
+    fn req066_journal_of_removed_files() {
+        let dir = tempdir().unwrap();
+        let mut st = shared_graph(dir.path());
+        st.remove_files(&["a.java"]).unwrap();
+        // A et B orphelins supprimés, S partagé conservé.
+        assert_eq!(
+            log_of(&st),
+            expected(
+                &[],
+                &["type:p.A", "type:p.B"],
+                &["type:p.A", "type:p.B", "type:p.S"],
+                &["a.java"],
+                &["type:p.A", "type:p.B"]
+            )
+        );
+        assert!(st.node_by_id("type:p.S").unwrap().is_some());
+        st.remove_files(&["c.java", "inconnu.java"]).unwrap();
+        let log = log_of(&st);
+        assert!(log.deleted.contains("type:p.S") && log.deleted.contains("type:p.C"));
+        assert!(log.files.contains("c.java") && !log.files.contains("inconnu.java"));
+        assert!(log.removed_sources.contains("type:p.C"));
+    }
+
+    #[test]
+    fn req066_failed_transaction_leaves_the_journal_unchanged() {
+        let dir = tempdir().unwrap();
+        let mut st = shared_graph(dir.path());
+        let d = ty("p.D", "a.java");
+        st.insert_pending_files(&[file("d.java")]).unwrap();
+        st.replace_structure("d.java", &[ty("p.D", "d.java")], &[])
+            .unwrap();
+        let before = log_of(&st);
+        st.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_c BEFORE DELETE ON files WHEN old.path = 'c.java'
+                 BEGIN SELECT RAISE(ABORT, 'test'); END;",
+            )
+            .unwrap();
+        assert!(st.remove_files(&["a.java", "c.java"]).is_err());
+        assert_eq!(log_of(&st), before);
+        // Référence refusée : rien n'est journalisé non plus.
+        let bad = Ref {
+            kind: EdgeKind::Contains,
+            ..pref(&d.id, "x", None)
+        };
+        assert!(st
+            .replace_structure("d.java", &[ty("p.D", "d.java")], &[bad])
+            .is_err());
+        assert_eq!(log_of(&st), before);
+    }
+
+    #[test]
+    fn req066_dependency_nodes_of_a_pass_are_in_the_next_journal() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("pom.xml")]).unwrap();
+        let module = |q: &str| Node::new(NodeKind::Module, q, "m", Some("pom.xml"), None, None);
+        let m = module("com.acme:m");
+        let dep = |t: &str| Ref {
+            kind: EdgeKind::DependsOn,
+            ..pref(&m.id, t, None)
+        };
+        st.replace_structure("pom.xml", std::slice::from_ref(&m), &[dep("org.x:x")])
+            .unwrap();
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(
+            log_of(&st),
+            expected(&["dependency:org.x:x"], &[], &[], &[], &[])
+        );
+        // Dépendance remplacée : x supprimé, y créé ; le journal de la passe suivante les nomme.
+        st.replace_structure("pom.xml", std::slice::from_ref(&m), &[dep("org.y:y")])
+            .unwrap();
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(
+            log_of(&st),
+            expected(
+                &["dependency:org.y:y"],
+                &["dependency:org.x:x"],
+                &[],
+                &[],
+                &[]
+            )
+        );
+        // Passe sans changement : journal vide.
+        crate::resolve::resolve(&mut st).unwrap();
+        assert!(log_of(&st).is_empty());
+    }
+
+    #[test]
+    fn req066_read_counters_count_node_and_edge_rows() {
+        let dir = tempdir().unwrap();
+        let mut st = shared_graph(dir.path());
+        // Quatre nœuds (A, B, S, C) et trois liens : A→C, B→S, C→A.
+        assert_eq!(st.count_nodes().unwrap(), 4);
+        let n_edges = st.edges().unwrap().len();
+        assert_eq!(n_edges, 3);
+        reset_diagnostics();
+        assert_eq!(diagnostics().node_rows_read(), 0);
+        assert_eq!(diagnostics().edge_rows_read(), 0);
+        st.nodes().unwrap();
+        assert_eq!(diagnostics().node_rows_read(), 4);
+        st.node_by_id("type:p.A").unwrap();
+        st.node_by_id("type:absent").unwrap();
+        assert_eq!(diagnostics().node_rows_read(), 5);
+        let found = st.nodes_matching("p.A").unwrap();
+        // Chaque requête de résolution compte ses lignes rendues.
+        // `p.A` : une seule ligne, par `RESOLVE_QUALIFIED` (ni identifiant, ni nom court, ni suffixe
+        // à frontière ne correspondent) ; 5 lignes déjà lues.
+        assert_eq!(found.len(), 1);
+        assert_eq!(diagnostics().node_rows_read(), 5 + 1);
+        reset_diagnostics();
+        st.edges().unwrap();
+        assert_eq!(diagnostics().edge_rows_read(), 3);
+        st.edges_at("type:p.A", true).unwrap();
+        st.edges_at("type:p.A", false).unwrap();
+        assert_eq!(diagnostics().edge_rows_read(), 5);
+        assert_eq!(diagnostics().node_rows_read(), 0);
+        // Les agrégats ne comptent pas.
+        st.count_edges().unwrap();
+        st.count_nodes().unwrap();
+        st.count_unresolved().unwrap();
+        assert_eq!(diagnostics().edge_rows_read(), 5);
+        // La lecture du diff de `replace_edges` compte les liens stockés.
+        reset_diagnostics();
+        st.replace_edges(&[]).unwrap();
+        assert_eq!(diagnostics().edge_rows_read(), 3);
+        // Passes et références réévaluées.
+        reset_diagnostics();
+        note_pass(false);
+        note_pass(true);
+        note_pass(true);
+        note_refs_reevaluated(7);
+        let d = diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (1, 2));
+        assert_eq!(d.refs_reevaluated(), 7);
+        reset_diagnostics();
+        assert_eq!(diagnostics(), Diagnostics::default());
+        // La passe complète lit les nœuds et les liens de la passe.
+        crate::resolve::resolve(&mut st).unwrap();
+        let d = diagnostics();
+        // Nœuds : 4 (`nodes()` de la passe) + 4 (`nodes()` du résumé) + 0 (aucun nœud
+        // `dependency` lu par `replace_dependencies_tx`). Liens : 0 (diff de `replace_edges_tx` :
+        // `replace_edges(&[])` les a tous supprimés) + 3 (`edges()` du résumé, sur les liens écrits).
+        assert_eq!((d.node_rows_read(), d.edge_rows_read()), (8, 3));
     }
 }
