@@ -5,6 +5,8 @@
 mod gen_js;
 #[path = "support/gen_repo.rs"]
 mod gen_repo;
+#[path = "support/mod.rs"]
+mod support;
 
 use assert_cmd::cargo::cargo_bin;
 use std::path::PathBuf;
@@ -634,5 +636,109 @@ fn perf_req063_ac5_taille_du_graphe() {
             u0 - c0 / 2
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Empreinte de l'export normalisé (DEC-080 : l'ordre des non résolues n'est pas comparé).
+fn normalized_hash(f: &Fixture) -> String {
+    let (_, out) = timed(f, &["export", "--format", "json", "--output", "-"]);
+    let n = support::normalized_export(&out.stdout);
+    blake3::hash(n.as_bytes()).to_hex().to_string()
+}
+
+/// Durées (ms) des lignes `résolution:` de la sortie d'erreur d'une commande `--verbose`.
+fn resolution_ms(out: &Output) -> Vec<u64> {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter_map(|l| l.split("résolution: ").nth(1))
+        .filter_map(|r| r.split(" ms").next()?.trim().parse().ok())
+        .collect()
+}
+
+/// AC-066-6 : mesures de départ de la résolution après un fichier modifié (`build` puis `update`).
+/// Sur HEAD (0.21.0), seule l'égalité des empreintes est affirmée ; le rapport des durées (≤ ¼)
+/// est ajouté avec la passe incrémentale.
+#[test]
+#[ignore]
+fn perf_req066_ac6_resolution_incrementale() {
+    let _g = serial();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["gen_js", "gen_repo"] {
+        let root = base.join(format!("target/perf-incremental-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let mock = root.join("mock");
+        let edited = if name == "gen_repo" {
+            gen_repo::generate(&repo, &mock);
+            gen_repo::java_path(1234)
+        } else {
+            gen_js::generate(&repo, &mock);
+            gen_js::path(gen_js::EDITED)
+        };
+        let config = root.join("config.toml");
+        std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        let f = Fixture { repo, config, mock };
+        let (_, built) = timed(&f, &["build", "--no-llm", "--verbose"]);
+        let build_ms = resolution_ms(&built);
+        assert_eq!(build_ms.len(), 1, "{name} : lignes résolution du build");
+        // Laisse passer la fenêtre « racy » avant la modification.
+        std::thread::sleep(Duration::from_millis(2_100));
+        let path = f.repo.join(edited);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let extra = if name == "gen_repo" {
+            "\n    // méthode ajoutée\n"
+        } else {
+            "\nexport function incrementalExtra(): number {\n  return 1;\n}\n"
+        };
+        let text = if name == "gen_repo" {
+            let i = text.rfind('}').expect("accolade finale");
+            format!(
+                "{}    public int incrementalExtra() {{\n        return 1;\n    }}\n{}",
+                &text[..i],
+                &text[i..]
+            )
+        } else {
+            format!("{text}{extra}")
+        };
+        std::fs::write(&path, text).unwrap();
+        let (_, updated) = timed(&f, &["update", "--no-llm", "--verbose"]);
+        let update_ms = resolution_ms(&updated);
+        assert_eq!(update_ms.len(), 1, "{name} : lignes résolution de l'update");
+        eprintln!(
+            "MESURE {name} : résolution build = {} ms, update = {} ms",
+            build_ms[0], update_ms[0]
+        );
+        let inc = normalized_hash(&f);
+        let copy = root.join("fresh");
+        copy_tree(&f.repo, &copy);
+        let g = Fixture {
+            repo: copy,
+            config: f.config.clone(),
+            mock: f.mock.clone(),
+        };
+        timed(&g, &["build", "--no-llm"]);
+        assert_eq!(
+            inc,
+            normalized_hash(&g),
+            "{name} : export normalisé de l'update != build"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Copie de l'arbre du dépôt sans `.nephila/`.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        if e.file_name() == ".nephila" {
+            continue;
+        }
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            std::fs::copy(e.path(), dest).unwrap();
+        }
     }
 }
