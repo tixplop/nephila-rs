@@ -1,5 +1,8 @@
 //! Filtres d'analyse, partie fichier de projet `.nephila.toml` (REQ-037, DEC-045).
 
+#[path = "support/mod.rs"]
+mod support;
+
 use assert_cmd::Command;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,6 +93,11 @@ impl Env {
 
     fn export(&self) -> String {
         self.ok(&["export", "--output", "-"]).0
+    }
+
+    /// Export normalisé pour comparer deux lancements : l'ordre de `unresolved` n'est pas garanti (DEC-081).
+    fn export_normalized(&self) -> String {
+        support::normalized_export(self.export().as_bytes())
     }
 
     fn status_lines(&self) -> Vec<String> {
@@ -293,7 +301,7 @@ fn graph_without(fixture: &str, remove: &[&str]) -> String {
         fs::remove_file(e.repo.join(r)).unwrap();
     }
     e.ok(&["build"]);
-    e.export()
+    e.export_normalized()
 }
 
 #[test]
@@ -305,7 +313,7 @@ fn req037_ac5_fichier_de_build_exclu_maven() {
     let e = Env::from_fixture("maven3/repo");
     e.project("exclude_types = [\"maven\"]\n");
     e.ok(&["build"]);
-    assert_eq!(e.export(), reference);
+    assert_eq!(e.export_normalized(), reference);
     assert!(!e.export().contains("depends_on"));
     // par update après un build sans filtre
     let e = Env::from_fixture("maven3/repo");
@@ -314,7 +322,7 @@ fn req037_ac5_fichier_de_build_exclu_maven() {
     e.project("exclude_types = [\"maven\"]\n");
     let (out, _) = e.ok(&["update"]);
     assert!(out.starts_with("update terminé"), "{out}");
-    assert_eq!(e.export(), reference);
+    assert_eq!(e.export_normalized(), reference);
 }
 
 #[test]
@@ -341,13 +349,13 @@ fn req037_ac5_npm_exclu_pom_et_package_a_la_racine() {
     make(&r);
     fs::remove_file(r.repo.join("package.json")).unwrap();
     r.ok(&["build"]);
-    let reference = r.export();
+    let reference = r.export_normalized();
     let e = Env::new();
     make(&e);
     e.project("exclude_types = [\"npm\"]\n");
     e.ok(&["build"]);
+    assert_eq!(e.export_normalized(), reference);
     let g = e.export();
-    assert_eq!(g, reference);
     assert!(!g.contains("app-front"));
     assert!(g.contains("module:com.acme:app"));
     // via update après un build complet
@@ -357,7 +365,7 @@ fn req037_ac5_npm_exclu_pom_et_package_a_la_racine() {
     assert!(e.export().contains("app-front"));
     e.project("exclude_types = [\"npm\"]\n");
     e.ok(&["update"]);
-    assert_eq!(e.export(), reference);
+    assert_eq!(e.export_normalized(), reference);
 }
 
 #[test]
@@ -366,13 +374,13 @@ fn req037_ac5_settings_gradle_exclu() {
     let e = Env::from_fixture("gradle/groovy");
     e.project("exclude = [\"settings.gradle\"]\n");
     e.ok(&["build"]);
-    assert_eq!(e.export(), reference);
+    assert_eq!(e.export_normalized(), reference);
     let e = Env::from_fixture("gradle/groovy");
     e.ok(&["build"]);
-    assert_ne!(e.export(), reference);
+    assert_ne!(e.export_normalized(), reference);
     e.project("exclude = [\"settings.gradle\"]\n");
     e.ok(&["update"]);
-    assert_eq!(e.export(), reference);
+    assert_eq!(e.export_normalized(), reference);
 }
 
 #[test]
@@ -582,12 +590,12 @@ fn req037_ac5_options_fichier_de_build_exclu() {
     );
     let e = Env::from_fixture("maven3/repo");
     e.ok(&["build", "--exclude-type", "maven"]);
-    assert_eq!(e.export(), reference);
+    assert_eq!(e.export_normalized(), reference);
 
     let reference = graph_without("gradle/groovy", &["settings.gradle"]);
     let e = Env::from_fixture("gradle/groovy");
     e.ok(&["build", "--exclude", "settings.gradle"]);
-    assert_eq!(e.export(), reference);
+    assert_eq!(e.export_normalized(), reference);
 
     let make = |e: &Env| {
         e.put(
@@ -614,7 +622,7 @@ fn req037_ac5_options_fichier_de_build_exclu() {
     let e = Env::new();
     make(&e);
     e.ok(&["build", "--exclude-type", "npm"]);
-    assert_eq!(e.export(), r.export());
+    assert_eq!(e.export_normalized(), r.export_normalized());
 }
 
 fn log_lines(e: &Env) -> usize {

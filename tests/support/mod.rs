@@ -166,3 +166,11 @@ pub fn normalized_export(raw: &[u8]) -> String {
     }
     serde_json::to_string(&doc).unwrap()
 }
+
+/// Empreinte d'un export JSON : BLAKE3 (hexadécimal) de l'export normalisé. L'ordre de `unresolved`
+/// n'est pas garanti d'un lancement à l'autre (DEC-081) ; seule définition, utilisée par tous les oracles.
+pub fn export_fingerprint(raw: &[u8]) -> String {
+    blake3::hash(normalized_export(raw).as_bytes())
+        .to_hex()
+        .to_string()
+}

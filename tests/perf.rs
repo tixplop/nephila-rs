@@ -501,34 +501,35 @@ fn perf_req021_ac7_help_with_grammars() {
     assert_under("--help (grammaires JS/TS)", d, 50);
 }
 
-/// Empreintes de l'export JSON des gros dépôts, sur le code de la 0.20.0 (AC-065-2) :
+/// Empreintes de l'export JSON normalisé des gros dépôts (l'ordre de `unresolved` n'est pas garanti :
+/// DEC-081), sur le code de la 0.20.0 (AC-065-2) :
 /// `(dépôt, étape, empreinte BLAKE3)`. Relever de nouvelles valeurs avec `NEPHILA_ORACLE_CAPTURE=1`.
 const ORACLE_GROS_DEPOTS: &[(&str, &str, &str)] = &[
     (
         "gen_repo",
         "build",
-        "697d76e547c3511c98c2dac7fd4bc241e301ad8a35d8ebfe092952b3cf870328",
+        "acc20901424008f094fc1e5bdf620270fec208d2d0aa7dd6e7b468d2b553d31e",
     ),
     (
         "gen_repo",
         "update",
-        "df7bf978c1a5c62ad88a41501dafb0c0cd5d6d5725e6e0166b8bd91ccef1680e",
+        "c55d9fc03eff50a2fecc1a558731bdfd6222ce6a2ee2416ca712f711864e8ece",
     ),
     (
         "gen_js",
         "build",
-        "39b2d29cbbf97edf2814c6f2a4ec86a0d21dd624d3608f5710864f3115b6977e",
+        "8fb0d18e27eb481f8409862193c22b260f123ce23b644e8fbc01db0447dced68",
     ),
     (
         "gen_js",
         "update",
-        "1b24971293c2e0aa4dbdaedec81518686003b0e7179b172f4deb89f0e383bd21",
+        "66a74b71c922190eb21a03358399619f75520e2e09de116c969c26b52fa1bdce",
     ),
 ];
 
 fn export_hash(f: &Fixture) -> String {
     let (_, out) = timed(f, &["export", "--format", "json", "--output", "-"]);
-    blake3::hash(&out.stdout).to_hex().to_string()
+    support::export_fingerprint(&out.stdout)
 }
 
 /// AC-065-2 : l'export des gros dépôts, après `build --no-llm` puis après `update`, est celui de la 0.20.0.
@@ -642,8 +643,7 @@ fn perf_req063_ac5_taille_du_graphe() {
 /// Empreinte de l'export normalisé (DEC-080 : l'ordre des non résolues n'est pas comparé).
 fn normalized_hash(f: &Fixture) -> String {
     let (_, out) = timed(f, &["export", "--format", "json", "--output", "-"]);
-    let n = support::normalized_export(&out.stdout);
-    blake3::hash(n.as_bytes()).to_hex().to_string()
+    support::export_fingerprint(&out.stdout)
 }
 
 /// Durées (ms) des lignes `résolution:` de la sortie d'erreur d'une commande `--verbose`.

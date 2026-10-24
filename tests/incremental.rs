@@ -9,7 +9,8 @@
 //! `unresolved` dans l'export brut) dépend de l'ordre d'arrivée des réponses.
 //!
 //! `NEPHILA_ORACLE_CAPTURE=1` réécrit `tests/fixtures/oracle_0_21_0.txt` (une ligne
-//! `dépôt<TAB>étape<TAB>sortie<TAB>code<TAB>empreinte`, triée) ; sans, le test compare.
+//! `dépôt<TAB>étape<TAB>sortie<TAB>code<TAB>empreinte`, triée ; les lignes `export` hachent l'export
+//! normalisé, l'ordre de `unresolved` n'étant pas garanti : DEC-081) ; sans, le test compare.
 
 #[path = "support/schema7.rs"]
 mod schema7;
@@ -18,7 +19,7 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use support::{apply_case, copy_dir, normalized_export, run, CASES};
+use support::{apply_case, copy_dir, export_fingerprint, normalized_export, run, CASES};
 
 enum Op {
     Write(&'static str, &'static str),
@@ -639,9 +640,10 @@ fn hash_line(
     lines.push(format!("{name}\t{step}\t{label}\t{code}\t{hash}"));
 }
 
-/// Ligne `export` : empreinte de l'export JSON brut du dépôt mis à jour (AC-070-2, DEC-080).
+/// Ligne `export` : empreinte de l'export JSON normalisé du dépôt mis à jour (AC-070-2, DEC-080) ;
+/// l'ordre de `unresolved` n'est pas garanti (DEC-081).
 fn export_line(lines: &mut Vec<String>, name: &str, step: &str, raw: &str) {
-    let hash = blake3::hash(raw.as_bytes()).to_hex();
+    let hash = support::export_fingerprint(raw.as_bytes());
     lines.push(format!("{name}\t{step}\texport\t0\t{hash}"));
 }
 
@@ -813,6 +815,46 @@ fn normalized_export_ignore_l_ordre_des_non_resolues_seulement() {
     // `nodes` garde son ordre.
     let swapped = doc("[]").replace(r#"[{"id":"b"},{"id":"a"}]"#, r#"[{"id":"a"},{"id":"b"}]"#);
     assert_ne!(n("[]"), normalized_export(swapped.as_bytes()));
+}
+
+#[test]
+fn req070_ac4_export_fingerprint_ignore_l_ordre_des_non_resolues_seulement() {
+    let doc = |nodes: &str, edges: &str, unres: &str| {
+        format!("{{\"edges\":{edges},\"nodes\":{nodes},\"unresolved\":{unres},\"version\":1}}")
+    };
+    let u1 = r#"{"kind":"calls","source":"a","target":"x"}"#;
+    let u2 = r#"{"kind":"calls","source":"a","target":"y"}"#;
+    let u3 = r#"{"kind":"links_to","source":"b","target":"x"}"#;
+    let (n, e) = (r#"[{"id":"a"},{"id":"b"}]"#, r#"[{"from":"a","to":"b"}]"#);
+    let f = |n: &str, e: &str, u: &str| export_fingerprint(doc(n, e, u).as_bytes());
+    let base = f(n, e, &format!("[{u1},{u2},{u3}]"));
+    assert_eq!(base.len(), 64);
+    assert_eq!(base, f(n, e, &format!("[{u3},{u1},{u2}]")));
+    assert_ne!(base, f(n, e, &format!("[{u1},{u2},{u1}]")));
+    assert_ne!(
+        base,
+        f(
+            n,
+            e,
+            &format!("[{u1},{u2},{}]", u3.replace("\"x\"}", "\"z\"}"))
+        )
+    );
+    assert_ne!(
+        base,
+        f(
+            r#"[{"id":"a"},{"id":"c"}]"#,
+            e,
+            &format!("[{u1},{u2},{u3}]")
+        )
+    );
+    assert_ne!(
+        base,
+        f(
+            n,
+            r#"[{"from":"b","to":"a"}]"#,
+            &format!("[{u1},{u2},{u3}]")
+        )
+    );
 }
 
 // --- REQ-069 : graphe de schéma 7 migré sur place par `update` ---

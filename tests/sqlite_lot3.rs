@@ -1,7 +1,8 @@
 //! Oracle de la 0.20.0 pour le lot 3 SQLite (REQ-065, AC-065-1) : pour chaque dépôt de
 //! `tests/fixtures` et chaque étape (`build --no-llm`, `build` avec le mock, `update` après
-//! modification, ajout et suppression, second `build`), empreinte BLAKE3 de l'export JSON, de
-//! `status` et de `summary`, avec le code de sortie.
+//! modification, ajout et suppression, second `build`), empreinte BLAKE3 de l'export JSON normalisé
+//! (l'ordre de `unresolved` n'est pas garanti : DEC-081), de `status` et de `summary` bruts, avec le
+//! code de sortie.
 //!
 //! `NEPHILA_ORACLE_CAPTURE=1` réécrit `tests/fixtures/oracle_0_20_0.txt` (une ligne
 //! `dépôt<TAB>étape<TAB>sortie<TAB>code<TAB>empreinte`, triée) ; sans, le test compare.
@@ -31,7 +32,11 @@ fn fingerprints(
     for (label, args) in outputs {
         let out = run(repo, config, mock, args);
         let code = out.status.code().map_or(-1, i64::from);
-        let hash = blake3::hash(&out.stdout).to_hex();
+        let hash = if label == "export" {
+            support::export_fingerprint(&out.stdout)
+        } else {
+            blake3::hash(&out.stdout).to_hex().to_string()
+        };
         lines.push(format!("{case}\t{step}\t{label}\t{code}\t{hash}"));
     }
 }

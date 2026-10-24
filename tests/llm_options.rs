@@ -12,6 +12,8 @@ use assert_cmd::cargo::cargo_bin;
 #[allow(dead_code)]
 #[path = "support/fake_server.rs"]
 mod fake_server;
+#[path = "support/mod.rs"]
+mod support;
 use fake_server::FakeServer;
 
 struct Env {
@@ -575,7 +577,7 @@ fn REQ058_AC6_mock_sans_effet() {
         seen.push((
             fs::read_to_string(&log).unwrap_or_default(),
             b.stdout,
-            e.stdout,
+            support::normalized_export(&e.stdout),
         ));
     }
     assert!(!seen[0].0.is_empty(), "le journal du mock est vide");
