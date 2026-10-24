@@ -546,7 +546,7 @@ mod tests {
         let ids: Vec<String> = store.nodes().unwrap().into_iter().map(|n| n.id).collect();
         assert!(ids.contains(&"type:p.A".to_string()), "{ids:?}");
         assert!(!ids.contains(&"type:p.B".to_string()));
-        assert!(finish(&report, "build").is_err());
+        assert!(finish(&report).is_err());
 
         // Après correction, un update analyse le fichier.
         drop(store);
@@ -556,7 +556,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(report.pending, 0);
-        assert!(finish(&report, "update").is_ok());
+        assert!(finish(&report).is_ok());
         let store = Store::open_readonly(repo).unwrap();
         assert!(store.nodes().unwrap().iter().any(|n| n.id == "type:p.B"));
     }

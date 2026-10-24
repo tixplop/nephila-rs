@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+use crate::out::Out;
 use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
@@ -187,6 +189,7 @@ pub fn run(
     as_json: bool,
     check_stale: bool,
     format_retries: Option<u32>,
+    out: &mut Out,
 ) -> Result<()> {
     if question.trim().is_empty() {
         return Err(Error::Message("la question est vide".to_string()));
@@ -199,12 +202,12 @@ pub fn run(
     let (answer, cited) = answer(&store, llm.as_ref(), question, config.format_retries)?;
     if as_json {
         let nodes: Vec<Value> = cited.iter().map(to_json).collect();
-        println!("{}", json!({"answer": answer, "nodes": nodes}));
+        writeln!(out, "{}", json!({"answer": answer, "nodes": nodes}))?;
     } else {
-        println!("{answer}");
-        println!("Nœuds cités :");
+        writeln!(out, "{answer}")?;
+        writeln!(out, "Nœuds cités :")?;
         for n in &cited {
-            println!("- {}", super::describe(n));
+            writeln!(out, "- {}", super::describe(n))?;
         }
     }
     Ok(())

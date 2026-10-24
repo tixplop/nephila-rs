@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::error::Result;
 use crate::filter::{compile_pattern, FileType, Filters, TYPE_LIST};
+use crate::out::Out;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -210,6 +211,12 @@ pub enum Query {
 
 /// Exécute la commande.
 pub fn run(cli: Cli) -> Result<()> {
+    let mut out = Out::stdout();
+    dispatch(&cli, &mut out)?;
+    out.flush()
+}
+
+fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
     match &cli.command {
         Command::Build(o) => {
             crate::progress::init(o.show_progress);
@@ -224,6 +231,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     format_retries: o.format_retries,
                 },
                 o.filters(),
+                out,
             )
         }
         Command::Update(o) => {
@@ -239,16 +247,22 @@ pub fn run(cli: Cli) -> Result<()> {
                     format_retries: o.format_retries,
                 },
                 o.filters(),
+                out,
             )
         }
-        Command::Status(j) => crate::status::run(&cli.repo, j.json),
-        Command::Summary(j) => crate::summary::run(&cli.repo, j.json),
+        Command::Status(j) => crate::status::run(&cli.repo, j.json, out),
+        Command::Summary(j) => crate::summary::run(&cli.repo, j.json, out),
         Command::Export { output, format } => {
-            crate::export::run(&cli.repo, output.as_deref(), *format)
+            crate::export::run(&cli.repo, output.as_deref(), *format, out)
         }
-        Command::Query(Query::Search { terme, limit, json }) => {
-            crate::query::search::run(&cli.repo, terme, *limit, json.json.json, json.check_stale)
-        }
+        Command::Query(Query::Search { terme, limit, json }) => crate::query::search::run(
+            &cli.repo,
+            terme,
+            *limit,
+            json.json.json,
+            json.check_stale,
+            out,
+        ),
         Command::Query(Query::Neighbors {
             nœud,
             depth,
@@ -261,12 +275,20 @@ pub fn run(cli: Cli) -> Result<()> {
             *limit,
             json.json.json,
             json.check_stale,
+            out,
         ),
         Command::Query(Query::Path {
             source,
             cible,
             json,
-        }) => crate::query::path::run(&cli.repo, source, cible, json.json.json, json.check_stale),
+        }) => crate::query::path::run(
+            &cli.repo,
+            source,
+            cible,
+            json.json.json,
+            json.check_stale,
+            out,
+        ),
         Command::Query(Query::Ask {
             question,
             json,
@@ -277,6 +299,7 @@ pub fn run(cli: Cli) -> Result<()> {
             json.json.json,
             json.check_stale,
             *format_retries,
+            out,
         ),
     }
 }

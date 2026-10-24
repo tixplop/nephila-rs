@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use crate::cli::ExportFormat;
 use crate::error::{Error, Result};
+use crate::out::Out;
 use crate::resolve;
 use crate::store::Store;
 
@@ -197,8 +198,8 @@ pub fn output_path(repo: &Path, output: Option<&Path>, ext: &str) -> Target {
 /// Enveloppe du flux de sortie (les tests y branchent un écrivain qui échoue).
 pub(crate) type Wrap<'a> = &'a dyn Fn(Box<dyn Write>) -> Box<dyn Write>;
 
-pub fn run(repo: &Path, output: Option<&Path>, format: ExportFormat) -> Result<()> {
-    run_wrapped(repo, output, format, &|w| w)
+pub fn run(repo: &Path, output: Option<&Path>, format: ExportFormat, out: &mut Out) -> Result<()> {
+    run_wrapped(repo, output, format, &|w| w, out)
 }
 
 /// Écrit le document dans `w` puis vide le tampon.
@@ -222,6 +223,7 @@ pub(crate) fn run_wrapped(
     output: Option<&Path>,
     format: ExportFormat,
     wrap: Wrap,
+    out: &mut Out,
 ) -> Result<()> {
     let store = Store::open_readonly(repo)?;
     // La page est construite avant d'être écrite (V-013).
@@ -236,9 +238,7 @@ pub(crate) fn run_wrapped(
         Target::Stdout => {
             let sink = wrap(Box::new(std::io::stdout().lock()));
             write_document(&store, page.as_deref(), sink).map_err(|e| match e {
-                ExportError::Write(e) => {
-                    Error::Message(format!("écriture sur stdout impossible : {e}"))
-                }
+                ExportError::Write(e) => crate::error::stdout_write(&e),
                 ExportError::Read(e) => e,
             })
         }
@@ -250,10 +250,7 @@ pub(crate) fn run_wrapped(
             // échec, il est supprimé : pas d'export tronqué sous son nom (DEC-092).
             let file = std::fs::File::create(&path).map_err(failed)?;
             match write_document(&store, page.as_deref(), wrap(Box::new(file))) {
-                Ok(()) => {
-                    println!("{}", path.display());
-                    Ok(())
-                }
+                Ok(()) => writeln!(out, "{}", path.display()),
                 Err(e) => {
                     let _ = std::fs::remove_file(&path);
                     Err(match e {

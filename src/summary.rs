@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+use crate::out::Out;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -147,16 +149,16 @@ fn load(store: &Store) -> Result<Value> {
 }
 
 /// Commande `nephila summary` : lecture seule, sans LLM ni configuration.
-pub fn run(repo: &Path, as_json: bool) -> Result<()> {
+pub fn run(repo: &Path, as_json: bool, out: &mut Out) -> Result<()> {
     let store = Store::open_readonly(repo)?;
     let v = load(&store)?;
     if as_json {
-        println!("{v}");
+        writeln!(out, "{v}")?;
         return Ok(());
     }
     let list = |key: &str| v[key].as_array().cloned().unwrap_or_default();
     let modules = list("modules");
-    println!("Modules ({})", modules.len());
+    writeln!(out, "Modules ({})", modules.len())?;
     for m in &modules {
         let deps: Vec<&str> = m["depends_on"]
             .as_array()
@@ -175,30 +177,32 @@ pub fn run(repo: &Path, as_json: bool) -> Result<()> {
             _ => qualified.to_string(),
         };
         if deps.is_empty() {
-            println!("  {name}");
+            writeln!(out, "  {name}")?;
         } else {
-            println!("  {name} -> {}", deps.join(", "));
+            writeln!(out, "  {name} -> {}", deps.join(", "))?;
         }
     }
-    println!("Nœuds les plus reliés");
+    writeln!(out, "Nœuds les plus reliés")?;
     for n in list("top_nodes") {
-        println!(
+        writeln!(
+            out,
             "  {} (degré {})",
             n["id"].as_str().unwrap_or("?"),
             n["degree"]
-        );
+        )?;
     }
-    println!("Thèmes");
+    writeln!(out, "Thèmes")?;
     let themes = list("themes");
     if themes.is_empty() {
-        println!("  aucun thème (graphe non enrichi)");
+        writeln!(out, "  aucun thème (graphe non enrichi)")?;
     }
     for t in themes {
-        println!(
+        writeln!(
+            out,
             "  {} ({} mentions)",
             t["concept"].as_str().unwrap_or("?"),
             t["mentions"]
-        );
+        )?;
     }
     Ok(())
 }

@@ -161,3 +161,62 @@ fn req081_ac2_pas_de_catch_unwind() {
     cherche_catch_unwind(&root.join("src"), root, &mut found);
     assert!(found.is_empty(), "catch_unwind : {found:?}");
 }
+
+/// Vrai si la ligne contient `motif` hors d'un identifiant plus long (`eprintln!` n'est pas
+/// `println!`).
+fn appelle(line: &str, motif: &str) -> bool {
+    line.match_indices(motif).any(|(i, _)| {
+        !line[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+/// Fichiers `src/**/*.rs`, avec leur texte lu jusqu'à la première ligne `#[cfg(test)]`.
+fn sources_hors_tests(dir: &Path, root: &Path, found: &mut Vec<(String, Vec<String>)>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            sources_hors_tests(&p, root, found);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&p).unwrap();
+            let lines = text
+                .lines()
+                .take_while(|l| l.trim() != "#[cfg(test)]")
+                .map(str::to_string)
+                .collect();
+            found.push((p.strip_prefix(root).unwrap().display().to_string(), lines));
+        }
+    }
+}
+
+#[test]
+fn req086_ac3_aucun_println_et_un_seul_texte_d_erreur_de_stdout() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    sources_hors_tests(&root.join("src"), root, &mut files);
+    let mut found = Vec::new();
+    for (name, lines) in &files {
+        for (i, line) in lines.iter().enumerate() {
+            if appelle(line, "println!") || appelle(line, "print!(") {
+                found.push(format!("{name}:{}", i + 1));
+            }
+        }
+    }
+    assert!(found.is_empty(), "println!/print! hors tests : {found:?}");
+
+    let mut texts = Vec::new();
+    for (name, lines) in &files {
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("écriture sur stdout impossible") {
+                texts.push(format!("{name}:{}", i + 1));
+            }
+        }
+    }
+    assert_eq!(texts.len(), 1, "texte d'E-17 : {texts:?}");
+}

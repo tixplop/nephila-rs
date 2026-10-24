@@ -7,6 +7,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::out::Out;
+
 use serde_json::{json, Value};
 
 use super::graph::{Graph, Lazy};
@@ -122,6 +124,7 @@ pub fn run(
     limit: Option<usize>,
     as_json: bool,
     check_stale: bool,
+    out: &mut Out,
 ) -> Result<()> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 {
@@ -143,7 +146,8 @@ pub fn run(
     let (uses, used_by) = (&uses[..n_uses], &used_by[..n_used_by]);
 
     if as_json {
-        println!(
+        writeln!(
+            out,
             "{}",
             json!({
                 "node": start.qualified,
@@ -151,29 +155,29 @@ pub fn run(
                 "used_by": used_by.iter().map(to_json).collect::<Vec<_>>(),
                 "remaining": remaining,
             })
-        );
+        )?;
         return Ok(());
     }
     if total == 0 {
-        println!("aucun voisin pour {}", start.qualified);
+        writeln!(out, "aucun voisin pour {}", start.qualified)?;
         return Ok(());
     }
     for (title, list) in [("utilise :", uses), ("utilisé par :", used_by)] {
         if list.is_empty() {
             continue;
         }
-        println!("{title}");
+        writeln!(out, "{title}")?;
         for f in list {
             let at = if depth > 1 {
                 format!(" [profondeur {}]", f.depth)
             } else {
                 String::new()
             };
-            println!("  {} {}{at}", f.kind, super::describe(&f.node));
+            writeln!(out, "  {} {}{at}", f.kind, super::describe(&f.node))?;
         }
     }
     if remaining > 0 {
-        println!("{}", super::remaining_line(remaining));
+        writeln!(out, "{}", super::remaining_line(remaining))?;
     }
     Ok(())
 }

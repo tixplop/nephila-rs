@@ -3,6 +3,8 @@
 
 use std::path::Path;
 
+use crate::out::Out;
+
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -114,6 +116,7 @@ pub fn run(
     limit: Option<usize>,
     as_json: bool,
     check_stale: bool,
+    out: &mut Out,
 ) -> Result<()> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 {
@@ -132,13 +135,17 @@ pub fn run(
     let shown = &hits[..hits.len() - remaining];
     if as_json {
         let results: Vec<Value> = shown.iter().map(|n| to_json(n)).collect();
-        println!("{}", json!({"results": results, "remaining": remaining}));
+        writeln!(
+            out,
+            "{}",
+            json!({"results": results, "remaining": remaining})
+        )?;
     } else {
         for n in shown {
-            println!("{}", line(n));
+            writeln!(out, "{}", line(n))?;
         }
         if remaining > 0 {
-            println!("{}", super::remaining_line(remaining));
+            writeln!(out, "{}", super::remaining_line(remaining))?;
         }
     }
     Ok(())

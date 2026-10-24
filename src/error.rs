@@ -33,6 +33,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Code de sortie d'une erreur d'exécution (l'usage clap sort avec 2).
 pub const EXIT_ERROR: i32 = 1;
 
+/// Erreur E-17 (écriture sur la sortie standard) : seule source du texte.
+pub fn stdout_write(e: &std::io::Error) -> Error {
+    Error::Message(format!("écriture sur stdout impossible : {e}"))
+}
+
 impl Error {
     /// Variable d'environnement numérique mal formée (E-14) : seule source du texte.
     pub fn bad_integer_env(name: &str, value: &str) -> Error {

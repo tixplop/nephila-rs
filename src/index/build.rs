@@ -11,6 +11,7 @@ use crate::index::lock::RepoLock;
 use crate::index::{enrich, structure};
 use crate::llm::{build_llm, Llm};
 use crate::model::{FileRecord, FileState};
+use crate::out::Out;
 use crate::resolve;
 use crate::scan;
 use crate::store::{db_path, Store};
@@ -192,6 +193,7 @@ pub fn run(
     verbose: bool,
     over: Overrides,
     cli_filters: Filters,
+    out: &mut Out,
 ) -> Result<()> {
     trace::init(verbose);
     check_repo(repo)?;
@@ -211,7 +213,8 @@ pub fn run(
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
     let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
-    let done = finish(&report, "build");
+    write_report(out, &report, "build")?;
+    let done = finish(&report);
     warn_transient(&cli_filters);
     done
 }
@@ -236,10 +239,14 @@ pub(crate) fn warn_transient(cli_filters: &Filters) {
     }
 }
 
-/// Affiche le bilan ; une clé refusée est rendue telle quelle (REQ-054) ; un fichier resté en attente, un fichier à enrichir (LLM actif) ou un arrêt
+/// Écrit la ligne de bilan sur stdout ; en cas d'échec (E-17), la commande s'arrête là.
+pub(crate) fn write_report(out: &mut Out, report: &BuildReport, verb: &str) -> Result<()> {
+    writeln!(out, "{}", report.line_for(verb))
+}
+
+/// Erreurs de fin de commande ; une clé refusée est rendue telle quelle (REQ-054) ; un fichier resté en attente, un fichier à enrichir (LLM actif) ou un arrêt
 /// de l'envoi rend une erreur (code non nul).
-pub(crate) fn finish(report: &BuildReport, verb: &str) -> Result<()> {
-    println!("{}", report.line_for(verb));
+pub(crate) fn finish(report: &BuildReport) -> Result<()> {
     if let Some(message) = &report.key_refused {
         return Err(Error::InvalidKey(message.clone()));
     }
@@ -405,6 +412,10 @@ pub(crate) fn finalize(
 
 #[cfg(test)]
 mod tests {
+    fn sink() -> Out {
+        Out::new(Box::new(Vec::new()))
+    }
+
     use super::*;
     use crate::scan::reads;
     use std::sync::atomic::Ordering;
@@ -749,7 +760,13 @@ mod tests {
             assert_eq!(String::from_utf8(out).unwrap(), expected, "{name}");
             drop(store);
             let file = tmp.path().join("out.json");
-            crate::export::run(&repo, Some(&file), crate::cli::ExportFormat::Json).unwrap();
+            crate::export::run(
+                &repo,
+                Some(&file),
+                crate::cli::ExportFormat::Json,
+                &mut sink(),
+            )
+            .unwrap();
             assert_eq!(
                 std::fs::read_to_string(&file).unwrap(),
                 format!("{expected}\n"),
@@ -784,10 +801,22 @@ mod tests {
             }
             let before = graph_db_hash(&repo);
             resolve::passes::reset();
-            crate::export::run(&repo, Some(&json), crate::cli::ExportFormat::Json).unwrap();
+            crate::export::run(
+                &repo,
+                Some(&json),
+                crate::cli::ExportFormat::Json,
+                &mut sink(),
+            )
+            .unwrap();
             assert_eq!(resolve::passes::count(), passes, "{label} : json");
             resolve::passes::reset();
-            crate::export::run(&repo, Some(&html), crate::cli::ExportFormat::Html).unwrap();
+            crate::export::run(
+                &repo,
+                Some(&html),
+                crate::cli::ExportFormat::Html,
+                &mut sink(),
+            )
+            .unwrap();
             assert_eq!(resolve::passes::count(), 0, "{label} : html");
             assert_eq!(graph_db_hash(&repo), before, "{label} : graph.db modifié");
             let store = Store::open_readonly(&repo).unwrap();
@@ -844,7 +873,8 @@ mod tests {
             crate::cli::ExportFormat::Html,
         ] {
             let file = tmp.path().join("out.export");
-            let err = crate::export::run_wrapped(&repo, Some(&file), format, wrap).unwrap_err();
+            let err = crate::export::run_wrapped(&repo, Some(&file), format, wrap, &mut sink())
+                .unwrap_err();
             assert_eq!(
                 err.to_string(),
                 format!(
@@ -855,7 +885,8 @@ mod tests {
             );
             assert!(!file.exists(), "{format:?} : fichier laissé");
             let err =
-                crate::export::run_wrapped(&repo, Some(Path::new("-")), format, wrap).unwrap_err();
+                crate::export::run_wrapped(&repo, Some(Path::new("-")), format, wrap, &mut sink())
+                    .unwrap_err();
             assert_eq!(
                 err.to_string(),
                 "écriture sur stdout impossible : disque plein simulé",
@@ -865,8 +896,14 @@ mod tests {
         // Un export du même nom qui existait est perdu (DEC-092, sans fichier temporaire).
         let file = tmp.path().join("old.json");
         std::fs::write(&file, "ancien").unwrap();
-        crate::export::run_wrapped(&repo, Some(&file), crate::cli::ExportFormat::Json, wrap)
-            .unwrap_err();
+        crate::export::run_wrapped(
+            &repo,
+            Some(&file),
+            crate::cli::ExportFormat::Json,
+            wrap,
+            &mut sink(),
+        )
+        .unwrap_err();
         assert!(!file.exists());
     }
 }

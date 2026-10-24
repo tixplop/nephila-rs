@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::out::Out;
+
 use serde_json::json;
 
 use super::graph::{Graph, Lazy};
@@ -147,7 +149,14 @@ fn shortest(from: &Node, to: &Node, g: &impl Graph) -> Result<Option<Vec<Step>>>
     Ok(Some(steps))
 }
 
-pub fn run(repo: &Path, from: &str, to: &str, as_json: bool, check_stale: bool) -> Result<()> {
+pub fn run(
+    repo: &Path,
+    from: &str,
+    to: &str,
+    as_json: bool,
+    check_stale: bool,
+    out: &mut Out,
+) -> Result<()> {
     let store = super::open(repo, check_stale)?;
     let a = lookup::require(&store, from)?;
     let b = lookup::require(&store, to)?;
@@ -177,9 +186,9 @@ pub fn run(repo: &Path, from: &str, to: &str, as_json: bool, check_stale: bool) 
                 })
             })
             .collect();
-        println!("{}", json!({"path": list}));
+        writeln!(out, "{}", json!({"path": list}))?;
     } else if steps.is_empty() {
-        println!("{}", super::describe(&a));
+        writeln!(out, "{}", super::describe(&a))?;
     } else {
         for s in &steps {
             let verb = if s.reversed {
@@ -187,7 +196,7 @@ pub fn run(repo: &Path, from: &str, to: &str, as_json: bool, check_stale: bool) 
             } else {
                 s.kind.as_str()
             };
-            println!("{} {verb} {}", s.from.qualified, s.to.qualified);
+            writeln!(out, "{} {verb} {}", s.from.qualified, s.to.qualified)?;
         }
     }
     Ok(())

@@ -11,6 +11,7 @@ use crate::index::lock::RepoLock;
 use crate::index::structure;
 use crate::llm::Llm;
 use crate::model::{FileRecord, FileState};
+use crate::out::Out;
 use crate::scan::ScannedFile;
 use crate::store::{db_path, Store};
 use crate::trace;
@@ -24,6 +25,7 @@ pub fn run(
     verbose: bool,
     over: build::Overrides,
     cli_filters: Filters,
+    out: &mut Out,
 ) -> Result<()> {
     trace::init(verbose);
     build::check_repo(repo)?;
@@ -44,16 +46,20 @@ pub fn run(
     if !db_path(repo).is_file() {
         eprintln!("aucun graphe : build complet");
         let report = build::build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
-        let done = build::finish(&report, "build");
+        build::write_report(out, &report, "build")?;
+        let done = build::finish(&report);
         build::warn_transient(&cli_filters);
         return done;
     }
     let done = match update(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)? {
         None => {
-            println!("graphe à jour");
+            writeln!(out, "graphe à jour")?;
             Ok(())
         }
-        Some(report) => build::finish(&report, "update"),
+        Some(report) => {
+            build::write_report(out, &report, "update")?;
+            build::finish(&report)
+        }
     };
     build::warn_transient(&cli_filters);
     done

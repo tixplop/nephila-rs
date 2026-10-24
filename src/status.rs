@@ -7,9 +7,10 @@ use serde_json::json;
 use crate::diff;
 use crate::error::Result;
 use crate::filter::ProjectFilters;
+use crate::out::Out;
 use crate::store::Store;
 
-pub fn run(repo: &Path, as_json: bool) -> Result<()> {
+pub fn run(repo: &Path, as_json: bool, out: &mut Out) -> Result<()> {
     let matcher = ProjectFilters::load_matcher(repo)?;
     let store = Store::open_readonly(repo)?;
     let d = diff::compute(repo, &store, &matcher, crate::index::default_jobs())?;
@@ -21,19 +22,19 @@ pub fn run(repo: &Path, as_json: bool) -> Result<()> {
             .map(|c| json!({"chemin": c.path, "état": c.change.label()}))
             .collect();
         let v = json!({"a_jour": d.is_up_to_date(), "fichiers": files, "to_enrich": to_enrich});
-        println!("{v}");
+        writeln!(out, "{v}")?;
         return Ok(());
     }
     if d.is_up_to_date() {
-        println!("graphe à jour");
+        writeln!(out, "graphe à jour")?;
     } else {
-        println!("graphe pas à jour");
+        writeln!(out, "graphe pas à jour")?;
         for c in &d.changes {
-            println!("{}\t{}", c.change.label(), c.path);
+            writeln!(out, "{}\t{}", c.change.label(), c.path)?;
         }
     }
     if to_enrich > 0 {
-        println!("{to_enrich} fichiers à enrichir (résumés et concepts)");
+        writeln!(out, "{to_enrich} fichiers à enrichir (résumés et concepts)")?;
     }
     Ok(())
 }

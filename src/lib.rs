@@ -8,6 +8,7 @@ pub mod filter;
 pub mod index;
 pub mod llm;
 pub mod model;
+pub mod out;
 pub mod parse;
 pub mod progress;
 pub mod query;
