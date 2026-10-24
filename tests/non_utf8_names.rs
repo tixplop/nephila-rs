@@ -190,7 +190,7 @@ fn REQ004_AC10_scan_et_walk_ne_retiennent_qu_un_fichier() {
     };
     let mut seen = Vec::new();
     for r in [&r1, &r2] {
-        let res = nephila::scan::scan(&r.root, &[], &Matcher::none()).unwrap();
+        let res = nephila::scan::scan(&r.root, &[], &Matcher::none(), 1).unwrap();
         assert_eq!(res.files.len(), 1, "{:?}", res.warnings);
         assert_eq!(res.files[0].path, "A\u{FFFD}.java");
         assert_eq!(
@@ -201,7 +201,7 @@ fn REQ004_AC10_scan_et_walk_ne_retiennent_qu_un_fichier() {
         for part in ["A\u{FFFD}.java", "A\\xFF.java", "A\\xFE.java"] {
             assert!(res.warnings[0].contains(part), "{:?}", res.warnings);
         }
-        let w = nephila::scan::walk(&r.root, &Matcher::none()).unwrap();
+        let w = nephila::scan::walk(&r.root, &Matcher::none(), 1).unwrap();
         assert_eq!(w.files.len(), 1);
         assert_eq!(w.files[0].path, "A\u{FFFD}.java");
         assert_eq!(w.collisions.len(), 1);
@@ -221,7 +221,7 @@ fn REQ004_AC10_nom_utf8_valide_contre_nom_non_utf8() {
         return;
     };
     for r in [&r1, &r2] {
-        let res = nephila::scan::scan(&r.root, &[], &Matcher::none()).unwrap();
+        let res = nephila::scan::scan(&r.root, &[], &Matcher::none(), 1).unwrap();
         assert_eq!(res.files.len(), 1, "{:?}", res.warnings);
         assert_eq!(
             res.files[0].hash,

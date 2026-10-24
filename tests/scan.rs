@@ -25,7 +25,7 @@ fn req004_ac1_gitignore_root_and_nested() {
     put(r, "sub/local.java", b"x");
     put(r, "sub/kept.java", b"x");
     put(r, "kept.md", b"x");
-    let res = scan(r, &[], &Matcher::none()).unwrap();
+    let res = scan(r, &[], &Matcher::none(), 1).unwrap();
     assert_eq!(paths(&res), vec!["kept.md", "sub/kept.java"]);
 }
 
@@ -39,7 +39,7 @@ fn req004_ac2_forced_exclusions() {
         put(r, &format!("{dir}/x.java"), b"x");
     }
     put(r, "ok.java", b"x");
-    let res = scan(r, &[], &Matcher::none()).unwrap();
+    let res = scan(r, &[], &Matcher::none(), 1).unwrap();
     assert_eq!(paths(&res), vec!["ok.java"]);
 }
 
@@ -52,13 +52,13 @@ fn req004_ac3_unsupported_extensions() {
     put(r, "noext", b"x");
     put(r, "pom.xml.bak", b"x");
     put(r, "a.sbt", b"x");
-    assert!(scan(r, &[], &Matcher::none()).unwrap().files.is_empty());
+    assert!(scan(r, &[], &Matcher::none(), 1).unwrap().files.is_empty());
 }
 
 fn check_type(name: &str) {
     let d = tempfile::tempdir().unwrap();
     put(d.path(), name, b"contenu");
-    let res = scan(d.path(), &[], &Matcher::none()).unwrap();
+    let res = scan(d.path(), &[], &Matcher::none(), 1).unwrap();
     assert_eq!(paths(&res), vec![name.to_string()], "{name}");
 }
 
@@ -93,7 +93,7 @@ fn req004_ac5_export_du_depot_jamais_indexe() {
     put(&r, "vue.json", b"{}");
     put(&r, "monrepo.jsonx", b"{}");
     assert_eq!(
-        paths(&scan(&r, &[], &Matcher::none()).unwrap()),
+        paths(&scan(&r, &[], &Matcher::none(), 1).unwrap()),
         vec!["config.json", "vue.json"]
     );
 }
@@ -160,7 +160,7 @@ fn req004_non_utf8_ignored_with_warning() {
     let d = tempfile::tempdir().unwrap();
     put(d.path(), "bad.java", &[0xff, 0xfe, 0x00, 0xc3]);
     put(d.path(), "good.java", b"ok");
-    let res = scan(d.path(), &[], &Matcher::none()).unwrap();
+    let res = scan(d.path(), &[], &Matcher::none(), 1).unwrap();
     assert_eq!(paths(&res), vec!["good.java"]);
     assert_eq!(res.warnings.len(), 1);
     assert!(res.warnings[0].contains("bad.java"));
@@ -179,7 +179,7 @@ fn req005_ac5_module_nearest_build_ancestor() {
     put(r, "core/deep/pom.xml", b"x");
     put(r, "core/deep/C.java", b"x");
     put(r, "docs/readme.md", b"x");
-    let res = scan(r, &[], &Matcher::none()).unwrap();
+    let res = scan(r, &[], &Matcher::none(), 1).unwrap();
     let m = |p: &str| {
         res.files
             .iter()
@@ -201,7 +201,7 @@ fn req005_ac5_module_nearest_build_ancestor() {
 fn req005_ac5_no_build_file_means_no_module() {
     let d = tempfile::tempdir().unwrap();
     put(d.path(), "A.java", b"x");
-    let res = scan(d.path(), &[], &Matcher::none()).unwrap();
+    let res = scan(d.path(), &[], &Matcher::none(), 1).unwrap();
     assert_eq!(res.files[0].module, None);
 }
 
@@ -209,7 +209,7 @@ fn req005_ac5_no_build_file_means_no_module() {
 fn req011_ac6_hash_is_blake3_and_reused_when_size_mtime_unchanged() {
     let d = tempfile::tempdir().unwrap();
     put(d.path(), "a.md", b"hello");
-    let first = scan(d.path(), &[], &Matcher::none()).unwrap();
+    let first = scan(d.path(), &[], &Matcher::none(), 1).unwrap();
     let f = &first.files[0];
     assert_eq!(f.hash, blake3::hash(b"hello").to_hex().to_string());
     assert_eq!(f.size, 5);
@@ -223,7 +223,7 @@ fn req011_ac6_hash_is_blake3_and_reused_when_size_mtime_unchanged() {
         recorded_at: f.mtime + 10_000,
         state: FileState::Indexed,
     }];
-    let second = scan(d.path(), &known, &Matcher::none()).unwrap();
+    let second = scan(d.path(), &known, &Matcher::none(), 1).unwrap();
     assert_eq!(second.files[0].hash, "sentinelle");
     assert!(!second.files[0].rehashed);
     assert!(first.files[0].rehashed);
@@ -233,7 +233,7 @@ fn req011_ac6_hash_is_blake3_and_reused_when_size_mtime_unchanged() {
         size: 99,
         ..known[0].clone()
     }];
-    let third = scan(d.path(), &known2, &Matcher::none()).unwrap();
+    let third = scan(d.path(), &known2, &Matcher::none(), 1).unwrap();
     assert_eq!(third.files[0].hash, f.hash);
     assert!(third.files[0].rehashed);
 }
@@ -243,7 +243,7 @@ fn req011_ac6_touch_rehashes_to_same_hash() {
     // Après un touch, le mtime change : empreinte recalculée mais identique (contenu inchangé).
     let d = tempfile::tempdir().unwrap();
     put(d.path(), "a.md", b"hello");
-    let first = scan(d.path(), &[], &Matcher::none()).unwrap();
+    let first = scan(d.path(), &[], &Matcher::none(), 1).unwrap();
     let f = &first.files[0];
     let known = vec![FileRecord {
         path: "a.md".into(),
@@ -253,7 +253,7 @@ fn req011_ac6_touch_rehashes_to_same_hash() {
         recorded_at: f.mtime + 10_000,
         state: FileState::Indexed,
     }];
-    let again = scan(d.path(), &known, &Matcher::none()).unwrap();
+    let again = scan(d.path(), &known, &Matcher::none(), 1).unwrap();
     assert_eq!(again.files[0].hash, f.hash);
     assert!(again.files[0].rehashed);
 }
@@ -261,7 +261,7 @@ fn req011_ac6_touch_rehashes_to_same_hash() {
 #[test]
 fn req004_empty_repo_gives_empty_scan() {
     let d = tempfile::tempdir().unwrap();
-    assert!(scan(d.path(), &[], &Matcher::none())
+    assert!(scan(d.path(), &[], &Matcher::none(), 1)
         .unwrap()
         .files
         .is_empty());
@@ -269,7 +269,13 @@ fn req004_empty_repo_gives_empty_scan() {
 
 #[test]
 fn req004_missing_root_is_error() {
-    assert!(scan(Path::new("/nonexistent/nephila-xyz"), &[], &Matcher::none()).is_err());
+    assert!(scan(
+        Path::new("/nonexistent/nephila-xyz"),
+        &[],
+        &Matcher::none(),
+        1
+    )
+    .is_err());
 }
 
 #[cfg(unix)]
@@ -287,7 +293,7 @@ fn req004_unreadable_dir_is_warned_and_skipped() {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         return;
     }
-    let res = scan(r, &[], &Matcher::none());
+    let res = scan(r, &[], &Matcher::none(), 1);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     let res = res.unwrap();
     assert_eq!(paths(&res), vec!["ok.md"]);
@@ -299,7 +305,7 @@ fn req011_ac6_racy_record_is_rehashed() {
     // Enregistrement fait moins de 2 s après la mtime : l'empreinte ne doit pas être réutilisée.
     let d = tempfile::tempdir().unwrap();
     put(d.path(), "a.md", b"hello");
-    let f = scan(d.path(), &[], &Matcher::none())
+    let f = scan(d.path(), &[], &Matcher::none(), 1)
         .unwrap()
         .files
         .remove(0);
@@ -311,7 +317,7 @@ fn req011_ac6_racy_record_is_rehashed() {
         recorded_at: f.mtime + 1_999,
         state: FileState::Indexed,
     }];
-    let res = scan(d.path(), &known, &Matcher::none()).unwrap();
+    let res = scan(d.path(), &known, &Matcher::none(), 1).unwrap();
     assert!(res.files[0].rehashed);
     assert_eq!(res.files[0].hash, f.hash);
 }
@@ -363,7 +369,7 @@ fn req004_ac6_package_json() {
 fn req004_ac6_vue_non_indexe() {
     let d = tempfile::tempdir().unwrap();
     put(d.path(), "a.vue", b"<template/>");
-    assert!(scan(d.path(), &[], &Matcher::none())
+    assert!(scan(d.path(), &[], &Matcher::none(), 1)
         .unwrap()
         .files
         .is_empty());
@@ -374,7 +380,7 @@ fn req004_ac6_package_json_est_un_fichier_de_build() {
     let d = tempfile::tempdir().unwrap();
     put(d.path(), "web/package.json", b"{}");
     put(d.path(), "web/src/a.ts", b"x");
-    let res = scan(d.path(), &[], &Matcher::none()).unwrap();
+    let res = scan(d.path(), &[], &Matcher::none(), 1).unwrap();
     let a = res.files.iter().find(|f| f.path == "web/src/a.ts").unwrap();
     assert_eq!(a.module.as_deref(), Some("web"));
 }
@@ -398,7 +404,7 @@ fn req004_ac7_node_modules_et_verrous_exclus() {
     put(r, "web/package.json", b"{}");
     put(r, "web/other-lock.json", b"{}");
     assert_eq!(
-        paths(&scan(r, &[], &Matcher::none()).unwrap()),
+        paths(&scan(r, &[], &Matcher::none(), 1).unwrap()),
         vec!["web/other-lock.json", "web/package.json"]
     );
 }

@@ -306,7 +306,7 @@ pub fn build(
     } else {
         Vec::new()
     };
-    let scanned = scan::scan(repo, &known, matcher)?;
+    let scanned = scan::scan(repo, &known, matcher, opts.jobs)?;
     let records: Vec<FileRecord> = scanned
         .files
         .iter()

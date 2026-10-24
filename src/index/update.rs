@@ -87,7 +87,7 @@ pub fn update(
 ) -> Result<Option<BuildReport>> {
     build::check_repo(repo)?;
     let mut store = Store::open_existing(repo)?;
-    let d = diff::compute(repo, &store, matcher)?;
+    let d = diff::compute(repo, &store, matcher, opts.jobs)?;
     trace!(
         "parcours: {} ajoutés, {} modifiés, {} supprimés, {} en attente{}",
         d.paths(Change::Added).count(),
@@ -349,7 +349,8 @@ mod tests {
         store.set_enrich_model(crate::llm::Llm::model(llm)).unwrap();
         let files = store.files_to_enrich().unwrap();
         assert_eq!(files.len(), 20);
-        let scanned = crate::scan::scan(repo, &store.files().unwrap(), &Matcher::none()).unwrap();
+        let scanned =
+            crate::scan::scan(repo, &store.files().unwrap(), &Matcher::none(), 1).unwrap();
         let abs = build::abs_paths(&scanned.files);
         let mut report = BuildReport::default();
         reset_diagnostics();

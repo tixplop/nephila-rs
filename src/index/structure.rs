@@ -249,7 +249,7 @@ mod tests {
             )
             .unwrap();
         }
-        let scanned = crate::scan::scan(repo, &[], &crate::filter::Matcher::none()).unwrap();
+        let scanned = crate::scan::scan(repo, &[], &crate::filter::Matcher::none(), 1).unwrap();
         assert_eq!(scanned.files.len(), n);
         let mut store = Store::open_or_create(repo).unwrap();
         let records: Vec<crate::model::FileRecord> = scanned
@@ -345,7 +345,7 @@ mod tests {
         let repo = dir.path();
         std::fs::write(repo.join("A.java"), "package p;\npublic class A {}\n").unwrap();
         std::fs::write(repo.join("B.java"), "package p;\npublic class B {}\n").unwrap();
-        let scanned = crate::scan::scan(repo, &[], &crate::filter::Matcher::none()).unwrap();
+        let scanned = crate::scan::scan(repo, &[], &crate::filter::Matcher::none(), 1).unwrap();
         assert_eq!(scanned.files.len(), 2);
         let mut store = Store::open_or_create(repo).unwrap();
         let records: Vec<FileRecord> = scanned

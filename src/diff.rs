@@ -65,14 +65,14 @@ impl Diff {
 /// Compare le dépôt avec les fichiers connus du graphe. Un fichier en attente reste « en
 /// attente » même s'il a changé (il sera retraité de toute façon) ; absent du disque, il est
 /// « supprimé » (c'est aussi le cas d'un fichier indexé que `matcher` exclut désormais).
-pub fn compute(repo: &Path, store: &Store, matcher: &Matcher) -> Result<Diff> {
+pub fn compute(repo: &Path, store: &Store, matcher: &Matcher, jobs: usize) -> Result<Diff> {
     let known = store.files()?;
     let scan::ScanResult {
         files: scanned,
         gradle_settings,
         excluded,
         ..
-    } = scan::scan(repo, &known, matcher)?;
+    } = scan::scan(repo, &known, matcher, jobs)?;
     let on_disk: HashMap<&str, &ScannedFile> =
         scanned.iter().map(|f| (f.path.as_str(), f)).collect();
     // Mise à niveau 0.9 -> 0.10 : un `package.json` enregistré comme document de données doit
@@ -132,7 +132,7 @@ pub fn compute(repo: &Path, store: &Store, matcher: &Matcher) -> Result<Diff> {
 /// (REQ-017, DEC-067).
 pub fn quick(repo: &Path, store: &Store, matcher: &Matcher) -> Result<usize> {
     let known = store.files()?;
-    let walked = scan::walk(repo, matcher)?;
+    let walked = scan::walk(repo, matcher, crate::index::default_jobs())?;
     let on_disk: HashMap<&str, &scan::WalkedFile> =
         walked.files.iter().map(|f| (f.path.as_str(), f)).collect();
     let mut count = 0;
