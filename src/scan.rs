@@ -76,17 +76,21 @@ impl Retained {
         if budget == 0 {
             return Err(text);
         }
-        let reserved = RETAINED.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-            cur.checked_add(len).filter(|n| *n <= budget)
-        });
-        match reserved {
-            Ok(_prev) => {
-                #[cfg(test)]
-                RETAINED_PEAK.fetch_max(_prev + len, Ordering::SeqCst);
-                Ok(Retained { text })
+        // Boucle explicite plutôt que l'ancienne API de mise à jour (dépréciée en 1.99) ou sa
+        // remplaçante (absente de la 1.98).
+        let mut cur = RETAINED.load(Ordering::SeqCst);
+        let _prev = loop {
+            let Some(new) = cur.checked_add(len).filter(|n| *n <= budget) else {
+                return Err(text);
+            };
+            match RETAINED.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(p) => break p,
+                Err(actual) => cur = actual,
             }
-            Err(_) => Err(text),
-        }
+        };
+        #[cfg(test)]
+        RETAINED_PEAK.fetch_max(_prev + len, Ordering::SeqCst);
+        Ok(Retained { text })
     }
 
     pub fn as_str(&self) -> &str {
@@ -701,6 +705,43 @@ pub(crate) fn scan_with_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn req073_ac6_reservation_concurrente_respecte_le_budget() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Barrier, Mutex};
+        let base = RETAINED.load(Ordering::SeqCst);
+        let peak0 = RETAINED_PEAK.load(Ordering::SeqCst);
+        let budget = base + 450;
+        let barrier = Barrier::new(8);
+        let kept = Mutex::new(Vec::new());
+        let errs = Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    barrier.wait();
+                    match Retained::reserve("x".repeat(100), budget) {
+                        Ok(r) => kept.lock().unwrap().push(r),
+                        Err(t) => errs.lock().unwrap().push(t),
+                    }
+                });
+            }
+        });
+        let kept = kept.into_inner().unwrap();
+        let errs = errs.into_inner().unwrap();
+        assert_eq!(kept.len(), 4);
+        assert_eq!(errs.len(), 4);
+        assert!(errs.iter().all(|t| t.len() == 100));
+        assert_eq!(RETAINED.load(Ordering::SeqCst), base + 400);
+        assert!(RETAINED_PEAK.load(Ordering::SeqCst).max(peak0) <= budget);
+        drop(kept);
+        assert_eq!(RETAINED.load(Ordering::SeqCst), base);
+
+        assert!(Retained::reserve("x".repeat(10), 0).is_err());
+        assert_eq!(RETAINED.load(Ordering::SeqCst), base);
+        let empty = Retained::reserve(String::new(), base + 10);
+        assert!(empty.is_ok());
+    }
 
     #[cfg(unix)]
     #[test]
