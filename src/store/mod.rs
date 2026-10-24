@@ -541,7 +541,8 @@ impl Store {
         }
     }
 
-    /// Ouvre le graphe en lecture seule, sans rien créer.
+    /// Ouvre le graphe en lecture seule, sans rien créer, dans une transaction de lecture qui
+    /// dure autant que le `Store` (REQ-085).
     pub fn open_readonly(repo: &Path) -> Result<Store> {
         let path = db_path(repo);
         if !path.is_file() {
@@ -560,6 +561,13 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(db_err)?;
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        // Instantané de lecture pour toute la vie du `Store` (DEC-094) : la première lecture le
+        // fixe, avant celle de la version du schéma ; la fermeture de la connexion y met fin.
+        conn.execute_batch("BEGIN DEFERRED").map_err(db_err)?;
+        conn.query_row("SELECT count(*) FROM sqlite_schema", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map_err(db_err)?;
         let mut store = Store::new(conn, true);
         match store.user_version()? {
             0 => {
@@ -578,6 +586,12 @@ impl Store {
             v => return Err(version_error(v)),
         }
         Ok(store)
+    }
+
+    /// Vrai pour un `Store` en lecture seule dont la transaction de lecture ouverte par
+    /// `open_readonly` est toujours en cours (DEC-094).
+    pub fn in_read_snapshot(&self) -> bool {
+        self.read_only && !self.conn.is_autocommit()
     }
 
     /// Version du schéma du graphe ouvert (5 à 7 en lecture seule seulement : DEC-066, DEC-073,
@@ -6217,5 +6231,86 @@ mod tests {
         // `replace_edges(&[])` les a tous supprimés ; le résumé de la passe complète est calculé
         // sur les liens de la passe, DEC-078).
         assert_eq!((d.node_rows_read(), d.edge_rows_read()), (4, 0));
+    }
+
+    #[test]
+    fn req085_ac1_read_only_store_survives_a_migration_done_meanwhile() {
+        for version in [6, 5, 7] {
+            let dir = tempdir().unwrap();
+            drop(rich(dir.path()));
+            match version {
+                6 => downgrade_to_6(dir.path()),
+                5 => downgrade_to_5(dir.path()),
+                _ => downgrade_to_7(dir.path()),
+            }
+            let reference = tempdir().unwrap();
+            std::fs::create_dir_all(db_path(reference.path()).parent().unwrap()).unwrap();
+            std::fs::copy(db_path(dir.path()), db_path(reference.path())).unwrap();
+
+            let reader = Store::open_readonly(dir.path()).unwrap();
+            assert_eq!(reader.opened_schema_version(), version);
+            drop(Store::open_existing(dir.path()).unwrap());
+            assert_eq!(
+                st_user_version(dir.path()),
+                SCHEMA_VERSION,
+                "depuis {version}"
+            );
+
+            let base = Store::open_readonly(reference.path()).unwrap();
+            assert_eq!(base.opened_schema_version(), version);
+            assert_eq!(
+                reader.file_contexts().unwrap(),
+                base.file_contexts().unwrap(),
+                "schéma {version}"
+            );
+            assert_eq!(
+                reader.refs_with_origin().unwrap(),
+                base.refs_with_origin().unwrap(),
+                "schéma {version}"
+            );
+            let (a, b) = (
+                crate::resolve::unresolved(&reader).unwrap(),
+                crate::resolve::unresolved(&base).unwrap(),
+            );
+            assert!(!b.is_empty());
+            assert_eq!(a, b, "schéma {version}");
+            assert_eq!(reader.nodes().unwrap(), base.nodes().unwrap());
+            assert_eq!(reader.edges().unwrap(), base.edges().unwrap());
+            assert!(!base.files().unwrap().is_empty());
+            assert_eq!(reader.files().unwrap(), base.files().unwrap());
+            drop(reader);
+            let again = Store::open_readonly(dir.path()).unwrap();
+            assert_eq!(again.opened_schema_version(), SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn req085_ac2_read_only_store_keeps_its_snapshot() {
+        let dir = tempdir().unwrap();
+        drop(rich(dir.path()));
+        assert!(!Store::open_or_create(dir.path())
+            .unwrap()
+            .in_read_snapshot());
+        let mut writer = Store::open_existing(dir.path()).unwrap();
+        assert!(!writer.in_read_snapshot());
+
+        let reader = Store::open_readonly(dir.path()).unwrap();
+        assert!(reader.in_read_snapshot());
+        let (nodes, edges, files) = (
+            reader.nodes().unwrap(),
+            reader.edges().unwrap(),
+            reader.files().unwrap(),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(writer.remove_files(&["B.java"]).unwrap(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        assert_eq!(reader.nodes().unwrap(), nodes);
+        assert_eq!(reader.edges().unwrap(), edges);
+        assert_eq!(reader.files().unwrap(), files);
+        assert!(reader.in_read_snapshot());
+        drop(reader);
+        let after = Store::open_readonly(dir.path()).unwrap();
+        assert!(after.files().unwrap().len() < files.len());
+        assert!(after.nodes().unwrap().len() < nodes.len());
     }
 }

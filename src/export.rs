@@ -74,7 +74,11 @@ fn element<W: Write, T: Serialize>(
 /// Écrit le document JSON de l'export (REQ-018, REQ-080) au fil de la lecture du graphe : aucune
 /// liste de nœuds, de liens ni de non résolues n'est gardée en mémoire (DEC-092). Texte identique
 /// à `Value::to_string()` de la 0.23.2 : clés dans l'ordre alphabétique, format compact.
+///
+/// Le `Store` doit être en lecture seule : tout est lu dans l'instantané qu'il tient depuis son
+/// ouverture (REQ-084, DEC-094), sans `BEGIN` propre.
 pub fn write_json<W: Write>(store: &Store, w: &mut W) -> std::result::Result<(), ExportError> {
+    debug_assert!(store.in_read_snapshot());
     w.write_all(b"{\"edges\":[")?;
     let mut first = true;
     store.for_each_edge(|e| {
@@ -289,5 +293,91 @@ mod tests {
             output_path(repo, Some(Path::new("a/b.json")), "json"),
             Target::File("a/b.json".into())
         );
+    }
+
+    use crate::model::{EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, SubKind};
+
+    fn graph(repo: &Path, resolved: bool) {
+        let mut st = Store::open_or_create(repo).unwrap();
+        let names = ["A", "B", "C"];
+        let files: Vec<FileRecord> = names
+            .iter()
+            .map(|n| FileRecord {
+                path: format!("{n}.java"),
+                hash: "h".into(),
+                size: 3,
+                mtime: 7,
+                recorded_at: 0,
+                state: FileState::Indexed,
+            })
+            .collect();
+        st.insert_pending_files(&files).unwrap();
+        let structures: Vec<_> = names
+            .iter()
+            .map(|n| {
+                let node = Node::new(
+                    NodeKind::Type,
+                    &format!("p.{n}"),
+                    n,
+                    Some(&format!("{n}.java")),
+                    Some(SubKind::Class),
+                    None,
+                );
+                let refs = vec![
+                    Ref {
+                        source: node.id.clone(),
+                        kind: EdgeKind::Imports,
+                        target_name: "p.B".into(),
+                        context: Some("package p;".into()),
+                    },
+                    Ref {
+                        source: node.id.clone(),
+                        kind: EdgeKind::Imports,
+                        target_name: format!("absent.{n}"),
+                        context: Some("package p;".into()),
+                    },
+                ];
+                (format!("{n}.java"), vec![node], refs)
+            })
+            .collect();
+        st.replace_structures(&structures).unwrap();
+        if resolved {
+            crate::resolve::resolve(&mut st).unwrap();
+            assert!(st.resolution_is_current().unwrap());
+        } else {
+            assert!(!st.resolution_is_current().unwrap());
+        }
+    }
+
+    fn json_of(store: &Store) -> String {
+        let mut out = Vec::new();
+        write_json(store, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn req084_ac2_export_reads_one_snapshot_despite_concurrent_writes() {
+        for resolved in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            graph(dir.path(), resolved);
+            let before_text = json_of(&Store::open_readonly(dir.path()).unwrap());
+            assert!(before_text.contains("\"unresolved\":[{"));
+            let before_view = nodes_and_edges(&Store::open_readonly(dir.path()).unwrap()).unwrap();
+
+            let reader = Store::open_readonly(dir.path()).unwrap();
+            assert!(reader.in_read_snapshot());
+            let mut writer = Store::open_existing(dir.path()).unwrap();
+            assert_eq!(writer.remove_files(&["B.java", "C.java"]).unwrap(), 2);
+            assert!(!writer.resolution_is_current().unwrap());
+            drop(writer);
+
+            assert_eq!(json_of(&reader), before_text, "résolu={resolved}");
+            assert_eq!(nodes_and_edges(&reader).unwrap(), before_view);
+            assert!(reader.in_read_snapshot());
+            drop(reader);
+            let after = json_of(&Store::open_readonly(dir.path()).unwrap());
+            assert_ne!(after, before_text, "résolu={resolved}");
+            assert!(!after.contains("p.C"));
+        }
     }
 }

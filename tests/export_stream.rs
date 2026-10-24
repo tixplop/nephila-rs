@@ -207,3 +207,141 @@ fn req080_ac7_successful_exports_write_nothing_on_stderr() {
     assert!(!out.status.success());
     assert!(!tmp.path().join("x.json").exists());
 }
+
+/// Export normalisé : tableaux triés (l'ordre des lignes n'est pas garanti entre deux graphes).
+fn normalized(doc: &str) -> serde_json::Value {
+    let mut v: serde_json::Value = serde_json::from_str(doc.trim_end()).unwrap();
+    for key in ["edges", "nodes", "unresolved"] {
+        let a = v[key].as_array_mut().unwrap();
+        a.sort_by_key(|x| x.to_string());
+    }
+    v
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == ".nephila" {
+            continue;
+        }
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&dest).unwrap();
+            copy_tree(&entry.path(), &dest);
+        } else {
+            fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+fn java_files(repo: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut dirs = vec![repo.join("src")];
+    while let Some(d) = dirs.pop() {
+        for e in fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// AC-084-1 : un `update` qui supprime des fichiers pendant qu'un export lent est bloqué sur un
+/// tube plein ne change pas le document exporté (un seul instantané de lecture).
+#[test]
+fn req084_ac1_export_is_one_snapshot_while_an_update_deletes_files() {
+    let env = Env::big(400);
+    let reference = env.run(&["export", "--output", "-"]);
+    assert!(reference.status.success());
+    let reference = text(&reference.stdout);
+    let edges_start = reference.find("\"edges\":[").unwrap();
+    let edges_end = reference.find("],\"nodes\":[").unwrap();
+    assert!(
+        edges_end - edges_start > 256 * 1024,
+        "section edges de {} octets",
+        edges_end - edges_start
+    );
+
+    let mut child = env
+        .command(&["export", "--output", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut head = vec![0u8; 10];
+    stdout.read_exact(&mut head).unwrap();
+
+    for (i, file) in java_files(&env.repo).iter().enumerate() {
+        if i % 2 == 0 {
+            fs::remove_file(file).unwrap();
+        }
+    }
+    let update = env.run(&["update", "--no-llm"]);
+    assert_eq!(update.status.code(), Some(0), "{}", text(&update.stderr));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "l'export aurait dû rester bloqué sur le tube plein"
+    );
+
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0));
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert_eq!(err, "");
+    let mut exported = head;
+    exported.extend(rest);
+    let exported = text(&exported);
+
+    let doc = normalized(&exported);
+    let ids: std::collections::HashSet<&str> = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    for e in doc["edges"].as_array().unwrap() {
+        assert!(ids.contains(e["source"].as_str().unwrap()), "{e}");
+        assert!(ids.contains(e["target"].as_str().unwrap()), "{e}");
+    }
+    for u in doc["unresolved"].as_array().unwrap() {
+        assert!(ids.contains(u["source"].as_str().unwrap()), "{u}");
+    }
+    assert_eq!(doc, normalized(&reference));
+
+    // L'export suivant voit la suppression : égal à un build neuf de l'arbre réduit.
+    let after = env.run(&["export", "--output", "-"]);
+    assert!(after.status.success());
+    let after = normalized(&text(&after.stdout));
+    assert_ne!(after, doc);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fresh = Env {
+        repo: tmp.path().join("monrepo"),
+        config: env.config.clone(),
+        _tmp: tmp,
+    };
+    fs::create_dir_all(&fresh.repo).unwrap();
+    copy_tree(&env.repo, &fresh.repo);
+    assert!(fresh
+        .command(&["build", "--no-llm"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let built = fresh.run(&["export", "--output", "-"]);
+    assert!(built.status.success());
+    assert_eq!(after, normalized(&text(&built.stdout)));
+}
