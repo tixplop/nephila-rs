@@ -5,7 +5,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::data::doc_path;
-use super::{Declared, FileStructure, ParseCtx, Reference};
+use super::{Declared, FileStructure, OrderedSet, ParseCtx, Reference};
 use crate::model::{EdgeKind, NodeKind};
 
 /// Sections dont chaque clé est une dépendance (la version est ignorée).
@@ -69,6 +69,7 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> FileStructure {
         summary: None,
         short: Some(short),
     });
+    let mut refs = OrderedSet::new();
     for section in SECTIONS {
         let Some(Value::Object(deps)) = root.get(section) else {
             continue;
@@ -79,11 +80,10 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> FileStructure {
                 kind: EdgeKind::DependsOn,
                 target: name.clone(),
             };
-            if !out.references.contains(&r) {
-                out.references.push(r);
-            }
+            refs.insert(r);
         }
     }
+    out.references = refs.into_vec();
     out
 }
 

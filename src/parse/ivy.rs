@@ -5,7 +5,7 @@ use std::path::Path;
 use super::maven::{read_events, warning, XmlEv};
 use super::FileStructure;
 use crate::model::{EdgeKind, NodeKind};
-use crate::parse::{Declared, Reference};
+use crate::parse::{Declared, OrderedSet, Reference};
 
 fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
     attrs
@@ -54,6 +54,7 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
         summary: None,
         short: Some(module),
     });
+    let mut refs = OrderedSet::new();
     for (o, name) in deps {
         let target = match o.as_deref().or(org.as_deref()) {
             Some(o) => format!("{o}:{name}"),
@@ -64,10 +65,9 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
             kind: EdgeKind::DependsOn,
             target,
         };
-        if !out.references.contains(&r) {
-            out.references.push(r);
-        }
+        refs.insert(r);
     }
+    out.references = refs.into_vec();
     out
 }
 

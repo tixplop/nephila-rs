@@ -8,7 +8,7 @@ use quick_xml::reader::Reader;
 
 use super::FileStructure;
 use crate::model::{EdgeKind, NodeKind};
-use crate::parse::{Declared, Reference};
+use crate::parse::{Declared, OrderedSet, Reference};
 
 /// Événement XML simplifié : chemin d'éléments (noms locaux) depuis la racine.
 pub(crate) enum XmlEv {
@@ -192,6 +192,7 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
         summary: None,
         short: Some(short),
     });
+    let mut refs = OrderedSet::new();
     for d in &deps {
         let (Some(g), Some(a)) = (&d.group, &d.artifact) else {
             continue;
@@ -202,10 +203,9 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
             kind: EdgeKind::DependsOn,
             target,
         };
-        if !out.references.contains(&r) {
-            out.references.push(r);
-        }
+        refs.insert(r);
     }
+    out.references = refs.into_vec();
     out
 }
 

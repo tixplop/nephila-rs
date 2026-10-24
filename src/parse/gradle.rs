@@ -7,7 +7,7 @@ use std::path::Path;
 use super::gradle_lex::{lex, Tok, Token};
 use super::{FileStructure, ParseCtx};
 use crate::model::{EdgeKind, NodeKind};
-use crate::parse::{Declared, Reference};
+use crate::parse::{Declared, OrderedSet, Reference};
 
 /// Dossier (séparateur `/`, `""` = racine du dépôt) du fichier `path`.
 fn dir_of(path: &Path) -> String {
@@ -320,16 +320,16 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> FileStructure {
     }
     if let Some(d) = out.declares.first() {
         let source = d.id();
+        let mut refs = OrderedSet::new();
         for target in targets {
             let r = Reference {
                 source: source.clone(),
                 kind: EdgeKind::DependsOn,
                 target,
             };
-            if !out.references.contains(&r) {
-                out.references.push(r);
-            }
+            refs.insert(r);
         }
+        out.references = refs.into_vec();
     }
     out
 }

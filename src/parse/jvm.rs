@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use crate::model::{node_id, EdgeKind, NodeKind, SubKind};
-use crate::parse::{Declared, Reference};
+use crate::parse::{Declared, OrderedSet, Reference};
 
 use super::FileStructure;
 
@@ -12,20 +12,20 @@ use super::FileStructure;
 pub const INIT: &str = "<init>";
 
 /// Import d'un fichier.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Import {
-    path: String,
-    wildcard: bool,
-    is_static: bool,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct Import {
+    pub(super) path: String,
+    pub(super) wildcard: bool,
+    pub(super) is_static: bool,
 }
 
 /// Construit la structure d'un fichier au fil du parcours de l'arbre.
 #[derive(Debug, Default)]
 pub struct Builder {
     package: Option<String>,
-    imports: Vec<Import>,
+    imports: OrderedSet<Import>,
     declares: Vec<Declared>,
-    references: Vec<Reference>,
+    references: OrderedSet<Reference>,
     seen: HashSet<String>,
     /// Noms qualifiés des types englobants, du plus externe au plus interne.
     stack: Vec<String>,
@@ -101,9 +101,7 @@ impl Builder {
             wildcard,
             is_static,
         };
-        if !self.imports.contains(&imp) {
-            self.imports.push(imp);
-        }
+        self.imports.insert(imp);
     }
 
     /// Nom qualifié d'un type de nom simple `name` déclaré à l'emplacement courant.
@@ -169,9 +167,7 @@ impl Builder {
             kind,
             target,
         };
-        if !self.references.contains(&r) {
-            self.references.push(r);
-        }
+        self.references.insert(r);
     }
 
     /// Référence depuis un type (nom qualifié).
@@ -197,7 +193,7 @@ impl Builder {
         if let Some(p) = &self.package {
             lines.push(format!("package {p}"));
         }
-        for i in &self.imports {
+        for i in self.imports.as_slice() {
             lines.push(format!(
                 "import {}{}{}",
                 if i.is_static { "static " } else { "" },
@@ -213,6 +209,7 @@ impl Builder {
     pub fn finish(mut self) -> FileStructure {
         let explicit: Vec<String> = self
             .imports
+            .as_slice()
             .iter()
             .filter(|i| !i.wildcard && !i.is_static)
             .map(|i| i.path.clone())
@@ -226,7 +223,7 @@ impl Builder {
         FileStructure {
             context: self.context(),
             declares: self.declares,
-            references: self.references,
+            references: self.references.into_vec(),
             warnings: Vec::new(),
         }
     }

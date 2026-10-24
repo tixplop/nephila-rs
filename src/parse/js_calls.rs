@@ -9,7 +9,7 @@ use crate::model::{NodeKind, SubKind};
 
 use super::js::{is_function_value, member_name};
 use super::js_imports::{Cible, Imports};
-use super::Declared;
+use super::{Declared, OrderedSet};
 
 /// Table locale : nom lié -> type annoté ou construit (`None` = type inconnu).
 type Locals = HashMap<String, Option<String>>;
@@ -24,7 +24,7 @@ struct Collector<'a> {
     imports: &'a Imports,
     types: HashMap<String, SubKind>,
     methods: HashSet<String>,
-    out: Vec<(String, String)>,
+    out: OrderedSet<(String, String)>,
 }
 
 /// Appels d'un fichier : couples (nom qualifié de la méthode appelante, nom visé).
@@ -55,11 +55,11 @@ pub fn collect(
         imports,
         types,
         methods,
-        out: Vec::new(),
+        out: OrderedSet::new(),
     };
     let mut owners = vec![module.to_string()];
     c.statements(root, &mut owners);
-    c.out
+    c.out.into_vec()
 }
 
 fn is_class_kind(k: &str) -> bool {
@@ -498,9 +498,7 @@ impl Collector<'_> {
             };
             if let Some(t) = target {
                 let r = (caller.to_string(), t);
-                if !self.out.contains(&r) {
-                    self.out.push(r);
-                }
+                self.out.insert(r);
             }
             let ok = this_ok && !rebinds_this(n.kind());
             let mut cur = n.walk();

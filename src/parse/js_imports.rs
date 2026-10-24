@@ -5,6 +5,8 @@ use std::cell::RefCell;
 
 use tree_sitter::Node;
 
+use super::OrderedSet;
+
 /// Extensions de code JS/TS retirées d'un spécifieur (`.d.ts` et variantes d'abord).
 const CODE_EXT: [&str; 8] = ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"];
 const DECL_EXT: [&str; 3] = [".d.ts", ".d.mts", ".d.cts"];
@@ -101,7 +103,7 @@ pub struct Import {
 pub struct Imports {
     pub entries: Vec<Import>,
     /// Utilisations `ns.X` rencontrées : (cibles de l'espace de noms, `X`).
-    used: RefCell<Vec<(Vec<String>, String)>>,
+    used: RefCell<OrderedSet<(Vec<String>, String)>>,
 }
 
 impl Imports {
@@ -256,9 +258,7 @@ impl Imports {
                     let x = rest.split('.').next().unwrap_or(rest).to_string();
                     let mut used = self.used.borrow_mut();
                     let u = (targets.clone(), x);
-                    if !used.contains(&u) {
-                        used.push(u);
-                    }
+                    used.insert(u);
                 }
                 Some(rest.to_string())
             }
@@ -272,25 +272,21 @@ impl Imports {
     /// Cibles des imports du package : nom exporté de chaque nom importé d'un spécifieur
     /// relatif ou d'alias, hors espace de noms.
     pub fn import_targets(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
+        let mut out: OrderedSet<String> = OrderedSet::new();
         for e in &self.entries {
-            if !e.namespace
-                && matches!(e.cible, Cible::Modules(_) | Cible::Alias)
-                && !out.contains(&e.exported)
-            {
-                out.push(e.exported.clone());
+            if !e.namespace && matches!(e.cible, Cible::Modules(_) | Cible::Alias) {
+                out.insert(e.exported.clone());
             }
         }
-        out
+        out.into_vec()
     }
 
     /// Contexte de résolution du fichier (format de `resolve::parse_context`).
     pub fn context(&self, module: &str) -> String {
-        let mut lines = vec![format!("package {module}")];
+        let mut lines = OrderedSet::new();
+        lines.insert(format!("package {module}"));
         let mut add = |l: String| {
-            if !lines.contains(&l) {
-                lines.push(l);
-            }
+            lines.insert(l);
         };
         for e in &self.entries {
             if let (Cible::Modules(ts), false) = (&e.cible, e.namespace) {
@@ -299,12 +295,12 @@ impl Imports {
                 }
             }
         }
-        for (ts, x) in self.used.borrow().iter() {
+        for (ts, x) in self.used.borrow().as_slice().iter() {
             for t in ts {
                 add(format!("import {t}.{x}"));
             }
         }
-        lines.join("\n")
+        lines.as_slice().join("\n")
     }
 }
 

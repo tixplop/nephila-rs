@@ -12,7 +12,7 @@ use crate::model::{node_id, EdgeKind, NodeKind, SubKind};
 use super::js_calls;
 use super::js_imports::Imports;
 use super::jvm::INIT;
-use super::{Declared, FileStructure, Lang, Reference};
+use super::{Declared, FileStructure, Lang, OrderedSet, Reference};
 
 /// Nom du module ES d'un fichier : (qualifié, court). Le qualifié est le chemin relatif sans
 /// extension (`.d.ts`, `.d.mts`, `.d.cts` retirés en entier, sinon la dernière extension) ; le
@@ -59,7 +59,7 @@ pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
             summary: None,
             short: Some(short),
         }],
-        references: Vec::new(),
+        references: OrderedSet::new(),
         seen: HashSet::new(),
         imports: Imports::collect(tree.root_node(), text.as_bytes(), &rel),
     };
@@ -82,7 +82,7 @@ pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
     Ok(FileStructure {
         context: Some(x.imports.context(&module)),
         declares: x.declares,
-        references: x.references,
+        references: x.references.into_vec(),
         warnings: Vec::new(),
     })
 }
@@ -90,7 +90,7 @@ pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
 struct Extractor<'a> {
     src: &'a [u8],
     declares: Vec<Declared>,
-    references: Vec<Reference>,
+    references: OrderedSet<Reference>,
     seen: HashSet<String>,
     imports: Imports,
 }
@@ -121,9 +121,7 @@ impl Extractor<'_> {
             kind,
             target,
         };
-        if !self.references.contains(&r) {
-            self.references.push(r);
-        }
+        self.references.insert(r);
     }
 
     /// Instructions d'un `program` ou du corps d'un namespace, déclarées sous `owner`.

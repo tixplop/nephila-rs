@@ -60,3 +60,55 @@ fn req076_ac3_perf_sans_attente() {
         .collect();
     assert!(lines.is_empty(), "thread::sleep( aux lignes {lines:?}");
 }
+
+/// Lignes (`fichier:ligne`) de la partie non test des `src/parse/*.rs` qui dédupliquent par liste :
+/// `!` (espaces permis) puis un chemin commençant par une minuscule ou `self.`, puis `.contains(&`.
+fn dedup_par_liste(text: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            break;
+        }
+        let c: Vec<char> = line.chars().collect();
+        for (k, _) in c.iter().enumerate().filter(|(_, ch)| **ch == '!') {
+            let mut j = k + 1;
+            while j < c.len() && c[j].is_whitespace() {
+                j += 1;
+            }
+            let start = j;
+            if !(c.get(j).is_some_and(|ch| ch.is_lowercase())) {
+                continue;
+            }
+            while j < c.len() && (c[j].is_alphanumeric() || c[j] == '_' || c[j] == '.') {
+                j += 1;
+            }
+            let path: String = c[start..j].iter().collect();
+            let rest: String = c[j..].iter().collect();
+            if path.ends_with(".contains") && rest.starts_with("(&") {
+                found.push(i + 1);
+                break;
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn req077_ac3_aucune_deduplication_par_liste() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/parse");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for l in dedup_par_liste(&text) {
+                found.push(format!(
+                    "{}:{l}",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+        }
+    }
+    found.sort();
+    assert!(found.is_empty(), "déduplications par liste : {found:?}");
+}
