@@ -1002,3 +1002,80 @@ fn perf_banc_js() {
         "AC-082-2 : update différent d'un build neuf"
     );
 }
+
+/// Pic de mémoire résidente (Kio) du seul processus `export --format json` de la 0.23.2, mesuré
+/// sur HEAD avant le flux (plus petite de 3 mesures) : AC-080-3.
+const EXPORT_RSS0_KIB: i64 = 665_432;
+
+/// Lance `cmd` et rend son statut et le `ru_maxrss` (Kio, Linux) du seul processus fils.
+#[cfg(target_os = "linux")]
+#[allow(clippy::zombie_processes)] // attendu par `libc::wait4` ci-dessous (ru_maxrss)
+fn run_maxrss(mut cmd: Command) -> (bool, i64) {
+    use std::process::Stdio;
+    let child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    let mut status: libc::c_int = 0;
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+    assert_eq!(r, pid, "wait4 a échoué");
+    (
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        usage.ru_maxrss,
+    )
+}
+
+/// AC-080-3 : pic de mémoire de `export --format json --output <fichier>` ≤ 50 % de celui de la
+/// 0.23.2, export normalisé égal à l'oracle des gros dépôts.
+#[test]
+#[ignore]
+#[cfg(target_os = "linux")]
+fn perf_req080_ac3_export_memoire() {
+    let _g = serial();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-export-mem");
+    let _ = std::fs::remove_dir_all(&root);
+    let repo = root.join("repo");
+    let mock = root.join("mock");
+    gen_repo::generate(&repo, &mock);
+    let config = root.join("config.toml");
+    std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    let f = Fixture { repo, config, mock };
+    timed(&f, &["build", "--no-llm"]);
+    let out = root.join("export-mem.json");
+    let mut rss = Vec::new();
+    for _ in 0..3 {
+        let _ = std::fs::remove_file(&out);
+        let (ok, kib) = run_maxrss(cmd(
+            &f,
+            &[
+                "export",
+                "--format",
+                "json",
+                "--output",
+                out.to_str().unwrap(),
+            ],
+        ));
+        assert!(ok, "export en échec");
+        rss.push(kib);
+    }
+    let best = *rss.iter().min().unwrap();
+    eprintln!("export RSS (Kio) : {rss:?}, plus petite {best}");
+    let raw = std::fs::read(&out).unwrap();
+    let oracle = ORACLE_GROS_DEPOTS
+        .iter()
+        .find(|(n, s, _)| *n == "gen_repo" && *s == "build")
+        .unwrap();
+    assert_eq!(
+        support::export_fingerprint(&raw),
+        oracle.2,
+        "écart d'oracle"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        best * 2 <= EXPORT_RSS0_KIB,
+        "RSS {best} Kio > 50 % de {EXPORT_RSS0_KIB} Kio"
+    );
+}

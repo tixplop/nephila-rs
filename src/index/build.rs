@@ -431,7 +431,7 @@ mod tests {
     /// Export normalisé (DEC-081) : `unresolved` trié, doublons conservés.
     fn normalized_export(repo: &Path) -> String {
         let store = Store::open_readonly(repo).unwrap();
-        let mut doc = crate::export::build_json(&store).unwrap();
+        let mut doc = oracle_build_json(&store).unwrap();
         if let Some(list) = doc.get_mut("unresolved").and_then(|u| u.as_array_mut()) {
             let key = |v: &serde_json::Value| {
                 let f = |k: &str| v.get(k).map(|x| x.to_string()).unwrap_or_default();
@@ -627,5 +627,246 @@ mod tests {
             rec.hash,
             blake3::hash(after.as_bytes()).to_hex().to_string()
         );
+    }
+
+    /// Export de la 0.23.2 (`build_json` de HEAD avant REQ-080), résolution complète comprise :
+    /// oracle d'AC-080-1 et d'AC-080-2.
+    fn oracle_build_json(store: &Store) -> Result<serde_json::Value> {
+        use serde_json::json;
+        let nodes: Vec<serde_json::Value> = store
+            .nodes()?
+            .into_iter()
+            .map(|n| {
+                json!({
+                    "id": n.id,
+                    "kind": n.kind.as_str(),
+                    "qualified": n.qualified,
+                    "short": n.short,
+                    "file": n.file,
+                    "subkind": n.subkind.map(|s| s.as_str()),
+                    "summary": n.summary,
+                })
+            })
+            .collect();
+        let edges: Vec<serde_json::Value> = store
+            .edges()?
+            .into_iter()
+            .map(|e| json!({"source": e.source, "target": e.target, "kind": e.kind.as_str()}))
+            .collect();
+        let unresolved: Vec<serde_json::Value> = resolve::unresolved(store)?
+            .into_iter()
+            .map(|r| json!({"source": r.source, "kind": r.kind.as_str(), "target": r.target_name}))
+            .collect();
+        Ok(
+            json!({"version": crate::export::EXPORT_VERSION, "nodes": nodes, "edges": edges, "unresolved": unresolved}),
+        )
+    }
+
+    /// Dépôts de REQ-065 (liste de `tests/sqlite_lot3.rs`) : dossier et dossier du mock.
+    const REQ065_REPOS: &[(&str, Option<&str>)] = &[
+        ("maven3/repo", Some("maven3/mock")),
+        ("maven2", Some("mock")),
+        ("gradle/edge", None),
+        ("gradle/groovy", None),
+        ("gradle/kotlin", None),
+        ("ivy", None),
+        ("data/repo", Some("data/mock")),
+        ("js/mixed", Some("js/mock")),
+        ("langs/mixed", None),
+    ];
+
+    /// `build` avec le mock (enrichissement du code compris) quand `mock` est donné.
+    fn build_with_mock(repo: &Path, mock: Option<&Path>) {
+        let llm = mock.map(|d| {
+            crate::llm::mock::MockLlm::new(crate::llm::mock::MockOptions {
+                dir: Some(d.to_path_buf()),
+                ..Default::default()
+            })
+        });
+        let opts = IndexOptions {
+            enrich_code: true,
+            ..IndexOptions::default()
+        };
+        let lock = RepoLock::acquire(repo).unwrap();
+        build_with_budget(
+            repo,
+            &opts,
+            llm.as_ref().map(|l| l as &dyn Llm),
+            &lock,
+            &Matcher::none(),
+            scan::RETAIN_BUDGET,
+        )
+        .unwrap();
+    }
+
+    fn graph_db_hash(repo: &Path) -> String {
+        let bytes = std::fs::read(crate::store::db_path(repo)).unwrap();
+        blake3::hash(&bytes).to_hex().to_string()
+    }
+
+    /// Schéma 7 de la 0.21.0 (copie de l'assistant du module de tests du stockage).
+    const SCHEMA7_DOWNGRADE: &str = "BEGIN;
+        DROP INDEX idx_refs_key;
+        DROP INDEX idx_refs_head;
+        DROP INDEX idx_refs_unresolved;
+        ALTER TABLE refs DROP COLUMN target_key;
+        ALTER TABLE refs DROP COLUMN target_head;
+        ALTER TABLE refs DROP COLUMN unresolved;
+        DELETE FROM meta WHERE key = 'resolution';
+        UPDATE meta SET value = '7' WHERE key = 'schema_version';
+        PRAGMA user_version = 7;
+        COMMIT;";
+
+    fn exec(repo: &Path, sql: &str) {
+        rusqlite::Connection::open(crate::store::db_path(repo))
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    }
+
+    /// AC-080-1 : l'export en flux est celui de la 0.23.2, octet pour octet (flux en mémoire, puis
+    /// fichier écrit par la commande), pour les dépôts de REQ-065 et pour un graphe vide.
+    #[test]
+    fn req080_ac1_stream_equals_the_0_23_2_export_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cases: Vec<(String, PathBuf)> = Vec::new();
+        for (i, (rel, mock)) in REQ065_REPOS.iter().enumerate() {
+            let repo = tmp.path().join(format!("r{i}"));
+            copy_dir(&fixture(rel), &repo);
+            let mock = mock.map(fixture);
+            build_with_mock(&repo, mock.as_deref());
+            cases.push((rel.to_string(), repo));
+        }
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        drop(Store::open_or_create(&empty).unwrap());
+        cases.push(("graphe vide".into(), empty));
+        for (name, repo) in cases {
+            let store = Store::open_readonly(&repo).unwrap();
+            let expected = oracle_build_json(&store).unwrap().to_string();
+            let mut out: Vec<u8> = Vec::new();
+            crate::export::write_json(&store, &mut out).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), expected, "{name}");
+            drop(store);
+            let file = tmp.path().join("out.json");
+            crate::export::run(&repo, Some(&file), crate::cli::ExportFormat::Json).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                format!("{expected}\n"),
+                "{name} (fichier)"
+            );
+        }
+    }
+
+    /// AC-080-2 : une passe de résolution seulement si le graphe n'est pas `à jour` de schéma 8 ;
+    /// jamais pour la page HTML ; le graphe n'est jamais modifié.
+    #[test]
+    fn req080_ac2_export_resolves_only_a_graph_that_is_not_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        copy_dir(&fixture("maven2"), &repo);
+        build_with_mock(&repo, Some(&fixture("mock")));
+        let json = tmp.path().join("out.json");
+        let html = tmp.path().join("out.html");
+        let slug = crate::export::slug(&repo);
+        let states: [(&str, Option<&str>, usize); 3] = [
+            ("à jour", None, 0),
+            (
+                "à résoudre",
+                Some("UPDATE meta SET value = 'à résoudre' WHERE key = 'resolution'"),
+                1,
+            ),
+            ("schéma 7", Some(SCHEMA7_DOWNGRADE), 1),
+        ];
+        for (label, change, passes) in states {
+            if let Some(sql) = change {
+                exec(&repo, sql);
+            }
+            let before = graph_db_hash(&repo);
+            resolve::passes::reset();
+            crate::export::run(&repo, Some(&json), crate::cli::ExportFormat::Json).unwrap();
+            assert_eq!(resolve::passes::count(), passes, "{label} : json");
+            resolve::passes::reset();
+            crate::export::run(&repo, Some(&html), crate::cli::ExportFormat::Html).unwrap();
+            assert_eq!(resolve::passes::count(), 0, "{label} : html");
+            assert_eq!(graph_db_hash(&repo), before, "{label} : graph.db modifié");
+            let store = Store::open_readonly(&repo).unwrap();
+            let doc = oracle_build_json(&store).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&json).unwrap(),
+                format!("{doc}\n"),
+                "{label}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&html).unwrap(),
+                format!("{}\n", crate::view::render(&slug, &doc)),
+                "{label} : page"
+            );
+        }
+    }
+
+    /// Écrivain qui accepte `limit` octets puis échoue (AC-080-4, AC-080-7).
+    struct FailAfter {
+        limit: usize,
+        written: usize,
+    }
+
+    impl std::io::Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.written >= self.limit {
+                return Err(std::io::Error::other("disque plein simulé"));
+            }
+            let n = buf.len().min(self.limit - self.written);
+            self.written += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// AC-080-4 et AC-080-7 : une écriture interrompue donne une erreur rendue sur une ligne, et le
+    /// fichier commencé est supprimé (JSON comme HTML) ; vers stdout, le texte d'E-17.
+    #[test]
+    fn req080_ac4_ac7_failing_writer_removes_the_file_and_renders_the_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        copy_dir(&fixture("maven2"), &repo);
+        build_with_mock(&repo, Some(&fixture("mock")));
+        let wrap: &dyn Fn(Box<dyn std::io::Write>) -> Box<dyn std::io::Write> = &|_real| {
+            Box::new(FailAfter {
+                limit: 100,
+                written: 0,
+            })
+        };
+        for format in [
+            crate::cli::ExportFormat::Json,
+            crate::cli::ExportFormat::Html,
+        ] {
+            let file = tmp.path().join("out.export");
+            let err = crate::export::run_wrapped(&repo, Some(&file), format, wrap).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "écriture de {} impossible : disque plein simulé",
+                    file.display()
+                ),
+                "{format:?}"
+            );
+            assert!(!file.exists(), "{format:?} : fichier laissé");
+            let err =
+                crate::export::run_wrapped(&repo, Some(Path::new("-")), format, wrap).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "écriture sur stdout impossible : disque plein simulé",
+                "{format:?}"
+            );
+        }
+        // Un export du même nom qui existait est perdu (DEC-092, sans fichier temporaire).
+        let file = tmp.path().join("old.json");
+        std::fs::write(&file, "ancien").unwrap();
+        crate::export::run_wrapped(&repo, Some(&file), crate::cli::ExportFormat::Json, wrap)
+            .unwrap_err();
+        assert!(!file.exists());
     }
 }

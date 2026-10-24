@@ -1,7 +1,9 @@
 //! Commande `export` (REQ-018) : le graphe entier en JSON, lecture seule, sans LLM.
 
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::cli::ExportFormat;
@@ -12,7 +14,119 @@ use crate::store::Store;
 /// Version du format d'export.
 pub const EXPORT_VERSION: u32 = 1;
 
-pub fn build_json(store: &Store) -> Result<Value> {
+/// Erreur d'un export en flux : écriture (sortie fermée, disque plein) ou lecture du graphe.
+#[derive(Debug)]
+pub enum ExportError {
+    Write(std::io::Error),
+    Read(Error),
+}
+
+impl From<Error> for ExportError {
+    fn from(e: Error) -> Self {
+        ExportError::Read(e)
+    }
+}
+
+impl From<std::io::Error> for ExportError {
+    fn from(e: std::io::Error) -> Self {
+        ExportError::Write(e)
+    }
+}
+
+impl From<serde_json::Error> for ExportError {
+    fn from(e: serde_json::Error) -> Self {
+        ExportError::Write(e.into())
+    }
+}
+
+/// Éléments sérialisés par référence, champs dans l'ordre alphabétique du document de la 0.23.2.
+#[derive(Serialize)]
+struct NodeOut<'a> {
+    file: Option<&'a str>,
+    id: &'a str,
+    kind: &'a str,
+    qualified: &'a str,
+    short: &'a str,
+    subkind: Option<&'a str>,
+    summary: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct LinkOut<'a> {
+    kind: &'a str,
+    source: &'a str,
+    target: &'a str,
+}
+
+/// Écrit un élément précédé d'une virgule sauf le premier.
+fn element<W: Write, T: Serialize>(
+    w: &mut W,
+    first: &mut bool,
+    item: &T,
+) -> std::result::Result<(), ExportError> {
+    if !std::mem::replace(first, false) {
+        w.write_all(b",")?;
+    }
+    serde_json::to_writer(&mut *w, item)?;
+    Ok(())
+}
+
+/// Écrit le document JSON de l'export (REQ-018, REQ-080) au fil de la lecture du graphe : aucune
+/// liste de nœuds, de liens ni de non résolues n'est gardée en mémoire (DEC-092). Texte identique
+/// à `Value::to_string()` de la 0.23.2 : clés dans l'ordre alphabétique, format compact.
+pub fn write_json<W: Write>(store: &Store, w: &mut W) -> std::result::Result<(), ExportError> {
+    w.write_all(b"{\"edges\":[")?;
+    let mut first = true;
+    store.for_each_edge(|e| {
+        let item = LinkOut {
+            kind: e.kind.as_str(),
+            source: &e.source,
+            target: &e.target,
+        };
+        element(w, &mut first, &item)
+    })?;
+    w.write_all(b"],\"nodes\":[")?;
+    first = true;
+    store.for_each_node(|n| {
+        let item = NodeOut {
+            file: n.file.as_deref(),
+            id: &n.id,
+            kind: n.kind.as_str(),
+            qualified: &n.qualified,
+            short: &n.short,
+            subkind: n.subkind.map(|s| s.as_str()),
+            summary: n.summary.as_deref(),
+        };
+        element(w, &mut first, &item)
+    })?;
+    w.write_all(b"],\"unresolved\":[")?;
+    first = true;
+    if store.resolution_is_current()? {
+        store.for_each_unresolved(|source, kind, target| {
+            let item = LinkOut {
+                kind: kind.as_str(),
+                source,
+                target,
+            };
+            element(w, &mut first, &item)
+        })?;
+    } else {
+        for r in resolve::unresolved(store)? {
+            let item = LinkOut {
+                kind: r.kind.as_str(),
+                source: &r.source,
+                target: &r.target_name,
+            };
+            element(w, &mut first, &item)?;
+        }
+    }
+    write!(w, "],\"version\":{EXPORT_VERSION}}}")?;
+    Ok(())
+}
+
+/// Nœuds et liens de l'export, sans les non résolues : entrée de la vue HTML (REQ-025), qui ne les
+/// affiche pas, et donc sans passe de résolution (DEC-092).
+fn nodes_and_edges(store: &Store) -> Result<Value> {
     let nodes: Vec<Value> = store
         .nodes()?
         .into_iter()
@@ -33,11 +147,7 @@ pub fn build_json(store: &Store) -> Result<Value> {
         .into_iter()
         .map(|e| json!({"source": e.source, "target": e.target, "kind": e.kind.as_str()}))
         .collect();
-    let unresolved: Vec<Value> = resolve::unresolved(store)?
-        .into_iter()
-        .map(|r| json!({"source": r.source, "kind": r.kind.as_str(), "target": r.target_name}))
-        .collect();
-    Ok(json!({"version": EXPORT_VERSION, "nodes": nodes, "edges": edges, "unresolved": unresolved}))
+    Ok(json!({"version": EXPORT_VERSION, "nodes": nodes, "edges": edges}))
 }
 
 /// Nom de base des fichiers d'export : dernier composant du chemin canonique du dépôt,
@@ -80,23 +190,76 @@ pub fn output_path(repo: &Path, output: Option<&Path>, ext: &str) -> Target {
     }
 }
 
+/// Enveloppe du flux de sortie (les tests y branchent un écrivain qui échoue).
+pub(crate) type Wrap<'a> = &'a dyn Fn(Box<dyn Write>) -> Box<dyn Write>;
+
 pub fn run(repo: &Path, output: Option<&Path>, format: ExportFormat) -> Result<()> {
+    run_wrapped(repo, output, format, &|w| w)
+}
+
+/// Écrit le document dans `w` puis vide le tampon.
+fn write_document(
+    store: &Store,
+    page: Option<&str>,
+    sink: Box<dyn Write>,
+) -> std::result::Result<(), ExportError> {
+    let mut w = BufWriter::new(sink);
+    match page {
+        None => write_json(store, &mut w)?,
+        Some(page) => w.write_all(page.as_bytes())?,
+    }
+    w.write_all(b"\n")?;
+    w.flush()?;
+    Ok(())
+}
+
+pub(crate) fn run_wrapped(
+    repo: &Path,
+    output: Option<&Path>,
+    format: ExportFormat,
+    wrap: Wrap,
+) -> Result<()> {
     let store = Store::open_readonly(repo)?;
-    let graph = build_json(&store)?;
-    let (text, ext) = match format {
-        ExportFormat::Json => (graph.to_string(), "json"),
-        ExportFormat::Html => (crate::view::render(&slug(repo), &graph), "html"),
+    // La page est construite avant d'être écrite (V-013).
+    let (page, ext) = match format {
+        ExportFormat::Json => (None, "json"),
+        ExportFormat::Html => (
+            Some(crate::view::render(&slug(repo), &nodes_and_edges(&store)?)),
+            "html",
+        ),
     };
     match output_path(repo, output, ext) {
-        Target::Stdout => println!("{text}"),
+        Target::Stdout => {
+            let sink = wrap(Box::new(std::io::stdout().lock()));
+            write_document(&store, page.as_deref(), sink).map_err(|e| match e {
+                ExportError::Write(e) => {
+                    Error::Message(format!("écriture sur stdout impossible : {e}"))
+                }
+                ExportError::Read(e) => e,
+            })
+        }
         Target::File(path) => {
-            std::fs::write(&path, format!("{text}\n")).map_err(|e| {
+            let failed = |e: std::io::Error| {
                 Error::Message(format!("écriture de {} impossible : {e}", path.display()))
-            })?;
-            println!("{}", path.display());
+            };
+            // Le fichier est ouvert (donc vidé) avant la lecture du graphe ; commencé puis en
+            // échec, il est supprimé : pas d'export tronqué sous son nom (DEC-092).
+            let file = std::fs::File::create(&path).map_err(failed)?;
+            match write_document(&store, page.as_deref(), wrap(Box::new(file))) {
+                Ok(()) => {
+                    println!("{}", path.display());
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    Err(match e {
+                        ExportError::Write(e) => failed(e),
+                        ExportError::Read(e) => e,
+                    })
+                }
+            }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

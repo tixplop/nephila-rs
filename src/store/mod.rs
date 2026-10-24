@@ -1245,6 +1245,37 @@ impl Store {
         Ok(out)
     }
 
+    /// Parcourt les nœuds dans l'ordre de `nodes()`, un à la fois (DEC-092) : la mémoire ne
+    /// dépend pas de la taille du graphe. Une erreur de `f` arrête le parcours et est rendue.
+    pub fn for_each_node<E, F>(&self, mut f: F) -> std::result::Result<(), E>
+    where
+        E: From<Error>,
+        F: FnMut(&Node) -> std::result::Result<(), E>,
+    {
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes ORDER BY id",
+            )
+            .map_err(db_err)?;
+        let mut rows = st.query([]).map_err(db_err)?;
+        while let Some(r) = rows.next().map_err(db_err)? {
+            let kind: String = r.get(1).map_err(db_err)?;
+            let subkind: Option<String> = r.get(5).map_err(db_err)?;
+            let node = Node {
+                id: r.get(0).map_err(db_err)?,
+                kind: NodeKind::parse(&kind)?,
+                qualified: r.get(2).map_err(db_err)?,
+                short: r.get(3).map_err(db_err)?,
+                file: r.get(4).map_err(db_err)?,
+                subkind: subkind.as_deref().map(SubKind::parse).transpose()?,
+                summary: r.get(6).map_err(db_err)?,
+            };
+            f(&node)?;
+        }
+        Ok(())
+    }
+
     /// Nœuds susceptibles de correspondre à un nom saisi : identifiant, nom qualifié ou nom court
     /// égal à `name`, ou nom qualifié terminé par `name`. Triés par identifiant. L'appelant
     /// affine (frontière de segment).
@@ -1408,6 +1439,81 @@ impl Store {
         }
         note_edge_rows(out.len());
         Ok(out)
+    }
+
+    /// Parcourt les liens dans l'ordre de `edges()`, un à la fois (DEC-092).
+    pub fn for_each_edge<E, F>(&self, mut f: F) -> std::result::Result<(), E>
+    where
+        E: From<Error>,
+        F: FnMut(&Edge) -> std::result::Result<(), E>,
+    {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT source, target, kind FROM edges ORDER BY source, target, kind")
+            .map_err(db_err)?;
+        let mut rows = st.query([]).map_err(db_err)?;
+        while let Some(r) = rows.next().map_err(db_err)? {
+            let kind: String = r.get(2).map_err(db_err)?;
+            let edge = Edge {
+                source: r.get(0).map_err(db_err)?,
+                target: r.get(1).map_err(db_err)?,
+                kind: EdgeKind::parse(&kind)?,
+            };
+            f(&edge)?;
+        }
+        Ok(())
+    }
+
+    /// Vrai si le graphe est de schéma 8 et marqué `à jour` (`meta.resolution`) : le statut
+    /// `refs.unresolved` est alors celui d'une résolution terminée. Lecture seule (DEC-092).
+    pub fn resolution_is_current(&self) -> Result<bool> {
+        if self.version != SCHEMA_VERSION {
+            return Ok(false);
+        }
+        let value: Option<String> = match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'resolution'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get(0))
+        {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(db_err(e)),
+        };
+        Ok(value.as_deref() == Some(RESOLUTION_DONE))
+    }
+
+    /// Parcourt les références comptées non résolues (`refs.unresolved = 1`), dans l'ordre de
+    /// `id`, sans copie de la table : `(source, genre, nom cible)`. À n'appeler que si
+    /// `resolution_is_current()` (schéma 8).
+    pub fn for_each_unresolved<E, F>(&self, mut f: F) -> std::result::Result<(), E>
+    where
+        E: From<Error>,
+        F: FnMut(&str, EdgeKind, &str) -> std::result::Result<(), E>,
+    {
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT source, kind, target_name FROM refs WHERE unresolved = 1 ORDER BY id",
+            )
+            .map_err(db_err)?;
+        let mut rows = st.query([]).map_err(db_err)?;
+        while let Some(r) = rows.next().map_err(db_err)? {
+            let kind: String = r.get(1).map_err(db_err)?;
+            let kind = EdgeKind::parse(&kind)?;
+            let source = r
+                .get_ref(0)
+                .map_err(db_err)?
+                .as_str()
+                .map_err(|e| db_err(e.into()))?;
+            let target = r
+                .get_ref(2)
+                .map_err(db_err)?
+                .as_str()
+                .map_err(|e| db_err(e.into()))?;
+            f(source, kind, target)?;
+        }
+        Ok(())
     }
 
     pub fn refs(&self) -> Result<Vec<Ref>> {

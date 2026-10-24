@@ -256,6 +256,28 @@ fn compute_from(store: &Store) -> Result<Resolution> {
     ))
 }
 
+/// Compteur de diagnostic des passes de `compute` du fil courant (AC-080-2).
+#[cfg(test)]
+pub(crate) mod passes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PASSES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        PASSES.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn reset() {
+        PASSES.with(|c| c.set(0));
+    }
+
+    pub(crate) fn count() -> usize {
+        PASSES.with(Cell::get)
+    }
+}
+
 #[derive(Default)]
 struct FileContext {
     package: Option<String>,
@@ -564,6 +586,8 @@ pub fn compute(
     contexts: &HashMap<String, String>,
     declarations: &[(String, String)],
 ) -> Resolution {
+    #[cfg(test)]
+    passes::bump();
     let idx = Index::new(nodes);
     let parsed: HashMap<&str, FileContext> = contexts
         .iter()
