@@ -71,7 +71,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.21.0                                      # version voulue
+V=v0.22.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -703,6 +703,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 ## Mise à niveau
 
 - **Renommage `rkg` → `nephila`** : le binaire s'appelle `nephila`, le graphe est stocké dans `.nephila/` (au lieu de `.rkg/`), la configuration dans `~/.config/nephila/config.toml` et les variables d'environnement sont préfixées `NEPHILA_` (`NEPHILA_CONFIG`, `NEPHILA_MOCK_DIR`…). Déplacez votre configuration (`mv ~/.config/rkg ~/.config/nephila`), puis reconstruisez le graphe avec `nephila build` et supprimez l'ancien dossier `.rkg/`.
+- **Vers 0.22** : le graphe passe au schéma 8 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, et la première résolution qui suit est complète ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.21 tel quel. Un binaire 0.21 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).
 - **Vers 0.21** : le graphe passe au schéma 7 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.20 tel quel. La place libérée n'est rendue au disque que par `sqlite3 .nephila/graph.db 'VACUUM'`. Un binaire 0.20 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).
 - **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles. Le graphe passe au schéma 6 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 tel quel.
 - **Vers 0.18** : le graphe passe au schéma 5. Un graphe 0.17 est refusé (`… lancez nephila build`) : le premier `nephila build` avec le LLM actif le remplace et enrichit une fois tous les fichiers de la portée (documents Markdown, ou tout avec `enrich_code`), puis les `build` suivants n'envoient que les fichiers nouveaux ou modifiés. Le code n'est plus enrichi par défaut et `batch_files` vaut 10.
@@ -713,6 +714,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.22 | Mise à jour incrémentale : `update` ne résout plus que les références touchées par les fichiers changés et ne relit plus toute la table des liens ; résumé global calculé sans relire le graphe ; une seule résolution complète par commande avec LLM. Même graphe qu'en 0.21 ; le schéma 8 est migré sur place. |
 | 0.21 | Stockage SQLite allégé : contexte d'imports stocké une fois par fichier, index inutiles retirés, cache SQLite agrandi à chaque ouverture en écriture, écritures regroupées, build neuf sans recalcul répété des nœuds. Même graphe qu'en 0.20 ; le schéma 7 est migré sur place. |
 | 0.20 | Options LLM thinking, effort et max_output_tokens dans la configuration personnelle. Rupture : une limite de sortie de 16384 jetons est envoyée par défaut, à anthropic (au lieu de 8192) et désormais à openai ; un modèle ou un serveur qui ne l'accepte pas refuse la requête (HTTP 400) : baissez max_output_tokens. Une réponse tronquée conseille aussi d'augmenter max_output_tokens. |
 | 0.19.2 | Fichiers aux noms non UTF-8 lus par leur chemin réel (ils ne restent plus en attente) ; deux noms identiques après conversion : un seul est indexé, l'autre est nommé par un avertissement, au lieu d'un échec de build |
@@ -746,7 +748,7 @@ L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests su
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.21.0 && git push origin v0.21.0
+git tag v0.22.0 && git push origin v0.22.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.

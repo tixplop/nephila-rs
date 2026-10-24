@@ -728,7 +728,7 @@ fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
     assert!(line.contains("0.17"));
     let at = |needle: &str| readme.find(needle).unwrap();
     assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.21.0", "git tag v0.21.0 && git push origin v0.21.0"] {
+    for needle in ["V=v0.22.0", "git tag v0.22.0 && git push origin v0.22.0"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
     assert!(!readme.contains("0.17.6"));
@@ -936,8 +936,8 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
         "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
         "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.21.0 ",
-        "git tag v0.21.0 && git push origin v0.21.0",
+        "V=v0.22.0 ",
+        "git tag v0.22.0 && git push origin v0.22.0",
     ] {
         assert!(readme.contains(expected), "absent : {expected}");
     }
@@ -1102,4 +1102,24 @@ fn REQ065_AC1_readme_0_21_stockage_allege() {
     let v19 = sec.find("- **Vers 0.19**").expect("puce Vers 0.19");
     assert!(b < v19);
     assert_eq!(sec[b..v19].trim_end(), bullet);
+}
+
+#[test]
+fn REQ066_AC1_readme_0_22_mise_a_jour_incrementale() {
+    let readme = repo_file("README.md");
+    let row = "| 0.22 | Mise à jour incrémentale : `update` ne résout plus que les références touchées par les fichiers changés et ne relit plus toute la table des liens ; résumé global calculé sans relire le graphe ; une seule résolution complète par commande avec LLM. Même graphe qu'en 0.21 ; le schéma 8 est migré sur place. |";
+    let bullet = "- **Vers 0.22** : le graphe passe au schéma 8 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, et la première résolution qui suit est complète ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.21 tel quel. Un binaire 0.21 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).";
+    let lines: Vec<&str> = readme.lines().collect();
+    assert_eq!(lines.iter().filter(|l| **l == row).count(), 1);
+    let i22 = lines.iter().position(|l| *l == row).unwrap();
+    let i21 = lines
+        .iter()
+        .position(|l| l.starts_with("| 0.21 |"))
+        .expect("ligne 0.21 absente");
+    assert_eq!(i22 + 1, i21);
+    let sec = readme_section(&readme, "## Mise à niveau");
+    let b = sec.find(bullet).expect("puce Vers 0.22 absente");
+    let v21 = sec.find("- **Vers 0.21**").expect("puce Vers 0.21");
+    assert!(b < v21);
+    assert_eq!(sec[b..v21].trim_end(), bullet);
 }
