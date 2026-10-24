@@ -350,12 +350,23 @@ impl<'a> Index<'a> {
     }
 }
 
+thread_local! {
+    static NAME_KEYS_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Appels de `name_keys` faits par le fil courant (diagnostic, AC-074-2).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn name_keys_calls() -> u64 {
+    NAME_KEYS_CALLS.with(std::cell::Cell::get)
+}
+
 const SEPARATORS: [char; 5] = ['.', '/', '#', ':', '\\'];
 
 /// Clé et tête d'un nom visé par une référence (DEC-076), seule définition : la clé est le
 /// dernier segment du nom (séparateurs de `SEPARATORS`), la tête le texte qui précède le premier
 /// `.` quand le nom en contient un. Le nom est d'abord débarrassé de ses espaces de bord.
 pub fn name_keys(name: &str) -> (String, Option<String>) {
+    NAME_KEYS_CALLS.with(|c| c.set(c.get() + 1));
     let name = name.trim();
     let head = name.find('.').map(|i| name[..i].to_string());
     (last_segment(name).to_string(), head)

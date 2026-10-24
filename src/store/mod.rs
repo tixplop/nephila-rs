@@ -1,5 +1,6 @@
 //! Stockage SQLite du graphe dans `<dépôt>/.nephila/graph.db` (DEC-009, DEC-010).
 
+use std::borrow::Borrow;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
@@ -8,9 +9,14 @@ use serde::{Deserialize, Serialize};
 use crate::llm::enrich::ENRICH_PROMPT_VERSION;
 
 use crate::error::{Error, Result};
+
+pub(crate) mod prepare;
 use crate::model::{
     Edge, EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, RefOrigin, SubKind,
 };
+#[cfg(test)]
+pub(crate) use prepare::{preparations_on_thread, preparations_total};
+pub use prepare::{prepare_raw, prepare_structure, PreparedRef, PreparedStructure};
 
 /// Instant courant en millisecondes depuis l'epoch.
 fn now_ms() -> i64 {
@@ -886,7 +892,8 @@ impl Store {
     /// n'est pas déclarée par le fichier sont rejetées. Déclarations et références nouvelles
     /// ont l'origine `parse`.
     pub fn replace_structure(&mut self, path: &str, nodes: &[Node], refs: &[Ref]) -> Result<()> {
-        self.replace_structures(&[(path.to_string(), nodes.to_vec(), refs.to_vec())])
+        let one = [(path.to_string(), nodes.to_vec(), refs.to_vec())];
+        self.replace_structures(&one)
     }
 
     /// Comme `replace_structure` pour plusieurs fichiers en une seule transaction (tout ou rien) :
@@ -896,37 +903,58 @@ impl Store {
     }
 
     /// Comme `replace_structures` ; renvoie le nombre de fichiers dont l'enrichissement conservé
-    /// a été réappliqué (DEC-062).
+    /// a été réappliqué (DEC-062). Prépare (DEC-086) puis écrit ; une erreur de préparation est
+    /// rendue à son rang, après le contrôle « fichier connu » des fichiers qui la précèdent.
     pub fn replace_structures_counted(
         &mut self,
         items: &[(String, Vec<Node>, Vec<Ref>)],
     ) -> Result<usize> {
+        let prepared: Vec<(&str, Result<PreparedStructure>)> = items
+            .iter()
+            .map(|(p, n, r)| (p.as_str(), prepare_raw(p, n, r)))
+            .collect();
+        self.write_items(prepared)
+    }
+
+    /// Écrit des structures préparées (DEC-086) en une seule transaction, tout ou rien : que des
+    /// instructions SQL, aucun calcul. Renvoie le nombre de fichiers dont l'enrichissement
+    /// conservé a été réappliqué (DEC-062).
+    pub fn write_prepared(&mut self, items: &[PreparedStructure]) -> Result<usize> {
+        self.write_items(items.iter().map(|p| (p.path.as_str(), Ok(p))))
+    }
+
+    fn write_items<'a, B: Borrow<PreparedStructure>>(
+        &mut self,
+        items: impl IntoIterator<Item = (&'a str, Result<B>)>,
+    ) -> Result<usize> {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
-        if !items.is_empty() {
-            mark_stale_tx(self.stale, &tx)?;
-        }
         let mut reapplied = 0;
-        let mut newly: Vec<&str> = Vec::new();
+        let mut newly: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut any = false;
         let track = self.log.is_some();
         let mut pending = ChangeLog::default();
-        for (path, nodes, refs) in items {
+        for (path, item) in items {
+            if !any {
+                mark_stale_tx(self.stale, &tx)?;
+                any = true;
+            }
             require_known(&tx, path)?;
-            let fresh = self.fresh
-                && !self.written.contains(path.as_str())
-                && !newly.contains(&path.as_str());
+            let p = item?;
+            let p: &PreparedStructure = p.borrow();
+            let fresh = self.fresh && !self.written.contains(path) && !newly.contains(path);
             if fresh {
-                if write_structure_fresh(&tx, path, nodes, refs)? {
+                if write_structure_fresh(&tx, p)? {
                     reapplied += 1;
                 }
-                newly.push(path);
+                newly.insert(path);
                 continue;
             }
             let mut touched = Touched::new(track);
             clear_summaries(&tx, path, &mut touched)?;
             release_file(&tx, path, None, &mut touched)?;
-            insert_nodes(&tx, path, nodes, "parse", &mut touched)?;
-            insert_refs(&tx, path, refs, "parse", &mut touched)?;
+            insert_nodes(&tx, path, &p.nodes, "parse", &mut touched)?;
+            insert_prepared_refs(&tx, p, &mut touched)?;
             tx.prepare_cached("UPDATE files SET state = 'indexed' WHERE path = ?1")
                 .map_err(db_err)?
                 .execute([path])
@@ -939,11 +967,12 @@ impl Store {
         }
         commit_counted(tx)?;
         self.merge_log(pending);
-        if !items.is_empty() {
+        if any {
             self.stale = true;
         }
         if self.fresh {
-            self.written.extend(items.iter().map(|(p, _, _)| p.clone()));
+            let done: Vec<String> = newly.iter().map(|p| (*p).to_string()).collect();
+            self.written.extend(done);
         }
         Ok(reapplied)
     }
@@ -2694,21 +2723,18 @@ fn reapply_enrichment(
 /// Écriture de la structure d'un fichier pas encore écrit sur une base fraîche (DEC-075) : rien
 /// à libérer ni à effacer ; l'enrichissement conservé est fusionné dans les enregistrements avant
 /// leur insertion. Renvoie `true` si un enrichissement conservé a été réappliqué.
-fn write_structure_fresh(
-    tx: &rusqlite::Transaction<'_>,
-    path: &str,
-    nodes: &[Node],
-    refs: &[Ref],
-) -> Result<bool> {
+fn write_structure_fresh(tx: &rusqlite::Transaction<'_>, p: &PreparedStructure) -> Result<bool> {
+    let path = p.path.as_str();
     // Base fraîche : le journal n'est pas tenu (DEC-077 point 1).
     let mut touched = Touched::new(false);
-    let mut parse_nodes = nodes.to_vec();
+    let mut merged: Option<Vec<Node>> = None;
     let mut kept: Option<(Vec<Node>, Vec<Ref>)> = None;
     if let Some(payload) = load_kept_enrichment(tx, path)? {
         let declared: std::collections::HashSet<String> =
-            nodes.iter().map(|n| n.id.clone()).collect();
+            p.nodes.iter().map(|n| n.id.clone()).collect();
         let (summaries, concepts, llm_refs) = filter_payload(payload, &declared);
         // Les résumés du fichier sont effacés puis remplacés par ceux de l'enrichissement.
+        let mut parse_nodes = p.nodes.clone();
         for n in &mut parse_nodes {
             n.summary = None;
         }
@@ -2717,10 +2743,17 @@ fn write_structure_fresh(
                 n.summary = Some(text.clone());
             }
         }
+        merged = Some(parse_nodes);
         kept = Some((concepts, llm_refs));
     }
-    insert_nodes_fresh(tx, path, &parse_nodes, "parse", &mut touched)?;
-    insert_refs(tx, path, refs, "parse", &mut touched)?;
+    insert_nodes_fresh(
+        tx,
+        path,
+        merged.as_deref().unwrap_or(&p.nodes),
+        "parse",
+        &mut touched,
+    )?;
+    insert_prepared_refs(tx, p, &mut touched)?;
     tx.prepare_cached("UPDATE files SET state = 'indexed' WHERE path = ?1")
         .map_err(db_err)?
         .execute([path])
@@ -2733,6 +2766,48 @@ fn write_structure_fresh(
     let ids: Vec<&String> = touched.ids.iter().collect();
     refresh_nodes(tx, &ids)?;
     Ok(reapplied)
+}
+
+/// Insère les références d'analyse d'une structure préparée : sources déclarées, clé et tête
+/// calculées, contexte unique contrôlé par la préparation (aucune sous-requête, DEC-086).
+fn insert_prepared_refs(
+    tx: &rusqlite::Transaction<'_>,
+    p: &PreparedStructure,
+    touched: &mut Touched,
+) -> Result<()> {
+    let path = p.path.as_str();
+    {
+        let mut insr = tx
+            .prepare_cached(
+                "INSERT INTO refs(source, file, kind, target_name, origin, target_key, target_head)
+                 VALUES (?1, ?2, ?3, ?4, 'parse', ?5, ?6)",
+            )
+            .map_err(db_err)?;
+        for r in &p.refs {
+            insr.execute(params![
+                r.source,
+                path,
+                r.kind.as_str(),
+                r.target_name,
+                r.key,
+                r.head
+            ])
+            .map_err(db_err)?;
+        }
+    }
+    if touched.track && !p.refs.is_empty() {
+        touched.log.files.insert(path.to_string());
+    }
+    if let Some(context) = p.context.as_deref() {
+        tx.prepare_cached(
+            "INSERT INTO file_contexts(file, context) VALUES (?1, ?2)
+             ON CONFLICT(file) DO UPDATE SET context = excluded.context",
+        )
+        .map_err(db_err)?
+        .execute(params![path, context])
+        .map_err(db_err)?;
+    }
+    Ok(())
 }
 
 fn version_error(v: i32) -> Error {

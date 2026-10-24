@@ -8,11 +8,10 @@ use std::sync::Mutex;
 
 use crate::error::{warn, Error, Result};
 use crate::index::build::BuildReport;
-use crate::model::{Node, NodeKind, Ref};
-use crate::parse::{self, FileStructure, ParseCtx};
+use crate::parse::{self, ParseCtx};
 use crate::progress::{self, Phase};
 use crate::scan::ScannedFile;
-use crate::store::Store;
+use crate::store::{PreparedStructure, Store};
 use crate::trace;
 
 /// Pile des fils d'analyse : filet pour les récursions restantes (DEC-054).
@@ -21,10 +20,8 @@ const EXTRACT_STACK: usize = 16 * 1024 * 1024;
 /// Nombre de fichiers enregistrés par transaction.
 const BATCH: usize = 200;
 
-type Batched = (String, Vec<Node>, Vec<Ref>);
-
 enum Outcome {
-    Parsed(String, FileStructure),
+    Parsed(Result<PreparedStructure>, Vec<String>),
     Failed(String, Error),
 }
 
@@ -54,7 +51,7 @@ pub(crate) fn analyze(
     let failed_before = report.failed;
     let retained_before = report.retained;
     trace!("structure: début {total} fichiers, {workers} fils");
-    let mut batch: Vec<Batched> = Vec::new();
+    let mut batch: Vec<PreparedStructure> = Vec::new();
 
     let mut meter = progress::Meter::start(Phase::Extraction, total);
     let mut spawn_error: Option<Error> = None;
@@ -124,20 +121,28 @@ pub(crate) fn analyze(
                     warn(&format!("{path} : {e}"));
                     report.failed += 1;
                 }
-                Outcome::Parsed(path, s) => {
+                Outcome::Parsed(prepared, warnings) => {
                     if write_error.is_some() {
                         continue;
                     }
-                    for w in &s.warnings {
+                    for w in &warnings {
                         warn(w);
                     }
-                    let (nodes, refs, dropped) = to_records(&path, &s);
-                    if dropped > 0 {
+                    let p = match prepared {
+                        Ok(p) => p,
+                        Err(e) => {
+                            queue.lock().unwrap_or_else(|q| q.into_inner()).clear();
+                            write_error = Some(e);
+                            continue;
+                        }
+                    };
+                    if p.dropped > 0 {
                         warn(&format!(
-                            "{path} : {dropped} référence(s) ignorée(s), source non déclarée"
+                            "{} : {} référence(s) ignorée(s), source non déclarée",
+                            p.path, p.dropped
                         ));
                     }
-                    batch.push((path, nodes, refs));
+                    batch.push(p);
                     if batch.len() >= BATCH {
                         flush(store, &mut batch, queue, report, &mut write_error);
                     }
@@ -162,7 +167,8 @@ pub(crate) fn analyze(
 
 fn extract(path: &str, text: &str, ctx: &ParseCtx) -> Outcome {
     match parse::extract(Path::new(path), text, ctx) {
-        Ok(s) => Outcome::Parsed(path.to_string(), s),
+        // Conversion, contrôles et clés : dans le fil d'extraction (DEC-086).
+        Ok(s) => Outcome::Parsed(crate::store::prepare_structure(path, &s), s.warnings),
         Err(e) => Outcome::Failed(path.to_string(), e),
     }
 }
@@ -171,7 +177,7 @@ fn extract(path: &str, text: &str, ctx: &ParseCtx) -> Outcome {
 /// résultats restants sont ignorés) et est conservée.
 fn flush(
     store: &mut Store,
-    batch: &mut Vec<Batched>,
+    batch: &mut Vec<PreparedStructure>,
     queue: &Mutex<VecDeque<ScannedFile>>,
     report: &mut BuildReport,
     write_error: &mut Option<Error>,
@@ -179,7 +185,7 @@ fn flush(
     if batch.is_empty() {
         return;
     }
-    match store.replace_structures_counted(batch) {
+    match store.write_prepared(batch) {
         Ok(retained) => {
             report.processed += batch.len();
             report.retained += retained;
@@ -192,67 +198,12 @@ fn flush(
     batch.clear();
 }
 
-/// Nom court d'un nœud, selon son genre.
-fn short_name(kind: NodeKind, qualified: &str) -> &str {
-    let after = |seps: &[char]| qualified.rsplit(seps).next().unwrap_or(qualified);
-    match kind {
-        NodeKind::Document => after(&['/']),
-        NodeKind::Module => after(&[':', '/']),
-        NodeKind::Section => after(&['#']),
-        NodeKind::Dependency => after(&[':']),
-        // Chemin de clé : tout ce qui suit le premier `#` (un nom de membre peut en contenir).
-        NodeKind::Key => qualified.split_once('#').map_or(qualified, |(_, k)| k),
-        NodeKind::Table => after(&['.']),
-        _ => after(&['.']),
-    }
-}
-
-/// Convertit la structure d'un fichier en nœuds et références rattachés à ce fichier. Les
-/// références dont la source n'est pas déclarée sont écartées (leur nombre est renvoyé).
-fn to_records(path: &str, x: &FileStructure) -> (Vec<Node>, Vec<Ref>, usize) {
-    let mut nodes: Vec<Node> = Vec::new();
-    for d in &x.declares {
-        let id = d.id();
-        if nodes.iter().any(|n| n.id == id) {
-            continue;
-        }
-        // Dépendances externes et concepts n'ont pas de fichier propre.
-        let file = match d.kind {
-            NodeKind::Dependency | NodeKind::Concept => None,
-            _ => Some(path),
-        };
-        nodes.push(Node::new(
-            d.kind,
-            &d.qualified,
-            d.short
-                .as_deref()
-                .unwrap_or_else(|| short_name(d.kind, &d.qualified)),
-            file,
-            d.subkind,
-            d.summary.as_deref(),
-        ));
-    }
-    let mut refs = Vec::new();
-    let mut dropped = 0;
-    for r in &x.references {
-        if !nodes.iter().any(|n| n.id == r.source) {
-            dropped += 1;
-            continue;
-        }
-        refs.push(Ref {
-            source: r.source.clone(),
-            kind: r.kind,
-            target_name: r.target.clone(),
-            context: x.context.clone(),
-        });
-    }
-    (nodes, refs, dropped)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::Declared;
+    use crate::model::NodeKind;
+    use crate::parse::{Declared, FileStructure};
+    use crate::store::prepare_structure;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Compteur de diagnostic (AC-071-3) : fils d'extraction lancés, tous appels confondus.
@@ -309,6 +260,172 @@ mod tests {
         assert!((1..=crate::index::MAX_JOBS).contains(&d), "{d}");
     }
 
+    fn write_repo(repo: &Path, n: usize) {
+        for i in 0..n {
+            if i % 10 == 9 {
+                std::fs::write(
+                    repo.join(format!("doc{i}.md")),
+                    format!(
+                        "# Doc {i}\n\nVoir [suite](doc{}.md) et `C{}`.\n\n## Détail\n",
+                        i - 1,
+                        i - 2
+                    ),
+                )
+                .unwrap();
+            } else {
+                std::fs::write(
+                    repo.join(format!("C{i}.java")),
+                    format!(
+                        "package p;\nimport q.D{i};\npublic class C{i} extends D{i} {{\n  void m() {{ C{}.go(); D{i}.run(); }}\n}}\n",
+                        (i + 1) % n
+                    ),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    fn pending_records(files: &[crate::scan::ScannedFile]) -> Vec<crate::model::FileRecord> {
+        files
+            .iter()
+            .map(|f| crate::model::FileRecord {
+                path: f.path.clone(),
+                hash: f.hash.clone(),
+                size: f.size,
+                mtime: f.mtime,
+                recorded_at: 0,
+                state: crate::model::FileState::Pending,
+            })
+            .collect()
+    }
+
+    /// Contenu des tables écrites par la phase structure (identifiants de référence exclus : ils
+    /// suivent l'ordre d'arrivée des fils), après la passe de résolution.
+    fn dump(repo: &Path) -> Vec<(String, Vec<String>)> {
+        let conn = rusqlite::Connection::open(repo.join(".nephila/graph.db")).unwrap();
+        let queries = [
+            ("nodes", "SELECT id, kind, qualified, short, file, subkind, summary, summary_file, qualified_rev FROM nodes ORDER BY id"),
+            ("declarations", "SELECT file, node, origin, short, subkind, located, summary FROM declarations ORDER BY file, node"),
+            ("refs", "SELECT source, file, kind, target_name, origin, target_key, target_head, unresolved FROM refs ORDER BY file, source, kind, target_name, origin"),
+            ("file_contexts", "SELECT file, context FROM file_contexts ORDER BY file"),
+            ("edges", "SELECT source, target, kind FROM edges ORDER BY source, target, kind"),
+        ];
+        queries
+            .iter()
+            .map(|(name, sql)| {
+                let mut st = conn.prepare(sql).unwrap();
+                let cols = st.column_count();
+                let rows = st
+                    .query_map([], |r| {
+                        Ok((0..cols)
+                            .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                            .collect::<Vec<_>>()
+                            .join("|"))
+                    })
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+                (name.to_string(), rows)
+            })
+            .collect()
+    }
+
+    fn resolve(store: &mut Store, repo: &Path) {
+        let mut report = BuildReport::default();
+        crate::index::build::finalize(
+            store,
+            None,
+            &crate::index::build::IndexOptions::default(),
+            repo,
+            &HashMap::new(),
+            &mut report,
+        )
+        .unwrap();
+    }
+
+    /// AC-074-2 : la préparation et le calcul des clés se font dans les fils d'extraction, et les
+    /// tables écrites sont celles d'une écriture des mêmes structures par `replace_structures`
+    /// (base fraîche, puis chemin général).
+    #[test]
+    fn req074_ac2_preparation_dans_les_fils_tables_identiques() {
+        use crate::store::{preparations_on_thread, preparations_total};
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write_repo(a.path(), 50);
+        write_repo(b.path(), 50);
+        let mut sa = Store::open_or_create(a.path()).unwrap();
+        let mut sb = Store::open_or_create(b.path()).unwrap();
+        let matcher = crate::filter::Matcher::none();
+        for round in 0..2 {
+            // A : analyze avec 4 fils.
+            let scanned = crate::scan::scan(a.path(), &[], &matcher, 1).unwrap();
+            assert_eq!(scanned.files.len(), 50);
+            if round == 0 {
+                sa.reset_with_pending_files(&pending_records(&scanned.files))
+                    .unwrap();
+            }
+            let (t0, k0, g0) = (
+                preparations_on_thread(),
+                crate::resolve::name_keys_calls(),
+                preparations_total(),
+            );
+            let mut report = BuildReport::default();
+            analyze(
+                a.path(),
+                scanned.files,
+                4,
+                &scanned.gradle_settings,
+                &mut sa,
+                &mut report,
+            )
+            .unwrap();
+            assert_eq!(
+                preparations_on_thread(),
+                t0,
+                "préparation sur le fil appelant"
+            );
+            assert_eq!(
+                crate::resolve::name_keys_calls(),
+                k0,
+                "name_keys sur le fil appelant"
+            );
+            assert_eq!(preparations_total() - g0, 50);
+            assert_eq!(report.processed, 50);
+
+            // B : mêmes structures, écrites par l'API brute avec la conversion de la 0.22.0.
+            let scanned = crate::scan::scan(b.path(), &[], &matcher, 1).unwrap();
+            if round == 0 {
+                sb.reset_with_pending_files(&pending_records(&scanned.files))
+                    .unwrap();
+            }
+            let ctx = ParseCtx {
+                repo_root: Some(b.path().canonicalize().unwrap()),
+                gradle_settings: scanned.gradle_settings.clone(),
+            };
+            let items: Vec<(String, Vec<crate::model::Node>, Vec<crate::model::Ref>)> = scanned
+                .files
+                .iter()
+                .map(|f| {
+                    let text = std::fs::read_to_string(b.path().join(&f.path)).unwrap();
+                    let x = parse::extract(Path::new(&f.path), &text, &ctx).unwrap();
+                    let (n, r, _) = crate::store::prepare::oracle::to_records(&f.path, &x);
+                    (f.path.clone(), n, r)
+                })
+                .collect();
+            sb.replace_structures(&items).unwrap();
+
+            resolve(&mut sa, a.path());
+            resolve(&mut sb, b.path());
+            let (da, db) = (dump(a.path()), dump(b.path()));
+            for ((name, ra), (_, rb)) in da.iter().zip(&db) {
+                assert_eq!(ra, rb, "table {name}, tour {round}");
+            }
+            assert!(da[2].1.len() > 100, "refs : {}", da[2].1.len());
+            assert!(!da[3].1.is_empty());
+            assert!(!da[4].1.is_empty());
+        }
+    }
+
     fn module(q: &str, short: Option<&str>) -> FileStructure {
         FileStructure {
             declares: vec![Declared {
@@ -324,32 +441,25 @@ mod tests {
 
     #[test]
     fn dec024_nom_court_porte_par_la_declaration() {
-        let (n, _, _) = to_records("api/pom.xml", &module("com.acme:api", Some("api")));
+        let n = prepare_structure("api/pom.xml", &module("com.acme:api", Some("api")))
+            .unwrap()
+            .nodes;
         assert_eq!(n[0].short, "api");
     }
 
     #[test]
-    fn short_name_key_et_table() {
-        assert_eq!(
-            short_name(NodeKind::Key, "app/application.yml#spring.datasource.url"),
-            "spring.datasource.url"
-        );
-        assert_eq!(short_name(NodeKind::Key, "c.json#a#b.c"), "a#b.c");
-        assert_eq!(short_name(NodeKind::Table, "shop.products"), "products");
-        assert_eq!(short_name(NodeKind::Table, "orders"), "orders");
-        assert_eq!(
-            short_name(NodeKind::Document, "db/V1__init.sql"),
-            "V1__init.sql"
-        );
-    }
-
-    #[test]
     fn dec024_nom_court_derive_du_module() {
-        let (n, _, _) = to_records("pom.xml", &module("com.acme:core", None));
+        let n = prepare_structure("pom.xml", &module("com.acme:core", None))
+            .unwrap()
+            .nodes;
         assert_eq!(n[0].short, "core");
-        let (n, _, _) = to_records("pom.xml", &module("core", None));
+        let n = prepare_structure("pom.xml", &module("core", None))
+            .unwrap()
+            .nodes;
         assert_eq!(n[0].short, "core");
-        let (n, _, _) = to_records("pom.xml", &module("a/b", None));
+        let n = prepare_structure("pom.xml", &module("a/b", None))
+            .unwrap()
+            .nodes;
         assert_eq!(n[0].short, "b");
     }
 
