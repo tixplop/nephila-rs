@@ -1,19 +1,20 @@
 //! Résolution des liens sans LLM (REQ-008) et liens `contains` dérivés (REQ-005).
 //!
-//! La passe est une fonction pure de `nodes`, `refs` et `declarations` : elle recalcule l'ensemble
-//! des liens en mémoire puis les remplace en une transaction. Le résultat est identique à un
-//! recalcul ciblé (références non résolues ou visant des noms ajoutés/supprimés), qui ne serait
-//! qu'une optimisation.
+//! Deux passes au même résultat (DEC-077) : la passe complète est une fonction pure de `nodes`,
+//! `refs` et `declarations` qui recalcule tous les liens en mémoire ; la passe incrémentale ne
+//! réévalue que les sources et les cibles que le journal des changements du stockage désigne.
+//! Toutes deux écrivent leurs différences, le statut des références et le résumé en une
+//! transaction.
 //!
 //! Le contexte d'une référence est un texte libre dont les lignes (ou segments séparés par `;`)
 //! `package a.b` et `import a.b.C` / `import a.b.*` sont reconnues.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error::Result;
 use crate::model::{node_id, parse_node_id, Edge, EdgeKind, Node, NodeKind, Ref, RefOrigin};
 use crate::scan::module_of;
-use crate::store::{FileRef, Store};
+use crate::store::{ChangeLog, FileRef, IncrementalWrite, Store};
 
 /// Bilan d'une passe de résolution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -32,9 +33,33 @@ pub struct Resolution {
     pub dependencies: Vec<Node>,
 }
 
-/// Recalcule tous les liens du graphe à partir des nœuds et des références.
+/// Résout les liens du graphe (DEC-077 point 2) : passe incrémentale quand le stockage tient un
+/// journal des changements sans nœud `module`, passe complète sinon (première passe d'un
+/// `build`, graphe non marqué `à jour`, module inséré, supprimé ou modifié).
 pub fn resolve(store: &mut Store) -> Result<ResolveStats> {
+    match store.change_log() {
+        Some(log) if !touches_module(log) => {
+            let log = log.clone();
+            resolve_incremental(store, &log)
+        }
+        _ => resolve_full(store),
+    }
+}
+
+fn touches_module(log: &ChangeLog) -> bool {
+    let prefix = format!("{}:", NodeKind::Module.as_str());
+    log.inserted
+        .iter()
+        .chain(&log.deleted)
+        .chain(&log.declarations_changed)
+        .any(|id| id.starts_with(&prefix))
+}
+
+/// Passe complète : recalcule tous les liens du graphe à partir des nœuds et des références.
+fn resolve_full(store: &mut Store) -> Result<ResolveStats> {
+    crate::store::note_pass(false);
     let refs = store.file_refs()?;
+    crate::store::note_refs_reevaluated(refs.len());
     let r = compute(
         &store.nodes()?,
         &refs,
@@ -51,6 +76,138 @@ pub fn resolve(store: &mut Store) -> Result<ResolveStats> {
         crate::summary::compute_stamped,
     )?;
     // Les liens sont dédupliqués par la clé primaire : on compte ce qui est stocké.
+    Ok(ResolveStats {
+        edges: store.count_edges()?,
+        unresolved: store.count_unresolved()?,
+    })
+}
+
+/// Passe incrémentale (DEC-077 point 3) : ne réévalue que les références des sources concernées
+/// par le journal et les liens `contains` des cibles concernées ; même résultat que la passe
+/// complète sur le même état.
+fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStats> {
+    crate::store::note_pass(true);
+    let nodes = store.resolution_nodes()?;
+    let idx = Index::new(&nodes);
+    let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let moved: BTreeSet<&str> = log
+        .inserted
+        .iter()
+        .chain(&log.deleted)
+        .map(String::as_str)
+        .collect();
+
+    // Sources réévaluées : fichiers dont les références ont changé, sources retirées, et
+    // références dont la clé ou la tête du nom visé est la clé d'un nœud inséré ou supprimé.
+    let mut sources: BTreeSet<String> = log.removed_sources.clone();
+    for f in &log.files {
+        sources.extend(store.ref_sources_of_file(f)?);
+    }
+    let keys: BTreeSet<&str> = moved
+        .iter()
+        .filter_map(|id| parse_node_id(id).ok())
+        .map(|(_, q)| last_segment(q))
+        .collect();
+    for k in keys {
+        sources.extend(store.ref_sources_by_key(k, false)?);
+        sources.extend(store.ref_sources_by_key(k, true)?);
+    }
+    sources.retain(|s| ids.contains(s.as_str()));
+
+    let mut write = IncrementalWrite::default();
+    let empty = FileContext::default();
+    let mut contexts: HashMap<String, FileContext> = HashMap::new();
+    let mut dependencies: HashMap<String, Node> = HashMap::new();
+    let mut reevaluated = 0;
+    for source in &sources {
+        let refs = store.refs_of_source(source)?;
+        reevaluated += refs.len();
+        let mut wanted: Vec<Edge> = Vec::new();
+        for (fr, was_unresolved) in &refs {
+            if fr.origin == RefOrigin::Parse && !contexts.contains_key(&fr.file) {
+                let ctx = parse_context(store.file_context(&fr.file)?.as_deref());
+                contexts.insert(fr.file.clone(), ctx);
+            }
+            let ctx = if fr.origin == RefOrigin::Parse {
+                &contexts[&fr.file]
+            } else {
+                &empty
+            };
+            let mut unresolved = false;
+            match eval_ref(fr, ctx, &ids, &idx) {
+                Outcome::Ignored => {}
+                Outcome::Unresolved => unresolved = true,
+                Outcome::Linked(e) => wanted.push(e),
+                Outcome::Depends(e, dep) => {
+                    if let Some(d) = dep {
+                        dependencies.entry(d.id.clone()).or_insert(d);
+                    }
+                    wanted.push(e);
+                }
+            }
+            if unresolved != *was_unresolved {
+                write.statuses.push((fr.id, unresolved));
+            }
+        }
+        write.sources.push((source.clone(), wanted));
+    }
+    crate::store::note_refs_reevaluated(reevaluated);
+    write.dependencies = dependencies.into_values().collect();
+    write.dependencies.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // Cibles des liens `contains` réévaluées : nœuds insérés, supprimés ou aux déclarations
+    // changées, et enfants (par la règle de `incoming_contains`) des nœuds insérés ou supprimés.
+    let mut targets: BTreeSet<&str> = log
+        .inserted
+        .iter()
+        .chain(&log.deleted)
+        .chain(&log.declarations_changed)
+        .map(String::as_str)
+        .filter(|id| ids.contains(id))
+        .collect();
+    let parents: HashSet<&str> = moved
+        .iter()
+        .filter_map(|id| parse_node_id(id).ok())
+        .map(|(_, q)| q)
+        .collect();
+    for n in &nodes {
+        let parent = match n.kind {
+            NodeKind::Type | NodeKind::Method => parent_of(&n.qualified),
+            NodeKind::Section => n.qualified.split_once('#').map(|(d, _)| d),
+            _ => None,
+        };
+        if parent.is_some_and(|p| parents.contains(p)) {
+            targets.insert(&n.id);
+        }
+    }
+    for id in &moved {
+        if let Ok((NodeKind::Document, file)) = parse_node_id(id) {
+            for node in store.declared_nodes(file)? {
+                if by_id
+                    .get(node.as_str())
+                    .is_some_and(|n| matches!(n.kind, NodeKind::Table | NodeKind::Key))
+                {
+                    targets.insert(by_id[node.as_str()].id.as_str());
+                }
+            }
+        }
+    }
+    let dirs = ModuleDirs::new(&nodes);
+    for id in targets {
+        let n = by_id[id];
+        let declaring = if matches!(n.kind, NodeKind::Package | NodeKind::Table | NodeKind::Key) {
+            store.declaring_files(&n.id)?
+        } else {
+            Vec::new()
+        };
+        let declaring: Vec<&str> = declaring.iter().map(String::as_str).collect();
+        let mut wanted = Vec::new();
+        incoming_contains(n, &declaring, &idx, &dirs, &mut wanted);
+        write.contained.push((n.id.clone(), wanted));
+    }
+
+    store.write_incremental(&write, crate::summary::compute_stamped)?;
     Ok(ResolveStats {
         edges: store.count_edges()?,
         unresolved: store.count_unresolved()?,
@@ -326,6 +483,65 @@ fn derived_package(kind: NodeKind, q: &str) -> Option<String> {
     }
 }
 
+/// Issue de l'évaluation d'une référence : seule définition, partagée par les deux passes.
+enum Outcome {
+    /// Ni lien ni non résolue (source absente, `depends_on` vide, mention d'analyse libre).
+    Ignored,
+    Unresolved,
+    Linked(Edge),
+    /// `depends_on` : lien, et nœud `dependency` à dériver quand la cible n'est pas un module.
+    Depends(Edge, Option<Node>),
+}
+
+/// Évalue une référence : `ctx` est le contexte de son fichier (vide pour une référence `llm`),
+/// `ids` les identifiants des nœuds, `idx` l'index de résolution.
+fn eval_ref(fr: &FileRef, ctx: &FileContext, ids: &HashSet<&str>, idx: &Index) -> Outcome {
+    let r = &fr.r;
+    let Ok((skind, sq)) = parse_node_id(&r.source) else {
+        return Outcome::Unresolved;
+    };
+    if !ids.contains(r.source.as_str()) {
+        return Outcome::Ignored;
+    }
+    // depends_on vise des coordonnées : module du dépôt, sinon dépendance dérivée (DEC-020).
+    if r.kind == EdgeKind::DependsOn && skind == NodeKind::Module {
+        let name = r.target_name.trim();
+        if name.is_empty() {
+            return Outcome::Ignored;
+        }
+        let module = node_id(NodeKind::Module, name);
+        let (target, dep) = if ids.contains(module.as_str()) {
+            (module, None)
+        } else {
+            let dep = Node::new(
+                NodeKind::Dependency,
+                name,
+                name.rsplit(':').next().unwrap_or(name),
+                None,
+                None,
+                None,
+            );
+            (dep.id.clone(), Some(dep))
+        };
+        let edge = Edge {
+            source: r.source.clone(),
+            target,
+            kind: r.kind,
+        };
+        return Outcome::Depends(edge, dep);
+    }
+    match resolve_ref(r, ctx, skind, sq, idx) {
+        Some(target) => Outcome::Linked(Edge {
+            source: r.source.clone(),
+            target,
+            kind: r.kind,
+        }),
+        // Une mention issue de l'analyse syntaxique non résolue est normale (texte libre).
+        None if r.kind == EdgeKind::Mentions && fr.origin == RefOrigin::Parse => Outcome::Ignored,
+        None => Outcome::Unresolved,
+    }
+}
+
 /// Calcule les liens résolus, les liens `contains` dérivés et les références non résolues.
 /// `contexts` donne le texte d'imports de chaque fichier ; il est analysé une fois par fichier
 /// (REQ-063). Les non résolues sont rendues par indice dans `refs`, sans copie de contexte.
@@ -346,57 +562,21 @@ pub fn compute(
 
     let mut dependencies: HashMap<String, Node> = HashMap::new();
     for (i, fr) in refs.iter().enumerate() {
-        let (r, origin) = (&fr.r, &fr.origin);
-        let Ok((skind, sq)) = parse_node_id(&r.source) else {
-            out.unresolved.push(i);
-            continue;
-        };
-        if !ids.contains(r.source.as_str()) {
-            continue;
-        }
-        // depends_on vise des coordonnées : module du dépôt, sinon dépendance dérivée (DEC-020).
-        if r.kind == EdgeKind::DependsOn && skind == NodeKind::Module {
-            let name = r.target_name.trim();
-            if name.is_empty() {
-                continue;
-            }
-            let module = node_id(NodeKind::Module, name);
-            let target = if ids.contains(module.as_str()) {
-                module
-            } else {
-                let dep = Node::new(
-                    NodeKind::Dependency,
-                    name,
-                    name.rsplit(':').next().unwrap_or(name),
-                    None,
-                    None,
-                    None,
-                );
-                let id = dep.id.clone();
-                dependencies.entry(id.clone()).or_insert(dep);
-                id
-            };
-            out.edges.push(Edge {
-                source: r.source.clone(),
-                target,
-                kind: r.kind,
-            });
-            continue;
-        }
-        let ctx = if *origin == RefOrigin::Parse {
+        let ctx = if fr.origin == RefOrigin::Parse {
             parsed.get(fr.file.as_str()).unwrap_or(&empty)
         } else {
             &empty
         };
-        match resolve_ref(r, ctx, skind, sq, &idx) {
-            Some(target) => out.edges.push(Edge {
-                source: r.source.clone(),
-                target,
-                kind: r.kind,
-            }),
-            // Une mention issue de l'analyse syntaxique non résolue est normale (texte libre).
-            None if r.kind == EdgeKind::Mentions && *origin == RefOrigin::Parse => {}
-            None => out.unresolved.push(i),
+        match eval_ref(fr, ctx, &ids, &idx) {
+            Outcome::Ignored => {}
+            Outcome::Unresolved => out.unresolved.push(i),
+            Outcome::Linked(e) => out.edges.push(e),
+            Outcome::Depends(e, dep) => {
+                if let Some(d) = dep {
+                    dependencies.entry(d.id.clone()).or_insert(d);
+                }
+                out.edges.push(e);
+            }
         }
     }
     out.dependencies = dependencies.into_values().collect();
@@ -410,10 +590,47 @@ pub fn compute(
     out
 }
 
-fn derive_contains(
-    nodes: &[Node],
-    declarations: &[(String, String)],
+/// Dossiers des modules du dépôt, par écosystème : modules déclarés par un `package.json`
+/// (modules ES) et par un fichier de build JVM (le reste), chacun rattaché à son fichier de
+/// build le plus proche.
+struct ModuleDirs<'a> {
+    jvm_set: HashSet<String>,
+    npm_set: HashSet<String>,
+    jvm: HashMap<String, &'a Node>,
+    npm: HashMap<String, &'a Node>,
+}
+
+impl<'a> ModuleDirs<'a> {
+    fn new(nodes: &'a [Node]) -> Self {
+        let mut jvm: HashMap<String, &Node> = HashMap::new();
+        let mut npm: HashMap<String, &Node> = HashMap::new();
+        for n in nodes.iter().filter(|n| n.kind == NodeKind::Module) {
+            if let Some(f) = &n.file {
+                let (dir, name) = f.rsplit_once('/').unwrap_or(("", f.as_str()));
+                let table = if name == "package.json" {
+                    &mut npm
+                } else {
+                    &mut jvm
+                };
+                table.entry(dir.to_string()).or_insert(n);
+            }
+        }
+        ModuleDirs {
+            jvm_set: jvm.keys().cloned().collect(),
+            npm_set: npm.keys().cloned().collect(),
+            jvm,
+            npm,
+        }
+    }
+}
+
+/// Liens `contains` entrants du nœud `n` (REQ-005), seule définition de la règle, utilisée par
+/// les deux passes. `declaring` : fichiers qui déclarent `n` (utile aux packages, tables et clés).
+fn incoming_contains(
+    n: &Node,
+    declaring: &[&str],
     idx: &Index,
+    dirs: &ModuleDirs,
     edges: &mut Vec<Edge>,
 ) {
     let is_kind = |q: &str, k: NodeKind| {
@@ -421,95 +638,81 @@ fn derive_contains(
             .get(q)
             .is_some_and(|v| v.iter().any(|n| n.kind == k))
     };
-    let mut push = |from: NodeKind, fq: &str, to: NodeKind, tq: &str| {
+    let mut push = |from: NodeKind, fq: &str| {
         edges.push(Edge {
             source: node_id(from, fq),
-            target: node_id(to, tq),
+            target: n.id.clone(),
             kind: EdgeKind::Contains,
         });
     };
+    match n.kind {
+        NodeKind::Type => {
+            if let Some(p) = parent_of(&n.qualified).filter(|p| is_kind(p, NodeKind::Package)) {
+                push(NodeKind::Package, p);
+            }
+        }
+        NodeKind::Method => {
+            // Un parent type l'emporte ; sinon un package (fonction de module ES, DEC-040).
+            if let Some(parent) = parent_of(&n.qualified) {
+                if is_kind(parent, NodeKind::Type) {
+                    push(NodeKind::Type, parent);
+                } else if is_kind(parent, NodeKind::Package) {
+                    push(NodeKind::Package, parent);
+                }
+            }
+        }
+        NodeKind::Section => {
+            if let Some((d, _)) = n.qualified.split_once('#') {
+                if is_kind(d, NodeKind::Document) {
+                    push(NodeKind::Document, d);
+                }
+            }
+        }
+        // Document de données -> table | clé : le fichier déclarant est le document (son nom
+        // qualifié est son chemin) ; une table partagée est contenue par chacun de ses fichiers.
+        // Le nom qualifié d'une clé n'est pas découpé (un nom de membre peut contenir `#`).
+        NodeKind::Table | NodeKind::Key => {
+            for file in declaring {
+                if is_kind(file, NodeKind::Document) {
+                    push(NodeKind::Document, file);
+                }
+            }
+        }
+        // Module -> package : module du fichier déclarant le package (AC-005-5).
+        NodeKind::Package => {
+            for file in declaring {
+                let js = crate::parse::Lang::from_path(std::path::Path::new(file))
+                    .is_some_and(|l| l.is_js_ts());
+                let (set, table) = if js {
+                    (&dirs.npm_set, &dirs.npm)
+                } else {
+                    (&dirs.jvm_set, &dirs.jvm)
+                };
+                if let Some(m) = module_of(file, set).and_then(|d| table.get(&d)) {
+                    push(NodeKind::Module, &m.qualified);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn derive_contains(
+    nodes: &[Node],
+    declarations: &[(String, String)],
+    idx: &Index,
+    edges: &mut Vec<Edge>,
+) {
+    let mut declared_by: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (file, node) in declarations {
+        declared_by.entry(node).or_default().push(file);
+    }
+    let dirs = ModuleDirs::new(nodes);
     for n in nodes {
-        match n.kind {
-            NodeKind::Type => {
-                if let Some(p) = parent_of(&n.qualified).filter(|p| is_kind(p, NodeKind::Package)) {
-                    push(NodeKind::Package, p, NodeKind::Type, &n.qualified);
-                }
-            }
-            NodeKind::Method => {
-                // Un parent type l'emporte ; sinon un package (fonction de module ES, DEC-040).
-                if let Some(parent) = parent_of(&n.qualified) {
-                    if is_kind(parent, NodeKind::Type) {
-                        push(NodeKind::Type, parent, NodeKind::Method, &n.qualified);
-                    } else if is_kind(parent, NodeKind::Package) {
-                        push(NodeKind::Package, parent, NodeKind::Method, &n.qualified);
-                    }
-                }
-            }
-            NodeKind::Section => {
-                if let Some((d, _)) = n.qualified.split_once('#') {
-                    if is_kind(d, NodeKind::Document) {
-                        push(NodeKind::Document, d, NodeKind::Section, &n.qualified);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Document de données -> table | clé : le fichier déclarant est le document (son nom qualifié
-    // est son chemin) ; une table partagée est contenue par chacun de ses fichiers. Le nom
-    // qualifié d'une clé n'est pas découpé (un nom de membre peut contenir `#`).
-    for (file, node) in declarations {
-        let to = match crate::model::parse_node_id(node) {
-            Ok((k @ (NodeKind::Table | NodeKind::Key), q)) => (k, q),
-            _ => continue,
-        };
-        if is_kind(file, NodeKind::Document) {
-            push(NodeKind::Document, file, to.0, to.1);
-        }
-    }
-
-    // Module -> package : module du fichier déclarant le package (AC-005-5).
-    let kinds: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    // Deux écosystèmes : modules déclarés par un `package.json` (modules ES) et par un fichier de
-    // build JVM (le reste), chacun rattaché à son fichier de build le plus proche.
-    let mut jvm_dirs: HashMap<String, &Node> = HashMap::new();
-    let mut npm_dirs: HashMap<String, &Node> = HashMap::new();
-    for n in nodes.iter().filter(|n| n.kind == NodeKind::Module) {
-        if let Some(f) = &n.file {
-            let (dir, name) = f.rsplit_once('/').unwrap_or(("", f.as_str()));
-            let table = if name == "package.json" {
-                &mut npm_dirs
-            } else {
-                &mut jvm_dirs
-            };
-            table.entry(dir.to_string()).or_insert(n);
-        }
-    }
-    let jvm_set: HashSet<String> = jvm_dirs.keys().cloned().collect();
-    let npm_set: HashSet<String> = npm_dirs.keys().cloned().collect();
-    for (file, node) in declarations {
-        let Some(n) = kinds
-            .get(node.as_str())
-            .filter(|n| n.kind == NodeKind::Package)
-        else {
-            continue;
-        };
-        let js =
-            crate::parse::Lang::from_path(std::path::Path::new(file)).is_some_and(|l| l.is_js_ts());
-        let (set, table) = if js {
-            (&npm_set, &npm_dirs)
-        } else {
-            (&jvm_set, &jvm_dirs)
-        };
-        if let Some(m) = module_of(file, set).and_then(|d| table.get(&d)) {
-            push(
-                NodeKind::Module,
-                &m.qualified,
-                NodeKind::Package,
-                &n.qualified,
-            );
-        }
+        let declaring = declared_by
+            .get(n.id.as_str())
+            .map_or(&[][..], Vec::as_slice);
+        incoming_contains(n, declaring, idx, &dirs, edges);
     }
 }
 
@@ -2009,5 +2212,697 @@ import q.R;",
             &new,
             &node_id(NodeKind::Dependency, "org.slf4j:slf4j-api")
         ));
+    }
+
+    // ---- Passe incrémentale (REQ-066, DEC-077) ----
+
+    const CODE_POOL: [&str; 8] = [
+        "j1.java",
+        "j2.java",
+        "m1/j3.java",
+        "m2/j4.java",
+        "m1/k1.kt",
+        "k2.kt",
+        "t1.ts",
+        "m1/t2.ts",
+    ];
+    const DOC_POOL: [&str; 3] = ["d1.md", "d2.md", "docs/d3.md"];
+    const DATA_POOL: [&str; 2] = ["data/s1.json", "data/s2.json"];
+    const POM_POOL: [&str; 3] = ["pom.xml", "m1/pom.xml", "m2/pom.xml"];
+    const REF_NAMES: [&str; 30] = [
+        "A",
+        "B",
+        "C",
+        "A.m1",
+        "B.m2",
+        "C.m1",
+        "a.b.A",
+        "a.c.B",
+        "a.c.B.m1",
+        "x.C.m2",
+        "m1",
+        "m2",
+        "fn1",
+        "Zed",
+        "Zed.m1",
+        "lib/str.fn1",
+        "lib/str",
+        "web.ui.Panel",
+        "Panel",
+        "Panel.m1",
+        "src/x#y",
+        "g:a:1.0",
+        "org.x:lib1",
+        "com.acme:m1",
+        "users",
+        "orders",
+        "d1.md",
+        "d2.md",
+        "idée",
+        "Cache",
+    ];
+    const DEPS: [&str; 5] = [
+        "com.acme:m1",
+        "com.acme:m2",
+        "com.acme:root",
+        "org.x:lib1",
+        "org.x:lib2",
+    ];
+    const CONCEPTS: [&str; 3] = ["idée", "Cache", "A"];
+
+    fn concept(name: &str) -> Node {
+        Node::new(NodeKind::Concept, name, name, None, None, None)
+    }
+
+    fn pending(path: &str) -> FileRecord {
+        FileRecord {
+            path: path.into(),
+            hash: "h".into(),
+            size: 1,
+            mtime: 1,
+            recorded_at: 0,
+            state: FileState::Pending,
+        }
+    }
+
+    fn random_file_context(g: &mut Lcg, pkg: &str) -> Option<String> {
+        match g.next(7) {
+            0 => None,
+            6 => Some("import q.B\nimport q.A".to_string()),
+            1 => Some(format!("package {pkg}")),
+            2 => Some(format!("package {pkg}\nimport a.c.A\nimport a.c.B")),
+            3 => Some("import a.b.*".to_string()),
+            4 => Some(format!("import static a.c.B.m1\nimport {pkg}.C")),
+            _ => Some(format!("package {pkg}\nimport a.b.A\nimport a.c.*")),
+        }
+    }
+
+    /// Nœuds et références aléatoires d'un fichier du réservoir (mêmes noms d'un fichier à
+    /// l'autre : nœuds partagés, noms ambigus).
+    fn gen_content(g: &mut Lcg, path: &str) -> (Vec<Node>, Vec<Ref>) {
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut refs: Vec<Ref> = Vec::new();
+        if path.ends_with("pom.xml") {
+            let dir = path.trim_end_matches("pom.xml").trim_end_matches('/');
+            let q = format!("com.acme:{}", if dir.is_empty() { "root" } else { dir });
+            let m = plain(NodeKind::Module, &q, Some(path));
+            for _ in 0..g.next(4) {
+                refs.push(rf(&m.id, EdgeKind::DependsOn, g.pick(&DEPS), None));
+            }
+            nodes.push(m);
+        } else if path.ends_with(".md") {
+            let doc = Node::new(NodeKind::Document, path, path, Some(path), None, None);
+            let mut sources = vec![doc.id.clone()];
+            nodes.push(doc);
+            for s in 0..g.next(3) {
+                let sec = Node::new(
+                    NodeKind::Section,
+                    &format!("{path}#S{s}"),
+                    &format!("S{s}"),
+                    Some(path),
+                    None,
+                    None,
+                );
+                sources.push(sec.id.clone());
+                nodes.push(sec);
+            }
+            for _ in 0..g.next(5) {
+                let src = sources[g.next(sources.len())].clone();
+                if src.starts_with("document:") && g.next(3) == 0 {
+                    refs.push(rf(&src, EdgeKind::LinksTo, g.pick(&REF_NAMES), None));
+                } else {
+                    refs.push(rf(&src, EdgeKind::Mentions, g.pick(&REF_NAMES), None));
+                }
+            }
+        } else if path.ends_with(".json") {
+            let doc = Node::new(
+                NodeKind::Document,
+                path,
+                path,
+                Some(path),
+                Some(SubKind::Json),
+                None,
+            );
+            let mut sources = vec![doc.id.clone()];
+            nodes.push(doc);
+            for t in ["users", "orders"] {
+                if g.next(2) == 0 {
+                    let table = Node::new(
+                        NodeKind::Table,
+                        t,
+                        t,
+                        Some(path),
+                        Some(SubKind::Table),
+                        None,
+                    );
+                    sources.push(table.id.clone());
+                    nodes.push(table);
+                    if g.next(2) == 0 {
+                        let key = Node::new(
+                            NodeKind::Key,
+                            &format!("{t}.id"),
+                            "id",
+                            Some(path),
+                            None,
+                            None,
+                        );
+                        sources.push(key.id.clone());
+                        nodes.push(key);
+                    }
+                }
+            }
+            for _ in 0..g.next(4) {
+                let src = sources[g.next(sources.len())].clone();
+                let kind = if src.starts_with("table:") {
+                    EdgeKind::References
+                } else {
+                    EdgeKind::Mentions
+                };
+                refs.push(rf(&src, kind, g.pick(&REF_NAMES), None));
+            }
+        } else {
+            let ts = path.ends_with(".ts");
+            let pkg = if ts {
+                g.pick(&["lib/str", "web.ui"])
+            } else {
+                g.pick(&["a.b", "a.c", "x"])
+            };
+            // Le package, le type ou son membre peuvent être déclarés par un autre fichier.
+            if g.next(4) != 0 {
+                nodes.push(plain(NodeKind::Package, pkg, Some(path)));
+            }
+            let types: [&str; 3] = if ts {
+                ["Panel", "Fmt", "A"]
+            } else {
+                ["A", "B", "C"]
+            };
+            for t in types {
+                if g.next(5) == 0 {
+                    nodes.push(method(&format!("{pkg}.{t}.m1"), path));
+                }
+                if g.next(2) == 0 {
+                    nodes.push(ty(&format!("{pkg}.{t}"), path));
+                    for m in ["m1", "m2"] {
+                        if g.next(2) == 0 {
+                            nodes.push(method(&format!("{pkg}.{t}.{m}"), path));
+                        }
+                    }
+                }
+            }
+            if g.next(3) == 0 {
+                nodes.push(method(&format!("{pkg}.fn1"), path));
+            }
+            let ctx = random_file_context(g, pkg);
+            for _ in 0..g.next(5) {
+                if nodes.is_empty() {
+                    break;
+                }
+                let src = &nodes[g.next(nodes.len())];
+                let kinds: &[EdgeKind] = match src.kind {
+                    NodeKind::Method => &[EdgeKind::Calls, EdgeKind::Calls, EdgeKind::Mentions],
+                    NodeKind::Type => &[
+                        EdgeKind::Imports,
+                        EdgeKind::Extends,
+                        EdgeKind::Implements,
+                        EdgeKind::Mentions,
+                    ],
+                    _ => &[EdgeKind::Imports, EdgeKind::Mentions],
+                };
+                let kind = kinds[g.next(kinds.len())];
+                let r = rf(&src.id, kind, g.pick(&REF_NAMES), ctx.as_deref());
+                refs.push(r);
+            }
+        }
+        (nodes, refs)
+    }
+
+    /// État d'une séquence aléatoire d'écritures sur le stockage.
+    struct Seq {
+        g: Lcg,
+        known: std::collections::BTreeSet<String>,
+        specs: std::collections::BTreeMap<String, (Vec<Node>, Vec<Ref>)>,
+        modules: std::collections::BTreeSet<String>,
+        /// Un nœud `module` a été inséré ou supprimé depuis la dernière passe.
+        module_touched: bool,
+    }
+
+    impl Seq {
+        fn write(&mut self, st: &mut Store, path: &str, content: (Vec<Node>, Vec<Ref>)) {
+            if self.known.insert(path.to_string()) {
+                st.insert_pending_files(&[pending(path)]).unwrap();
+            }
+            let has = content.0.iter().any(|n| n.kind == NodeKind::Module);
+            if has != self.modules.contains(path) {
+                self.module_touched = true;
+                if has {
+                    self.modules.insert(path.to_string());
+                } else {
+                    self.modules.remove(path);
+                }
+            }
+            st.replace_structure(path, &content.0, &content.1).unwrap();
+            self.specs.insert(path.to_string(), content);
+        }
+
+        fn remove(&mut self, st: &mut Store, path: &str) {
+            if self.modules.remove(path) {
+                self.module_touched = true;
+            }
+            st.remove_files(&[path]).unwrap();
+            self.known.remove(path);
+            self.specs.remove(path);
+        }
+
+        fn any_path(&mut self) -> String {
+            let all: Vec<&str> = CODE_POOL
+                .iter()
+                .chain(&DOC_POOL)
+                .chain(&DATA_POOL)
+                .chain(&POM_POOL)
+                .copied()
+                .collect();
+            all[self.g.next(all.len())].to_string()
+        }
+
+        /// Une écriture aléatoire.
+        fn step(&mut self, st: &mut Store) {
+            match self.g.next(20) {
+                0..=9 => {
+                    let p = self.any_path();
+                    let c = gen_content(&mut self.g, &p);
+                    self.write(st, &p, c);
+                }
+                10..=12 => {
+                    let known: Vec<String> = self.known.iter().cloned().collect();
+                    if !known.is_empty() {
+                        let p = known[self.g.next(known.len())].clone();
+                        self.remove(st, &p);
+                    } else {
+                        let p = self.any_path();
+                        let c = gen_content(&mut self.g, &p);
+                        self.write(st, &p, c);
+                    }
+                }
+                13..=16 => {
+                    let with_nodes: Vec<String> = self
+                        .specs
+                        .iter()
+                        .filter(|(_, (n, _))| !n.is_empty())
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    if with_nodes.is_empty() {
+                        return self.step(st);
+                    }
+                    let p = with_nodes[self.g.next(with_nodes.len())].clone();
+                    let declared: Vec<String> =
+                        self.specs[&p].0.iter().map(|n| n.id.clone()).collect();
+                    let concepts: Vec<Node> = (0..self.g.next(3))
+                        .map(|_| concept(self.g.pick(&CONCEPTS)))
+                        .collect();
+                    let refs: Vec<Ref> = (0..self.g.next(4))
+                        .map(|_| {
+                            let src = declared[self.g.next(declared.len())].clone();
+                            let kind = if self.g.next(5) == 0 {
+                                EdgeKind::Calls
+                            } else {
+                                EdgeKind::Mentions
+                            };
+                            rf(&src, kind, self.g.pick(&REF_NAMES), None)
+                        })
+                        .collect();
+                    st.apply_enrichments(
+                        "m",
+                        &[crate::store::EnrichmentWrite {
+                            path: p,
+                            hash: "h".into(),
+                            summaries: vec![],
+                            concepts,
+                            refs,
+                        }],
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    // Déplacement d'un fichier de code : mêmes nœuds et références, autre chemin.
+                    let movable: Vec<String> = self
+                        .specs
+                        .keys()
+                        .filter(|p| CODE_POOL.contains(&p.as_str()))
+                        .cloned()
+                        .collect();
+                    let free: Vec<&str> = CODE_POOL
+                        .iter()
+                        .copied()
+                        .filter(|p| !self.known.contains(*p))
+                        .collect();
+                    if movable.is_empty() || free.is_empty() {
+                        return self.step(st);
+                    }
+                    let from = movable[self.g.next(movable.len())].clone();
+                    let to = free[self.g.next(free.len())];
+                    let (mut nodes, refs) = self.specs[&from].clone();
+                    for n in &mut nodes {
+                        if n.file.is_some() {
+                            n.file = Some(to.to_string());
+                        }
+                    }
+                    self.remove(st, &from);
+                    self.write(st, to, (nodes, refs));
+                }
+            }
+        }
+    }
+
+    type GraphState = (
+        Vec<Node>,
+        Vec<Edge>,
+        Vec<i64>,
+        ResolveStats,
+        Vec<(String, String, String)>,
+        String,
+    );
+
+    fn graph_state(repo: &std::path::Path, st: &Store, stats: &ResolveStats) -> GraphState {
+        let conn = rusqlite::Connection::open(crate::store::db_path(repo)).unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM refs WHERE unresolved = 1 ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let mut un: Vec<(String, String, String)> = unresolved(st)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.source, r.kind.as_str().to_string(), r.target_name))
+            .collect();
+        un.sort();
+        (
+            st.nodes().unwrap(),
+            st.edges().unwrap(),
+            ids,
+            stats.clone(),
+            un,
+            st.summary().unwrap().unwrap().0,
+        )
+    }
+
+    /// Copie du graphe (`VACUUM INTO`) rouverte en écriture : marqueur `à résoudre`, donc passe
+    /// complète.
+    fn oracle_copy(main: &std::path::Path, oracle: &std::path::Path) -> Store {
+        let dest = crate::store::db_path(oracle);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", dest.display()));
+        }
+        rusqlite::Connection::open(crate::store::db_path(main))
+            .unwrap()
+            .execute("VACUUM INTO ?1", [dest.to_str().unwrap()])
+            .unwrap();
+        Store::open_or_create(oracle).unwrap()
+    }
+
+    /// AC-066-1 : 300 séquences aléatoires, après chaque passe le graphe est celui de la passe
+    /// complète sur une copie du même graphe.
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let (mut incremental, mut full, mut skipped, mut edges_seen) = (0, 0, 0, 0);
+        let mut st = Store::open_or_create(main_dir.path()).unwrap();
+        for seed in 0..300u64 {
+            st.reset().unwrap();
+            let mut seq = Seq {
+                g: Lcg(seed * 7919 + 13),
+                known: Default::default(),
+                specs: Default::default(),
+                modules: Default::default(),
+                module_touched: false,
+            };
+            // Graphe résolu de départ.
+            for _ in 0..3 {
+                seq.step(&mut st);
+            }
+            resolve(&mut st).unwrap();
+            for round in 0..3 {
+                seq.module_touched = false;
+                for _ in 0..1 + seq.g.next(5) {
+                    seq.step(&mut st);
+                }
+                let mut oracle = oracle_copy(main_dir.path(), oracle_dir.path());
+                let ctx = format!("séquence {seed}, pas {round}");
+                // Cas sans oracle : une mention vise une dépendance dérivée que la même passe
+                // supprime (clé étrangère de `edges`, limite connue de la passe complète, qui
+                // échoue alors aussi sur le graphe réel quand elle est choisie).
+                let oracle_result = resolve(&mut oracle);
+                crate::store::reset_diagnostics();
+                let main_result = resolve(&mut st);
+                let d = crate::store::diagnostics();
+                if seq.module_touched {
+                    full += 1;
+                } else {
+                    incremental += 1;
+                    assert_eq!((d.full_passes(), d.incremental_passes()), (0, 1), "{ctx}");
+                }
+                let Ok(expected_stats) = oracle_result else {
+                    skipped += 1;
+                    if seq.module_touched {
+                        assert!(main_result.is_err(), "{ctx}");
+                        break;
+                    }
+                    continue;
+                };
+                let stats = main_result.unwrap_or_else(|e| panic!("{ctx} : {e}"));
+                if seq.module_touched {
+                    assert_eq!((d.full_passes(), d.incremental_passes()), (1, 0), "{ctx}");
+                }
+                let got = graph_state(main_dir.path(), &st, &stats);
+                let want = graph_state(oracle_dir.path(), &oracle, &expected_stats);
+                assert_eq!(got.0, want.0, "nœuds, {ctx}");
+                assert_eq!(got.1, want.1, "liens, {ctx}");
+                assert_eq!(got.2, want.2, "statut des références, {ctx}");
+                assert_eq!(got.3, want.3, "bilan, {ctx}");
+                assert_eq!(got.4, want.4, "non résolues, {ctx}");
+                assert_eq!(got.5, want.5, "résumé, {ctx}");
+                edges_seen += got.1.len();
+            }
+        }
+        assert!(incremental > 500, "{incremental} passes incrémentales");
+        assert!(full > 15, "{full} passes complètes");
+        assert!(skipped < 25, "{skipped} pas sans oracle");
+        assert!(edges_seen > 3000, "{edges_seen} liens comparés");
+    }
+
+    /// Comparaison d'un graphe réel et d'une copie passée par la passe complète.
+    fn assert_same_as_full_pass(e: &mut Env, what: &str) -> ResolveStats {
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle = oracle_copy(e._dir.path(), oracle_dir.path());
+        let stats = resolve(&mut e.store).unwrap();
+        let want_stats = resolve(&mut oracle).unwrap();
+        let got = graph_state(e._dir.path(), &e.store, &stats);
+        let want = graph_state(oracle_dir.path(), &oracle, &want_stats);
+        assert_eq!(got, want, "{what}");
+        stats
+    }
+
+    /// DEC-077 : la tête d'un nom pointé (`B.m2`) désigne les références à réévaluer quand un
+    /// type `B` apparaît, même si la clé du nom (`m2`) n'est celle d'aucun nœud inséré.
+    #[test]
+    fn req066_head_of_a_dotted_name_reevaluates_the_reference() {
+        let mut e = env(&["B.java", "U.java", "C.java"]);
+        e.store
+            .replace_file(
+                "B.java",
+                &[ty("p.B", "B.java"), method("p.B.m2", "B.java")],
+                &[],
+            )
+            .unwrap();
+        e.store
+            .replace_file(
+                "U.java",
+                &[ty("u.U", "U.java"), method("u.U.run", "U.java")],
+                &[rf(
+                    &mid("u.U.run"),
+                    EdgeKind::Calls,
+                    "B.m2",
+                    Some("package u\nimport q.B"),
+                )],
+            )
+            .unwrap();
+        resolve(&mut e.store).unwrap();
+        assert!(has_edge(
+            &e,
+            &mid("u.U.run"),
+            EdgeKind::Calls,
+            &mid("p.B.m2")
+        ));
+        e.store
+            .replace_file("C.java", &[ty("r.B", "C.java")], &[])
+            .unwrap();
+        crate::store::reset_diagnostics();
+        assert_same_as_full_pass(&mut e, "type B ajouté");
+        assert_eq!(crate::store::diagnostics().incremental_passes(), 1);
+        assert!(!has_edge(
+            &e,
+            &mid("u.U.run"),
+            EdgeKind::Calls,
+            &mid("p.B.m2")
+        ));
+        // Le type retiré, la référence retrouve sa cible.
+        e.store.remove_file("C.java").unwrap();
+        assert_same_as_full_pass(&mut e, "type B retiré");
+        assert!(has_edge(
+            &e,
+            &mid("u.U.run"),
+            EdgeKind::Calls,
+            &mid("p.B.m2")
+        ));
+    }
+
+    /// 400 fichiers Java en 40 packages de 10 : types et méthodes aux noms tous distincts, chaque
+    /// type appelé par 3 autres, 5 références non résolues vers `Zed` dans 5 fichiers.
+    fn big_graph() -> Env {
+        let paths: Vec<String> = (0..400).map(|i| format!("p{}/T{i}.java", i / 10)).collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let mut e = env(&refs);
+        let items: Vec<(String, Vec<Node>, Vec<Ref>)> =
+            (0..400).map(|i| big_file(i, &paths[i])).collect();
+        e.store.replace_structures(&items).unwrap();
+        resolve(&mut e.store).unwrap();
+        e
+    }
+
+    fn big_file(i: usize, path: &str) -> (String, Vec<Node>, Vec<Ref>) {
+        let pkg = format!("p{}", i / 10);
+        let (t, m) = (format!("{pkg}.T{i}"), format!("{pkg}.T{i}.m{i}"));
+        let mut refs: Vec<Ref> = (1..=3)
+            .map(|d| {
+                rf(
+                    &mid(&m),
+                    EdgeKind::Calls,
+                    &format!("m{}", (i + d) % 400),
+                    None,
+                )
+            })
+            .collect();
+        if i % 80 == 3 {
+            refs.push(rf(&mid(&m), EdgeKind::Calls, "Zed.run", None));
+        }
+        (
+            path.to_string(),
+            vec![
+                plain(NodeKind::Package, &pkg, Some(path)),
+                ty(&t, path),
+                method(&m, path),
+            ],
+            refs,
+        )
+    }
+
+    /// Nombre de références dont la source est déclarée par l'un des `files`.
+    fn refs_of_files(st: &Store, files: &[&str]) -> u64 {
+        let declared: HashSet<String> = st
+            .declarations()
+            .unwrap()
+            .into_iter()
+            .filter(|(f, _)| files.contains(&f.as_str()))
+            .map(|(_, n)| n)
+            .collect();
+        st.refs()
+            .unwrap()
+            .iter()
+            .filter(|r| declared.contains(&r.source))
+            .count() as u64
+    }
+
+    /// AC-066-2 (a) : un fichier modifié ne réévalue que ses références et ne lit que ses liens.
+    #[test]
+    fn req066_ac2_a_one_modified_file_reads_only_its_links() {
+        let mut e = big_graph();
+        let total_edges = e.store.count_edges().unwrap() as u64;
+        let nodes = e.store.count_nodes().unwrap() as u64;
+        let f = "p0/T0.java";
+        let (_, mut n, mut r) = big_file(0, f);
+        n.push(method("p0.T0.extra", f));
+        r.push(rf(&mid("p0.T0.extra"), EdgeKind::Calls, "m77", None));
+        r[0] = rf(&mid("p0.T0.m0"), EdgeKind::Calls, "m200", None);
+        e.store.replace_file(f, &n, &r).unwrap();
+        let sources = refs_of_files(&e.store, &[f]);
+        let outgoing: u64 = [mid("p0.T0.m0"), mid("p0.T0.extra")]
+            .iter()
+            .map(|id| {
+                e.store
+                    .edges_at(id, true)
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, k)| *k != EdgeKind::Contains)
+                    .count() as u64
+            })
+            .sum();
+        let contained = 3; // package -> type, type -> méthodes
+        crate::store::reset_diagnostics();
+        resolve(&mut e.store).unwrap();
+        let d = crate::store::diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (0, 1));
+        assert_eq!(d.refs_reevaluated(), sources);
+        // Le résumé global relit encore tous les liens et tous les nœuds (remplacé en T-149) :
+        // on les retire des compteurs pour ne mesurer que la passe.
+        let edges_read = d.edge_rows_read() - e.store.count_edges().unwrap() as u64;
+        assert!(edges_read <= outgoing + contained, "{edges_read} liens lus");
+        assert!(
+            edges_read * 20 < total_edges,
+            "{edges_read} / {total_edges}"
+        );
+        assert_eq!(
+            d.node_rows_read() - e.store.count_nodes().unwrap() as u64,
+            nodes + 1
+        );
+    }
+
+    /// AC-066-2 (b) : un fichier ajouté qui rend 5 références résolubles.
+    #[test]
+    fn req066_ac2_b_added_target_resolves_the_five_unresolved_references() {
+        let mut e = big_graph();
+        let before = e.store.count_unresolved().unwrap();
+        assert_eq!(before, 5);
+        e.store
+            .insert_pending_files(&[pending("Zed.java")])
+            .unwrap();
+        e.store
+            .replace_file(
+                "Zed.java",
+                &[
+                    plain(NodeKind::Package, "pz", Some("Zed.java")),
+                    ty("pz.Zed", "Zed.java"),
+                    method("pz.Zed.run", "Zed.java"),
+                ],
+                &[],
+            )
+            .unwrap();
+        let visiting: Vec<String> = (0..400)
+            .filter(|i| i % 80 == 3)
+            .map(|i| mid(&format!("p{}.T{i}.m{i}", i / 10)))
+            .collect();
+        assert_eq!(visiting.len(), 5);
+        let bound = refs_of_files(&e.store, &["Zed.java"])
+            + e.store
+                .refs()
+                .unwrap()
+                .iter()
+                .filter(|r| visiting.contains(&r.source))
+                .count() as u64;
+        crate::store::reset_diagnostics();
+        let stats = resolve(&mut e.store).unwrap();
+        let d = crate::store::diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (0, 1));
+        assert!(
+            d.refs_reevaluated() <= bound,
+            "{} > {bound}",
+            d.refs_reevaluated()
+        );
+        assert_eq!(stats.unresolved, 0);
+        for v in &visiting {
+            assert!(has_edge(&e, v, EdgeKind::Calls, &mid("pz.Zed.run")), "{v}");
+        }
     }
 }

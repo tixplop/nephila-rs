@@ -357,4 +357,151 @@ mod tests {
         assert!(commits <= 2, "{commits} validations pour 2 appels");
         assert!(commits >= 1);
     }
+
+    /// Dépôt `maven3` (trois modules, des documents) construit `--no-llm`.
+    fn maven_repo(dir: &Path) -> PathBuf {
+        let repo = dir.join("repo");
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/maven3/repo"),
+            &repo,
+        );
+        let lock = RepoLock::acquire(&repo).unwrap();
+        build::build(
+            &repo,
+            &IndexOptions::default(),
+            None,
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap();
+        repo
+    }
+
+    /// `update` du dépôt ; passes (complètes, incrémentales) de la commande.
+    fn passes_of_update(repo: &Path) -> (u64, u64) {
+        let lock = RepoLock::acquire(repo).unwrap();
+        reset_diagnostics();
+        update(
+            repo,
+            &IndexOptions::default(),
+            None,
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap()
+        .expect("des fichiers ont changé");
+        let d = diagnostics();
+        (d.full_passes(), d.incremental_passes())
+    }
+
+    /// Le graphe de `repo` est celui d'un `build` neuf du même arbre.
+    fn assert_same_as_fresh_build(repo: &Path, dir: &Path, what: &str) {
+        let fresh = dir.join("fresh");
+        let _ = std::fs::remove_dir_all(&fresh);
+        copy_dir(repo, &fresh);
+        std::fs::remove_dir_all(fresh.join(".nephila")).unwrap();
+        let lock = RepoLock::acquire(&fresh).unwrap();
+        build::build(
+            &fresh,
+            &IndexOptions::default(),
+            None,
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap();
+        let (a, b) = (
+            Store::open_readonly(repo).unwrap(),
+            Store::open_readonly(&fresh).unwrap(),
+        );
+        assert_eq!(a.nodes().unwrap(), b.nodes().unwrap(), "{what} : nœuds");
+        assert_eq!(a.edges().unwrap(), b.edges().unwrap(), "{what} : liens");
+        assert_eq!(a.count_unresolved().unwrap(), b.count_unresolved().unwrap());
+        assert_eq!(
+            a.summary().unwrap().unwrap().0,
+            b.summary().unwrap().unwrap().0,
+            "{what} : résumé"
+        );
+    }
+
+    fn touch_java(repo: &Path, extra: &str) {
+        let f = repo.join("api/src/main/java/com/acme/api/ApiController.java");
+        let mut text = std::fs::read_to_string(&f).unwrap();
+        let i = text.rfind('}').unwrap();
+        text.insert_str(i, extra);
+        std::fs::write(f, text).unwrap();
+    }
+
+    /// AC-066-3 (a) : graphe non marqué `à jour` -> passe complète.
+    #[test]
+    fn req066_ac3_a_unmarked_graph_gets_a_full_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = maven_repo(dir.path());
+        rusqlite::Connection::open(db_path(&repo))
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value = 'à résoudre' WHERE key = 'resolution'",
+                [],
+            )
+            .unwrap();
+        touch_java(&repo, "\n    void ajoutee() {}\n");
+        assert_eq!(passes_of_update(&repo), (1, 0));
+        assert_same_as_fresh_build(&repo, dir.path(), "marqueur absent");
+        // La commande suivante, graphe marqué, est incrémentale.
+        touch_java(&repo, "\n    void autre() {}\n");
+        assert_eq!(passes_of_update(&repo), (0, 1));
+        assert_same_as_fresh_build(&repo, dir.path(), "marqueur posé");
+    }
+
+    /// AC-066-3 (b) : un module nouveau -> passe complète.
+    #[test]
+    fn req066_ac3_b_new_module_gets_a_full_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = maven_repo(dir.path());
+        std::fs::create_dir_all(repo.join("extra")).unwrap();
+        std::fs::write(
+            repo.join("extra/pom.xml"),
+            "<project><groupId>com.acme</groupId><artifactId>extra</artifactId>\
+             <dependencies><dependency><groupId>com.acme</groupId><artifactId>core</artifactId>\
+             </dependency></dependencies></project>",
+        )
+        .unwrap();
+        assert_eq!(passes_of_update(&repo), (1, 0));
+        let store = Store::open_readonly(&repo).unwrap();
+        assert!(store
+            .nodes()
+            .unwrap()
+            .iter()
+            .any(|n| n.id == "module:com.acme:extra"));
+        assert_same_as_fresh_build(&repo, dir.path(), "module ajouté");
+    }
+
+    /// AC-066-3 (c) : un `pom.xml` existant dont les dépendances externes changent -> passe
+    /// incrémentale (constats d'AC-008-6).
+    #[test]
+    fn req066_ac3_c_modified_pom_gets_an_incremental_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = maven_repo(dir.path());
+        let dep = "dependency:org.slf4j:slf4j-api";
+        {
+            let store = Store::open_readonly(&repo).unwrap();
+            assert!(store.nodes().unwrap().iter().any(|n| n.id == dep));
+        }
+        let pom = repo.join("core/pom.xml");
+        let text = std::fs::read_to_string(&pom)
+            .unwrap()
+            .replace("slf4j-api", "newlib")
+            .replace("org.slf4j", "org.new");
+        std::fs::write(&pom, text).unwrap();
+        assert_eq!(passes_of_update(&repo), (0, 1));
+        let store = Store::open_readonly(&repo).unwrap();
+        let nodes = store.nodes().unwrap();
+        assert!(!nodes.iter().any(|n| n.id == dep));
+        assert!(nodes.iter().any(|n| n.id == "dependency:org.new:newlib"));
+        assert!(store.edges().unwrap().iter().any(|e| {
+            e.source == "module:com.acme:core"
+                && e.target == "dependency:org.new:newlib"
+                && e.kind == crate::model::EdgeKind::DependsOn
+        }));
+        assert_same_as_fresh_build(&repo, dir.path(), "pom modifié");
+    }
 }

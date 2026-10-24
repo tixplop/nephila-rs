@@ -89,6 +89,74 @@ const RESOLVE_BOUNDARIES: [(char, char); 4] = [('.', '/'), ('#', '$'), ('/', '0'
 
 const SCHEMA: &str = include_str!("schema.sql");
 
+/// Requêtes de la passe de résolution incrémentale (DEC-077), partagées avec le test d'AC-066-4
+/// (`EXPLAIN QUERY PLAN`) : toutes sur index, sauf le chargement des nœuds de l'index de
+/// résolution et les deux comptes (agrégats calculés par SQLite sur des index).
+pub(crate) const RESOLVE_NODES: &str = "SELECT id, kind, qualified, short, file FROM nodes";
+pub(crate) const REF_SOURCES_BY_KEY: &str =
+    "SELECT DISTINCT source FROM refs WHERE target_key = ?1";
+pub(crate) const REF_SOURCES_BY_HEAD: &str =
+    "SELECT DISTINCT source FROM refs WHERE target_head = ?1";
+pub(crate) const REF_SOURCES_BY_FILE: &str = "SELECT DISTINCT source FROM refs WHERE file = ?1";
+pub(crate) const REFS_OF_SOURCE: &str = "SELECT id, kind, target_name, origin, file, unresolved
+     FROM refs WHERE source = ?1 ORDER BY id";
+pub(crate) const FILE_CONTEXT: &str = "SELECT context FROM file_contexts WHERE file = ?1";
+pub(crate) const DECLARING_FILES: &str = "SELECT file FROM declarations WHERE node = ?1";
+pub(crate) const DECLARED_NODES: &str = "SELECT node FROM declarations WHERE file = ?1";
+pub(crate) const STORED_REF_EDGES: &str =
+    "SELECT target, kind FROM edges WHERE source = ?1 AND kind <> 'contains'";
+pub(crate) const STORED_CONTAINS: &str =
+    "SELECT source FROM edges WHERE target = ?1 AND kind = 'contains'";
+pub(crate) const INSERT_EDGE: &str =
+    "INSERT OR IGNORE INTO edges(source, target, kind) VALUES (?1, ?2, ?3)";
+pub(crate) const DELETE_EDGE: &str =
+    "DELETE FROM edges WHERE source = ?1 AND target = ?2 AND kind = ?3";
+pub(crate) const INSERT_DEPENDENCY: &str =
+    "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary, qualified_rev)
+     VALUES (?1, 'dependency', ?2, ?3, NULL, NULL, NULL, ?4)";
+pub(crate) const DEPENDS_ON_ENTERING: &str =
+    "SELECT 1 FROM edges WHERE target = ?1 AND kind = 'depends_on' LIMIT 1";
+pub(crate) const DELETE_DEPENDENCY: &str = "DELETE FROM nodes WHERE id = ?1 AND kind = 'dependency'
+     AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = ?1)";
+pub(crate) const SET_UNRESOLVED: &str = "UPDATE refs SET unresolved = ?2 WHERE id = ?1";
+pub(crate) const COUNT_EDGES: &str = "SELECT COUNT(*) FROM edges";
+pub(crate) const COUNT_UNRESOLVED: &str = "SELECT count(*) FROM refs WHERE unresolved = 1";
+/// Toutes les requêtes ci-dessus, nommées.
+#[cfg(test)]
+pub(crate) const INCREMENTAL_QUERIES: [(&str, &str); 18] = [
+    ("RESOLVE_NODES", RESOLVE_NODES),
+    ("REF_SOURCES_BY_KEY", REF_SOURCES_BY_KEY),
+    ("REF_SOURCES_BY_HEAD", REF_SOURCES_BY_HEAD),
+    ("REF_SOURCES_BY_FILE", REF_SOURCES_BY_FILE),
+    ("REFS_OF_SOURCE", REFS_OF_SOURCE),
+    ("FILE_CONTEXT", FILE_CONTEXT),
+    ("DECLARING_FILES", DECLARING_FILES),
+    ("DECLARED_NODES", DECLARED_NODES),
+    ("STORED_REF_EDGES", STORED_REF_EDGES),
+    ("STORED_CONTAINS", STORED_CONTAINS),
+    ("INSERT_EDGE", INSERT_EDGE),
+    ("DELETE_EDGE", DELETE_EDGE),
+    ("INSERT_DEPENDENCY", INSERT_DEPENDENCY),
+    ("DEPENDS_ON_ENTERING", DEPENDS_ON_ENTERING),
+    ("DELETE_DEPENDENCY", DELETE_DEPENDENCY),
+    ("SET_UNRESOLVED", SET_UNRESOLVED),
+    ("COUNT_EDGES", COUNT_EDGES),
+    ("COUNT_UNRESOLVED", COUNT_UNRESOLVED),
+];
+
+/// Ce qu'une passe incrémentale écrit (DEC-077 point 3), calculé par `resolve`.
+#[derive(Debug, Default)]
+pub(crate) struct IncrementalWrite {
+    /// Nœuds `dependency` visés par les `depends_on` réévalués (créés s'ils manquent).
+    pub dependencies: Vec<Node>,
+    /// Par source réévaluée : ses liens sortants voulus, hors `contains`.
+    pub sources: Vec<(String, Vec<Edge>)>,
+    /// Par cible réévaluée : ses liens `contains` entrants voulus.
+    pub contained: Vec<(String, Vec<Edge>)>,
+    /// Statut des références dont il change (identifiant, non résolue).
+    pub statuses: Vec<(i64, bool)>,
+}
+
 /// Nom qualifié aux caractères Unicode inversés : valeur de `nodes.qualified_rev`. Seule
 /// fonction de calcul, appelée à chaque écriture d'un nœud.
 pub fn reverse_qualified(qualified: &str) -> String {
@@ -1249,7 +1317,12 @@ impl Store {
     }
 
     pub fn count_edges(&self) -> Result<usize> {
-        self.count("edges")
+        self.conn
+            .prepare_cached(COUNT_EDGES)
+            .map_err(db_err)?
+            .query_row([], |r| r.get::<_, i64>(0))
+            .map(|n| n as usize)
+            .map_err(db_err)
     }
 
     pub fn count_nodes(&self) -> Result<usize> {
@@ -1455,11 +1528,267 @@ impl Store {
         Ok(())
     }
 
+    /// Nœuds de l'index de résolution : identifiant, genre, nom qualifié, nom court, fichier
+    /// (chargement léger de la passe incrémentale, sans résumé ni ordre).
+    pub(crate) fn resolution_nodes(&self) -> Result<Vec<Node>> {
+        let mut st = self.conn.prepare_cached(RESOLVE_NODES).map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind, qualified, short, file) = row.map_err(db_err)?;
+            out.push(Node {
+                id,
+                kind: NodeKind::parse(&kind)?,
+                qualified,
+                short,
+                file,
+                subkind: None,
+                summary: None,
+            });
+        }
+        note_node_rows(out.len());
+        Ok(out)
+    }
+
+    /// Premier champ texte de chaque ligne de `sql` pour le paramètre `arg`.
+    fn strings_of(&self, sql: &str, arg: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
+        let rows = st
+            .query_map([arg], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(db_err)
+    }
+
+    /// Sources des références dont la clé (`by_head` faux) ou la tête (`by_head` vrai) vaut `key`.
+    pub(crate) fn ref_sources_by_key(&self, key: &str, by_head: bool) -> Result<Vec<String>> {
+        self.strings_of(
+            if by_head {
+                REF_SOURCES_BY_HEAD
+            } else {
+                REF_SOURCES_BY_KEY
+            },
+            key,
+        )
+    }
+
+    /// Sources des références écrites par le fichier `file`.
+    pub(crate) fn ref_sources_of_file(&self, file: &str) -> Result<Vec<String>> {
+        self.strings_of(REF_SOURCES_BY_FILE, file)
+    }
+
+    /// Fichiers qui déclarent le nœud `node`.
+    pub(crate) fn declaring_files(&self, node: &str) -> Result<Vec<String>> {
+        self.strings_of(DECLARING_FILES, node)
+    }
+
+    /// Nœuds déclarés par le fichier `file`.
+    pub(crate) fn declared_nodes(&self, file: &str) -> Result<Vec<String>> {
+        self.strings_of(DECLARED_NODES, file)
+    }
+
+    /// Contexte d'imports d'un fichier, s'il en a un.
+    pub(crate) fn file_context(&self, file: &str) -> Result<Option<String>> {
+        match self
+            .conn
+            .prepare_cached(FILE_CONTEXT)
+            .map_err(db_err)?
+            .query_row([file], |r| r.get::<_, String>(0))
+        {
+            Ok(c) => Ok(Some(c)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Références dont la source est `source`, dans l'ordre d'insertion, avec leur statut stocké
+    /// (vrai : comptée non résolue).
+    pub(crate) fn refs_of_source(&self, source: &str) -> Result<Vec<(FileRef, bool)>> {
+        let mut st = self.conn.prepare_cached(REFS_OF_SOURCE).map_err(db_err)?;
+        let rows = st
+            .query_map([source], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind, target_name, origin, file, unresolved) = row.map_err(db_err)?;
+            out.push((
+                FileRef {
+                    id,
+                    r: Ref {
+                        source: source.to_string(),
+                        kind: EdgeKind::parse(&kind)?,
+                        target_name,
+                        context: None,
+                    },
+                    origin: if origin == "llm" {
+                        RefOrigin::Llm
+                    } else {
+                        RefOrigin::Parse
+                    },
+                    file,
+                },
+                unresolved != 0,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Écrit en une transaction une passe incrémentale (DEC-077 point 3) : dépendances dérivées
+    /// manquantes, différence des liens de chaque source et des liens `contains` de chaque cible
+    /// réévaluées, dépendances devenues inutiles, statut des références, résumé et marqueur.
+    /// Le journal repart des seuls nœuds `dependency` créés ou supprimés par la passe.
+    pub(crate) fn write_incremental<F>(&mut self, w: &IncrementalWrite, summary: F) -> Result<()>
+    where
+        F: FnOnce(&Store) -> Result<(String, i64)>,
+    {
+        use std::collections::{BTreeSet, HashSet};
+        self.ensure_writable()?;
+        self.end_fresh();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )
+        .map_err(db_err)?;
+        let mut log = ChangeLog::default();
+        {
+            let mut ins = tx.prepare_cached(INSERT_DEPENDENCY).map_err(db_err)?;
+            for n in &w.dependencies {
+                let added = ins
+                    .execute(params![
+                        n.id,
+                        n.qualified,
+                        n.short,
+                        reverse_qualified(&n.qualified)
+                    ])
+                    .map_err(db_err)?;
+                if added > 0 {
+                    log.inserted.insert(n.id.clone());
+                }
+            }
+        }
+        let dependency_prefix = format!("{}:", NodeKind::Dependency.as_str());
+        let depends_on = EdgeKind::DependsOn.as_str();
+        let mut candidates: BTreeSet<String> = BTreeSet::new();
+        for (source, wanted) in &w.sources {
+            let stored: Vec<(String, String)> = {
+                let mut st = tx.prepare_cached(STORED_REF_EDGES).map_err(db_err)?;
+                let rows = st
+                    .query_map([source], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(db_err)?;
+                rows.collect::<std::result::Result<_, _>>()
+                    .map_err(db_err)?
+            };
+            note_edge_rows(stored.len());
+            let wanted_set: HashSet<(&str, &str)> = wanted
+                .iter()
+                .map(|e| (e.target.as_str(), e.kind.as_str()))
+                .collect();
+            let mut del = tx.prepare_cached(DELETE_EDGE).map_err(db_err)?;
+            for (t, k) in &stored {
+                if !wanted_set.contains(&(t.as_str(), k.as_str())) {
+                    del.execute(params![source, t, k]).map_err(db_err)?;
+                    if k == depends_on && t.starts_with(&dependency_prefix) {
+                        candidates.insert(t.clone());
+                    }
+                }
+            }
+            let stored_set: HashSet<(&str, &str)> = stored
+                .iter()
+                .map(|(t, k)| (t.as_str(), k.as_str()))
+                .collect();
+            let mut ins = tx.prepare_cached(INSERT_EDGE).map_err(db_err)?;
+            for e in wanted {
+                if !stored_set.contains(&(e.target.as_str(), e.kind.as_str())) {
+                    ins.execute(params![e.source, e.target, e.kind.as_str()])
+                        .map_err(db_err)?;
+                }
+            }
+        }
+        for (target, wanted) in &w.contained {
+            let stored: Vec<String> = {
+                let mut st = tx.prepare_cached(STORED_CONTAINS).map_err(db_err)?;
+                let rows = st
+                    .query_map([target], |r| r.get::<_, String>(0))
+                    .map_err(db_err)?;
+                rows.collect::<std::result::Result<_, _>>()
+                    .map_err(db_err)?
+            };
+            note_edge_rows(stored.len());
+            let contains = EdgeKind::Contains.as_str();
+            let wanted_set: HashSet<&str> = wanted.iter().map(|e| e.source.as_str()).collect();
+            let mut del = tx.prepare_cached(DELETE_EDGE).map_err(db_err)?;
+            for s in &stored {
+                if !wanted_set.contains(s.as_str()) {
+                    del.execute(params![s, target, contains]).map_err(db_err)?;
+                }
+            }
+            let stored_set: HashSet<&str> = stored.iter().map(String::as_str).collect();
+            let mut ins = tx.prepare_cached(INSERT_EDGE).map_err(db_err)?;
+            for e in wanted {
+                if !stored_set.contains(e.source.as_str()) {
+                    ins.execute(params![e.source, e.target, contains])
+                        .map_err(db_err)?;
+                }
+            }
+        }
+        // Dépendances dérivées qui n'ont plus de lien `depends_on` entrant.
+        for id in &candidates {
+            let still_used = tx
+                .prepare_cached(DEPENDS_ON_ENTERING)
+                .map_err(db_err)?
+                .exists([id])
+                .map_err(db_err)?;
+            if !still_used {
+                let gone = tx
+                    .prepare_cached(DELETE_DEPENDENCY)
+                    .map_err(db_err)?
+                    .execute([id])
+                    .map_err(db_err)?;
+                if gone > 0 {
+                    log.deleted.insert(id.clone());
+                }
+            }
+        }
+        {
+            let mut set = tx.prepare_cached(SET_UNRESOLVED).map_err(db_err)?;
+            for (id, unresolved) in &w.statuses {
+                set.execute(params![id, i64::from(*unresolved)])
+                    .map_err(db_err)?;
+            }
+        }
+        // Les lectures du calcul passent par la même connexion : elles voient la transaction.
+        let (text, computed_at) = summary(self)?;
+        set_summary_tx(&tx, &text, computed_at)?;
+        set_resolution_tx(&tx, RESOLUTION_DONE)?;
+        commit_counted(tx)?;
+        self.stale = false;
+        self.log = Some(log);
+        Ok(())
+    }
+
     /// Références comptées non résolues par la dernière passe (index partiel, DEC-076).
     pub fn count_unresolved(&self) -> Result<usize> {
         let n: i64 = self
             .conn
-            .prepare_cached("SELECT count(*) FROM refs WHERE unresolved = 1")
+            .prepare_cached(COUNT_UNRESOLVED)
             .map_err(db_err)?
             .query_row([], |r| r.get(0))
             .map_err(db_err)?;
@@ -4913,7 +5242,9 @@ mod tests {
         assert!(expected.len() >= 3, "{expected:?}");
         assert_eq!(stats.unresolved, expected.len());
         assert_eq!(marked(&st), expected);
-        // Une deuxième passe complète remet à zéro avant de marquer.
+        // Une deuxième passe complète remet à zéro avant de marquer (journal absent : la passe
+        // n'est pas incrémentale, le statut a été modifié hors du stockage).
+        st.log = None;
         st.conn
             .execute(
                 "UPDATE refs SET unresolved = 1 WHERE target_name = 'p.B'",
@@ -4955,6 +5286,127 @@ mod tests {
         assert_eq!(marker(&st).as_deref(), Some("à jour"));
         st.reset().unwrap();
         assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+    }
+
+    /// AC-066-4 : les requêtes de la passe incrémentale passent par des index ; seules exceptions,
+    /// nommées : le chargement des nœuds de l'index de résolution et le compte des liens.
+    #[test]
+    fn req066_ac4_incremental_queries_use_indexes() {
+        let dir = tempdir().unwrap();
+        let st = Store::open_or_create(dir.path()).unwrap();
+        let scans_nodes = ["RESOLVE_NODES"];
+        let scans_edges = ["COUNT_EDGES"];
+        for (name, sql) in INCREMENTAL_QUERIES {
+            let mut stmt = st
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let params = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+            let details: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(params), |r| r.get(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(!details.is_empty() || name.starts_with("INSERT"), "{name}");
+            let joined = details.join(" | ");
+            assert_eq!(
+                joined.contains("SCAN nodes"),
+                scans_nodes.contains(&name),
+                "{name} : {joined}"
+            );
+            assert_eq!(
+                joined.contains("SCAN edges"),
+                scans_edges.contains(&name),
+                "{name} : {joined}"
+            );
+            assert!(!joined.contains("SCAN refs"), "{name} : {joined}");
+            assert!(!joined.contains("SCAN declarations"), "{name} : {joined}");
+        }
+    }
+
+    /// AC-069-3, passe incrémentale : le statut stocké et le marqueur suivent la passe.
+    #[test]
+    fn req069_ac3_status_and_marker_follow_the_incremental_pass() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.java"), file("b.md"), file("c.java")])
+            .unwrap();
+        let (a, b) = (ty("p.A", "a.java"), ty("p.B", "a.java"));
+        let doc = Node::new(NodeKind::Document, "b.md", "b.md", Some("b.md"), None, None);
+        st.replace_structures(&[
+            (
+                "a.java".to_string(),
+                vec![a.clone(), b.clone()],
+                vec![
+                    pref(&a.id, "p.B", None),
+                    pref(&a.id, "Absent", None),
+                    pref(&b.id, "Later", None),
+                    mention(&a.id, "texte libre"),
+                ],
+            ),
+            (
+                "b.md".to_string(),
+                vec![doc.clone()],
+                vec![mention(&doc.id, "Inconnue")],
+            ),
+        ])
+        .unwrap();
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        assert_eq!(marked(&st).len(), 2);
+        reset_diagnostics();
+
+        // `Later` apparaît : sa référence se résout ; une nouvelle référence reste non résolue.
+        let later = ty("q.Later", "c.java");
+        st.replace_structure(
+            "c.java",
+            std::slice::from_ref(&later),
+            &[pref(&later.id, "Nulle part", None)],
+        )
+        .unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        let stats = crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(diagnostics().incremental_passes(), 1);
+        assert_eq!(diagnostics().full_passes(), 0);
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        let expected = expected_unresolved(&st);
+        assert_eq!(expected.len(), 2, "{expected:?}");
+        assert_eq!(stats.unresolved, expected.len());
+        assert_eq!(marked(&st), expected);
+        assert_eq!(st.count_unresolved().unwrap(), expected.len());
+
+        // `Later` disparaît : sa référence redevient non résolue.
+        st.remove_files(&["c.java"]).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(diagnostics().incremental_passes(), 2);
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        let expected = expected_unresolved(&st);
+        assert_eq!(expected.len(), 2, "{expected:?}");
+        assert_eq!(marked(&st), expected);
+
+        // Écritures qui ne touchent ni nœuds ni références : le marqueur reste `à jour`.
+        st.insert_files(&[file("d.md")]).unwrap();
+        st.set_enrich_model("m").unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        st.apply_enrichments(
+            "m",
+            &[EnrichmentWrite {
+                path: "b.md".into(),
+                hash: "h".into(),
+                summaries: vec![],
+                concepts: vec![concept("idée")],
+                refs: vec![mention(&doc.id, "idée"), mention(&doc.id, "Inconnue2")],
+            }],
+        )
+        .unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(diagnostics().incremental_passes(), 3);
+        let expected = expected_unresolved(&st);
+        assert_eq!(expected.len(), 4, "{expected:?}");
+        assert_eq!(marked(&st), expected);
+        assert_eq!(st.count_unresolved().unwrap(), expected.len());
     }
 
     #[test]
@@ -5509,7 +5961,9 @@ mod tests {
         assert_eq!(d.refs_reevaluated(), 7);
         reset_diagnostics();
         assert_eq!(diagnostics(), Diagnostics::default());
-        // La passe complète lit les nœuds et les liens de la passe.
+        // La passe complète lit les nœuds et les liens de la passe (journal absent : les liens ont
+        // été supprimés hors du stockage, une passe incrémentale ne les rétablirait pas).
+        st.log = None;
         crate::resolve::resolve(&mut st).unwrap();
         let d = diagnostics();
         // Nœuds : 4 (`nodes()` de la passe) + 4 (`nodes()` du résumé) + 0 (aucun nœud
