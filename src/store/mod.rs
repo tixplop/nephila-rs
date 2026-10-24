@@ -618,43 +618,30 @@ impl Store {
         concept_nodes: &[Node],
         refs: &[Ref],
     ) -> Result<()> {
+        self.apply_enrichments(
+            model,
+            &[EnrichmentWrite {
+                path: path.to_string(),
+                hash: hash.to_string(),
+                summaries: summaries.to_vec(),
+                concepts: concept_nodes.to_vec(),
+                refs: refs.to_vec(),
+            }],
+        )
+    }
+
+    /// Comme `apply_enrichment` pour plusieurs fichiers en une seule transaction, tout ou rien
+    /// (DEC-074) : mêmes contrôles et même entrée d'enrichissement conservé par fichier.
+    pub fn apply_enrichments(&mut self, model: &str, items: &[EnrichmentWrite]) -> Result<()> {
         self.ensure_writable()?;
         self.end_fresh();
+        if items.is_empty() {
+            return Ok(());
+        }
         let tx = self.conn.transaction().map_err(db_err)?;
-        require_known(&tx, path)?;
-        let mut touched = Touched::new();
-        apply_enrichment_tx(&tx, path, summaries, concept_nodes, refs, &mut touched)?;
-        finish_file(&tx, &touched)?;
-        let payload = Payload {
-            summaries: summaries.to_vec(),
-            concepts: concept_nodes
-                .iter()
-                .map(|n| PayloadConcept {
-                    name: n.qualified.clone(),
-                    summary: n.summary.clone(),
-                })
-                .collect(),
-            refs: refs
-                .iter()
-                .map(|r| PayloadRef {
-                    source: r.source.clone(),
-                    kind: r.kind.as_str().to_string(),
-                    target: r.target_name.clone(),
-                })
-                .collect(),
-        };
-        let json = serde_json::to_string(&payload)
-            .map_err(|e| Error::Message(format!("enrichissement non sérialisable : {e}")))?;
-        tx.prepare_cached(
-            "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(path) DO UPDATE SET content_hash = excluded.content_hash,
-                 model = excluded.model, prompt_version = excluded.prompt_version,
-                 payload = excluded.payload",
-        )
-        .map_err(db_err)?
-        .execute(params![path, hash, model, ENRICH_PROMPT_VERSION, json])
-        .map_err(db_err)?;
+        for item in items {
+            write_enrichment(&tx, model, item)?;
+        }
         commit_counted(tx)
     }
 
@@ -794,24 +781,36 @@ impl Store {
 
     /// Supprime un fichier, ses nœuds, références et les liens attachés. Renvoie `false` si inconnu.
     pub fn remove_file(&mut self, path: &str) -> Result<bool> {
+        Ok(self.remove_files(&[path])? > 0)
+    }
+
+    /// Supprime plusieurs fichiers (même effet que `remove_file` pour chacun) en une seule
+    /// transaction, tout ou rien (DEC-074). Renvoie le nombre de fichiers qui existaient.
+    pub fn remove_files(&mut self, paths: &[&str]) -> Result<usize> {
         self.ensure_writable()?;
         self.end_fresh();
+        if paths.is_empty() {
+            return Ok(0);
+        }
         let tx = self.conn.transaction().map_err(db_err)?;
-        let mut touched = Touched::new();
-        clear_summaries(&tx, path, &mut touched)?;
-        release_file(&tx, path, None, &mut touched)?;
-        finish_file(&tx, &touched)?;
-        tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
-            .map_err(db_err)?
-            .execute([path])
-            .map_err(db_err)?;
-        let n = tx
-            .prepare_cached("DELETE FROM files WHERE path = ?1")
-            .map_err(db_err)?
-            .execute([path])
-            .map_err(db_err)?;
+        let mut removed = 0;
+        for path in paths {
+            let mut touched = Touched::new();
+            clear_summaries(&tx, path, &mut touched)?;
+            release_file(&tx, path, None, &mut touched)?;
+            finish_file(&tx, &touched)?;
+            tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
+                .map_err(db_err)?
+                .execute([path])
+                .map_err(db_err)?;
+            removed += tx
+                .prepare_cached("DELETE FROM files WHERE path = ?1")
+                .map_err(db_err)?
+                .execute([path])
+                .map_err(db_err)?;
+        }
         commit_counted(tx)?;
-        Ok(n > 0)
+        Ok(removed)
     }
 
     /// Remplace l'ensemble des liens dérivés (résolution, REQ-008).
@@ -819,56 +818,7 @@ impl Store {
         self.ensure_writable()?;
         self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
-        // Seule la différence avec les liens stockés est écrite : après une mise à jour, presque
-        // tous les liens sont inchangés et les réécrire tous coûterait plusieurs secondes.
-        let wanted: std::collections::HashSet<(&str, &str, &str)> = edges
-            .iter()
-            .map(|e| (e.source.as_str(), e.target.as_str(), e.kind.as_str()))
-            .collect();
-        let stale: Vec<(String, String, String)> = {
-            let mut st = tx
-                .prepare_cached("SELECT source, target, kind FROM edges")
-                .map_err(db_err)?;
-            let rows = st
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .map_err(db_err)?;
-            let mut stale = Vec::new();
-            let mut present: std::collections::HashSet<(String, String, String)> =
-                std::collections::HashSet::new();
-            for row in rows {
-                let (s, t, k): (String, String, String) = row.map_err(db_err)?;
-                if wanted.contains(&(s.as_str(), t.as_str(), k.as_str())) {
-                    present.insert((s, t, k));
-                } else {
-                    stale.push((s, t, k));
-                }
-            }
-            drop(st);
-            let mut ins = tx
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO edges(source, target, kind) VALUES (?1, ?2, ?3)",
-                )
-                .map_err(db_err)?;
-            for e in edges {
-                let key = (
-                    e.source.clone(),
-                    e.target.clone(),
-                    e.kind.as_str().to_string(),
-                );
-                if !present.contains(&key) {
-                    ins.execute(params![e.source, e.target, e.kind.as_str()])
-                        .map_err(db_err)?;
-                }
-            }
-            stale
-        };
-        let mut del = tx
-            .prepare_cached("DELETE FROM edges WHERE source = ?1 AND target = ?2 AND kind = ?3")
-            .map_err(db_err)?;
-        for (s, t, k) in &stale {
-            del.execute(params![s, t, k]).map_err(db_err)?;
-        }
-        drop(del);
+        replace_edges_tx(&tx, edges)?;
         commit_counted(tx)
     }
 
@@ -1168,30 +1118,29 @@ impl Store {
         self.ensure_writable()?;
         self.end_fresh();
         let tx = self.conn.transaction().map_err(db_err)?;
-        tx.prepare_cached(
-            "DELETE FROM nodes WHERE kind = 'dependency'
-             AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+        replace_dependencies_tx(&tx, deps)?;
+        commit_counted(tx)
+    }
+
+    /// Écrit en une seule transaction les dépendances dérivées, les liens et le résumé global
+    /// d'une passe de résolution (DEC-074). `summary` calcule le résumé sur l'état que la
+    /// transaction vient d'écrire (texte, horodatage). Une erreur annule toute la passe.
+    pub fn write_resolution<F>(&mut self, deps: &[Node], edges: &[Edge], summary: F) -> Result<()>
+    where
+        F: FnOnce(&Store) -> Result<(String, i64)>,
+    {
+        self.ensure_writable()?;
+        self.end_fresh();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
         )
-        .map_err(db_err)?
-        .execute([])
         .map_err(db_err)?;
-        {
-            let mut ins = tx
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary, qualified_rev)
-                     VALUES (?1, 'dependency', ?2, ?3, NULL, NULL, NULL, ?4)",
-                )
-                .map_err(db_err)?;
-            for n in deps {
-                ins.execute(params![
-                    n.id,
-                    n.qualified,
-                    n.short,
-                    reverse_qualified(&n.qualified)
-                ])
-                .map_err(db_err)?;
-            }
-        }
+        replace_dependencies_tx(&tx, deps)?;
+        replace_edges_tx(&tx, edges)?;
+        // Les lectures du calcul passent par la même connexion : elles voient la transaction.
+        let (text, computed_at) = summary(self)?;
+        set_summary_tx(&tx, &text, computed_at)?;
         commit_counted(tx)
     }
 
@@ -1310,12 +1259,164 @@ impl Store {
     pub fn set_summary(&mut self, text: &str, computed_at: i64) -> Result<()> {
         self.ensure_writable()?;
         self.end_fresh();
-        self.conn
-            .prepare_cached("INSERT INTO summary(id, text, computed_at) VALUES (1, ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET text = excluded.text, computed_at = excluded.computed_at").map_err(db_err)?.execute(params![text, computed_at])
-            .map_err(db_err)?;
-        Ok(())
+        set_summary_tx(&self.conn, text, computed_at)
     }
+}
+
+/// Écrit dans `tx` la différence entre les liens stockés et `edges`.
+fn replace_edges_tx(tx: &rusqlite::Connection, edges: &[Edge]) -> Result<()> {
+    // Seule la différence avec les liens stockés est écrite : après une mise à jour, presque
+    // tous les liens sont inchangés et les réécrire tous coûterait plusieurs secondes.
+    let wanted: std::collections::HashSet<(&str, &str, &str)> = edges
+        .iter()
+        .map(|e| (e.source.as_str(), e.target.as_str(), e.kind.as_str()))
+        .collect();
+    let stale: Vec<(String, String, String)> = {
+        let mut st = tx
+            .prepare_cached("SELECT source, target, kind FROM edges")
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(db_err)?;
+        let mut stale = Vec::new();
+        let mut present: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        for row in rows {
+            let (s, t, k): (String, String, String) = row.map_err(db_err)?;
+            if wanted.contains(&(s.as_str(), t.as_str(), k.as_str())) {
+                present.insert((s, t, k));
+            } else {
+                stale.push((s, t, k));
+            }
+        }
+        drop(st);
+        let mut ins = tx
+            .prepare_cached("INSERT OR IGNORE INTO edges(source, target, kind) VALUES (?1, ?2, ?3)")
+            .map_err(db_err)?;
+        for e in edges {
+            let key = (
+                e.source.clone(),
+                e.target.clone(),
+                e.kind.as_str().to_string(),
+            );
+            if !present.contains(&key) {
+                ins.execute(params![e.source, e.target, e.kind.as_str()])
+                    .map_err(db_err)?;
+            }
+        }
+        stale
+    };
+    let mut del = tx
+        .prepare_cached("DELETE FROM edges WHERE source = ?1 AND target = ?2 AND kind = ?3")
+        .map_err(db_err)?;
+    for (s, t, k) in &stale {
+        del.execute(params![s, t, k]).map_err(db_err)?;
+    }
+    drop(del);
+    Ok(())
+}
+
+/// Remplace dans `tx` les nœuds `dependency` dérivés.
+fn replace_dependencies_tx(tx: &rusqlite::Connection, deps: &[Node]) -> Result<()> {
+    tx.prepare_cached(
+        "DELETE FROM nodes WHERE kind = 'dependency'
+             AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
+    )
+    .map_err(db_err)?
+    .execute([])
+    .map_err(db_err)?;
+    {
+        let mut ins = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO nodes(id, kind, qualified, short, file, subkind, summary, qualified_rev)
+                     VALUES (?1, 'dependency', ?2, ?3, NULL, NULL, NULL, ?4)",
+                )
+                .map_err(db_err)?;
+        for n in deps {
+            ins.execute(params![
+                n.id,
+                n.qualified,
+                n.short,
+                reverse_qualified(&n.qualified)
+            ])
+            .map_err(db_err)?;
+        }
+    }
+    Ok(())
+}
+
+fn set_summary_tx(conn: &rusqlite::Connection, text: &str, computed_at: i64) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO summary(id, text, computed_at) VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET text = excluded.text, computed_at = excluded.computed_at",
+    )
+    .map_err(db_err)?
+    .execute(params![text, computed_at])
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Résultat de l'enrichissement d'un fichier, à écrire par `Store::apply_enrichments`.
+#[derive(Debug, Clone)]
+pub struct EnrichmentWrite {
+    pub path: String,
+    /// Empreinte du contenu enrichi.
+    pub hash: String,
+    /// Couples (identifiant de nœud, résumé).
+    pub summaries: Vec<(String, String)>,
+    pub concepts: Vec<Node>,
+    pub refs: Vec<Ref>,
+}
+
+/// Écrit l'enrichissement d'un fichier dans la transaction `tx` : déclarations et références
+/// `llm`, résumés, puis entrée d'enrichissement conservé.
+fn write_enrichment(
+    tx: &rusqlite::Transaction<'_>,
+    model: &str,
+    item: &EnrichmentWrite,
+) -> Result<()> {
+    let EnrichmentWrite {
+        path,
+        hash,
+        summaries,
+        concepts: concept_nodes,
+        refs,
+    } = item;
+    require_known(tx, path)?;
+    let mut touched = Touched::new();
+    apply_enrichment_tx(tx, path, summaries, concept_nodes, refs, &mut touched)?;
+    finish_file(tx, &touched)?;
+    let payload = Payload {
+        summaries: summaries.to_vec(),
+        concepts: concept_nodes
+            .iter()
+            .map(|n| PayloadConcept {
+                name: n.qualified.clone(),
+                summary: n.summary.clone(),
+            })
+            .collect(),
+        refs: refs
+            .iter()
+            .map(|r| PayloadRef {
+                source: r.source.clone(),
+                kind: r.kind.as_str().to_string(),
+                target: r.target_name.clone(),
+            })
+            .collect(),
+    };
+    let json = serde_json::to_string(&payload)
+        .map_err(|e| Error::Message(format!("enrichissement non sérialisable : {e}")))?;
+    tx.prepare_cached(
+        "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(path) DO UPDATE SET content_hash = excluded.content_hash,
+             model = excluded.model, prompt_version = excluded.prompt_version,
+             payload = excluded.payload",
+    )
+    .map_err(db_err)?
+    .execute(params![path, hash, model, ENRICH_PROMPT_VERSION, json])
+    .map_err(db_err)?;
+    Ok(())
 }
 
 fn require_known(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<()> {
@@ -4030,5 +4131,107 @@ mod tests {
                 .unwrap();
             assert_eq!(orphans, 0, "graine {seed}");
         }
+    }
+
+    /// Tables touchées par une suppression de fichiers.
+    fn removal_dump(st: &Store) -> Vec<Rows> {
+        let mut v = graph_dump(st);
+        v.push(dump(st, "files", "path,hash,state"));
+        v.push(dump(st, "edges", "source,target,kind"));
+        v.push(dump(st, "summary", "id,text"));
+        v
+    }
+
+    #[test]
+    fn req060_remove_files_matches_remove_file_one_by_one() {
+        let d1 = tempdir().unwrap();
+        let d2 = tempdir().unwrap();
+        let mut grouped = with_kept_enrichments(d1.path());
+        let mut single = with_kept_enrichments(d2.path());
+        let gone = ["d02.md", "d05.md", "d11.md", "d40.md", "unknown.md"];
+        reset_diagnostics();
+        assert_eq!(grouped.remove_files(&gone).unwrap(), 4);
+        assert_eq!(diagnostics().commits(), 1);
+        for p in gone {
+            single.remove_file(p).unwrap();
+        }
+        assert_eq!(removal_dump(&grouped), removal_dump(&single));
+        assert_eq!(grouped.remove_files(&[]).unwrap(), 0);
+        assert!(grouped.enrichment_entry("d02.md").unwrap().is_none());
+    }
+
+    #[test]
+    fn req060_ac4_grouped_removal_is_all_or_nothing() {
+        let dir = tempdir().unwrap();
+        let mut st = with_kept_enrichments(dir.path());
+        st.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_third BEFORE DELETE ON files WHEN old.path = 'd04.md'
+                 BEGIN SELECT RAISE(ABORT, 'test'); END;",
+            )
+            .unwrap();
+        let before = removal_dump(&st);
+        let err = st
+            .remove_files(&["d02.md", "d03.md", "d04.md", "d05.md", "d06.md"])
+            .unwrap_err();
+        assert!(err.to_string().contains("test"), "{err}");
+        assert_eq!(removal_dump(&st), before);
+        assert_eq!(st.files().unwrap().len(), 50);
+    }
+
+    #[test]
+    fn req060_apply_enrichments_matches_one_by_one_in_one_commit() {
+        let d1 = tempdir().unwrap();
+        let d2 = tempdir().unwrap();
+        let mk = |repo: &Path| {
+            let mut st = Store::open_or_create(repo).unwrap();
+            st.insert_pending_files(&many_files(6)).unwrap();
+            let items: Vec<_> = (0..6).map(item_of).collect();
+            st.replace_structures(&items).unwrap();
+            st
+        };
+        let writes: Vec<EnrichmentWrite> = (0..4)
+            .map(|i| {
+                let (f, nodes, _) = item_of(i);
+                EnrichmentWrite {
+                    path: f,
+                    hash: "h".into(),
+                    summaries: vec![(nodes[1].id.clone(), format!("résumé {i}"))],
+                    concepts: vec![concept(&format!("idée{i}"))],
+                    refs: vec![mention(&nodes[0].id, &format!("idée{i}"))],
+                }
+            })
+            .collect();
+        let mut grouped = mk(d1.path());
+        let mut single = mk(d2.path());
+        reset_diagnostics();
+        grouped.apply_enrichments("m", &writes).unwrap();
+        assert_eq!(diagnostics().commits(), 1);
+        for w in &writes {
+            single
+                .apply_enrichment(&w.path, &w.hash, "m", &w.summaries, &w.concepts, &w.refs)
+                .unwrap();
+        }
+        assert_eq!(graph_dump(&grouped), graph_dump(&single));
+        // Un fichier inconnu annule tout le groupe.
+        let mut bad = writes.clone();
+        bad.push(EnrichmentWrite {
+            path: "inconnu.md".into(),
+            hash: "h".into(),
+            summaries: vec![],
+            concepts: vec![],
+            refs: vec![],
+        });
+        let before = graph_dump(&grouped);
+        let (f, nodes, _) = item_of(5);
+        bad[0] = EnrichmentWrite {
+            path: f,
+            hash: "h2".into(),
+            summaries: vec![(nodes[0].id.clone(), "autre".into())],
+            concepts: vec![],
+            refs: vec![],
+        };
+        assert!(grouped.apply_enrichments("m", &bad).is_err());
+        assert_eq!(graph_dump(&grouped), before);
     }
 }

@@ -250,3 +250,100 @@ fn req065_ac1_oracle_0_20_0() {
         );
     }
 }
+
+/// AC-060-5 : un `update` tué pendant l'enrichissement garde les fichiers déjà enregistrés.
+#[test]
+fn req060_ac5_killed_update_keeps_enriched_files() {
+    use nephila::store::Store;
+    use std::collections::BTreeSet;
+
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let mock = tmp.path().join("mock");
+    copy_dir(&fx.join("maven2"), &repo);
+    copy_dir(&fx.join("mock"), &mock);
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\nbatch_files = 1\nconcurrency = 1\n",
+    )
+    .unwrap();
+    let log = tmp.path().join("mock.log");
+    let out = run(&repo, &config, Some(&mock), &["build", "--no-llm"]);
+    assert!(out.status.success());
+
+    let mut child = Command::new(cargo_bin("nephila"))
+        .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+        .env("NEPHILA_MOCK_DELAY_MS", "300")
+        .env("NEPHILA_CONFIG", &config)
+        .env("NEPHILA_MOCK_DIR", &mock)
+        .env("NEPHILA_MOCK_LOG", &log)
+        .arg("-C")
+        .arg(&repo)
+        .arg("update")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        assert!(
+            start.elapsed().as_secs() < 30,
+            "aucun enrichissement enregistré"
+        );
+        if let Ok(store) = Store::open_readonly(&repo) {
+            let files = store.files().unwrap_or_default();
+            if files
+                .iter()
+                .any(|f| store.enrichment_entry(&f.path).ok().flatten().is_some())
+            {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let st = run(&repo, &config, Some(&mock), &["status"]);
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let store = Store::open_readonly(&repo).unwrap();
+    let files: Vec<String> = store.files().unwrap().into_iter().map(|f| f.path).collect();
+    let enriched: BTreeSet<String> = files
+        .iter()
+        .filter(|f| store.enrichment_entry(f).unwrap().is_some())
+        .cloned()
+        .collect();
+    drop(store);
+    assert!(!enriched.is_empty() && enriched.len() < files.len());
+
+    let _ = fs::remove_file(&log);
+    let out = Command::new(cargo_bin("nephila"))
+        .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+        .env_remove("NEPHILA_MOCK_DELAY_MS")
+        .env("NEPHILA_CONFIG", &config)
+        .env("NEPHILA_MOCK_DIR", &mock)
+        .env("NEPHILA_MOCK_LOG", &log)
+        .arg("-C")
+        .arg(&repo)
+        .arg("update")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sent: BTreeSet<String> = fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.split('\t').next().unwrap().to_string())
+        .collect();
+    assert!(sent.is_disjoint(&enriched), "{sent:?} / {enriched:?}");
+    assert_eq!(sent.len() + enriched.len(), files.len());
+}

@@ -246,7 +246,7 @@ pub(crate) fn finish(report: &BuildReport, verb: &str) -> Result<()> {
     }
 }
 
-/// Une passe de résolution suivie du rafraîchissement du résumé, tracée.
+/// Une passe de résolution, résumé global compris (une transaction), tracée.
 fn resolve_pass(store: &mut Store) -> Result<resolve::ResolveStats> {
     let started = Instant::now();
     let stats = resolve::resolve(store)?;
@@ -256,7 +256,6 @@ fn resolve_pass(store: &mut Store) -> Result<resolve::ResolveStats> {
         stats.edges,
         stats.unresolved
     );
-    crate::summary::refresh(store)?;
     Ok(stats)
 }
 

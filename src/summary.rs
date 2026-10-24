@@ -72,10 +72,9 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Recalcule le résumé et le stocke avec son horodatage.
-pub fn refresh(store: &mut Store) -> Result<()> {
-    let value = compute(store)?;
-    store.set_summary(&value.to_string(), now_millis())
+/// Résumé du graphe courant sérialisé, avec son horodatage (millisecondes Unix).
+pub(crate) fn compute_stamped(store: &Store) -> Result<(String, i64)> {
+    Ok((compute(store)?.to_string(), now_millis()))
 }
 
 /// Résumé stocké, avec `computed_at`.

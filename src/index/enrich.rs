@@ -15,7 +15,7 @@ use crate::llm::{with_format_retries, Enrichment, Llm, LotItem};
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
 use crate::parse::markdown;
 use crate::progress::{self, Phase};
-use crate::store::Store;
+use crate::store::{EnrichmentWrite, Store};
 use crate::trace;
 
 /// Nombre d'erreurs réseau consécutives qui arrête l'envoi (DEC-015).
@@ -741,22 +741,23 @@ impl Drop for ExpandGuard<'_, '_> {
     }
 }
 
-/// Écrit l'enrichissement complet d'un fichier (une transaction).
-fn apply_done(
-    store: &mut Store,
-    model: &str,
+/// Prépare l'écriture de l'enrichissement complet d'un fichier : avertissement des éléments
+/// écartés (texte rangé dans `notes`, émis avec la progression du message), puis ajout au groupe
+/// `pending` (écrit en une transaction par `flush_group`).
+fn queue_done(
     file: &FileRecord,
     x: &Enrichment,
-    stop: &AtomicBool,
     succeeded: &mut usize,
-    write_error: &mut Option<Error>,
+    write_error: &Option<Error>,
+    pending: &mut Vec<EnrichmentWrite>,
+    notes: &mut Vec<String>,
 ) {
     if write_error.is_some() {
         return;
     }
     *succeeded += 1;
     if !x.rejected.is_empty() {
-        warn(&format!(
+        notes.push(format!(
             "{} : {} élément(s) d'enrichissement écarté(s) : {}",
             file.path,
             x.rejected.len(),
@@ -764,20 +765,35 @@ fn apply_done(
         ));
     }
     let (concepts, refs) = concept_records(x);
-    if let Err(e) = store.apply_enrichment(
-        &file.path,
-        &file.hash,
-        model,
-        &x.summaries,
-        &concepts,
-        &refs,
-    ) {
+    pending.push(EnrichmentWrite {
+        path: file.path.clone(),
+        hash: file.hash.clone(),
+        summaries: x.summaries.clone(),
+        concepts,
+        refs,
+    });
+}
+
+/// Écrit le groupe de fichiers enrichis en une seule transaction (DEC-074) ; une erreur annule le
+/// groupe (fichiers « à enrichir »), arrête l'envoi et est mémorisée.
+fn flush_group(
+    store: &mut Store,
+    model: &str,
+    pending: &mut Vec<EnrichmentWrite>,
+    stop: &AtomicBool,
+    write_error: &mut Option<Error>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    if let Err(e) = store.apply_enrichments(model, pending) {
         stop.store(true, Ordering::SeqCst);
         *write_error = Some(e);
     }
+    pending.clear();
 }
 
-/// Pool de threads LLM ; le thread courant écrit une transaction par fichier.
+/// Pool de threads LLM ; le thread courant écrit une transaction par groupe de messages reçus.
 pub(crate) fn enrich_all(
     repo: &Path,
     abs: &HashMap<String, PathBuf>,
@@ -989,91 +1005,110 @@ pub(crate) fn enrich_with_stop(
             });
         }
         drop(tx);
-        for msg in rx {
-            let mut advance = 0usize;
-            match msg {
-                Msg::Outcomes(batch) => {
-                    advance = batch.len();
-                    for outcome in batch {
-                        match outcome {
-                            Outcome::Failed(path, e) => {
-                                // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
-                                if !matches!(e, Error::InvalidKey(_)) {
-                                    warn(&format!("{path} : {e}"));
+        // Un message reçu, puis tous ceux déjà arrivés (sans attente), sont écrits en une seule
+        // transaction avant d'attendre le suivant : aucune transaction ouverte pendant un appel.
+        let mut pending: Vec<EnrichmentWrite> = Vec::new();
+        while let Ok(first) = rx.recv() {
+            // Avertissements et progression de chaque message, émis après la validation du groupe.
+            let mut advances: Vec<(Vec<String>, usize)> = Vec::new();
+            let mut next = Some(first);
+            while let Some(msg) = next.take() {
+                let mut adv = 0usize;
+                let mut notes: Vec<String> = Vec::new();
+                match msg {
+                    Msg::Outcomes(batch) => {
+                        adv = batch.len();
+                        for outcome in batch {
+                            match outcome {
+                                Outcome::Failed(path, e) => {
+                                    // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
+                                    if !matches!(e, Error::InvalidKey(_)) {
+                                        notes.push(format!("{path} : {e}"));
+                                    }
+                                    report.failed += 1;
+                                    failures.push((path, e));
                                 }
-                                report.failed += 1;
-                                failures.push((path, e));
-                            }
-                            Outcome::Done(file, x) => {
-                                apply_done(
-                                    store,
-                                    llm.model(),
-                                    &file,
-                                    &x,
-                                    stop,
-                                    &mut succeeded,
-                                    &mut write_error,
-                                );
-                            }
-                        }
-                    }
-                }
-                Msg::Chunk {
-                    file,
-                    index,
-                    count,
-                    result,
-                } => {
-                    let entry = partials
-                        .entry(file.path.clone())
-                        .or_insert_with(|| Partial {
-                            results: vec![None; count],
-                            done: 0,
-                            failed: false,
-                        });
-                    // Résultat d'un fichier déjà en échec : ignoré.
-                    if !entry.failed {
-                        match result {
-                            Err(e) => {
-                                entry.failed = true;
-                                // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
-                                if !matches!(e, Error::InvalidKey(_)) {
-                                    warn(&format!("{} : {e}", file.path));
-                                }
-                                report.failed += 1;
-                                failures.push((file.path.clone(), e));
-                                advance = 1;
-                            }
-                            Ok(x) => {
-                                entry.results[index - 1] = Some(x);
-                                entry.done += 1;
-                                if entry.done == count {
-                                    let parts: Vec<Enrichment> =
-                                        entry.results.iter_mut().filter_map(Option::take).collect();
-                                    // Un seul appel : résultat tel quel, comme avant DEC-063.
-                                    let merged = if count == 1 {
-                                        parts.into_iter().next().unwrap_or_default()
-                                    } else {
-                                        chunk::merge_enrichments(parts)
-                                    };
-                                    apply_done(
-                                        store,
-                                        llm.model(),
-                                        file,
-                                        &merged,
-                                        stop,
+                                Outcome::Done(file, x) => {
+                                    queue_done(
+                                        &file,
+                                        &x,
                                         &mut succeeded,
-                                        &mut write_error,
+                                        &write_error,
+                                        &mut pending,
+                                        &mut notes,
                                     );
-                                    advance = 1;
+                                }
+                            }
+                        }
+                    }
+                    Msg::Chunk {
+                        file,
+                        index,
+                        count,
+                        result,
+                    } => {
+                        let entry = partials
+                            .entry(file.path.clone())
+                            .or_insert_with(|| Partial {
+                                results: vec![None; count],
+                                done: 0,
+                                failed: false,
+                            });
+                        // Résultat d'un fichier déjà en échec : ignoré.
+                        if !entry.failed {
+                            match result {
+                                Err(e) => {
+                                    entry.failed = true;
+                                    // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
+                                    if !matches!(e, Error::InvalidKey(_)) {
+                                        notes.push(format!("{} : {e}", file.path));
+                                    }
+                                    report.failed += 1;
+                                    failures.push((file.path.clone(), e));
+                                    adv = 1;
+                                }
+                                Ok(x) => {
+                                    entry.results[index - 1] = Some(x);
+                                    entry.done += 1;
+                                    if entry.done == count {
+                                        let parts: Vec<Enrichment> = entry
+                                            .results
+                                            .iter_mut()
+                                            .filter_map(Option::take)
+                                            .collect();
+                                        // Un seul appel : résultat tel quel, comme avant DEC-063.
+                                        let merged = if count == 1 {
+                                            parts.into_iter().next().unwrap_or_default()
+                                        } else {
+                                            chunk::merge_enrichments(parts)
+                                        };
+                                        queue_done(
+                                            file,
+                                            &merged,
+                                            &mut succeeded,
+                                            &write_error,
+                                            &mut pending,
+                                            &mut notes,
+                                        );
+                                        adv = 1;
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                advances.push((notes, adv));
+                next = rx.try_recv().ok();
             }
-            if let Some(m) = meter.as_mut() {
-                m.advance(advance);
+            flush_group(store, llm.model(), &mut pending, stop, &mut write_error);
+            // Avertissements et progression de chaque message, dans l'ordre d'arrivée.
+            for (notes, adv) in advances {
+                for note in notes {
+                    warn(&note);
+                }
+                if let Some(m) = meter.as_mut() {
+                    m.advance(adv);
+                }
             }
         }
     });

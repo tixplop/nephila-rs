@@ -35,8 +35,8 @@ pub struct Resolution {
 /// Recalcule tous les liens du graphe à partir des nœuds et des références.
 pub fn resolve(store: &mut Store) -> Result<ResolveStats> {
     let r = compute_from(store)?;
-    store.replace_derived_dependencies(&r.dependencies)?;
-    store.replace_edges(&r.edges)?;
+    // Dépendances dérivées, liens et résumé global : une seule transaction (DEC-074).
+    store.write_resolution(&r.dependencies, &r.edges, crate::summary::compute_stamped)?;
     // Les liens sont dédupliqués par la clé primaire : on compte ce qui est stocké.
     Ok(ResolveStats {
         edges: store.count_edges()?,
@@ -1913,5 +1913,77 @@ import q.R;",
         PARSE_CONTEXT_CALLS.with(|c| c.set(0));
         resolve(&mut e.store).unwrap();
         assert_eq!(PARSE_CONTEXT_CALLS.with(|c| c.get()), 5);
+    }
+
+    /// Séquence de la 0.20.0 : trois écritures séparées.
+    fn old_pass(store: &mut Store) {
+        let r = compute_from(store).unwrap();
+        store.replace_derived_dependencies(&r.dependencies).unwrap();
+        store.replace_edges(&r.edges).unwrap();
+        let v = crate::summary::compute(store).unwrap();
+        store.set_summary(&v.to_string(), 1).unwrap();
+    }
+
+    fn seed_modules(e: &mut Env) {
+        build_module(
+            e,
+            "api/pom.xml",
+            "com.acme:api",
+            &["com.acme:core", "org.slf4j:slf4j-api"],
+        );
+        build_module(e, "core/pom.xml", "com.acme:core", &["org.x:lib"]);
+        e.store
+            .replace_file(
+                "S.java",
+                &[ty("com.c.Svc", "S.java"), ty("com.c.Repo", "S.java")],
+                &[rf(
+                    &tid("com.c.Svc"),
+                    EdgeKind::Imports,
+                    "Repo",
+                    Some("package com.c;"),
+                )],
+            )
+            .unwrap();
+    }
+
+    fn state(e: &Env) -> (Vec<Node>, Vec<crate::model::Edge>, String) {
+        (
+            e.store.nodes().unwrap(),
+            e.store.edges().unwrap(),
+            e.store.summary().unwrap().unwrap().0,
+        )
+    }
+
+    /// AC-060-3 : une passe de résolution suivie du résumé global = une transaction, même résultat.
+    #[test]
+    fn req060_ac3_resolution_pass_is_one_transaction_with_same_result() {
+        let files = ["api/pom.xml", "core/pom.xml", "S.java"];
+        let mut new = env(&files);
+        let mut old = env(&files);
+        seed_modules(&mut new);
+        seed_modules(&mut old);
+        crate::store::reset_diagnostics();
+        resolve(&mut new.store).unwrap();
+        assert_eq!(crate::store::diagnostics().commits(), 1);
+        old_pass(&mut old.store);
+        assert_eq!(state(&new), state(&old));
+        assert!(!state(&new).1.is_empty());
+
+        // Seconde passe après modification : dépendance retirée, lien disparu, résumé recalculé.
+        for e in [&mut new, &mut old] {
+            build_module(e, "api/pom.xml", "com.acme:api", &["com.acme:core"]);
+            e.store
+                .replace_file("S.java", &[ty("com.c.Svc", "S.java")], &[])
+                .unwrap();
+        }
+        crate::store::reset_diagnostics();
+        resolve(&mut new.store).unwrap();
+        assert_eq!(crate::store::diagnostics().commits(), 1);
+        old_pass(&mut old.store);
+        assert_eq!(state(&new), state(&old));
+        assert!(!has_node(
+            &new,
+            &node_id(NodeKind::Dependency, "org.slf4j:slf4j-api")
+        ));
     }
 }

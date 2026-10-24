@@ -126,9 +126,9 @@ pub fn update(
         return Ok(None);
     }
 
-    for path in d.paths(Change::Deleted) {
-        store.remove_file(path)?;
-    }
+    // Tous les fichiers supprimés partent en une seule transaction (DEC-074).
+    let deleted: Vec<&str> = d.paths(Change::Deleted).collect();
+    store.remove_files(&deleted)?;
     // Les chemins de projet Gradle dépendent des settings : un settings ajouté, modifié ou
     // supprimé fait réanalyser les scripts de build de son arborescence.
     let settings_dirs: Vec<&str> = d
@@ -184,5 +184,177 @@ fn record(f: &ScannedFile, state: FileState) -> FileRecord {
         mtime: f.mtime,
         recorded_at: 0,
         state,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::Matcher;
+    use crate::index::lock::RepoLock;
+    use crate::llm::mock::{MockLlm, MockOptions};
+    use crate::store::{diagnostics, reset_diagnostics};
+    use std::path::PathBuf;
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            let dest = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &dest);
+            } else {
+                std::fs::copy(e.path(), dest).unwrap();
+            }
+        }
+    }
+
+    fn class_name(i: usize) -> String {
+        format!("C{i:02}")
+    }
+
+    /// Dépôt de `n` classes Java, construit `--no-llm`.
+    fn built_repo(dir: &Path, n: usize) -> PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for i in 0..n {
+            let c = class_name(i);
+            std::fs::write(
+                repo.join(format!("{c}.java")),
+                format!("package p;\nimport java.util.List;\npublic class {c} {{}}\n"),
+            )
+            .unwrap();
+        }
+        let lock = RepoLock::acquire(&repo).unwrap();
+        build::build(
+            &repo,
+            &IndexOptions::default(),
+            None,
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap();
+        repo
+    }
+
+    fn update_commits(repo: &Path, deleted: &[usize]) -> u64 {
+        for &i in deleted {
+            std::fs::remove_file(repo.join(format!("{}.java", class_name(i)))).unwrap();
+        }
+        let lock = RepoLock::acquire(repo).unwrap();
+        reset_diagnostics();
+        update(
+            repo,
+            &IndexOptions::default(),
+            None,
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap()
+        .unwrap();
+        diagnostics().commits()
+    }
+
+    #[test]
+    fn req060_ac1_deleted_files_are_removed_in_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = built_repo(dir.path(), 40);
+        let copy = dir.path().join("copy");
+        copy_dir(&repo, &copy);
+
+        let c1 = update_commits(&repo, &[7]);
+        let gone: Vec<usize> = (10..30).collect();
+        let c20 = update_commits(&copy, &gone);
+        assert_eq!(c1, c20, "une validation par fichier supprimé");
+
+        let store = Store::open_readonly(&copy).unwrap();
+        let files: Vec<String> = store.files().unwrap().into_iter().map(|f| f.path).collect();
+        let nodes: Vec<String> = store.nodes().unwrap().into_iter().map(|n| n.id).collect();
+        let decls = store.declarations().unwrap();
+        let contexts = store.file_contexts().unwrap();
+        let refs = store.file_refs().unwrap();
+        for i in 0..40 {
+            let c = class_name(i);
+            let path = format!("{c}.java");
+            let kept = !gone.contains(&i);
+            assert_eq!(files.contains(&path), kept, "{path}");
+            assert_eq!(nodes.contains(&format!("type:p.{c}")), kept, "{path}");
+            assert_eq!(decls.iter().any(|(f, _)| *f == path), kept, "{path}");
+            assert_eq!(contexts.contains_key(&path), kept, "{path}");
+            assert_eq!(refs.iter().any(|r| r.file == path), kept, "{path}");
+            assert!(store.enrichment_entry(&path).unwrap().is_none());
+        }
+        assert_eq!(files.len(), 20);
+    }
+
+    /// AC-060-2 : `batch_files = 10`, 20 documents, deux appels : au plus une validation par appel.
+    #[test]
+    fn req060_ac2_enrichments_are_committed_per_received_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let mockdir = dir.path().join("mock");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&mockdir).unwrap();
+        for i in 0..20 {
+            std::fs::write(repo.join(format!("d{i:02}.md")), format!("# Titre {i}\n")).unwrap();
+            std::fs::write(
+                mockdir.join(format!("d{i:02}.md.json")),
+                format!(
+                    "{{\"version\":2,\"summaries\":[{{\"node\":\"document:d{i:02}.md\",\"summary\":\"résumé {i}\"}}],\"concepts\":[{{\"name\":\"Idée{i}\",\"summary\":\"concept {i}\",\"sections\":[\"section:d{i:02}.md#titre-{i}\"]}}]}}"
+                ),
+            )
+            .unwrap();
+        }
+        let lock = RepoLock::acquire(&repo).unwrap();
+        let opts = IndexOptions {
+            concurrency: 1,
+            batch_files: 10,
+            ..IndexOptions::default()
+        };
+        build::build(&repo, &opts, None, &lock, &Matcher::none()).unwrap();
+
+        let log = dir.path().join("mock.log");
+        let llm = MockLlm::new(MockOptions {
+            dir: Some(mockdir),
+            log: Some(log.clone()),
+            ..MockOptions::default()
+        });
+        // Build sans LLM : les 20 documents sont indexés mais pas enrichis.
+        update_with_llm(&repo, &opts, &llm);
+        let calls = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(calls, 2);
+        let store = Store::open_readonly(&repo).unwrap();
+        assert_eq!(store.files_to_enrich().unwrap().len(), 0);
+        for i in 0..20 {
+            let path = format!("d{i:02}.md");
+            assert!(store.enrichment_entry(&path).unwrap().is_some(), "{path}");
+            let node = store
+                .node_by_id(&format!("document:{path}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.summary.as_deref(), Some(&*format!("résumé {i}")));
+        }
+        assert!(store
+            .nodes()
+            .unwrap()
+            .iter()
+            .any(|n| n.kind == crate::model::NodeKind::Concept));
+    }
+
+    /// Enrichit les fichiers à enrichir et compte les validations de cette phase seule.
+    fn update_with_llm(repo: &Path, opts: &IndexOptions, llm: &MockLlm) {
+        let mut store = Store::open_existing(repo).unwrap();
+        store.set_enrich_model(crate::llm::Llm::model(llm)).unwrap();
+        let files = store.files_to_enrich().unwrap();
+        assert_eq!(files.len(), 20);
+        let scanned = crate::scan::scan(repo, &store.files().unwrap(), &Matcher::none()).unwrap();
+        let abs = build::abs_paths(&scanned.files);
+        let mut report = BuildReport::default();
+        reset_diagnostics();
+        crate::index::enrich::enrich_all(repo, &abs, &files, opts, llm, &mut store, &mut report)
+            .unwrap();
+        let commits = diagnostics().commits();
+        assert!(commits <= 2, "{commits} validations pour 2 appels");
+        assert!(commits >= 1);
     }
 }
