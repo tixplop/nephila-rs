@@ -81,8 +81,8 @@
 # Priorité : ce fichier > configuration personnelle > défaut.
 # max_chunk_chars = 30000
 
-# Nombre d'appels LLM simultanés (borne aussi les fils d'analyse). Entier > 0. Remplace la valeur
-# de la configuration personnelle.
+# Nombre d'appels LLM simultanés. Entier > 0. Remplace la valeur de la configuration personnelle.
+# Sans effet sur l'extraction : ses fils se règlent par l'option --jobs, qui n'a pas de clé.
 # Plafond dans ce fichier : au plus 64.
 # Priorité : ce fichier > configuration personnelle > défaut.
 # concurrency = 2

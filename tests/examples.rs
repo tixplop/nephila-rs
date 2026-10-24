@@ -728,7 +728,7 @@ fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
     assert!(line.contains("0.17"));
     let at = |needle: &str| readme.find(needle).unwrap();
     assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.22.0", "git tag v0.22.0 && git push origin v0.22.0"] {
+    for needle in ["V=v0.23.0", "git tag v0.23.0 && git push origin v0.23.0"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
     assert!(!readme.contains("0.17.6"));
@@ -936,8 +936,8 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
         "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
         "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.22.0 ",
-        "git tag v0.22.0 && git push origin v0.22.0",
+        "V=v0.23.0 ",
+        "git tag v0.23.0 && git push origin v0.23.0",
     ] {
         assert!(readme.contains(expected), "absent : {expected}");
     }
@@ -1122,4 +1122,117 @@ fn REQ066_AC1_readme_0_22_mise_a_jour_incrementale() {
     let v21 = sec.find("- **Vers 0.21**").expect("puce Vers 0.21");
     assert!(b < v21);
     assert_eq!(sec[b..v21].trim_end(), bullet);
+}
+
+fn cargo_minor() -> String {
+    let toml = repo_file("Cargo.toml");
+    let v = toml
+        .lines()
+        .find_map(|l| l.strip_prefix("version = \""))
+        .and_then(|l| l.strip_suffix('"'))
+        .expect("version de Cargo.toml");
+    v.split('.').take(2).collect::<Vec<_>>().join(".")
+}
+
+fn block_ending_at(text: &str, last: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let end = lines
+        .iter()
+        .position(|l| l.trim_end() == last)
+        .unwrap_or_else(|| panic!("ligne `{last}` absente"));
+    let mut start = end;
+    while start > 0 && lines[start - 1].starts_with('#') && !lines[start - 1].trim().eq("#") {
+        start -= 1;
+    }
+    lines[start..=end]
+        .iter()
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+#[test]
+fn REQ041_AC13_blocs_de_concurrency_des_exemples() {
+    let personal = [
+        "# Nombre d'appels LLM simultanés. Entier > 0. Défaut : 4. Sans effet sur l'extraction : ses",
+        "# fils, et ceux du parcours du dépôt, se règlent par l'option --jobs de build et update",
+        "# (défaut : nombre de cœurs disponibles), qui n'a pas de clé de configuration.",
+        "# Un dépôt peut le remplacer par son .nephila.toml.",
+        "# Priorité : .nephila.toml du dépôt > ce fichier > défaut.",
+        "# concurrency = 4",
+    ];
+    let project = [
+        "# Nombre d'appels LLM simultanés. Entier > 0. Remplace la valeur de la configuration personnelle.",
+        "# Sans effet sur l'extraction : ses fils se règlent par l'option --jobs, qui n'a pas de clé.",
+        "# Plafond dans ce fichier : au plus 64.",
+        "# Priorité : ce fichier > configuration personnelle > défaut.",
+        "# concurrency = 2",
+    ];
+    let a = example("config.toml");
+    let b = example("nephila.toml");
+    assert_eq!(block_ending_at(&a, "# concurrency = 4"), personal);
+    assert_eq!(block_ending_at(&b, "# concurrency = 2"), project);
+    for text in [&a, &b] {
+        for bad in ["borne aussi", "fils d'analyse", "fils de l'analyse"] {
+            assert!(!text.contains(bad), "{bad}");
+        }
+        for l in text.lines() {
+            assert!(!l.starts_with("# jobs =") && !l.starts_with("jobs ="));
+        }
+    }
+}
+
+#[test]
+fn REQ071_AC6_exemples_et_readme_sans_fils_d_analyse() {
+    let readme = repo_file("README.md");
+    for (name, text) in [
+        ("config.toml", example("config.toml")),
+        ("nephila.toml", example("nephila.toml")),
+        ("README.md", readme),
+    ] {
+        for bad in ["borne aussi", "fils d'analyse"] {
+            assert!(!text.contains(bad), "{name} : {bad}");
+        }
+    }
+}
+
+#[test]
+fn REQ071_AC11_readme_option_jobs() {
+    let readme = repo_file("README.md");
+    let version = cargo_minor();
+    assert_eq!(version, "0.23");
+    let lines: Vec<&str> = readme.lines().collect();
+    for cmd in ["build ", "update"] {
+        let prefix = format!("nephila {cmd}");
+        let n = lines
+            .iter()
+            .filter(|l| {
+                l.starts_with(&prefix)
+                    && l.contains(" [--enrich-code] [--jobs <N>] [--batch-files <N>] ")
+            })
+            .count();
+        assert_eq!(n, 1, "ligne d'usage de {cmd}");
+    }
+    let jobs = "| `--jobs <N>` | Nombre de fils du parcours du dépôt et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs disponibles (au plus 256 ; 4 si le système ne le donne pas). Pas de clé de configuration ; indépendant de `concurrency`, qui ne règle que les appels LLM |";
+    assert_eq!(lines.iter().filter(|l| **l == jobs).count(), 1);
+    let ij = lines.iter().position(|l| *l == jobs).unwrap();
+    assert!(lines[ij + 1].starts_with("| `--batch-files <N>` |"));
+    let conc =
+        "| `concurrency` | Appels LLM simultanés ; sans effet sur l'extraction, réglée par `--jobs` | 4 |";
+    assert_eq!(lines.iter().filter(|l| **l == conc).count(), 1);
+    assert!(readme.contains("; le nombre de fils annoncé au début de la phase structure est celui de `--jobs` (au plus le nombre de fichiers), celui de l'enrichissement vient de `concurrency`"));
+    let sec = readme_section(&readme, "## Mise à niveau");
+    let start = format!("- **Vers {version}** : le parcours du dépôt et l'extraction utilisent par défaut un fil par cœur disponible");
+    let b = sec.find(&start).expect("puce Vers 0.23 absente");
+    let v22 = sec.find("**Vers 0.22**").expect("puce Vers 0.22");
+    assert!(b < v22);
+    assert!(sec[b..v22].contains("ajoutez --jobs 1 à nephila build et nephila update."));
+    let row = lines
+        .iter()
+        .find(|l| l.starts_with(&format!("| {version} |")))
+        .expect("ligne de version");
+    assert!(row.contains("Option --jobs de build et update : nombre de fils du parcours du dépôt et de l'extraction, par défaut le nombre de cœurs disponibles ; concurrency ne règle plus que les appels LLM."));
+    assert!(row.contains("arcours du dépôt et empreintes en parallèle, fichier lu une seule fois pour son empreinte et son analyse, écriture SQLite allégée, même graphe qu'en 0.22 quel que soit le nombre de fils"));
+    let i23 = lines.iter().position(|l| l == row).unwrap();
+    assert!(lines[i23 + 1].starts_with("| 0.22 |"));
+    assert!(!readme.contains("Appels simultanés |"));
 }

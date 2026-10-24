@@ -143,8 +143,9 @@ api_key_env = "ANTHROPIC_API_KEY"
 # Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # max_chunk_chars = 60000
 
-# Nombre d'appels LLM simultanés. Entier > 0. Défaut : 4. Borne aussi le nombre de fils de
-# l'analyse syntaxique.
+# Nombre d'appels LLM simultanés. Entier > 0. Défaut : 4. Sans effet sur l'extraction : ses
+# fils, et ceux du parcours du dépôt, se règlent par l'option --jobs de build et update
+# (défaut : nombre de cœurs disponibles), qui n'a pas de clé de configuration.
 # Un dépôt peut le remplacer par son .nephila.toml.
 # Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # concurrency = 4
