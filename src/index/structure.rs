@@ -28,12 +28,13 @@ enum Outcome {
     Failed(String, Error),
 }
 
-/// Analyse `files` avec `jobs` fils et enregistre leur structure. Un fichier illisible ou
+/// Analyse `files` (prises par valeur : le contenu retenu par le parcours est pris par le fil
+/// d'extraction puis libéré, REQ-073) avec `jobs` fils et enregistre leur structure. Un fichier illisible ou
 /// dont l'analyse échoue reste « en attente » (avertissement nommant la cause) ; les autres
 /// continuent. `gradle_settings` : table des `settings.gradle(.kts)` du parcours.
 pub(crate) fn analyze(
     repo: &Path,
-    files: &[ScannedFile],
+    files: Vec<ScannedFile>,
     jobs: usize,
     gradle_settings: &HashMap<String, Option<String>>,
     store: &mut Store,
@@ -44,17 +45,18 @@ pub(crate) fn analyze(
         repo_root: Some(repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf())),
         gradle_settings: gradle_settings.clone(),
     };
-    let queue: Mutex<VecDeque<&ScannedFile>> = Mutex::new(files.iter().collect());
+    let total = files.len();
+    let queue: Mutex<VecDeque<ScannedFile>> = Mutex::new(files.into());
     let (tx, rx) = mpsc::channel::<Outcome>();
-    let workers = jobs.clamp(1, files.len().max(1));
+    let workers = jobs.clamp(1, total.max(1));
     let mut write_error: Option<Error> = None;
     let started = std::time::Instant::now();
     let failed_before = report.failed;
     let retained_before = report.retained;
-    trace!("structure: début {} fichiers, {workers} fils", files.len());
+    trace!("structure: début {total} fichiers, {workers} fils");
     let mut batch: Vec<Batched> = Vec::new();
 
-    let mut meter = progress::Meter::start(Phase::Extraction, files.len());
+    let mut meter = progress::Meter::start(Phase::Extraction, total);
     let mut spawn_error: Option<Error> = None;
     std::thread::scope(|scope| {
         let queue = &queue;
@@ -66,19 +68,30 @@ pub(crate) fn analyze(
                 .name("nephila-extract".into())
                 .stack_size(EXTRACT_STACK)
                 .spawn_scoped(scope, move || loop {
-                    let Some(file) = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front()
+                    let Some(mut file) =
+                        queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front()
                     else {
                         break;
                     };
-                    let outcome = match std::fs::read_to_string(&file.abs) {
-                        Err(e) => Outcome::Failed(
-                            file.path.clone(),
-                            Error::Message(format!("lecture de {} impossible : {e}", file.path)),
-                        ),
-                        Ok(text) => match parse::extract(Path::new(&file.path), &text, ctx) {
-                            Ok(s) => Outcome::Parsed(file.path.clone(), s),
-                            Err(e) => Outcome::Failed(file.path.clone(), e),
-                        },
+                    // Contenu retenu par le parcours, sinon lecture par le chemin réel.
+                    let outcome = match file.content.take() {
+                        Some(retained) => {
+                            extract(&file.path, retained.as_str(), ctx)
+                            // `retained` est libéré ici : le budget est rendu.
+                        }
+                        None => {
+                            crate::scan::count_read(&file.path, crate::scan::ReadKind::Extract);
+                            match std::fs::read_to_string(&file.abs) {
+                                Err(e) => Outcome::Failed(
+                                    file.path.clone(),
+                                    Error::Message(format!(
+                                        "lecture de {} impossible : {e}",
+                                        file.path
+                                    )),
+                                ),
+                                Ok(text) => extract(&file.path, &text, ctx),
+                            }
+                        }
                     };
                     if tx.send(outcome).is_err() {
                         break;
@@ -147,12 +160,19 @@ pub(crate) fn analyze(
     }
 }
 
+fn extract(path: &str, text: &str, ctx: &ParseCtx) -> Outcome {
+    match parse::extract(Path::new(path), text, ctx) {
+        Ok(s) => Outcome::Parsed(path.to_string(), s),
+        Err(e) => Outcome::Failed(path.to_string(), e),
+    }
+}
+
 /// Enregistre le lot en une transaction. Une erreur vide la file (les fils s'arrêtent, les
 /// résultats restants sont ignorés) et est conservée.
 fn flush(
     store: &mut Store,
     batch: &mut Vec<Batched>,
-    queue: &Mutex<VecDeque<&ScannedFile>>,
+    queue: &Mutex<VecDeque<ScannedFile>>,
     report: &mut BuildReport,
     write_error: &mut Option<Error>,
 ) {
@@ -269,7 +289,7 @@ mod tests {
         let mut report = BuildReport::default();
         analyze(
             repo,
-            &scanned.files,
+            scanned.files,
             jobs,
             &scanned.gradle_settings,
             &mut store,
@@ -366,9 +386,16 @@ mod tests {
         let mut report = BuildReport::default();
         crate::progress::init(true);
         crate::progress::take_captured();
+        let mut files = scanned.files;
+        // B.java : cas d'un fichier que l'extraction lit elle-même (contenu non retenu, REQ-073).
+        for f in &mut files {
+            if f.path == "B.java" {
+                f.content = None;
+            }
+        }
         analyze(
             repo,
-            &scanned.files,
+            files,
             2,
             &scanned.gradle_settings,
             &mut store,

@@ -32,7 +32,7 @@ const BUILD_FILES: [&str; 7] = [
 ];
 
 /// Fichier retenu par le parcours.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ScannedFile {
     /// Chemin relatif à la racine, séparateur `/`.
     pub path: String,
@@ -46,6 +46,142 @@ pub struct ScannedFile {
     pub abs: PathBuf,
     /// `true` si l'empreinte a été calculée (et non réutilisée).
     pub rehashed: bool,
+    /// Contenu lu pour l'empreinte, retenu jusqu'à l'analyse (REQ-073, DEC-085).
+    pub content: Option<Retained>,
+}
+
+/// Budget des contenus retenus à la fois par commande (DEC-085).
+pub const RETAIN_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Octets de contenu actuellement retenus (tous fichiers confondus).
+static RETAINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Maximum atteint par `RETAINED` (diagnostic des tests, AC-073-3).
+#[cfg(test)]
+pub(crate) static RETAINED_PEAK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Contenu UTF-8 d'un fichier retenu en mémoire ; ses octets sont réservés dans le budget tant
+/// qu'il existe et rendus quand il est libéré.
+pub struct Retained {
+    text: String,
+}
+
+impl Retained {
+    /// Retient `text` si le budget le permet (réservation atomique avant de garder). Un budget nul
+    /// ne retient rien.
+    fn reserve(text: String, budget: usize) -> std::result::Result<Retained, String> {
+        use std::sync::atomic::Ordering;
+        let len = text.len();
+        if budget == 0 {
+            return Err(text);
+        }
+        let reserved = RETAINED.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+            cur.checked_add(len).filter(|n| *n <= budget)
+        });
+        match reserved {
+            Ok(_prev) => {
+                #[cfg(test)]
+                RETAINED_PEAK.fetch_max(_prev + len, Ordering::SeqCst);
+                Ok(Retained { text })
+            }
+            Err(_) => Err(text),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl Drop for Retained {
+    fn drop(&mut self) {
+        RETAINED.fetch_sub(self.text.len(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for Retained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Retained({} octets)", self.text.len())
+    }
+}
+
+/// Le contenu retenu est un cache : il ne compte pas dans l'égalité de deux `ScannedFile`.
+impl PartialEq for ScannedFile {
+    fn eq(&self, o: &Self) -> bool {
+        self.path == o.path
+            && self.hash == o.hash
+            && self.size == o.size
+            && self.mtime == o.mtime
+            && self.module == o.module
+            && self.abs == o.abs
+            && self.rehashed == o.rehashed
+    }
+}
+
+impl Eq for ScannedFile {}
+
+/// Lectures de contenu comptées par chemin et par sorte (diagnostic des tests, AC-073-1 à 3).
+#[cfg(test)]
+pub(crate) mod reads {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Kind {
+        Hash,
+        Extract,
+        Settings,
+    }
+
+    static READS: LazyLock<Mutex<HashMap<(String, Kind), usize>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub fn record(path: &str, kind: Kind) {
+        let mut m = READS.lock().unwrap_or_else(|p| p.into_inner());
+        *m.entry((path.to_string(), kind)).or_insert(0) += 1;
+    }
+
+    pub fn reset() {
+        READS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    /// Lectures d'une sorte.
+    pub fn kind(kind: Kind) -> usize {
+        let m = READS.lock().unwrap_or_else(|p| p.into_inner());
+        m.iter()
+            .filter(|((_, k), _)| *k == kind)
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    /// Chemins lus, avec leur nombre total de lectures.
+    pub fn all() -> HashMap<String, usize> {
+        let m = READS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out: HashMap<String, usize> = HashMap::new();
+        for ((p, _), n) in m.iter() {
+            *out.entry(p.clone()).or_insert(0) += n;
+        }
+        out
+    }
+}
+
+/// Enregistre une lecture de contenu (sans effet hors tests).
+pub(crate) fn count_read(_path: &str, _kind: ReadKind) {
+    #[cfg(test)]
+    reads::record(_path, _kind);
+}
+
+#[cfg(test)]
+pub(crate) use reads::Kind as ReadKind;
+
+/// Sorte de lecture (sans effet hors tests).
+#[cfg(not(test))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReadKind {
+    Hash,
+    Extract,
+    Settings,
 }
 
 #[derive(Debug, Default)]
@@ -363,13 +499,18 @@ pub fn walk(root: &Path, matcher: &Matcher, jobs: usize) -> Result<WalkResult> {
 /// Lit `rel` sous `root` ; refuse (message d'avertissement) un fichier illisible ou non UTF-8.
 /// Critère unique de `scan` et de `diff::quick` (DEC-068).
 pub fn read_utf8(abs: &Path, rel: &str) -> std::result::Result<Vec<u8>, String> {
+    read_text(abs, rel).map(String::into_bytes)
+}
+
+/// Comme `read_utf8`, le contenu étant rendu en `String` (validée une seule fois, sans copie).
+pub fn read_text(abs: &Path, rel: &str) -> std::result::Result<String, String> {
     let bytes =
         std::fs::read(abs).map_err(|e| format!("{rel} ignoré : lecture impossible ({e})"))?;
-    if std::str::from_utf8(&bytes).is_err() {
-        return Err(format!("{rel} ignoré : fichier non UTF-8"));
-    }
-    Ok(bytes)
+    String::from_utf8(bytes).map_err(|_| format!("{rel} ignoré : fichier non UTF-8"))
 }
+
+/// Empreinte lue d'un fichier et son contenu retenu s'il tient dans le budget.
+type Hashed = std::result::Result<(String, Option<Retained>), String>;
 
 /// Fils d'empreintes lancés (diagnostic des tests, AC-072-2).
 #[cfg(test)]
@@ -379,28 +520,28 @@ pub(crate) static HASH_THREADS: std::sync::atomic::AtomicUsize =
 /// Lit et empreinte `files[i]` pour chaque `i` de `todo`, par min(`jobs`, n) fils qui prennent
 /// leurs indices dans une file partagée ; résultat à la position de `todo`. Avec `jobs` = 1 ou un
 /// seul fichier, lecture dans le fil appelant.
-fn hash_files(
-    files: &[WalkedFile],
-    todo: &[usize],
-    jobs: usize,
-) -> Vec<std::result::Result<String, String>> {
+fn hash_files(files: &[WalkedFile], todo: &[usize], jobs: usize, budget: usize) -> Vec<Hashed> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let work = || {
-        let mut out: Vec<(usize, std::result::Result<String, String>)> = Vec::new();
+        let mut out: Vec<(usize, Hashed)> = Vec::new();
         loop {
             let k = next.fetch_add(1, Ordering::SeqCst);
             let Some(&i) = todo.get(k) else { break };
             let f = &files[i];
+            count_read(&f.path, ReadKind::Hash);
             out.push((
                 k,
-                read_utf8(&f.abs, &f.path).map(|b| blake3::hash(&b).to_hex().to_string()),
+                read_text(&f.abs, &f.path).map(|text| {
+                    let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+                    (hash, Retained::reserve(text, budget).ok())
+                }),
             ));
         }
         out
     };
     let workers = jobs.min(todo.len());
-    let mut done: Vec<(usize, std::result::Result<String, String>)> = Vec::new();
+    let mut done: Vec<(usize, Hashed)> = Vec::new();
     if workers > 1 {
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
@@ -440,6 +581,17 @@ pub fn scan(
     matcher: &Matcher,
     jobs: usize,
 ) -> Result<ScanResult> {
+    scan_with_budget(root, known, matcher, jobs, RETAIN_BUDGET)
+}
+
+/// `scan` avec un budget de contenus retenus explicite (réglé par les tests seulement).
+pub(crate) fn scan_with_budget(
+    root: &Path,
+    known: &[FileRecord],
+    matcher: &Matcher,
+    jobs: usize,
+    budget: usize,
+) -> Result<ScanResult> {
     let walked = walk(root, matcher, jobs)?;
     let known: HashMap<&str, &FileRecord> = known.iter().map(|r| (r.path.as_str(), r)).collect();
     let mut res = ScanResult {
@@ -477,15 +629,14 @@ pub fn scan(
         .map(|f| reusable(&f.path, f.size, f.mtime))
         .collect();
     let to_read: Vec<usize> = (0..hashes.len()).filter(|&i| hashes[i].is_none()).collect();
-    let read = hash_files(&walked.files, &to_read, jobs);
-    let mut fresh: HashMap<usize, std::result::Result<String, String>> =
-        to_read.iter().copied().zip(read).collect();
+    let read = hash_files(&walked.files, &to_read, jobs, budget);
+    let mut fresh: HashMap<usize, Hashed> = to_read.iter().copied().zip(read).collect();
     let mut read_warnings: Vec<(String, String)> = Vec::new();
     for (i, f) in walked.files.into_iter().enumerate() {
-        let (hash, rehashed) = match hashes[i].take() {
-            Some(h) => (h, false),
+        let (hash, rehashed, content) = match hashes[i].take() {
+            Some(h) => (h, false, None),
             None => match fresh.remove(&i).expect("résultat de lecture") {
-                Ok(h) => (h, true),
+                Ok((h, c)) => (h, true, c),
                 Err(msg) => {
                     read_warnings.push((f.path, msg));
                     continue;
@@ -500,6 +651,7 @@ pub fn scan(
             module: None,
             abs: f.abs,
             rehashed,
+            content,
         });
     }
     read_warnings.sort();
@@ -528,9 +680,15 @@ pub fn scan(
             )
         })
         .map(|f| {
-            let name = std::fs::read_to_string(&f.abs)
-                .ok()
-                .and_then(|t| crate::parse::gradle::root_project_name(&t));
+            let name = match &f.content {
+                Some(c) => crate::parse::gradle::root_project_name(c.as_str()),
+                None => {
+                    count_read(&f.path, ReadKind::Settings);
+                    std::fs::read_to_string(&f.abs)
+                        .ok()
+                        .and_then(|t| crate::parse::gradle::root_project_name(&t))
+                }
+            };
             (
                 f.path.rsplit_once('/').map_or("", |(d, _)| d).to_string(),
                 name,
@@ -762,6 +920,7 @@ mod tests {
                 module: None,
                 abs,
                 rehashed,
+                content: None,
             });
         }
         res.files.sort_by(|a, b| a.path.cmp(&b.path));

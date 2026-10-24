@@ -87,7 +87,7 @@ pub fn update(
 ) -> Result<Option<BuildReport>> {
     build::check_repo(repo)?;
     let mut store = Store::open_existing(repo)?;
-    let d = diff::compute(repo, &store, matcher, opts.jobs)?;
+    let mut d = diff::compute(repo, &store, matcher, opts.jobs)?;
     trace!(
         "parcours: {} ajoutés, {} modifiés, {} supprimés, {} en attente{}",
         d.paths(Change::Added).count(),
@@ -145,16 +145,17 @@ pub fn update(
         .filter(|c| c.change != Change::Deleted)
         .map(|c| c.path.as_str())
         .collect();
-    let todo: Vec<ScannedFile> = d
-        .scanned
-        .iter()
+    let abs = build::abs_paths(&d.scanned);
+    // Les fichiers à analyser sont déplacés (contenu retenu compris) ; les autres sont libérés,
+    // avec leur contenu, avant l'analyse (REQ-073).
+    let todo: Vec<ScannedFile> = std::mem::take(&mut d.scanned)
+        .into_iter()
         .filter(|f| {
             changed.contains(f.path.as_str())
                 || settings_dirs
                     .iter()
                     .any(|dir| is_build_script_under(&f.path, dir))
         })
-        .cloned()
         .collect();
     // Nouveaux et modifiés passent « en attente » (empreinte à jour) jusqu'à leur analyse :
     // un échec ou une interruption les laisse repérables par le prochain update.
@@ -167,13 +168,12 @@ pub fn update(
     };
     structure::analyze(
         repo,
-        &todo,
+        todo,
         opts.jobs,
         &d.gradle_settings,
         &mut store,
         &mut report,
     )?;
-    let abs = build::abs_paths(&d.scanned);
     build::finalize(&mut store, llm, opts, repo, &abs, &mut report)?;
     Ok(Some(report))
 }

@@ -299,6 +299,18 @@ pub fn build(
     _lock: &RepoLock,
     matcher: &Matcher,
 ) -> Result<BuildReport> {
+    build_with_budget(repo, opts, llm, _lock, matcher, scan::RETAIN_BUDGET)
+}
+
+/// `build` avec un budget de contenus retenus explicite (réglé par les tests seulement).
+pub(crate) fn build_with_budget(
+    repo: &Path,
+    opts: &IndexOptions,
+    llm: Option<&dyn Llm>,
+    _lock: &RepoLock,
+    matcher: &Matcher,
+    budget: usize,
+) -> Result<BuildReport> {
     check_repo(repo)?;
     let mut store = Store::open_or_create(repo)?;
     let known = if db_path(repo).is_file() {
@@ -306,7 +318,7 @@ pub fn build(
     } else {
         Vec::new()
     };
-    let scanned = scan::scan(repo, &known, matcher, opts.jobs)?;
+    let scanned = scan::scan_with_budget(repo, &known, matcher, opts.jobs, budget)?;
     let records: Vec<FileRecord> = scanned
         .files
         .iter()
@@ -337,15 +349,15 @@ pub fn build(
         excluded: matcher.is_active().then_some(scanned.excluded),
         ..BuildReport::default()
     };
+    let abs = abs_paths(&scanned.files);
     structure::analyze(
         repo,
-        &scanned.files,
+        scanned.files,
         opts.jobs,
         &scanned.gradle_settings,
         &mut store,
         &mut report,
     )?;
-    let abs = abs_paths(&scanned.files);
     finalize(&mut store, llm, opts, repo, &abs, &mut report)?;
     Ok(report)
 }
@@ -389,4 +401,231 @@ pub(crate) fn finalize(
         .count();
     report.to_enrich = store.count_files_to_enrich()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::reads;
+    use std::sync::atomic::Ordering;
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            let dest = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &dest);
+            } else {
+                std::fs::copy(e.path(), dest).unwrap();
+            }
+        }
+    }
+
+    fn fixture(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(rel)
+    }
+
+    /// Export normalisé (DEC-081) : `unresolved` trié, doublons conservés.
+    fn normalized_export(repo: &Path) -> String {
+        let store = Store::open_readonly(repo).unwrap();
+        let mut doc = crate::export::build_json(&store).unwrap();
+        if let Some(list) = doc.get_mut("unresolved").and_then(|u| u.as_array_mut()) {
+            let key = |v: &serde_json::Value| {
+                let f = |k: &str| v.get(k).map(|x| x.to_string()).unwrap_or_default();
+                (f("source"), f("kind"), f("target"))
+            };
+            list.sort_by_key(key);
+        }
+        serde_json::to_string(&doc).unwrap()
+    }
+
+    fn indexed_paths(repo: &Path) -> Vec<String> {
+        let store = Store::open_readonly(repo).unwrap();
+        store.files().unwrap().into_iter().map(|f| f.path).collect()
+    }
+
+    fn do_build(repo: &Path, budget: usize) -> BuildReport {
+        let lock = RepoLock::acquire(repo).unwrap();
+        build_with_budget(
+            repo,
+            &IndexOptions::default(),
+            None,
+            &lock,
+            &Matcher::none(),
+            budget,
+        )
+        .unwrap()
+    }
+
+    fn do_update(repo: &Path) {
+        let lock = RepoLock::acquire(repo).unwrap();
+        crate::index::update::update(
+            repo,
+            &IndexOptions::default(),
+            None,
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap();
+    }
+
+    /// AC-073-1 : chaque fichier pris en charge est lu une fois ; graphe identique à celui d'un
+    /// budget nul (aucun contenu retenu : deux lectures par fichier).
+    #[test]
+    fn req073_ac1_each_file_read_once_same_graph_as_zero_budget() {
+        for rel in ["maven3/repo", "gradle/groovy", "js/mixed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let one = dir.path().join("one");
+            let zero = dir.path().join("zero");
+            copy_dir(&fixture(rel), &one);
+            copy_dir(&fixture(rel), &zero);
+
+            reads::reset();
+            do_build(&one, scan::RETAIN_BUDGET);
+            let paths = indexed_paths(&one);
+            assert!(!paths.is_empty(), "{rel}");
+            let got = reads::all();
+            for p in &paths {
+                assert_eq!(got.get(p), Some(&1), "{rel} : {p} lu {:?} fois", got.get(p));
+            }
+            assert_eq!(reads::kind(reads::Kind::Extract), 0, "{rel}");
+            assert_eq!(reads::kind(reads::Kind::Settings), 0, "{rel}");
+
+            reads::reset();
+            do_build(&zero, 0);
+            let got0 = reads::all();
+            for p in &paths {
+                assert!(got0.get(p).copied().unwrap_or(0) >= 2, "{rel} : {p}");
+            }
+            assert_eq!(normalized_export(&one), normalized_export(&zero), "{rel}");
+        }
+    }
+
+    /// AC-073-2 : second build puis update.
+    #[test]
+    fn req073_ac2_second_build_and_update_read_each_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        copy_dir(&fixture("maven3/repo"), &repo);
+        do_build(&repo, scan::RETAIN_BUDGET);
+        let paths = indexed_paths(&repo);
+
+        reads::reset();
+        do_build(&repo, scan::RETAIN_BUDGET);
+        let got = reads::all();
+        for p in &paths {
+            assert_eq!(got.get(p), Some(&1), "second build : {p}");
+        }
+
+        let java = paths.iter().find(|p| p.ends_with(".java")).unwrap().clone();
+        let mut text = std::fs::read_to_string(repo.join(&java)).unwrap();
+        text.push_str("\n// modifié\n");
+        std::fs::write(repo.join(&java), text).unwrap();
+        std::fs::write(repo.join("G.java"), "package p;\npublic class G {}\n").unwrap();
+        reads::reset();
+        do_update(&repo);
+        let got = reads::all();
+        assert_eq!(got.get(&java), Some(&1), "fichier modifié");
+        assert_eq!(got.get("G.java"), Some(&1), "fichier ajouté");
+        for (p, n) in &got {
+            assert!(*n <= 1, "{p} lu {n} fois");
+        }
+    }
+
+    /// AC-073-3 : budget de 1 000 octets, 5 fichiers de 400 octets.
+    #[test]
+    fn req073_ac3_budget_bounds_retained_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small");
+        let big = dir.path().join("big");
+        for r in [&small, &big] {
+            std::fs::create_dir_all(r).unwrap();
+            for i in 0..5 {
+                let mut t = format!("# Titre {i}\n\n");
+                while t.len() < 399 {
+                    t.push('x');
+                }
+                t.push('\n');
+                assert_eq!(t.len(), 400);
+                std::fs::write(r.join(format!("d{i}.md")), t).unwrap();
+            }
+        }
+        reads::reset();
+        scan::RETAINED_PEAK.store(0, Ordering::SeqCst);
+        do_build(&small, 1_000);
+        let peak = scan::RETAINED_PEAK.load(Ordering::SeqCst);
+        assert!(peak > 0 && peak <= 1_000, "pic {peak}");
+        assert_eq!(reads::kind(reads::Kind::Hash), 5);
+        assert_eq!(reads::kind(reads::Kind::Extract), 3);
+        do_build(&big, scan::RETAIN_BUDGET);
+        assert_eq!(normalized_export(&small), normalized_export(&big));
+    }
+
+    /// AC-073-4 : contenu réécrit (même taille) entre `scan` et `analyze`.
+    #[test]
+    fn req073_ac4_analysis_uses_the_content_of_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let before = "package p;\npublic class A {}\n";
+        let after = "package p;\npublic class B {}\n";
+        assert_eq!(before.len(), after.len());
+        std::fs::write(repo.join("A.java"), before).unwrap();
+        let scanned = scan::scan(repo, &[], &Matcher::none(), 1).unwrap();
+        let mut store = Store::open_or_create(repo).unwrap();
+        let records: Vec<FileRecord> = scanned
+            .files
+            .iter()
+            .map(|f| FileRecord {
+                path: f.path.clone(),
+                hash: f.hash.clone(),
+                size: f.size,
+                mtime: f.mtime,
+                recorded_at: 0,
+                state: FileState::Pending,
+            })
+            .collect();
+        store.reset_with_pending_files(&records).unwrap();
+        std::fs::write(repo.join("A.java"), after).unwrap();
+        let mut report = BuildReport::default();
+        structure::analyze(
+            repo,
+            scanned.files,
+            1,
+            &scanned.gradle_settings,
+            &mut store,
+            &mut report,
+        )
+        .unwrap();
+        let ids: Vec<String> = store.nodes().unwrap().into_iter().map(|n| n.id).collect();
+        assert!(ids.contains(&"type:p.A".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"type:p.B".to_string()), "{ids:?}");
+        let rec = store.files().unwrap().remove(0);
+        assert_eq!(
+            rec.hash,
+            blake3::hash(before.as_bytes()).to_hex().to_string()
+        );
+        drop(store);
+
+        // Changement de date : l'update suivant analyse le nouvel état.
+        let f = std::fs::File::options()
+            .write(true)
+            .open(repo.join("A.java"))
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        drop(f);
+        do_update(repo);
+        let store = Store::open_readonly(repo).unwrap();
+        let ids: Vec<String> = store.nodes().unwrap().into_iter().map(|n| n.id).collect();
+        assert!(ids.contains(&"type:p.B".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"type:p.A".to_string()), "{ids:?}");
+        let rec = store.files().unwrap().remove(0);
+        assert_eq!(
+            rec.hash,
+            blake3::hash(after.as_bytes()).to_hex().to_string()
+        );
+    }
 }
