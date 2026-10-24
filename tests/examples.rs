@@ -728,7 +728,7 @@ fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
     assert!(line.contains("0.17"));
     let at = |needle: &str| readme.find(needle).unwrap();
     assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.23.1", "git tag v0.23.1 && git push origin v0.23.1"] {
+    for needle in ["V=v0.23.2", "git tag v0.23.2 && git push origin v0.23.2"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
     assert!(!readme.contains("0.17.6"));
@@ -936,8 +936,8 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
         "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
         "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.23.1 ",
-        "git tag v0.23.1 && git push origin v0.23.1",
+        "V=v0.23.2 ",
+        "git tag v0.23.2 && git push origin v0.23.2",
     ] {
         assert!(readme.contains(expected), "absent : {expected}");
     }
@@ -1235,4 +1235,17 @@ fn REQ071_AC11_readme_option_jobs() {
     let i23 = lines.iter().position(|l| l == row).unwrap();
     assert!(lines[i23 + 1].starts_with("| 0.22 |"));
     assert!(!readme.contains("Appels simultanés |"));
+}
+
+#[test]
+fn req076_ac2_readme_prerequis_rust_1_99() {
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .unwrap();
+    let expected = "Prérequis : Rust 1.99 ou plus récent (`cargo`). Aucune dépendance système : SQLite est intégré au binaire.";
+    assert!(
+        readme.lines().any(|l| l == expected),
+        "ligne absente : {expected}"
+    );
+    assert!(!readme.contains("une chaîne Rust stable récente"));
 }

@@ -76,17 +76,11 @@ impl Retained {
         if budget == 0 {
             return Err(text);
         }
-        // Boucle explicite plutôt que l'ancienne API de mise à jour (dépréciée en 1.99) ou sa
-        // remplaçante (absente de la 1.98).
-        let mut cur = RETAINED.load(Ordering::SeqCst);
-        let _prev = loop {
-            let Some(new) = cur.checked_add(len).filter(|n| *n <= budget) else {
-                return Err(text);
-            };
-            match RETAINED.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(p) => break p,
-                Err(actual) => cur = actual,
-            }
+        // Réservation atomique : refusée si elle déborde ou dépasse le budget.
+        let Ok(_prev) = RETAINED.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+            cur.checked_add(len).filter(|n| *n <= budget)
+        }) else {
+            return Err(text);
         };
         #[cfg(test)]
         RETAINED_PEAK.fetch_max(_prev + len, Ordering::SeqCst);

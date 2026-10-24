@@ -1,5 +1,5 @@
 //! Performances sur 10 000 fichiers (REQ-021) et sur un dépôt JS/TS de 3 000 fichiers. Tests `#[ignore]` à lancer en release :
-//! `cargo test --release -q --color never -- --ignored perf`.
+//! `cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf`.
 
 #[path = "support/gen_js.rs"]
 mod gen_js;
@@ -53,6 +53,27 @@ fn serial() -> MutexGuard<'static, ()> {
     M.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Antidate de 10 s tous les fichiers de `dir` : hors de la fenêtre « racy », leurs empreintes
+/// sont réutilisables dès le premier `build`, sans attente réelle.
+fn backdate(dir: &std::path::Path) {
+    let t = std::time::SystemTime::now() - Duration::from_secs(10);
+    fn walk(dir: &std::path::Path, times: std::fs::FileTimes) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            let ty = std::fs::symlink_metadata(&p).unwrap().file_type();
+            if ty.is_dir() {
+                walk(&p, times);
+            } else if ty.is_file() {
+                std::fs::set_times(&p, times).unwrap();
+            }
+        }
+    }
+    walk(
+        dir,
+        std::fs::FileTimes::new().set_modified(t).set_accessed(t),
+    );
+}
+
 /// Dépôt indexé une seule fois pour tous les tests. Il vit sous `target/` (jamais dans
 /// `/tmp`) et est supprimé puis régénéré à chaque lancement.
 fn fixture() -> &'static Fixture {
@@ -64,6 +85,7 @@ fn fixture() -> &'static Fixture {
         let repo = root.join("repo");
         let mock = root.join("mock");
         gen_repo::generate(&repo, &mock);
+        backdate(&repo);
         let config = root.join("config.toml");
         std::fs::write(
             &config,
@@ -76,8 +98,6 @@ fn fixture() -> &'static Fixture {
             "build : {d:?} ; {}",
             String::from_utf8_lossy(&out.stdout).trim()
         );
-        // Laisse passer la fenêtre « racy » pour que les empreintes soient réutilisables.
-        std::thread::sleep(Duration::from_millis(2_100));
         timed(&f, &["update"]);
         f
     })
@@ -435,6 +455,7 @@ fn js_fixture() -> Fixture {
     let repo = root.join("repo");
     let mock = root.join("mock");
     gen_js::generate(&repo, &mock);
+    backdate(&repo);
     let config = root.join("config.toml");
     std::fs::write(
         &config,
@@ -460,9 +481,8 @@ fn perf_req021_ac7_js_ts() {
     let name = gen_js::class_name(gen_js::EDITED);
     let (_, found) = timed(&f, &["query", "search", &name]);
     assert!(String::from_utf8_lossy(&found.stdout).contains(&name));
-    // Enrichissement initial (LLM simulé), puis fenêtre « racy ».
+    // Enrichissement initial (LLM simulé).
     timed(&f, &["build"]);
-    std::thread::sleep(Duration::from_millis(2_100));
     timed(&f, &["update"]);
     let path = f.repo.join(gen_js::path(gen_js::EDITED));
     assert!(path.to_string_lossy().ends_with(".ts"));
@@ -728,14 +748,13 @@ fn perf_req066_ac6_resolution_incrementale() {
             gen_js::generate(&repo, &mock);
             gen_js::path(gen_js::EDITED)
         };
+        backdate(&repo);
         let config = root.join("config.toml");
         std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
         let f = Fixture { repo, config, mock };
         let (_, built) = timed(&f, &["build", "--no-llm", "--verbose"]);
         let build_ms = resolution_ms(&built);
         assert_eq!(build_ms.len(), 1, "{name} : lignes résolution du build");
-        // Laisse passer la fenêtre « racy » avant la modification.
-        std::thread::sleep(Duration::from_millis(2_100));
         let path = f.repo.join(edited);
         let text = std::fs::read_to_string(&path).unwrap();
         let extra = if name == "gen_repo" {
