@@ -560,4 +560,85 @@ mod tests {
         let store = Store::open_readonly(repo).unwrap();
         assert!(store.nodes().unwrap().iter().any(|n| n.id == "type:p.B"));
     }
+
+    fn write_mixed_repo(repo: &Path) {
+        for i in 0..30 {
+            std::fs::write(
+                repo.join(format!("J{i}.java")),
+                format!("package p;\nimport q.D{i};\npublic class J{i} extends D{i} {{ void m() {{ J{}.go(); }} }}\n", (i + 1) % 30),
+            )
+            .unwrap();
+            std::fs::write(
+                repo.join(format!("t{i}.ts")),
+                format!(
+                    "import {{ x }} from './t{}';\nexport class T{i} {{ run() {{ x(); }} }}\n",
+                    (i + 1) % 30
+                ),
+            )
+            .unwrap();
+        }
+        for i in 0..8 {
+            std::fs::write(
+                repo.join(format!("K{i}.kt")),
+                format!("package k\nclass K{i} {{ fun f() = K{}() }}\n", (i + 1) % 8),
+            )
+            .unwrap();
+        }
+        for d in ["a", "b"] {
+            std::fs::create_dir(repo.join(d)).unwrap();
+            std::fs::write(
+                repo.join(d).join("build.gradle.kts"),
+                "plugins { kotlin(\"jvm\") }\ndependencies { implementation(\"x:y:1\") }\n",
+            )
+            .unwrap();
+        }
+    }
+
+    /// Analyse le dépôt mixte avec `jobs` fils ; rend (parsers créés, tables).
+    fn analyze_mixed(jobs: usize, fresh: bool) -> (usize, Vec<(String, Vec<String>)>) {
+        use crate::parse::lang::PARSERS_CREATED;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        write_mixed_repo(repo);
+        let scanned = crate::scan::scan(repo, &[], &crate::filter::Matcher::none(), 1).unwrap();
+        assert_eq!(scanned.files.len(), 70);
+        let mut store = Store::open_or_create(repo).unwrap();
+        store
+            .reset_with_pending_files(&pending_records(&scanned.files))
+            .unwrap();
+        crate::parse::lang::tests::FORCE_FRESH.store(fresh, Ordering::SeqCst);
+        PARSERS_CREATED.store(0, Ordering::SeqCst);
+        let mut report = BuildReport::default();
+        let r = analyze(
+            repo,
+            scanned.files,
+            jobs,
+            &scanned.gradle_settings,
+            &mut store,
+            &mut report,
+        );
+        crate::parse::lang::tests::FORCE_FRESH.store(false, Ordering::SeqCst);
+        r.unwrap();
+        let created = PARSERS_CREATED.load(Ordering::SeqCst);
+        resolve(&mut store, repo);
+        drop(store);
+        (created, dump(repo))
+    }
+
+    /// AC-078-1 : au plus un parser par fil et par grammaire ; graphe identique à celui d'un
+    /// parser neuf par fichier.
+    #[test]
+    fn req078_ac1_un_parser_par_fil_et_par_grammaire() {
+        let (created, tables) = analyze_mixed(3, false);
+        assert!((3..=9).contains(&created), "{created} parsers créés");
+        let (created1, tables1) = analyze_mixed(1, false);
+        assert_eq!(created1, 3);
+        let (fresh_created, oracle) = analyze_mixed(3, true);
+        assert_eq!(fresh_created, 0, "le crochet contourne le cache");
+        assert!(oracle
+            .iter()
+            .any(|(n, rows)| n == "nodes" && rows.len() > 60));
+        assert_eq!(tables, oracle);
+        assert_eq!(tables1, oracle);
+    }
 }

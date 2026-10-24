@@ -87,24 +87,186 @@ impl Lang {
         matches!(self, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
     }
 
-    /// Analyse `text` ; l'arbre est tolérant aux erreurs (nœuds `ERROR`/manquants).
+    /// Case du cache de parsers (une par grammaire ; les scripts Gradle partagent celle de leur langage).
+    fn grammar_slot(self) -> Option<usize> {
+        match self {
+            Lang::Java => Some(0),
+            Lang::Kotlin | Lang::KotlinGradle => Some(1),
+            Lang::Scala => Some(2),
+            Lang::Groovy | Lang::GroovyGradle => Some(3),
+            Lang::JavaScript => Some(4),
+            Lang::TypeScript => Some(5),
+            Lang::Tsx => Some(6),
+            Lang::Xml
+            | Lang::PackageJson
+            | Lang::Markdown
+            | Lang::Sql
+            | Lang::DataXml
+            | Lang::Json
+            | Lang::Yaml => None,
+        }
+    }
+
+    /// Analyse `text` ; l'arbre est tolérant aux erreurs (nœuds `ERROR`/manquants). Le parser est
+    /// pris dans un cache propre au fil, un par grammaire (DEC-090) ; l'analyse est toujours complète.
     pub fn parse(self, text: &str) -> Result<tree_sitter::Tree> {
-        let grammar = self
+        #[cfg(test)]
+        if tests::FORCE_FRESH.load(std::sync::atomic::Ordering::SeqCst) {
+            return tests::parse_fresh(self, text);
+        }
+        let (grammar, slot) = self
             .grammar()
+            .zip(self.grammar_slot())
             .ok_or_else(|| Error::Message(format!("{self:?} n'a pas de grammaire tree-sitter")))?;
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&grammar)
-            .map_err(|e| Error::Message(format!("grammaire {self:?} incompatible : {e}")))?;
-        parser
-            .parse(text, None)
-            .ok_or_else(|| Error::Message(format!("analyse {self:?} interrompue")))
+        PARSERS.with(|cell| {
+            let mut parsers = cell.borrow_mut();
+            if parsers[slot].is_none() {
+                let mut parser = tree_sitter::Parser::new();
+                parser.set_language(&grammar).map_err(|e| {
+                    Error::Message(format!("grammaire {self:?} incompatible : {e}"))
+                })?;
+                #[cfg(test)]
+                PARSERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                parsers[slot] = Some(parser);
+            }
+            let parser = parsers[slot].as_mut().expect("parser créé ci-dessus");
+            let tree = parser.parse(text, None);
+            if tree.is_none() {
+                parser.reset();
+            }
+            tree.ok_or_else(|| Error::Message(format!("analyse {self:?} interrompue")))
+        })
     }
 }
 
+thread_local! {
+    /// Parsers du fil courant, un par grammaire, créés au premier usage (REQ-078).
+    static PARSERS: std::cell::RefCell<[Option<tree_sitter::Parser>; 7]> =
+        const { std::cell::RefCell::new([None, None, None, None, None, None, None]) };
+}
+
+/// Compteur de diagnostic : parsers créés, tous fils confondus (tests seulement).
 #[cfg(test)]
-mod tests {
+pub(crate) static PARSERS_CREATED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// Crochet de test : `Lang::parse` crée un parser neuf par appel (oracle de la 0.23.2).
+    pub(crate) static FORCE_FRESH: AtomicBool = AtomicBool::new(false);
+
+    /// Implémentation de la 0.23.2 : un parser neuf par appel.
+    pub(crate) fn parse_fresh(lang: Lang, text: &str) -> Result<tree_sitter::Tree> {
+        let grammar = lang
+            .grammar()
+            .ok_or_else(|| Error::Message(format!("{lang:?} n'a pas de grammaire tree-sitter")))?;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&grammar)
+            .map_err(|e| Error::Message(format!("grammaire {lang:?} incompatible : {e}")))?;
+        parser
+            .parse(text, None)
+            .ok_or_else(|| Error::Message(format!("analyse {lang:?} interrompue")))
+    }
+
+    fn sample_texts() -> Vec<(Lang, String)> {
+        let mut v = vec![
+            (
+                Lang::Java,
+                "package p;\npublic class A { void m() { b(); } }\n".to_string(),
+            ),
+            (
+                Lang::Java,
+                "package p; class { void ( ;;; }}}\n".to_string(),
+            ),
+            (
+                Lang::Groovy,
+                "class G { def f() { println 'x' } }\n".to_string(),
+            ),
+            (
+                Lang::GroovyGradle,
+                "plugins { id 'java' }\ndependencies { implementation 'a:b:1' }\n".to_string(),
+            ),
+            (Lang::Groovy, "def x = [1, 2,\nclass {{{ ))\n".to_string()),
+            (
+                Lang::Tsx,
+                "export const A = () => <div>{x}</div>;\n".to_string(),
+            ),
+            (Lang::Tsx, "const = <div <<< >>> {{ ;\n".to_string()),
+            (Lang::Java, String::new()),
+            (Lang::Tsx, String::new()),
+            (Lang::Groovy, String::new()),
+        ];
+        let mut big = String::from("package p;\npublic class Big {\n");
+        let mut i = 0;
+        while big.len() < 1_000_000 {
+            big.push_str(&format!("  void m{i}() {{ n{i}(); }}\n"));
+            i += 1;
+        }
+        big.push_str("}\n");
+        v.push((Lang::Java, big));
+        v.push((
+            Lang::Groovy,
+            "class G { def f() { println 'y' } }\n".to_string(),
+        ));
+        v.push((Lang::Tsx, "let a: number = ;\n".to_string()));
+        v
+    }
+
+    fn check_suite(texts: &[(Lang, String)]) {
+        for round in 0..2 {
+            for (lang, text) in texts {
+                let a = lang.parse(text).unwrap().root_node().to_sexp();
+                let b = parse_fresh(*lang, text).unwrap().root_node().to_sexp();
+                assert_eq!(a, b, "{lang:?} tour {round} ({} octets)", text.len());
+            }
+        }
+    }
+
+    /// AC-078-2 : sur un même fil, suite alternée ; puis sur 4 fils en parallèle.
+    #[test]
+    fn req078_ac2_arbres_identiques_a_un_parser_neuf() {
+        let texts = sample_texts();
+        check_suite(&texts);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                std::thread::Builder::new()
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn_scoped(s, || check_suite(&texts))
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn req078_grammaires_partagees_par_les_scripts_gradle() {
+        assert_eq!(
+            Lang::Kotlin.grammar_slot(),
+            Lang::KotlinGradle.grammar_slot()
+        );
+        assert_eq!(
+            Lang::Groovy.grammar_slot(),
+            Lang::GroovyGradle.grammar_slot()
+        );
+        assert_eq!(Lang::Json.grammar_slot(), None);
+        let slots: std::collections::HashSet<_> = [
+            Lang::Java,
+            Lang::Kotlin,
+            Lang::Scala,
+            Lang::Groovy,
+            Lang::JavaScript,
+            Lang::TypeScript,
+            Lang::Tsx,
+        ]
+        .iter()
+        .map(|l| l.grammar_slot().unwrap())
+        .collect();
+        assert_eq!(slots.len(), 7);
+        assert!(Lang::Json.parse("{}").is_err());
+    }
 
     fn l(p: &str) -> Option<Lang> {
         Lang::from_path(Path::new(p))
