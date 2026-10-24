@@ -449,7 +449,7 @@ Le slug est le nom du dossier analysé en minuscules ASCII. Chaque suite de cara
 
 **Format JSON** : objet avec `version`, `nodes`, `edges` et `unresolved`.
 
-Le document est écrit au fil de la lecture du graphe, sans le charger en mémoire. Si l'export échoue en cours de route (disque plein, sortie fermée par le lecteur), la commande s'arrête sur une ligne erreur: et un code non nul : le fichier commencé est supprimé, y compris un export précédent du même nom, et avec --output - stdout peut contenir un début de document. Seul le code de sortie 0 garantit un document complet.
+Le document est écrit au fil de la lecture du graphe, sans le charger en mémoire. Si l'export échoue en cours de route (disque plein, sortie fermée par le lecteur), la commande s'arrête sur une ligne erreur: et un code non nul : le fichier commencé est supprimé, y compris un export précédent du même nom, et avec --output - stdout peut contenir un début de document. Seul le code de sortie 0 garantit un document complet. Avec --output <fichier>, si seule la ligne du chemin ne peut être écrite sur stdout, le fichier, complet, est gardé, avec la même erreur et le code 1.
 
 **Page HTML** : fichier unique, CSS et JS embarqués, sans aucune ressource externe ni requête réseau. Elle s'ouvre en `file://`. Elle n'affiche jamais tout le graphe, mais une vue partielle que l'on étend :
 
@@ -698,6 +698,8 @@ Les références qui ne trouvent pas de cible sont comptées dans « référence
 
 Les messages sont écrits sur stderr, préfixés `erreur:` ou `avertissement:`. stdout ne contient que le résultat.
 
+Si stdout est fermée avant la fin de la sortie (lecteur arrêté, | head), toute commande s'arrête sur une seule ligne erreur: écriture sur stdout impossible : <cause> et le code 1, sans rien écrire de plus. build et update ont déjà enregistré le graphe : seul leur bilan manque, et nephila status donne l'état. Une commande qui n'avait rien à écrire sur stdout garde son propre message.
+
 ## Usage par un agent
 
 Les sorties `--json` sont stables et sans décoration. Séquence type :
@@ -742,7 +744,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
-| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit. Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe. Nouveautés : déduplications linéaires, un parser par fil, export en flux sans nouvelle résolution, profil release optimisé, banc de performance. |
+| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit. Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe. Nouveautés : déduplications linéaires, un parser par fil, export en flux sans nouvelle résolution, profil release optimisé, banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. |
 | 0.23 | Option --jobs de build et update : nombre de fils du parcours du dépôt et de l'extraction, par défaut le nombre de cœurs disponibles ; concurrency ne règle plus que les appels LLM. Parcours du dépôt et empreintes en parallèle, fichier lu une seule fois pour son empreinte et son analyse, écriture SQLite allégée, même graphe qu'en 0.22 quel que soit le nombre de fils. |
 | 0.22 | Mise à jour incrémentale : `update` ne résout plus que les références touchées par les fichiers changés et ne relit plus toute la table des liens ; résumé global calculé sans relire le graphe ; une seule résolution complète par commande avec LLM. Même graphe qu'en 0.21 ; le schéma 8 est migré sur place. |
 | 0.21 | Stockage SQLite allégé : contexte d'imports stocké une fois par fichier, index inutiles retirés, cache SQLite agrandi à chaque ouverture en écriture, écritures regroupées, build neuf sans recalcul répété des nœuds. Même graphe qu'en 0.20 ; le schéma 7 est migré sur place. |

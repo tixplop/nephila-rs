@@ -1409,3 +1409,25 @@ fn REQ082_AC4_readme_commande_du_banc_et_lignes_banc() {
         assert!(sec.contains(needle), "lecture des lignes banc : {needle}");
     }
 }
+
+#[test]
+fn REQ086_AC5_readme_sortie_standard_fermee() {
+    let readme = repo_file("README.md");
+    let codes = readme_section(&readme, "## Codes de sortie");
+    let prev = "stdout ne contient que le résultat.";
+    let para = "Si stdout est fermée avant la fin de la sortie (lecteur arrêté, | head), toute commande s'arrête sur une seule ligne erreur: écriture sur stdout impossible : <cause> et le code 1, sans rien écrire de plus. build et update ont déjà enregistré le graphe : seul leur bilan manque, et nephila status donne l'état. Une commande qui n'avait rien à écrire sur stdout garde son propre message.";
+    let a = codes.find(prev).expect("phrase précédente");
+    let b = codes.find(para).expect("paragraphe de la sortie fermée");
+    assert_eq!(codes[a + prev.len()..b].trim(), "");
+
+    let export = readme_section(&readme, "## Export et vue HTML");
+    assert!(export.contains("Seul le code de sortie 0 garantit un document complet. Avec --output <fichier>, si seule la ligne du chemin ne peut être écrite sur stdout, le fichier, complet, est gardé, avec la même erreur et le code 1."));
+
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| 0.24 |"))
+        .expect("ligne 0.24");
+    assert!(row.starts_with("| 0.24 | Rupture : "));
+    assert!(row.ends_with("banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. |"));
+    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
+}
