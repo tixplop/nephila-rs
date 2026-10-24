@@ -34,13 +34,26 @@ pub struct Resolution {
 
 /// Recalcule tous les liens du graphe à partir des nœuds et des références.
 pub fn resolve(store: &mut Store) -> Result<ResolveStats> {
-    let r = compute_from(store)?;
-    // Dépendances dérivées, liens et résumé global : une seule transaction (DEC-074).
-    store.write_resolution(&r.dependencies, &r.edges, crate::summary::compute_stamped)?;
+    let refs = store.file_refs()?;
+    let r = compute(
+        &store.nodes()?,
+        &refs,
+        &store.file_contexts()?,
+        &store.declarations()?,
+    );
+    let unresolved: Vec<i64> = r.unresolved.iter().map(|&i| refs[i].id).collect();
+    // Dépendances dérivées, liens, statut des références, résumé global et marqueur : une seule
+    // transaction (DEC-074, DEC-076).
+    store.write_resolution(
+        &r.dependencies,
+        &r.edges,
+        &unresolved,
+        crate::summary::compute_stamped,
+    )?;
     // Les liens sont dédupliqués par la clé primaire : on compte ce qui est stocké.
     Ok(ResolveStats {
         edges: store.count_edges()?,
-        unresolved: r.unresolved.len(),
+        unresolved: store.count_unresolved()?,
     })
 }
 
@@ -74,6 +87,7 @@ fn materialize_unresolved(
         .collect()
 }
 
+#[cfg(test)]
 fn compute_from(store: &Store) -> Result<Resolution> {
     Ok(compute(
         &store.nodes()?,
@@ -178,6 +192,15 @@ impl<'a> Index<'a> {
 }
 
 const SEPARATORS: [char; 5] = ['.', '/', '#', ':', '\\'];
+
+/// Clé et tête d'un nom visé par une référence (DEC-076), seule définition : la clé est le
+/// dernier segment du nom (séparateurs de `SEPARATORS`), la tête le texte qui précède le premier
+/// `.` quand le nom en contient un. Le nom est d'abord débarrassé de ses espaces de bord.
+pub fn name_keys(name: &str) -> (String, Option<String>) {
+    let name = name.trim();
+    let head = name.find('.').map(|i| name[..i].to_string());
+    (last_segment(name).to_string(), head)
+}
 
 fn last_segment(q: &str) -> &str {
     q.rsplit(SEPARATORS).next().unwrap_or(q)
@@ -1473,6 +1496,7 @@ mod tests {
         let mut nodes = vec![source];
         nodes.extend(others);
         let refs = vec![FileRef {
+            id: 1,
             r: rf(&src_id, EdgeKind::Calls, target, None),
             origin: RefOrigin::Parse,
             file: "S".into(),

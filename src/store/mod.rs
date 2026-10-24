@@ -20,7 +20,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -28,6 +28,14 @@ const SCHEMA_WITHOUT_REV: i32 = 5;
 /// Dernier schéma avec `refs.context`, `AUTOINCREMENT` et les index allégés au schéma 7, migré
 /// sur place (DEC-073).
 const SCHEMA_WITH_REF_CONTEXT: i32 = 6;
+
+/// Dernier schéma sans clé, tête ni statut des références ni marqueur `meta.resolution`, migré
+/// sur place (DEC-076).
+const SCHEMA_WITH_FILE_CONTEXTS: i32 = 7;
+
+/// Valeurs de `meta.resolution` (DEC-076) : le graphe est-il le résultat d'une passe terminée ?
+const RESOLUTION_DONE: &str = "à jour";
+const RESOLUTION_PENDING: &str = "à résoudre";
 
 /// Références du schéma 7 : le contexte d'une référence d'analyse est celui de son fichier.
 const REFS_SQL: &str = "SELECT r.source, r.kind, r.target_name,
@@ -38,7 +46,8 @@ const REFS_LEGACY_SQL: &str =
     "SELECT source, kind, target_name, context, origin FROM refs ORDER BY id";
 
 /// Références avec fichier et origine, sans contexte (REQ-063).
-const FILE_REFS_SQL: &str = "SELECT source, kind, target_name, origin, file FROM refs ORDER BY id";
+const FILE_REFS_SQL: &str =
+    "SELECT id, source, kind, target_name, origin, file FROM refs ORDER BY id";
 /// Contextes d'imports par fichier du schéma 7.
 const FILE_CONTEXTS_SQL: &str = "SELECT file, context FROM file_contexts";
 /// Contextes des schémas 5 et 6, regroupés par fichier (lecture seule).
@@ -49,6 +58,8 @@ const FILE_CONTEXTS_LEGACY_SQL: &str = "SELECT file, min(context) FROM refs
 /// (`Store::file_contexts`), une fois par fichier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRef {
+    /// Identifiant de la référence (`refs.id`).
+    pub id: i64,
     /// Référence, `context` à `None`.
     pub r: Ref,
     pub origin: RefOrigin,
@@ -180,11 +191,42 @@ pub struct Store {
     fresh: bool,
     /// Fichiers dont la structure a été écrite depuis le vidage (base fraîche seulement).
     written: std::collections::HashSet<String>,
+    /// `meta.resolution` vaut déjà `à résoudre` (DEC-076) : la première écriture après une passe
+    /// ou l'ouverture l'écrit, les suivantes non.
+    stale: bool,
 }
 
 type Touched = std::collections::BTreeSet<String>;
 
 impl Store {
+    fn new(conn: Connection, read_only: bool) -> Store {
+        Store {
+            conn,
+            read_only,
+            version: SCHEMA_VERSION,
+            fresh: false,
+            written: std::collections::HashSet::new(),
+            stale: true,
+        }
+    }
+
+    /// Lit `meta.resolution` à l'ouverture en écriture : tout autre état que `à jour` compte
+    /// comme « à résoudre ».
+    fn load_resolution_marker(&mut self) -> Result<()> {
+        let value: Option<String> = match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'resolution'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get(0))
+        {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(db_err(e)),
+        };
+        self.stale = value.as_deref() != Some(RESOLUTION_DONE);
+        Ok(())
+    }
+
     fn end_fresh(&mut self) {
         self.fresh = false;
         self.written.clear();
@@ -204,21 +246,18 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;
         configure_write(&conn)?;
-        let store = Store {
-            conn,
-            read_only: false,
-            version: SCHEMA_VERSION,
-            fresh: false,
-            written: std::collections::HashSet::new(),
-        };
+        let mut store = Store::new(conn, false);
         match store.user_version()? {
             0 => store.create_schema()?,
             v if v == SCHEMA_VERSION => {}
-            SCHEMA_WITHOUT_REV | SCHEMA_WITH_REF_CONTEXT => store.migrate_to_current()?,
+            SCHEMA_WITHOUT_REV | SCHEMA_WITH_REF_CONTEXT | SCHEMA_WITH_FILE_CONTEXTS => {
+                store.migrate_to_current()?
+            }
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
         }
+        store.load_resolution_marker()?;
         Ok(store)
     }
 
@@ -238,17 +277,15 @@ impl Store {
         )
         .map_err(db_err)?;
         configure_write(&conn)?;
-        let store = Store {
-            conn,
-            read_only: false,
-            version: SCHEMA_VERSION,
-            fresh: false,
-            written: std::collections::HashSet::new(),
-        };
+        let mut store = Store::new(conn, false);
         match store.user_version()? {
-            v if v == SCHEMA_VERSION => Ok(store),
-            SCHEMA_WITHOUT_REV | SCHEMA_WITH_REF_CONTEXT => {
+            v if v == SCHEMA_VERSION => {
+                store.load_resolution_marker()?;
+                Ok(store)
+            }
+            SCHEMA_WITHOUT_REV | SCHEMA_WITH_REF_CONTEXT | SCHEMA_WITH_FILE_CONTEXTS => {
                 store.migrate_to_current()?;
+                store.load_resolution_marker()?;
                 Ok(store)
             }
             v => Err(Error::Message(format!(
@@ -277,13 +314,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(db_err)?;
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        let mut store = Store {
-            conn,
-            read_only: true,
-            version: SCHEMA_VERSION,
-            fresh: false,
-            written: std::collections::HashSet::new(),
-        };
+        let mut store = Store::new(conn, true);
         match store.user_version()? {
             0 => {
                 return Err(Error::Message(format!(
@@ -291,7 +322,11 @@ impl Store {
                     path.display()
                 )))
             }
-            v if v == SCHEMA_VERSION || v == SCHEMA_WITHOUT_REV || v == SCHEMA_WITH_REF_CONTEXT => {
+            v if v == SCHEMA_VERSION
+                || v == SCHEMA_WITHOUT_REV
+                || v == SCHEMA_WITH_REF_CONTEXT
+                || v == SCHEMA_WITH_FILE_CONTEXTS =>
+            {
                 store.version = v
             }
             v => return Err(version_error(v)),
@@ -299,18 +334,71 @@ impl Store {
         Ok(store)
     }
 
-    /// Version du schéma du graphe ouvert (5 ou 6 en lecture seule seulement : DEC-066, DEC-073).
+    /// Version du schéma du graphe ouvert (5 à 7 en lecture seule seulement : DEC-066, DEC-073,
+    /// DEC-076).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
-    /// Migre un schéma 5 ou 6 en schéma 7 sur place : 5 -> 6, puis 6 -> 7, chacune en une seule
-    /// transaction. Rien n'est perdu.
+    /// Migre un schéma 5, 6 ou 7 en schéma 8 sur place : 5 -> 6, 6 -> 7, puis 7 -> 8, chacune en
+    /// une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         if self.user_version()? == SCHEMA_WITHOUT_REV {
             self.migrate_5_to_6()?;
         }
-        self.migrate_6_to_7()
+        self.migrate_6_to_7()?;
+        self.migrate_7_to_8()
+    }
+
+    /// Migre un schéma 7 en schéma 8 en une transaction `IMMEDIATE` (DEC-076) : colonnes et index
+    /// de `refs`, clé et tête de chaque référence existante (calculées par nephila), marqueur
+    /// `à résoudre`, versions. Sans `IF NOT EXISTS` : un objet en conflit fait échouer la
+    /// migration, qui est alors annulée en entier.
+    fn migrate_7_to_8(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITH_FILE_CONTEXTS {
+            return Ok(());
+        }
+        tx.execute_batch(
+            "ALTER TABLE refs ADD COLUMN target_key TEXT NOT NULL DEFAULT '';
+             ALTER TABLE refs ADD COLUMN target_head TEXT;
+             ALTER TABLE refs ADD COLUMN unresolved INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(db_err)?;
+        let rows: Vec<(i64, String)> = {
+            let mut st = tx
+                .prepare_cached("SELECT id, target_name FROM refs")
+                .map_err(db_err)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(db_err)?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?
+        };
+        {
+            let mut up = tx
+                .prepare_cached("UPDATE refs SET target_key = ?2, target_head = ?3 WHERE id = ?1")
+                .map_err(db_err)?;
+            for (id, name) in rows {
+                let (key, head) = crate::resolve::name_keys(&name);
+                up.execute(params![id, key, head]).map_err(db_err)?;
+            }
+        }
+        tx.execute_batch(&format!(
+            "CREATE INDEX idx_refs_key ON refs(target_key);
+             CREATE INDEX idx_refs_head ON refs(target_head) WHERE target_head IS NOT NULL;
+             CREATE INDEX idx_refs_unresolved ON refs(unresolved) WHERE unresolved = 1;
+             INSERT OR REPLACE INTO meta(key, value) VALUES ('resolution', '{RESOLUTION_PENDING}');
+             UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
     }
 
     /// Migre un schéma 6 en schéma 7 en une transaction `IMMEDIATE` (DEC-073) : `refs` reconstruite
@@ -354,8 +442,8 @@ impl Store {
              DROP INDEX idx_edges_source;
              DROP INDEX idx_declarations_node;
              CREATE INDEX idx_declarations_node_file ON declarations(node, file);
-             UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
-             PRAGMA user_version = {SCHEMA_VERSION};"
+             UPDATE meta SET value = '{SCHEMA_WITH_FILE_CONTEXTS}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITH_FILE_CONTEXTS};"
         ))
         .map_err(db_err)?;
         commit_counted(tx)
@@ -435,7 +523,7 @@ impl Store {
     fn create_schema(&self) -> Result<()> {
         // Schéma et version dans une seule transaction : jamais de base à moitié créée.
         let sql = format!(
-            "BEGIN;\n{SCHEMA}\nINSERT INTO meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+            "BEGIN;\n{SCHEMA}\nINSERT INTO meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}'), ('resolution', '{RESOLUTION_PENDING}');\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
         );
         self.conn.execute_batch(&sql).map_err(db_err)
     }
@@ -458,7 +546,10 @@ impl Store {
              DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
         )
         .map_err(db_err)?;
-        commit_counted(tx)
+        set_resolution_tx(&tx, RESOLUTION_PENDING)?;
+        commit_counted(tx)?;
+        self.stale = true;
+        Ok(())
     }
 
     /// Vide le graphe et enregistre `files` « en attente » en une seule transaction : le graphe
@@ -472,6 +563,7 @@ impl Store {
              DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
         )
         .map_err(db_err)?;
+        set_resolution_tx(&tx, RESOLUTION_PENDING)?;
         {
             let mut st = tx
                 .prepare_cached("INSERT INTO files(path, hash, size, mtime, recorded_at, state) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')")
@@ -484,6 +576,7 @@ impl Store {
             }
         }
         commit_counted(tx)?;
+        self.stale = true;
         self.fresh = true;
         Ok(())
     }
@@ -568,6 +661,9 @@ impl Store {
     ) -> Result<usize> {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
+        if !items.is_empty() {
+            mark_stale_tx(self.stale, &tx)?;
+        }
         let mut reapplied = 0;
         let mut newly: Vec<&str> = Vec::new();
         for (path, nodes, refs) in items {
@@ -597,6 +693,9 @@ impl Store {
             finish_file(&tx, &touched)?;
         }
         commit_counted(tx)?;
+        if !items.is_empty() {
+            self.stale = true;
+        }
         if self.fresh {
             self.written.extend(items.iter().map(|(p, _, _)| p.clone()));
         }
@@ -639,10 +738,13 @@ impl Store {
             return Ok(());
         }
         let tx = self.conn.transaction().map_err(db_err)?;
+        mark_stale_tx(self.stale, &tx)?;
         for item in items {
             write_enrichment(&tx, model, item)?;
         }
-        commit_counted(tx)
+        commit_counted(tx)?;
+        self.stale = true;
+        Ok(())
     }
 
     /// Fichiers indexés à enrichir : dans la portée de l'enrichissement (documents, plus les
@@ -793,6 +895,7 @@ impl Store {
             return Ok(0);
         }
         let tx = self.conn.transaction().map_err(db_err)?;
+        mark_stale_tx(self.stale, &tx)?;
         let mut removed = 0;
         for path in paths {
             let mut touched = Touched::new();
@@ -810,6 +913,7 @@ impl Store {
                 .map_err(db_err)?;
         }
         commit_counted(tx)?;
+        self.stale = true;
         Ok(removed)
     }
 
@@ -865,7 +969,7 @@ impl Store {
     /// Schéma 6 : requêtes séparées sur index, réunies ici (DEC-066). Schéma 5 (lecture seule) :
     /// requête de la 0.18.0.
     pub fn nodes_matching(&self, name: &str) -> Result<Vec<Node>> {
-        if self.version < SCHEMA_VERSION {
+        if self.version < SCHEMA_WITH_FILE_CONTEXTS {
             return self.run_resolve(RESOLVE_LEGACY, [name].as_slice());
         }
         let mut found = self.run_resolve(RESOLVE_ID, [name].as_slice())?;
@@ -1026,18 +1130,20 @@ impl Store {
         let rows = st
             .query_map([], |r| {
                 Ok((
-                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })
             .map_err(db_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (source, kind, target_name, origin, file) = row.map_err(db_err)?;
+            let (id, source, kind, target_name, origin, file) = row.map_err(db_err)?;
             out.push(FileRef {
+                id,
                 r: Ref {
                     source,
                     kind: EdgeKind::parse(&kind)?,
@@ -1058,7 +1164,7 @@ impl Store {
     /// Contexte d'imports de chaque fichier qui en a un (`file_contexts` ; sur un schéma 5 ou 6
     /// en lecture seule, le contexte de ses références d'analyse).
     pub fn file_contexts(&self) -> Result<std::collections::HashMap<String, String>> {
-        let sql = if self.version < SCHEMA_VERSION {
+        let sql = if self.version < SCHEMA_WITH_FILE_CONTEXTS {
             FILE_CONTEXTS_LEGACY_SQL
         } else {
             FILE_CONTEXTS_SQL
@@ -1074,7 +1180,7 @@ impl Store {
     /// d'une référence d'analyse est celui de son fichier (`file_contexts`), une référence `llm`
     /// n'en a pas ; sur un schéma 5 ou 6 (lecture seule), il vient de `refs.context`.
     pub fn refs_with_origin(&self) -> Result<Vec<(Ref, RefOrigin)>> {
-        let sql = if self.version < SCHEMA_VERSION {
+        let sql = if self.version < SCHEMA_WITH_FILE_CONTEXTS {
             REFS_LEGACY_SQL
         } else {
             REFS_SQL
@@ -1125,7 +1231,16 @@ impl Store {
     /// Écrit en une seule transaction les dépendances dérivées, les liens et le résumé global
     /// d'une passe de résolution (DEC-074). `summary` calcule le résumé sur l'état que la
     /// transaction vient d'écrire (texte, horodatage). Une erreur annule toute la passe.
-    pub fn write_resolution<F>(&mut self, deps: &[Node], edges: &[Edge], summary: F) -> Result<()>
+    ///
+    /// Passe complète : le statut des références est remis à zéro (par l'index partiel) puis
+    /// posé sur `unresolved` (identifiants de `refs`), et le marqueur passe à `à jour` (DEC-076).
+    pub fn write_resolution<F>(
+        &mut self,
+        deps: &[Node],
+        edges: &[Edge],
+        unresolved: &[i64],
+        summary: F,
+    ) -> Result<()>
     where
         F: FnOnce(&Store) -> Result<(String, i64)>,
     {
@@ -1138,10 +1253,36 @@ impl Store {
         .map_err(db_err)?;
         replace_dependencies_tx(&tx, deps)?;
         replace_edges_tx(&tx, edges)?;
+        tx.prepare_cached("UPDATE refs SET unresolved = 0 WHERE unresolved = 1")
+            .map_err(db_err)?
+            .execute([])
+            .map_err(db_err)?;
+        {
+            let mut mark = tx
+                .prepare_cached("UPDATE refs SET unresolved = 1 WHERE id = ?1")
+                .map_err(db_err)?;
+            for id in unresolved {
+                mark.execute([id]).map_err(db_err)?;
+            }
+        }
         // Les lectures du calcul passent par la même connexion : elles voient la transaction.
         let (text, computed_at) = summary(self)?;
         set_summary_tx(&tx, &text, computed_at)?;
-        commit_counted(tx)
+        set_resolution_tx(&tx, RESOLUTION_DONE)?;
+        commit_counted(tx)?;
+        self.stale = false;
+        Ok(())
+    }
+
+    /// Références comptées non résolues par la dernière passe (index partiel, DEC-076).
+    pub fn count_unresolved(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .prepare_cached("SELECT count(*) FROM refs WHERE unresolved = 1")
+            .map_err(db_err)?
+            .query_row([], |r| r.get(0))
+            .map_err(db_err)?;
+        Ok(usize::try_from(n).unwrap_or(0))
     }
 
     /// Couples (fichier, identifiant de nœud) des déclarations.
@@ -1342,6 +1483,27 @@ fn replace_dependencies_tx(tx: &rusqlite::Connection, deps: &[Node]) -> Result<(
             .map_err(db_err)?;
         }
     }
+    Ok(())
+}
+
+/// Dans la transaction d'une écriture de nœuds, de déclarations ou de références : écrit
+/// `à résoudre` si le marqueur ne l'est pas déjà (`stale`).
+fn mark_stale_tx(stale: bool, tx: &rusqlite::Connection) -> Result<()> {
+    if !stale {
+        set_resolution_tx(tx, RESOLUTION_PENDING)?;
+    }
+    Ok(())
+}
+
+/// Écrit `meta.resolution` (DEC-076).
+fn set_resolution_tx(conn: &rusqlite::Connection, value: &str) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO meta(key, value) VALUES ('resolution', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .map_err(db_err)?
+    .execute([value])
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -1616,6 +1778,12 @@ fn insert_refs(
     refs: &[Ref],
     origin: &str,
 ) -> Result<()> {
+    // Aucun lien `contains` n'est produit par des références : ils sont dérivés (DEC-077).
+    if refs.iter().any(|r| r.kind == EdgeKind::Contains) {
+        return Err(Error::Message(format!(
+            "référence de genre contains refusée dans {path}"
+        )));
+    }
     // Contexte unique des références d'analyse du fichier (DEC-073) ; aucun pour l'origine `llm`.
     let context = refs.first().and_then(|r| r.context.as_deref());
     if origin == "llm" {
@@ -1631,19 +1799,22 @@ fn insert_refs(
     }
     let mut insr = tx
         .prepare_cached(
-            "INSERT INTO refs(source, file, kind, target_name, origin)
-             SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS
+            "INSERT INTO refs(source, file, kind, target_name, origin, target_key, target_head)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS
                (SELECT 1 FROM declarations WHERE node = ?1 AND file = ?2)",
         )
         .map_err(db_err)?;
     for r in refs {
+        let (key, head) = crate::resolve::name_keys(&r.target_name);
         let n = insr
             .execute(params![
                 r.source,
                 path,
                 r.kind.as_str(),
                 r.target_name,
-                origin
+                origin,
+                key,
+                head
             ])
             .map_err(db_err)?;
         if n == 0 {
@@ -1821,6 +1992,10 @@ fn filter_payload(
         let Ok(kind) = EdgeKind::parse(&r.kind) else {
             continue;
         };
+        // Un enrichissement conservé ne peut pas porter de lien `contains` (DEC-077).
+        if kind == EdgeKind::Contains {
+            continue;
+        }
         if declared.contains(&r.source) {
             kept.insert(r.target.clone());
             refs.push(Ref {
@@ -2488,15 +2663,39 @@ mod tests {
         PRAGMA user_version = 6;
         COMMIT;";
 
-    /// Ramène un graphe de schéma 7 au schéma 6 de la 0.20.0.
+    /// Assistant « schéma 7 de la 0.21.0 » (DEC-076 point 6), en SQL écrit en dur : index
+    /// nouveaux supprimés, trois colonnes de `refs` retirées, clé `meta.resolution` supprimée,
+    /// versions 7.
+    const SCHEMA7_DOWNGRADE: &str = "BEGIN;
+        DROP INDEX idx_refs_key;
+        DROP INDEX idx_refs_head;
+        DROP INDEX idx_refs_unresolved;
+        ALTER TABLE refs DROP COLUMN target_key;
+        ALTER TABLE refs DROP COLUMN target_head;
+        ALTER TABLE refs DROP COLUMN unresolved;
+        DELETE FROM meta WHERE key = 'resolution';
+        UPDATE meta SET value = '7' WHERE key = 'schema_version';
+        PRAGMA user_version = 7;
+        COMMIT;";
+
+    /// Ramène un graphe de schéma 8 au schéma 7 de la 0.21.0.
+    fn downgrade_to_7(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA7_DOWNGRADE)
+            .unwrap();
+    }
+
+    /// Ramène un graphe de schéma 8 au schéma 6 de la 0.20.0 (le schéma 7 d'abord).
     fn downgrade_to_6(repo: &Path) {
+        downgrade_to_7(repo);
         Connection::open(db_path(repo))
             .unwrap()
             .execute_batch(SCHEMA6_DOWNGRADE)
             .unwrap();
     }
 
-    /// Ramène un graphe de schéma 7 au schéma 5 (6, puis 6 -> 5).
+    /// Ramène un graphe de schéma 8 au schéma 5 (6, puis 6 -> 5).
     fn downgrade_to_5(repo: &Path) {
         downgrade_to_6(repo);
         let c = Connection::open(db_path(repo)).unwrap();
@@ -3315,7 +3514,7 @@ mod tests {
             ),
             ("summary", "id,text,computed_at"),
             (
-                "(SELECT * FROM meta WHERE key <> 'schema_version')",
+                "(SELECT * FROM meta WHERE key NOT IN ('schema_version', 'resolution'))",
                 "key,value",
             ),
         ];
@@ -3375,7 +3574,7 @@ mod tests {
                 .collect()
         };
         assert!(!ref_cols.iter().any(|c| c == "context"), "{ref_cols:?}");
-        assert_eq!(st_user_version(dir.path()), 7);
+        assert_eq!(st_user_version(dir.path()), SCHEMA_VERSION);
         let v: String = st
             .conn
             .query_row(
@@ -3384,8 +3583,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, "7");
-        assert_eq!(SCHEMA_VERSION, 7);
+        assert_eq!(v, SCHEMA_VERSION.to_string());
+        assert_eq!(SCHEMA_VERSION, 8);
     }
 
     #[test]
@@ -3454,10 +3653,10 @@ mod tests {
             fresh_objects = objects(&st);
             snapshot7(&st)
         };
-        if version == 5 {
-            downgrade_to_5(dir.path());
-        } else {
-            downgrade_to_6(dir.path());
+        match version {
+            5 => downgrade_to_5(dir.path()),
+            6 => downgrade_to_6(dir.path()),
+            _ => downgrade_to_7(dir.path()),
         }
         let st = if existing {
             Store::open_existing(dir.path()).unwrap()
@@ -3473,8 +3672,12 @@ mod tests {
         for version in [6, 5] {
             for existing in [false, true] {
                 let (dir, st, before) = migrated_from(version, existing);
-                assert_eq!(st.schema_version().unwrap(), 7, "depuis {version}");
-                assert_eq!(st_user_version(dir.path()), 7);
+                assert_eq!(
+                    st.schema_version().unwrap(),
+                    SCHEMA_VERSION,
+                    "depuis {version}"
+                );
+                assert_eq!(st_user_version(dir.path()), SCHEMA_VERSION);
                 let v: String = st
                     .conn
                     .query_row(
@@ -3483,7 +3686,7 @@ mod tests {
                         |r| r.get(0),
                     )
                     .unwrap();
-                assert_eq!(v, "7");
+                assert_eq!(v, SCHEMA_VERSION.to_string());
                 assert_eq!(
                     snapshot7(&st),
                     before,
@@ -3514,11 +3717,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_6_and_7_without_touching_the_file() {
-        for version in [7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_8_without_touching_the_file() {
+        for version in [8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                7 => downgrade_to_7(dir.path()),
                 6 => downgrade_to_6(dir.path()),
                 5 => downgrade_to_5(dir.path()),
                 _ => {}
@@ -4233,5 +4437,415 @@ mod tests {
         };
         assert!(grouped.apply_enrichments("m", &bad).is_err());
         assert_eq!(graph_dump(&grouped), before);
+    }
+
+    // --- REQ-069 : schéma 8, clé, tête et statut des références, marqueur ---
+
+    fn marker(st: &Store) -> Option<String> {
+        st.conn
+            .query_row("SELECT value FROM meta WHERE key = 'resolution'", [], |r| {
+                r.get(0)
+            })
+            .ok()
+    }
+
+    fn strings(st: &Store, sql: &str) -> Vec<String> {
+        let mut q = st.conn.prepare(sql).unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn req069_ac1_fresh_graph_has_key_head_and_status_columns_and_indexes() {
+        let dir = tempdir().unwrap();
+        let st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(
+            strings(
+                &st,
+                "SELECT name FROM pragma_table_info('refs') ORDER BY cid"
+            ),
+            [
+                "id",
+                "source",
+                "file",
+                "kind",
+                "target_name",
+                "origin",
+                "target_key",
+                "target_head",
+                "unresolved"
+            ]
+        );
+        for (name, cols, sql) in [
+            (
+                "idx_refs_key",
+                "target_key",
+                "CREATE INDEX idx_refs_key ON refs(target_key)",
+            ),
+            (
+                "idx_refs_head",
+                "target_head",
+                "CREATE INDEX idx_refs_head ON refs(target_head) WHERE target_head IS NOT NULL",
+            ),
+            (
+                "idx_refs_unresolved",
+                "unresolved",
+                "CREATE INDEX idx_refs_unresolved ON refs(unresolved) WHERE unresolved = 1",
+            ),
+        ] {
+            assert_eq!(
+                strings(
+                    &st,
+                    &format!("SELECT name FROM pragma_index_info('{name}') ORDER BY seqno")
+                ),
+                [cols],
+                "{name}"
+            );
+            assert_eq!(
+                strings(
+                    &st,
+                    &format!("SELECT sql FROM sqlite_master WHERE name = '{name}'")
+                ),
+                [sql]
+            );
+        }
+        assert_eq!(st_user_version(dir.path()), 8);
+        assert_eq!(st.schema_version().unwrap(), 8);
+        assert_eq!(
+            strings(&st, "SELECT value FROM meta WHERE key = 'schema_version'"),
+            ["8"]
+        );
+    }
+
+    const KEY_NAMES: [&str; 8] = [
+        "a.b.C", "C", " C ", "T.m", "x/y#z", "g:a:1.0", "a.b/c.d", "",
+    ];
+    const KEYS: [&str; 8] = ["C", "C", "C", "m", "z", "0", "d", ""];
+    const HEADS: [Option<&str>; 8] = [
+        Some("a"),
+        None,
+        None,
+        Some("T"),
+        None,
+        Some("g:a:1"),
+        Some("a"),
+        None,
+    ];
+
+    fn key_rows(st: &Store, origin: &str) -> Vec<(String, String, Option<String>)> {
+        let mut q = st
+            .conn
+            .prepare("SELECT target_name, target_key, target_head FROM refs WHERE origin = ?1 ORDER BY id")
+            .unwrap();
+        q.query_map([origin], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn expected_keys() -> Vec<(String, String, Option<String>)> {
+        (0..8)
+            .map(|i| {
+                (
+                    KEY_NAMES[i].to_string(),
+                    KEYS[i].to_string(),
+                    HEADS[i].map(String::from),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn req069_ac2_key_and_head_are_written_by_every_reference_path() {
+        let refs_of = |src: &str| -> Vec<Ref> {
+            KEY_NAMES
+                .iter()
+                .map(|n| Ref {
+                    source: src.into(),
+                    kind: EdgeKind::Imports,
+                    target_name: (*n).into(),
+                    context: None,
+                })
+                .collect()
+        };
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let a = ty("p.A", "a.java");
+        // Base fraîche.
+        st.reset_with_pending_files(&[file("a.java")]).unwrap();
+        st.replace_structure("a.java", std::slice::from_ref(&a), &refs_of(&a.id))
+            .unwrap();
+        assert_eq!(key_rows(&st, "parse"), expected_keys());
+        // Chemin général : le même fichier réécrit.
+        st.replace_structure("a.java", std::slice::from_ref(&a), &refs_of(&a.id))
+            .unwrap();
+        assert_eq!(key_rows(&st, "parse"), expected_keys());
+        // Enrichissement.
+        st.apply_enrichment("a.java", "h", "m", &[], &[], &refs_of(&a.id))
+            .unwrap();
+        assert_eq!(key_rows(&st, "llm"), expected_keys());
+        let flagged: i64 = st
+            .conn
+            .query_row("SELECT count(*) FROM refs WHERE unresolved <> 0", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(flagged, 0);
+    }
+
+    fn marked(st: &Store) -> Vec<(String, String, String)> {
+        let mut q = st
+            .conn
+            .prepare("SELECT source, kind, target_name FROM refs WHERE unresolved = 1 ORDER BY source, kind, target_name")
+            .unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn expected_unresolved(st: &Store) -> Vec<(String, String, String)> {
+        let mut v: Vec<_> = crate::resolve::unresolved(st)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.source, r.kind.as_str().to_string(), r.target_name))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn req069_ac3_status_and_marker_follow_the_full_pass() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        st.insert_pending_files(&[file("a.java"), file("b.md")])
+            .unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        let (a, b) = (ty("p.A", "a.java"), ty("p.B", "a.java"));
+        let doc = Node::new(NodeKind::Document, "b.md", "b.md", Some("b.md"), None, None);
+        st.replace_structures(&[
+            (
+                "a.java".to_string(),
+                vec![a.clone(), b.clone()],
+                vec![
+                    pref(&a.id, "p.B", None),
+                    pref(&a.id, "Absent", None),
+                    pref(&b.id, "Autre", None),
+                    mention(&a.id, "texte libre"),
+                ],
+            ),
+            ("b.md".to_string(), vec![doc.clone()], vec![]),
+        ])
+        .unwrap();
+        st.apply_enrichment(
+            "b.md",
+            "h",
+            "m",
+            &[],
+            &[concept("idée")],
+            &[mention(&doc.id, "Inconnue"), mention(&doc.id, "idée")],
+        )
+        .unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        let stats = crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        let expected = expected_unresolved(&st);
+        assert!(expected.len() >= 3, "{expected:?}");
+        assert_eq!(stats.unresolved, expected.len());
+        assert_eq!(marked(&st), expected);
+        // Une deuxième passe complète remet à zéro avant de marquer.
+        st.conn
+            .execute(
+                "UPDATE refs SET unresolved = 1 WHERE target_name = 'p.B'",
+                [],
+            )
+            .unwrap();
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(marked(&st), expected);
+
+        // Écritures qui remettent le marqueur à « à résoudre » ; passe qui le remet à « à jour ».
+        st.insert_files(&[file("c.md")]).unwrap();
+        st.set_enrich_model("m").unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        st.replace_structure("c.md", &[ty("p.C", "c.md")], &[])
+            .unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        crate::resolve::resolve(&mut st).unwrap();
+        st.apply_enrichments(
+            "m",
+            &[EnrichmentWrite {
+                path: "b.md".into(),
+                hash: "h".into(),
+                summaries: vec![],
+                concepts: vec![],
+                refs: vec![],
+            }],
+        )
+        .unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        st.remove_files(&["c.md"]).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(marked(&st), expected_unresolved(&st));
+        st.reset_with_pending_files(&[file("a.java")]).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        st.reset().unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+    }
+
+    #[test]
+    fn req069_marker_is_written_once_by_the_first_write_and_rolls_back_with_it() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        crate::resolve::resolve(&mut st).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        // Écriture refusée : le marqueur reste « à jour ».
+        let a = ty("p.A", "a.md");
+        let bad = Ref {
+            kind: EdgeKind::Contains,
+            ..pref(&a.id, "x", None)
+        };
+        assert!(st
+            .replace_structure("a.md", std::slice::from_ref(&a), &[bad])
+            .is_err());
+        assert_eq!(marker(&st).as_deref(), Some("à jour"));
+        st.replace_structure("a.md", &[a], &[]).unwrap();
+        assert_eq!(marker(&st).as_deref(), Some("à résoudre"));
+    }
+
+    #[test]
+    fn req069_ac4_schemas_7_6_and_5_are_migrated_with_key_head_and_marker() {
+        let fresh_dir = tempdir().unwrap();
+        let fresh_keys = {
+            let st = rich(fresh_dir.path());
+            dump(&st, "refs", "id,target_key,target_head,unresolved")
+        };
+        assert!(!fresh_keys.is_empty());
+        let fresh_status = {
+            let mut st = Store::open_existing(fresh_dir.path()).unwrap();
+            crate::resolve::resolve(&mut st).unwrap();
+            dump(&st, "refs", "id,unresolved")
+        };
+        for version in [7, 6, 5] {
+            for existing in [false, true] {
+                let (dir, mut st, before) = migrated_from(version, existing);
+                let ctx = format!("depuis {version}, existing={existing}");
+                assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION, "{ctx}");
+                assert_eq!(st_user_version(dir.path()), SCHEMA_VERSION, "{ctx}");
+                assert_eq!(snapshot7(&st), before, "{ctx}");
+                assert_eq!(
+                    dump(&st, "refs", "id,target_key,target_head,unresolved"),
+                    fresh_keys,
+                    "{ctx}"
+                );
+                assert_eq!(marker(&st).as_deref(), Some("à résoudre"), "{ctx}");
+                crate::resolve::resolve(&mut st).unwrap();
+                assert_eq!(dump(&st, "refs", "id,unresolved"), fresh_status, "{ctx}");
+                assert_eq!(marker(&st).as_deref(), Some("à jour"), "{ctx}");
+            }
+        }
+    }
+
+    #[test]
+    fn req069_ac4_migrated_keys_match_the_function() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let a = ty("p.A", "a.java");
+        st.insert_pending_files(&[file("a.java")]).unwrap();
+        let refs: Vec<Ref> = KEY_NAMES.iter().map(|n| pref(&a.id, n, None)).collect();
+        st.replace_structure("a.java", &[a], &refs).unwrap();
+        drop(st);
+        downgrade_to_7(dir.path());
+        let st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(key_rows(&st, "parse"), expected_keys());
+    }
+
+    #[test]
+    fn req066_ac7_a_contains_reference_is_refused_and_leaves_the_graph_unchanged() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.java"), file("b.java")])
+            .unwrap();
+        let (a, b) = (ty("p.A", "a.java"), ty("p.B", "b.java"));
+        st.replace_structure(
+            "b.java",
+            std::slice::from_ref(&b),
+            &[pref(&b.id, "A", Some(CTX))],
+        )
+        .unwrap();
+        let contains = |src: &str| Ref {
+            kind: EdgeKind::Contains,
+            ..pref(src, "x", None)
+        };
+        let all = |st: &Store| {
+            let mut v = graph_dump(st);
+            v.push(dump(st, "edges", "source,target,kind"));
+            v.push(dump(st, "meta", "key,value"));
+            v
+        };
+        // Chemin général : le fichier b.java existe déjà.
+        let before = all(&st);
+        let e = st
+            .replace_structure(
+                "b.java",
+                std::slice::from_ref(&b),
+                &[pref(&b.id, "A", Some(CTX)), contains(&b.id)],
+            )
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("référence de genre contains refusée dans b.java"),
+            "{e}"
+        );
+        assert_eq!(all(&st), before);
+        // Plusieurs fichiers en une transaction : rien n'est écrit pour a.java non plus.
+        assert!(st
+            .replace_structures(&[
+                ("a.java".to_string(), vec![a.clone()], vec![]),
+                ("b.java".to_string(), vec![b.clone()], vec![contains(&b.id)]),
+            ])
+            .is_err());
+        assert_eq!(all(&st), before);
+        // Base fraîche.
+        st.reset_with_pending_files(&[file("a.java")]).unwrap();
+        let fresh = all(&st);
+        assert!(st
+            .replace_structure("a.java", std::slice::from_ref(&a), &[contains(&a.id)])
+            .is_err());
+        assert_eq!(all(&st), fresh);
+        // Enrichissement.
+        st.replace_structure("a.java", std::slice::from_ref(&a), &[])
+            .unwrap();
+        let before = all(&st);
+        let e = st
+            .apply_enrichment("a.java", "h", "m", &[], &[], &[contains(&a.id)])
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("référence de genre contains refusée dans a.java"),
+            "{e}"
+        );
+        assert_eq!(all(&st), before);
+        assert!(st
+            .apply_enrichments(
+                "m",
+                &[EnrichmentWrite {
+                    path: "a.java".into(),
+                    hash: "h".into(),
+                    summaries: vec![],
+                    concepts: vec![],
+                    refs: vec![contains(&a.id)],
+                }],
+            )
+            .is_err());
+        assert_eq!(all(&st), before);
     }
 }

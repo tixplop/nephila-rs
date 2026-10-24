@@ -69,10 +69,18 @@ CREATE TABLE refs (
     file        TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
     kind        TEXT NOT NULL,
     target_name TEXT NOT NULL,
-    origin      TEXT NOT NULL DEFAULT 'parse' CHECK (origin IN ('parse', 'llm'))
+    origin      TEXT NOT NULL DEFAULT 'parse' CHECK (origin IN ('parse', 'llm')),
+    -- Clé (dernier segment) et tête (avant le premier point) du nom visé, écrites par nephila à
+    -- chaque insertion (DEC-076) ; `unresolved` = 1 : comptée non résolue par la dernière passe.
+    target_key  TEXT NOT NULL DEFAULT '',
+    target_head TEXT,
+    unresolved  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_refs_source ON refs(source);
 CREATE INDEX idx_refs_file ON refs(file);
+CREATE INDEX idx_refs_key ON refs(target_key);
+CREATE INDEX idx_refs_head ON refs(target_head) WHERE target_head IS NOT NULL;
+CREATE INDEX idx_refs_unresolved ON refs(unresolved) WHERE unresolved = 1;
 
 CREATE TABLE edges (
     source TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,

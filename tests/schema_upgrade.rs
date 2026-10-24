@@ -1,7 +1,8 @@
-//! Mise à niveau du graphe du schéma 5 au schéma 6 (REQ-057, DEC-066) : AC-057-3 ; et vers le
-//! schéma 7 (REQ-062, DEC-073) : AC-062-5, AC-062-6.
+//! Mise à niveau du graphe du schéma 5 au schéma 6 (REQ-057, DEC-066) : AC-057-3 ; vers le
+//! schéma 7 (REQ-062, DEC-073) : AC-062-5, AC-062-6 ; vers le schéma courant (REQ-069, DEC-076).
 
 use assert_cmd::Command;
+use nephila::store::SCHEMA_VERSION;
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -101,7 +102,7 @@ impl Env {
     fn built_at_schema5() -> Env {
         let env = Env::new();
         env.ok(&["build"]);
-        assert_eq!(env.user_version(), 7);
+        assert_eq!(env.user_version(), SCHEMA_VERSION);
         schema6::downgrade_to_5(&env.db());
         assert_eq!(env.user_version(), 5);
         env
@@ -111,7 +112,7 @@ impl Env {
     fn built_at_schema6() -> Env {
         let env = Env::new();
         env.ok(&["build"]);
-        assert_eq!(env.user_version(), 7);
+        assert_eq!(env.user_version(), SCHEMA_VERSION);
         schema6::downgrade_to_6(&env.db());
         assert_eq!(env.user_version(), 6);
         env
@@ -166,7 +167,7 @@ fn req057_ac3_schema5_read_only_commands_then_update_migrates_without_llm() {
 
     env.ok(&["update"]);
     assert!(env.logged().is_empty(), "{:?}", env.logged());
-    assert_eq!(env.user_version(), 7);
+    assert_eq!(env.user_version(), SCHEMA_VERSION);
     let db = env.db();
     let (total, filled): (i64, i64) = db
         .query_row(
@@ -186,7 +187,7 @@ fn req057_ac3_schema5_build_migrates_without_llm() {
     let enrichments = env.enrichments();
     env.ok(&["build"]);
     assert!(env.logged().is_empty(), "{:?}", env.logged());
-    assert_eq!(env.user_version(), 7);
+    assert_eq!(env.user_version(), SCHEMA_VERSION);
     assert_eq!(env.enrichments(), enrichments);
 }
 
@@ -210,7 +211,7 @@ fn graph_fingerprint(env: &Env) -> (u64, String) {
 fn downgraded(version: u32) -> (Env, Vec<String>) {
     let env = Env::new();
     env.ok(&["build"]);
-    assert_eq!(env.user_version(), 7);
+    assert_eq!(env.user_version(), SCHEMA_VERSION);
     let outputs: Vec<String> = READS.iter().map(|a| text(&env.ok(a).stdout)).collect();
     if version == 5 {
         schema6::downgrade_to_5(&env.db());
@@ -238,7 +239,7 @@ fn req062_ac5_old_schemas_are_read_unchanged_then_migrated_by_update_or_build() 
         let o = env.ok(&["update"]);
         assert_eq!(text(&o.stdout).trim(), "graphe à jour", "schéma {version}");
         assert!(env.logged().is_empty(), "{:?}", env.logged());
-        assert_eq!(env.user_version(), 7);
+        assert_eq!(env.user_version(), SCHEMA_VERSION);
         assert_eq!(text(&env.ok(READS[4]).stdout), outputs[4]);
         assert_eq!(env.enrichments(), enrichments);
 
@@ -246,7 +247,7 @@ fn req062_ac5_old_schemas_are_read_unchanged_then_migrated_by_update_or_build() 
         let (other, _) = downgraded(version);
         other.ok(&["build"]);
         assert!(other.logged().is_empty(), "{:?}", other.logged());
-        assert_eq!(other.user_version(), 7);
+        assert_eq!(other.user_version(), SCHEMA_VERSION);
         assert_eq!(text(&other.ok(READS[4]).stdout), outputs[4]);
         assert_eq!(other.enrichments(), enrichments);
     }

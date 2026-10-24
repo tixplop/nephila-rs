@@ -1,9 +1,12 @@
 //! Assistant de test « schéma 6 de la 0.20.0 » (DEC-073 point 6), en SQL écrit en dur : ramène un
-//! graphe de schéma 7 au schéma 6 (`refs` recréée avec `AUTOINCREMENT` et `context` rempli depuis
+//! graphe de schéma 8 au schéma 7 (assistant `schema7`), puis au schéma 6 (`refs` recréée avec `AUTOINCREMENT` et `context` rempli depuis
 //! `file_contexts`, index de la 0.20.0, `file_contexts` et `idx_declarations_node_file`
 //! supprimés, versions 6). Copie de celui du module de tests du stockage.
 
 use rusqlite::Connection;
+
+#[path = "schema7.rs"]
+mod schema7;
 
 pub const SCHEMA6_DOWNGRADE: &str = "BEGIN;
     CREATE TABLE refs_old (
@@ -33,12 +36,13 @@ pub const SCHEMA6_DOWNGRADE: &str = "BEGIN;
     PRAGMA user_version = 6;
     COMMIT;";
 
-/// Ramène le graphe ouvert de schéma 7 au schéma 6 de la 0.20.0.
+/// Ramène le graphe ouvert de schéma 8 au schéma 6 de la 0.20.0 (le schéma 7 d'abord).
 pub fn downgrade_to_6(db: &Connection) {
+    schema7::downgrade_to_7(db);
     db.execute_batch(SCHEMA6_DOWNGRADE).unwrap();
 }
 
-/// Ramène le graphe ouvert de schéma 7 au schéma 5 (6, puis 6 -> 5).
+/// Ramène le graphe ouvert de schéma 8 au schéma 5 (6, puis 6 -> 5).
 pub fn downgrade_to_5(db: &Connection) {
     downgrade_to_6(db);
     db.execute_batch(

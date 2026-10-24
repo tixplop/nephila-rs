@@ -11,6 +11,8 @@
 //! `NEPHILA_ORACLE_CAPTURE=1` réécrit `tests/fixtures/oracle_0_21_0.txt` (une ligne
 //! `dépôt<TAB>étape<TAB>sortie<TAB>code<TAB>empreinte`, triée) ; sans, le test compare.
 
+#[path = "support/schema7.rs"]
+mod schema7;
 #[path = "support/mod.rs"]
 mod support;
 
@@ -811,4 +813,123 @@ fn normalized_export_ignore_l_ordre_des_non_resolues_seulement() {
     // `nodes` garde son ordre.
     let swapped = doc("[]").replace(r#"[{"id":"b"},{"id":"a"}]"#, r#"[{"id":"a"},{"id":"b"}]"#);
     assert_ne!(n("[]"), normalized_export(swapped.as_bytes()));
+}
+
+// --- REQ-069 : graphe de schéma 7 migré sur place par `update` ---
+
+fn db_of(repo: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(repo.join(".nephila/graph.db")).unwrap()
+}
+
+fn user_version_of(repo: &Path) -> i32 {
+    db_of(repo)
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap()
+}
+
+fn graph_hash(repo: &Path) -> String {
+    blake3::hash(&fs::read(repo.join(".nephila/graph.db")).unwrap())
+        .to_hex()
+        .to_string()
+}
+
+/// Comme `Env::run`, avec le journal du mock dans `log`.
+fn run_logged(env: &Env, repo: &Path, log: &Path, args: &[&str]) -> std::process::Output {
+    let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"));
+    c.arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("NEPHILA_CONFIG", &env.config)
+        .env("NEPHILA_MOCK_LOG", log)
+        .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+        .env_remove("NEPHILA_MOCK_DELAY_MS")
+        .env_remove("NEPHILA_MOCK_INVALID_KEY");
+    match &env.mock {
+        Some(m) => c.env("NEPHILA_MOCK_DIR", m),
+        None => c.env_remove("NEPHILA_MOCK_DIR"),
+    };
+    c.output().unwrap()
+}
+
+#[test]
+fn req069_ac5_schema_7_graph_is_read_unchanged_then_migrated_by_update() {
+    let reads: [&[&str]; 5] = [
+        &["query", "neighbors", "OrderRepository.save"],
+        &["query", "search", "Order"],
+        &["status"],
+        &["summary"],
+        &["export", "--output", "-"],
+    ];
+    let env = Env::new("maven2", Some("mock"));
+    let repo = env.repo();
+    ok(&env, &repo, "build", &["build"]);
+    assert_eq!(user_version_of(&repo), nephila::store::SCHEMA_VERSION);
+    let before: Vec<String> = reads.iter().map(|a| ok(&env, &repo, "avant", a)).collect();
+    schema7::downgrade_to_7(&db_of(&repo));
+    assert_eq!(user_version_of(&repo), 7);
+    let hash = graph_hash(&repo);
+    for (a, expected) in reads.iter().zip(&before) {
+        assert_eq!(&ok(&env, &repo, "schéma 7", a), expected, "{a:?}");
+        assert_eq!(user_version_of(&repo), 7, "{a:?}");
+        assert_eq!(graph_hash(&repo), hash, "{a:?}");
+    }
+
+    // Aucun changement : `graphe à jour`, aucun appel LLM, graphe migré.
+    let log = env.root.join("mock.log");
+    let out = run_logged(&env, &repo, &log, &["update"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "graphe à jour");
+    assert!(fs::read_to_string(&log).unwrap_or_default().is_empty());
+    assert_eq!(user_version_of(&repo), nephila::store::SCHEMA_VERSION);
+
+    // Un fichier modifié, un ajouté, un supprimé : même graphe qu'un `build` du même arbre.
+    let case = CASES.iter().find(|c| c.name == "maven2").unwrap();
+    apply_case(&repo, case);
+    ok(&env, &repo, "update", &["update"]);
+    let other = env.root.join("other");
+    copy_tree(&repo, &other, false);
+    ok(&env, &other, "build", &["build"]);
+    let (_, updated) = snapshot(&env, &repo, "update");
+    let (_, built) = snapshot(&env, &other, "build");
+    assert_eq!(updated, built);
+}
+
+#[test]
+fn req069_ac6_failed_migration_leaves_the_schema_7_graph_untouched() {
+    let env = Env::new("maven2", None);
+    let repo = env.repo();
+    ok(&env, &repo, "build", &["build", "--no-llm"]);
+    schema7::downgrade_to_7(&db_of(&repo));
+    // Objet en conflit avec un index que la migration crée (sans `IF NOT EXISTS`).
+    db_of(&repo)
+        .execute_batch("CREATE INDEX idx_refs_key ON refs(source)")
+        .unwrap();
+    let dump = |sql: &str, cols: usize| -> Vec<Vec<String>> {
+        let db = db_of(&repo);
+        let mut q = db.prepare(sql).unwrap();
+        q.query_map([], |r| {
+            (0..cols)
+                .map(|i| Ok(format!("{:?}", r.get_ref(i)?)))
+                .collect()
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    };
+    let master = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name";
+    let refs = "SELECT * FROM refs ORDER BY id";
+    let (master_before, refs_before) = (dump(master, 4), dump(refs, 6));
+    assert!(!refs_before.is_empty());
+
+    let out = env.run(&repo, &["update"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.lines().any(|l| l.starts_with("erreur:")), "{err}");
+    assert_eq!(user_version_of(&repo), 7);
+    assert_eq!(dump(master, 4), master_before);
+    assert_eq!(dump(refs, 6), refs_before);
 }
