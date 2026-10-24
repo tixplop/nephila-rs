@@ -121,6 +121,177 @@ fn req065_ac1_oracle_0_20_0() {
     }
 }
 
+/// Sorties observables d'un dépôt : export normalisé (empreinte), `status`, `summary`.
+fn observed(repo: &Path, config: &Path, mock: Option<&Path>) -> Vec<(&'static str, String)> {
+    let outputs: [(&'static str, &[&str]); 3] = [
+        ("export", &["export", "--format", "json", "--output", "-"]),
+        ("status", &["status"]),
+        ("summary", &["summary"]),
+    ];
+    outputs
+        .iter()
+        .map(|(label, args)| {
+            let out = run(repo, config, mock, args);
+            let text = if *label == "export" {
+                support::export_fingerprint(&out.stdout)
+            } else {
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            };
+            (*label, text)
+        })
+        .collect()
+}
+
+/// Lance `args` (avec `--jobs n` si demandé) ; renvoie la ligne de bilan (stdout) et les sorties observées.
+fn step(
+    c: &Case,
+    repo: &Path,
+    config: &Path,
+    mock: Option<&Path>,
+    args: &[&str],
+    jobs: Option<usize>,
+) -> (String, Vec<(&'static str, String)>) {
+    let n = jobs.map(|j| j.to_string());
+    let mut full: Vec<&str> = args.to_vec();
+    if let Some(n) = &n {
+        full.extend(["--jobs", n]);
+    }
+    let out = run(repo, config, mock, &full);
+    assert!(
+        out.status.success(),
+        "{} / {full:?} : {}",
+        c.name,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        observed(repo, config, mock),
+    )
+}
+
+fn compare(
+    c: &Case,
+    option: &str,
+    expected: &(String, Vec<(&'static str, String)>),
+    actual: &(String, Vec<(&'static str, String)>),
+) {
+    assert_eq!(
+        expected.0, actual.0,
+        "{} / {option} : ligne de bilan différente",
+        c.name
+    );
+    for (e, a) in expected.1.iter().zip(&actual.1) {
+        assert_eq!(
+            e.1, a.1,
+            "{} / {option} : première section différente : {}",
+            c.name, e.0
+        );
+    }
+}
+
+struct Sandbox {
+    _tmp: tempfile::TempDir,
+    repo: std::path::PathBuf,
+    mock: Option<std::path::PathBuf>,
+    config: std::path::PathBuf,
+}
+
+fn sandbox(c: &Case) -> Sandbox {
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    copy_dir(&fx.join(c.repo), &repo);
+    let mock = c.mock.map(|m| {
+        let d = tmp.path().join("mock");
+        copy_dir(&fx.join(m), &d);
+        d
+    });
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\nconcurrency = 1\n",
+    )
+    .unwrap();
+    Sandbox {
+        _tmp: tmp,
+        repo,
+        mock,
+        config,
+    }
+}
+
+/// Bilan et sorties d'un `build` de l'arbre (modifié ou non) avec `--jobs jobs`.
+fn built(
+    c: &Case,
+    args: &[&str],
+    jobs: Option<usize>,
+    modified: bool,
+) -> (String, Vec<(&'static str, String)>) {
+    let sb = sandbox(c);
+    if modified {
+        support::apply_case(&sb.repo, c);
+    }
+    step(c, &sb.repo, &sb.config, sb.mock.as_deref(), args, jobs)
+}
+
+/// AC-075-2 : `build --no-llm` donne le même graphe quel que soit `--jobs`.
+#[test]
+fn req075_ac2_build_no_llm_meme_graphe_quel_que_soit_jobs() {
+    for c in CASES {
+        let reference = built(c, &["build", "--no-llm"], None, false);
+        for j in [1, 2, 8] {
+            let actual = built(c, &["build", "--no-llm"], Some(j), false);
+            compare(
+                c,
+                &format!("build --no-llm --jobs {j}"),
+                &reference,
+                &actual,
+            );
+        }
+    }
+}
+
+/// AC-075-2 : `build` avec le mock (`concurrency = 1`) donne le même graphe quel que soit `--jobs`.
+#[test]
+fn req075_ac2_build_mock_meme_graphe_quel_que_soit_jobs() {
+    for c in CASES {
+        let reference = built(c, &["build"], None, false);
+        for j in [1, 8] {
+            let actual = built(c, &["build"], Some(j), false);
+            compare(c, &format!("build --jobs {j}"), &reference, &actual);
+        }
+    }
+}
+
+/// AC-075-2 : l'`update` du scénario de REQ-065 avec `--jobs 1` et `--jobs 8` donne les sorties d'un
+/// `build` du même arbre ; les deux `update` ont la même ligne de bilan.
+#[test]
+fn req075_ac2_update_meme_graphe_quel_que_soit_jobs() {
+    for c in CASES {
+        let reference = built(c, &["build"], None, true);
+        let mut bilans = Vec::new();
+        for j in [1, 8] {
+            let sb = sandbox(c);
+            let m = sb.mock.as_deref();
+            step(c, &sb.repo, &sb.config, m, &["build"], Some(j));
+            support::apply_case(&sb.repo, c);
+            let actual = step(c, &sb.repo, &sb.config, m, &["update"], Some(j));
+            compare(
+                c,
+                &format!("update --jobs {j}"),
+                &(actual.0.clone(), reference.1.clone()),
+                &actual,
+            );
+            bilans.push(actual.0);
+        }
+        assert_eq!(
+            bilans[0], bilans[1],
+            "{} / update : ligne de bilan différente entre --jobs 1 et --jobs 8",
+            c.name
+        );
+    }
+}
+
 /// AC-060-5 : un `update` tué pendant l'enrichissement garde les fichiers déjà enregistrés.
 #[test]
 fn req060_ac5_killed_update_keeps_enriched_files() {

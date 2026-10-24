@@ -580,6 +580,60 @@ fn perf_req065_ac2_oracle_gros_depots() {
     }
 }
 
+/// AC-074-4 : `build --no-llm --verbose` avec `--jobs 1` puis sans `--jobs` : durées des lignes
+/// `parcours:` et `structure: fin` affichées, exports égaux entre eux et à l'oracle de la 0.20.0.
+#[test]
+#[ignore]
+fn perf_req074_ac4_parcours_et_structure() {
+    let _g = serial();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["gen_repo", "gen_js"] {
+        let root = base.join(format!("target/perf-req074-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let mock = root.join("mock");
+        if name == "gen_repo" {
+            gen_repo::generate(&repo, &mock);
+        } else {
+            gen_js::generate(&repo, &mock);
+        }
+        let config = root.join("config.toml");
+        std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        let f = Fixture { repo, config, mock };
+        let result = std::panic::catch_unwind(|| {
+            let mut hashes = Vec::new();
+            for args in [
+                &["build", "--no-llm", "--verbose", "--jobs", "1"][..],
+                &["build", "--no-llm", "--verbose"][..],
+            ] {
+                let _ = std::fs::remove_dir_all(f.repo.join(".nephila"));
+                let (d, out) = timed(&f, args);
+                let err = String::from_utf8_lossy(&out.stderr);
+                let lines: Vec<&str> = err
+                    .lines()
+                    .filter(|l| l.contains("parcours:") || l.contains("structure: fin"))
+                    .collect();
+                assert_eq!(lines.len(), 2, "{name} {args:?} : {err}");
+                eprintln!("{name} {args:?} : total {d:?}");
+                for l in lines {
+                    eprintln!("  {l}");
+                }
+                hashes.push(export_hash(&f));
+            }
+            assert_eq!(hashes[0], hashes[1], "{name} : exports différents");
+            let oracle = ORACLE_GROS_DEPOTS
+                .iter()
+                .find(|(n, s, _)| *n == name && *s == "build")
+                .unwrap();
+            assert_eq!(hashes[0], oracle.2, "{name} : écart d'oracle");
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
 /// Mesures de la 0.20.0 (AC-063-5), figées sur HEAD : place utilisée U₀ et Σ `length(context)` C₀.
 /// U varie de ~0,3 % d'un lancement à l'autre (ordre d'écriture des fils) : on fige le minimum des mesures relevées sur HEAD (six lancements).
 const U0_JS: i64 = 162_426_880;
