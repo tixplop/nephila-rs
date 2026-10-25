@@ -142,7 +142,7 @@ pub fn run(
         )?;
     } else {
         for n in shown {
-            writeln!(out, "{}", line(n))?;
+            writeln!(out, "{}", crate::escape::data(&line(n)))?;
         }
         if remaining > 0 {
             writeln!(out, "{}", super::remaining_line(remaining))?;

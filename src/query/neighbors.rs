@@ -159,7 +159,11 @@ pub fn run(
         return Ok(());
     }
     if total == 0 {
-        writeln!(out, "aucun voisin pour {}", start.qualified)?;
+        writeln!(
+            out,
+            "{}",
+            crate::escape::data(&format!("aucun voisin pour {}", start.qualified))
+        )?;
         return Ok(());
     }
     for (title, list) in [("utilise :", uses), ("utilisé par :", used_by)] {
@@ -173,7 +177,8 @@ pub fn run(
             } else {
                 String::new()
             };
-            writeln!(out, "  {} {}{at}", f.kind, super::describe(&f.node))?;
+            let l = format!("  {} {}{at}", f.kind, super::describe(&f.node));
+            writeln!(out, "{}", crate::escape::data(&l))?;
         }
     }
     if remaining > 0 {

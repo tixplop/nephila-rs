@@ -188,7 +188,7 @@ pub fn run(
             .collect();
         writeln!(out, "{}", json!({"path": list}))?;
     } else if steps.is_empty() {
-        writeln!(out, "{}", super::describe(&a))?;
+        writeln!(out, "{}", crate::escape::data(&super::describe(&a)))?;
     } else {
         for s in &steps {
             let verb = if s.reversed {
@@ -196,7 +196,8 @@ pub fn run(
             } else {
                 s.kind.as_str()
             };
-            writeln!(out, "{} {verb} {}", s.from.qualified, s.to.qualified)?;
+            let l = format!("{} {verb} {}", s.from.qualified, s.to.qualified);
+            writeln!(out, "{}", crate::escape::data(&l))?;
         }
     }
     Ok(())

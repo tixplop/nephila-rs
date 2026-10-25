@@ -65,7 +65,10 @@ pub fn require(store: &Store, name: &str) -> Result<Node> {
             "aucun résultat : nœud « {name} » introuvable (essayez `nephila query search`)"
         ))),
         Lookup::Ambiguous(c) => {
-            let list: Vec<String> = c.iter().map(|n| format!("  {}", n.id)).collect();
+            let list: Vec<String> = c
+                .iter()
+                .map(|n| format!("  {}", crate::escape::data(&n.id)))
+                .collect();
             Err(Error::Message(format!(
                 "« {name} » est ambigu, précisez avec le nom qualifié :\n{}",
                 list.join("\n")

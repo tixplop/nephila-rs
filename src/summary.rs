@@ -177,19 +177,20 @@ pub fn run(repo: &Path, as_json: bool, out: &mut Out) -> Result<()> {
             _ => qualified.to_string(),
         };
         if deps.is_empty() {
-            writeln!(out, "  {name}")?;
+            writeln!(out, "{}", crate::escape::data(&format!("  {name}")))?;
         } else {
-            writeln!(out, "  {name} -> {}", deps.join(", "))?;
+            let l = format!("  {name} -> {}", deps.join(", "));
+            writeln!(out, "{}", crate::escape::data(&l))?;
         }
     }
     writeln!(out, "Nœuds les plus reliés")?;
     for n in list("top_nodes") {
-        writeln!(
-            out,
+        let l = format!(
             "  {} (degré {})",
             n["id"].as_str().unwrap_or("?"),
             n["degree"]
-        )?;
+        );
+        writeln!(out, "{}", crate::escape::data(&l))?;
     }
     writeln!(out, "Thèmes")?;
     let themes = list("themes");
@@ -197,12 +198,12 @@ pub fn run(repo: &Path, as_json: bool, out: &mut Out) -> Result<()> {
         writeln!(out, "  aucun thème (graphe non enrichi)")?;
     }
     for t in themes {
-        writeln!(
-            out,
+        let l = format!(
             "  {} ({} mentions)",
             t["concept"].as_str().unwrap_or("?"),
             t["mentions"]
-        )?;
+        );
+        writeln!(out, "{}", crate::escape::data(&l))?;
     }
     Ok(())
 }

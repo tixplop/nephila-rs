@@ -88,5 +88,5 @@ pub fn report_error(e: &Error) {
 
 /// Écrit `avertissement: <message>` sur stderr.
 pub fn warn(msg: &str) {
-    eprintln!("avertissement: {msg}");
+    eprintln!("avertissement: {}", crate::escape::data(msg));
 }

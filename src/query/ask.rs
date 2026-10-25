@@ -204,10 +204,11 @@ pub fn run(
         let nodes: Vec<Value> = cited.iter().map(to_json).collect();
         writeln!(out, "{}", json!({"answer": answer, "nodes": nodes}))?;
     } else {
-        writeln!(out, "{answer}")?;
+        writeln!(out, "{}", crate::escape::ask_answer(&answer))?;
         writeln!(out, "Nœuds cités :")?;
         for n in &cited {
-            writeln!(out, "- {}", super::describe(n))?;
+            let l = format!("- {}", super::describe(n));
+            writeln!(out, "{}", crate::escape::data(&l))?;
         }
     }
     Ok(())
