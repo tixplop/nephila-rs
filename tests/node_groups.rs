@@ -676,6 +676,32 @@ fn req107_ac3_element_ecarte_repete_compte_et_ecrit_une_fois() {
     assert_eq!(warns, [want.as_str()], "{err}");
 }
 
+#[test]
+fn req107_ac5_quatre_elements_distincts_dans_l_ordre_sur_trois_appels() {
+    let env = Env::mock(&[(BIG, java("Big", 400))], "");
+    let fixtures = [
+        r#"{"version":2,"summaries":[{"node":"type:N1","summary":"s"}],"concepts":[{"name":"x","summary":"s","sections":[]}]}"#,
+        r#"{"version":2,"summaries":[{"node":"type:N1","summary":"s"}],"concepts":[{"name":"y","summary":"s","sections":[]}]}"#,
+        r#"{"version":2,"summaries":[{"node":"type:N2","summary":"s"}],"concepts":[{"name":"x","summary":"s","sections":[]}]}"#,
+    ];
+    for (i, body) in fixtures.iter().enumerate() {
+        let f = env.mock.join(format!("{BIG}.{}.json", i + 1));
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, body).unwrap();
+    }
+    let o = env.run(&["build"], &[]);
+    let (_, err) = text(&o);
+    assert!(o.status.success(), "{err}");
+    let want = format!(
+        "avertissement: {BIG} : 4 élément(s) d'enrichissement écarté(s) : résumé pour type:N1 (nœud hors liste) ; concept x (fichier non Markdown) ; concept y (fichier non Markdown) ; résumé pour type:N2 (nœud hors liste)"
+    );
+    let warns: Vec<&str> = err
+        .lines()
+        .filter(|l| l.contains(BIG) && l.contains("élément(s) d'enrichissement écarté(s)"))
+        .collect();
+    assert_eq!(warns, [want.as_str()], "{err}");
+}
+
 /// `n` caractères de remplissage (lettres et espaces), en lignes de 49 caractères au plus.
 fn filler(n: usize) -> String {
     let base: Vec<char> = "Lorem ipsum dolor sit amet consectetur adipiscing elit "

@@ -1381,15 +1381,38 @@ fn REQ079_AC7_readme_puce_vers_024_et_ligne_du_tableau() {
     }
     // REQ-102, REQ-103 : collision de noms après conversion, phrase en fin de cellule.
     assert!(
-        row.trim_end().ends_with(
-            "Deux noms identiques après conversion : le fichier déjà indexé reste retenu, un fichier illisible est ignoré et laisse la place au suivant, que l'avertissement nomme par son nom réel. |"
+        row.contains(
+            "Deux noms identiques après conversion : le fichier déjà indexé reste retenu, un fichier illisible est ignoré et laisse la place au suivant, que l'avertissement nomme par son nom réel. Les déclarations imbriquées"
         ),
-        "ligne 0.24 : phrase de collision absente en fin de cellule"
+        "ligne 0.24 : phrase de collision absente avant la phrase d'imbrication"
     );
     assert!(
         !lines.iter().any(|l| l.starts_with("| 0.24.1 |")),
         "aucune ligne 0.24.1"
     );
+}
+
+#[test]
+fn req104_req105_readme_declarations_imbriquees_ignorees() {
+    let readme = repo_file("README.md");
+    assert!(readme.contains("déclarations imbriquées au-delà de 1000 niveaux ignorées"));
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| 0.24 |"))
+        .expect("ligne 0.24");
+    assert!(
+        row.trim_end().ends_with("Les déclarations imbriquées au-delà de 1000 niveaux sont ignorées avec un avertissement, le reste du fichier est indexé ; les avertissements de l'analyse sont écrits triés par chemin, quel que soit --jobs. |"),
+        "{row}"
+    );
+    assert!(readme.contains(
+        "avertissement: <fichier> : déclarations imbriquées au-delà de 1000 niveaux ignorées"
+    ));
+    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
+    for banned in ["profondeur", "récursion"] {
+        for l in readme.lines().filter(|l| l.contains("imbriquées")) {
+            assert!(!l.contains(banned), "{l}");
+        }
+    }
 }
 
 #[test]
