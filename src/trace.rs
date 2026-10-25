@@ -68,6 +68,7 @@ pub fn classify(e: &crate::error::Error) -> String {
         Error::Network(_) => "réseau",
         Error::InvalidKey(_) => "clé refusée",
         Error::Rejected { .. } => "requête refusée",
+        Error::Redirected { .. } => "requête redirigée",
         Error::Truncated(_) => "tronquée",
         Error::Message(_) | Error::Format(_) | Error::TooManyCalls { .. } => "erreur",
     };

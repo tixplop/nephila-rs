@@ -50,12 +50,15 @@ impl Policy {
                     .consecutive_network
                     .min(self.network_total.saturating_sub(ticket));
             }
-            Some(e @ (Error::InvalidKey(_) | Error::Rejected { .. })) => {
+            Some(
+                e @ (Error::InvalidKey(_) | Error::Rejected { .. } | Error::Redirected { .. }),
+            ) => {
                 if self.stop_cause.is_none() {
                     self.refused = Some(e.clone());
                     self.stop_cause = Some(
                         match e {
                             Error::InvalidKey(_) => "clé d'API refusée par le fournisseur",
+                            Error::Redirected { .. } => "requête redirigée par le fournisseur",
                             _ => "requête refusée par le fournisseur",
                         }
                         .to_string(),
@@ -292,7 +295,7 @@ fn trace_detail(e: &Error) -> String {
     match e {
         Error::Message(m) | Error::Format(m) => m.split(" : ").next().unwrap_or("").to_string(),
         Error::Truncated(_) => TRUNCATED.to_string(),
-        Error::Rejected { trace, .. } => trace.clone(),
+        Error::Rejected { trace, .. } | Error::Redirected { trace, .. } => trace.clone(),
         other => other.to_string(),
     }
 }
@@ -1030,7 +1033,12 @@ pub(crate) fn enrich_with_stop(
                             match outcome {
                                 Outcome::Failed(path, e) => {
                                     // Clé ou requête refusée (E-12, E-19) : l'erreur finale la dit ; aucun fichier n'est nommé.
-                                    if !matches!(e, Error::InvalidKey(_) | Error::Rejected { .. }) {
+                                    if !matches!(
+                                        e,
+                                        Error::InvalidKey(_)
+                                            | Error::Rejected { .. }
+                                            | Error::Redirected { .. }
+                                    ) {
                                         notes.push(format!("{path} : {e}"));
                                     }
                                     report.failed += 1;
@@ -1068,7 +1076,12 @@ pub(crate) fn enrich_with_stop(
                                 Err(e) => {
                                     entry.failed = true;
                                     // Clé ou requête refusée (E-12, E-19) : l'erreur finale la dit ; aucun fichier n'est nommé.
-                                    if !matches!(e, Error::InvalidKey(_) | Error::Rejected { .. }) {
+                                    if !matches!(
+                                        e,
+                                        Error::InvalidKey(_)
+                                            | Error::Rejected { .. }
+                                            | Error::Redirected { .. }
+                                    ) {
                                         notes.push(format!("{} : {e}", file.path));
                                     }
                                     report.failed += 1;
@@ -1744,6 +1757,23 @@ mod tests {
             p.stop_cause.as_deref(),
             Some("requête refusée par le fournisseur")
         );
+    }
+
+    #[test]
+    fn req092_redirect_stops_at_first_with_its_own_cause() {
+        let r = Error::Redirected {
+            message: "openai redirige (HTTP 302) sans destination ; corrigez base_url".into(),
+            trace: "openai redirige (HTTP 302)".into(),
+        };
+        let mut p = Policy::default();
+        assert!(p.record(0, Some(&r)));
+        assert_eq!(
+            p.stop_cause.as_deref(),
+            Some("requête redirigée par le fournisseur")
+        );
+        assert_eq!(p.refused, Some(r.clone()));
+        assert_eq!(trace_detail(&r), "openai redirige (HTTP 302)");
+        assert_eq!(crate::trace::classify(&r), "requête redirigée");
     }
 
     #[test]

@@ -11,6 +11,9 @@ pub enum Error {
     /// retentée, arrête l'envoi dès le premier appel. `message` est le texte E-19 complet,
     /// `trace` le détail fixe de la trace (sans rien recopier de la réponse).
     Rejected { message: String, trace: String },
+    /// Réponse HTTP 3xx du fournisseur (REQ-092, DEC-100) : jamais suivie ni retentée, arrête
+    /// l'envoi dès le premier appel. Mêmes champs que `Rejected`.
+    Redirected { message: String, trace: String },
     /// Erreur réseau, quota ou erreur serveur du fournisseur.
     Network(String),
     /// Délai d'appel dépassé (`timeout_secs`).
@@ -58,6 +61,7 @@ impl fmt::Display for Error {
         match self {
             Error::InvalidKey(m)
             | Error::Rejected { message: m, .. }
+            | Error::Redirected { message: m, .. }
             | Error::Network(m)
             | Error::Timeout(m)
             | Error::Message(m)

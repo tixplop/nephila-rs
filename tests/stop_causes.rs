@@ -1,4 +1,4 @@
-//! Causes d'arrêt de l'envoi : requête refusée (REQ-091, DEC-099), contre le faux serveur.
+//! Causes d'arrêt de l'envoi : requête refusée (REQ-091, DEC-099), redirection (REQ-092, DEC-100), contre le faux serveur.
 
 #[allow(dead_code)]
 #[path = "support/fake_server.rs"]
@@ -304,4 +304,143 @@ fn req091_ac7_empty_body_and_long_message() {
     assert!(middle.chars().count() <= 200, "{}", middle.chars().count());
     assert!(middle.ends_with('…'), "{middle}");
     assert!(!middle.contains('\n') && !middle.contains('\t'));
+}
+
+fn redirect_path(provider: &str) -> &'static str {
+    if provider == "anthropic" {
+        "/v1/messages"
+    } else {
+        "/v1/chat/completions"
+    }
+}
+
+/// Serveur A qui redirige toute requête vers B ; B ne doit jamais être contacté.
+fn redirecting(provider: &str, status: u16, b: &FakeServer) -> FakeServer {
+    let target = format!("{}{}", b.base_url, redirect_path(provider));
+    FakeServer::start_replies(
+        (0..8)
+            .map(|_| Reply::with_header(status, "", "Location", &target))
+            .collect(),
+    )
+}
+
+fn assert_redirect_line(o: &Output, provider: &str, code: u16, dest: &str, ctx: &str) {
+    let err = text(&o.stderr);
+    let all = lines(o);
+    let errors = error_lines(o);
+    assert_eq!(errors.len(), 1, "{ctx}: {err}");
+    assert_eq!(all.last().unwrap(), &errors[0], "{ctx}: {err}");
+    assert_eq!(
+        errors[0],
+        format!("erreur: {provider} redirige (HTTP {code}) {dest} ; corrigez base_url"),
+        "{ctx}"
+    );
+    assert!(!err.contains("panne réseau"), "{ctx}: {err}");
+    assert!(!err.contains("envoi interrompu"), "{ctx}: {err}");
+    assert!(!err.contains("avertissement:"), "{ctx}: {err}");
+    assert_eq!(o.status.code(), Some(1), "{ctx}");
+}
+
+#[test]
+fn req092_ac1_redirect_is_never_followed_build_and_ask() {
+    for provider in ["openai", "anthropic"] {
+        let b = FakeServer::start_replies(vec![]);
+        let a = redirecting(provider, 302, &b);
+        let env = Env::new(provider, &a, 3, 1);
+        let o = env.run(&["build"]);
+        assert_eq!(posts(&a), 1, "{provider}");
+        assert_eq!(b.connections(), 0, "{provider}");
+        let dest = format!("vers {}{}", b.base_url, redirect_path(provider));
+        assert_redirect_line(&o, provider, 302, &dest, provider);
+
+        let a = redirecting(provider, 302, &b);
+        let env = Env::new(provider, &a, 1, 1);
+        env.add_class();
+        assert!(env.run(&["build", "--no-llm"]).status.success());
+        let o = env.run(&["query", "ask", "Alpha"]);
+        assert_eq!(posts(&a), 1, "ask {provider}");
+        assert_eq!(b.connections(), 0, "ask {provider}");
+        assert!(o.stdout.is_empty(), "ask {provider}");
+        assert_eq!(lines(&o).len(), 1, "ask {provider}: {:?}", lines(&o));
+        assert_redirect_line(&o, provider, 302, &dest, &format!("ask {provider}"));
+    }
+}
+
+#[test]
+fn req092_ac2_other_statuses_and_missing_location() {
+    for code in [301u16, 307, 308] {
+        let b = FakeServer::start_replies(vec![]);
+        let a = redirecting("openai", code, &b);
+        let env = Env::new("openai", &a, 3, 1);
+        let o = env.run(&["build"]);
+        assert_eq!(posts(&a), 1, "{code}");
+        assert_eq!(b.connections(), 0, "{code}");
+        let dest = format!("vers {}{}", b.base_url, redirect_path("openai"));
+        assert_redirect_line(&o, "openai", code, &dest, &code.to_string());
+    }
+    for loc in [None, Some("  \t ")] {
+        let reply = |_| match loc {
+            None => Reply::status(302, ""),
+            Some(v) => Reply::with_header(302, "", "Location", v),
+        };
+        let a = FakeServer::start_replies((0..6).map(reply).collect());
+        let env = Env::new("openai", &a, 3, 1);
+        let o = env.run(&["build"]);
+        assert_eq!(posts(&a), 1, "{loc:?}");
+        assert_redirect_line(&o, "openai", 302, "sans destination", &format!("{loc:?}"));
+    }
+}
+
+#[test]
+fn req092_ac4_long_location_is_truncated() {
+    let long = format!("http://h/{}\t{}", "a".repeat(150), "b".repeat(150));
+    let a = FakeServer::start_replies(
+        (0..6)
+            .map(|_| Reply::with_header(302, "", "Location", &long))
+            .collect(),
+    );
+    let env = Env::new("openai", &a, 3, 1);
+    let o = env.run(&["build"]);
+    let last = lines(&o).last().unwrap().clone();
+    let middle = last
+        .strip_prefix("erreur: openai redirige (HTTP 302) vers ")
+        .and_then(|r| r.strip_suffix(" ; corrigez base_url"))
+        .unwrap_or_else(|| panic!("{last}"));
+    assert!(
+        middle.chars().count() <= 200 && middle.ends_with('…'),
+        "{middle}"
+    );
+    assert!(!middle.contains('\t'));
+}
+
+#[test]
+fn req092_ac3_verbose_trace_has_the_redirect_label_and_no_wait() {
+    let b = FakeServer::start_replies(vec![]);
+    let a = redirecting("openai", 302, &b);
+    let env = Env::new("openai", &a, 3, 1);
+    let o = env.run(&["build", "--verbose"]);
+    let err = text(&o.stderr);
+    let all = lines(&o);
+    let end = all
+        .iter()
+        .find(|l| l.contains("llm enrich fin"))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(
+        end.contains(" [1/1] requête redirigée ")
+            && end.ends_with(" ms : openai redirige (HTTP 302)"),
+        "{end}"
+    );
+    assert!(!err.contains("llm enrich attente"), "{err}");
+    assert!(
+        all.iter()
+            .filter(|l| l.starts_with("trace:"))
+            .all(|l| !l.contains(&b.base_url[b.base_url.rfind(':').unwrap()..])),
+        "{err}"
+    );
+    assert!(
+        all.iter().any(|l| l.ends_with(
+            "politique: arrêt de l'envoi (requête redirigée par le fournisseur), 2 fichiers non envoyés"
+        )),
+        "{err}"
+    );
 }

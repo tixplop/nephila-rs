@@ -99,6 +99,8 @@ pub fn agent(timeout_secs: u64, concurrency: usize, tls: &Tls) -> ureq::Agent {
         .tls_config(client_config(tls))
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(timeout_secs))
+        // Aucune redirection suivie (REQ-092, DEC-100) : ni requête ni clé vers une autre adresse.
+        .redirects(0)
         .build()
 }
 
@@ -262,6 +264,15 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
         None => req.call(),
     };
     match result {
+        Ok(resp) if (300..400).contains(&resp.status()) => {
+            // Corps non lu : la connexion n'est pas réutilisée, rien n'est suivi (E-20).
+            let location = resp.header("location").map(provider_text);
+            Attempt::Done(Err(redirected(
+                provider,
+                resp.status(),
+                location.as_deref(),
+            )))
+        }
         Ok(resp) => match resp.into_string() {
             Ok(text) => Attempt::Done(Ok(text)),
             Err(e) => match e.kind() {
@@ -378,6 +389,19 @@ fn rejected(provider: &str, code: u16, url: &str, detail: Option<&str>) -> Error
     };
     Error::Rejected {
         message,
+        trace: head,
+    }
+}
+
+/// Redirection (E-20) : texte complet et détail fixe de la trace (sans `Location`).
+fn redirected(provider: &str, code: u16, location: Option<&str>) -> Error {
+    let head = format!("{provider} redirige (HTTP {code})");
+    let dest = match location {
+        Some(l) if !l.is_empty() => format!("vers {l}"),
+        _ => "sans destination".to_string(),
+    };
+    Error::Redirected {
+        message: format!("{head} {dest} ; corrigez base_url"),
         trace: head,
     }
 }
