@@ -650,6 +650,32 @@ fn req047_ac11_une_seule_ligne_par_fichier() {
     assert!(warns[0].starts_with(&prefix), "{}", warns[0]);
 }
 
+#[test]
+fn req107_ac3_element_ecarte_repete_compte_et_ecrit_une_fois() {
+    let env = Env::mock(&[(BIG, java("Big", 400))], "");
+    for call in [1, 2] {
+        let f = env.mock.join(format!("{BIG}.{call}.json"));
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(
+            f,
+            serde_json::json!({"version": 2, "summaries": [], "concepts": [{"name": "x", "sections": []}]})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    let o = env.run(&["build"], &[]);
+    let (_, err) = text(&o);
+    assert!(o.status.success(), "{err}");
+    let want = format!(
+        "avertissement: {BIG} : 1 élément(s) d'enrichissement écarté(s) : concept x (fichier non Markdown)"
+    );
+    let warns: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("avertissement:") && l.contains(BIG))
+        .collect();
+    assert_eq!(warns, [want.as_str()], "{err}");
+}
+
 /// `n` caractères de remplissage (lettres et espaces), en lignes de 49 caractères au plus.
 fn filler(n: usize) -> String {
     let base: Vec<char> = "Lorem ipsum dolor sit amet consectetur adipiscing elit "

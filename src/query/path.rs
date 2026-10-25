@@ -42,13 +42,13 @@ fn passive(kind: EdgeKind) -> &'static str {
 fn undirected(g: &impl Graph, cur: &str) -> Result<Vec<(String, EdgeKind, bool)>> {
     let mut adj: Vec<(String, EdgeKind, bool)> = g
         .edges_at(cur, true)?
-        .into_iter()
-        .map(|(o, k)| (o, k, false))
+        .iter()
+        .map(|(o, k)| (o.clone(), *k, false))
         .collect();
     adj.extend(
         g.edges_at(cur, false)?
-            .into_iter()
-            .map(|(o, k)| (o, k, true)),
+            .iter()
+            .map(|(o, k)| (o.clone(), *k, true)),
     );
     adj.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_str().cmp(b.1.as_str())));
     Ok(adj)

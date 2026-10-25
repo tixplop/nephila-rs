@@ -33,11 +33,11 @@ struct Found {
 fn group(id: &str, g: &impl Graph) -> Result<Vec<String>> {
     let mut out = vec![id.to_string()];
     if g.node(id)?.is_some_and(|n| n.kind == NodeKind::Type) {
-        for (target, kind) in g.edges_at(id, true)? {
+        for &(ref target, kind) in g.edges_at(id, true)?.iter() {
             if kind == EdgeKind::Contains
-                && g.node(&target)?.is_some_and(|n| n.kind == NodeKind::Method)
+                && g.node(target)?.is_some_and(|n| n.kind == NodeKind::Method)
             {
-                out.push(target);
+                out.push(target.clone());
             }
         }
     }
@@ -60,18 +60,18 @@ fn explore(start: &Node, dir: Direction, depth: usize, g: &impl Graph) -> Result
         for id in &frontier {
             let members: HashSet<String> = group(id, g)?.into_iter().collect();
             for member in &members {
-                for (far, kind) in g.edges_at(member, outgoing)? {
-                    if members.contains(&far) {
+                for &(ref far, kind) in g.edges_at(member, outgoing)?.iter() {
+                    if members.contains(far) {
                         continue;
                     }
-                    let Some(node) = g.node(&far)? else {
+                    let Some(node) = g.node(far)? else {
                         continue;
                     };
                     // Une même cible peut apparaître par plusieurs genres de lien.
                     if kept.contains(&(far.clone(), kind)) {
                         continue;
                     }
-                    if visited.contains(&far) && !kept_nodes.contains(&far) {
+                    if visited.contains(far) && !kept_nodes.contains(far) {
                         continue;
                     }
                     kept.insert((far.clone(), kind));
@@ -82,7 +82,7 @@ fn explore(start: &Node, dir: Direction, depth: usize, g: &impl Graph) -> Result
                         node,
                     });
                     if in_next.insert(far.clone()) {
-                        next.push(far);
+                        next.push(far.clone());
                     }
                 }
             }
@@ -203,7 +203,7 @@ mod tests {
             Ok(self.nodes.get(id).cloned())
         }
 
-        fn edges_at(&self, id: &str, outgoing: bool) -> Result<Vec<(String, EdgeKind)>> {
+        fn edges_at(&self, id: &str, outgoing: bool) -> Result<crate::query::graph::Adjacent> {
             let mut v: Vec<(String, &'static str)> = self
                 .edges
                 .iter()
@@ -216,7 +216,8 @@ mod tests {
             v.sort();
             v.into_iter()
                 .map(|(o, k)| Ok((o, EdgeKind::parse(k)?)))
-                .collect()
+                .collect::<Result<Vec<_>>>()
+                .map(Into::into)
         }
     }
 
@@ -308,20 +309,20 @@ mod tests {
             for id in &frontier {
                 let members: HashSet<String> = group(id, g)?.into_iter().collect();
                 for member in &members {
-                    for (far, kind) in g.edges_at(member, outgoing)? {
-                        if members.contains(&far) {
+                    for &(ref far, kind) in g.edges_at(member, outgoing)?.iter() {
+                        if members.contains(far) {
                             continue;
                         }
-                        let Some(node) = g.node(&far)? else {
+                        let Some(node) = g.node(far)? else {
                             continue;
                         };
                         if level_found
                             .iter()
-                            .any(|f| f.node.id == far && f.kind == kind)
+                            .any(|f| &f.node.id == far && f.kind == kind)
                         {
                             continue;
                         }
-                        if visited.contains(&far) && !level_found.iter().any(|f| f.node.id == far) {
+                        if visited.contains(far) && !level_found.iter().any(|f| &f.node.id == far) {
                             continue;
                         }
                         level_found.push(Found {
@@ -329,8 +330,8 @@ mod tests {
                             depth: level,
                             node,
                         });
-                        if !next.contains(&far) {
-                            next.push(far);
+                        if !next.contains(far) {
+                            next.push(far.clone());
                         }
                     }
                 }

@@ -1,5 +1,7 @@
 //! Découpage des gros fichiers (REQ-007) : coupes sur fins de ligne, en-tête répété et fusion.
 
+use std::collections::HashSet;
+
 use crate::llm::enrich::{Concept, Enrichment};
 
 /// Nombre de lignes de tête examinées pour trouver package, imports et type englobant.
@@ -113,15 +115,18 @@ pub fn split_spans(text: &str, max_chars: usize) -> Vec<(String, usize)> {
 }
 
 /// Fusionne les enrichissements des morceaux d'un même fichier : premier résumé non vide par
-/// nœud, concepts fusionnés par nom (premier résumé non vide, sections unies), rejets cumulés.
+/// nœud, concepts fusionnés par nom (premier résumé non vide, sections unies), rejets cumulés
+/// sans doublon (égalité exacte, ordre de première apparition).
 pub fn merge_enrichments(parts: Vec<Enrichment>) -> Enrichment {
     let mut out = Enrichment::default();
+    let mut summarized: HashSet<String> = HashSet::new();
+    let mut seen_rejected: HashSet<String> = HashSet::new();
     for p in parts {
         for (node, summary) in p.summaries {
             if summary.trim().is_empty() {
                 continue;
             }
-            if !out.summaries.iter().any(|(n, _)| *n == node) {
+            if summarized.insert(node.clone()) {
                 out.summaries.push((node, summary));
             }
         }
@@ -144,7 +149,12 @@ pub fn merge_enrichments(parts: Vec<Enrichment>) -> Enrichment {
                 }),
             }
         }
-        out.rejected.extend(p.rejected);
+        for r in p.rejected {
+            if !seen_rejected.contains(&r) {
+                seen_rejected.insert(r.clone());
+                out.rejected.push(r);
+            }
+        }
     }
     out
 }
@@ -197,6 +207,122 @@ mod tests {
         assert_eq!(m.concepts.len(), 1);
         assert_eq!(m.concepts[0].summary.as_deref(), Some("def"));
         assert_eq!(m.concepts[0].sections, ["section:g#a", "section:g#b"]);
+    }
+
+    /// `merge_enrichments` de la 0.24.0 (oracle).
+    fn merge_oracle(parts: Vec<Enrichment>) -> Enrichment {
+        let mut out = Enrichment::default();
+        for p in parts {
+            for (node, summary) in p.summaries {
+                if summary.trim().is_empty() {
+                    continue;
+                }
+                if !out.summaries.iter().any(|(n, _)| *n == node) {
+                    out.summaries.push((node, summary));
+                }
+            }
+            for c in p.concepts {
+                match out.concepts.iter_mut().find(|e| e.name == c.name) {
+                    Some(e) => {
+                        if e.summary.is_none() {
+                            e.summary = c.summary;
+                        }
+                        for s in c.sections {
+                            if !e.sections.contains(&s) {
+                                e.sections.push(s);
+                            }
+                        }
+                    }
+                    None => out.concepts.push(Concept {
+                        name: c.name,
+                        summary: c.summary,
+                        sections: c.sections,
+                    }),
+                }
+            }
+            out.rejected.extend(p.rejected);
+        }
+        out
+    }
+
+    #[test]
+    fn req107_ac1_merge_enrichments_egale_l_oracle_sur_entrees_generees() {
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..300 {
+            let mut parts = Vec::new();
+            for _ in 0..(1 + next(8)) {
+                let summaries = (0..next(8))
+                    .map(|_| {
+                        let text = match next(4) {
+                            0 => String::new(),
+                            1 => "  ".to_string(),
+                            _ => format!("r{}", next(5)),
+                        };
+                        (format!("type:N{}", next(6)), text)
+                    })
+                    .collect();
+                let concepts = (0..next(4))
+                    .map(|_| {
+                        let secs: Vec<String> = (0..next(3))
+                            .map(|_| format!("section:g#{}", next(3)))
+                            .collect();
+                        let summary = (next(2) == 0).then(|| format!("d{}", next(3)));
+                        Concept {
+                            name: format!("c{}", next(3)),
+                            summary,
+                            sections: secs,
+                        }
+                    })
+                    .collect();
+                let rejected = (0..next(5)).map(|_| format!("rej {}", next(4))).collect();
+                parts.push(Enrichment {
+                    summaries,
+                    concepts,
+                    rejected,
+                });
+            }
+            let want = merge_oracle(parts.clone());
+            let got = merge_enrichments(parts);
+            assert_eq!(got.summaries, want.summaries);
+            assert_eq!(got.concepts, want.concepts);
+            let mut seen = HashSet::new();
+            let dedup: Vec<String> = want
+                .rejected
+                .into_iter()
+                .filter(|r| seen.insert(r.clone()))
+                .collect();
+            assert_eq!(got.rejected, dedup);
+        }
+    }
+
+    #[test]
+    fn req107_ac2_merge_enrichments_vingt_mille_noeuds_en_temps_lineaire() {
+        let parts: Vec<Enrichment> = (0..50)
+            .map(|p| {
+                let mut summaries: Vec<(String, String)> = (0..400)
+                    .map(|i| (format!("type:P{p}N{i}"), format!("s{p}-{i}")))
+                    .collect();
+                summaries.extend((0..400).map(|i| (format!("type:P0N{i}"), "bis".to_string())));
+                Enrichment {
+                    summaries,
+                    concepts: vec![],
+                    rejected: vec![],
+                }
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let m = merge_enrichments(parts);
+        assert!(t.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(m.summaries.len(), 20_000);
+        assert_eq!(m.summaries[0], ("type:P0N0".into(), "s0-0".into()));
+        assert_eq!(m.summaries[400], ("type:P1N0".into(), "s1-0".into()));
+        assert_eq!(m.summaries[19_999].0, "type:P49N399");
     }
 
     #[test]
