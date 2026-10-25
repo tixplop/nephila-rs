@@ -334,3 +334,119 @@ fn req079_ac8_aide_de_build_et_update() {
     let o = e.run(&["status", "--help"]);
     assert!(!String::from_utf8_lossy(&o.stdout).contains("exclude_defaults"));
 }
+
+// ---- REQ-114 : trace `parcours` des exclusions par défaut ----
+
+/// Ligne `parcours:` de stderr, sans le préfixe `trace: [..] `.
+fn walk_line(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("trace: [") && l.contains("] parcours: "))
+        .collect();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    lines[0].split_once("] ").unwrap().1.to_string()
+}
+
+fn verbose_walk(e: &Env, args: &[&str]) -> String {
+    let (_, err) = e.ok(args);
+    walk_line(&err)
+}
+
+#[test]
+fn req114_ac1_build_compte_les_exclusions_par_defaut() {
+    let e = Env::new();
+    let want = "parcours: 4 fichiers (exclusions par défaut : 9 dossiers, 1 fichiers)";
+    assert_eq!(verbose_walk(&e, &["build", "--no-llm", "--verbose"]), want);
+    for jobs in ["1", "8"] {
+        assert_eq!(
+            verbose_walk(&e, &["build", "--no-llm", "--verbose", "--jobs", jobs]),
+            want,
+            "--jobs {jobs}"
+        );
+    }
+    let quiet = e.ok(&["build", "--no-llm"]);
+    let loud = e.ok(&["build", "--no-llm", "--verbose"]);
+    assert_eq!(quiet.0, loud.0);
+    assert!(!quiet.1.contains("exclusions par défaut"), "{}", quiet.1);
+}
+
+#[test]
+fn req114_ac2_gitignore_et_desactivation() {
+    let e = Env::new();
+    e.put(".gitignore", "dist/\n");
+    let line = verbose_walk(&e, &["build", "--no-llm", "--verbose"]);
+    assert!(
+        line.ends_with(" fichiers (exclusions par défaut : 7 dossiers, 1 fichiers)"),
+        "{line}"
+    );
+
+    let e = Env::new();
+    e.project("exclude_defaults = false\n");
+    let line = verbose_walk(&e, &["build", "--no-llm", "--verbose"]);
+    assert!(!line.contains("exclusions par défaut"), "{line}");
+    assert!(!line.contains("(filtres"), "{line}");
+
+    e.project("exclude_defaults = false\nexclude = [\"vendor/\", \"*.min.js\"]\n");
+    let line = verbose_walk(&e, &["build", "--no-llm", "--verbose"]);
+    assert!(
+        line.ends_with(" (filtres : 2 motifs, types aucun, 2 fichiers exclus)"),
+        "{line}"
+    );
+    assert!(!line.contains("exclusions par défaut"), "{line}");
+}
+
+#[test]
+fn req114_ac3_update_porte_le_meme_segment() {
+    let e = Env::new();
+    e.ok(&["build", "--no-llm"]);
+    e.put("A.java", "package p;\npublic class A { int x; }\n");
+    let line = verbose_walk(&e, &["update", "--no-llm", "--verbose"]);
+    assert_eq!(
+        line,
+        "parcours: 0 ajoutés, 1 modifiés, 0 supprimés, 0 en attente (exclusions par défaut : 9 dossiers, 1 fichiers)"
+    );
+}
+
+#[test]
+fn req114_ac5_texte_et_place_du_segment() {
+    let e = Env::new();
+    let line = verbose_walk(&e, &["build", "--no-llm", "--verbose"]);
+    assert!(
+        line.ends_with(" fichiers (exclusions par défaut : 9 dossiers, 1 fichiers)"),
+        "{line}"
+    );
+    let line = verbose_walk(
+        &e,
+        &[
+            "build",
+            "--no-llm",
+            "--verbose",
+            "--exclude",
+            "outils/T.java",
+        ],
+    );
+    assert!(
+        line.ends_with(
+            " (exclusions par défaut : 9 dossiers, 1 fichiers) (filtres : 1 motifs, types aucun, 1 fichiers exclus)"
+        ),
+        "{line}"
+    );
+
+    // Seul chemin exclu par défaut : un fichier ; les deux nombres restent ensemble.
+    let tmp = Env::new();
+    fs::remove_dir_all(&tmp.repo).unwrap();
+    fs::create_dir_all(&tmp.repo).unwrap();
+    tmp.put("A.java", "package p;\npublic class A {}\n");
+    tmp.put("lib/jquery.min.js", "function j() {}\n");
+    let line = verbose_walk(&tmp, &["build", "--no-llm", "--verbose"]);
+    assert_eq!(
+        line,
+        "parcours: 1 fichiers (exclusions par défaut : 0 dossiers, 1 fichiers)"
+    );
+
+    // Aucun chemin exclu par défaut : ligne de HEAD.
+    tmp.put("lib/jquery.min.js", "function j() {}\n");
+    fs::remove_file(tmp.repo.join("lib/jquery.min.js")).unwrap();
+    let line = verbose_walk(&tmp, &["build", "--no-llm", "--verbose"]);
+    assert_eq!(line, "parcours: 1 fichiers");
+}

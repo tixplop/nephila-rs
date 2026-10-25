@@ -47,6 +47,10 @@ pub struct Diff {
     pub gradle_settings: HashMap<String, Option<String>>,
     /// Fichiers que le parcours aurait retenus sans filtre (REQ-037).
     pub excluded: usize,
+    /// Dossiers élagués par les exclusions par défaut (REQ-114).
+    pub default_dirs: usize,
+    /// Fichiers `*.min.js` écartés par les exclusions par défaut (REQ-114).
+    pub default_files: usize,
 }
 
 impl Diff {
@@ -79,6 +83,8 @@ pub fn compute(
         files: scanned,
         gradle_settings,
         excluded,
+        default_dirs,
+        default_files,
         ..
     } = scan::scan_with_budget(repo, &known, matcher, jobs, budget)?;
     let on_disk: HashMap<&str, &ScannedFile> =
@@ -130,6 +136,8 @@ pub fn compute(
         known,
         gradle_settings,
         excluded,
+        default_dirs,
+        default_files,
     })
 }
 

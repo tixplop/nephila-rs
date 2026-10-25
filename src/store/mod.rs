@@ -641,11 +641,19 @@ impl Store {
     /// Migre un schéma 5, 6 ou 7 en schéma 8 sur place : 5 -> 6, 6 -> 7, puis 7 -> 8, chacune en
     /// une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
-        if self.user_version()? == SCHEMA_WITHOUT_REV {
+        let from = self.user_version()?;
+        let started = std::time::Instant::now();
+        if from == SCHEMA_WITHOUT_REV {
             self.migrate_5_to_6()?;
         }
         self.migrate_6_to_7()?;
-        self.migrate_7_to_8()
+        self.migrate_7_to_8()?;
+        // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
+        crate::trace!(
+            "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
+            started.elapsed().as_millis()
+        );
+        Ok(())
     }
 
     /// Migre un schéma 7 en schéma 8 en une transaction `IMMEDIATE` (DEC-076) : colonnes et index

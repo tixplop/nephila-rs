@@ -354,8 +354,9 @@ pub(crate) fn build_with_budget(
         })
         .collect();
     trace!(
-        "parcours: {} fichiers{}",
+        "parcours: {} fichiers{}{}",
         records.len(),
+        matcher.default_trace_segment(scanned.default_dirs, scanned.default_files),
         matcher.trace_suffix(scanned.excluded)
     );
     store.reset_with_pending_files(&records)?;

@@ -227,6 +227,16 @@ impl Matcher {
         excluded
     }
 
+    /// Segment de la trace `parcours` (REQ-114) : ` (exclusions par défaut : <d> dossiers, <f>
+    /// fichiers)` ; vide quand les deux comptes sont nuls ou que les exclusions par défaut sont
+    /// désactivées.
+    pub fn default_trace_segment(&self, dirs: usize, files: usize) -> String {
+        if self.defaults_off || (dirs == 0 && files == 0) {
+            return String::new();
+        }
+        format!(" (exclusions par défaut : {dirs} dossiers, {files} fichiers)")
+    }
+
     /// Suffixe de la trace `parcours` : ` (filtres : <m> motifs, types <liste|aucun>, <k> fichiers
     /// exclus)` ; vide sans filtre.
     pub fn trace_suffix(&self, excluded: usize) -> String {

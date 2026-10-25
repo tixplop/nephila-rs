@@ -195,6 +195,10 @@ pub struct ScanResult {
     pub gradle_settings: HashMap<String, Option<String>>,
     /// Fichiers que le parcours aurait retenus sans filtre (REQ-037).
     pub excluded: usize,
+    /// Dossiers élagués par les exclusions par défaut de REQ-079 (REQ-114).
+    pub default_dirs: usize,
+    /// Fichiers `*.min.js` écartés par les exclusions par défaut de REQ-079 (REQ-114).
+    pub default_files: usize,
 }
 
 fn is_build_file(name: &str) -> bool {
@@ -238,6 +242,10 @@ pub struct WalkResult {
     pub warnings: Vec<String>,
     /// Fichiers que le parcours aurait retenus sans filtre (REQ-037).
     pub excluded: usize,
+    /// Dossiers élagués par les exclusions par défaut de REQ-079 (REQ-114).
+    pub default_dirs: usize,
+    /// Fichiers `*.min.js` écartés par les exclusions par défaut de REQ-079 (REQ-114).
+    pub default_files: usize,
     /// Groupes de fichiers de même chemin après conversion (DEC-071, DEC-104), triés par chemin.
     pub collisions: Vec<Collision>,
 }
@@ -326,10 +334,11 @@ fn walk_entry(
         return;
     }
     let name = entry.file_name().to_string_lossy();
-    if !is_supported(&name)
-        || name == export_name
-        || (matcher.default_excludes() && name.ends_with(".min.js"))
-    {
+    if !is_supported(&name) || name == export_name {
+        return;
+    }
+    if matcher.default_excludes() && name.ends_with(".min.js") {
+        acc.default_files += 1;
         return;
     }
     let real_rel = match entry.path().strip_prefix(root) {
@@ -386,6 +395,7 @@ struct WalkAcc {
     /// (chemin converti ou `""`, texte).
     warnings: Vec<(String, String)>,
     excluded: usize,
+    default_files: usize,
     strip_error: Option<String>,
 }
 
@@ -401,6 +411,7 @@ impl Drop for LocalAcc<'_> {
         g.found.extend(acc.found);
         g.warnings.extend(acc.warnings);
         g.excluded += acc.excluded;
+        g.default_files += acc.default_files;
         if let Some(e) = acc.strip_error {
             if g.strip_error.as_ref().is_none_or(|old| e < *old) {
                 g.strip_error = Some(e);
@@ -451,6 +462,8 @@ pub(crate) fn walk_with<L: crate::workers::Launcher>(
     // L'export par défaut (`<slug>.json`) peut être écrit dans le dépôt : jamais indexé (AC-004-5).
     let export_name = format!("{}.json", crate::export::slug(root));
     let defaults = matcher.default_excludes();
+    let default_dirs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dir_counter = std::sync::Arc::clone(&default_dirs);
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
@@ -461,11 +474,18 @@ pub(crate) fn walk_with<L: crate::workers::Launcher>(
         .follow_links(false)
         .filter_entry(move |e| {
             let is_dir = e.file_type().is_some_and(|t| t.is_dir());
-            !(is_dir && e.depth() > 0 && {
-                let name = e.file_name().to_string_lossy();
-                EXCLUDED_DIRS.contains(&name.as_ref())
-                    || (defaults && DEFAULT_EXCLUDED_DIRS.contains(&name.as_ref()))
-            })
+            if !is_dir || e.depth() == 0 {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            if EXCLUDED_DIRS.contains(&name.as_ref()) {
+                return false;
+            }
+            if defaults && DEFAULT_EXCLUDED_DIRS.contains(&name.as_ref()) {
+                dir_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+            true
         })
         .build();
 
@@ -541,6 +561,8 @@ pub(crate) fn walk_with<L: crate::workers::Launcher>(
     }
     let mut res = WalkResult {
         excluded: acc.excluded,
+        default_dirs: default_dirs.load(std::sync::atomic::Ordering::Relaxed),
+        default_files: acc.default_files,
         ..WalkResult::default()
     };
     let mut warnings = acc.warnings;
@@ -770,6 +792,8 @@ pub(crate) fn scan_with_budget(
     let mut res = ScanResult {
         warnings: walked.warnings,
         excluded: walked.excluded,
+        default_dirs: walked.default_dirs,
+        default_files: walked.default_files,
         ..ScanResult::default()
     };
     // Groupes de collision par chemin converti ; `<où>` des lectures de leur premier fichier :
@@ -1333,6 +1357,47 @@ mod tests {
         let res = scan(dir.path(), &[], &Matcher::none(), 1).unwrap();
         assert_eq!(res.gradle_settings.get(""), Some(&Some("app".to_string())));
         assert_eq!(res.gradle_settings.get("t"), Some(&None));
+    }
+
+    // ---- AC-114-4 : comptes des exclusions par défaut ----
+
+    #[test]
+    fn req114_ac4_comptes_des_exclusions_par_defaut() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        put(&root.join("A.java"), b"class A {}\n");
+        put(&root.join(".gitignore"), b"ignored/\n");
+        // Comptés : un par dossier, quel que soit le contenu.
+        put(&root.join("dist/D.java"), b"class D {}\n");
+        put(&root.join("a/b/out/O.java"), b"class O {}\n");
+        put(&root.join("coverage/c.json"), b"{}\n");
+        put(&root.join(".idea/w.xml"), b"<p/>\n");
+        put(&root.join("vendor/V.java"), b"class V {}\n");
+        // Non comptés : sous un dossier élagué, exclu fixe ou ignoré.
+        put(&root.join("vendor/dist/X.java"), b"class X {}\n");
+        put(&root.join("target/dist/T.java"), b"class T {}\n");
+        put(&root.join("ignored/dist/I.java"), b"class I {}\n");
+        // Fichiers `*.min.js` : comptés ; sous node_modules/ ou un dossier élagué : non.
+        put(&root.join("x.min.js"), b"var x;\n");
+        put(&root.join("lib/y.min.js"), b"var y;\n");
+        put(&root.join("node_modules/n/z.min.js"), b"var z;\n");
+        put(&root.join("dist/w.min.js"), b"var w;\n");
+        put(&root.join("lib/app.min.mjs"), b"var m;\n");
+        for jobs in [1, 2, 8] {
+            let w = walk(root, &Matcher::none(), jobs, &[]).unwrap();
+            assert_eq!(w.default_dirs, 5, "jobs {jobs}");
+            assert_eq!(w.default_files, 2, "jobs {jobs}");
+            let s = scan(root, &[], &Matcher::none(), jobs).unwrap();
+            assert_eq!((s.default_dirs, s.default_files), (5, 2), "jobs {jobs}");
+            let off = crate::filter::Filters {
+                defaults_off: true,
+                ..Default::default()
+            }
+            .compile(root)
+            .unwrap();
+            let w = walk(root, &off, jobs, &[]).unwrap();
+            assert_eq!((w.default_dirs, w.default_files), (0, 0), "jobs {jobs}");
+        }
     }
 
     // ---- AC-079-5 : exclusions par défaut non parcourues ----

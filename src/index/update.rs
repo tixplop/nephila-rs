@@ -97,11 +97,12 @@ pub fn update(
     let to_resolve = store.needs_resolution()?;
     let mut d = diff::compute(repo, &store, matcher, opts.jobs, scan::RETAIN_BUDGET)?;
     trace!(
-        "parcours: {} ajoutés, {} modifiés, {} supprimés, {} en attente{}",
+        "parcours: {} ajoutés, {} modifiés, {} supprimés, {} en attente{}{}",
         d.paths(Change::Added).count(),
         d.paths(Change::Modified).count(),
         d.paths(Change::Deleted).count(),
         d.paths(Change::Pending).count(),
+        matcher.default_trace_segment(d.default_dirs, d.default_files),
         matcher.trace_suffix(d.excluded)
     );
 

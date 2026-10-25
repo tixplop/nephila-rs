@@ -6,7 +6,7 @@
 use rusqlite::Connection;
 
 #[path = "schema7.rs"]
-mod schema7;
+pub mod schema7;
 
 pub const SCHEMA6_DOWNGRADE: &str = "BEGIN;
     CREATE TABLE refs_old (

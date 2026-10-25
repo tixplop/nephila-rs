@@ -337,3 +337,145 @@ fn req062_ac6_failed_migration_leaves_the_schema_6_graph_untouched() {
         .collect();
     assert_eq!(rows_after, rows_before);
 }
+
+// ---- REQ-115 : trace de la migration du schéma ----
+
+/// Dépôt exemple construit puis ramené au schéma `version` (5, 6 ou 7).
+fn built_at(version: i32) -> Env {
+    let env = Env::new();
+    env.ok(&["build", "--no-llm"]);
+    match version {
+        7 => schema6::schema7::downgrade_to_7(&env.db()),
+        6 => schema6::downgrade_to_6(&env.db()),
+        5 => schema6::downgrade_to_5(&env.db()),
+        v => panic!("schéma {v}"),
+    }
+    assert_eq!(env.user_version(), version);
+    env
+}
+
+/// Lignes `trace:` de stderr sans leur préfixe `trace: [..] `.
+fn trace_lines(stderr: &[u8]) -> Vec<String> {
+    text(stderr)
+        .lines()
+        .filter(|l| l.starts_with("trace: ["))
+        .map(|l| l.split_once("] ").unwrap().1.to_string())
+        .collect()
+}
+
+fn migration_line(version: i32) -> String {
+    format!("schéma: migration {version} vers {SCHEMA_VERSION} en ")
+}
+
+/// Une seule ligne `schéma:`, de la forme du design, avant la ligne `parcours:`.
+fn assert_migration_trace(stderr: &[u8], version: i32) {
+    let lines = trace_lines(stderr);
+    let schema: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("schéma:"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(schema.len(), 1, "{lines:?}");
+    let line = &lines[schema[0]];
+    let ms = line
+        .strip_prefix(&migration_line(version))
+        .and_then(|r| r.strip_suffix(" ms"))
+        .unwrap_or_else(|| panic!("ligne inattendue : {line}"));
+    assert!(
+        !ms.is_empty() && ms.chars().all(|c| c.is_ascii_digit()),
+        "{line}"
+    );
+    let config = lines
+        .iter()
+        .position(|l| l.contains("config: llm inactif (--no-llm)"))
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    let walk = lines.iter().position(|l| l.contains("parcours:")).unwrap();
+    assert!(config < schema[0] && schema[0] < walk, "{lines:?}");
+}
+
+#[test]
+fn req115_ac1_update_trace_la_migration_depuis_chaque_schema() {
+    for version in [7, 6, 5] {
+        let env = built_at(version);
+        let o = env.ok(&["update", "--no-llm", "--verbose"]);
+        assert_migration_trace(&o.stderr, version);
+        assert_eq!(env.user_version(), SCHEMA_VERSION);
+    }
+}
+
+#[test]
+fn req115_ac1_build_trace_la_migration() {
+    let env = built_at(7);
+    let o = env.ok(&["build", "--no-llm", "--verbose"]);
+    assert_migration_trace(&o.stderr, 7);
+    assert_eq!(env.user_version(), SCHEMA_VERSION);
+}
+
+#[test]
+fn req115_ac2_aucune_trace_sans_migration() {
+    let env = Env::new();
+    // Base neuve.
+    let o = env.ok(&["build", "--no-llm", "--verbose"]);
+    assert!(!text(&o.stderr).contains("schéma:"), "{}", text(&o.stderr));
+    // Schéma courant.
+    for args in [
+        ["update", "--no-llm", "--verbose"],
+        ["build", "--no-llm", "--verbose"],
+    ] {
+        let o = env.ok(&args);
+        assert!(!text(&o.stderr).contains("schéma:"), "{}", text(&o.stderr));
+    }
+    // Sans --verbose, aucune trace.
+    let env = built_at(7);
+    let o = env.ok(&["update", "--no-llm"]);
+    assert!(!text(&o.stderr).contains("trace:"), "{}", text(&o.stderr));
+    assert_eq!(env.user_version(), SCHEMA_VERSION);
+}
+
+#[test]
+fn req115_ac2_aucune_trace_si_la_migration_echoue() {
+    let env = built_at(6);
+    env.db()
+        .execute_batch("CREATE TABLE file_contexts (x TEXT)")
+        .unwrap();
+    let o = env.run(&["update", "--no-llm", "--verbose"]);
+    assert!(!o.status.success());
+    assert!(!text(&o.stderr).contains("schéma:"), "{}", text(&o.stderr));
+}
+
+#[test]
+fn req115_ac3_texte_exact_et_place() {
+    let env = built_at(7);
+    let o = env.ok(&["update", "--no-llm", "--verbose"]);
+    let err = text(&o.stderr);
+    let re = is_migration_trace_7;
+    let matching: Vec<&str> = err.lines().filter(|l| re(l)).collect();
+    assert_eq!(matching.len(), 1, "{err}");
+    assert!(!err.contains('→') && !err.contains("->"), "{err}");
+    assert_migration_trace(&o.stderr, 7);
+}
+
+/// Vérifie le motif de AC-115-3 (pas de dépendance de test nouvelle) :
+/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 8 en [0-9]+ ms$`.
+fn is_migration_trace_7(line: &str) -> bool {
+    {
+        let Some(rest) = line.strip_prefix("trace: [") else {
+            return false;
+        };
+        let Some((time, rest)) = rest.split_once("s] ") else {
+            return false;
+        };
+        let Some((secs, millis)) = time.split_once('.') else {
+            return false;
+        };
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !(digits(secs) && millis.len() == 3 && digits(millis)) {
+            return false;
+        }
+        let head = format!("schéma: migration 7 vers {SCHEMA_VERSION} en ");
+        rest.strip_prefix(&head)
+            .and_then(|r| r.strip_suffix(" ms"))
+            .is_some_and(digits)
+    }
+}
