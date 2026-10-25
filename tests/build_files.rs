@@ -344,3 +344,26 @@ fn req022_ac10_root_module_named_after_folder_without_dash_c() {
     nephila_in(&repo, &["update"]);
     assert_monrepo_module(&repo, &["export", "--output", "-"]);
 }
+
+#[test]
+fn req105_ac3_deeply_nested_pom_is_built_quickly_and_silently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let pom = format!(
+        "<project><groupId>g</groupId><artifactId>a</artifactId>{}{}\
+         <dependencies><dependency><groupId>d</groupId><artifactId>e</artifactId></dependency></dependencies></project>",
+        "<x>\n".repeat(20_000),
+        "</x>\n".repeat(20_000)
+    );
+    fs::write(repo.join("pom.xml"), pom).unwrap();
+    fs::write(repo.join("Ok.java"), "public class Ok {}\n").unwrap();
+    let env = Env { _tmp: tmp, repo };
+    let out = env.cmd(&["build", "--no-llm"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).is_empty(), "{}", text(&out.stderr));
+    let module = text(&env.ok(&["query", "search", "a"]).stdout);
+    assert!(module.contains("g:a (module"), "{module}");
+    let ok = text(&env.ok(&["query", "search", "Ok"]).stdout);
+    assert!(ok.contains("Ok"), "{ok}");
+}

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::maven::{read_events, warning, XmlEv};
+use super::maven::{read_events, warning, Ev};
 use super::FileStructure;
 use crate::model::{EdgeKind, NodeKind};
 use crate::parse::{Declared, OrderedSet, Reference};
@@ -17,27 +17,25 @@ fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// Extrait le module (`<info>`) et ses dépendances.
 pub fn extract(path: &Path, text: &str) -> FileStructure {
-    let (events, problem) = read_events(text);
     let mut out = FileStructure::default();
     let mut module: Option<String> = None;
     let mut org: Option<String> = None;
     let mut deps: Vec<(Option<String>, String)> = Vec::new();
-    for ev in &events {
-        let XmlEv::Open(p, a) = ev else { continue };
-        let p: Vec<&str> = p.iter().map(String::as_str).collect();
-        match p.as_slice() {
-            ["ivy-module", "info"] => {
-                org = attr(a, "organisation").map(str::to_string);
-                module = attr(a, "module").map(str::to_string);
+    let problem = read_events(text, |ev| {
+        let Ev::Open(p, a) = ev else { return };
+        if p.len() == 2 && p[0] == "ivy-module" && p[1] == "info" {
+            org = attr(&a, "organisation").map(str::to_string);
+            module = attr(&a, "module").map(str::to_string);
+        } else if p.len() == 3
+            && p[0] == "ivy-module"
+            && p[1] == "dependencies"
+            && p[2] == "dependency"
+        {
+            if let Some(name) = attr(&a, "name") {
+                deps.push((attr(&a, "org").map(str::to_string), name.to_string()));
             }
-            ["ivy-module", "dependencies", "dependency"] => {
-                if let Some(name) = attr(a, "name") {
-                    deps.push((attr(a, "org").map(str::to_string), name.to_string()));
-                }
-            }
-            _ => {}
         }
-    }
+    });
     if let Some(problem) = problem {
         out.warnings.push(warning(path, &problem));
     }
