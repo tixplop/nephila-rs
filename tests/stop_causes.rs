@@ -649,25 +649,43 @@ fn req094_ac5_ac6_verbose_counts_then_the_stop_line() {
     let o = env.build(&order[..3], true);
     let err = text(&o.stderr);
     let all = lines(&o);
-    let mut at = 0;
-    for k in 1..=3 {
-        let fin = all[at..]
-            .iter()
-            .position(|l| l.contains("llm enrich fin") && l.contains("délai dépassé"))
-            .unwrap_or_else(|| panic!("{err}"));
-        at += fin + 1;
-        assert!(
-            all[at].ends_with(&format!("politique: délais dépassés consécutifs {k}/3")),
-            "{k}: {}",
-            all[at]
-        );
-    }
-    assert!(
-        all[at + 1..].iter().any(|l| l.ends_with(
-            "politique: arrêt de l'envoi (délais dépassés répétés), 3 fichiers non envoyés"
-        )),
-        "{err}"
+    // Ordre par positions : des avertissements peuvent s'intercaler entre deux traces.
+    let ends: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("llm enrich fin") && l.contains("délai dépassé"))
+        .map(|(i, _)| i)
+        .collect();
+    let counts: Vec<(usize, &str)> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            l.split("politique: délais dépassés consécutifs ")
+                .nth(1)
+                .map(|k| (i, k))
+        })
+        .collect();
+    let stops: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            l.ends_with(
+                "politique: arrêt de l'envoi (délais dépassés répétés), 3 fichiers non envoyés",
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let labels: Vec<&str> = counts.iter().map(|(_, k)| *k).collect();
+    assert_eq!(labels, ["1/3", "2/3", "3/3"], "{err}");
+    let ([f1, f2, f3], [(c1, _), (c2, _), (c3, _)], [stop]) = (
+        <[usize; 3]>::try_from(ends).unwrap_or_else(|_| panic!("3 lignes llm enrich fin\n{err}")),
+        <[(usize, &str); 3]>::try_from(counts)
+            .unwrap_or_else(|_| panic!("3 lignes de compte\n{err}")),
+        <[usize; 1]>::try_from(stops).unwrap_or_else(|_| panic!("1 ligne d'arrêt\n{err}")),
     );
+    assert!(f1 < c1 && c1 < f2 && f2 < c2 && c2 < f3 && f3 < c3, "{err}");
+    assert!(c3 < stop, "{err}");
+    assert_eq!(all.last().map(String::as_str), Some(E22_6), "{err}");
     assert!(!err.contains("erreurs réseau consécutives"), "{err}");
 }
 
