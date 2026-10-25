@@ -132,7 +132,7 @@ pub fn compute(repo: &Path, store: &Store, matcher: &Matcher, jobs: usize) -> Re
 /// (REQ-017, DEC-067).
 pub fn quick(repo: &Path, store: &Store, matcher: &Matcher) -> Result<usize> {
     let known = store.files()?;
-    let walked = scan::walk(repo, matcher, crate::index::default_jobs())?;
+    let walked = scan::walk(repo, matcher, crate::index::default_jobs(), &known)?;
     let on_disk: HashMap<&str, &scan::WalkedFile> =
         walked.files.iter().map(|f| (f.path.as_str(), f)).collect();
     let mut count = 0;

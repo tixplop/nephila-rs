@@ -201,7 +201,7 @@ fn REQ004_AC10_scan_et_walk_ne_retiennent_qu_un_fichier() {
         for part in ["A\u{FFFD}.java", "A\\xFF.java", "A\\xFE.java"] {
             assert!(res.warnings[0].contains(part), "{:?}", res.warnings);
         }
-        let w = nephila::scan::walk(&r.root, &Matcher::none(), 1).unwrap();
+        let w = nephila::scan::walk(&r.root, &Matcher::none(), 1, &[]).unwrap();
         assert_eq!(w.files.len(), 1);
         assert_eq!(w.files[0].path, "A\u{FFFD}.java");
         assert_eq!(w.collisions.len(), 1);
@@ -462,4 +462,185 @@ fn REQ100_AC3_non_utf8_et_lecture_impossible_echappes() {
             "{e}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fichier déjà indexé retenu en cas de collision (REQ-103, DEC-104) ; couverture d'`update`
+// ---------------------------------------------------------------------------------------------
+
+const A7_FF_FE: &str = "avertissement: A\\xFE.java ignoré : même chemin dans le graphe que A\\xFF.java (A\u{FFFD}.java), seul retenu ; renommez ce fichier";
+
+/// Noms des types trouvés par `query search` (sortie brute, pour les recherches ciblées).
+fn search(r: &Repo, q: &str) -> String {
+    out(&r.run(&["query", "search", q]))
+}
+
+#[test]
+fn REQ004_AC16_update_avec_llm_simule_enrichit_le_nouveau_fichier() {
+    let Some(env) = Env::new("provider = \"mock\"\nenrich_code = true\n") else {
+        return;
+    };
+    let o = env.run(&["build"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let before = fs::read_to_string(&env.log)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    if fs::write(
+        env.repo.join(OsStr::from_bytes(b"C\xff.java")),
+        "class C { void go() {} }\n",
+    )
+    .is_err()
+    {
+        return;
+    }
+    let o = env.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(!err(&o).contains("avertissement:"), "{}", err(&o));
+    let log = fs::read_to_string(&env.log).unwrap_or_default();
+    let added: Vec<&str> = log.lines().skip(before).collect();
+    assert!(
+        added.iter().any(|l| l.contains("C\u{FFFD}.java")),
+        "ajouts au journal : {added:?}"
+    );
+    let o = env.run(&["status"]);
+    assert_eq!(first_line(&o), "graphe à jour", "{}", out(&o));
+    assert!(!out(&o).contains("à enrichir"), "{}", out(&o));
+    assert!(!out(&o).contains("en attente"), "{}", out(&o));
+    let o = env.run(&["query", "search", "go"]);
+    assert!(out(&o).contains("C.go"), "{}", out(&o));
+    assert!(out(&o).contains("C\u{FFFD}.java"), "{}", out(&o));
+}
+
+#[test]
+fn REQ004_AC17_collision_de_dossiers_non_utf8() {
+    let files: [(&[u8], &str); 3] = [
+        (b"d\xfe/A.java", "class A {}\n"),
+        (b"d\xff/A.java", "class A2 {}\n"),
+        (b"B.java", "class B {}\n"),
+    ];
+    let Some((r1, r2)) = both_orders(&files) else {
+        return;
+    };
+    let line = "avertissement: d\\xFF/A.java ignoré : même chemin dans le graphe que d\\xFE/A.java (d\u{FFFD}/A.java), seul retenu ; renommez ce fichier\n";
+    for r in [&r1, &r2] {
+        let o = r.run(&["build", "--no-llm"]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert!(
+            out(&o).starts_with("build terminé : 2 fichiers traités,"),
+            "{}",
+            out(&o)
+        );
+        assert_eq!(o.stderr, line.as_bytes());
+        let s = search(r, "A");
+        assert!(s.contains("d\u{FFFD}/A.java"), "{s}");
+        assert!(!s.contains("A2"), "{s}");
+        let o = r.run(&["update", "--no-llm"]);
+        assert_eq!(out(&o).trim_end(), "graphe à jour");
+        assert_eq!(o.stderr, line.as_bytes());
+        let o = r.run(&["status"]);
+        assert_eq!(first_line(&o), "graphe à jour", "{}", out(&o));
+        assert_eq!(o.stderr, line.as_bytes());
+        let o = r.run(&["query", "search", "B", "--check-stale"]);
+        assert_eq!(err(&o), "");
+    }
+}
+
+const INDEXED_FF: [(&[u8], &str); 2] = [
+    (b"A\xff.java", "class A2 {}\n"),
+    (b"B.java", "class B {}\n"),
+];
+
+#[test]
+fn REQ103_AC1_le_fichier_deja_indexe_reste_retenu() {
+    let Some(r) = Repo::new(&INDEXED_FF) else {
+        return;
+    };
+    let o = r.run(&["build", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    if fs::write(
+        r.root.join(OsStr::from_bytes(b"A\xfe.java")),
+        "class A {}\n",
+    )
+    .is_err()
+    {
+        return;
+    }
+    let line = format!("{A7_FF_FE}\n");
+    let o = r.run(&["status"]);
+    assert_eq!(first_line(&o), "graphe à jour", "{}", out(&o));
+    assert_eq!(o.stderr, line.as_bytes());
+    let o = r.run(&["update", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(out(&o).trim_end(), "graphe à jour");
+    assert_eq!(o.stderr, line.as_bytes());
+    assert!(search(&r, "A2").contains("A2"));
+    let types = search(&r, "A");
+    assert!(
+        !types
+            .lines()
+            .any(|l| l.split_whitespace().any(|w| w == "A")),
+        "{types}"
+    );
+    let o = r.run(&["query", "search", "B", "--check-stale"]);
+    assert_eq!(err(&o), "");
+    let o = r.run(&["build", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(o.stderr, line.as_bytes());
+    assert!(search(&r, "A2").contains("A2"));
+}
+
+#[test]
+fn REQ103_AC2_le_fichier_modifie_perd_sa_priorite() {
+    let Some(r) = Repo::new(&INDEXED_FF) else {
+        return;
+    };
+    let o = r.run(&["build", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    if fs::write(
+        r.root.join(OsStr::from_bytes(b"A\xfe.java")),
+        "class A {}\n",
+    )
+    .is_err()
+    {
+        return;
+    }
+    fs::write(
+        r.root.join(OsStr::from_bytes(b"A\xff.java")),
+        "class A22 {}\n",
+    )
+    .unwrap();
+    let o = r.run(&["update", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(o.stderr, format!("{A7_FE_FF}\n").as_bytes());
+    let s = search(&r, "A");
+    assert!(s.contains("A\u{FFFD}.java"), "{s}");
+    assert!(!s.contains("A22") && !s.contains("A2"), "{s}");
+}
+
+#[test]
+fn REQ103_AC4_textes_a7_octet_pour_octet() {
+    let Some(r) = Repo::new(&INDEXED_FF) else {
+        return;
+    };
+    r.run(&["build", "--no-llm"]);
+    if fs::write(
+        r.root.join(OsStr::from_bytes(b"A\xfe.java")),
+        "class A {}\n",
+    )
+    .is_err()
+    {
+        return;
+    }
+    let o = r.run(&["update", "--no-llm"]);
+    assert_eq!(a7_lines(&o), vec![A7_FF_FE.as_bytes().to_vec()]);
+    assert_eq!(o.stderr.iter().filter(|b| **b == b'\n').count(), 1);
+    fs::write(
+        r.root.join(OsStr::from_bytes(b"A\xff.java")),
+        "class A22 {}\n",
+    )
+    .unwrap();
+    let o = r.run(&["update", "--no-llm"]);
+    assert_eq!(a7_lines(&o), vec![A7_FE_FF.as_bytes().to_vec()]);
+    assert_eq!(o.stderr.iter().filter(|b| **b == b'\n').count(), 1);
 }

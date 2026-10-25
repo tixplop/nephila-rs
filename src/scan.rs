@@ -253,13 +253,24 @@ pub struct Collision {
     pub path: String,
 }
 
-/// Choix du fichier retenu dans un groupe de chemins réels relatifs de même chemin converti
-/// (DEC-071) : celui dont le chemin entier est de l'UTF-8 valide, sinon le plus petit dans
-/// l'ordre de `OsStr`. Rend l'indice dans `group` (non vide). Seul endroit à changer pour
-/// modifier la règle.
-fn choose_kept(group: &[&Path]) -> usize {
-    let key = |i: usize| (group[i].to_str().is_none(), group[i].as_os_str());
-    (0..group.len()).min_by_key(|&i| key(i)).unwrap_or(0)
+/// Ordre de choix des fichiers d'un groupe de même chemin converti (DEC-104). `group` donne, par
+/// fichier, son chemin réel relatif, sa taille et sa date ; `known` la taille et la date de
+/// l'enregistrement du graphe pour ce chemin converti. Clé : d'abord le fichier qui correspond à
+/// l'enregistrement (REQ-103), puis celui dont le chemin entier est de l'UTF-8 valide, puis le
+/// plus petit dans l'ordre de `OsStr` (DEC-071). Rend les indices de `group`, le retenu en
+/// premier. Seul endroit à changer pour modifier la règle.
+fn choice_order(group: &[(&Path, u64, i64)], known: Option<(u64, i64)>) -> Vec<usize> {
+    let key = |i: usize| {
+        let (p, size, mtime) = group[i];
+        (
+            known != Some((size, mtime)),
+            p.to_str().is_none(),
+            p.as_os_str(),
+        )
+    };
+    let mut order: Vec<usize> = (0..group.len()).collect();
+    order.sort_by(|&a, &b| key(a).cmp(&key(b)));
+    order
 }
 
 /// Forme échappée d'un chemin réel relatif pour les avertissements (V-006) : octets invalides en
@@ -420,8 +431,14 @@ impl Drop for LocalAcc<'_> {
 /// Parcourt `root` sans rien lire : dossiers exclus (REQ-004), types pris en charge, export
 /// `<slug>.json` écarté, filtres de REQ-037 puis métadonnées (chemin, taille, date). Le parcours
 /// utilise `jobs` fils (DEC-084) ; les fichiers sont rendus triés par chemin et les
-/// avertissements, triés, écrits après le parcours.
-pub fn walk(root: &Path, matcher: &Matcher, jobs: usize) -> Result<WalkResult> {
+/// avertissements, triés, écrits après le parcours. `known` (vide sans graphe) fait passer en tête
+/// d'un groupe de collision le fichier déjà indexé (REQ-103).
+pub fn walk(
+    root: &Path,
+    matcher: &Matcher,
+    jobs: usize,
+    known: &[FileRecord],
+) -> Result<WalkResult> {
     if !root.is_dir() {
         return Err(Error::Message(format!(
             "{} n'est pas un dossier lisible",
@@ -485,9 +502,21 @@ pub fn walk(root: &Path, matcher: &Matcher, jobs: usize) -> Result<WalkResult> {
         groups.entry(f.path.as_str()).or_default().push(i);
     }
     let mut dropped = vec![false; found.len()];
+    // Taille et date des enregistrements connus, par chemin converti (construite une fois, et
+    // seulement s'il y a une collision).
+    let mut known_meta: Option<HashMap<&str, (u64, i64)>> = None;
     for (path, idx) in groups.iter().filter(|(_, idx)| idx.len() > 1) {
-        let reals: Vec<&Path> = idx.iter().map(|&i| found[i].1.as_path()).collect();
-        let kept = idx[choose_kept(&reals)];
+        let table = known_meta.get_or_insert_with(|| {
+            known
+                .iter()
+                .map(|r| (r.path.as_str(), (r.size, r.mtime)))
+                .collect()
+        });
+        let metas: Vec<(&Path, u64, i64)> = idx
+            .iter()
+            .map(|&i| (found[i].1.as_path(), found[i].0.size, found[i].0.mtime))
+            .collect();
+        let kept = idx[choice_order(&metas, table.get(path).copied())[0]];
         for &i in idx.iter().filter(|&&i| i != kept) {
             dropped[i] = true;
             res.collisions.push(Collision {
@@ -608,7 +637,7 @@ pub(crate) fn scan_with_budget(
     jobs: usize,
     budget: usize,
 ) -> Result<ScanResult> {
-    let walked = walk(root, matcher, jobs)?;
+    let walked = walk(root, matcher, jobs, known)?;
     let known: HashMap<&str, &FileRecord> = known.iter().map(|r| (r.path.as_str(), r)).collect();
     let mut res = ScanResult {
         warnings: walked.warnings,
@@ -775,6 +804,81 @@ mod tests {
         assert!(res.files[0].rehashed);
     }
 
+    /// Dépôt de `A\xfe.java` (`class A {}`) et `A\xff.java` (`class B {}`, même taille), aux dates
+    /// données en secondes ; `None` si le système de fichiers refuse un nom non UTF-8.
+    #[cfg(unix)]
+    fn collision_pair(dir: &Path, fe_secs: u64, ff_secs: u64) -> Option<(u64, i64, i64)> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut size = 0;
+        for (name, body, secs) in [
+            (&b"A\xfe.java"[..], "class A {}\n", fe_secs),
+            (&b"A\xff.java"[..], "class B {}\n", ff_secs),
+        ] {
+            let p = dir.join(std::ffi::OsStr::from_bytes(name));
+            std::fs::write(&p, body).ok()?;
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+            size = body.len() as u64;
+        }
+        Some((size, fe_secs as i64 * 1000, ff_secs as i64 * 1000))
+    }
+
+    fn indexed(path: &str, size: u64, mtime: i64) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            hash: String::new(),
+            size,
+            mtime,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn req103_ac3_ordre_de_choix_du_groupe_de_collision() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = |b: &[u8]| PathBuf::from(std::ffi::OsStr::from_bytes(b));
+        let fe = name(b"A\xfe.java");
+        let ff = name(b"A\xff.java");
+        for jobs in [1, 8] {
+            // Cas 1 : `known` correspond à `A\xff.java` seul -> retenu, `A\xfe.java` ignoré.
+            let dir = tempfile::tempdir().unwrap();
+            let Some((size, fe_ms, ff_ms)) =
+                collision_pair(dir.path(), 1_600_000_000, 1_700_000_000)
+            else {
+                return;
+            };
+            let known = [indexed("A\u{FFFD}.java", size, ff_ms)];
+            let w = walk(dir.path(), &Matcher::none(), jobs, &known).unwrap();
+            assert_eq!(w.files.len(), 1);
+            assert_eq!(w.files[0].abs, dir.path().join(&ff), "jobs {jobs}");
+            assert_eq!(w.collisions.len(), 1);
+            assert_eq!(w.collisions[0].ignored, fe);
+            assert_eq!(w.collisions[0].kept, ff);
+            // Cas 2 : autre taille -> DEC-071, `A\xfe.java` retenu.
+            let known = [indexed("A\u{FFFD}.java", size + 1, ff_ms)];
+            let w = walk(dir.path(), &Matcher::none(), jobs, &known).unwrap();
+            assert_eq!(w.files[0].abs, dir.path().join(&fe), "jobs {jobs}");
+            assert_eq!(w.collisions[0].ignored, ff);
+            // Autre date -> idem ; la date de `A\xfe.java` seule le fait retenir.
+            let known = [indexed("A\u{FFFD}.java", size, ff_ms + 1)];
+            let w = walk(dir.path(), &Matcher::none(), jobs, &known).unwrap();
+            assert_eq!(w.files[0].abs, dir.path().join(&fe), "jobs {jobs}");
+            let known = [indexed("A\u{FFFD}.java", size, fe_ms)];
+            let w = walk(dir.path(), &Matcher::none(), jobs, &known).unwrap();
+            assert_eq!(w.files[0].abs, dir.path().join(&fe), "jobs {jobs}");
+            // Cas 3 : mêmes dates, `known` correspond aux deux -> DEC-071.
+            let dir = tempfile::tempdir().unwrap();
+            let (size, _, ms) = collision_pair(dir.path(), 1_650_000_000, 1_650_000_000).unwrap();
+            let known = [indexed("A\u{FFFD}.java", size, ms)];
+            let w = walk(dir.path(), &Matcher::none(), jobs, &known).unwrap();
+            assert_eq!(w.files[0].abs, dir.path().join(&fe), "jobs {jobs}");
+            assert_eq!(w.collisions[0].ignored, ff);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn escaped_met_en_forme_le_nom_reel() {
@@ -835,14 +939,14 @@ mod tests {
         put(&locked.join("V.java"), b"class V {}\n");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let unreadable = std::fs::read_dir(&locked).is_err();
-        let on = walk(root, &Matcher::none(), 2).unwrap();
+        let on = walk(root, &Matcher::none(), 2, &[]).unwrap();
         let off_matcher = crate::filter::Filters {
             defaults_off: true,
             ..Default::default()
         }
         .compile(root)
         .unwrap();
-        let off = walk(root, &off_matcher, 2).unwrap();
+        let off = walk(root, &off_matcher, 2, &[]).unwrap();
         let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
         assert!(on.warnings.is_empty(), "{:?}", on.warnings);
         assert_eq!(on.excluded, 0);
@@ -856,6 +960,12 @@ mod tests {
     }
 
     // ---- AC-072-1 : oracles (0.22.0, HEAD avant T-154) et générateur d'arbres à graine fixe ----
+
+    /// Règle de choix de la 0.22.0 (DEC-071), conservée comme oracle.
+    fn choose_kept(group: &[&Path]) -> usize {
+        let key = |i: usize| (group[i].to_str().is_none(), group[i].as_os_str());
+        (0..group.len()).min_by_key(|&i| key(i)).unwrap_or(0)
+    }
 
     /// `walk` de la 0.22.0, séquentiel, conservé tel quel comme oracle.
     fn oracle_walk(root: &Path, matcher: &Matcher) -> Result<WalkResult> {
@@ -1248,7 +1358,7 @@ mod tests {
             collisions += want.collisions.len();
             excluded += want.excluded;
             for jobs in [1, 2, 8] {
-                let got = walk(&root, &matcher, jobs).unwrap();
+                let got = walk(&root, &matcher, jobs, &[]).unwrap();
                 assert_eq!(got.files, want.files, "seed {seed}, jobs {jobs}");
                 assert_eq!(got.collisions, want.collisions, "seed {seed}, jobs {jobs}");
                 assert_eq!(got.excluded, want.excluded, "seed {seed}, jobs {jobs}");
@@ -1276,7 +1386,7 @@ mod tests {
                     multi += 1;
                 }
                 let sw: Vec<&String> = got.warnings.iter().collect();
-                let again = walk(&root, &matcher, jobs).unwrap();
+                let again = walk(&root, &matcher, jobs, &[]).unwrap();
                 assert_eq!(
                     sw,
                     again.warnings.iter().collect::<Vec<_>>(),
