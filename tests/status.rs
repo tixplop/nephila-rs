@@ -347,3 +347,28 @@ fn req012_ac6_files_to_enrich_are_counted_when_structure_is_up_to_date() {
     let v: serde_json::Value = serde_json::from_slice(&env.status(&["--json"]).stdout).unwrap();
     assert_eq!(v["to_enrich"], 0);
 }
+
+#[cfg(unix)]
+#[test]
+#[allow(non_snake_case)]
+fn REQ100_AC2_status_echappe_le_chemin_converti() {
+    let env = Env::built();
+    fs::write(env.repo.join("\u{1b}[31mE.java"), "class E {}\n").unwrap();
+    fs::write(env.repo.join("a\u{202E}b.java"), "class AB {}\n").unwrap();
+    let out = env.status(&[]);
+    assert!(!out.stdout.contains(&0x1B));
+    assert!(!out.stdout.windows(3).any(|w| w == b"\xe2\x80\xae"));
+    let l = lines(&out);
+    assert!(l.contains(&"ajouté\t\\x1B[31mE.java".to_string()), "{l:?}");
+    assert!(l.contains(&"ajouté\ta\\u{202E}b.java".to_string()), "{l:?}");
+    let j = text(&env.status(&["--json"]).stdout);
+    assert!(j.contains("\"chemin\":\"\\u001b[31mE.java\""), "{j}");
+    let u = env.run(&["update"], &[]);
+    assert!(u.status.success(), "{}", text(&u.stderr));
+    fs::remove_file(env.repo.join("\u{1b}[31mE.java")).unwrap();
+    let l = lines(&env.status(&[]));
+    assert!(
+        l.contains(&"supprimé\t\\x1B[31mE.java".to_string()),
+        "{l:?}"
+    );
+}

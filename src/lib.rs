@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod diff;
 pub mod error;
+pub mod escape;
 pub mod export;
 pub mod filter;
 pub mod index;

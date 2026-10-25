@@ -386,3 +386,80 @@ fn REQ004_AC15_renommer_le_fichier_ignore() {
         assert_eq!(err(&o), "");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Chemin converti échappé et contrôles C1 / marques de direction (REQ-100, REQ-101, DEC-103)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn REQ100_AC1_chemin_converti_echappe_dans_a7() {
+    let files: [(&[u8], &str); 2] = [
+        (b"\x1b[31mX\xfe.java", "class X {}\n"),
+        (b"\x1b[31mX\xff.java", "class X2 {}\n"),
+    ];
+    let Some((r1, _)) = both_orders(&files) else {
+        return;
+    };
+    let expected = "avertissement: \\x1B[31mX\\xFF.java ignoré : même chemin dans le graphe que \\x1B[31mX\\xFE.java (\\x1B[31mX\u{FFFD}.java), seul retenu ; renommez ce fichier\n";
+    for args in [
+        &["build", "--no-llm"][..],
+        &["update", "--no-llm"],
+        &["status"],
+    ] {
+        let o = r1.run(args);
+        assert_eq!(err(&o), expected, "{args:?}");
+        assert!(!o.stderr.contains(&0x1B), "{args:?}");
+    }
+}
+
+#[test]
+fn REQ101_AC2_marque_de_direction_dans_a7() {
+    let files: [(&[u8], &str); 2] = [
+        (b"\xe2\x80\xaeA\xfe.java", "class A {}\n"),
+        (b"\xe2\x80\xaeA\xff.java", "class A2 {}\n"),
+    ];
+    let Some((r1, _)) = both_orders(&files) else {
+        return;
+    };
+    let o = r1.run(&["build", "--no-llm"]);
+    let expected = "avertissement: \\u{202E}A\\xFF.java ignoré : même chemin dans le graphe que \\u{202E}A\\xFE.java (\\u{202E}A\u{FFFD}.java), seul retenu ; renommez ce fichier\n";
+    assert_eq!(err(&o), expected);
+    assert!(!o.stderr.windows(3).any(|w| w == b"\xe2\x80\xae"));
+}
+
+#[test]
+fn REQ100_AC3_non_utf8_et_lecture_impossible_echappes() {
+    use std::os::unix::fs::PermissionsExt;
+    let files: [(&[u8], &str); 2] = [
+        (b"\x1b[1mbad.java", "x"),
+        (b"\x1b[1mro.java", "class R {}\n"),
+    ];
+    let Some(r) = Repo::new(&files) else {
+        return;
+    };
+    fs::write(
+        r.root.join(OsStr::from_bytes(b"\x1b[1mbad.java")),
+        b"class \xff\xfe {}",
+    )
+    .unwrap();
+    let ro = r.root.join(OsStr::from_bytes(b"\x1b[1mro.java"));
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read(&ro).is_ok();
+    let o = r.run(&["build", "--no-llm"]);
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o644)).unwrap();
+    let e = err(&o);
+    assert!(!o.stderr.contains(&0x1B), "{e}");
+    assert!(
+        e.lines()
+            .any(|l| l == "avertissement: \\x1B[1mbad.java ignoré : fichier non UTF-8"),
+        "{e}"
+    );
+    if !readable {
+        assert!(
+            e.lines()
+                .any(|l| l
+                    .starts_with("avertissement: \\x1B[1mro.java ignoré : lecture impossible (")),
+            "{e}"
+        );
+    }
+}

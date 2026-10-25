@@ -33,7 +33,12 @@ pub fn run(repo: &Path, as_json: bool, out: &mut Out) -> Result<()> {
     if !d.is_up_to_date() {
         writeln!(out, "graphe pas à jour")?;
         for c in &d.changes {
-            writeln!(out, "{}\t{}", c.change.label(), c.path)?;
+            writeln!(
+                out,
+                "{}\t{}",
+                c.change.label(),
+                crate::escape::path(&c.path)
+            )?;
         }
     } else if to_resolve {
         writeln!(out, "{TO_RESOLVE_LINE}")?;

@@ -263,17 +263,17 @@ fn choose_kept(group: &[&Path]) -> usize {
 }
 
 /// Forme échappée d'un chemin réel relatif pour les avertissements (V-006) : octets invalides en
-/// `\xHH` majuscules ; dans les suites valides `\` et `'` précédés d'un `\`, contrôles en `\xHH`.
+/// `\xHH` majuscules ; dans les suites valides `\` et `'` précédés d'un `\`, puis la table de `escape` (contrôles C0 et C1, marques de direction).
 pub fn escaped(rel: &Path) -> String {
     fn valid(out: &mut String, s: &str) {
         for c in s.chars() {
             match c {
                 '\\' => out.push_str("\\\\"),
                 '\'' => out.push_str("\\'"),
-                c if c.is_control() && (c as u32) < 0x20 || c == '\u{7f}' => {
-                    out.push_str(&format!("\\x{:02X}", c as u32));
-                }
-                c => out.push(c),
+                c => match crate::escape::control(c) {
+                    Some(e) => out.push_str(&e),
+                    None => out.push(c),
+                },
             }
         }
     }
@@ -362,7 +362,10 @@ fn walk_entry(
     let meta = match entry.metadata() {
         Ok(m) => m,
         Err(e) => {
-            let msg = format!("{rel} ignoré : lecture impossible ({e})");
+            let msg = format!(
+                "{} ignoré : lecture impossible ({e})",
+                crate::escape::path(&rel)
+            );
             acc.warnings.push((rel, msg));
             return;
         }
@@ -512,9 +515,14 @@ pub fn read_utf8(abs: &Path, rel: &str) -> std::result::Result<Vec<u8>, String> 
 
 /// Comme `read_utf8`, le contenu étant rendu en `String` (validée une seule fois, sans copie).
 pub fn read_text(abs: &Path, rel: &str) -> std::result::Result<String, String> {
-    let bytes =
-        std::fs::read(abs).map_err(|e| format!("{rel} ignoré : lecture impossible ({e})"))?;
-    String::from_utf8(bytes).map_err(|_| format!("{rel} ignoré : fichier non UTF-8"))
+    let bytes = std::fs::read(abs).map_err(|e| {
+        format!(
+            "{} ignoré : lecture impossible ({e})",
+            crate::escape::path(rel)
+        )
+    })?;
+    String::from_utf8(bytes)
+        .map_err(|_| format!("{} ignoré : fichier non UTF-8", crate::escape::path(rel)))
 }
 
 /// Empreinte lue d'un fichier et son contenu retenu s'il tient dans le budget.
@@ -612,7 +620,7 @@ pub(crate) fn scan_with_budget(
             "{} ignoré : même chemin dans le graphe que {} ({}), seul retenu ; renommez ce fichier",
             escaped(&c.ignored),
             escaped(&c.kept),
-            c.path
+            crate::escape::path(&c.path)
         );
         warn(&msg);
         res.warnings.push(msg);
@@ -779,6 +787,26 @@ mod tests {
         assert_eq!(f(b"l'a.java"), "l\\'a.java");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn req101_ac1_escaped_controles_c1_et_marques_de_direction() {
+        use std::os::unix::ffi::OsStrExt;
+        let f = |b: &[u8]| escaped(Path::new(std::ffi::OsStr::from_bytes(b)));
+        assert_eq!(f(b"a\xc2\x9bb.java"), "a\\u{009B}b.java");
+        assert_eq!(f(b"a\xc2\x85.java"), "a\\u{0085}.java");
+        for cp in [
+            0x202Au32, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069,
+        ] {
+            let name = format!("x{}.java", char::from_u32(cp).unwrap());
+            assert_eq!(f(name.as_bytes()), format!("x\\u{{{cp:04X}}}.java"));
+        }
+        for c in ['\u{200F}', '\u{2028}', '\u{FFFD}'] {
+            let name = format!("x{c}.java");
+            assert_eq!(f(name.as_bytes()), name);
+        }
+        assert_eq!(f(b"a\x9bb.java"), "a\\x9Bb.java");
+    }
+
     #[test]
     fn scan_remplit_root_project_name_des_settings() {
         let dir = tempfile::tempdir().unwrap();
@@ -891,7 +919,10 @@ mod tests {
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    let msg = format!("{rel} ignoré : lecture impossible ({e})");
+                    let msg = format!(
+                        "{} ignoré : lecture impossible ({e})",
+                        crate::escape::path(&rel)
+                    );
                     warn(&msg);
                     res.warnings.push(msg);
                     continue;
@@ -957,7 +988,7 @@ mod tests {
                 "{} ignoré : même chemin dans le graphe que {} ({}), seul retenu ; renommez ce fichier",
                 escaped(&c.ignored),
                 escaped(&c.kept),
-                c.path
+                crate::escape::path(&c.path)
             );
             warn(&msg);
             res.warnings.push(msg);
