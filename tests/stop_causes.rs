@@ -60,13 +60,18 @@ impl Env {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_base(args, "10")
+    }
+
+    /// Comme `run`, avec `NEPHILA_RETRY_BASE_MS` = `base`.
+    fn run_base(&self, args: &[&str], base: &str) -> Output {
         Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(&self.repo)
             .args(args)
             .env("NEPHILA_CONFIG", self._tmp.path().join("config.toml"))
             .env(KEY_VAR, "sk-test")
-            .env("NEPHILA_RETRY_BASE_MS", "10")
+            .env("NEPHILA_RETRY_BASE_MS", base)
             .output()
             .unwrap()
     }
@@ -443,4 +448,296 @@ fn req092_ac3_verbose_trace_has_the_redirect_label_and_no_wait() {
         )),
         "{err}"
     );
+}
+
+// ---- Fournisseur saturé (REQ-093, DEC-099) et délais dépassés répétés (REQ-094) ----
+
+const SATURATED_ERROR: &str = "erreur: envoi interrompu : fournisseur saturé : relancez nephila update plus tard ou réduisez concurrency ; 4 fichier(s) à enrichir";
+const TIMEOUT_CAUSE: &str =
+    "délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur";
+
+fn saturated_run(provider: &str, status: u16, verbose: bool) -> (FakeServer, Output) {
+    let s = FakeServer::start_replies(refusals(status, "{}", 20));
+    let env = Env::new(provider, &s, 4, 1);
+    let args: &[&str] = if verbose {
+        &["build", "--verbose"]
+    } else {
+        &["build"]
+    };
+    let o = env.run_base(args, "1");
+    (s, o)
+}
+
+#[test]
+fn req093_ac1_ac4_saturation_stops_after_15_requests_with_e21() {
+    for (provider, status) in [("openai", 429u16), ("openai", 529), ("anthropic", 529)] {
+        let ctx = format!("{provider} {status}");
+        let (s, o) = saturated_run(provider, status, false);
+        let err = text(&o.stderr);
+        assert_eq!(posts(&s), 15, "{ctx}: {err}");
+        assert_eq!(error_lines(&o), [SATURATED_ERROR], "{ctx}: {err}");
+        assert_eq!(lines(&o).last().unwrap(), SATURATED_ERROR, "{ctx}");
+        assert!(!err.contains("panne réseau"), "{ctx}: {err}");
+        let warnings: Vec<_> = lines(&o)
+            .into_iter()
+            .filter(|l| l.starts_with("avertissement:"))
+            .collect();
+        assert_eq!(warnings.len(), 3, "{ctx}: {err}");
+        for w in &warnings {
+            assert!(
+                w.contains(&format!("erreur de {provider} (HTTP {status}) sur ")),
+                "{ctx}: {w}"
+            );
+        }
+        assert_eq!(o.status.code(), Some(1), "{ctx}");
+    }
+}
+
+#[test]
+fn req093_ac1_ac4_always_503_keeps_the_network_cause() {
+    let s = FakeServer::start_replies(refusals(503, "{}", 20));
+    let env = Env::new("openai", &s, 4, 1);
+    let o = env.run_base(&["build", "--verbose"], "1");
+    let err = text(&o.stderr);
+    assert_eq!(posts(&s), 15, "{err}");
+    assert_eq!(
+        error_lines(&o),
+        ["erreur: envoi interrompu : panne réseau répétée (3 erreurs réseau consécutives) ; 4 fichier(s) à enrichir"]
+    );
+    assert!(!err.contains("saturé"), "{err}");
+    for k in 1..=3 {
+        assert!(
+            lines(&o)
+                .iter()
+                .any(|l| l.ends_with(&format!("politique: erreurs réseau consécutives {k}/3"))),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn req093_ac3_verbose_counts_carry_the_saturation_mark() {
+    let (_s, o) = saturated_run("openai", 429, true);
+    let err = text(&o.stderr);
+    let all = lines(&o);
+    let mut at = 0;
+    for k in 1..=3 {
+        let end = format!("politique: erreurs réseau consécutives {k}/3 (fournisseur saturé)");
+        at += all[at..]
+            .iter()
+            .position(|l| l.ends_with(&end))
+            .unwrap_or_else(|| panic!("{end}: {err}"));
+    }
+    let stop = all
+        .iter()
+        .position(|l| {
+            l.ends_with("politique: arrêt de l'envoi (fournisseur saturé), 1 fichiers non envoyés")
+        })
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(stop > at);
+    assert_eq!(all.last().unwrap(), SATURATED_ERROR);
+    assert!(!err.contains("panne réseau"), "{err}");
+}
+
+/// Dépôt de documents pour le fournisseur simulé, avec son journal d'appels.
+struct MockEnv {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    log: PathBuf,
+}
+
+impl MockEnv {
+    fn new(docs: usize) -> MockEnv {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        for i in 0..docs {
+            fs::write(
+                repo.join(format!("docs/d{i}.md")),
+                format!("# D{i}\n\nTexte {i}.\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            tmp.path().join("config.toml"),
+            "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\nbatch_files = 1\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("mock")).unwrap();
+        let log = tmp.path().join("mock.log");
+        MockEnv {
+            _tmp: tmp,
+            repo,
+            log,
+        }
+    }
+
+    fn build(&self, timeouts: &[String], verbose: bool) -> Output {
+        let mut c = Command::new(cargo_bin("nephila"));
+        c.arg("-C").arg(&self.repo).arg("build");
+        if verbose {
+            c.arg("--verbose");
+        }
+        c.env("NEPHILA_CONFIG", self._tmp.path().join("config.toml"))
+            .env("NEPHILA_MOCK_DIR", self._tmp.path().join("mock"))
+            .env("NEPHILA_MOCK_LOG", &self.log)
+            .env("NEPHILA_MOCK_TIMEOUT_FILES", timeouts.join(","))
+            .output()
+            .unwrap()
+    }
+
+    /// Chemins du journal dans l'ordre d'envoi, sans doublon.
+    fn order(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
+    }
+
+    /// Ordre d'envoi d'un build sans échec, puis graphe et journal remis à neuf.
+    fn send_order(&self) -> Vec<String> {
+        let o = self.build(&[], false);
+        assert!(o.status.success(), "{}", text(&o.stderr));
+        let order = self.order();
+        fs::remove_dir_all(self.repo.join(".nephila")).unwrap();
+        fs::remove_file(&self.log).unwrap();
+        order
+    }
+
+    fn to_enrich(&self) -> usize {
+        let o = Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["status", "--json"])
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        v["to_enrich"].as_u64().unwrap() as usize
+    }
+}
+
+const E22_6: &str = "erreur: envoi interrompu : délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur ; 6 fichier(s) à enrichir";
+
+#[test]
+fn req094_ac1_ac6_three_timeouts_stop_the_send_with_e22() {
+    let env = MockEnv::new(6);
+    let order = env.send_order();
+    let o = env.build(&order[..3], false);
+    let err = text(&o.stderr);
+    assert_eq!(env.order(), order[..3], "{err}");
+    let raw = fs::read_to_string(&env.log).unwrap();
+    assert_eq!(raw.lines().count(), 3, "{raw}");
+    assert_eq!(error_lines(&o), [E22_6], "{err}");
+    assert_eq!(lines(&o).last().unwrap(), E22_6);
+    assert!(!err.contains("panne réseau"), "{err}");
+    let warnings = lines(&o)
+        .into_iter()
+        .filter(|l| l.starts_with("avertissement:"))
+        .count();
+    assert_eq!(warnings, 3, "{err}");
+    assert_eq!(env.to_enrich(), 6);
+    assert_eq!(o.status.code(), Some(1));
+}
+
+#[test]
+fn req094_ac5_ac6_verbose_counts_then_the_stop_line() {
+    let env = MockEnv::new(6);
+    let order = env.send_order();
+    let o = env.build(&order[..3], true);
+    let err = text(&o.stderr);
+    let all = lines(&o);
+    let mut at = 0;
+    for k in 1..=3 {
+        let fin = all[at..]
+            .iter()
+            .position(|l| l.contains("llm enrich fin") && l.contains("délai dépassé"))
+            .unwrap_or_else(|| panic!("{err}"));
+        at += fin + 1;
+        assert!(
+            all[at].ends_with(&format!("politique: délais dépassés consécutifs {k}/3")),
+            "{k}: {}",
+            all[at]
+        );
+    }
+    assert!(
+        all[at + 1..].iter().any(|l| l.ends_with(
+            "politique: arrêt de l'envoi (délais dépassés répétés), 3 fichiers non envoyés"
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("erreurs réseau consécutives"), "{err}");
+}
+
+#[test]
+fn req094_ac3_ac6_a_success_between_timeouts_does_not_stop() {
+    let env = MockEnv::new(6);
+    let order = env.send_order();
+    let bad: Vec<String> = [0, 1, 3, 4].iter().map(|&i| order[i].clone()).collect();
+    let o = env.build(&bad, true);
+    let err = text(&o.stderr);
+    assert_eq!(env.order(), order, "{err}");
+    assert_eq!(env.to_enrich(), 4);
+    assert!(!err.contains("arrêt de l'envoi"), "{err}");
+    assert!(
+        error_lines(&o)
+            .iter()
+            .all(|l| !l.contains("envoi interrompu")),
+        "{err}"
+    );
+    let counts: Vec<String> = lines(&o)
+        .iter()
+        .filter_map(|l| l.split("politique: délais dépassés consécutifs ").nth(1))
+        .map(String::from)
+        .collect();
+    assert_eq!(counts, ["1/3", "2/3", "1/3", "2/3"], "{err}");
+}
+
+#[test]
+fn req094_ac2_slow_provider_gets_three_requests_only() {
+    let slow = |n: usize| -> Vec<Reply> {
+        (0..n)
+            .map(|_| Reply::Http {
+                status: 200,
+                body: "{}".into(),
+                headers: vec![],
+                delay_ms: 2000,
+            })
+            .collect()
+    };
+    let s = FakeServer::start_replies(slow(5));
+    let env = Env::new("openai", &s, 5, 1);
+    let conf = env._tmp.path().join("config.toml");
+    fs::write(
+        &conf,
+        fs::read_to_string(&conf).unwrap() + "timeout_secs = 1\n",
+    )
+    .unwrap();
+    let t = std::time::Instant::now();
+    let o = env.run(&["build", "--verbose"]);
+    let err = text(&o.stderr);
+    assert!(t.elapsed() < std::time::Duration::from_secs(10), "{err}");
+    // Compte côté client : exactement 3 appels partis.
+    let started = lines(&o)
+        .iter()
+        .filter(|l| l.contains("llm enrich départ"))
+        .count();
+    assert_eq!(started, 3, "{err}");
+    // Le faux serveur sert une connexion à la fois (2 s chacune) : il enregistre la 3e requête,
+    // déjà envoyée par le client, un peu après la fin de la commande.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while posts(&s) < 3 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(posts(&s), 3, "{err}");
+    assert_eq!(
+        error_lines(&o),
+        [format!(
+            "erreur: envoi interrompu : {TIMEOUT_CAUSE} ; 5 fichier(s) à enrichir"
+        )],
+        "{err}"
+    );
+    assert_eq!(o.status.code(), Some(1));
 }

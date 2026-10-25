@@ -141,6 +141,17 @@ fn logged_paths(env: &Env) -> Vec<String> {
     v
 }
 
+/// Chemins du journal du mock dans l'ordre d'envoi, sans doublon.
+fn logged_order(env: &Env) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    fs::read_to_string(&env.log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.split('\t').next().unwrap().to_string())
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
+}
+
 fn call_count(env: &Env) -> usize {
     fs::read_to_string(&env.log)
         .unwrap_or_default()
@@ -252,26 +263,28 @@ fn req010_ac4_update_behaves_the_same() {
 }
 
 #[test]
-fn req010_ac5_four_timeouts_do_not_stop_the_sending() {
+fn req010_ac5_four_timeouts_never_three_in_a_row_do_not_stop_the_sending() {
     let env = Env::new();
-    let all: Vec<String> = {
-        // Premier build réussi pour connaître les fichiers, puis reconstruction avec échecs.
-        let ok = env.run("build", &[]);
-        assert!(ok.status.success());
-        let mut v = paths_in_graph(&env, FileState::Indexed);
-        v.sort();
-        v
-    };
+    // Premier build réussi pour connaître les fichiers et leur ordre d'envoi (concurrency = 1).
+    let ok = env.run("build", &[]);
+    assert!(ok.status.success());
+    let order = logged_order(&env);
+    let mut all = order.clone();
+    all.sort();
     assert!(all.len() >= 8);
-    let bad: Vec<String> = all.iter().take(4).cloned().collect();
+    // AC-010-5 modifié : jamais 3 délais de suite (une réussite entre le 2e et le 3e).
+    let mut bad: Vec<String> = [0, 1, 3, 4].iter().map(|&i| order[i].clone()).collect();
     fs::remove_file(&env.log).unwrap();
     // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
     fs::remove_dir_all(env.repo.join(".nephila")).unwrap();
     let out = env.run("build", &[("NEPHILA_MOCK_TIMEOUT_FILES", &bad.join(","))]);
     assert!(!out.status.success());
-    assert_eq!(logged_paths(&env), all);
+    assert_eq!(logged_order(&env), order);
+    bad.sort();
     assert_eq!(to_enrich(&env), bad);
     assert_eq!(paths_in_graph(&env, FileState::Indexed).len(), all.len());
+    let err = stderr(&out);
+    assert!(!err.contains("envoi interrompu"), "{err}");
 }
 
 #[test]

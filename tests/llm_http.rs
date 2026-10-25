@@ -86,9 +86,10 @@ fn req002_ac3_server_error_is_network_not_key() {
         anthropic(&s).enrich("A.java", 1, "x", &a_ids(), &a_ids()),
         Err(Error::Network(_))
     ));
+    // Un 429 définitif est une saturation (REQ-093, DEC-099), comptée comme une erreur réseau.
     assert!(matches!(
         openai(&s, None).enrich("A.java", 1, "x", &a_ids(), &a_ids()),
-        Err(Error::Network(_))
+        Err(Error::Saturated(_))
     ));
 }
 

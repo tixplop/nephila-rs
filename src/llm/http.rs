@@ -313,7 +313,12 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
             Attempt::Done(Err(rejected(provider, code, &url, detail.as_deref())))
         }
         Err(ureq::Error::Status(code, resp)) => {
-            let error = Error::Network(format!("erreur de {provider} (HTTP {code}) sur {url}"));
+            let text = format!("erreur de {provider} (HTTP {code}) sur {url}");
+            let error = if matches!(code, 429 | 529) {
+                Error::Saturated(text)
+            } else {
+                Error::Network(text)
+            };
             if is_retryable_status(code) {
                 Attempt::Retry {
                     error,

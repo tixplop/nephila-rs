@@ -18,62 +18,103 @@ use crate::progress::{self, Phase};
 use crate::store::{EnrichmentWrite, Store};
 use crate::trace;
 
-/// Nombre d'erreurs réseau consécutives qui arrête l'envoi (DEC-015).
+/// Seuil des erreurs réseau consécutives (saturations comprises) et des délais dépassés
+/// consécutifs, chacun compté à part, qui arrête l'envoi (DEC-015, DEC-099).
 const MAX_CONSECUTIVE_NETWORK_ERRORS: usize = 3;
+
+/// Cause d'arrêt à seuil : libellé de la trace et cause de la ligne `erreur:` (une seule table).
+struct ThresholdCause {
+    label: &'static str,
+    cause: &'static str,
+}
+
+const CAUSE_NETWORK: ThresholdCause = ThresholdCause {
+    label: "panne réseau répétée (3 erreurs réseau consécutives)",
+    cause: "panne réseau répétée (3 erreurs réseau consécutives)",
+};
+const CAUSE_SATURATED: ThresholdCause = ThresholdCause {
+    label: "fournisseur saturé",
+    cause: "fournisseur saturé : relancez nephila update plus tard ou réduisez concurrency",
+};
+const CAUSE_TIMEOUT: ThresholdCause = ThresholdCause {
+    label: "délais dépassés répétés",
+    cause: "délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur",
+};
 
 /// Politique d'échec partagée entre les threads de travail (DEC-015).
 #[derive(Default)]
 struct Policy {
     consecutive_network: usize,
     network_total: usize,
+    consecutive_timeout: usize,
+    timeout_total: usize,
+    /// Cause de la ligne `erreur:` finale.
     stop_cause: Option<String>,
+    /// Libellé de la cause dans la trace `politique: arrêt de l'envoi`.
+    stop_label: Option<String>,
     /// Première erreur d'arrêt immédiat (clé refusée REQ-054, requête refusée REQ-091), si elle
     /// est la cause de l'arrêt.
     refused: Option<Error>,
 }
 
-/// Total des erreurs réseau constatées au départ d'un appel (DEC-022).
-type Ticket = usize;
+/// Totaux des erreurs réseau et des délais dépassés constatés au départ d'un appel (DEC-022).
+type Ticket = (usize, usize);
 
 impl Policy {
     /// Prend un ticket au départ d'un appel (sous le verrou de la politique).
     fn dispatch(&self) -> Ticket {
-        self.network_total
+        (self.network_total, self.timeout_total)
+    }
+
+    fn stop_with(&mut self, label: &str, cause: &str) {
+        if self.stop_cause.is_none() {
+            self.stop_label = Some(label.to_string());
+            self.stop_cause = Some(cause.to_string());
+        }
     }
 
     /// Met à jour la politique ; renvoie vrai si l'envoi de nouveaux fichiers doit s'arrêter.
-    /// Une réussite n'efface que les erreurs réseau constatées avant le départ de son appel (DEC-022).
+    /// Une réussite n'efface que les échecs constatés avant le départ de son appel (DEC-022).
     fn record(&mut self, ticket: Ticket, result: Option<&Error>) -> bool {
         match result {
             None => {
                 self.consecutive_network = self
                     .consecutive_network
-                    .min(self.network_total.saturating_sub(ticket));
+                    .min(self.network_total.saturating_sub(ticket.0));
+                self.consecutive_timeout = self
+                    .consecutive_timeout
+                    .min(self.timeout_total.saturating_sub(ticket.1));
             }
             Some(
                 e @ (Error::InvalidKey(_) | Error::Rejected { .. } | Error::Redirected { .. }),
             ) => {
                 if self.stop_cause.is_none() {
                     self.refused = Some(e.clone());
-                    self.stop_cause = Some(
-                        match e {
-                            Error::InvalidKey(_) => "clé d'API refusée par le fournisseur",
-                            Error::Redirected { .. } => "requête redirigée par le fournisseur",
-                            _ => "requête refusée par le fournisseur",
-                        }
-                        .to_string(),
-                    );
+                    let cause = match e {
+                        Error::InvalidKey(_) => "clé d'API refusée par le fournisseur",
+                        Error::Redirected { .. } => "requête redirigée par le fournisseur",
+                        _ => "requête refusée par le fournisseur",
+                    };
+                    self.stop_with(cause, cause);
                 }
             }
-            Some(Error::Network(_)) => {
+            Some(e @ (Error::Network(_) | Error::Saturated(_))) => {
                 self.consecutive_network += 1;
                 self.network_total += 1;
                 if self.consecutive_network >= MAX_CONSECUTIVE_NETWORK_ERRORS {
-                    self.stop_cause.get_or_insert_with(|| {
-                        format!(
-                            "panne réseau répétée ({MAX_CONSECUTIVE_NETWORK_ERRORS} erreurs réseau consécutives)"
-                        )
-                    });
+                    let c = if matches!(e, Error::Saturated(_)) {
+                        CAUSE_SATURATED
+                    } else {
+                        CAUSE_NETWORK
+                    };
+                    self.stop_with(c.label, c.cause);
+                }
+            }
+            Some(Error::Timeout(_)) => {
+                self.consecutive_timeout += 1;
+                self.timeout_total += 1;
+                if self.consecutive_timeout >= MAX_CONSECUTIVE_NETWORK_ERRORS {
+                    self.stop_with(CAUSE_TIMEOUT.label, CAUSE_TIMEOUT.cause);
                 }
             }
             Some(_) => {}
@@ -979,11 +1020,20 @@ pub(crate) fn enrich_with_stop(
                             None => guard.stop_cause.is_some(),
                         };
                         if trace::enabled() {
-                            if matches!(error, Some(Error::Network(_))) {
-                                trace!(
+                            match error {
+                                Some(Error::Network(_)) => trace!(
                                     "politique: erreurs réseau consécutives {}/{MAX_CONSECUTIVE_NETWORK_ERRORS}",
                                     guard.consecutive_network
-                                );
+                                ),
+                                Some(Error::Saturated(_)) => trace!(
+                                    "politique: erreurs réseau consécutives {}/{MAX_CONSECUTIVE_NETWORK_ERRORS} (fournisseur saturé)",
+                                    guard.consecutive_network
+                                ),
+                                Some(Error::Timeout(_)) => trace!(
+                                    "politique: délais dépassés consécutifs {}/{MAX_CONSECUTIVE_NETWORK_ERRORS}",
+                                    guard.consecutive_timeout
+                                ),
+                                _ => {}
                             }
                             if halt && !was_stopped {
                                 let left: usize = shared
@@ -995,7 +1045,7 @@ pub(crate) fn enrich_with_stop(
                                     .sum();
                                 trace!(
                                     "politique: arrêt de l'envoi ({}), {left} fichiers non envoyés",
-                                    guard.stop_cause.as_deref().unwrap_or("")
+                                    guard.stop_label.as_deref().unwrap_or("")
                                 );
                             }
                         }
@@ -1701,6 +1751,123 @@ mod tests {
         assert!(p.stop_cause.is_none());
     }
 
+    fn sat() -> Error {
+        Error::Saturated("saturé".into())
+    }
+
+    fn to() -> Error {
+        Error::Timeout("délai".into())
+    }
+
+    fn run(p: &mut Policy, errors: &[Option<Error>]) -> Vec<bool> {
+        errors
+            .iter()
+            .map(|e| {
+                let t = p.dispatch();
+                p.record(t, e.as_ref())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn req093_ac2_cause_follows_the_error_reaching_the_threshold() {
+        let mut p = Policy::default();
+        assert_eq!(
+            run(&mut p, &[Some(net()), Some(net()), Some(sat())]),
+            [false, false, true]
+        );
+        assert!(p
+            .stop_cause
+            .as_deref()
+            .unwrap()
+            .starts_with("fournisseur saturé : relancez nephila update plus tard"));
+        assert_eq!(p.stop_label.as_deref(), Some("fournisseur saturé"));
+
+        let mut p = Policy::default();
+        assert_eq!(
+            run(&mut p, &[Some(sat()), Some(sat()), Some(net())]),
+            [false, false, true]
+        );
+        assert_eq!(
+            p.stop_cause.as_deref(),
+            Some("panne réseau répétée (3 erreurs réseau consécutives)")
+        );
+
+        // Une réussite partie après remet le compte à zéro dans les deux cas.
+        for last in [sat(), net()] {
+            let mut p = Policy::default();
+            let r = run(
+                &mut p,
+                &[Some(sat()), Some(net()), None, Some(sat()), Some(last)],
+            );
+            assert!(r.iter().all(|h| !h), "{r:?}");
+            assert!(p.stop_cause.is_none());
+        }
+    }
+
+    #[test]
+    fn req094_ac4_three_timeouts_stop_with_their_own_cause() {
+        let mut p = Policy::default();
+        assert_eq!(
+            run(&mut p, &[Some(to()), Some(to()), Some(to())]),
+            [false, false, true]
+        );
+        assert_eq!(
+            p.stop_cause.as_deref(),
+            Some("délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur")
+        );
+        assert_eq!(p.stop_label.as_deref(), Some("délais dépassés répétés"));
+    }
+
+    #[test]
+    fn req094_ac4_network_error_neither_counts_nor_resets_timeouts() {
+        let mut p = Policy::default();
+        assert_eq!(
+            run(&mut p, &[Some(to()), Some(to()), Some(net()), Some(to())]),
+            [false, false, false, true]
+        );
+        assert!(p.stop_cause.unwrap().starts_with("délais dépassés répétés"));
+    }
+
+    #[test]
+    fn req094_ac4_success_after_the_timeouts_resets_them() {
+        let mut p = Policy::default();
+        assert_eq!(
+            run(&mut p, &[Some(to()), Some(to()), None, Some(to())]),
+            [false, false, false, false]
+        );
+        assert!(p.stop_cause.is_none());
+    }
+
+    #[test]
+    fn req094_ac4_success_dispatched_before_timeouts_does_not_reset_them() {
+        let mut p = Policy::default();
+        let a = p.dispatch();
+        let (b, c) = (p.dispatch(), p.dispatch());
+        assert!(!p.record(b, Some(&to())));
+        assert!(!p.record(c, Some(&to())));
+        assert!(!p.record(a, None));
+        let d = p.dispatch();
+        assert!(p.record(d, Some(&to())));
+    }
+
+    #[test]
+    fn req094_ac4_counts_are_not_added_up() {
+        let mut p = Policy::default();
+        let r = run(&mut p, &[Some(net()), Some(to()), Some(net()), Some(to())]);
+        assert!(r.iter().all(|h| !h));
+        assert_eq!((p.consecutive_network, p.consecutive_timeout), (2, 2));
+        assert!(p.stop_cause.is_none());
+    }
+
+    #[test]
+    fn req010_ac9_timeouts_distinct_count_and_saturation_is_a_network_error() {
+        let mut p = Policy::default();
+        run(&mut p, &[Some(net()), Some(sat())]);
+        assert_eq!((p.consecutive_network, p.network_total), (2, 2));
+        assert_eq!(p.consecutive_timeout, 0);
+    }
+
     #[test]
     fn req010_ac9_invalid_key_stops_at_first() {
         let mut p = Policy::default();
@@ -1733,7 +1900,7 @@ mod tests {
         assert_eq!(p.refused, Some(rejected()));
 
         let mut p = Policy::default();
-        assert!(p.record(0, Some(&rejected())));
+        assert!(p.record((0, 0), Some(&rejected())));
         assert_eq!(p.consecutive_network, 0);
     }
 
@@ -1741,8 +1908,8 @@ mod tests {
     fn req091_ac5_first_immediate_stop_wins() {
         let key = Error::InvalidKey("clé".into());
         let mut p = Policy::default();
-        assert!(p.record(0, Some(&key)));
-        assert!(p.record(0, Some(&rejected())));
+        assert!(p.record((0, 0), Some(&key)));
+        assert!(p.record((0, 0), Some(&rejected())));
         assert_eq!(p.refused, Some(key.clone()));
         assert_eq!(
             p.stop_cause.as_deref(),
@@ -1750,8 +1917,8 @@ mod tests {
         );
 
         let mut p = Policy::default();
-        assert!(p.record(0, Some(&rejected())));
-        assert!(p.record(0, Some(&key)));
+        assert!(p.record((0, 0), Some(&rejected())));
+        assert!(p.record((0, 0), Some(&key)));
         assert_eq!(p.refused, Some(rejected()));
         assert_eq!(
             p.stop_cause.as_deref(),
@@ -1766,7 +1933,7 @@ mod tests {
             trace: "openai redirige (HTTP 302)".into(),
         };
         let mut p = Policy::default();
-        assert!(p.record(0, Some(&r)));
+        assert!(p.record((0, 0), Some(&r)));
         assert_eq!(
             p.stop_cause.as_deref(),
             Some("requête redirigée par le fournisseur")

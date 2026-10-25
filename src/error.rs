@@ -16,6 +16,9 @@ pub enum Error {
     Redirected { message: String, trace: String },
     /// Erreur réseau, quota ou erreur serveur du fournisseur.
     Network(String),
+    /// Échec définitif d'un appel sur HTTP 429 ou 529 (REQ-093, DEC-099) : compté comme une
+    /// erreur réseau par la politique, mais la cause d'arrêt dit « fournisseur saturé ».
+    Saturated(String),
     /// Délai d'appel dépassé (`timeout_secs`).
     Timeout(String),
     /// Toute autre erreur, avec un message destiné à l'utilisateur.
@@ -63,6 +66,7 @@ impl fmt::Display for Error {
             | Error::Rejected { message: m, .. }
             | Error::Redirected { message: m, .. }
             | Error::Network(m)
+            | Error::Saturated(m)
             | Error::Timeout(m)
             | Error::Message(m)
             | Error::Format(m)

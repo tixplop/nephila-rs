@@ -65,7 +65,7 @@ pub fn classify(e: &crate::error::Error) -> String {
     use crate::error::Error;
     let label = match e {
         Error::Timeout(_) => "délai dépassé",
-        Error::Network(_) => "réseau",
+        Error::Network(_) | Error::Saturated(_) => "réseau",
         Error::InvalidKey(_) => "clé refusée",
         Error::Rejected { .. } => "requête refusée",
         Error::Redirected { .. } => "requête redirigée",
