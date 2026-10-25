@@ -147,7 +147,12 @@ Réanalyser un fichier modifié efface ses résumés et concepts ; un fichier in
 
 - un fichier en échec reste « en attente » ou « à enrichir », est nommé sur stderr avec sa cause, et le traitement des autres continue ;
 - il n'y a pas de vérification préalable de la clé d'API : l'extraction a lieu d'abord, et le premier appel révèle une clé refusée (HTTP 401/403). L'envoi s'arrête alors, la ligne de bilan est affichée, et stderr porte une seule ligne `erreur: clé d'API refusée par <fournisseur> (HTTP <code>) ; vérifiez la variable désignée par api_key_env`, avec le code 1. Une fois la variable corrigée, `nephila update` n'envoie que les fichiers à enrichir. Sans fichier à enrichir, aucun appel n'a lieu et une clé fausse passe inaperçue ;
-- l'envoi au LLM s'arrête aussi, sur une clé refusée (dès le premier refus) ou après 3 erreurs réseau consécutives, comptées une fois les nouveaux essais épuisés (une réussite remet le compte à zéro) ;
+- l'envoi au LLM s'arrête aussi, sur une clé refusée, une requête refusée ou une redirection (dès le premier appel), ou après 3 erreurs réseau consécutives ou 3 délais dépassés consécutifs, comptés une fois les nouveaux essais épuisés (une réussite remet le compte à zéro). Chaque cause a sa seule ligne `erreur:`, la dernière de stderr, après la ligne de bilan ; code 1 ; la première cause constatée l'emporte :
+  - `erreur: requête refusée par <fournisseur> (HTTP <code>) sur <url> : <message du fournisseur> ; vérifiez model, thinking, effort et max_output_tokens` : HTTP 400, 404, 413 ou 422, un seul appel. Le message du fournisseur dit quel réglage corriger ; sans message utilisable, la ligne s'écrit sans ` : <message du fournisseur>` ;
+  - `erreur: <fournisseur> redirige (HTTP <code>) vers <adresse> ; corrigez base_url` (ou `sans destination`) : la redirection n'est jamais suivie, et rien n'est envoyé à l'adresse de destination, clé comprise. Corrigez `base_url` d'après l'adresse affichée, si vous faites confiance à cet hôte ;
+  - `erreur: envoi interrompu : fournisseur saturé : relancez nephila update plus tard ou réduisez concurrency` : trois appels de suite en échec définitif sur HTTP 429 ou 529. Les avertissements par fichier gardent le code HTTP ;
+  - `erreur: envoi interrompu : délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur` : trois appels de suite sans réponse dans `timeout_secs`. Un délai isolé suivi d'une réussite ne change rien ;
+  - ces deux dernières lignes se terminent par les comptes habituels (` ; <n> fichier(s) à enrichir`). Les fichiers d'une requête refusée ou redirigée n'ont aucune ligne `avertissement:` ; tous restent « à enrichir » et `nephila update` les reprend, eux seuls. `query ask` écrit les deux premières lignes seules sur stderr, stdout vide ;
 - les appels déjà en cours se terminent et sont enregistrés, et la ligne de bilan est toujours affichée ;
 - une référence dont le genre de lien est inconnu ou non autorisé pour son nœud source est écartée avec un avertissement ; le fichier est indexé normalement.
 
@@ -227,9 +232,11 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 - la configuration (fournisseur, modèle, `enrich_code`, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;
 - le parcours des fichiers ;
 - le début et la fin de chaque phase (structure, résolution, enrichissement) ; la ligne de fin de la résolution se termine par ` (complète)` ou ` (incrémentale, <N> références réévaluées)` selon la passe, et un `update` sur un graphe à résoudre commence par une passe complète ; la fin de la phase structure donne le nombre de fichiers dont les résumés ont été repris sans appel (`, <r> enrichissements conservés`) ; le nombre de fils annoncé au début de la phase structure est celui de `--jobs` (au plus le nombre de fichiers), celui de l'enrichissement vient de `concurrency` ;
-- le départ et la fin de chaque appel LLM, avec son résultat (`ok`, `délai dépassé`, `réseau`, `clé refusée`, `erreur` ou `tronquée`) et sa durée ; `[i/n]` compte les appels du fichier (morceaux et groupes de 150 nœuds confondus) ; le départ d'un nouvel essai porte la marque ` (essai <e>/<t>)`, où `<t>` vaut `format_retries` + 1 (le premier essai n'a pas de marque) ;
-- chaque attente avant un nouvel essai HTTP, entre le départ et la fin de l'appel : `llm enrich attente <chemin> [i/n] <ms> ms après HTTP 503 (nouvel essai 1/4)` (cause `HTTP <code>` ou `erreur réseau`) ;
-- les décisions d'arrêt.
+- le départ et la fin de chaque appel LLM, avec son résultat (`ok`, `délai dépassé`, `réseau`, `clé refusée`, `requête refusée`, `requête redirigée`, `erreur` ou `tronquée`) et sa durée ; `[i/n]` compte les appels du fichier (morceaux et groupes de 150 nœuds confondus) ; le départ d'un nouvel essai porte la marque ` (essai <e>/<t>)`, où `<t>` vaut `format_retries` + 1 (le premier essai n'a pas de marque) ;
+- chaque attente avant un nouvel essai HTTP, entre le départ et la fin de l'appel : `llm enrich attente <chemin> [i/n] <ms> ms après HTTP 503 (nouvel essai 1/4)` (cause `HTTP <code>`, `erreur réseau` ou `lecture interrompue`) ;
+- la découpe d'un lot dont la réponse est tronquée : `llm enrich découpe <lot> [1/1] en <moitié 1> et <moitié 2>` ;
+- les comptes de la politique d'arrêt : `politique: erreurs réseau consécutives <k>/3` (suivi de ` (fournisseur saturé)` quand la dernière erreur est un 429 ou un 529) et `politique: délais dépassés consécutifs <k>/3` ;
+- les décisions d'arrêt : `politique: arrêt de l'envoi (<cause>), <q> fichiers non envoyés`, où `<cause>` est `clé d'API refusée par le fournisseur`, `requête refusée par le fournisseur`, `requête redirigée par le fournisseur`, `panne réseau répétée (3 erreurs réseau consécutives)`, `fournisseur saturé` ou `délais dépassés répétés`. Le message du fournisseur et l'adresse de redirection ne figurent jamais dans une trace : ils sont dans la ligne `erreur:`.
 
 Un fichier non envoyé pour trop d'appels n'a aucune ligne `llm enrich`.
 
@@ -503,7 +510,7 @@ Ce que chaque clé envoie à chaque fournisseur :
 
 Avec thinking = false, aucun champ de réflexion n'est envoyé ; un modèle qui réfléchit toujours le fait quand même. Pour limiter sa réflexion : thinking = true et effort = "low". Un modèle qui ne prend pas en charge ces champs refuse la requête (HTTP 400). Ces trois clés ne sont lues que dans la configuration personnelle : .nephila.toml les refuse.
 
-Un modèle ou un serveur local dont la réponse maximale est plus courte que 16384 jetons refuse aussi la requête (HTTP 400) : baissez `max_output_tokens`. Les fichiers de la requête refusée restent « à enrichir ».
+Un modèle ou un serveur local dont la réponse maximale est plus courte que 16384 jetons refuse aussi la requête (HTTP 400) : baissez `max_output_tokens`. L'envoi s'arrête alors sur la ligne `erreur: requête refusée par <fournisseur> (HTTP 400) sur <url> : <message du fournisseur> ; vérifiez model, thinking, effort et max_output_tokens`, au lieu de laisser des fichiers « à enrichir » un par un ; les fichiers non enrichis restent « à enrichir » pour le prochain `nephila update`.
 
 La clé d'API n'est jamais écrite dans le fichier. `nephila` ne la vérifie pas avant le traitement : une clé refusée est constatée au premier appel, après l'extraction (voir [`nephila build` et `nephila update`](#nephila-build-et-nephila-update)).
 
@@ -578,14 +585,14 @@ Par défaut (`batch_files = 10`), un appel LLM regroupe jusqu'à dix fichiers, c
 - `--batch-files <N>` remplace la clé pour la commande en cours, sans rien écrire. Priorité : option, puis clé `batch_files`, puis défaut 10. Sans LLM actif, l'option est acceptée sans effet.
 - Jusqu'à `concurrency` appels (lots ou morceaux) sont en vol en même temps. Les connexions HTTP sont réutilisées d'un appel à l'autre.
 - Si un lot échoue, tous ses fichiers restent « à enrichir » et sont repris par le prochain `nephila update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse échoue seul.
-- Si la réponse du modèle est tronquée par la limite de jetons, tout le lot échoue ; voir [Réponse tronquée par la limite de jetons](#réponse-tronquée-par-la-limite-de-jetons).
+- Si la réponse du modèle à un lot est tronquée par la limite de jetons, le lot n'échoue pas : il est découpé en deux moitiés, envoyées aussitôt, puis chaque moitié tronquée est découpée à son tour, jusqu'au fichier seul. Sans `--verbose`, rien ne le montre ; avec `--verbose`, chaque découpe a sa ligne `llm enrich découpe`. Seul un fichier envoyé seul peut encore recevoir l'avertissement de [Réponse tronquée par la limite de jetons](#réponse-tronquée-par-la-limite-de-jetons).
 
 ## Réponses non conformes et nouveaux essais
 
 Un modèle, surtout local, rate parfois son JSON. Quand un appel aboutit mais que la réponse est inexploitable, `nephila` renvoie aussitôt la même requête, à l'identique, jusqu'à `format_retries` fois (défaut 2, soit au plus 3 appels).
 
 - **Retenté** : réponse reçue mais inexploitable (JSON illisible, aucun objet JSON dans le texte, schéma non respecté).
-- **Jamais retenté** : réponse tronquée par la limite de jetons (voir ci-dessous), délai dépassé, erreur réseau, clé refusée (ils relèvent de la politique d'arrêt), fichier illisible, éléments écartés d'une réponse conforme, fichier absent d'une réponse de lot conforme (il reste « à enrichir » pour le prochain `update`).
+- **Jamais retenté** : réponse tronquée par la limite de jetons (voir ci-dessous), délai dépassé, erreur réseau, clé refusée, requête refusée, redirection (ils relèvent de la politique d'arrêt), fichier illisible, éléments écartés d'une réponse conforme, fichier absent d'une réponse de lot conforme (il reste « à enrichir » pour le prochain `update`).
 - **Unité d'essai** : l'appel. Un morceau d'un gros fichier est retenté seul ; un lot est retenté en entier.
 - **Un essai réussi ne laisse aucune trace** : ni avertissement, ni changement du bilan ; seul `--verbose` montre les essais.
 - **Échec final** : le fichier reste « à enrichir » et une ligne le nomme, avec le nombre d'essais faits :
@@ -602,8 +609,11 @@ avertissement: src/A.java : réponse LLM non conforme au schéma : JSON illisibl
 Une surcharge passagère du fournisseur ne fait pas échouer un fichier. Les réponses HTTP 429, 500, 502, 503, 504 et 529, et les erreurs réseau transitoires (connexion refusée, réinitialisée ou fermée avant la réponse), sont renvoyées à l'identique jusqu'à 4 nouveaux essais, soit 5 envois au plus, avec une attente de plus en plus longue : environ 1, 2, 4 puis 8 s, tirées au hasard entre la moitié et la totalité de ces durées (15 s d'attente au plus par appel).
 
 - **`retry-after`** : si la réponse porte un `retry-after` en secondes, l'attente vaut cette valeur. Au-delà de 60 s, il n'y a aucun nouvel essai : le fichier échoue aussitôt, la commande ne reste pas bloquée.
-- **Jamais renvoyés** : 401 et 403 (clé refusée), les autres statuts (400, 404, 413…), le délai dépassé, le refus de certificat.
-- **Politique d'arrêt** : les essais sont internes à l'appel. Seul l'échec final compte, et les 3 erreurs réseau consécutives qui arrêtent l'envoi sont celles d'appels dont les essais sont épuisés. Un succès à un nouvel essai ne laisse aucune trace, sauf avec `--verbose` (lignes `llm enrich attente`).
+- **Jamais renvoyés** : 401 et 403 (clé refusée), la requête refusée (400, 404, 413, 422) et la redirection (300 à 399, jamais suivie), qui arrêtent chacune l'envoi dès le premier appel (voir [Gestion des échecs](#nephila-build-et-nephila-update)), les autres statuts, le délai dépassé, le refus de certificat.
+- **Fournisseur saturé** : un 429 ou un 529 qui résiste aux 5 envois compte comme une erreur réseau ; la troisième de suite arrête l'envoi sur `fournisseur saturé : relancez nephila update plus tard ou réduisez concurrency` (réduire `concurrency` aide pour un 429, seule l'attente aide pour un 529).
+- **Attente interrompue par l'arrêt** : quand une autre cause arrête l'envoi (une clé refusée, par exemple) pendant l'attente d'un appel, la commande finit aussitôt, sans finir l'attente ni renvoyer. L'appel qui attendait garde l'avertissement de sa dernière erreur.
+- **Lecture interrompue** : quand la réponse arrive (HTTP 200) mais que la connexion se ferme avant la fin du corps, le fournisseur a déjà produit la réponse : un seul nouvel envoi, et non quatre. Avec `--verbose`, `llm enrich attente <chemin> [1/1] <ms> ms après lecture interrompue (nouvel essai 1/4)`. Si ce nouvel envoi échoue aussi, le fichier reste « à enrichir » avec l'avertissement `… : lecture de la réponse : <cause>` (ou celui de la nouvelle erreur).
+- **Politique d'arrêt** : les essais sont internes à l'appel. Seul l'échec final compte, et les 3 erreurs réseau consécutives et les 3 délais dépassés consécutifs qui arrêtent l'envoi sont ceux d'appels dont les essais sont épuisés. Un succès à un nouvel essai ne laisse aucune trace, sauf avec `--verbose` (lignes `llm enrich attente`).
 - **Échec final** : l'avertissement habituel, `avertissement: <chemin> : erreur de openai (HTTP 503) sur <url>`, sans mention des essais.
 
 Un modèle qui échoue souvent au format se règle mieux en changeant de modèle ou en réduisant `batch_files` qu'en augmentant les essais.
@@ -622,7 +632,7 @@ Pour `nephila query ask`, une seule ligne sur stderr, stdout vide :
 erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée ou augmentez max_output_tokens
 ```
 
-Que faire : relancer le seul fichier avec `nephila update --batch-files 1`, ou donner à `max_chunk_chars` ou à `batch_files` une valeur plus petite dans `.nephila.toml` ou dans la configuration personnelle, ou augmenter `max_output_tokens` dans la configuration personnelle (la réflexion compte dans cette limite). Une troncature n'arrête jamais l'envoi : les autres fichiers continuent. Avec `--verbose`, l'appel se termine par le résultat `tronquée`.
+Que faire : donner à `max_chunk_chars` une valeur plus petite dans `.nephila.toml` ou dans la configuration personnelle, ou augmenter `max_output_tokens` dans la configuration personnelle (la réflexion compte dans cette limite). Une troncature n'arrête jamais l'envoi : les autres fichiers continuent. Avec `--verbose`, l'appel se termine par le résultat `tronquée`.
 
 ## Ce que l'analyse extrait
 
@@ -695,7 +705,7 @@ Les références qui ne trouvent pas de cible sont comptées dans « référence
 | Code | Signification |
 |---|---|
 | 0 | Succès |
-| 1 | Erreur d'exécution : configuration, clé refusée, réseau, graphe absent, aucun résultat, fichiers en attente ou à enrichir avec le LLM actif… |
+| 1 | Erreur d'exécution : configuration, clé refusée, requête refusée, redirection, réseau, graphe absent, aucun résultat, fichiers en attente ou à enrichir avec le LLM actif… |
 | 2 | Erreur d'usage : commande ou option inconnue, valeur invalide |
 
 Les messages sont écrits sur stderr, préfixés `erreur:` ou `avertissement:`. stdout ne contient que le résultat.
@@ -749,7 +759,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
-| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit. Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe. Nouveautés : déduplications linéaires, un parser par fil, export en flux sans nouvelle résolution, profil release optimisé, banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. Graphe à résoudre : nephila status l'annonce (graphe à résoudre : lancez nephila update) après une commande interrompue ou une passe de résolution en échec (erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe) ; --verbose dit si la passe est complète ou incrémentale. |
+| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit. Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe. Nouveautés : déduplications linéaires, un parser par fil, export en flux sans nouvelle résolution, profil release optimisé, banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. Graphe à résoudre : nephila status l'annonce (graphe à résoudre : lancez nephila update) après une commande interrompue ou une passe de résolution en échec (erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe) ; --verbose dit si la passe est complète ou incrémentale. Envoi au LLM : une requête refusée (HTTP 400, 404, 413, 422), une redirection ou des délais dépassés répétés l'arrêtent chacun avec une ligne erreur: dédiée (`erreur: requête refusée par <fournisseur> (HTTP <code>) sur <url>`, `erreur: <fournisseur> redirige (HTTP <code>) vers <adresse> ; corrigez base_url`) ; les redirections ne sont pas suivies. |
 | 0.23 | Option --jobs de build et update : nombre de fils du parcours du dépôt et de l'extraction, par défaut le nombre de cœurs disponibles ; concurrency ne règle plus que les appels LLM. Parcours du dépôt et empreintes en parallèle, fichier lu une seule fois pour son empreinte et son analyse, écriture SQLite allégée, même graphe qu'en 0.22 quel que soit le nombre de fils. |
 | 0.22 | Mise à jour incrémentale : `update` ne résout plus que les références touchées par les fichiers changés et ne relit plus toute la table des liens ; résumé global calculé sans relire le graphe ; une seule résolution complète par commande avec LLM. Même graphe qu'en 0.21 ; le schéma 8 est migré sur place. |
 | 0.21 | Stockage SQLite allégé : contexte d'imports stocké une fois par fichier, index inutiles retirés, cache SQLite agrandi à chaque ouverture en écriture, écritures regroupées, build neuf sans recalcul répété des nœuds. Même graphe qu'en 0.20 ; le schéma 7 est migré sur place. |

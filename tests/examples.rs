@@ -1464,6 +1464,72 @@ fn REQ088_REQ089_REQ090_readme_graphe_a_resoudre_erreur_et_trace() {
         .lines()
         .find(|l| l.starts_with("| 0.24 |"))
         .expect("ligne 0.24");
-    assert!(row.ends_with(" Graphe à résoudre : nephila status l'annonce (graphe à résoudre : lancez nephila update) après une commande interrompue ou une passe de résolution en échec (erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe) ; --verbose dit si la passe est complète ou incrémentale. |"), "ligne 0.24 : {row}");
+    assert!(row.contains(" Graphe à résoudre : nephila status l'annonce (graphe à résoudre : lancez nephila update) après une commande interrompue ou une passe de résolution en échec (erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe) ; --verbose dit si la passe est complète ou incrémentale."), "ligne 0.24 : {row}");
     assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
+}
+
+#[test]
+fn REQ091_REQ092_REQ093_REQ094_REQ095_REQ096_REQ097_REQ041_readme_causes_d_arret_et_essais_http() {
+    let readme = repo_file("README.md");
+    for expected in [
+        "requête refusée par <fournisseur> (HTTP <code>) sur <url>",
+        "corrigez base_url",
+        "fournisseur saturé : relancez nephila update plus tard ou réduisez concurrency",
+        "délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur",
+        "llm enrich découpe",
+        "après lecture interrompue",
+        "requête redirigée",
+        "politique: délais dépassés consécutifs",
+    ] {
+        assert!(readme.contains(expected), "absent : {expected}");
+    }
+    assert!(!readme.contains("tout le lot échoue"));
+    for banned in [" rejetée", " coupée", " coupées"] {
+        assert!(!readme.contains(banned), "mot interdit : {banned}");
+    }
+    for l in readme.lines() {
+        assert!(
+            !l.contains(" timeout ") && !l.contains(" un timeout"),
+            "timeout en prose : {l}"
+        );
+    }
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| 0.24 |"))
+        .expect("ligne 0.24");
+    assert!(row.ends_with(" |"));
+    let tail = row.rsplit("complète ou incrémentale.").next().unwrap();
+    for expected in [
+        "requête refusée",
+        "redirection",
+        "délais dépassés répétés",
+        "redirections ne sont pas suivies",
+    ] {
+        assert!(tail.contains(expected), "ligne 0.24, absent : {expected}");
+    }
+    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
+    let http = readme_section(&readme, "### Nouveaux essais HTTP");
+    for expected in [
+        "requête refusée",
+        "redirection",
+        "saturé",
+        "lecture interrompue",
+        "un seul nouvel envoi",
+    ] {
+        assert!(http.contains(expected), "section HTTP, absent : {expected}");
+    }
+    let tronq = readme_section(&readme, "### Réponse tronquée par la limite de jetons");
+    let que_faire = tronq
+        .lines()
+        .find(|l| l.starts_with("Que faire"))
+        .expect("Que faire");
+    assert!(!que_faire.contains("batch_files") && !que_faire.contains("--batch-files"));
+    assert!(que_faire.contains("max_chunk_chars") && que_faire.contains("max_output_tokens"));
+    assert!(row.contains("`erreur: requête refusée par <fournisseur> (HTTP <code>) sur <url>`"));
+    assert!(row.contains(
+        "`erreur: <fournisseur> redirige (HTTP <code>) vers <adresse> ; corrigez base_url`"
+    ));
+    assert!(!row.contains("trois délais dépassés répétés"));
+    let lots = readme_section(&readme, "## Enrichissement en lots");
+    assert!(lots.contains("llm enrich découpe"));
 }
