@@ -138,7 +138,7 @@ pub fn compute(
 /// valeurs diffère de `files`. Seuls les fichiers absents de `files` sont lus (pour écarter ceux
 /// que `update` écarterait, DEC-068) ; ni empreinte, ni `settings.gradle`
 /// (REQ-017, DEC-067).
-pub fn quick(repo: &Path, store: &Store, matcher: &Matcher) -> Result<usize> {
+pub fn quick(repo: &Path, store: &Store, matcher: &Matcher) -> Result<QuickCheck> {
     let known = store.files()?;
     let walked = scan::walk(repo, matcher, crate::index::default_jobs(), &known)?;
     let on_disk: HashMap<&str, &scan::WalkedFile> =
@@ -172,7 +172,18 @@ pub fn quick(repo: &Path, store: &Store, matcher: &Matcher) -> Result<usize> {
                 })
         })
         .count();
-    Ok(count)
+    Ok(QuickCheck {
+        count,
+        warnings: walked.warnings,
+    })
+}
+
+/// Résultat de `quick` : fichiers différents du graphe et avertissements du parcours, à écrire
+/// par l'appelant (REQ-113).
+#[derive(Debug)]
+pub struct QuickCheck {
+    pub count: usize,
+    pub warnings: Vec<String>,
 }
 
 #[cfg(test)]

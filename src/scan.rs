@@ -412,7 +412,7 @@ impl Drop for LocalAcc<'_> {
 /// Parcourt `root` sans rien lire : dossiers exclus (REQ-004), types pris en charge, export
 /// `<slug>.json` écarté, filtres de REQ-037 puis métadonnées (chemin, taille, date). Le parcours
 /// utilise `jobs` fils (DEC-084) ; les fichiers sont rendus triés par chemin et les
-/// avertissements, triés, écrits après le parcours. `known` (vide sans graphe) fait passer en tête
+/// avertissements, triés, rendus dans `WalkResult::warnings` (écrits par l'appelant, REQ-113). `known` (vide sans graphe) fait passer en tête
 /// d'un groupe de collision le fichier déjà indexé (REQ-103).
 pub fn walk(
     root: &Path,
@@ -545,10 +545,8 @@ pub(crate) fn walk_with<L: crate::workers::Launcher>(
     };
     let mut warnings = acc.warnings;
     warnings.sort();
-    for (_, msg) in warnings {
-        warn(&msg);
-        res.warnings.push(msg);
-    }
+    res.warnings
+        .extend(warnings.into_iter().map(|(_, msg)| msg));
     let mut found = acc.found;
     found.sort_by(|a, b| (&a.0.path, &a.1).cmp(&(&b.0.path, &b.1)));
 
@@ -764,6 +762,10 @@ pub(crate) fn scan_with_budget(
     budget: usize,
 ) -> Result<ScanResult> {
     let walked = walk(root, matcher, jobs, known)?;
+    // REQ-113 : le parcours rend ses avertissements, l'appelant les écrit.
+    for msg in &walked.warnings {
+        warn(msg);
+    }
     let known: HashMap<&str, &FileRecord> = known.iter().map(|r| (r.path.as_str(), r)).collect();
     let mut res = ScanResult {
         warnings: walked.warnings,

@@ -400,3 +400,141 @@ fn req017_ac12_option_is_refused_outside_query() {
         assert!(text(&o.stderr).contains("--check-stale"), "{cmd}");
     }
 }
+
+/// Dossier `locked/` en `chmod 000`, remis en 755 à la fin (garde `Drop`).
+#[cfg(unix)]
+struct Locked(PathBuf);
+
+#[cfg(unix)]
+impl Locked {
+    fn new(env: &Env) -> Locked {
+        use std::os::unix::fs::PermissionsExt;
+        let p = env.repo.join("locked");
+        fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("X.java"), "class X {}\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+        Locked(p)
+    }
+
+    /// Vrai si le processus lit quand même le dossier (par exemple sous root).
+    fn readable(&self) -> bool {
+        fs::read_dir(&self.0).is_ok()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Locked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[cfg(unix)]
+fn lines(b: &[u8]) -> Vec<String> {
+    text(b).lines().map(str::to_string).collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn req113_ac1_stale_line_stays_first_before_walk_warnings() {
+    let env = Env::new_aged();
+    env.modify_three();
+    let lock = Locked::new(&env);
+    if lock.readable() {
+        return;
+    }
+    for json in [false, true] {
+        let mut a = vec!["query", "search", "OrderService", "--check-stale"];
+        if json {
+            a.push("--json");
+        }
+        let o = env.run(&a);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+        let l = lines(&o.stderr);
+        assert_eq!(l.len(), 2, "{l:?}");
+        assert_eq!(
+            l[0],
+            "avertissement: graphe pas à jour : 3 fichiers modifiés"
+        );
+        assert!(
+            l[1].starts_with("avertissement: entrée illisible ignorée : ")
+                && l[1].contains("locked"),
+            "{l:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn req113_ac1_up_to_date_graph_gives_only_the_walk_warning() {
+    let env = Env::new_aged();
+    let lock = Locked::new(&env);
+    if lock.readable() {
+        return;
+    }
+    let o = env.run(&["query", "search", "OrderService", "--check-stale"]);
+    assert_eq!(o.status.code(), Some(0));
+    let l = lines(&o.stderr);
+    assert_eq!(l.len(), 1, "{l:?}");
+    assert!(
+        l[0].starts_with("avertissement: entrée illisible ignorée : "),
+        "{l:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn req113_ac2_other_commands_write_the_walk_warning_once_and_first() {
+    let env = Env::new_aged();
+    let lock = Locked::new(&env);
+    if lock.readable() {
+        return;
+    }
+    for args in [
+        &["status"][..],
+        &["update", "--no-llm"][..],
+        &["build", "--no-llm"][..],
+    ] {
+        let o = env.run(args);
+        assert_eq!(o.status.code(), Some(0), "{args:?} {}", text(&o.stderr));
+        let l = lines(&o.stderr);
+        let n = l
+            .iter()
+            .filter(|x| x.contains("entrée illisible ignorée"))
+            .count();
+        assert_eq!(n, 1, "{args:?} {l:?}");
+        assert!(l[0].contains("entrée illisible ignorée"), "{args:?} {l:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn req113_ac3_no_result_keeps_the_three_line_order() {
+    let env = Env::new_aged();
+    env.modify_three();
+    let lock = Locked::new(&env);
+    if lock.readable() {
+        return;
+    }
+    for json in [false, true] {
+        let mut a = vec!["query", "search", "NomQuiNExistePas", "--check-stale"];
+        if json {
+            a.push("--json");
+        }
+        let o = env.run(&a);
+        assert!(!o.status.success());
+        assert!(o.stdout.is_empty(), "{}", text(&o.stdout));
+        let l = lines(&o.stderr);
+        assert_eq!(l.len(), 3, "{l:?}");
+        assert_eq!(
+            l[0],
+            "avertissement: graphe pas à jour : 3 fichiers modifiés"
+        );
+        assert!(
+            l[1].starts_with("avertissement: entrée illisible ignorée : ")
+                && l[1].contains("locked")
+        );
+        assert!(l[2].contains("aucun résultat"), "{l:?}");
+    }
+}

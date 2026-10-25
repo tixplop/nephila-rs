@@ -22,7 +22,8 @@ pub fn open(repo: &Path, check_stale: bool) -> Result<Store> {
     let matcher = ProjectFilters::load_matcher(repo)?;
     let store = Store::open_readonly(repo)?;
     if check_stale {
-        let n = diff::quick(repo, &store, &matcher)?;
+        let check = diff::quick(repo, &store, &matcher)?;
+        let n = check.count;
         if n > 0 {
             let (noun, adj) = if n == 1 {
                 ("fichier", "modifié")
@@ -30,6 +31,9 @@ pub fn open(repo: &Path, check_stale: bool) -> Result<Store> {
                 ("fichiers", "modifiés")
             };
             error::warn(&format!("graphe pas à jour : {n} {noun} {adj}"));
+        }
+        for msg in &check.warnings {
+            error::warn(msg);
         }
     }
     Ok(store)
