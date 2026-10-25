@@ -93,6 +93,8 @@ pub fn update(
 ) -> Result<Option<BuildReport>> {
     build::check_repo(repo)?;
     let mut store = Store::open_existing(repo)?;
+    // Lu à l'ouverture, avant toute écriture de la commande (REQ-088, DEC-097).
+    let to_resolve = store.needs_resolution()?;
     let mut d = diff::compute(repo, &store, matcher, opts.jobs)?;
     trace!(
         "parcours: {} ajoutés, {} modifiés, {} supprimés, {} en attente{}",
@@ -128,9 +130,9 @@ pub fn update(
         store.set_enrich_model(llm.model())?;
         store.set_enrich_code(opts.enrich_code)?;
     }
-    // « Aucun changement » : rien d'ajouté, modifié, supprimé ou en attente, et (LLM inactif ou
-    // aucun fichier à enrichir).
-    if d.is_up_to_date() && (llm.is_none() || store.count_files_to_enrich()? == 0) {
+    // « Aucun changement » : rien d'ajouté, modifié, supprimé ou en attente, graphe marqué
+    // « à jour », et (LLM inactif ou aucun fichier à enrichir).
+    if d.is_up_to_date() && !to_resolve && (llm.is_none() || store.count_files_to_enrich()? == 0) {
         return Ok(None);
     }
 
@@ -676,5 +678,108 @@ mod tests {
         let d = diagnostics();
         assert_eq!((d.full_passes(), d.incremental_passes()), (0, 2));
         assert_same_as_full_pass(&repo, dir.path(), "update avec le mock");
+    }
+
+    // --- REQ-088 : graphe à résoudre ---
+
+    /// Début d'un `update` jusqu'à `structure::analyze` inclus (fichiers réanalysés et marqués
+    /// `indexed`, marqueur `à résoudre`), puis `Store` libéré sans passe : arrêt simulé.
+    fn structure_phase_only(repo: &Path) {
+        let mut store = Store::open_existing(repo).unwrap();
+        let matcher = Matcher::none();
+        let mut d = diff::compute(repo, &store, &matcher, 1).unwrap();
+        assert!(!d.changes.is_empty());
+        let changed: std::collections::HashSet<String> =
+            d.changes.iter().map(|c| c.path.clone()).collect();
+        let todo: Vec<ScannedFile> = std::mem::take(&mut d.scanned)
+            .into_iter()
+            .filter(|f| changed.contains(&f.path))
+            .collect();
+        let records: Vec<FileRecord> = todo.iter().map(|f| record(f, FileState::Pending)).collect();
+        store.insert_files(&records).unwrap();
+        let mut report = BuildReport::default();
+        structure::analyze(repo, todo, 1, &d.gradle_settings, &mut store, &mut report).unwrap();
+        assert!(store.needs_resolution().unwrap());
+    }
+
+    fn fresh_build_report(
+        repo: &Path,
+        dir: &Path,
+        llm: Option<&dyn crate::llm::Llm>,
+    ) -> (BuildReport, Store) {
+        let fresh = dir.join("fresh");
+        let _ = std::fs::remove_dir_all(&fresh);
+        copy_dir(repo, &fresh);
+        std::fs::remove_dir_all(fresh.join(".nephila")).unwrap();
+        let lock = RepoLock::acquire(&fresh).unwrap();
+        let r = build::build(
+            &fresh,
+            &IndexOptions::default(),
+            llm,
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap();
+        (r, Store::open_readonly(&fresh).unwrap())
+    }
+
+    /// AC-088-2 : arrêt entre la structure et la résolution, sans LLM puis avec le LLM simulé.
+    #[test]
+    fn req088_ac2_update_after_a_stop_between_structure_and_resolution_redoes_the_pass() {
+        for with_llm in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (repo, mock) = maven2_with_mock(dir.path());
+            let log = dir.path().join("mock.log");
+            let llm = MockLlm::new(MockOptions {
+                dir: Some(mock),
+                log: Some(log.clone()),
+                ..MockOptions::default()
+            });
+            let lock = RepoLock::acquire(&repo).unwrap();
+            let llm_ref: Option<&dyn crate::llm::Llm> = with_llm.then_some(&llm);
+            let opts = IndexOptions::default();
+            build::build(&repo, &opts, llm_ref, &lock, &Matcher::none()).unwrap();
+            let f = repo.join("core/src/main/java/com/acme/core/OrderService.java");
+            let text = std::fs::read_to_string(&f).unwrap();
+            let i = text.rfind('}').unwrap();
+            let mut text = text;
+            text.insert_str(i, "\n    void ajoutee() { repo.save(null); }\n");
+            std::fs::write(&f, text).unwrap();
+
+            structure_phase_only(&repo);
+            let _ = std::fs::remove_file(&log);
+            reset_diagnostics();
+            let report = update(&repo, &opts, llm_ref, &lock, &Matcher::none())
+                .unwrap()
+                .expect("le graphe est à résoudre");
+            let d = diagnostics();
+            assert_eq!(
+                (d.full_passes(), d.incremental_passes()),
+                (1, 0),
+                "llm = {with_llm}"
+            );
+            assert!(
+                std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+                "aucun appel LLM"
+            );
+            let (fresh_report, fresh) = fresh_build_report(&repo, dir.path(), llm_ref);
+            assert_eq!(report.edges, fresh_report.edges);
+            assert_eq!(report.unresolved, fresh_report.unresolved);
+            let store = Store::open_readonly(&repo).unwrap();
+            assert!(!store.needs_resolution().unwrap());
+            assert_eq!(store.edges().unwrap(), fresh.edges().unwrap());
+            assert_eq!(
+                store.count_unresolved().unwrap(),
+                fresh.count_unresolved().unwrap()
+            );
+            assert_eq!(
+                store.summary().unwrap().unwrap().0,
+                fresh.summary().unwrap().unwrap().0
+            );
+            drop(store);
+            assert!(update(&repo, &opts, llm_ref, &lock, &Matcher::none())
+                .unwrap()
+                .is_none());
+        }
     }
 }

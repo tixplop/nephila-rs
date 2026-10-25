@@ -911,12 +911,24 @@ fn req069_ac5_schema_7_graph_is_read_unchanged_then_migrated_by_update() {
     assert_eq!(user_version_of(&repo), 7);
     let hash = graph_hash(&repo);
     for (a, expected) in reads.iter().zip(&before) {
-        assert_eq!(&ok(&env, &repo, "schéma 7", a), expected, "{a:?}");
+        // REQ-088 : sans marqueur (schéma 7), le graphe est à résoudre.
+        let expected = if a[0] == "status" {
+            assert!(expected.starts_with("graphe à jour\n"), "{expected}");
+            expected.replacen(
+                "graphe à jour",
+                "graphe à résoudre : lancez nephila update",
+                1,
+            )
+        } else {
+            expected.clone()
+        };
+        assert_eq!(ok(&env, &repo, "schéma 7", a), expected, "{a:?}");
         assert_eq!(user_version_of(&repo), 7, "{a:?}");
         assert_eq!(graph_hash(&repo), hash, "{a:?}");
     }
 
-    // Aucun changement : `graphe à jour`, aucun appel LLM, graphe migré.
+    // Aucun changement : le graphe migré est à résoudre, `update` fait une passe complète
+    // (bilan), sans appel LLM ; le suivant dit `graphe à jour`.
     let log = env.root.join("mock.log");
     let out = run_logged(&env, &repo, &log, &["update"]);
     assert!(
@@ -924,9 +936,17 @@ fn req069_ac5_schema_7_graph_is_read_unchanged_then_migrated_by_update() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "graphe à jour");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("update terminé : 0 fichiers traités,"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     assert!(fs::read_to_string(&log).unwrap_or_default().is_empty());
     assert_eq!(user_version_of(&repo), nephila::store::SCHEMA_VERSION);
+    let out = run_logged(&env, &repo, &log, &["update"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "graphe à jour");
+    assert!(fs::read_to_string(&log).unwrap_or_default().is_empty());
+    assert_eq!(ok(&env, &repo, "status", &["status"]), before[2]);
 
     // Un fichier modifié, un ajouté, un supprimé : même graphe qu'un `build` du même arbre.
     let case = CASES.iter().find(|c| c.name == "maven2").unwrap();
@@ -1238,4 +1258,85 @@ fn req087_ac1_vanishing_derived_dependency_is_dropped_without_error() {
     );
     let again = ok(&env, &repo, "update 3", &["update", "--no-llm"]);
     assert!(again.contains("graphe à jour"), "{again}");
+}
+
+// --- REQ-088 : graphe à résoudre, `update` refait la passe, `status` le signale ---
+
+const TRIGGER: &str = "CREATE TRIGGER boom BEFORE INSERT ON edges \
+    BEGIN SELECT RAISE(ABORT, 'panne simulée'); END;";
+
+fn resolution_marker(repo: &Path) -> String {
+    db_of(repo)
+        .query_row("SELECT value FROM meta WHERE key = 'resolution'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn req088_ac1_failed_pass_leaves_a_graph_to_resolve_that_update_redoes() {
+    let env = Env::new("maven3/repo", None);
+    let repo = env.repo();
+    ok(&env, &repo, "build", &["build", "--no-llm"]);
+    assert_eq!(resolution_marker(&repo), "à jour");
+    db_of(&repo).execute_batch(TRIGGER).unwrap();
+    let java = repo.join("core/src/main/java/com/acme/core/OrderService.java");
+    let text = fs::read_to_string(&java).unwrap().replace(
+        "repo.save(new Order());",
+        "repo.save(new Order());\n        place();",
+    );
+    fs::write(&java, text).unwrap();
+
+    // AC-089-1 : l'erreur de la passe est la seule ligne de stderr.
+    let out = env.run(&repo, &["update", "--no-llm"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 1, "{err}");
+    assert!(
+        lines[0].starts_with("erreur: résolution : base du graphe : ")
+            && lines[0].contains("panne simulée")
+            && lines[0].ends_with(" ; lancez nephila build pour reconstruire le graphe"),
+        "{err}"
+    );
+    assert_eq!(resolution_marker(&repo), "à résoudre");
+
+    // `status` : texte et JSON.
+    let st = env.run(&repo, &["status"]);
+    assert!(st.status.success());
+    let st = String::from_utf8_lossy(&st.stdout).to_string();
+    assert_eq!(
+        st.lines().next(),
+        Some("graphe à résoudre : lancez nephila update")
+    );
+    let js = env.run(&repo, &["status", "--json"]);
+    assert!(js.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&js.stdout).unwrap();
+    assert_eq!(v["a_jour"], false);
+    assert_eq!(v["fichiers"].as_array().unwrap().len(), 0);
+
+    // Remède : déclencheur supprimé, `update` refait la passe.
+    db_of(&repo).execute_batch("DROP TRIGGER boom").unwrap();
+    let b = ok(&env, &repo, "update", &["update", "--no-llm"]);
+    assert!(b.starts_with("update terminé : 0 fichiers traités,"), "{b}");
+    assert_eq!(resolution_marker(&repo), "à jour");
+    let fresh = env.root.join("fresh");
+    copy_tree(&repo, &fresh, false);
+    let fb = ok(&env, &fresh, "build neuf", &["build", "--no-llm"]);
+    let (raw, snap) = snapshot(&env, &repo, "update");
+    let (raw_fresh, fresh_snap) = snapshot(&env, &fresh, "build neuf");
+    assert_eq!(snap, fresh_snap);
+    assert_eq!(counts(&b, "update"), counts(&fb, "build neuf"));
+    assert_eq!(
+        export_fingerprint(raw.as_bytes()),
+        export_fingerprint(raw_fresh.as_bytes())
+    );
+    let again = ok(&env, &repo, "update 2", &["update", "--no-llm"]);
+    assert!(again.contains("graphe à jour"), "{again}");
+    let st = ok(&env, &repo, "status 2", &["status"]);
+    assert_eq!(st.lines().next(), Some("graphe à jour"));
+    let js = ok(&env, &repo, "status 2", &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&js).unwrap();
+    assert_eq!(v["a_jour"], true);
 }

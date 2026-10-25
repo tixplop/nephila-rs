@@ -157,11 +157,16 @@ fn req057_ac3_schema5_read_only_commands_then_update_migrates_without_llm() {
         &["query", "neighbors", "OrderRepository.save"][..],
         &["status"][..],
     ] {
-        assert_eq!(
-            text(&env.ok(args).stdout),
-            text(&reference.ok(args).stdout),
-            "{args:?}"
-        );
+        let mut expected = text(&reference.ok(args).stdout);
+        if args[0] == "status" {
+            // REQ-088 : le graphe de schéma 5 n'a pas de marqueur, donc il est à résoudre.
+            expected = expected.replacen(
+                "graphe à jour",
+                "graphe à résoudre : lancez nephila update",
+                1,
+            );
+        }
+        assert_eq!(text(&env.ok(args).stdout), expected, "{args:?}");
     }
     assert_eq!(env.user_version(), 5);
 
@@ -229,17 +234,37 @@ fn req062_ac5_old_schemas_are_read_unchanged_then_migrated_by_update_or_build() 
         let before = graph_fingerprint(&env);
         for (args, expected) in READS.iter().zip(&outputs) {
             let o = env.ok(args);
-            assert_eq!(&text(&o.stdout), expected, "schéma {version} : {args:?}");
+            // REQ-088 : un graphe de schéma 5 à 7 n'a pas de marqueur, donc il est à résoudre.
+            let expected = if args[0] == "status" {
+                assert!(expected.starts_with("graphe à jour\n"), "{expected}");
+                expected.replacen(
+                    "graphe à jour",
+                    "graphe à résoudre : lancez nephila update",
+                    1,
+                )
+            } else {
+                expected.clone()
+            };
+            assert_eq!(text(&o.stdout), expected, "schéma {version} : {args:?}");
             assert_eq!(env.user_version(), version as i32, "{args:?}");
             assert_eq!(graph_fingerprint(&env), before, "{args:?}");
         }
         let enrichments = env.enrichments();
         assert!(!enrichments.is_empty());
 
+        // Premier `update` : bilan d'une passe complète (graphe à résoudre), aucun appel LLM.
+        let o = env.ok(&["update"]);
+        assert!(
+            text(&o.stdout).starts_with("update terminé : 0 fichiers traités,"),
+            "schéma {version} : {}",
+            text(&o.stdout)
+        );
+        assert!(env.logged().is_empty(), "{:?}", env.logged());
+        assert_eq!(env.user_version(), SCHEMA_VERSION);
+        assert_eq!(text(&env.ok(&["status"]).stdout), outputs[2]);
         let o = env.ok(&["update"]);
         assert_eq!(text(&o.stdout).trim(), "graphe à jour", "schéma {version}");
         assert!(env.logged().is_empty(), "{:?}", env.logged());
-        assert_eq!(env.user_version(), SCHEMA_VERSION);
         assert_eq!(text(&env.ok(READS[4]).stdout), outputs[4]);
         assert_eq!(env.enrichments(), enrichments);
 

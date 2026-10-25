@@ -619,3 +619,21 @@ fn req090_ac1_mock_build_has_a_full_then_an_incremental_pass() {
     let incr = pos(&|l| l.contains("(incrémentale, ")).unwrap();
     assert!(full < first_start && incr > last_end, "{all:?}");
 }
+
+#[test]
+fn req090_ac1_unresolved_graph_gets_a_full_pass_without_any_change() {
+    let env = Env::mock();
+    assert!(env.cmd(&["build", "--no-llm"]).status.success());
+    rusqlite::Connection::open(env.repo.join(".nephila/graph.db"))
+        .unwrap()
+        .execute(
+            "UPDATE meta SET value = 'à résoudre' WHERE key = 'resolution'",
+            [],
+        )
+        .unwrap();
+    let o = env.cmd(&["update", "--no-llm", "--verbose"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let lines = pass_lines(&o);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(pass_kind(&lines[0]), "complète");
+}

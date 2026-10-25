@@ -449,16 +449,7 @@ impl Store {
     /// Lit `meta.resolution` à l'ouverture en écriture : tout autre état que `à jour` compte
     /// comme « à résoudre ».
     fn load_resolution_marker(&mut self) -> Result<()> {
-        let value: Option<String> = match self
-            .conn
-            .prepare_cached("SELECT value FROM meta WHERE key = 'resolution'")
-            .map_err(db_err)?
-            .query_row([], |r| r.get(0))
-        {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(db_err(e)),
-        };
+        let value = self.read_resolution_marker()?;
         self.stale = value.as_deref() != Some(RESOLUTION_DONE);
         self.log = (!self.stale).then(ChangeLog::default);
         Ok(())
@@ -1482,23 +1473,33 @@ impl Store {
         Ok(())
     }
 
+    /// Valeur de `meta.resolution`, `None` si la clé manque (schémas 5 à 7). Lecture seule.
+    fn read_resolution_marker(&self) -> Result<Option<String>> {
+        match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'resolution'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get(0))
+        {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
     /// Vrai si le graphe est de schéma 8 et marqué `à jour` (`meta.resolution`) : le statut
     /// `refs.unresolved` est alors celui d'une résolution terminée. Lecture seule (DEC-092).
     pub fn resolution_is_current(&self) -> Result<bool> {
         if self.version != SCHEMA_VERSION {
             return Ok(false);
         }
-        let value: Option<String> = match self
-            .conn
-            .prepare_cached("SELECT value FROM meta WHERE key = 'resolution'")
-            .map_err(db_err)?
-            .query_row([], |r| r.get(0))
-        {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(db_err(e)),
-        };
-        Ok(value.as_deref() == Some(RESOLUTION_DONE))
+        Ok(self.read_resolution_marker()?.as_deref() == Some(RESOLUTION_DONE))
+    }
+
+    /// Vrai si le graphe est « à résoudre » : `meta.resolution` différent de `à jour`, ou clé
+    /// absente (REQ-088, DEC-097). Lecture seule, sans effet sur `graph.db`.
+    pub fn needs_resolution(&self) -> Result<bool> {
+        Ok(self.read_resolution_marker()?.as_deref() != Some(RESOLUTION_DONE))
     }
 
     /// Parcourt les références comptées non résolues (`refs.unresolved = 1`), dans l'ordre de
@@ -6115,6 +6116,87 @@ mod tests {
         settle(&mut st);
         write(&mut st, &[], &[]);
         assert!(log_of(&st).is_empty());
+    }
+
+    /// AC-088-3 : `needs_resolution()` suit le marqueur `meta.resolution`.
+    #[test]
+    fn req088_ac3_needs_resolution_follows_the_marker() {
+        let dir = tempdir().unwrap();
+        let mut st = shared_graph(dir.path());
+        assert!(!st.needs_resolution().unwrap(), "après une passe");
+        st.insert_pending_files(&[file("d.java")]).unwrap();
+        st.replace_structure("d.java", &[ty("p.D", "d.java")], &[])
+            .unwrap();
+        assert!(st.needs_resolution().unwrap(), "après replace_structure");
+        settle(&mut st);
+        assert!(!st.needs_resolution().unwrap());
+        st.apply_enrichments(
+            "m",
+            &[EnrichmentWrite {
+                path: "a.java".into(),
+                hash: "h".into(),
+                summaries: vec![],
+                concepts: vec![concept("idée")],
+                refs: vec![],
+            }],
+        )
+        .unwrap();
+        assert!(st.needs_resolution().unwrap(), "après apply_enrichments");
+        settle(&mut st);
+        assert!(!st.needs_resolution().unwrap());
+        st.remove_files(&["c.java"]).unwrap();
+        assert!(st.needs_resolution().unwrap(), "après remove_files");
+        settle(&mut st);
+        assert!(!st.needs_resolution().unwrap());
+        st.reset_with_pending_files(&[file("z.java")]).unwrap();
+        assert!(st.needs_resolution().unwrap(), "après le vidage d'un build");
+        settle(&mut st);
+        drop(st);
+
+        // Graphe rouvert : la valeur de la clé décide, en écriture comme en lecture seule.
+        let db = || Connection::open(db_path(dir.path())).unwrap();
+        let hash = || blake3::hash(&std::fs::read(db_path(dir.path())).unwrap());
+        let check = |expected: bool, what: &str| {
+            let before = hash();
+            assert_eq!(
+                Store::open_readonly(dir.path())
+                    .unwrap()
+                    .needs_resolution()
+                    .unwrap(),
+                expected,
+                "lecture seule : {what}"
+            );
+            assert_eq!(hash(), before, "{what} : graph.db inchangé");
+            assert_eq!(
+                Store::open_existing(dir.path())
+                    .unwrap()
+                    .needs_resolution()
+                    .unwrap(),
+                expected,
+                "écriture : {what}"
+            );
+        };
+        check(false, "à jour");
+        db().execute(
+            "UPDATE meta SET value = 'à résoudre' WHERE key = 'resolution'",
+            [],
+        )
+        .unwrap();
+        check(true, "à résoudre");
+        db().execute(
+            "UPDATE meta SET value = 'à jour' WHERE key = 'resolution'",
+            [],
+        )
+        .unwrap();
+        check(false, "à jour de nouveau");
+        // Clé absente (schéma 7) : à résoudre, lu sans migration ni écriture.
+        downgrade_to_7(dir.path());
+        let before = hash();
+        let ro = Store::open_readonly(dir.path()).unwrap();
+        assert_eq!(ro.opened_schema_version(), 7);
+        assert!(ro.needs_resolution().unwrap(), "clé absente");
+        drop(ro);
+        assert_eq!(hash(), before);
     }
 
     #[test]

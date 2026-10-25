@@ -264,9 +264,20 @@ fn req010_ac3_status_after_build_killed_during_enrichment_is_readable_and_up_to_
     assert!(out.status.success(), "{}", text(&out.stderr));
     // La structure était complète avant l'enrichissement : aucun fichier en attente.
     // Les fichiers non enrichis sont signalés sur une ligne à part, hors état « à jour ».
+    // La première ligne suit `meta.resolution`, lu après la mort du processus (REQ-088).
+    let marker: String = rusqlite::Connection::open(env.repo.join(".nephila/graph.db"))
+        .unwrap()
+        .query_row("SELECT value FROM meta WHERE key = 'resolution'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
     let l = lines(&out);
     assert_eq!(l.len(), 2, "{l:?}");
-    assert_eq!(l[0], "graphe à jour");
+    if marker == "à jour" {
+        assert_eq!(l[0], "graphe à jour");
+    } else {
+        assert_eq!(l[0], "graphe à résoudre : lancez nephila update");
+    }
     assert!(l[1].contains("fichiers à enrichir"), "{l:?}");
 }
 
@@ -285,7 +296,12 @@ fn req020_ac2_status_answers_during_running_build() {
         elapsed < Duration::from_secs(3),
         "status bloqué : {elapsed:?}"
     );
-    assert_eq!(lines(&out)[0], "graphe à jour");
+    // Pendant l'enrichissement, le marqueur peut déjà valoir `à résoudre` (REQ-088).
+    let first = &lines(&out)[0];
+    assert!(
+        first == "graphe à jour" || first == "graphe à résoudre : lancez nephila update",
+        "{first}"
+    );
 }
 
 #[test]
