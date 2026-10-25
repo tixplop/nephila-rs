@@ -1189,6 +1189,8 @@ fn REQ071_AC6_exemples_et_readme_sans_fils_d_analyse() {
         ("nephila.toml", example("nephila.toml")),
         ("README.md", readme),
     ] {
+        // E-25 (REQ-112) garde son texte exact : seul « création des fils d'analyse impossible : » est permis.
+        let text = text.replace("création des fils d'analyse impossible : ", "");
         for bad in ["borne aussi", "fils d'analyse"] {
             assert!(!text.contains(bad), "{name} : {bad}");
         }
@@ -1401,7 +1403,7 @@ fn req104_req105_readme_declarations_imbriquees_ignorees() {
         .find(|l| l.starts_with("| 0.24 |"))
         .expect("ligne 0.24");
     assert!(
-        row.trim_end().ends_with("Les déclarations imbriquées au-delà de 1000 niveaux sont ignorées avec un avertissement, le reste du fichier est indexé ; les avertissements de l'analyse sont écrits triés par chemin, quel que soit --jobs. |"),
+        row.contains("Les déclarations imbriquées au-delà de 1000 niveaux sont ignorées avec un avertissement, le reste du fichier est indexé ; les avertissements de l'analyse sont écrits triés par chemin, quel que soit --jobs."),
         "{row}"
     );
     assert!(readme.contains(
@@ -1566,4 +1568,42 @@ fn REQ091_REQ092_REQ093_REQ094_REQ095_REQ096_REQ097_REQ041_readme_causes_d_arret
     assert!(!row.contains("trois délais dépassés répétés"));
     let lots = readme_section(&readme, "## Enrichissement en lots");
     assert!(lots.contains("llm enrich découpe"));
+}
+
+#[test]
+fn REQ111_AC1_readme_documente_les_fils_refuses_par_le_systeme() {
+    let readme = repo_file("README.md");
+    for expected in [
+        "parcours du dépôt impossible : ",
+        "création des fils d'analyse impossible : ",
+        "--jobs 1",
+        "fils démarrés sur",
+        "exclusions par défaut : ",
+        "schéma: migration",
+    ] {
+        assert!(readme.contains(expected), "absent : {expected}");
+    }
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| 0.24 |"))
+        .expect("ligne 0.24");
+    assert!(row.ends_with(" |"));
+    let tail = row.rsplit("quel que soit --jobs.").next().unwrap();
+    for expected in [
+        "refusé par le système",
+        "plafond de processus",
+        "ligne `erreur:`",
+        "--check-stale",
+        "graphe pas à jour",
+        "première de stderr",
+    ] {
+        assert!(tail.contains(expected), "ligne 0.24, absent : {expected}");
+    }
+    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
+    for banned in ["thread", "worker"] {
+        for l in readme.lines().filter(|l| l.contains("impossible : ")) {
+            assert!(!l.contains(banned), "mot interdit {banned} : {l}");
+        }
+        assert!(!tail.contains(banned), "mot interdit {banned} : {tail}");
+    }
 }
