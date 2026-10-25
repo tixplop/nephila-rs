@@ -499,14 +499,14 @@ fn call_plan(
             .map(|g| (0, g.to_vec()))
             .collect();
     }
-    let words: Vec<HashSet<&str>> = parts.iter().map(|p| ident_words(p)).collect();
-    // Textes en minuscules et leurs mots, calculés une fois, seulement si un nœud `table:` existe.
+    let words: Vec<WordIndex> = parts.iter().map(|p| WordIndex::new(p)).collect();
+    // Textes en minuscules et leurs index, calculés une fois, seulement si un nœud `table:` existe.
     let lowered: Vec<String> = if nodes.iter().any(|(id, _)| id.starts_with("table:")) {
         parts.iter().map(|p| p.to_lowercase()).collect()
     } else {
         Vec::new()
     };
-    let lower_words: Vec<HashSet<&str>> = lowered.iter().map(|p| ident_words(p)).collect();
+    let lower_words: Vec<WordIndex> = lowered.iter().map(|p| WordIndex::new(p)).collect();
     let mut lists: Vec<Vec<String>> = vec![Vec::new(); parts.len()];
     for (id, short) in nodes {
         if let Some(&k) = homes.get(id) {
@@ -519,12 +519,12 @@ fn call_plan(
             let short_lower = table.then(|| short.to_lowercase());
             let name = short_lower.as_deref().unwrap_or(short);
             let simple = name.chars().all(is_ident);
-            for (k, part) in parts.iter().enumerate() {
-                let hit = match (simple, table) {
-                    (true, true) => lower_words[k].contains(name),
-                    (true, false) => words[k].contains(name),
-                    (false, true) => contains_bounded(&lowered[k], name),
-                    (false, false) => contains_bounded(part, name),
+            for k in 0..parts.len() {
+                let index = if table { &lower_words[k] } else { &words[k] };
+                let hit = if simple {
+                    index.has_word(name)
+                } else {
+                    index.contains_bounded(name)
                 };
                 if hit {
                     lists[k].push(id.clone());
@@ -550,37 +550,87 @@ fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
-/// Mots maximaux d'`is_ident` d'un texte, en un seul parcours.
-fn ident_words(text: &str) -> HashSet<&str> {
-    let mut set = HashSet::new();
-    let mut start: Option<usize> = None;
-    for (i, c) in text.char_indices() {
-        match (is_ident(c), start) {
-            (true, None) => start = Some(i),
-            (false, Some(s)) => {
-                set.insert(&text[s..i]);
-                start = None;
+/// Index d'un texte (DEC-107) : mot maximal d'`is_ident` → positions en octets de ses
+/// occurrences, par ordre croissant. Calculé en un seul parcours.
+struct WordIndex<'a> {
+    text: &'a str,
+    positions: HashMap<&'a str, Vec<usize>>,
+}
+
+impl<'a> WordIndex<'a> {
+    fn new(text: &'a str) -> Self {
+        let mut positions: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut start: Option<usize> = None;
+        for (i, c) in text.char_indices() {
+            match (is_ident(c), start) {
+                (true, None) => start = Some(i),
+                (false, Some(s)) => {
+                    positions.entry(&text[s..i]).or_default().push(s);
+                    start = None;
+                }
+                _ => {}
             }
-            _ => {}
         }
+        if let Some(s) = start {
+            positions.entry(&text[s..]).or_default().push(s);
+        }
+        WordIndex { text, positions }
     }
-    if let Some(s) = start {
-        set.insert(&text[s..]);
+
+    /// Vrai si `word` est un mot maximal du texte.
+    fn has_word(&self, word: &str) -> bool {
+        self.positions.contains_key(word)
     }
-    set
+
+    /// Équivalent de `contains_bounded(text, name)`. Chaque mot maximal du nom est un mot
+    /// maximal de toute occurrence acceptée : les candidats sont les positions de celui des
+    /// mots du nom qui en compte le moins (le premier à égalité), vérifiées à son écart dans
+    /// le nom ; un mot absent de l'index exclut le nom. Sans caractère d'identifiant dans le
+    /// nom, recherche directe.
+    fn contains_bounded(&self, name: &str) -> bool {
+        let mut best: Option<(usize, &Vec<usize>)> = None;
+        let mut from = 0;
+        while let Some(rel) = name[from..].find(is_ident) {
+            let start = from + rel;
+            let end = name[start..]
+                .find(|c| !is_ident(c))
+                .map_or(name.len(), |e| start + e);
+            let Some(list) = self.positions.get(&name[start..end]) else {
+                return false;
+            };
+            if best.is_none_or(|(_, b)| list.len() < b.len()) {
+                best = Some((start, list));
+            }
+            from = end;
+        }
+        let Some((offset, candidates)) = best else {
+            return contains_bounded(self.text, name);
+        };
+        candidates.iter().any(|&p| {
+            p.checked_sub(offset)
+                .and_then(|i| self.text.get(i..))
+                .is_some_and(|rest| {
+                    rest.starts_with(name) && bounds_ok(self.text, p - offset, name)
+                })
+        })
+    }
+}
+
+/// Bords de l'occurrence de `name` à l'octet `i` de `text` (règle de `contains_bounded`).
+fn bounds_ok(text: &str, i: usize, name: &str) -> bool {
+    let first_ident = name.chars().next().is_some_and(is_ident);
+    let last_ident = name.chars().next_back().is_some_and(is_ident);
+    let before_ok = !first_ident || !text[..i].chars().next_back().is_some_and(is_ident);
+    let after_ok = !last_ident || !text[i + name.len()..].chars().next().is_some_and(is_ident);
+    before_ok && after_ok
 }
 
 /// Vrai si `name` (non vide) figure dans `text` avec des bords qui ne prolongent pas un mot : le
 /// caractère qui précède (resp. suit) ne doit pas être `is_ident` quand le nom commence (resp.
-/// finit) par un caractère `is_ident`.
+/// finit) par un caractère `is_ident`. Utilisé pour un nom sans caractère d'identifiant.
 fn contains_bounded(text: &str, name: &str) -> bool {
-    let first_ident = name.chars().next().is_some_and(is_ident);
-    let last_ident = name.chars().next_back().is_some_and(is_ident);
-    text.match_indices(name).any(|(i, m)| {
-        let before_ok = !first_ident || !text[..i].chars().next_back().is_some_and(is_ident);
-        let after_ok = !last_ident || !text[i + m.len()..].chars().next().is_some_and(is_ident);
-        before_ok && after_ok
-    })
+    text.match_indices(name)
+        .any(|(i, _)| bounds_ok(text, i, name))
 }
 
 /// Morceau du titre de chaque section Markdown (DEC-061) : identifiant du nœud `section:` →
@@ -2556,5 +2606,288 @@ mod tests {
         assert_eq!(*llm.0.lock().unwrap(), [1, 2]);
         assert_eq!(failures.len(), 1);
         assert_eq!(report.failed, 1);
+    }
+}
+
+/// REQ-106 : le plan d'appels indexé par mots donne celui de l'oracle (code de la 0.24.0).
+#[cfg(test)]
+mod plan_index_tests {
+    use super::*;
+
+    fn oracle_ident_words(text: &str) -> HashSet<&str> {
+        let mut set = HashSet::new();
+        let mut start: Option<usize> = None;
+        for (i, c) in text.char_indices() {
+            match (is_ident(c), start) {
+                (true, None) => start = Some(i),
+                (false, Some(s)) => {
+                    set.insert(&text[s..i]);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            set.insert(&text[s..]);
+        }
+        set
+    }
+
+    fn oracle_contains_bounded(text: &str, name: &str) -> bool {
+        let first_ident = name.chars().next().is_some_and(is_ident);
+        let last_ident = name.chars().next_back().is_some_and(is_ident);
+        text.match_indices(name).any(|(i, m)| {
+            let before_ok = !first_ident || !text[..i].chars().next_back().is_some_and(is_ident);
+            let after_ok = !last_ident || !text[i + m.len()..].chars().next().is_some_and(is_ident);
+            before_ok && after_ok
+        })
+    }
+
+    fn oracle_call_plan(
+        parts: &[String],
+        nodes: &[(String, String)],
+        homes: &HashMap<String, usize>,
+    ) -> Vec<(usize, Vec<String>)> {
+        let ids: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
+        if parts.len() <= 1 {
+            return node_groups(&ids)
+                .into_iter()
+                .map(|g| (0, g.to_vec()))
+                .collect();
+        }
+        let words: Vec<HashSet<&str>> = parts.iter().map(|p| oracle_ident_words(p)).collect();
+        let lowered: Vec<String> = if nodes.iter().any(|(id, _)| id.starts_with("table:")) {
+            parts.iter().map(|p| p.to_lowercase()).collect()
+        } else {
+            Vec::new()
+        };
+        let lower_words: Vec<HashSet<&str>> =
+            lowered.iter().map(|p| oracle_ident_words(p)).collect();
+        let mut lists: Vec<Vec<String>> = vec![Vec::new(); parts.len()];
+        for (id, short) in nodes {
+            if let Some(&k) = homes.get(id) {
+                lists[k.min(parts.len() - 1)].push(id.clone());
+                continue;
+            }
+            let mut found = false;
+            if !short.is_empty() {
+                let table = id.starts_with("table:");
+                let short_lower = table.then(|| short.to_lowercase());
+                let name = short_lower.as_deref().unwrap_or(short);
+                let simple = name.chars().all(is_ident);
+                for (k, part) in parts.iter().enumerate() {
+                    let hit = match (simple, table) {
+                        (true, true) => lower_words[k].contains(name),
+                        (true, false) => words[k].contains(name),
+                        (false, true) => oracle_contains_bounded(&lowered[k], name),
+                        (false, false) => oracle_contains_bounded(part, name),
+                    };
+                    if hit {
+                        lists[k].push(id.clone());
+                        found = true;
+                    }
+                }
+            }
+            if !found {
+                lists[0].push(id.clone());
+            }
+        }
+        let mut plan = Vec::new();
+        for (k, list) in lists.iter().enumerate() {
+            for g in node_groups(list) {
+                plan.push((k, g.to_vec()));
+            }
+        }
+        plan
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const ALPHABET: &[&str] = &[
+        "a", "b", "s", "l", "f", "4", "j", "A", "B", "É", "é", "ß", "中", "文", "😀", "ж", "0",
+        "1", "_", "$", "-", ".", ":", "/", "@", "'", " ", "\n", "-", ".", "a", "b",
+    ];
+    const SEPARATORS: &[&str] = &["-", ".", ":", "/", "@", "'", " ", "\n"];
+
+    fn random_string(rng: &mut Rng, max: usize) -> String {
+        (0..rng.below(max) + 1)
+            .map(|_| ALPHABET[rng.below(ALPHABET.len())])
+            .collect()
+    }
+
+    fn random_name(rng: &mut Rng) -> String {
+        match rng.below(5) {
+            0 => random_string(rng, 4),
+            1 => format!(
+                "{}{}{}",
+                random_string(rng, 3),
+                SEPARATORS[rng.below(SEPARATORS.len())],
+                random_string(rng, 3)
+            ),
+            2 => format!(
+                "{}{}",
+                SEPARATORS[rng.below(SEPARATORS.len())],
+                random_string(rng, 3)
+            ),
+            3 => format!(
+                "{}{}",
+                random_string(rng, 3),
+                SEPARATORS[rng.below(SEPARATORS.len())]
+            ),
+            _ => SEPARATORS[rng.below(SEPARATORS.len())].repeat(rng.below(2) + 1),
+        }
+    }
+
+    #[test]
+    fn req106_ac1_plan_equal_to_oracle() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut with_non_word_hit = 0;
+        for case in 0..3000 {
+            let n_parts = rng.below(4) + 1;
+            let mut parts: Vec<String> =
+                (0..n_parts).map(|_| random_string(&mut rng, 40)).collect();
+            let n_nodes = rng.below(8) + 1;
+            let mut nodes: Vec<(String, String)> = Vec::new();
+            for i in 0..n_nodes {
+                let mut name = random_name(&mut rng);
+                if rng.below(3) > 0 {
+                    // le nom est cité dans un morceau, entre deux caractères tirés au hasard
+                    let k = rng.below(parts.len());
+                    let (l, r) = (random_string(&mut rng, 2), random_string(&mut rng, 2));
+                    parts[k] = format!("{l}{name}{r}{}", parts[k]);
+                }
+                if rng.below(6) == 0 {
+                    name = name.to_uppercase();
+                }
+                let kind = ["class", "table", "dep", "section"][rng.below(4)];
+                nodes.push((format!("{kind}:n{i}"), name));
+                if rng.below(5) == 0 {
+                    let dup = nodes[i].clone();
+                    nodes.push((format!("{}d", dup.0), dup.1));
+                }
+            }
+            let mut homes = HashMap::new();
+            for (id, _) in &nodes {
+                if id.starts_with("section:") && rng.below(2) == 0 {
+                    homes.insert(id.clone(), rng.below(parts.len() + 1));
+                }
+            }
+            if parts.len() > 1 {
+                for (id, short) in &nodes {
+                    let name = if id.starts_with("table:") {
+                        short.to_lowercase()
+                    } else {
+                        short.clone()
+                    };
+                    if !name.is_empty()
+                        && !name.chars().all(is_ident)
+                        && name.chars().any(is_ident)
+                        && parts.iter().any(|p| {
+                            let p = if id.starts_with("table:") {
+                                p.to_lowercase()
+                            } else {
+                                p.clone()
+                            };
+                            oracle_contains_bounded(&p, &name)
+                        })
+                    {
+                        with_non_word_hit += 1;
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                call_plan(&parts, &nodes, &homes),
+                oracle_call_plan(&parts, &nodes, &homes),
+                "cas {case} : {parts:?} {nodes:?}"
+            );
+        }
+        assert!(
+            with_non_word_hit >= 500,
+            "seulement {with_non_word_hit} cas à nom non-mot présent"
+        );
+    }
+
+    fn plan_for(parts: &[&str], nodes: &[(&str, &str)]) -> Vec<(usize, Vec<String>)> {
+        let parts: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+        let nodes: Vec<(String, String)> = nodes
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let got = call_plan(&parts, &nodes, &HashMap::new());
+        assert_eq!(got, oracle_call_plan(&parts, &nodes, &HashMap::new()));
+        got
+    }
+
+    #[test]
+    fn req106_ac2_written_cases() {
+        let parts = [
+            "<artifactId>slf4j-api</artifactId>",
+            "slf4j-api-ext",
+            "slf4j-api.jar",
+            "xslf4j-api",
+            "slf4j-api2",
+            "\"@scope/pkg\":",
+            "\"@scope/pkgx\"",
+        ];
+        let plan = plan_for(&parts, &[("dep:a", "slf4j-api"), ("dep:b", "@scope/pkg")]);
+        let at = |k: usize| -> Vec<String> {
+            plan.iter()
+                .filter(|(i, _)| *i == k)
+                .flat_map(|(_, l)| l.clone())
+                .collect()
+        };
+        assert_eq!(at(0), ["dep:a"]);
+        assert_eq!(at(1), ["dep:a"]);
+        assert_eq!(at(2), ["dep:a"]);
+        assert!(at(3).is_empty() && at(4).is_empty());
+        assert_eq!(at(5), ["dep:b"]);
+        assert!(at(6).is_empty());
+        // nœud `table:` : texte en minuscules
+        let plan = plan_for(
+            &["x", "SELECT * FROM \"My-Table\" ;", "my-table2"],
+            &[("table:t", "My-Table")],
+        );
+        assert_eq!(
+            plan,
+            vec![(0, vec![]), (1, vec!["table:t".to_string()]), (2, vec![])]
+        );
+    }
+
+    #[test]
+    fn req106_ac3_cost() {
+        let nodes: Vec<(String, String)> = (0..20_000)
+            .map(|i| (format!("dep:{i}"), format!("dep-{i}")))
+            .collect();
+        let parts: Vec<String> = (0..5)
+            .map(|k| {
+                let mut s = String::with_capacity(100_000);
+                let mut i = k;
+                while s.len() < 100_000 {
+                    s.push_str(&format!("compile 'g:dep-{}:1.0' // x\n", i * 7 % 20_000));
+                    i += 1;
+                }
+                s
+            })
+            .collect();
+        let plan = call_plan(&parts, &nodes, &HashMap::new());
+        let mut lists: Vec<usize> = vec![0; 5];
+        for (k, l) in &plan {
+            lists[*k] += l.len();
+        }
+        let expected: usize = lists.iter().map(|n| (*n).div_ceil(150).max(1)).sum();
+        assert_eq!(plan.len(), expected);
+        assert!(lists.iter().sum::<usize>() >= 20_000);
     }
 }
