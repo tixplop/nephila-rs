@@ -620,3 +620,161 @@ fn req052_ac6_timeout_is_sent_once() {
     assert!(waits(&o).is_empty());
     assert!(text(&o.stderr).contains("délai dépassé"));
 }
+
+// --- REQ-097 : lecture interrompue du corps d'une réponse 2xx ---
+
+fn cut() -> Reply {
+    Reply::Partial {
+        status: 200,
+        declared_len: 1000,
+        sent: 10,
+    }
+}
+
+fn ask_env(provider: &str, s: &FakeServer) -> Env {
+    let env = Env::new(provider, s);
+    fs::write(
+        env.repo.join("Alpha.java"),
+        "package p;\npublic class Alpha {}\n",
+    )
+    .unwrap();
+    assert!(env.run(&["build", "--no-llm"], None).status.success());
+    env
+}
+
+#[test]
+fn req097_ac1_always_cut_gives_two_requests_and_a_warning() {
+    for provider in ["openai", "anthropic"] {
+        let s = FakeServer::start_replies((0..8).map(|_| cut()).collect());
+        let env = Env::new(provider, &s);
+        let o = env.run(&["build"], Some("10"));
+        assert_ne!(o.status.code(), Some(0), "{provider}");
+        assert_eq!(posts(&s).len(), 2, "{provider}");
+        let w = warnings(&o);
+        assert_eq!(w.len(), 1, "{provider}: {}", text(&o.stderr));
+        assert!(w[0].contains("lecture de la réponse"), "{}", w[0]);
+        assert!(!env.search_finds_summary(), "{provider}");
+    }
+}
+
+#[test]
+fn req097_ac1_cut_then_conforming_enriches() {
+    for provider in ["openai", "anthropic"] {
+        let s = FakeServer::start_replies(vec![cut(), good(provider)]);
+        let env = Env::new(provider, &s);
+        let o = env.run(&["build"], Some("10"));
+        assert_eq!(o.status.code(), Some(0), "{provider}: {}", text(&o.stderr));
+        assert_eq!(posts(&s).len(), 2, "{provider}");
+        assert!(env.search_finds_summary(), "{provider}");
+    }
+}
+
+#[test]
+fn req097_ac1_ask_always_cut_gives_two_requests_and_an_error() {
+    let s = FakeServer::start_replies((0..8).map(|_| cut()).collect());
+    let env = ask_env("openai", &s);
+    let o = env.run(&["query", "ask", "Alpha"], Some("10"));
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
+    assert!(o.stdout.is_empty());
+    assert_eq!(posts(&s).len(), 2);
+    let errs: Vec<String> = text(&o.stderr)
+        .lines()
+        .filter(|l| l.starts_with("erreur:"))
+        .map(String::from)
+        .collect();
+    assert_eq!(errs.len(), 1, "{}", text(&o.stderr));
+    assert!(errs[0].contains("lecture de la réponse"), "{}", errs[0]);
+}
+
+#[test]
+fn req097_ac2_cut_then_503_gives_two_requests() {
+    let s = FakeServer::start_replies(vec![cut(), Reply::status(503, "{}"), good("openai")]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build"], Some("10"));
+    assert_ne!(o.status.code(), Some(0));
+    assert_eq!(posts(&s).len(), 2);
+    assert!(!env.search_finds_summary());
+}
+
+#[test]
+fn req097_ac2_two_503_then_cut_then_conforming_gives_four_requests() {
+    let s = FakeServer::start_replies(vec![
+        Reply::status(503, "{}"),
+        Reply::status(503, "{}"),
+        cut(),
+        good("openai"),
+    ]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build"], Some("10"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(posts(&s).len(), 4);
+    assert!(env.search_finds_summary());
+}
+
+#[test]
+fn req097_ac2_four_503_then_cut_gives_five_requests() {
+    let mut replies: Vec<Reply> = (0..4).map(|_| Reply::status(503, "{}")).collect();
+    replies.push(cut());
+    replies.push(good("openai"));
+    let s = FakeServer::start_replies(replies);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build"], Some("10"));
+    assert_ne!(o.status.code(), Some(0));
+    assert_eq!(posts(&s).len(), 5);
+    assert!(!env.search_finds_summary());
+}
+
+#[test]
+fn req097_ac3_wait_line_says_interrupted_read() {
+    let s = FakeServer::start_replies(vec![cut(), good("openai")]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], Some("10"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let w = waits(&o);
+    assert_eq!(w.len(), 1, "{w:#?}");
+    let (_, rest) = wait_parts(&w[0], &format!("{DOC} [1/1]"));
+    assert_eq!(rest, "après lecture interrompue (nouvel essai 1/4)");
+    assert!(!w[0].contains("erreur réseau"), "{}", w[0]);
+}
+
+#[test]
+fn req097_ac4_waits_follow_the_cause_of_each_new_send() {
+    let s = FakeServer::start_replies(vec![
+        Reply::status(503, "{}"),
+        Reply::status(503, "{}"),
+        cut(),
+        good("openai"),
+    ]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], Some("10"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(posts(&s).len(), 4);
+    let w = waits(&o);
+    assert_eq!(w.len(), 3, "{w:#?}");
+    for (line, end) in w.iter().zip([
+        "après HTTP 503 (nouvel essai 1/4)",
+        "après HTTP 503 (nouvel essai 2/4)",
+        "après lecture interrompue (nouvel essai 3/4)",
+    ]) {
+        assert!(line.ends_with(end), "{line}");
+    }
+}
+
+#[test]
+fn req097_ac4_cut_then_503_gives_one_wait_line_and_http_503_end() {
+    let s = FakeServer::start_replies(vec![cut(), Reply::status(503, "{}"), good("openai")]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], Some("10"));
+    assert_ne!(o.status.code(), Some(0));
+    assert_eq!(posts(&s).len(), 2);
+    let w = waits(&o);
+    assert_eq!(w.len(), 1, "{w:#?}");
+    assert!(
+        w[0].ends_with("après lecture interrompue (nouvel essai 1/4)"),
+        "{}",
+        w[0]
+    );
+    let lines = trace_lines(&o);
+    let end = &lines[position(&lines, "llm enrich fin")];
+    assert!(end.contains("HTTP 503"), "{end}");
+}

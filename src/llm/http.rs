@@ -186,6 +186,7 @@ fn jitter() -> f64 {
 
 /// Cause d'un nouvel essai après une erreur de transport, dans la trace d'attente.
 const NETWORK_CAUSE: &str = "erreur réseau";
+const INTERRUPTED_CAUSE: &str = "lecture interrompue";
 
 /// Statuts HTTP retentés (REQ-052).
 fn is_retryable_status(code: u16) -> bool {
@@ -208,8 +209,10 @@ enum Attempt {
     Retry {
         error: Error,
         retry_after: Option<String>,
-        /// Cause dite dans la trace d'attente : `HTTP <code>` ou `erreur réseau`.
+        /// Cause dite dans la trace d'attente : `HTTP <code>`, `erreur réseau` ou `lecture interrompue`.
         cause: String,
+        /// Lecture interrompue (REQ-097) : un seul nouvel envoi, dont le résultat est définitif.
+        last: bool,
     },
 }
 
@@ -228,14 +231,18 @@ pub fn send(
     stop: Option<&AtomicBool>,
 ) -> Result<String> {
     let mut k = 0;
+    let mut definitive = false;
     loop {
         match attempt(provider, req.clone(), body) {
             Attempt::Done(r) => return r,
+            Attempt::Retry { error, .. } if definitive => return Err(error),
             Attempt::Retry {
                 error,
                 retry_after,
                 cause,
+                last,
             } => {
+                definitive = last;
                 k += 1;
                 if k > MAX_RETRIES {
                     return Err(error);
@@ -325,7 +332,8 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
                         Attempt::Retry {
                             error,
                             retry_after: None,
-                            cause: NETWORK_CAUSE.into(),
+                            cause: INTERRUPTED_CAUSE.into(),
+                            last: true,
                         }
                     } else {
                         Attempt::Done(Err(error))
@@ -356,6 +364,7 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
                     error,
                     retry_after: resp.header("retry-after").map(String::from),
                     cause: format!("HTTP {code}"),
+                    last: false,
                 }
             } else {
                 Attempt::Done(Err(error))
@@ -376,6 +385,7 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
                         error,
                         retry_after: None,
                         cause: NETWORK_CAUSE.into(),
+                        last: false,
                     }
                 } else {
                     Attempt::Done(Err(error))

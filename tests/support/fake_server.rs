@@ -20,6 +20,12 @@ pub enum Reply {
     },
     /// Ferme la connexion sans répondre (après lecture de la requête).
     Close,
+    /// En-tête `Content-Length: <declared_len>`, puis `sent` octets du corps, puis fermeture.
+    Partial {
+        status: u16,
+        declared_len: usize,
+        sent: usize,
+    },
 }
 
 impl Reply {
@@ -330,14 +336,29 @@ fn serve<S: Read + Write>(mut stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, queue:
         headers: vec![],
         delay_ms: 0,
     });
-    let Reply::Http {
-        status,
-        body: payload,
-        headers: extra,
-        delay_ms,
-    } = reply
-    else {
-        return; // fermeture sans réponse
+    let (status, payload, extra, delay_ms) = match reply {
+        Reply::Http {
+            status,
+            body,
+            headers,
+            delay_ms,
+        } => (status, body, headers, delay_ms),
+        Reply::Partial {
+            status,
+            declared_len,
+            sent,
+        } => {
+            let head = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                 Content-Length: {declared_len}\r\nConnection: close\r\n\r\n{}",
+                "x".repeat(sent)
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+            rec.lock().unwrap()[index].answered_at = Some(Instant::now());
+            return; // fermeture avant la fin du corps
+        }
+        Reply::Close => return, // fermeture sans réponse
     };
     if delay_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
