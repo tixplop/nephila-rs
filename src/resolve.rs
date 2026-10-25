@@ -588,32 +588,80 @@ pub fn compute(
 ) -> Resolution {
     #[cfg(test)]
     passes::bump();
+    let is_module_depends = |fr: &FileRef| {
+        fr.r.kind == EdgeKind::DependsOn
+            && parse_node_id(&fr.r.source).is_ok_and(|(k, _)| k == NodeKind::Module)
+    };
+    let all_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let empty = FileContext::default();
+
+    // `depends_on` des modules d'abord (DEC-096 point 1) : leur évaluation ne lit que les
+    // identifiants des modules, jamais l'index.
+    let no_index = Index::new(&[]);
+    let mut dependencies: HashMap<String, Node> = HashMap::new();
+    let mut depends: HashMap<usize, Outcome> = HashMap::new();
+    for (i, fr) in refs
+        .iter()
+        .enumerate()
+        .filter(|(_, fr)| is_module_depends(fr))
+    {
+        let outcome = eval_ref(fr, &empty, &all_ids, &no_index);
+        if let Outcome::Depends(_, Some(d)) = &outcome {
+            dependencies
+                .entry(d.id.clone())
+                .or_insert_with(|| d.clone());
+        }
+        depends.insert(i, outcome);
+    }
+
+    // Dépendance dérivée (sans déclaration) que plus aucun `depends_on` ne vise : elle disparaît
+    // de cette passe, donc de l'index et des identifiants (REQ-087).
+    let declared: HashSet<&str> = declarations.iter().map(|(_, n)| n.as_str()).collect();
+    let vanishing: HashSet<&str> = nodes
+        .iter()
+        .filter(|n| {
+            n.kind == NodeKind::Dependency
+                && !declared.contains(n.id.as_str())
+                && !dependencies.contains_key(&n.id)
+        })
+        .map(|n| n.id.as_str())
+        .collect();
+    let kept: Vec<Node>;
+    let nodes: &[Node] = if vanishing.is_empty() {
+        nodes
+    } else {
+        kept = nodes
+            .iter()
+            .filter(|n| !vanishing.contains(n.id.as_str()))
+            .cloned()
+            .collect();
+        &kept
+    };
+
     let idx = Index::new(nodes);
     let parsed: HashMap<&str, FileContext> = contexts
         .iter()
         .map(|(f, c)| (f.as_str(), parse_context(Some(c))))
         .collect();
-    let empty = FileContext::default();
     let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     let mut out = Resolution::default();
 
-    let mut dependencies: HashMap<String, Node> = HashMap::new();
     for (i, fr) in refs.iter().enumerate() {
-        let ctx = if fr.origin == RefOrigin::Parse {
-            parsed.get(fr.file.as_str()).unwrap_or(&empty)
-        } else {
-            &empty
+        let outcome = match depends.remove(&i) {
+            Some(o) => o,
+            None => {
+                let ctx = if fr.origin == RefOrigin::Parse {
+                    parsed.get(fr.file.as_str()).unwrap_or(&empty)
+                } else {
+                    &empty
+                };
+                eval_ref(fr, ctx, &ids, &idx)
+            }
         };
-        match eval_ref(fr, ctx, &ids, &idx) {
+        match outcome {
             Outcome::Ignored => {}
             Outcome::Unresolved => out.unresolved.push(i),
-            Outcome::Linked(e) => out.edges.push(e),
-            Outcome::Depends(e, dep) => {
-                if let Some(d) = dep {
-                    dependencies.entry(d.id.clone()).or_insert(d);
-                }
-                out.edges.push(e);
-            }
+            Outcome::Linked(e) | Outcome::Depends(e, _) => out.edges.push(e),
         }
     }
     out.dependencies = dependencies.into_values().collect();
@@ -3032,6 +3080,118 @@ import q.R;",
         let want = graph_state(oracle_dir.path(), &oracle, &want_stats);
         assert_eq!(got, want, "{what}");
         stats
+    }
+
+    /// Document `docs/d.md` dont une mention d'analyse et une référence `llm` visent `a`.
+    fn ac087_document(e: &mut Env) {
+        let sec = node_id(NodeKind::Section, "docs/d.md#s");
+        e.store
+            .replace_file(
+                "d.md",
+                &[
+                    plain(NodeKind::Document, "docs/d.md", Some("d.md")),
+                    plain(NodeKind::Section, "docs/d.md#s", Some("d.md")),
+                ],
+                &[rf(&sec, EdgeKind::Mentions, "a", None)],
+            )
+            .unwrap();
+        e.store
+            .apply_enrichment(
+                "d.md",
+                "h",
+                "m",
+                &[],
+                &[],
+                &[rf(&sec, EdgeKind::Mentions, "a", None)],
+            )
+            .unwrap();
+    }
+
+    fn mention_targets(e: &Env) -> Vec<String> {
+        let mut v: Vec<String> = e
+            .store
+            .edges()
+            .unwrap()
+            .into_iter()
+            .filter(|x| x.kind == EdgeKind::Mentions)
+            .map(|x| x.target)
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// AC-087-2 : module `m` supprimé alors que des mentions visent sa dépendance dérivée.
+    fn ac087_2(with_type: bool) {
+        let files = ["m/pom.xml", "d.md", "p.java"];
+        let dep = node_id(NodeKind::Dependency, "g:a");
+        let mut e = env(&files);
+        if with_type {
+            e.store
+                .replace_file("p.java", &[ty("p.a", "p.java")], &[])
+                .unwrap();
+        }
+        build_module(&mut e, "m/pom.xml", "m", &["g:a"]);
+        resolve(&mut e.store).unwrap();
+        assert!(
+            has_node(&e, &dep),
+            "dépendance dérivée par la première passe"
+        );
+        ac087_document(&mut e);
+        resolve(&mut e.store).unwrap();
+        if with_type {
+            assert!(mention_targets(&e).is_empty(), "ambiguïté constatée avant");
+        } else {
+            assert_eq!(mention_targets(&e), vec![dep.clone()]);
+        }
+
+        e.store.replace_file("m/pom.xml", &[], &[]).unwrap();
+        crate::store::reset_diagnostics();
+        let stats = resolve(&mut e.store).unwrap();
+        let d = crate::store::diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (1, 0));
+        assert!(!has_node(&e, &dep));
+        assert!(!e
+            .store
+            .edges()
+            .unwrap()
+            .iter()
+            .any(|x| x.source == dep || x.target == dep));
+        if with_type {
+            assert_eq!(mention_targets(&e), vec![tid("p.a")]);
+            assert_eq!(stats.unresolved, 0);
+        } else {
+            assert!(mention_targets(&e).is_empty());
+            assert_eq!(stats.unresolved, 1);
+            assert_eq!(unresolved(&e.store).unwrap().len(), 1);
+        }
+
+        // Graphe neuf avec le même état final : jamais de `m`, jamais de dépendance dérivée.
+        let mut fresh = env(&files);
+        if with_type {
+            fresh
+                .store
+                .replace_file("p.java", &[ty("p.a", "p.java")], &[])
+                .unwrap();
+        }
+        ac087_document(&mut fresh);
+        let fresh_stats = resolve(&mut fresh.store).unwrap();
+        let got = graph_state(e._dir.path(), &e.store, &stats);
+        let want = graph_state(fresh._dir.path(), &fresh.store, &fresh_stats);
+        // Les identifiants de `refs` diffèrent (le pom de `m` en a consommé) : ils sont exclus.
+        assert_eq!(
+            (got.0, got.1, got.3, got.4, got.5),
+            (want.0, want.1, want.3, want.4, want.5)
+        );
+    }
+
+    #[test]
+    fn req087_ac2_full_pass_drops_a_vanishing_dependency_like_a_fresh_graph() {
+        ac087_2(false);
+    }
+
+    #[test]
+    fn req087_ac2_full_pass_links_the_remaining_candidate_after_the_dependency_vanishes() {
+        ac087_2(true);
     }
 
     /// DEC-077 : la tête d'un nom pointé (`B.m2`) désigne les références à réévaluer quand un

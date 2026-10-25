@@ -1149,3 +1149,93 @@ fn req068_ac3_killed_build_then_update_equals_a_fresh_build() {
     let b = normalized_export(export_raw(&env, &fresh, "export neuf").as_bytes());
     assert!(a == b, "{}", export_gap(&a, &b));
 }
+
+const GUAVA_ID: &str = "dependency:com.google.guava:guava";
+
+/// Nombre de `pom.xml` du dépôt qui déclarent la coordonnée `com.google.guava` / `guava`.
+fn poms_declaring_guava(repo: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for module in ["core/pom.xml", "api/pom.xml"] {
+        let text = fs::read_to_string(repo.join(module)).unwrap();
+        if text.contains("<groupId>com.google.guava</groupId>")
+            && text.contains("<artifactId>guava</artifactId>")
+        {
+            found.push(module.to_string());
+        }
+    }
+    found
+}
+
+#[test]
+fn req087_ac1_vanishing_derived_dependency_is_dropped_without_error() {
+    let env = Env::new("maven2", None);
+    let repo = env.repo();
+    // Préconditions : seul `core/pom.xml` déclare guava, le README le cite.
+    let pom = repo.join("core/pom.xml");
+    let text = fs::read_to_string(&pom).unwrap().replace(
+        "  </dependencies>",
+        "    <dependency>\n      <groupId>com.google.guava</groupId>\n      <artifactId>guava</artifactId>\n      <version>33.0</version>\n    </dependency>\n  </dependencies>",
+    );
+    fs::write(&pom, text).unwrap();
+    assert_eq!(
+        poms_declaring_guava(&repo),
+        vec!["core/pom.xml".to_string()]
+    );
+    let readme = repo.join("README.md");
+    let mut r = fs::read_to_string(&readme).unwrap();
+    r.push_str("\nLe module `core` utilise `guava`.\n");
+    fs::write(&readme, &r).unwrap();
+    assert!(r.contains("`guava`"));
+    ok(&env, &repo, "build", &["build", "--no-llm"]);
+
+    r.push_str("\nUne ligne de plus.\n");
+    fs::write(&readme, &r).unwrap();
+    ok(&env, &repo, "update 1", &["update", "--no-llm"]);
+    let raw = ok(
+        &env,
+        &repo,
+        "export 1",
+        &["export", "--format", "json", "--output", "-"],
+    );
+    let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let linked = doc["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "mentions" && e["target"] == GUAVA_ID);
+    assert!(
+        linked,
+        "lien mentions vers {GUAVA_ID} absent après le premier update"
+    );
+
+    fs::remove_file(&pom).unwrap();
+    let out = env.run(&repo, &["update", "--no-llm"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success() && !stderr.lines().any(|l| l.starts_with("erreur:")),
+        "update après suppression du module : {stderr}"
+    );
+    let inc_counts = counts(&String::from_utf8_lossy(&out.stdout), "update 2");
+    let (raw2, snap) = snapshot(&env, &repo, "update 2");
+
+    let fresh = env.root.join("fresh");
+    copy_tree(&repo, &fresh, false);
+    let b = ok(&env, &fresh, "build neuf", &["build", "--no-llm"]);
+    let (raw_fresh, fresh_snap) = snapshot(&env, &fresh, "build neuf");
+    let d = diff(
+        "maven2 module supprimé",
+        &(snap.clone(), inc_counts),
+        &(fresh_snap, counts(&b, "build neuf")),
+    );
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(
+        export_fingerprint(raw2.as_bytes()),
+        export_fingerprint(raw_fresh.as_bytes())
+    );
+    assert!(
+        !snap[2].contains(GUAVA_ID),
+        "summary cite encore la dépendance disparue"
+    );
+    let again = ok(&env, &repo, "update 3", &["update", "--no-llm"]);
+    assert!(again.contains("graphe à jour"), "{again}");
+}
