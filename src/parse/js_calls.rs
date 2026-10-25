@@ -9,7 +9,7 @@ use crate::model::{NodeKind, SubKind};
 
 use super::js::{is_function_value, member_name};
 use super::js_imports::{Cible, Imports};
-use super::{Declared, OrderedSet};
+use super::{Declared, OrderedSet, MAX_NESTING};
 
 /// Table locale : nom lié -> type annoté ou construit (`None` = type inconnu).
 type Locals = HashMap<String, Option<String>>;
@@ -25,6 +25,9 @@ struct Collector<'a> {
     types: HashMap<String, SubKind>,
     methods: HashSet<String>,
     out: OrderedSet<(String, String)>,
+    /// `namespace` et nœuds `ERROR` englobants ; au-delà de `MAX_NESTING`, on ne descend plus
+    /// (même borne que l'extracteur de structure, DEC-105).
+    level: usize,
 }
 
 /// Appels d'un fichier : couples (nom qualifié de la méthode appelante, nom visé).
@@ -56,6 +59,7 @@ pub fn collect(
         types,
         methods,
         out: OrderedSet::new(),
+        level: 0,
     };
     let mut owners = vec![module.to_string()];
     c.statements(root, &mut owners);
@@ -116,7 +120,14 @@ impl Collector<'_> {
                     }
                 }
             }
-            "ambient_declaration" | "ERROR" => self.statements(n, owners),
+            "ambient_declaration" => self.statements(n, owners),
+            "ERROR" => {
+                if self.level < MAX_NESTING {
+                    self.level += 1;
+                    self.statements(n, owners);
+                    self.level -= 1;
+                }
+            }
             "expression_statement" => {
                 let mut cur = n.walk();
                 for c in n.named_children(&mut cur) {
@@ -171,9 +182,14 @@ impl Collector<'_> {
             return;
         }
         let q = format!("{}.{}", owners.last().unwrap(), self.text(name));
+        if self.level >= MAX_NESTING {
+            return;
+        }
         if let Some(body) = n.child_by_field_name("body") {
             owners.push(q);
+            self.level += 1;
             self.statements(body, owners);
+            self.level -= 1;
             owners.pop();
         }
     }

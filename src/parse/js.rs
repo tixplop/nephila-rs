@@ -12,7 +12,7 @@ use crate::model::{node_id, EdgeKind, NodeKind, SubKind};
 use super::js_calls;
 use super::js_imports::Imports;
 use super::jvm::INIT;
-use super::{Declared, FileStructure, Lang, OrderedSet, Reference};
+use super::{Declared, FileStructure, Lang, OrderedSet, Reference, MAX_NESTING};
 
 /// Nom du module ES d'un fichier : (qualifié, court). Le qualifié est le chemin relatif sans
 /// extension (`.d.ts`, `.d.mts`, `.d.cts` retirés en entier, sinon la dernière extension) ; le
@@ -62,6 +62,8 @@ pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
         references: OrderedSet::new(),
         seen: HashSet::new(),
         imports: Imports::collect(tree.root_node(), text.as_bytes(), &rel),
+        level: 0,
+        nesting_cut: false,
     };
     let package = node_id(NodeKind::Package, &module);
     x.seen.insert(package.clone());
@@ -84,7 +86,7 @@ pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
         declares: x.declares,
         references: x.references.into_vec(),
         warnings: Vec::new(),
-        nesting_cut: false,
+        nesting_cut: x.nesting_cut,
     })
 }
 
@@ -94,6 +96,11 @@ struct Extractor<'a> {
     references: OrderedSet<Reference>,
     seen: HashSet<String>,
     imports: Imports,
+    /// Déclarations englobantes (`namespace`, types) et nœuds `ERROR` traversés au point courant
+    /// (DEC-105) ; au-delà de `MAX_NESTING`, ni déclaration ni descente.
+    level: usize,
+    /// Une déclaration ou une reprise a été refusée par `MAX_NESTING`.
+    nesting_cut: bool,
 }
 
 impl Extractor<'_> {
@@ -136,6 +143,16 @@ impl Extractor<'_> {
     /// Reprise dans un nœud `ERROR` : une accolade ouverte et non refermée est un corps cassé
     /// (fonction, classe, bloc) ; ce qu'elle contient n'est pas de premier niveau.
     fn recover(&mut self, n: Node, owner: &str, depth: &mut i32) {
+        if self.level >= MAX_NESTING {
+            self.nesting_cut = true;
+            return;
+        }
+        self.level += 1;
+        self.recover_children(n, owner, depth);
+        self.level -= 1;
+    }
+
+    fn recover_children(&mut self, n: Node, owner: &str, depth: &mut i32) {
         let mut cur = n.walk();
         for c in n.children(&mut cur) {
             match c.kind() {
@@ -243,14 +260,24 @@ impl Extractor<'_> {
         if name.kind() != "identifier" {
             return;
         }
+        if self.level >= MAX_NESTING {
+            self.nesting_cut = true;
+            return;
+        }
         let q = format!("{owner}.{}", self.text(name));
         self.declare(NodeKind::Type, q.clone(), Some(SubKind::Object));
         if let Some(body) = n.child_by_field_name("body") {
+            self.level += 1;
             self.statements(body, &q);
+            self.level -= 1;
         }
     }
 
     fn type_decl(&mut self, n: Node, owner: &str, name: &str, sub: SubKind) {
+        if self.level >= MAX_NESTING {
+            self.nesting_cut = true;
+            return;
+        }
         let q = format!("{owner}.{name}");
         self.declare(NodeKind::Type, q.clone(), Some(sub));
         let id = node_id(NodeKind::Type, &q);
@@ -707,5 +734,130 @@ mod tests {
         );
         assert_eq!(ids(&s), vec!["package:src/u"]);
         assert!(s.references.is_empty());
+    }
+
+    /// AC-104-3 (TypeScript) : `namespace C1 { function m() {} namespace C2 { … } }`, frère `B`.
+    #[test]
+    fn req104_ac3_imbrication_bornee_a_1000_niveaux() {
+        use crate::parse::nesting_support::{on_extract_stack, qualified, source};
+        for depth in [MAX_NESTING, MAX_NESTING + 1] {
+            let src = source(
+                depth,
+                &|i| format!("namespace C{i} {{\nfunction m() {{}}\n"),
+                "}\n",
+                "namespace B { function m() {} }",
+            );
+            let s = on_extract_stack(move || extract(Lang::TypeScript, Path::new("x.ts"), &src))
+                .unwrap();
+            let got: HashSet<String> = s.declares.iter().map(|d| d.id()).collect();
+            let last = format!("x.{}", qualified(MAX_NESTING));
+            let beyond = format!("x.{}", qualified(MAX_NESTING + 1));
+            assert!(
+                got.contains(&format!("type:{last}")),
+                "niveau 1000 ({depth})"
+            );
+            assert!(
+                got.contains(&format!("method:{last}.m")),
+                "fonction du niveau 1000 ({depth})"
+            );
+            assert!(
+                !got.contains(&format!("type:{beyond}")),
+                "niveau 1001 ({depth})"
+            );
+            assert!(
+                !got.contains(&format!("method:{beyond}.m")),
+                "fonction du niveau 1001 ({depth})"
+            );
+            assert!(got.contains("type:x.C1.B"), "frère ({depth})");
+            assert!(
+                got.contains("method:x.C1.B.m"),
+                "fonction du frère ({depth})"
+            );
+            let chain = s
+                .declares
+                .iter()
+                .filter(|d| d.kind == NodeKind::Type)
+                .count();
+            assert_eq!(chain, MAX_NESTING + 1, "types déclarés ({depth})");
+            assert_eq!(s.nesting_cut, depth > MAX_NESTING, "drapeau ({depth})");
+        }
+    }
+
+    /// AC-104-3 : un type déclaré dans le namespace de niveau 1 000 est au niveau 1 001, refusé.
+    #[test]
+    fn req104_ac3_type_au_dela_de_la_borne_refuse() {
+        use crate::parse::nesting_support::{on_extract_stack, source};
+        let src = source(
+            MAX_NESTING,
+            &|i| format!("namespace C{i} {{\n"),
+            "}\n",
+            "class K extends Y { m() {} }",
+        );
+        // `K` est frère au niveau 2 : extrait ; placé au niveau 1 000, il serait refusé.
+        let deep = format!(
+            "{}class K extends Y {{ m() {{}} }}\n{}",
+            (1..=MAX_NESTING)
+                .map(|i| format!("namespace C{i} {{\n"))
+                .collect::<String>(),
+            "}\n".repeat(MAX_NESTING)
+        );
+        let (a, b) = on_extract_stack(move || {
+            (
+                extract(Lang::TypeScript, Path::new("x.ts"), &src).unwrap(),
+                extract(Lang::TypeScript, Path::new("x.ts"), &deep).unwrap(),
+            )
+        });
+        assert!(a.declares.iter().any(|d| d.id() == "type:x.C1.K"));
+        assert!(!a.nesting_cut);
+        assert!(b.declares.iter().all(|d| !d.qualified.ends_with(".K")));
+        assert!(b.references.iter().all(|r| r.target != "Y"));
+        assert!(b.nesting_cut);
+    }
+
+    /// AC-104-4 : `recover` s'arrête quand le niveau est déjà à `MAX_NESTING` (tree-sitter-javascript
+    /// ne produit pas d'imbrication profonde de `ERROR` : la reprise est testée directement).
+    #[test]
+    fn req104_ac4_reprise_bornee_par_le_niveau() {
+        fn first_error(n: Node) -> Option<Node> {
+            if n.kind() == "ERROR" {
+                return Some(n);
+            }
+            let mut cur = n.walk();
+            let children: Vec<Node> = n.children(&mut cur).collect();
+            children.into_iter().find_map(first_error)
+        }
+        let text = "function good() {}\nexport function bad( {\n}\nfunction after() {}\n";
+        let tree = Lang::TypeScript.parse(text).unwrap();
+        let err = first_error(tree.root_node()).expect("un noeud ERROR");
+        for (level, cut) in [(0, false), (MAX_NESTING, true)] {
+            let mut x = Extractor {
+                src: text.as_bytes(),
+                declares: Vec::new(),
+                references: OrderedSet::new(),
+                seen: HashSet::new(),
+                imports: Imports::collect(tree.root_node(), text.as_bytes(), "c.ts"),
+                level,
+                nesting_cut: false,
+            };
+            x.recover(err, "c", &mut 0);
+            assert_eq!(x.nesting_cut, cut, "drapeau (niveau {level})");
+            assert_eq!(x.level, level, "niveau restitué");
+            if cut {
+                assert!(x.declares.is_empty(), "rien déclaré au-delà de la borne");
+            }
+        }
+    }
+
+    /// AC-104-4 : un texte très mal formé ne fait pas déborder la pile ; sans dépassement, pas de panique.
+    #[test]
+    fn req104_ac4_texte_tres_mal_forme_sans_debordement() {
+        use crate::parse::nesting_support::on_extract_stack;
+        let src = format!(
+            "function a() {{}}\n{}\nfunction z() {{}}\n",
+            "( { [ ".repeat(5_000)
+        );
+        let s =
+            on_extract_stack(move || extract(Lang::JavaScript, Path::new("e.js"), &src)).unwrap();
+        assert!(s.declares.iter().any(|d| d.id() == "method:e.a"));
     }
 }
