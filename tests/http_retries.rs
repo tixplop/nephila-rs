@@ -138,14 +138,24 @@ fn req052_ac2_other_statuses_are_sent_once() {
         let s = FakeServer::start_replies(vec![Reply::status(status, "{}"), good("openai")]);
         let env = Env::new("openai", &s);
         let o = env.run(&["build"], Some("10"));
-        assert_ne!(o.status.code(), Some(0), "{status}");
+        assert_eq!(o.status.code(), Some(1), "{status}");
         assert_eq!(posts(&s).len(), 1, "{status}");
         assert!(
             !env.search_finds_summary(),
             "{status} : le fichier doit rester à enrichir"
         );
-        if status != 401 && status != 403 {
-            assert!(!warnings(&o).is_empty(), "{status}: {}", text(&o.stderr));
+        // 401/403 : clé refusée (REQ-054) ; 400, 404, 413 : requête refusée (REQ-091), E-19.
+        assert!(warnings(&o).is_empty(), "{status}: {}", text(&o.stderr));
+        let last = text(&o.stderr).lines().last().unwrap().to_string();
+        if status == 401 || status == 403 {
+            assert!(last.starts_with("erreur: clé d'API refusée"), "{last}");
+        } else {
+            assert!(
+                last.starts_with(&format!(
+                    "erreur: requête refusée par openai (HTTP {status}) sur "
+                )),
+                "{status}: {last}"
+            );
         }
     }
 }

@@ -27,8 +27,9 @@ struct Policy {
     consecutive_network: usize,
     network_total: usize,
     stop_cause: Option<String>,
-    /// Première clé refusée reçue, si elle est la cause de l'arrêt (REQ-054).
-    key_refused: Option<String>,
+    /// Première erreur d'arrêt immédiat (clé refusée REQ-054, requête refusée REQ-091), si elle
+    /// est la cause de l'arrêt.
+    refused: Option<Error>,
 }
 
 /// Total des erreurs réseau constatées au départ d'un appel (DEC-022).
@@ -49,12 +50,17 @@ impl Policy {
                     .consecutive_network
                     .min(self.network_total.saturating_sub(ticket));
             }
-            Some(Error::InvalidKey(message)) => {
+            Some(e @ (Error::InvalidKey(_) | Error::Rejected { .. })) => {
                 if self.stop_cause.is_none() {
-                    self.key_refused = Some(message.clone());
+                    self.refused = Some(e.clone());
+                    self.stop_cause = Some(
+                        match e {
+                            Error::InvalidKey(_) => "clé d'API refusée par le fournisseur",
+                            _ => "requête refusée par le fournisseur",
+                        }
+                        .to_string(),
+                    );
                 }
-                self.stop_cause
-                    .get_or_insert_with(|| "clé d'API refusée par le fournisseur".to_string());
             }
             Some(Error::Network(_)) => {
                 self.consecutive_network += 1;
@@ -286,6 +292,7 @@ fn trace_detail(e: &Error) -> String {
     match e {
         Error::Message(m) | Error::Format(m) => m.split(" : ").next().unwrap_or("").to_string(),
         Error::Truncated(_) => TRUNCATED.to_string(),
+        Error::Rejected { trace, .. } => trace.clone(),
         other => other.to_string(),
     }
 }
@@ -1022,8 +1029,8 @@ pub(crate) fn enrich_with_stop(
                         for outcome in batch {
                             match outcome {
                                 Outcome::Failed(path, e) => {
-                                    // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
-                                    if !matches!(e, Error::InvalidKey(_)) {
+                                    // Clé ou requête refusée (E-12, E-19) : l'erreur finale la dit ; aucun fichier n'est nommé.
+                                    if !matches!(e, Error::InvalidKey(_) | Error::Rejected { .. }) {
                                         notes.push(format!("{path} : {e}"));
                                     }
                                     report.failed += 1;
@@ -1060,8 +1067,8 @@ pub(crate) fn enrich_with_stop(
                             match result {
                                 Err(e) => {
                                     entry.failed = true;
-                                    // Clé refusée (E-12) : l'erreur finale la dit ; aucun fichier n'est nommé.
-                                    if !matches!(e, Error::InvalidKey(_)) {
+                                    // Clé ou requête refusée (E-12, E-19) : l'erreur finale la dit ; aucun fichier n'est nommé.
+                                    if !matches!(e, Error::InvalidKey(_) | Error::Rejected { .. }) {
                                         notes.push(format!("{} : {e}", file.path));
                                     }
                                     report.failed += 1;
@@ -1120,7 +1127,7 @@ pub(crate) fn enrich_with_stop(
     );
     let policy = policy.into_inner().unwrap_or_else(|p| p.into_inner());
     report.stop_cause = policy.stop_cause;
-    report.key_refused = policy.key_refused;
+    report.refused = policy.refused;
     match write_error {
         Some(e) => Err(e),
         None => Ok(failures),
@@ -1686,6 +1693,66 @@ mod tests {
         let mut p = Policy::default();
         let t = p.dispatch();
         assert!(p.record(t, Some(&Error::InvalidKey("k".into()))));
+    }
+
+    fn rejected() -> Error {
+        Error::Rejected {
+            message: "requête refusée par openai (HTTP 400) sur u ; v".into(),
+            trace: "requête refusée par openai (HTTP 400)".into(),
+        }
+    }
+
+    #[test]
+    fn req091_ac5_rejected_stops_at_first_and_keeps_network_count() {
+        let mut p = Policy::default();
+        for _ in 0..2 {
+            let t = p.dispatch();
+            assert!(!p.record(t, Some(&net())));
+        }
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&rejected())));
+        assert_eq!(p.consecutive_network, 2);
+        assert_eq!(p.network_total, 2);
+        assert_eq!(
+            p.stop_cause.as_deref(),
+            Some("requête refusée par le fournisseur")
+        );
+        assert_eq!(p.refused, Some(rejected()));
+
+        let mut p = Policy::default();
+        assert!(p.record(0, Some(&rejected())));
+        assert_eq!(p.consecutive_network, 0);
+    }
+
+    #[test]
+    fn req091_ac5_first_immediate_stop_wins() {
+        let key = Error::InvalidKey("clé".into());
+        let mut p = Policy::default();
+        assert!(p.record(0, Some(&key)));
+        assert!(p.record(0, Some(&rejected())));
+        assert_eq!(p.refused, Some(key.clone()));
+        assert_eq!(
+            p.stop_cause.as_deref(),
+            Some("clé d'API refusée par le fournisseur")
+        );
+
+        let mut p = Policy::default();
+        assert!(p.record(0, Some(&rejected())));
+        assert!(p.record(0, Some(&key)));
+        assert_eq!(p.refused, Some(rejected()));
+        assert_eq!(
+            p.stop_cause.as_deref(),
+            Some("requête refusée par le fournisseur")
+        );
+    }
+
+    #[test]
+    fn req091_trace_detail_is_the_fixed_label() {
+        assert_eq!(
+            trace_detail(&rejected()),
+            "requête refusée par openai (HTTP 400)"
+        );
+        assert_eq!(crate::trace::classify(&rejected()), "requête refusée");
     }
 
     #[test]

@@ -35,8 +35,8 @@ pub struct BuildReport {
     pub llm_active: bool,
     /// Cause de l'arrêt de l'envoi de nouveaux fichiers (clé refusée, panne réseau répétée).
     pub stop_cause: Option<String>,
-    /// Message de la première clé refusée, quand elle a arrêté l'envoi (REQ-054).
-    pub key_refused: Option<String>,
+    /// Première clé refusée (REQ-054) ou requête refusée (REQ-091), quand elle a arrêté l'envoi.
+    pub refused: Option<Error>,
     /// Fichiers exclus par les filtres (REQ-037) ; `None` sans filtre actif.
     pub excluded: Option<usize>,
 }
@@ -247,8 +247,8 @@ pub(crate) fn write_report(out: &mut Out, report: &BuildReport, verb: &str) -> R
 /// Erreurs de fin de commande ; une clé refusée est rendue telle quelle (REQ-054) ; un fichier resté en attente, un fichier à enrichir (LLM actif) ou un arrêt
 /// de l'envoi rend une erreur (code non nul).
 pub(crate) fn finish(report: &BuildReport) -> Result<()> {
-    if let Some(message) = &report.key_refused {
-        return Err(Error::InvalidKey(message.clone()));
+    if let Some(e) = &report.refused {
+        return Err(e.clone());
     }
     let mut problems = Vec::new();
     if let Some(cause) = &report.stop_cause {

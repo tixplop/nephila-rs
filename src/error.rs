@@ -7,6 +7,10 @@ use std::fmt;
 pub enum Error {
     /// Clé d'API refusée par le fournisseur (HTTP 401/403).
     InvalidKey(String),
+    /// Requête refusée par le fournisseur (HTTP 400, 404, 413, 422 ; REQ-091, DEC-099) : jamais
+    /// retentée, arrête l'envoi dès le premier appel. `message` est le texte E-19 complet,
+    /// `trace` le détail fixe de la trace (sans rien recopier de la réponse).
+    Rejected { message: String, trace: String },
     /// Erreur réseau, quota ou erreur serveur du fournisseur.
     Network(String),
     /// Délai d'appel dépassé (`timeout_secs`).
@@ -53,6 +57,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::InvalidKey(m)
+            | Error::Rejected { message: m, .. }
             | Error::Network(m)
             | Error::Timeout(m)
             | Error::Message(m)

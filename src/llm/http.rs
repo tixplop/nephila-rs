@@ -213,7 +213,7 @@ enum Attempt {
 
 /// Exécute la requête, avec jusqu'à 4 nouveaux essais à l'identique (statuts 429, 500, 502, 503,
 /// 504, 529 et erreurs réseau transitoires, attente progressive) ; 401/403 -> `InvalidKey`,
-/// autres échecs -> `Network`. Retourne le corps de la réponse. `label` nomme l'appel dans la
+/// 400/404/413/422 -> `Rejected` (jamais retentée), autres échecs -> `Network`. Retourne le corps de la réponse. `label` nomme l'appel dans la
 /// trace d'attente (`<chemin> [i/n]`) ; `None` (`query ask`) : aucune ligne d'attente.
 pub fn send(
     provider: &str,
@@ -293,6 +293,14 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
         Err(ureq::Error::Status(code @ (401 | 403), _)) => Attempt::Done(Err(Error::InvalidKey(format!(
             "clé d'API refusée par {provider} (HTTP {code}) ; vérifiez la variable désignée par api_key_env"
         )))),
+        Err(ureq::Error::Status(code @ (400 | 404 | 413 | 422), resp)) => {
+            // Corps lu une fois ; une lecture qui échoue donne un message sans partie `error.message`.
+            let detail = resp
+                .into_string()
+                .ok()
+                .and_then(|body| provider_error_message(&body));
+            Attempt::Done(Err(rejected(provider, code, &url, detail.as_deref())))
+        }
         Err(ureq::Error::Status(code, resp)) => {
             let error = Error::Network(format!("erreur de {provider} (HTTP {code}) sur {url}"));
             if is_retryable_status(code) {
@@ -326,6 +334,51 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
                 }
             }
         },
+    }
+}
+
+/// Indice de fin du texte d'une requête refusée (E-19) : seule source.
+const REJECTED_HINT: &str = "vérifiez model, thinking, effort et max_output_tokens";
+
+/// Longueur maximale d'un texte recopié du fournisseur (`truncate.provider`).
+const PROVIDER_TEXT_CHARS: usize = 200;
+
+/// Texte recopié du fournisseur (`error.message`, `Location`) : une ligne (caractères de contrôle
+/// remplacés par une espace, espaces répétées réduites, bords rognés), puis 200 caractères
+/// Unicode au plus, `…` final compris. Seule fonction de `truncate.provider`.
+pub fn provider_text(raw: &str) -> String {
+    let flat: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let line = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= PROVIDER_TEXT_CHARS {
+        return line;
+    }
+    let cut: String = line.chars().take(PROVIDER_TEXT_CHARS - 1).collect();
+    let mut out = cut.trim_end().to_string();
+    out.push('…');
+    out
+}
+
+/// `error.message` du corps JSON d'une réponse d'erreur, normalisé ; `None` si le corps n'est pas
+/// du JSON, n'a pas de chaîne `error.message`, ou si elle est vide après normalisation.
+fn provider_error_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let text = provider_text(value.get("error")?.get("message")?.as_str()?);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Requête refusée (E-19) : texte complet et détail fixe de la trace.
+fn rejected(provider: &str, code: u16, url: &str, detail: Option<&str>) -> Error {
+    let head = format!("requête refusée par {provider} (HTTP {code})");
+    let message = match detail {
+        Some(d) => format!("{head} sur {url} : {d} ; {REJECTED_HINT}"),
+        None => format!("{head} sur {url} ; {REJECTED_HINT}"),
+    };
+    Error::Rejected {
+        message,
+        trace: head,
     }
 }
 
@@ -384,6 +437,63 @@ pub fn parse_body(provider: &str, body: &str) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn req091_ac4_long_message_is_one_line_of_200_chars_ending_with_ellipsis() {
+        let raw = format!("{}\n\t{}", "a".repeat(150), "b".repeat(150));
+        let t = provider_text(&raw);
+        assert_eq!(t.chars().count(), 200);
+        assert!(t.ends_with('…'));
+        assert!(!t.chars().any(char::is_control));
+        let body = serde_json::json!({"error": {"message": raw}}).to_string();
+        let m = provider_error_message(&body).unwrap();
+        assert_eq!(m, t);
+    }
+
+    #[test]
+    fn req091_ac4_message_of_exactly_200_chars_is_kept() {
+        let raw = "é".repeat(200);
+        assert_eq!(provider_text(&raw), raw);
+        let raw = format!("  {}  ", "é".repeat(200));
+        assert_eq!(provider_text(&raw), "é".repeat(200));
+        assert_eq!(provider_text(&"é".repeat(201)).chars().count(), 200);
+        assert_eq!(provider_text("a \u{1} \r\n  b"), "a b");
+        // Coupure juste après une espace : pas d'espace avant `…`.
+        let raw = format!("{} {}", "a".repeat(198), "b".repeat(10));
+        assert_eq!(provider_text(&raw), format!("{}…", "a".repeat(198)));
+    }
+
+    #[test]
+    fn req091_ac4_unusable_bodies_give_no_message_part() {
+        for body in [
+            "",
+            "pas du json",
+            r#"{"error":"x"}"#,
+            r#"{"error":{"message":42}}"#,
+            r#"{"error":{"message":" \n\t "}}"#,
+            r#"{"error":{}}"#,
+        ] {
+            assert_eq!(provider_error_message(body), None, "{body}");
+            let e = rejected("openai", 400, "http://h/p", None);
+            let text = e.to_string();
+            assert_eq!(
+                text,
+                "requête refusée par openai (HTTP 400) sur http://h/p ; vérifiez model, thinking, effort et max_output_tokens"
+            );
+            assert!(!text.contains('\n'));
+        }
+        let e = rejected("anthropic", 422, "http://h/p", Some("model: x"));
+        assert_eq!(
+            e.to_string(),
+            "requête refusée par anthropic (HTTP 422) sur http://h/p : model: x ; vérifiez model, thinking, effort et max_output_tokens"
+        );
+        match e {
+            Error::Rejected { trace, .. } => {
+                assert_eq!(trace, "requête refusée par anthropic (HTTP 422)")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     const S: Duration = Duration::from_secs(1);
 
