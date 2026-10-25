@@ -166,6 +166,8 @@ $ nephila status --json
 
 Graphe à jour : `graphe à jour`.
 
+Graphe à résoudre : `graphe à résoudre : lancez nephila update`, code 0, sans fichier listé (`--json` : `"a_jour":false` et `fichiers` vide). Les liens du graphe sont à recalculer : une commande a été interrompue entre l'analyse des fichiers et la fin de la résolution, ou une passe de résolution a échoué (voir [Codes de sortie](#codes-de-sortie)). Lancez `nephila update` : sans fichier changé, il refait toute la passe de résolution, sans appel LLM pour les fichiers déjà enrichis. Si l'erreur `résolution` revient, lancez `nephila build`.
+
 ### `nephila query`
 
 Un nœud se désigne par son nom (`shop.Order`) ou par son identifiant `genre:nom` (`method:shop.Order.place`). Toutes les requêtes acceptent `--json` et `--check-stale`.
@@ -224,7 +226,7 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 
 - la configuration (fournisseur, modèle, `enrich_code`, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;
 - le parcours des fichiers ;
-- le début et la fin de chaque phase (structure, résolution, enrichissement) ; la fin de la phase structure donne le nombre de fichiers dont les résumés ont été repris sans appel (`, <r> enrichissements conservés`) ; le nombre de fils annoncé au début de la phase structure est celui de `--jobs` (au plus le nombre de fichiers), celui de l'enrichissement vient de `concurrency` ;
+- le début et la fin de chaque phase (structure, résolution, enrichissement) ; la ligne de fin de la résolution se termine par ` (complète)` ou ` (incrémentale, <N> références réévaluées)` selon la passe, et un `update` sur un graphe à résoudre commence par une passe complète ; la fin de la phase structure donne le nombre de fichiers dont les résumés ont été repris sans appel (`, <r> enrichissements conservés`) ; le nombre de fils annoncé au début de la phase structure est celui de `--jobs` (au plus le nombre de fichiers), celui de l'enrichissement vient de `concurrency` ;
 - le départ et la fin de chaque appel LLM, avec son résultat (`ok`, `délai dépassé`, `réseau`, `clé refusée`, `erreur` ou `tronquée`) et sa durée ; `[i/n]` compte les appels du fichier (morceaux et groupes de 150 nœuds confondus) ; le départ d'un nouvel essai porte la marque ` (essai <e>/<t>)`, où `<t>` vaut `format_retries` + 1 (le premier essai n'a pas de marque) ;
 - chaque attente avant un nouvel essai HTTP, entre le départ et la fin de l'appel : `llm enrich attente <chemin> [i/n] <ms> ms après HTTP 503 (nouvel essai 1/4)` (cause `HTTP <code>` ou `erreur réseau`) ;
 - les décisions d'arrêt.
@@ -700,6 +702,8 @@ Les messages sont écrits sur stderr, préfixés `erreur:` ou `avertissement:`. 
 
 Si stdout est fermée avant la fin de la sortie (lecteur arrêté, | head), toute commande s'arrête sur une seule ligne erreur: écriture sur stdout impossible : <cause> et le code 1, sans rien écrire de plus. build et update ont déjà enregistré le graphe : seul leur bilan manque, et nephila status donne l'état. Une commande qui n'avait rien à écrire sur stdout garde son propre message.
 
+Si la passe de résolution des liens échoue (`build` ou `update`), la commande s'arrête sur une seule ligne `erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe` et le code 1, sans ligne de bilan : les fichiers ont été lus et enregistrés, seuls les liens ne sont pas recalculés. `nephila status` annonce alors `graphe à résoudre : lancez nephila update` ; essayez d'abord `nephila update`, puis `nephila build` si l'erreur revient.
+
 ## Usage par un agent
 
 Les sorties `--json` sont stables et sans décoration. Séquence type :
@@ -731,6 +735,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 ## Mise à niveau
 
 - **Renommage `rkg` → `nephila`** : le binaire s'appelle `nephila`, le graphe est stocké dans `.nephila/` (au lieu de `.rkg/`), la configuration dans `~/.config/nephila/config.toml` et les variables d'environnement sont préfixées `NEPHILA_` (`NEPHILA_CONFIG`, `NEPHILA_MOCK_DIR`…). Déplacez votre configuration (`mv ~/.config/rkg ~/.config/nephila`), puis reconstruisez le graphe avec `nephila build` et supprimez l'ancien dossier `.rkg/`.
+- **Vers 0.24** (graphe à résoudre) : un graphe d'une version antérieure à la 0.22 est annoncé « graphe à résoudre » jusqu'au premier `nephila update`, qui le migre et fait une passe complète.
 - **Vers 0.24** : les dossiers dist/, out/, coverage/, .next/, .nuxt/, vendor/ et .idea/, à tout niveau, et les fichiers *.min.js sont exclus par défaut. nephila status liste comme supprimé chaque fichier du graphe qu'ils contiennent, et le premier nephila update les retire, sans appel LLM. Pour les garder : exclude_defaults = false dans .nephila.toml.
 - **Vers 0.23** : le parcours du dépôt et l'extraction utilisent par défaut un fil par cœur disponible, quelle que soit concurrency, qui ne règle plus que les appels LLM. Pour limiter ces fils comme concurrency = 1 le faisait, ajoutez --jobs 1 à nephila build et nephila update.
 - **Vers 0.22** : le graphe passe au schéma 8 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, et la première résolution qui suit est complète ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.21 tel quel. Un binaire 0.21 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).
@@ -744,7 +749,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
-| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit. Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe. Nouveautés : déduplications linéaires, un parser par fil, export en flux sans nouvelle résolution, profil release optimisé, banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. |
+| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit. Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe. Nouveautés : déduplications linéaires, un parser par fil, export en flux sans nouvelle résolution, profil release optimisé, banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. Graphe à résoudre : nephila status l'annonce (graphe à résoudre : lancez nephila update) après une commande interrompue ou une passe de résolution en échec (erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe) ; --verbose dit si la passe est complète ou incrémentale. |
 | 0.23 | Option --jobs de build et update : nombre de fils du parcours du dépôt et de l'extraction, par défaut le nombre de cœurs disponibles ; concurrency ne règle plus que les appels LLM. Parcours du dépôt et empreintes en parallèle, fichier lu une seule fois pour son empreinte et son analyse, écriture SQLite allégée, même graphe qu'en 0.22 quel que soit le nombre de fils. |
 | 0.22 | Mise à jour incrémentale : `update` ne résout plus que les références touchées par les fichiers changés et ne relit plus toute la table des liens ; résumé global calculé sans relire le graphe ; une seule résolution complète par commande avec LLM. Même graphe qu'en 0.21 ; le schéma 8 est migré sur place. |
 | 0.21 | Stockage SQLite allégé : contexte d'imports stocké une fois par fichier, index inutiles retirés, cache SQLite agrandi à chaque ouverture en écriture, écritures regroupées, build neuf sans recalcul répété des nœuds. Même graphe qu'en 0.20 ; le schéma 7 est migré sur place. |

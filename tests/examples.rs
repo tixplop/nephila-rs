@@ -1428,6 +1428,42 @@ fn REQ086_AC5_readme_sortie_standard_fermee() {
         .find(|l| l.starts_with("| 0.24 |"))
         .expect("ligne 0.24");
     assert!(row.starts_with("| 0.24 | Rupture : "));
-    assert!(row.ends_with("banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. |"));
+    assert!(row.contains("banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. Graphe à résoudre : nephila status l'annonce"));
+    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
+}
+
+#[test]
+fn REQ088_REQ089_REQ090_readme_graphe_a_resoudre_erreur_et_trace() {
+    let readme = repo_file("README.md");
+    for expected in [
+        "graphe à résoudre : lancez nephila update",
+        "erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe",
+        " (incrémentale, <N> références réévaluées)",
+        "un graphe d'une version antérieure à la 0.22 est annoncé « graphe à résoudre » jusqu'au premier `nephila update`",
+    ] {
+        assert!(readme.contains(expected), "absent : {expected}");
+    }
+    let status = readme_section(&readme, "### `nephila status`");
+    assert!(status.contains("graphe à résoudre : lancez nephila update"));
+    let codes = readme_section(&readme, "## Codes de sortie");
+    assert!(codes.contains(
+        "erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe"
+    ));
+    let traces = readme_section(&readme, "### Traces (`--verbose`)");
+    assert!(traces.contains(" (incrémentale, <N> références réévaluées)"));
+    assert!(traces.contains("(complète)"));
+    for banned in ["corrompu", "invalide", "périmé"] {
+        for l in status.lines().chain(traces.lines()) {
+            assert!(
+                !l.contains(banned) || !l.contains("résol"),
+                "mot interdit : {l}"
+            );
+        }
+    }
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| 0.24 |"))
+        .expect("ligne 0.24");
+    assert!(row.ends_with(" Graphe à résoudre : nephila status l'annonce (graphe à résoudre : lancez nephila update) après une commande interrompue ou une passe de résolution en échec (erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe) ; --verbose dit si la passe est complète ou incrémentale. |"), "ligne 0.24 : {row}");
     assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
 }
