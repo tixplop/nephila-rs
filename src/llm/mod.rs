@@ -9,6 +9,8 @@ pub mod mock;
 pub mod openai;
 pub mod retry;
 
+use std::sync::atomic::AtomicBool;
+
 use crate::config::{Config, Effort, Provider};
 use crate::error::{Error, Result};
 pub use ask::AskReply;
@@ -50,7 +52,9 @@ pub trait Llm: Send + Sync {
         known: &[String],
     ) -> Result<Enrichment>;
     /// Comme `enrich`, en nommant l'appel pour les traces d'attente des nouveaux essais HTTP
-    /// (`<chemin> [i/n]`). Par défaut, le libellé est ignoré.
+    /// (`<chemin> [i/n]`) et en passant l'arrêt de l'envoi, qui interrompt leur attente (REQ-095).
+    /// Par défaut, le libellé et l'arrêt sont ignorés.
+    #[allow(clippy::too_many_arguments)]
     fn enrich_labeled(
         &self,
         label: &str,
@@ -59,8 +63,9 @@ pub trait Llm: Send + Sync {
         text: &str,
         requested: &[String],
         known: &[String],
+        stop: &AtomicBool,
     ) -> Result<Enrichment> {
-        let _ = label;
+        let _ = (label, stop);
         self.enrich(file, call, text, requested, known)
     }
     /// Enrichit un lot de 2 fichiers ou plus en un seul appel (schéma version 3, DEC-033).
@@ -71,8 +76,9 @@ pub trait Llm: Send + Sync {
         &self,
         label: &str,
         items: &[LotItem],
+        stop: &AtomicBool,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        let _ = label;
+        let _ = (label, stop);
         self.enrich_lot(items)
     }
     /// Répond à une question à partir d'un contexte de graphe.
@@ -109,9 +115,10 @@ impl Llm for WithModel {
         text: &str,
         requested: &[String],
         known: &[String],
+        stop: &AtomicBool,
     ) -> Result<Enrichment> {
         self.inner
-            .enrich_labeled(label, file, call, text, requested, known)
+            .enrich_labeled(label, file, call, text, requested, known, stop)
     }
 
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
@@ -122,8 +129,9 @@ impl Llm for WithModel {
         &self,
         label: &str,
         items: &[LotItem],
+        stop: &AtomicBool,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        self.inner.enrich_lot_labeled(label, items)
+        self.inner.enrich_lot_labeled(label, items, stop)
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {

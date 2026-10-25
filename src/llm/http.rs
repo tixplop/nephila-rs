@@ -2,9 +2,9 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{ring, CryptoProvider, WebPkiSupportedAlgorithms};
@@ -216,13 +216,16 @@ enum Attempt {
 /// Exécute la requête, avec jusqu'à 4 nouveaux essais à l'identique (statuts 429, 500, 502, 503,
 /// 504, 529 et erreurs réseau transitoires, attente progressive) ; 401/403 -> `InvalidKey`,
 /// 400/404/413/422 -> `Rejected` (jamais retentée), autres échecs -> `Network`. Retourne le corps de la réponse. `label` nomme l'appel dans la
-/// trace d'attente (`<chemin> [i/n]`) ; `None` (`query ask`) : aucune ligne d'attente.
+/// trace d'attente (`<chemin> [i/n]`) ; `None` (`query ask`) : aucune ligne d'attente. `stop` :
+/// arrêt de l'envoi (REQ-095) ; posé, l'attente s'interrompt, aucun nouvel envoi n'a lieu et
+/// l'erreur du dernier envoi est rendue.
 pub fn send(
     provider: &str,
     req: ureq::Request,
     body: Option<&serde_json::Value>,
     retry: &Retry,
     label: Option<&str>,
+    stop: Option<&AtomicBool>,
 ) -> Result<String> {
     let mut k = 0;
     loop {
@@ -239,18 +242,47 @@ pub fn send(
                 }
                 match retry_delay(k, retry.base, retry_after.as_deref(), jitter()) {
                     Some(d) => {
+                        if is_stopped(stop) {
+                            return Err(error);
+                        }
                         if let Some(label) = label {
                             crate::trace!(
                                 "llm enrich attente {label} {} ms après {cause} (nouvel essai {k}/{MAX_RETRIES})",
                                 d.as_millis()
                             );
                         }
-                        std::thread::sleep(d)
+                        if wait(d, stop) {
+                            return Err(error);
+                        }
                     }
                     None => return Err(error),
                 }
             }
         }
+    }
+}
+
+/// Durée maximale d'une tranche d'attente (REQ-095).
+const WAIT_SLICE: Duration = Duration::from_millis(100);
+
+fn is_stopped(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|s| s.load(Ordering::SeqCst))
+}
+
+/// Attend `d` par tranches de `min(100 ms, reste)`, le drapeau d'arrêt relu avant chaque tranche
+/// et à la fin (avant un nouvel envoi). Retourne `true` si l'attente a été interrompue par
+/// l'arrêt (aucun nouvel envoi), `false` si elle est allée à son terme.
+pub fn wait(d: Duration, stop: Option<&AtomicBool>) -> bool {
+    let start = Instant::now();
+    loop {
+        if is_stopped(stop) {
+            return true;
+        }
+        let rest = d.saturating_sub(start.elapsed());
+        if rest.is_zero() {
+            return false;
+        }
+        std::thread::sleep(rest.min(WAIT_SLICE));
     }
 }
 
@@ -684,6 +716,77 @@ mod tests {
         }
     }
 
+    mod interrupted_wait {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+
+        fn ms(n: u64) -> Duration {
+            Duration::from_millis(n)
+        }
+
+        #[test]
+        fn req095_ac2_stop_set_by_another_thread_ends_the_wait_within_a_slice() {
+            let stop = AtomicBool::new(false);
+            let t = Instant::now();
+            let interrupted = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    std::thread::sleep(ms(250));
+                    stop.store(true, Ordering::SeqCst);
+                });
+                wait(Duration::from_secs(5), Some(&stop))
+            });
+            let e = t.elapsed();
+            assert!(interrupted);
+            assert!(e >= ms(250) && e < ms(450), "{e:?}");
+        }
+
+        #[test]
+        fn req095_ac2_wait_without_stop_lasts_its_duration() {
+            let stop = AtomicBool::new(false);
+            for stop in [None, Some(&stop)] {
+                let t = Instant::now();
+                assert!(!wait(ms(350), stop));
+                let e = t.elapsed();
+                assert!(e >= ms(350) && e < ms(500), "{e:?}");
+            }
+        }
+
+        #[test]
+        fn req095_ac2_stop_already_set_gives_no_new_send() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/x", listener.local_addr().unwrap());
+            let count = Arc::new(AtomicUsize::new(0));
+            let served = Arc::clone(&count);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut s) = stream else { return };
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf);
+                    served.fetch_add(1, Ordering::SeqCst);
+                    let _ = s.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 30\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    );
+                }
+            });
+            let agent = agent(10, 1, &Tls::default());
+            let stop = AtomicBool::new(true);
+            let t = Instant::now();
+            let r = send(
+                "test",
+                agent.post(&url),
+                Some(&serde_json::json!({})),
+                &Retry::default(),
+                None,
+                Some(&stop),
+            );
+            assert!(t.elapsed() < Duration::from_secs(2));
+            assert!(matches!(r, Err(Error::Network(_))), "{r:?}");
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
     /// Serveur keep-alive local : compte les connexions acceptées ; les 4 premières requêtes
     /// ne reçoivent leur réponse que toutes ensemble (4 connexions simultanées nécessaires).
     mod pool {
@@ -818,7 +921,7 @@ mod tests {
                         let body = serde_json::json!({});
                         for round in 0..2 {
                             let req = agent.post(url);
-                            send("test", req, Some(&body), retry, None).unwrap();
+                            send("test", req, Some(&body), retry, None, None).unwrap();
                             if round == 0 {
                                 barrier.wait();
                             }

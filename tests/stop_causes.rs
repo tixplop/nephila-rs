@@ -741,3 +741,157 @@ fn req094_ac2_slow_provider_gets_three_requests_only() {
     );
     assert_eq!(o.status.code(), Some(1));
 }
+
+const E12: &str =
+    "erreur: clé d'API refusée par openai (HTTP 401) ; vérifiez la variable désignée par api_key_env";
+
+/// REQ-095 : première requête `status` avec `retry-after: 30`, seconde `401` 300 ms plus tard.
+fn waiting_then_refused(status: u16, verbose: bool) -> (FakeServer, Output, std::time::Duration) {
+    let s = FakeServer::start_replies(vec![
+        Reply::with_header(status, "{}", "retry-after", "30"),
+        Reply::Http {
+            status: 401,
+            body: "{}".into(),
+            headers: vec![],
+            delay_ms: 300,
+        },
+    ]);
+    let env = Env::new("openai", &s, 2, 2);
+    let args: &[&str] = if verbose {
+        &["build", "--verbose"]
+    } else {
+        &["build"]
+    };
+    let t = std::time::Instant::now();
+    let o = env.run_base(args, "10");
+    let elapsed = t.elapsed();
+    let status_out = Command::new(cargo_bin("nephila"))
+        .arg("-C")
+        .arg(&env.repo)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(v["to_enrich"].as_u64(), Some(2), "{}", text(&o.stderr));
+    (s, o, elapsed)
+}
+
+#[test]
+fn req095_ac1_stop_interrupts_the_retry_wait() {
+    for status in [503u16, 429] {
+        let (s, o, elapsed) = waiting_then_refused(status, false);
+        let err = text(&o.stderr);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "{status}: {elapsed:?} {err}"
+        );
+        assert_eq!(posts(&s), 2, "{status}: {err}");
+        assert_eq!(error_lines(&o), [E12], "{status}: {err}");
+        assert_eq!(lines(&o).last().unwrap(), E12, "{status}");
+        assert_eq!(o.status.code(), Some(1), "{status}");
+    }
+}
+
+#[test]
+fn req095_ac4_verbose_has_one_wait_line_and_the_waiting_call_ends_after_the_policy_line() {
+    let (_s, o, elapsed) = waiting_then_refused(503, true);
+    let err = text(&o.stderr);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "{elapsed:?} {err}"
+    );
+    let all = lines(&o);
+    let waits: Vec<_> = all
+        .iter()
+        .filter(|l| l.contains("llm enrich attente"))
+        .collect();
+    assert_eq!(waits.len(), 1, "{err}");
+    assert!(
+        waits[0].ends_with("30000 ms après HTTP 503 (nouvel essai 1/4)"),
+        "{}",
+        waits[0]
+    );
+    let policy = all
+        .iter()
+        .position(|l| {
+            l.contains("politique: arrêt de l'envoi (clé d'API refusée par le fournisseur)")
+        })
+        .unwrap_or_else(|| panic!("{err}"));
+    let end = all
+        .iter()
+        .position(|l| l.contains("llm enrich fin") && l.contains(" réseau "))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(end > policy, "{err}");
+    let ms: u64 = all[end]
+        .split(" réseau ")
+        .nth(1)
+        .and_then(|r| r.split(" ms").next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{}", all[end]));
+    assert!(ms < 30000, "{}", all[end]);
+    let warnings: Vec<_> = all
+        .iter()
+        .filter(|l| l.starts_with("avertissement:"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{err}");
+    assert!(
+        warnings[0].contains("erreur de openai (HTTP 503) sur "),
+        "{err}"
+    );
+    assert_eq!(all.last().unwrap(), E12);
+}
+
+#[test]
+fn req095_ac5_no_interrupted_line_and_warning_only_for_the_waiting_document() {
+    for (status, shown) in [(503u16, "HTTP 503"), (429, "HTTP 429")] {
+        let (_s, o, _) = waiting_then_refused(status, true);
+        let err = text(&o.stderr);
+        let all = lines(&o);
+        for l in all
+            .iter()
+            .filter(|l| l.starts_with("trace:") && l.contains("llm enrich "))
+        {
+            assert!(
+                l.contains(" départ ") || l.contains(" fin ") || l.contains(" attente "),
+                "{l}"
+            );
+            assert!(!l.contains("interrompue"), "{l}");
+        }
+        let policy = all
+            .iter()
+            .position(|l| {
+                l.contains("politique: arrêt de l'envoi (clé d'API refusée par le fournisseur), ")
+            })
+            .unwrap_or_else(|| panic!("{err}"));
+        let end = all
+            .iter()
+            .position(|l| l.contains("llm enrich fin") && l.contains(" réseau "))
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!(end > policy, "{err}");
+        assert!(all[end].contains(shown), "{}", all[end]);
+        let ms: u64 = all[end]
+            .split(" réseau ")
+            .nth(1)
+            .and_then(|r| r.split(" ms").next())
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap();
+        assert!(ms < 2000, "{}", all[end]);
+
+        let (_s, o, _) = waiting_then_refused(status, false);
+        let err = text(&o.stderr);
+        let warnings: Vec<_> = lines(&o)
+            .into_iter()
+            .filter(|l| l.starts_with("avertissement:"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{err}");
+        assert!(
+            warnings[0].contains(&format!("erreur de openai ({shown}) sur ")),
+            "{err}"
+        );
+        assert_eq!(lines(&o).last().unwrap(), E12, "{err}");
+        assert!(
+            error_lines(&o).iter().all(|l| !l.contains("saturé")),
+            "{err}"
+        );
+    }
+}

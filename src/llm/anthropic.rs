@@ -7,6 +7,7 @@ use super::enrich::{
 use super::{http, Generation, Llm, Retry, Tls};
 use super::{Enrichment, LotItem};
 use crate::error::{Error, Result, TRUNCATED};
+use std::sync::atomic::AtomicBool;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
@@ -70,7 +71,13 @@ impl AnthropicLlm {
     }
 
     /// Appelle `/v1/messages` et retourne le texte de la réponse.
-    fn complete(&self, label: Option<&str>, system: String, user: String) -> Result<String> {
+    fn complete(
+        &self,
+        label: Option<&str>,
+        stop: Option<&AtomicBool>,
+        system: String,
+        user: String,
+    ) -> Result<String> {
         let body = request_body(&self.model, &self.gen, &system, &user);
         let raw = http::send(
             "anthropic",
@@ -78,6 +85,7 @@ impl AnthropicLlm {
             Some(&body),
             &self.retry,
             label,
+            stop,
         )?;
         let v = http::parse_body("anthropic", &raw)?;
         if v["stop_reason"] == "max_tokens" {
@@ -101,7 +109,7 @@ impl Llm for AnthropicLlm {
         requested: &[String],
         known: &[String],
     ) -> Result<Enrichment> {
-        self.enrich_with(None, file, call, text, requested, known)
+        self.enrich_with(None, None, file, call, text, requested, known)
     }
 
     fn enrich_labeled(
@@ -112,24 +120,27 @@ impl Llm for AnthropicLlm {
         text: &str,
         requested: &[String],
         known: &[String],
+        stop: &AtomicBool,
     ) -> Result<Enrichment> {
-        self.enrich_with(Some(label), file, call, text, requested, known)
+        self.enrich_with(Some(label), Some(stop), file, call, text, requested, known)
     }
 
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
-        self.enrich_lot_with(None, items)
+        self.enrich_lot_with(None, None, items)
     }
 
     fn enrich_lot_labeled(
         &self,
         label: &str,
         items: &[LotItem],
+        stop: &AtomicBool,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        self.enrich_lot_with(Some(label), items)
+        self.enrich_lot_with(Some(label), Some(stop), items)
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
         let out = self.complete(
+            None,
             None,
             ask_system_prompt(),
             ask_user_prompt(question, context),
@@ -139,9 +150,11 @@ impl Llm for AnthropicLlm {
 }
 
 impl AnthropicLlm {
+    #[allow(clippy::too_many_arguments)]
     fn enrich_with(
         &self,
         label: Option<&str>,
+        stop: Option<&AtomicBool>,
         file: &str,
         call: usize,
         text: &str,
@@ -150,6 +163,7 @@ impl AnthropicLlm {
     ) -> Result<Enrichment> {
         let out = self.complete(
             label,
+            stop,
             enrichment_system_prompt(),
             enrichment_user_prompt(file, call, text, requested),
         )?;
@@ -159,9 +173,10 @@ impl AnthropicLlm {
     fn enrich_lot_with(
         &self,
         label: Option<&str>,
+        stop: Option<&AtomicBool>,
         items: &[LotItem],
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        let out = self.complete(label, lot_system_prompt(), lot_user_prompt(items))?;
+        let out = self.complete(label, stop, lot_system_prompt(), lot_user_prompt(items))?;
         Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
     }
 }

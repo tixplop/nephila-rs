@@ -380,9 +380,11 @@ fn traced_enrich(
     requested: &[String],
     known: &[String],
     attempt: Attempt,
+    stop: &AtomicBool,
 ) -> Result<Enrichment> {
     if !trace::enabled() {
-        return llm.enrich(path, index, text, requested, known);
+        let label = format!("{path} [{index}/{total}]");
+        return llm.enrich_labeled(&label, path, index, text, requested, known, stop);
     }
     trace!(
         "llm enrich départ {path} [{index}/{total}] {} car.{}",
@@ -391,7 +393,7 @@ fn traced_enrich(
     );
     let started = Instant::now();
     let label = format!("{path} [{index}/{total}]");
-    let result = llm.enrich_labeled(&label, path, index, text, requested, known);
+    let result = llm.enrich_labeled(&label, path, index, text, requested, known, stop);
     let ms = started.elapsed().as_millis();
     match &result {
         Ok(x) => trace!(
@@ -417,7 +419,7 @@ fn traced_lot(
 ) -> Result<Vec<(String, Result<Enrichment>)>> {
     let total = retries.saturating_add(1);
     with_format_retries(retries, stop, |current| {
-        traced_lot_once(llm, items, Attempt { current, total })
+        traced_lot_once(llm, items, Attempt { current, total }, stop)
     })
 }
 
@@ -425,18 +427,19 @@ fn traced_lot_once(
     llm: &dyn Llm,
     items: &[LotItem],
     attempt: Attempt,
+    stop: &AtomicBool,
 ) -> Result<Vec<(String, Result<Enrichment>)>> {
-    if !trace::enabled() {
-        return llm.enrich_lot(items);
-    }
     let label = format!("lot {} +{}", items[0].file, items.len() - 1);
+    if !trace::enabled() {
+        return llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop);
+    }
     trace!(
         "llm enrich départ {label} [1/1] {} car.{}",
         items.iter().map(|i| i.text.chars().count()).sum::<usize>(),
         attempt.mark()
     );
     let started = Instant::now();
-    let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items);
+    let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop);
     let ms = started.elapsed().as_millis();
     match &result {
         Ok(results) => {
@@ -651,6 +654,7 @@ fn run_call(
             requested,
             known,
             Attempt { current, total },
+            stop,
         )
     })
 }
