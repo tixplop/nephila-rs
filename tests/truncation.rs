@@ -65,7 +65,15 @@ impl Setup {
     /// `responses` : réponses successives du faux serveur (la vérification de clé en consomme
     /// une par lancement) ; `extra` : lignes de configuration en plus.
     fn new(provider: &str, responses: Vec<String>, extra: &str) -> Setup {
-        let server = FakeServer::start(responses.into_iter().map(|b| (200, b)).collect());
+        Setup::with_replies(
+            provider,
+            responses.into_iter().map(|b| (200, b)).collect(),
+            extra,
+        )
+    }
+
+    fn with_replies(provider: &str, replies: Vec<(u16, String)>, extra: &str) -> Setup {
+        let server = FakeServer::start(replies);
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         fs::create_dir_all(&repo).unwrap();
@@ -153,6 +161,29 @@ fn out(o: &Output) -> String {
 
 fn a5(path: &str) -> String {
     format!("avertissement: {path} : {LABEL} ; {ADVICE}")
+}
+
+/// Réponse de lot (schéma version 3) pour les classes `names`, fichiers `<n>.java`.
+fn lot_reply(names: &[&str]) -> String {
+    let files: Vec<serde_json::Value> = names
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "file": format!("{n}.java"),
+                "summaries": [{"node": format!("type:{n}"), "summary": format!("Classe {n}.")}],
+                "concepts": []
+            })
+        })
+        .collect();
+    serde_json::json!({"version": 3, "files": files}).to_string()
+}
+
+/// Noms (`A`, `B`, …) des fichiers `<n>.java` cités dans un corps de requête, dans l'ordre alphabétique.
+fn files_in(body: &str) -> Vec<&'static str> {
+    ["A", "B", "C", "D", "E"]
+        .into_iter()
+        .filter(|n| body.contains(&format!("{n}.java")))
+        .collect()
 }
 
 const A_JAVA: &str = "public class A {}\n";
@@ -271,13 +302,20 @@ fn req046_ac4_format_retries_sans_effet_sur_la_troncature() {
 }
 
 #[test]
-fn req046_ac5_lot_tronque_deux_fichiers_nommes() {
-    let lot_ok = r#"{"version": 3, "files": [{"file": "C.java", "summaries": [], "concepts": []}, {"file": "D.java", "summaries": [], "concepts": []}]}"#;
+fn req046_ac5_lot_tronque_coupe_en_moities_puis_fichiers_seuls() {
+    // Première réponse tronquée seulement : 4 requêtes, 4 fichiers enrichis, aucun avertissement.
+    let one = |n: &str| {
+        format!(
+            r#"{{"version": 2, "summaries": [{{"node": "type:{n}", "summary": "Classe {n}."}}], "concepts": []}}"#
+        )
+    };
     let s = Setup::new(
         "anthropic",
         vec![
             trunc("anthropic"),
-            anthropic_reply(lot_ok, Some("end_turn")),
+            anthropic_reply(&one("A"), Some("end_turn")),
+            anthropic_reply(&one("B"), Some("end_turn")),
+            anthropic_reply(&lot_reply(&["C", "D"]), Some("end_turn")),
         ],
         "batch_files = 2\n",
     );
@@ -285,23 +323,32 @@ fn req046_ac5_lot_tronque_deux_fichiers_nommes() {
         s.write(&format!("{n}.java"), &format!("public class {n} {{}}\n"));
     }
     let o = s.run(&["build"]);
-    assert!(!o.status.success());
+    assert!(o.status.success(), "{}", err(&o));
     let posts = s.posts();
-    assert_eq!(posts.len(), 2, "{}", err(&o));
-    assert!(posts[0].contains("A.java") && posts[0].contains("B.java"));
-    assert!(!posts[0].contains("C.java") && !posts[0].contains("D.java"));
+    assert_eq!(posts.len(), 4, "{}", err(&o));
+    assert_eq!(files_in(&posts[0]), ["A", "B"]);
+    assert_eq!(files_in(&posts[1]), ["A"]);
+    assert_eq!(files_in(&posts[2]), ["B"]);
+    assert_eq!(files_in(&posts[3]), ["C", "D"]);
+    assert!(!err(&o).contains("avertissement:"), "{}", err(&o));
+    assert!(s.to_enrich_paths().is_empty());
+
+    // Toutes les réponses tronquées : 6 requêtes, 4 fichiers à enrichir, une ligne par fichier.
+    let s = Setup::new("anthropic", many("anthropic", 30), "batch_files = 2\n");
+    for n in ["A", "B", "C", "D"] {
+        s.write(&format!("{n}.java"), &format!("public class {n} {{}}\n"));
+    }
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 6, "{}", err(&o));
     let e = err(&o);
-    for n in ["A.java", "B.java"] {
+    for n in ["A.java", "B.java", "C.java", "D.java"] {
         assert_eq!(e.matches(&a5(n)).count(), 1, "{e}");
     }
-    for n in ["C.java", "D.java"] {
-        assert!(
-            !e.lines()
-                .any(|l| l.starts_with("avertissement:") && l.contains(n)),
-            "{e}"
-        );
-    }
-    assert_eq!(s.to_enrich_paths(), ["A.java", "B.java"]);
+    assert_eq!(
+        s.to_enrich_paths(),
+        ["A.java", "B.java", "C.java", "D.java"]
+    );
 }
 
 #[test]
@@ -346,6 +393,7 @@ fn req046_ac14_lot_tronque_deux_lignes_dans_l_ordre() {
     s.write("A.java", "public class A {}\n");
     s.write("B.java", "public class B {}\n");
     let o = s.run(&["build"]);
+    assert_eq!(s.posts().len(), 3, "{}", err(&o));
     for bad in ["max_tokens", "max_completion_tokens", "reasoning_effort"] {
         assert!(!err(&o).contains(bad), "{bad} dans {}", err(&o));
     }
@@ -601,7 +649,7 @@ fn req046_ac8_ac11_trace_depart_et_fin_tronquee() {
 #[test]
 fn req046_ac11_lot_tronque_trace_et_lignes_a5() {
     let mk = || {
-        let s = Setup::new("anthropic", vec![trunc("anthropic")], "batch_files = 2\n");
+        let s = Setup::new("anthropic", many("anthropic", 10), "batch_files = 2\n");
         for n in ["A", "B"] {
             s.write(&format!("{n}.java"), &format!("public class {n} {{}}\n"));
         }
@@ -611,8 +659,10 @@ fn req046_ac11_lot_tronque_trace_et_lignes_a5() {
     let o = s.run(&["build", "--verbose"]);
     let e = err(&o);
     let fin: Vec<&str> = llm_enrich_for(&e, "llm enrich fin");
-    assert_eq!(fin.len(), 1, "{e}");
+    assert_eq!(fin.len(), 3, "{e}");
     assert!(fin_matches(fin[0], "lot A.java +1"), "{}", fin[0]);
+    assert!(fin_matches(fin[1], "A.java"), "{}", fin[1]);
+    assert!(fin_matches(fin[2], "B.java"), "{}", fin[2]);
     no_forbidden_trace(&e);
 
     let s = mk();
@@ -714,4 +764,205 @@ fn req046_ac13_progression_cinq_lignes() {
         seen.push((e, so));
     }
     assert_eq!(seen[0], seen[1]);
+}
+
+// ---- REQ-096 : lot tronqué coupé en deux moitiés ----
+
+fn four_docs(s: &Setup) {
+    for n in ["A", "B", "C", "D"] {
+        s.write(&format!("{n}.java"), &format!("public class {n} {{}}\n"));
+    }
+}
+
+/// Réponses d'AC-096-1 : le lot tronqué, puis les deux moitiés conformes.
+fn split_replies(p: &str) -> Vec<String> {
+    let ok = |names: &[&str]| match p {
+        "anthropic" => anthropic_reply(&lot_reply(names), Some("end_turn")),
+        _ => openai_reply(&lot_reply(names), Some("stop")),
+    };
+    vec![trunc(p), ok(&["A", "B"]), ok(&["C", "D"])]
+}
+
+#[test]
+fn req096_ac1_lot_tronque_deux_moities_enrichies() {
+    for p in ["openai", "anthropic"] {
+        let s = Setup::new(p, split_replies(p), "batch_files = 4\n");
+        four_docs(&s);
+        let o = s.run(&["build"]);
+        assert!(o.status.success(), "{p} {}", err(&o));
+        let posts = s.posts();
+        assert_eq!(posts.len(), 3, "{p} {}", err(&o));
+        assert_eq!(files_in(&posts[0]), ["A", "B", "C", "D"], "{p}");
+        assert_eq!(files_in(&posts[1]), ["A", "B"], "{p}");
+        assert_eq!(files_in(&posts[2]), ["C", "D"], "{p}");
+        for n in ["A", "B", "C", "D"] {
+            assert_eq!(
+                s.summary_of(&format!("type:{n}")),
+                Some(format!("Classe {n}.")),
+                "{p}"
+            );
+        }
+        assert!(!err(&o).contains("avertissement:"), "{p} {}", err(&o));
+    }
+}
+
+#[test]
+fn req096_ac2_tout_tronque_requetes_et_lignes_a5() {
+    let s = Setup::new("anthropic", many("anthropic", 30), "batch_files = 2\n");
+    s.write("A.java", "public class A {}\n");
+    s.write("B.java", "public class B {}\n");
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    let posts = s.posts();
+    assert_eq!(posts.len(), 3, "{}", err(&o));
+    assert_eq!(files_in(&posts[0]), ["A", "B"]);
+    assert_eq!(files_in(&posts[1]), ["A"]);
+    assert_eq!(files_in(&posts[2]), ["B"]);
+    let warns: Vec<String> = err(&o)
+        .lines()
+        .filter(|l| l.starts_with("avertissement:"))
+        .map(String::from)
+        .collect();
+    assert_eq!(warns, [a5("A.java"), a5("B.java")], "{}", err(&o));
+
+    let s = Setup::new("anthropic", many("anthropic", 30), "batch_files = 3\n");
+    for n in ["A", "B", "C"] {
+        s.write(&format!("{n}.java"), &format!("public class {n} {{}}\n"));
+    }
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    let posts = s.posts();
+    assert_eq!(posts.len(), 5, "{}", err(&o));
+    let seen: Vec<Vec<&str>> = posts.iter().map(|b| files_in(b)).collect();
+    assert_eq!(
+        seen,
+        [
+            vec!["A", "B", "C"],
+            vec!["A", "B"],
+            vec!["A"],
+            vec!["B"],
+            vec!["C"]
+        ]
+    );
+}
+
+#[test]
+fn req096_ac3_cle_refusee_apres_troncature_arrete_l_envoi() {
+    let s = Setup::with_replies(
+        "anthropic",
+        vec![(200, trunc("anthropic")), (401, "{}".into())],
+        "batch_files = 2\n",
+    );
+    four_docs(&s);
+    let o = s.run(&["build"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert_eq!(s.posts().len(), 2, "{}", err(&o));
+    let errs: Vec<String> = err(&o)
+        .lines()
+        .filter(|l| l.starts_with("erreur:"))
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        errs,
+        ["erreur: clé d'API refusée par anthropic (HTTP 401) ; vérifiez la variable désignée par api_key_env"],
+        "{}",
+        err(&o)
+    );
+    assert_eq!(s.to_enrich(), 4);
+}
+
+/// Lignes `trace:` de l'enrichissement, sans l'horodatage, à partir de `llm enrich`.
+fn llm_lines(e: &str) -> Vec<String> {
+    trace_lines_of(e)
+        .into_iter()
+        .filter_map(|l| l.split_once("s] ").map(|(_, r)| r.to_string()))
+        .filter(|l| l.starts_with("llm enrich") || l.starts_with("politique:"))
+        .collect()
+}
+
+#[test]
+fn req096_ac5_ac6_trace_verbose_de_la_decoupe() {
+    let s = Setup::new("anthropic", split_replies("anthropic"), "batch_files = 4\n");
+    four_docs(&s);
+    let o = s.run(&["build", "--verbose"]);
+    let e = err(&o);
+    assert!(o.status.success(), "{e}");
+    let lines = llm_lines(&e);
+    let pos = lines
+        .iter()
+        .position(|l| l.starts_with("llm enrich fin lot A.java +3 [1/1] tronquée "))
+        .unwrap_or_else(|| panic!("{e}"));
+    assert_eq!(
+        lines[pos + 1],
+        "llm enrich découpe lot A.java +3 [1/1] en lot A.java +1 et lot C.java +1",
+        "{e}"
+    );
+    assert!(
+        lines[pos + 2].starts_with("llm enrich départ lot A.java +1 [1/1] "),
+        "{e}"
+    );
+    assert!(
+        lines[pos + 3].starts_with("llm enrich fin lot A.java +1 [1/1] ok"),
+        "{e}"
+    );
+    assert!(
+        lines[pos + 4].starts_with("llm enrich départ lot C.java +1 [1/1] "),
+        "{e}"
+    );
+    assert!(!lines.iter().any(|l| l.starts_with("politique:")), "{e}");
+
+    // Sans --verbose : aucune ligne ne parle de découpe.
+    let s = Setup::new("anthropic", split_replies("anthropic"), "batch_files = 4\n");
+    four_docs(&s);
+    let o = s.run(&["build"]);
+    assert!(!err(&o).contains("découpe"), "{}", err(&o));
+
+    // Second scénario d'AC-096-2 : deux lignes de découpe, départs des fichiers seuls.
+    let s = Setup::new("anthropic", many("anthropic", 30), "batch_files = 3\n");
+    for n in ["A", "B", "C"] {
+        s.write(&format!("{n}.java"), &format!("public class {n} {{}}\n"));
+    }
+    let o = s.run(&["build", "--verbose"]);
+    let e = err(&o);
+    let cuts: Vec<String> = llm_lines(&e)
+        .into_iter()
+        .filter(|l| l.contains("découpe"))
+        .collect();
+    assert_eq!(
+        cuts,
+        [
+            "llm enrich découpe lot A.java +2 [1/1] en lot A.java +1 et C.java",
+            "llm enrich découpe lot A.java +1 [1/1] en A.java et B.java"
+        ],
+        "{e}"
+    );
+    for n in ["A.java", "B.java", "C.java"] {
+        assert!(
+            llm_lines(&e)
+                .iter()
+                .any(|l| l.starts_with(&format!("llm enrich départ {n} [1/1] "))),
+            "{n} {e}"
+        );
+    }
+}
+
+#[test]
+fn req096_ac5_progression_enrichissement_complet() {
+    let s = Setup::new("anthropic", split_replies("anthropic"), "batch_files = 4\n");
+    four_docs(&s);
+    let o = s.run(&["build", "--show-progress"]);
+    let e = err(&o);
+    assert!(o.status.success(), "{e}");
+    assert!(!e.contains("avertissement:"), "{e}");
+    let pcts: Vec<u32> = e
+        .lines()
+        .filter_map(|l| l.strip_prefix("progression: enrichissement "))
+        .map(|l| l.split(' ').next().unwrap().parse().unwrap())
+        .collect();
+    assert!(pcts.windows(2).all(|w| w[0] < w[1]), "{e}");
+    assert!(
+        e.lines()
+            .any(|l| l == "progression: enrichissement 100 % (4/4 fichiers)"),
+        "{e}"
+    );
 }

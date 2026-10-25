@@ -303,6 +303,25 @@ fn run_unit<'a>(
                 })
                 .collect();
             match traced_lot(llm, &items, retries, stop) {
+                // Lot tronqué (REQ-096, DEC-101) : deux moitiés remises en tête de file ; aucune
+                // issue pour le lot lui-même, ses fichiers en recevront par leurs moitiés.
+                Err(Error::Truncated(_)) => {
+                    let mut first: Vec<&'a FileRecord> = readable.iter().map(|(f, _)| *f).collect();
+                    let second = first.split_off(first.len().div_ceil(2));
+                    let name = |half: &[&FileRecord]| match half {
+                        [only] => only.path.clone(),
+                        [head, ..] => format!("lot {} +{}", head.path, half.len() - 1),
+                        [] => String::new(),
+                    };
+                    trace!(
+                        "llm enrich découpe lot {} +{} [1/1] en {} et {}",
+                        items[0].file,
+                        items.len() - 1,
+                        name(&first),
+                        name(&second)
+                    );
+                    Step::Calls(outcomes, vec![Unit::Lot(first), Unit::Lot(second)])
+                }
                 Err(e) => {
                     let per_file = truncation_advice(e.clone());
                     for (f, _) in &readable {
@@ -2157,6 +2176,84 @@ mod tests {
                 "progression: enrichissement 80 % (8/10 fichiers)",
                 "progression: enrichissement 100 % (10/10 fichiers)",
             ]
+        );
+    }
+
+    /// AC-096-4 : un lot tronqué est coupé en deux moitiés remises en tête de file.
+    #[test]
+    fn req096_ac4_lot_tronque_coupe_en_moities_dans_l_ordre() {
+        struct Cut(Mutex<Vec<String>>);
+        impl Llm for Cut {
+            fn enrich(
+                &self,
+                file: &str,
+                _: usize,
+                _: &str,
+                _: &[String],
+                _: &[String],
+            ) -> Result<Enrichment> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(file.trim_end_matches(".txt").into());
+                Ok(Enrichment::default())
+            }
+            fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+                let names: String = items
+                    .iter()
+                    .map(|i| i.file.trim_end_matches(".txt"))
+                    .collect();
+                self.0.lock().unwrap().push(names);
+                Err(Error::Truncated("tronquée".into()))
+            }
+            fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+                Err(Error::Message("inutilisé".into()))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for n in ["a", "b", "c", "d", "e", "f"] {
+            let name = format!("{n}.txt");
+            std::fs::write(dir.path().join(&name), "texte\n").unwrap();
+            files.push(rec(&name, 6));
+        }
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(&files).unwrap();
+        let mut report = BuildReport::default();
+        let opts = IndexOptions {
+            jobs: 1,
+            concurrency: 1,
+            max_chunk_chars: 1000,
+            batch_files: 5,
+            format_retries: 0,
+            enrich_code: false,
+        };
+        let llm = Cut(Mutex::new(Vec::new()));
+        progress::init(true);
+        progress::take_captured();
+        let failures = enrich_with_stop(
+            dir.path(),
+            &HashMap::new(),
+            &files,
+            &opts,
+            &llm,
+            &mut store,
+            &mut report,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let lines = progress::take_captured();
+        progress::init(false);
+        assert_eq!(
+            *llm.0.lock().unwrap(),
+            ["abcde", "abc", "ab", "a", "b", "c", "de", "d", "e", "f"]
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert_eq!(lines.len(), 7, "{lines:?}");
+        assert_eq!(
+            lines.last().unwrap(),
+            "progression: enrichissement 100 % (6/6 fichiers)"
         );
     }
 
