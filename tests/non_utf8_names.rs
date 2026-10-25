@@ -644,3 +644,327 @@ fn REQ103_AC4_textes_a7_octet_pour_octet() {
     assert_eq!(a7_lines(&o), vec![A7_FE_FF.as_bytes().to_vec()]);
     assert_eq!(o.stderr.iter().filter(|b| **b == b'\n').count(), 1);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Collision : un fichier retenu illisible ou non UTF-8 laisse la place au suivant (REQ-102)
+// ---------------------------------------------------------------------------------------------
+
+/// Comme `both_orders`, avec des contenus en octets (créés dans l'ordre, puis écrits).
+fn both_orders_bytes(files: &[(&[u8], &[u8])]) -> Option<(Repo, Repo)> {
+    let names: Vec<(&[u8], &str)> = files.iter().map(|(n, _)| (*n, "")).collect();
+    let (r1, r2) = both_orders(&names)?;
+    for r in [&r1, &r2] {
+        for (n, body) in files {
+            fs::write(r.root.join(OsStr::from_bytes(n)), body).unwrap();
+        }
+    }
+    Some((r1, r2))
+}
+
+fn repo_bytes(files: &[(&[u8], &[u8])]) -> Option<Repo> {
+    both_orders_bytes(files).map(|(r, _)| r)
+}
+
+const FE_BAD: [(&[u8], &[u8]); 3] = [
+    (b"A\xfe.java", b"\xff"),
+    (b"A\xff.java", b"class A2 {}\n"),
+    (b"B.java", b"class B {}\n"),
+];
+
+const THREE: [(&[u8], &[u8]); 3] = [
+    (b"A\xfd.java", b"\xff"),
+    (b"A\xfe.java", b"class A2 {}\n"),
+    (b"A\xff.java", b"\xff"),
+];
+
+const BOTH_BAD: [(&[u8], &[u8]); 3] = [
+    (b"A\xfe.java", b"\xff"),
+    (b"A\xff.java", b"\xfe"),
+    (b"B.java", b"class B {}\n"),
+];
+
+const W_FE: &str = "avertissement: A\\xFE.java ignoré : fichier non UTF-8";
+const W_FF: &str = "avertissement: A\\xFF.java ignoré : fichier non UTF-8";
+const W_FD: &str = "avertissement: A\\xFD.java ignoré : fichier non UTF-8";
+const A7_FD_FE: &str = "avertissement: A\\xFD.java ignoré : même chemin dans le graphe que A\\xFE.java (A\u{FFFD}.java), seul retenu ; renommez ce fichier";
+const A7_FF_FE2: &str = "avertissement: A\\xFF.java ignoré : même chemin dans le graphe que A\\xFE.java (A\u{FFFD}.java), seul retenu ; renommez ce fichier";
+
+fn has_type_a(r: &Repo) -> bool {
+    search(r, "A")
+        .lines()
+        .any(|l| l.split_whitespace().any(|w| w == "A"))
+}
+
+#[test]
+fn REQ102_AC1_le_suivant_lisible_est_retenu() {
+    let Some((r1, r2)) = both_orders_bytes(&FE_BAD) else {
+        return;
+    };
+    for r in [&r1, &r2] {
+        let o = r.run(&["build", "--no-llm"]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert!(
+            out(&o).starts_with("build terminé : 2 fichiers traités,"),
+            "{}",
+            out(&o)
+        );
+        assert!(
+            !err(&o).contains("même chemin dans le graphe"),
+            "{}",
+            err(&o)
+        );
+        let s = search(r, "A2");
+        assert!(s.contains("A2") && s.contains("A\u{FFFD}.java"), "{s}");
+        let o = r.run(&["status"]);
+        assert_eq!(first_line(&o), "graphe à jour", "{}", out(&o));
+        let o = r.run(&["update", "--no-llm"]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert_eq!(out(&o).trim_end(), "graphe à jour");
+        let o = r.run(&["query", "search", "B", "--check-stale"]);
+        assert_eq!(err(&o), "");
+    }
+}
+
+/// Dépôt d'AC-102-2 : `A\xfe.java` sans droit de lecture, `A\xff.java` lisible. `None` si le
+/// système refuse le nom ; le booléen dit si le processus lit quand même le fichier (root).
+fn unreadable_first() -> Option<(Repo, bool)> {
+    use std::os::unix::fs::PermissionsExt;
+    let r = Repo::new(&[
+        (b"A\xfe.java", "class A {}\n"),
+        (b"A\xff.java", "class A2 {}\n"),
+    ])?;
+    let p = r.root.join(OsStr::from_bytes(b"A\xfe.java"));
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read(&p).is_ok();
+    Some((r, readable))
+}
+
+fn restore(r: &Repo) {
+    use std::os::unix::fs::PermissionsExt;
+    let p = r.root.join(OsStr::from_bytes(b"A\xfe.java"));
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn REQ102_AC2_fichier_sans_droit_de_lecture() {
+    let Some((r, readable)) = unreadable_first() else {
+        return;
+    };
+    let o = r.run(&["build", "--no-llm"]);
+    restore(&r);
+    if readable {
+        return;
+    }
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(search(&r, "A2").contains("A2"));
+    assert!(!has_type_a(&r));
+}
+
+#[test]
+fn REQ102_AC3_trois_fichiers_deux_avertissements() {
+    let Some((r1, r2)) = both_orders_bytes(&THREE) else {
+        return;
+    };
+    for r in [&r1, &r2] {
+        let o = r.run(&["build", "--no-llm"]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert!(search(r, "A2").contains("A2"));
+        let lines: Vec<String> = err(&o)
+            .lines()
+            .filter(|l| l.starts_with("avertissement:"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines, [A7_FF_FE2, W_FD]);
+        assert!(!err(&o).contains("A\\xFF.java ignoré : fichier non UTF-8"));
+    }
+}
+
+#[test]
+fn REQ102_AC4_aucun_fichier_lisible() {
+    let Some((r1, r2)) = both_orders_bytes(&BOTH_BAD) else {
+        return;
+    };
+    for r in [&r1, &r2] {
+        let o = r.run(&["build", "--no-llm"]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert!(
+            out(&o).starts_with("build terminé : 1 fichiers traités,"),
+            "{}",
+            out(&o)
+        );
+        assert!(!err(&o).contains("même chemin"), "{}", err(&o));
+        assert_eq!(err(&o), format!("{W_FE}\n{W_FF}\n"));
+        let o = r.run(&["status"]);
+        assert_eq!(first_line(&o), "graphe à jour", "{}", out(&o));
+    }
+}
+
+#[test]
+fn REQ102_AC5_update_apres_un_fichier_retenu_devenu_illisible() {
+    let Some(r) = Repo::new(&[
+        (b"A\xfe.java", "class A {}\n"),
+        (b"A\xff.java", "class A2 {}\n"),
+        (b"B.java", "class B {}\n"),
+    ]) else {
+        return;
+    };
+    let o = r.run(&["build", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    fs::write(r.root.join(OsStr::from_bytes(b"A\xfe.java")), b"\xff").unwrap();
+    let o = r.run(&["status"]);
+    assert!(out(&o).contains("modifié\tA\u{FFFD}.java"), "{}", out(&o));
+    let o = r.run(&["update", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(search(&r, "A2").contains("A2"));
+    assert!(!has_type_a(&r));
+    let o = r.run(&["status"]);
+    assert_eq!(first_line(&o), "graphe à jour", "{}", out(&o));
+    let o = r.run(&["query", "search", "B", "--check-stale"]);
+    assert_eq!(err(&o), "");
+}
+
+#[test]
+fn REQ102_AC7_textes_des_avertissements() {
+    // (a)
+    let Some((r1, r2)) = both_orders_bytes(&FE_BAD) else {
+        return;
+    };
+    for r in [&r1, &r2] {
+        let o = r.run(&["build", "--no-llm"]);
+        assert_eq!(err(&o), format!("{W_FE}\n"));
+        let line = format!("{A7_FF_FE}\n");
+        for args in [
+            &["status"][..],
+            &["update", "--no-llm"],
+            &["build", "--no-llm"],
+        ] {
+            assert_eq!(err(&r.run(args)), line, "{args:?}");
+        }
+    }
+    // (b)
+    let Some(r) = repo_bytes(&THREE) else {
+        return;
+    };
+    let o = r.run(&["build", "--no-llm"]);
+    assert_eq!(err(&o), format!("{A7_FF_FE2}\n{W_FD}\n"));
+    let o = r.run(&["status"]);
+    assert_eq!(err(&o), format!("{A7_FD_FE}\n{A7_FF_FE2}\n"));
+    // (c)
+    let Some(r) = repo_bytes(&BOTH_BAD) else {
+        return;
+    };
+    for args in [
+        &["build", "--no-llm"][..],
+        &["status"],
+        &["update", "--no-llm"],
+    ] {
+        let o = r.run(args);
+        assert_eq!(err(&o), format!("{W_FE}\n{W_FF}\n"), "{args:?}");
+        assert!(!err(&o).contains("A\u{FFFD}.java ignoré"));
+    }
+}
+
+const QUOTE: [(&[u8], &[u8]); 3] = [
+    (b"l'A\xfe.java", b"\xff"),
+    (b"l'A\xff.java", b"class A2 {}\n"),
+    (b"l'b.java", b"\xff"),
+];
+
+#[test]
+fn REQ102_AC9_forme_et_tri_des_lectures() {
+    let expected = [
+        "avertissement: l\\'A\\xFE.java ignoré : fichier non UTF-8",
+        "avertissement: l'b.java ignoré : fichier non UTF-8",
+    ];
+    for extra in [
+        &[][..],
+        &["--jobs", "1"],
+        &["--jobs", "8"],
+        &["--verbose"],
+        &["--show-progress"],
+    ] {
+        let Some(r) = repo_bytes(&QUOTE) else {
+            return;
+        };
+        let mut args = vec!["build", "--no-llm"];
+        args.extend_from_slice(extra);
+        let o = r.run(&args);
+        assert_eq!(o.status.code(), Some(0), "{extra:?} {}", err(&o));
+        let e = err(&o);
+        let lines: Vec<&str> = e.lines().collect();
+        let warns: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("avertissement:"))
+            .collect();
+        assert_eq!(warns, expected, "{extra:?}");
+        if extra.is_empty() || extra[0] == "--jobs" {
+            assert_eq!(e, format!("{}\n{}\n", expected[0], expected[1]));
+        }
+        let trace = match extra {
+            ["--verbose"] => Some("structure: début"),
+            ["--show-progress"] => Some("progression: extraction 0 %"),
+            _ => None,
+        };
+        if let Some(t) = trace {
+            let last_warn = lines.iter().rposition(|l| l.starts_with("avertissement:"));
+            let first_trace = lines.iter().position(|l| l.contains(t));
+            assert!(
+                first_trace.is_some() && last_warn < first_trace,
+                "{extra:?}\n{e}"
+            );
+        }
+    }
+    // Lecture impossible : une seule ligne.
+    let Some((r, readable)) = unreadable_first() else {
+        return;
+    };
+    let o = r.run(&["build", "--no-llm"]);
+    restore(&r);
+    if !readable {
+        let e = err(&o);
+        assert_eq!(e.lines().count(), 1, "{e}");
+        assert!(
+            e.starts_with("avertissement: A\\xFE.java ignoré : lecture impossible (")
+                && e.trim_end().ends_with(')'),
+            "{e}"
+        );
+    }
+}
+
+#[test]
+fn REQ103_AC5_fichier_illisible_non_relu_par_status() {
+    let Some((r, readable)) = unreadable_first() else {
+        return;
+    };
+    let o = r.run(&["build", "--no-llm"]);
+    if readable {
+        restore(&r);
+        return;
+    }
+    let s = r.run(&["status"]);
+    let q = r.run(&["query", "search", "A2", "--check-stale"]);
+    restore(&r);
+    assert_eq!(s.status.code(), Some(0));
+    assert_eq!(first_line(&s), "graphe à jour", "{}", out(&s));
+    assert_eq!(err(&s), format!("{A7_FF_FE}\n"));
+    assert!(!err(&s).contains("lecture impossible"));
+    assert_eq!(err(&q), "");
+    let _ = o;
+}
+
+#[test]
+fn REQ102_check_stale_compte_le_groupe_si_un_fichier_est_lisible() {
+    for (files, stale) in [(&FE_BAD[..2], true), (&BOTH_BAD[..2], false)] {
+        let Some(r) = Repo::new(&[(b"B.java", "class B {}\n")]) else {
+            return;
+        };
+        let o = r.run(&["build", "--no-llm"]);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        for (n, body) in files {
+            fs::write(r.root.join(OsStr::from_bytes(n)), body).unwrap();
+        }
+        let o = r.run(&["query", "search", "B", "--check-stale"]);
+        assert_eq!(!err(&o).is_empty(), stale, "stderr : {}", err(&o));
+    }
+}

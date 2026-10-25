@@ -135,6 +135,11 @@ pub fn quick(repo: &Path, store: &Store, matcher: &Matcher) -> Result<usize> {
     let walked = scan::walk(repo, matcher, crate::index::default_jobs(), &known)?;
     let on_disk: HashMap<&str, &scan::WalkedFile> =
         walked.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let groups: HashMap<&str, &scan::Collision> = walked
+        .collisions
+        .iter()
+        .map(|c| (c.path.as_str(), c))
+        .collect();
     let mut count = 0;
     for k in &known {
         let changed = match (on_disk.get(k.path.as_str()), k.state) {
@@ -149,7 +154,15 @@ pub fn quick(repo: &Path, store: &Store, matcher: &Matcher) -> Result<usize> {
         .iter()
         .filter(|f| !seen.contains(f.path.as_str()))
         // Un fichier que `update` écarterait (illisible, non UTF-8) n'est pas « ajouté » (DEC-068).
-        .filter(|f| scan::read_utf8(&f.abs, &f.path).is_ok())
+        // Dans un groupe de collision, le premier fichier lisible suffit (REQ-102).
+        .filter(|f| {
+            scan::read_utf8(&f.abs, &f.path).is_ok()
+                || groups.get(f.path.as_str()).is_some_and(|c| {
+                    c.rest
+                        .iter()
+                        .any(|(_, wf)| scan::read_utf8(&wf.abs, &wf.path).is_ok())
+                })
+        })
         .count();
     Ok(count)
 }

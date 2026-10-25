@@ -238,19 +238,21 @@ pub struct WalkResult {
     pub warnings: Vec<String>,
     /// Fichiers que le parcours aurait retenus sans filtre (REQ-037).
     pub excluded: usize,
-    /// Fichiers écartés parce qu'un autre a le même chemin après conversion (DEC-071).
+    /// Groupes de fichiers de même chemin après conversion (DEC-071, DEC-104), triés par chemin.
     pub collisions: Vec<Collision>,
 }
 
-/// Fichier écarté : son chemin converti est celui d'un autre fichier, seul retenu (DEC-071).
+/// Groupe de fichiers de même chemin converti (DEC-071, DEC-104). Le premier, dans l'ordre de
+/// choix, est dans `WalkResult::files` ; les suivants, non lus, ne passent en jeu que si la
+/// lecture de celui qui les précède échoue (REQ-102).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collision {
-    /// Chemin réel relatif du fichier ignoré.
-    pub ignored: PathBuf,
-    /// Chemin réel relatif du fichier retenu.
-    pub kept: PathBuf,
-    /// Chemin converti, commun aux deux.
+    /// Chemin converti, commun à tous les fichiers du groupe.
     pub path: String,
+    /// Chemin réel relatif du premier fichier du groupe.
+    pub head: PathBuf,
+    /// Fichiers suivants, dans l'ordre de choix : chemin réel relatif et métadonnées.
+    pub rest: Vec<(PathBuf, WalkedFile)>,
 }
 
 /// Ordre de choix des fichiers d'un groupe de même chemin converti (DEC-104). `group` donne, par
@@ -516,18 +518,23 @@ pub fn walk(
             .iter()
             .map(|&i| (found[i].1.as_path(), found[i].0.size, found[i].0.mtime))
             .collect();
-        let kept = idx[choice_order(&metas, table.get(path).copied())[0]];
-        for &i in idx.iter().filter(|&&i| i != kept) {
+        let order: Vec<usize> = choice_order(&metas, table.get(path).copied())
+            .into_iter()
+            .map(|k| idx[k])
+            .collect();
+        for &i in &order[1..] {
             dropped[i] = true;
-            res.collisions.push(Collision {
-                ignored: found[i].1.clone(),
-                kept: found[kept].1.clone(),
-                path: (*path).to_string(),
-            });
         }
+        res.collisions.push(Collision {
+            path: (*path).to_string(),
+            head: found[order[0]].1.clone(),
+            rest: order[1..]
+                .iter()
+                .map(|&i| (found[i].1.clone(), found[i].0.clone()))
+                .collect(),
+        });
     }
-    res.collisions
-        .sort_by(|a, b| (&a.path, a.ignored.as_os_str()).cmp(&(&b.path, b.ignored.as_os_str())));
+    res.collisions.sort_by(|a, b| a.path.cmp(&b.path));
     res.files = found
         .into_iter()
         .zip(dropped)
@@ -544,14 +551,15 @@ pub fn read_utf8(abs: &Path, rel: &str) -> std::result::Result<Vec<u8>, String> 
 
 /// Comme `read_utf8`, le contenu étant rendu en `String` (validée une seule fois, sans copie).
 pub fn read_text(abs: &Path, rel: &str) -> std::result::Result<String, String> {
-    let bytes = std::fs::read(abs).map_err(|e| {
-        format!(
-            "{} ignoré : lecture impossible ({e})",
-            crate::escape::path(rel)
-        )
-    })?;
-    String::from_utf8(bytes)
-        .map_err(|_| format!("{} ignoré : fichier non UTF-8", crate::escape::path(rel)))
+    read_text_as(abs, &crate::escape::path(rel))
+}
+
+/// Comme `read_text`, `label` étant le texte déjà échappé de `<où>` : le chemin converti, ou le
+/// nom réel pour un fichier d'un groupe de collision (REQ-102, V-006).
+fn read_text_as(abs: &Path, label: &str) -> std::result::Result<String, String> {
+    let bytes =
+        std::fs::read(abs).map_err(|e| format!("{label} ignoré : lecture impossible ({e})"))?;
+    String::from_utf8(bytes).map_err(|_| format!("{label} ignoré : fichier non UTF-8"))
 }
 
 /// Empreinte lue d'un fichier et son contenu retenu s'il tient dans le budget.
@@ -565,7 +573,13 @@ pub(crate) static HASH_THREADS: std::sync::atomic::AtomicUsize =
 /// Lit et empreinte `files[i]` pour chaque `i` de `todo`, par min(`jobs`, n) fils qui prennent
 /// leurs indices dans une file partagée ; résultat à la position de `todo`. Avec `jobs` = 1 ou un
 /// seul fichier, lecture dans le fil appelant.
-fn hash_files(files: &[WalkedFile], todo: &[usize], jobs: usize, budget: usize) -> Vec<Hashed> {
+fn hash_files(
+    files: &[WalkedFile],
+    todo: &[usize],
+    jobs: usize,
+    budget: usize,
+    labels: &HashMap<&str, String>,
+) -> Vec<Hashed> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let work = || {
@@ -575,9 +589,13 @@ fn hash_files(files: &[WalkedFile], todo: &[usize], jobs: usize, budget: usize) 
             let Some(&i) = todo.get(k) else { break };
             let f = &files[i];
             count_read(&f.path, ReadKind::Hash);
+            let label = labels
+                .get(f.path.as_str())
+                .cloned()
+                .unwrap_or_else(|| crate::escape::path(&f.path).into_owned());
             out.push((
                 k,
-                read_text(&f.abs, &f.path).map(|text| {
+                read_text_as(&f.abs, &label).map(|text| {
                     let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
                     (hash, Retained::reserve(text, budget).ok())
                 }),
@@ -617,6 +635,16 @@ fn hash_files(files: &[WalkedFile], todo: &[usize], jobs: usize, budget: usize) 
     done.into_iter().map(|(_, r)| r).collect()
 }
 
+/// Avertissement A-7 : `ignored` n'est pas dans le graphe, `kept` y est sous `path`.
+fn collision_message(ignored: &Path, kept: &Path, path: &str) -> String {
+    format!(
+        "{} ignoré : même chemin dans le graphe que {} ({}), seul retenu ; renommez ce fichier",
+        escaped(ignored),
+        escaped(kept),
+        crate::escape::path(path)
+    )
+}
+
 /// Parcourt `root`. `known` : enregistrements de la table `files`, dont l'empreinte est
 /// réutilisée quand taille et mtime n'ont pas changé. `matcher` : filtres de REQ-037, appliqués
 /// après les exclusions de REQ-004 et avant toute lecture.
@@ -644,16 +672,18 @@ pub(crate) fn scan_with_budget(
         excluded: walked.excluded,
         ..ScanResult::default()
     };
-    for c in &walked.collisions {
-        let msg = format!(
-            "{} ignoré : même chemin dans le graphe que {} ({}), seul retenu ; renommez ce fichier",
-            escaped(&c.ignored),
-            escaped(&c.kept),
-            crate::escape::path(&c.path)
-        );
-        warn(&msg);
-        res.warnings.push(msg);
-    }
+    // Groupes de collision par chemin converti ; `<où>` des lectures de leur premier fichier :
+    // le nom réel (REQ-102).
+    let groups: HashMap<&str, &Collision> = walked
+        .collisions
+        .iter()
+        .map(|c| (c.path.as_str(), c))
+        .collect();
+    let labels: HashMap<&str, String> = walked
+        .collisions
+        .iter()
+        .map(|c| (c.path.as_str(), escaped(&c.head)))
+        .collect();
     // Fichiers dont l'empreinte n'est pas réutilisable (règle taille, date, « racy-clean »).
     let reusable = |rel: &str, size: u64, mtime: i64| -> Option<String> {
         match known.get(rel) {
@@ -668,22 +698,75 @@ pub(crate) fn scan_with_budget(
             _ => None,
         }
     };
-    let mut hashes: Vec<Option<String>> = walked
-        .files
+    let mut files = walked.files;
+    let mut hashes: Vec<Option<String>> = files
         .iter()
         .map(|f| reusable(&f.path, f.size, f.mtime))
         .collect();
     let to_read: Vec<usize> = (0..hashes.len()).filter(|&i| hashes[i].is_none()).collect();
-    let read = hash_files(&walked.files, &to_read, jobs, budget);
+    let read = hash_files(&files, &to_read, jobs, budget, &labels);
     let mut fresh: HashMap<usize, Hashed> = to_read.iter().copied().zip(read).collect();
-    let mut read_warnings: Vec<(String, String)> = Vec::new();
-    for (i, f) in walked.files.into_iter().enumerate() {
+    // (chemin converti, chemin réel, texte).
+    let mut read_warnings: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut collision_notes: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut no_file: HashSet<usize> = HashSet::new();
+    // Repli au premier fichier lisible de chaque groupe (REQ-102, DEC-104), dans le fil appelant.
+    for (i, f) in files.iter_mut().enumerate() {
+        let Some(c) = groups.get(f.path.as_str()) else {
+            continue;
+        };
+        let mut kept_real = c.head.clone();
+        if matches!(fresh.get(&i), Some(Err(_))) {
+            let Some(Err(msg)) = fresh.remove(&i) else {
+                unreachable!()
+            };
+            read_warnings.push((c.path.clone(), c.head.clone(), msg));
+            let mut found = false;
+            for (real, wf) in &c.rest {
+                if found {
+                    collision_notes.push((
+                        c.path.clone(),
+                        real.clone(),
+                        collision_message(real, &kept_real, &c.path),
+                    ));
+                    continue;
+                }
+                count_read(&wf.path, ReadKind::Hash);
+                match read_text_as(&wf.abs, &escaped(real)) {
+                    Ok(text) => {
+                        let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+                        fresh.insert(i, Ok((hash, Retained::reserve(text, budget).ok())));
+                        *f = wf.clone();
+                        kept_real = real.clone();
+                        found = true;
+                    }
+                    Err(m) => read_warnings.push((c.path.clone(), real.clone(), m)),
+                }
+            }
+            if !found {
+                no_file.insert(i);
+            }
+        } else {
+            for (real, _) in &c.rest {
+                collision_notes.push((
+                    c.path.clone(),
+                    real.clone(),
+                    collision_message(real, &kept_real, &c.path),
+                ));
+            }
+        }
+    }
+    for (i, f) in files.into_iter().enumerate() {
+        if no_file.contains(&i) {
+            continue;
+        }
         let (hash, rehashed, content) = match hashes[i].take() {
             Some(h) => (h, false, None),
             None => match fresh.remove(&i).expect("résultat de lecture") {
                 Ok((h, c)) => (h, true, c),
                 Err(msg) => {
-                    read_warnings.push((f.path, msg));
+                    let real = PathBuf::from(&f.path);
+                    read_warnings.push((f.path, real, msg));
                     continue;
                 }
             },
@@ -699,8 +782,13 @@ pub(crate) fn scan_with_budget(
             content,
         });
     }
-    read_warnings.sort();
-    for (_, msg) in read_warnings {
+    // Après les lectures, avant toute trace : A-7 puis lectures (V-006).
+    let order = |a: &(String, PathBuf, String), b: &(String, PathBuf, String)| {
+        (&a.0, a.1.as_os_str()).cmp(&(&b.0, b.1.as_os_str()))
+    };
+    collision_notes.sort_by(order);
+    read_warnings.sort_by(order);
+    for (_, _, msg) in collision_notes.into_iter().chain(read_warnings) {
         warn(&msg);
         res.warnings.push(msg);
     }
@@ -855,13 +943,13 @@ mod tests {
             assert_eq!(w.files.len(), 1);
             assert_eq!(w.files[0].abs, dir.path().join(&ff), "jobs {jobs}");
             assert_eq!(w.collisions.len(), 1);
-            assert_eq!(w.collisions[0].ignored, fe);
-            assert_eq!(w.collisions[0].kept, ff);
+            assert_eq!(w.collisions[0].rest[0].0, fe);
+            assert_eq!(w.collisions[0].head, ff);
             // Cas 2 : autre taille -> DEC-071, `A\xfe.java` retenu.
             let known = [indexed("A\u{FFFD}.java", size + 1, ff_ms)];
             let w = walk(dir.path(), &Matcher::none(), jobs, &known).unwrap();
             assert_eq!(w.files[0].abs, dir.path().join(&fe), "jobs {jobs}");
-            assert_eq!(w.collisions[0].ignored, ff);
+            assert_eq!(w.collisions[0].rest[0].0, ff);
             // Autre date -> idem ; la date de `A\xfe.java` seule le fait retenir.
             let known = [indexed("A\u{FFFD}.java", size, ff_ms + 1)];
             let w = walk(dir.path(), &Matcher::none(), jobs, &known).unwrap();
@@ -875,8 +963,116 @@ mod tests {
             let known = [indexed("A\u{FFFD}.java", size, ms)];
             let w = walk(dir.path(), &Matcher::none(), jobs, &known).unwrap();
             assert_eq!(w.files[0].abs, dir.path().join(&fe), "jobs {jobs}");
-            assert_eq!(w.collisions[0].ignored, ff);
+            assert_eq!(w.collisions[0].rest[0].0, ff);
+            // Cas 4 (REQ-102) : `A\xff.java` correspond à `known` (empreinte vide, donc lu) mais
+            // n'est pas de l'UTF-8 : `A\xfe.java` prend la place.
+            let dir = tempfile::tempdir().unwrap();
+            let (size, _, ff_ms) =
+                collision_pair(dir.path(), 1_600_000_000, 1_700_000_000).unwrap();
+            std::fs::write(dir.path().join(&ff), vec![0xff; size as usize]).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(&ff))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + std::time::Duration::from_millis(ff_ms as u64))
+                .unwrap();
+            let known = [indexed("A\u{FFFD}.java", size, ff_ms)];
+            let w = walk(dir.path(), &Matcher::none(), jobs, &known).unwrap();
+            assert_eq!(w.files[0].abs, dir.path().join(&ff), "tête = fichier connu");
+            let r = scan(dir.path(), &known, &Matcher::none(), jobs).unwrap();
+            assert_eq!(r.files.len(), 1, "{:?}", r.warnings);
+            assert_eq!(r.files[0].abs, dir.path().join(&fe), "jobs {jobs}");
+            assert_eq!(
+                r.warnings,
+                vec!["A\\xFF.java ignoré : fichier non UTF-8".to_string()],
+                "jobs {jobs}"
+            );
         }
+    }
+
+    /// Dossier d'AC-102-1 sans `B.java` : `A\xfe.java` (contenu `\xff`) et `A\xff.java`.
+    #[cfg(unix)]
+    fn fallback_dir(files: &[(&[u8], &[u8])]) -> Option<tempfile::TempDir> {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(name)), body).ok()?;
+        }
+        Some(dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn req102_ac6_le_suivant_lisible_prend_la_place() {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(dir) =
+            fallback_dir(&[(b"A\xfe.java", b"\xff"), (b"A\xff.java", b"class A2 {}\n")])
+        else {
+            return;
+        };
+        let mut first = None;
+        for jobs in [1, 8] {
+            let r = scan(dir.path(), &[], &Matcher::none(), jobs).unwrap();
+            assert_eq!(r.files.len(), 1, "{:?}", r.warnings);
+            let f = &r.files[0];
+            assert_eq!(f.path, "A\u{FFFD}.java");
+            assert_eq!(f.hash, blake3::hash(b"class A2 {}\n").to_hex().to_string());
+            assert_eq!(f.size, 12);
+            assert!(f.rehashed);
+            assert!(f.abs.as_os_str().as_bytes().ends_with(b"A\xff.java"));
+            assert_eq!(
+                r.warnings,
+                vec!["A\\xFE.java ignoré : fichier non UTF-8".to_string()]
+            );
+            match &first {
+                None => first = Some((r.files, r.warnings)),
+                Some((files, warnings)) => {
+                    assert_eq!(&r.files, files);
+                    assert_eq!(&r.warnings, warnings);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn req102_ac3_le_compteur_ne_voit_pas_le_fichier_non_lu() {
+        let Some(dir) = fallback_dir(&[
+            (b"A\xfd.java", b"\xff"),
+            (b"A\xfe.java", b"class A2 {}\n"),
+            (b"A\xff.java", b"\xff"),
+        ]) else {
+            return;
+        };
+        reads::reset();
+        let r = scan(dir.path(), &[], &Matcher::none(), 1).unwrap();
+        assert_eq!(r.files.len(), 1);
+        assert_eq!(
+            r.warnings,
+            vec![
+                "A\\xFF.java ignoré : même chemin dans le graphe que A\\xFE.java (A\u{FFFD}.java), seul retenu ; renommez ce fichier".to_string(),
+                "A\\xFD.java ignoré : fichier non UTF-8".to_string(),
+            ]
+        );
+        // Deux lectures du chemin converti (`A\xfd`, `A\xfe`), jamais une troisième (`A\xff`).
+        assert_eq!(reads::all().get("A\u{FFFD}.java"), Some(&2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn req102_aucun_fichier_lisible_un_avertissement_par_fichier() {
+        let Some(dir) = fallback_dir(&[(b"A\xfe.java", b"\xff"), (b"A\xff.java", b"\xfe")]) else {
+            return;
+        };
+        let r = scan(dir.path(), &[], &Matcher::none(), 1).unwrap();
+        assert!(r.files.is_empty());
+        assert_eq!(
+            r.warnings,
+            vec![
+                "A\\xFE.java ignoré : fichier non UTF-8".to_string(),
+                "A\\xFF.java ignoré : fichier non UTF-8".to_string(),
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -967,8 +1163,43 @@ mod tests {
         (0..group.len()).min_by_key(|&i| key(i)).unwrap_or(0)
     }
 
+    /// Fichier écarté d'une collision selon la 0.22.0.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct OracleCollision {
+        ignored: PathBuf,
+        kept: PathBuf,
+        path: String,
+    }
+
+    /// Résultat du `walk` de la 0.22.0.
+    #[derive(Default)]
+    struct OracleWalk {
+        files: Vec<WalkedFile>,
+        warnings: Vec<String>,
+        excluded: usize,
+        collisions: Vec<OracleCollision>,
+    }
+
+    /// Groupes du `walk` courant ramenés à la forme de la 0.22.0 (`known` vide : l'ordre de
+    /// choix est celui de DEC-071, le premier du groupe est le retenu de l'oracle).
+    fn as_oracle(w: &WalkResult) -> Vec<OracleCollision> {
+        let mut v: Vec<OracleCollision> = w
+            .collisions
+            .iter()
+            .flat_map(|c| {
+                c.rest.iter().map(|(real, _)| OracleCollision {
+                    ignored: real.clone(),
+                    kept: c.head.clone(),
+                    path: c.path.clone(),
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| (&a.path, a.ignored.as_os_str()).cmp(&(&b.path, b.ignored.as_os_str())));
+        v
+    }
+
     /// `walk` de la 0.22.0, séquentiel, conservé tel quel comme oracle.
-    fn oracle_walk(root: &Path, matcher: &Matcher) -> Result<WalkResult> {
+    fn oracle_walk(root: &Path, matcher: &Matcher) -> Result<OracleWalk> {
         if !root.is_dir() {
             return Err(Error::Message(format!(
                 "{} n'est pas un dossier lisible",
@@ -993,7 +1224,7 @@ mod tests {
             })
             .build();
 
-        let mut res = WalkResult::default();
+        let mut res = OracleWalk::default();
         let mut found: Vec<(WalkedFile, PathBuf)> = Vec::new();
         for entry in walker {
             let entry = match entry {
@@ -1065,7 +1296,7 @@ mod tests {
             let kept = idx[choose_kept(&reals)];
             for &i in idx.iter().filter(|&&i| i != kept) {
                 dropped[i] = true;
-                res.collisions.push(Collision {
+                res.collisions.push(OracleCollision {
                     ignored: found[i].1.clone(),
                     kept: found[kept].1.clone(),
                     path: (*path).to_string(),
@@ -1286,7 +1517,15 @@ mod tests {
                     "N\u{FFFD}.java".as_bytes(),
                     b"Z\x80.md",
                 ] {
-                    std::fs::write(d.join(std::ffi::OsStr::from_bytes(n)), "class N {}\n").unwrap();
+                    // REQ-102 (AC-102-8) : une graine sur trois rend non UTF-8 le fichier que
+                    // l'oracle 0.22.0 retient (`N\u{FFFD}.java`).
+                    let body: &[u8] = if seed.is_multiple_of(3) && n == "N\u{FFFD}.java".as_bytes()
+                    {
+                        b"\xff"
+                    } else {
+                        b"class N {}\n"
+                    };
+                    std::fs::write(d.join(std::ffi::OsStr::from_bytes(n)), body).unwrap();
                 }
             }
         }
@@ -1337,6 +1576,43 @@ mod tests {
         let _ = locked;
     }
 
+    /// Vrai si le groupe `nu/N*.java` du générateur a pour retenu de l'oracle un fichier non UTF-8.
+    #[cfg(unix)]
+    fn bad_group(root: &Path) -> bool {
+        std::fs::read(root.join("nu").join("N\u{FFFD}.java"))
+            .is_ok_and(|b| String::from_utf8(b).is_err())
+    }
+
+    #[cfg(unix)]
+    const BAD_A7: &str = "nu/N\\xFF.java ignoré : même chemin dans le graphe que nu/N\\xFE.java (nu/N\u{FFFD}.java), seul retenu ; renommez ce fichier";
+
+    /// Pour ces seuls groupes, la comparaison à l'oracle est remplacée par la règle de REQ-102
+    /// (AC-102-8) : `nu/N\xfe.java`, le premier lisible, prend la place, `nu/N\xff.java` reçoit
+    /// l'A-7 qui le nomme. Retire le groupe des deux résultats après l'avoir vérifié sur `got`.
+    #[cfg(unix)]
+    fn settle_bad_group(got: &mut ScanResult, want: &mut ScanResult) {
+        use std::os::unix::ffi::OsStrExt;
+        let p = "nu/N\u{FFFD}.java";
+        let f = got
+            .files
+            .iter()
+            .find(|f| f.path == p)
+            .expect("groupe retenu");
+        assert!(f.abs.as_os_str().as_bytes().ends_with(b"N\xfe.java"));
+        assert_eq!(f.hash, blake3::hash(b"class N {}\n").to_hex().to_string());
+        assert!(f.rehashed);
+        assert!(
+            got.warnings.iter().any(|w| w == BAD_A7),
+            "{:?}",
+            got.warnings
+        );
+        got.files.retain(|f| f.path != p);
+        for r in [got, want] {
+            r.warnings
+                .retain(|w| !(w.starts_with("nu/N") && w.contains("même chemin")));
+        }
+    }
+
     fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
         v.sort();
         v
@@ -1360,7 +1636,7 @@ mod tests {
             for jobs in [1, 2, 8] {
                 let got = walk(&root, &matcher, jobs, &[]).unwrap();
                 assert_eq!(got.files, want.files, "seed {seed}, jobs {jobs}");
-                assert_eq!(got.collisions, want.collisions, "seed {seed}, jobs {jobs}");
+                assert_eq!(as_oracle(&got), want.collisions, "seed {seed}, jobs {jobs}");
                 assert_eq!(got.excluded, want.excluded, "seed {seed}, jobs {jobs}");
                 assert_eq!(
                     sorted(got.warnings.clone()),
@@ -1413,15 +1689,32 @@ mod tests {
 
     #[test]
     fn req072_ac1_scan_equals_sequential_oracle_for_any_jobs() {
+        let mut bad_seen = 0;
+        let mut compared = 0;
         for seed in 0..100u64 {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("repo");
             std::fs::create_dir_all(&root).unwrap();
             let (filters, locked) = gen_tree(seed, &root);
             let matcher = filters.compile(&root).unwrap();
-            let want = oracle_scan(&root, &[], &matcher).unwrap();
+            let mut want = oracle_scan(&root, &[], &matcher).unwrap();
+            #[cfg(unix)]
+            let bad = bad_group(&root)
+                && want
+                    .warnings
+                    .iter()
+                    .any(|w| w == "nu/N\u{FFFD}.java ignoré : fichier non UTF-8");
+            #[cfg(not(unix))]
+            let bad = false;
+            bad_seen += usize::from(bad);
+            compared +=
+                usize::from(!bad && want.warnings.iter().any(|w| w.contains("même chemin")));
             for jobs in [1, 2, 8] {
-                let got = scan(&root, &[], &matcher, jobs).unwrap();
+                let mut got = scan(&root, &[], &matcher, jobs).unwrap();
+                #[cfg(unix)]
+                if bad {
+                    settle_bad_group(&mut got, &mut want);
+                }
                 assert_eq!(got.files, want.files, "seed {seed}, jobs {jobs}");
                 assert_eq!(got.gradle_settings, want.gradle_settings, "seed {seed}");
                 assert_eq!(got.excluded, want.excluded, "seed {seed}");
@@ -1433,6 +1726,18 @@ mod tests {
             }
             unlock(&locked);
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert!(
+                bad_seen > 0,
+                "AC-102-8 : groupes à retenu non UTF-8 attendus"
+            );
+            assert!(
+                compared > 0,
+                "AC-102-8 : collisions comparées à l'oracle attendues"
+            );
+        }
+        let _ = (bad_seen, compared);
     }
 
     #[test]
@@ -1467,9 +1772,21 @@ mod tests {
                     }
                 })
                 .collect();
-            let want = oracle_scan(&root, &known, &matcher).unwrap();
+            let mut want = oracle_scan(&root, &known, &matcher).unwrap();
+            #[cfg(unix)]
+            let bad = bad_group(&root)
+                && want
+                    .warnings
+                    .iter()
+                    .any(|w| w == "nu/N\u{FFFD}.java ignoré : fichier non UTF-8");
+            #[cfg(not(unix))]
+            let bad = false;
             for jobs in [1, 2, 8] {
-                let got = scan(&root, &known, &matcher, jobs).unwrap();
+                let mut got = scan(&root, &known, &matcher, jobs).unwrap();
+                #[cfg(unix)]
+                if bad {
+                    settle_bad_group(&mut got, &mut want);
+                }
                 assert_eq!(got.files, want.files, "seed {seed}, jobs {jobs}");
                 assert_eq!(got.gradle_settings, want.gradle_settings, "seed {seed}");
                 assert_eq!(got.excluded, want.excluded, "seed {seed}");

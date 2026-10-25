@@ -348,3 +348,30 @@ fn req071_ac9_deux_fichiers_non_utf8_stderr_identique() {
     );
     assert!(pa.is_some() && pz.is_some() && pa < pz, "{err}");
 }
+
+#[cfg(unix)]
+#[test]
+fn req102_ac9_groupe_de_collision_stderr_identique_quel_que_soit_jobs() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let e = Env::new(1);
+    for (name, body) in [
+        (&b"l'A\xfe.java"[..], &b"\xff"[..]),
+        (b"l'A\xff.java", b"class A2 {}\n"),
+        (b"l'b.java", b"\xff"),
+    ] {
+        if fs::write(e.repo.join(OsStr::from_bytes(name)), body).is_err() {
+            return;
+        }
+    }
+    let a = e.run(&["build", "--no-llm", "--jobs", "1"]);
+    e.reset();
+    let b = e.run(&["build", "--no-llm", "--jobs", "8"]);
+    assert_eq!(a.status.code(), Some(0));
+    assert_eq!(a.stdout, b.stdout);
+    assert_eq!(a.stderr, b.stderr);
+    assert_eq!(
+        text(&a.stderr),
+        "avertissement: l\\'A\\xFE.java ignoré : fichier non UTF-8\navertissement: l'b.java ignoré : fichier non UTF-8\n"
+    );
+}

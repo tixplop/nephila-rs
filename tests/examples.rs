@@ -1379,6 +1379,17 @@ fn REQ079_AC7_readme_puce_vers_024_et_ligne_du_tableau() {
     ] {
         assert!(row.contains(w), "ligne 0.24 sans : {w}");
     }
+    // REQ-102, REQ-103 : collision de noms après conversion, phrase en fin de cellule.
+    assert!(
+        row.trim_end().ends_with(
+            "Deux noms identiques après conversion : le fichier déjà indexé reste retenu, un fichier illisible est ignoré et laisse la place au suivant, que l'avertissement nomme par son nom réel. |"
+        ),
+        "ligne 0.24 : phrase de collision absente en fin de cellule"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("| 0.24.1 |")),
+        "aucune ligne 0.24.1"
+    );
 }
 
 #[test]
