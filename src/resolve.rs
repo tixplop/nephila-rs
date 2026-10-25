@@ -85,10 +85,8 @@ fn resolve_full(store: &mut Store) -> Result<ResolveStats> {
 /// complète sur le même état.
 fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStats> {
     crate::store::note_pass(true);
-    let nodes = store.resolution_nodes()?;
-    let idx = Index::new(&nodes);
-    let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-    let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let all_nodes = store.resolution_nodes()?;
+    let all_ids: HashSet<&str> = all_nodes.iter().map(|n| n.id.as_str()).collect();
     let moved: BTreeSet<&str> = log
         .inserted
         .iter()
@@ -111,15 +109,84 @@ fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStat
         sources.extend(store.ref_sources_by_key(k, false)?);
         sources.extend(store.ref_sources_by_key(k, true)?);
     }
-    sources.retain(|s| ids.contains(s.as_str()));
+    sources.retain(|s| all_ids.contains(s.as_str()));
+
+    // Dépendances qui disparaissent (REQ-087, DEC-096 point 2) : les `depends_on` des sources
+    // réévaluées sont évalués d'abord ; ils ne lisent que les identifiants des modules.
+    let mut loaded: HashMap<String, Vec<(FileRef, bool)>> = HashMap::new();
+    let no_index = Index::new(&[]);
+    let empty = FileContext::default();
+    let mut wanted_deps: HashSet<String> = HashSet::new();
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for source in &sources {
+        if !matches!(parse_node_id(source), Ok((NodeKind::Module, _))) {
+            continue;
+        }
+        let refs = store.refs_of_source(source)?;
+        for (fr, _) in &refs {
+            if fr.r.kind == EdgeKind::DependsOn {
+                if let Outcome::Depends(e, _) = eval_ref(fr, &empty, &all_ids, &no_index) {
+                    wanted_deps.insert(e.target);
+                }
+            }
+        }
+        candidates.extend(store.stored_dependencies(source)?);
+        loaded.insert(source.clone(), refs);
+    }
+    let mut vanishing: HashSet<String> = HashSet::new();
+    for c in candidates {
+        if wanted_deps.contains(&c) || !all_ids.contains(c.as_str()) {
+            continue;
+        }
+        if !store.declaring_files(&c)?.is_empty() {
+            continue;
+        }
+        if store
+            .depends_on_sources(&c)?
+            .iter()
+            .any(|s| !sources.contains(s))
+        {
+            continue;
+        }
+        vanishing.insert(c);
+    }
+    let vanishing_keys: BTreeSet<String> = vanishing
+        .iter()
+        .filter_map(|id| parse_node_id(id).ok())
+        .map(|(_, q)| last_segment(q).to_string())
+        .collect();
+    for k in &vanishing_keys {
+        sources.extend(store.ref_sources_by_key(k, false)?);
+        sources.extend(store.ref_sources_by_key(k, true)?);
+    }
+    sources.retain(|s| all_ids.contains(s.as_str()));
+
+    // Ces nœuds sont retirés de l'index et des identifiants : résolus comme s'ils n'existaient
+    // pas, comme dans la passe complète.
+    let kept: Vec<Node>;
+    let nodes: &[Node] = if vanishing.is_empty() {
+        &all_nodes
+    } else {
+        kept = all_nodes
+            .iter()
+            .filter(|n| !vanishing.contains(&n.id))
+            .cloned()
+            .collect();
+        &kept
+    };
+    let idx = Index::new(nodes);
+    let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     let mut write = IncrementalWrite::default();
-    let empty = FileContext::default();
     let mut contexts: HashMap<String, FileContext> = HashMap::new();
     let mut dependencies: HashMap<String, Node> = HashMap::new();
     let mut reevaluated = 0;
     for source in &sources {
-        let refs = store.refs_of_source(source)?;
+        let refs = match loaded.remove(source) {
+            Some(refs) => refs,
+            None => store.refs_of_source(source)?,
+        };
         reevaluated += refs.len();
         let mut wanted: Vec<Edge> = Vec::new();
         for (fr, was_unresolved) in &refs {
@@ -169,7 +236,7 @@ fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStat
         .filter_map(|id| parse_node_id(id).ok())
         .map(|(_, q)| q)
         .collect();
-    for n in &nodes {
+    for n in nodes {
         let parent = match n.kind {
             NodeKind::Type | NodeKind::Method => parent_of(&n.qualified),
             NodeKind::Section => n.qualified.split_once('#').map(|(d, _)| d),
@@ -191,7 +258,7 @@ fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStat
             }
         }
     }
-    let dirs = ModuleDirs::new(&nodes);
+    let dirs = ModuleDirs::new(nodes);
     for id in targets {
         let n = by_id[id];
         let declaring = if matches!(n.kind, NodeKind::Package | NodeKind::Table | NodeKind::Key) {
@@ -207,7 +274,7 @@ fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStat
 
     store.write_incremental(&write, |s| {
         Ok(crate::summary::stamped(&crate::summary::from_store(
-            s, &nodes,
+            s, nodes,
         )?))
     })?;
     Ok(ResolveStats {
@@ -2294,7 +2361,7 @@ import q.R;",
     fn req067_ac1_summary_equals_the_0_21_0_oracle() {
         let dir = tempfile::tempdir().unwrap();
         let mut st = Store::open_or_create(dir.path()).unwrap();
-        let (mut full, mut incremental, mut skipped, mut themes, mut deps) = (0, 0, 0, 0, 0);
+        let (mut full, mut incremental, mut themes, mut deps, mut lifted) = (0, 0, 0, 0, 0);
         for seed in 0..200u64 {
             st.reset().unwrap();
             let mut seq = Seq {
@@ -2304,15 +2371,20 @@ import q.R;",
                 modules: Default::default(),
                 module_touched: false,
             };
+            if seed % 2 == 0 {
+                seq.seed_dependency_case(&mut st);
+            }
             for _ in 0..3 + seq.g.next(6) {
                 seq.step(&mut st);
             }
             for round in 0..3 {
                 crate::store::reset_diagnostics();
-                // Cas sans oracle (limite connue de la passe complète, voir AC-066-1).
-                if resolve(&mut st).is_err() {
-                    skipped += 1;
-                    break;
+                let before = mentioned_dependencies(&st);
+                resolve(&mut st).unwrap_or_else(|e| {
+                    panic!("séquence {seed}, pas {round} : passe en échec : {e}")
+                });
+                if lifted_case(&before, &st) {
+                    lifted += 1;
                 }
                 let d = crate::store::diagnostics();
                 full += d.full_passes();
@@ -2337,7 +2409,7 @@ import q.R;",
         }
         assert!(full > 150, "{full} passes complètes");
         assert!(incremental > 150, "{incremental} passes incrémentales");
-        assert!(skipped < 10, "{skipped} séquences sans oracle");
+        assert!(lifted > 0, "aucune passe du cas levé par REQ-087");
         assert!(themes > 10, "{themes} thèmes comparés");
         assert!(deps > 100, "{deps} dépendances comparées");
     }
@@ -2468,9 +2540,11 @@ import q.R;",
         let d = crate::store::diagnostics();
         assert_eq!((d.full_passes(), d.incremental_passes()), (0, 1));
         // La passe relit les 3 liens `depends_on` stockés des modules (leurs références sont
-        // réévaluées) ; le résumé lit 3 liens de dépendances, 1 concept mentionné et 10 du
-        // classement.
-        assert_eq!(d.edge_rows_read(), 3 + 3 + 1 + 10);
+        // réévaluées) pour l'écriture, et une seconde fois pour chercher les dépendances qui
+        // disparaissent (REQ-087, `stored_dependencies`) ; aucun candidat ne disparaît, donc
+        // aucune lecture de `DEPENDS_ON_SOURCES`. Le résumé lit 3 liens de dépendances,
+        // 1 concept mentionné et 10 du classement.
+        assert_eq!(d.edge_rows_read(), 3 + 3 + 3 + 1 + 10);
         assert_eq!(
             stored_summary(&e.store),
             summary_oracle(&e.store).to_string()
@@ -2594,6 +2668,8 @@ import q.R;",
         "org.x:lib1",
         "org.x:lib2",
     ];
+    /// Coordonnées jamais celles d'un module du réservoir : toujours des dépendances dérivées.
+    const EXTERNAL_DEPS: [&str; 2] = ["org.x:lib1", "org.x:lib2"];
     const CONCEPTS: [&str; 3] = ["idée", "Cache", "A"];
 
     fn concept(name: &str) -> Node {
@@ -2656,6 +2732,9 @@ import q.R;",
                 let src = sources[g.next(sources.len())].clone();
                 if src.starts_with("document:") && g.next(3) == 0 {
                     refs.push(rf(&src, EdgeKind::LinksTo, g.pick(&REF_NAMES), None));
+                } else if g.next(3) == 0 {
+                    // Coordonnées d'une dépendance : visée par `mentions` (REQ-087).
+                    refs.push(rf(&src, EdgeKind::Mentions, g.pick(&DEPS), None));
                 } else {
                     refs.push(rf(&src, EdgeKind::Mentions, g.pick(&REF_NAMES), None));
                 }
@@ -2762,6 +2841,24 @@ import q.R;",
         (nodes, refs)
     }
 
+    /// Document dont les sections ne mentionnent que des coordonnées de `depends_on` : les
+    /// dépendances dérivées par les `pom.xml` sont visées par des liens `mentions`.
+    fn dependency_mentions(g: &mut Lcg, path: &str) -> (Vec<Node>, Vec<Ref>) {
+        let doc = Node::new(NodeKind::Document, path, path, Some(path), None, None);
+        let sec = Node::new(
+            NodeKind::Section,
+            &format!("{path}#S0"),
+            "S0",
+            Some(path),
+            None,
+            None,
+        );
+        let refs = (0..1 + g.next(2))
+            .map(|_| rf(&sec.id, EdgeKind::Mentions, g.pick(&EXTERNAL_DEPS), None))
+            .collect();
+        (vec![doc, sec], refs)
+    }
+
     /// État d'une séquence aléatoire d'écritures sur le stockage.
     struct Seq {
         g: Lcg,
@@ -2810,10 +2907,54 @@ import q.R;",
             all[self.g.next(all.len())].to_string()
         }
 
+        /// Départ du cas levé par REQ-087 : un `pom.xml` dérive une dépendance externe et un
+        /// document la mentionne.
+        fn seed_dependency_case(&mut self, st: &mut Store) {
+            let q = "com.acme:root";
+            let m = plain(NodeKind::Module, q, Some("pom.xml"));
+            let refs = vec![
+                rf(&m.id, EdgeKind::DependsOn, "org.x:lib1", None),
+                rf(&m.id, EdgeKind::DependsOn, "org.x:lib2", None),
+            ];
+            self.write(st, "pom.xml", (vec![m], refs));
+            let p = self.g.pick(&DOC_POOL).to_string();
+            let c = dependency_mentions(&mut self.g, &p);
+            self.write(st, &p, c);
+        }
+
         /// Une écriture aléatoire.
         fn step(&mut self, st: &mut Store) {
             match self.g.next(20) {
                 0..=9 => {
+                    match self.g.next(5) {
+                        0 | 1 => {
+                            // Document qui mentionne des coordonnées de dépendances (REQ-087).
+                            let p = self.g.pick(&DOC_POOL).to_string();
+                            let c = dependency_mentions(&mut self.g, &p);
+                            self.write(st, &p, c);
+                            return;
+                        }
+                        2 | 3 => {
+                            // Réécriture d'un `pom.xml` connu : ses dépendances changent, le
+                            // module reste (passe incrémentale).
+                            let poms: Vec<String> = self
+                                .known
+                                .iter()
+                                .filter(|p| POM_POOL.contains(&p.as_str()))
+                                .cloned()
+                                .collect();
+                            if !poms.is_empty() {
+                                let p = poms[self.g.next(poms.len())].clone();
+                                let mut c = gen_content(&mut self.g, &p);
+                                if self.g.next(2) == 0 {
+                                    c.1.clear();
+                                }
+                                self.write(st, &p, c);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
                     let p = self.any_path();
                     let c = gen_content(&mut self.g, &p);
                     self.write(st, &p, c);
@@ -2853,7 +2994,11 @@ import q.R;",
                             } else {
                                 EdgeKind::Mentions
                             };
-                            rf(&src, kind, self.g.pick(&REF_NAMES), None)
+                            if kind == EdgeKind::Mentions && self.g.next(3) == 0 {
+                                rf(&src, kind, self.g.pick(&DEPS), None)
+                            } else {
+                                rf(&src, kind, self.g.pick(&REF_NAMES), None)
+                            }
                         })
                         .collect();
                     st.apply_enrichments(
@@ -2948,20 +3093,41 @@ import q.R;",
         Store::open_or_create(oracle).unwrap()
     }
 
+    /// Dépendances dérivées visées par un lien `mentions` dans l'état courant du graphe.
+    fn mentioned_dependencies(st: &Store) -> std::collections::BTreeSet<String> {
+        st.edges()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::Mentions && e.target.starts_with("dependency:"))
+            .map(|e| e.target)
+            .collect()
+    }
+
+    /// Cas levé par REQ-087 : la passe a fait disparaître une dépendance dérivée que `before`
+    /// (état d'avant la passe) donnait pour visée par un lien `mentions`.
+    fn lifted_case(before: &std::collections::BTreeSet<String>, st: &Store) -> bool {
+        let nodes = st.nodes().unwrap();
+        before.iter().any(|id| !nodes.iter().any(|n| &n.id == id))
+    }
+
     /// Compteurs d'une série de séquences d'AC-066-1.
     struct Ac066_1Counts {
         incremental: usize,
         full: usize,
-        skipped: usize,
         edges_seen: usize,
+        /// Passes où une dépendance qui disparaît était visée par un lien `mentions`.
+        lifted: usize,
+        lifted_incremental: usize,
     }
 
     /// AC-066-1 (DEC-087) : pour chaque graine de `seeds`, séquence aléatoire dont chaque passe
-    /// donne le graphe de la passe complète sur une copie du même graphe.
+    /// donne le graphe de la passe complète sur une copie du même graphe. Une passe en échec,
+    /// réelle ou de l'oracle, fait échouer le test (REQ-087, AC-087-4).
     fn ac066_1_run(seeds: std::ops::Range<u64>) -> Ac066_1Counts {
         let main_dir = tempfile::tempdir().unwrap();
         let oracle_dir = tempfile::tempdir().unwrap();
-        let (mut incremental, mut full, mut skipped, mut edges_seen) = (0, 0, 0, 0);
+        let (mut incremental, mut full, mut edges_seen) = (0, 0, 0);
+        let (mut lifted, mut lifted_incremental) = (0, 0);
         let mut st = Store::open_or_create(main_dir.path()).unwrap();
         for seed in seeds {
             st.reset().unwrap();
@@ -2973,10 +3139,13 @@ import q.R;",
                 module_touched: false,
             };
             // Graphe résolu de départ.
+            if seed % 3 != 0 {
+                seq.seed_dependency_case(&mut st);
+            }
             for _ in 0..3 {
                 seq.step(&mut st);
             }
-            resolve(&mut st).unwrap();
+            resolve(&mut st).unwrap_or_else(|e| panic!("séquence {seed}, départ : {e}"));
             for round in 0..3 {
                 seq.module_touched = false;
                 for _ in 0..1 + seq.g.next(5) {
@@ -2984,30 +3153,25 @@ import q.R;",
                 }
                 let mut oracle = oracle_copy(main_dir.path(), oracle_dir.path());
                 let ctx = format!("séquence {seed}, pas {round}");
-                // Cas sans oracle : une mention vise une dépendance dérivée que la même passe
-                // supprime (clé étrangère de `edges`, limite connue de la passe complète, qui
-                // échoue alors aussi sur le graphe réel quand elle est choisie).
-                let oracle_result = resolve(&mut oracle);
+                let expected_stats = resolve(&mut oracle)
+                    .unwrap_or_else(|e| panic!("{ctx} : passe de l'oracle en échec : {e}"));
+                let before = mentioned_dependencies(&st);
                 crate::store::reset_diagnostics();
-                let main_result = resolve(&mut st);
+                let stats =
+                    resolve(&mut st).unwrap_or_else(|e| panic!("{ctx} : passe en échec : {e}"));
                 let d = crate::store::diagnostics();
                 if seq.module_touched {
                     full += 1;
+                    assert_eq!((d.full_passes(), d.incremental_passes()), (1, 0), "{ctx}");
                 } else {
                     incremental += 1;
                     assert_eq!((d.full_passes(), d.incremental_passes()), (0, 1), "{ctx}");
                 }
-                let Ok(expected_stats) = oracle_result else {
-                    skipped += 1;
-                    if seq.module_touched {
-                        assert!(main_result.is_err(), "{ctx}");
-                        break;
+                if lifted_case(&before, &st) {
+                    lifted += 1;
+                    if !seq.module_touched {
+                        lifted_incremental += 1;
                     }
-                    continue;
-                };
-                let stats = main_result.unwrap_or_else(|e| panic!("{ctx} : {e}"));
-                if seq.module_touched {
-                    assert_eq!((d.full_passes(), d.incremental_passes()), (1, 0), "{ctx}");
                 }
                 let got = graph_state(main_dir.path(), &st, &stats);
                 let want = graph_state(oracle_dir.path(), &oracle, &expected_stats);
@@ -3023,8 +3187,9 @@ import q.R;",
         Ac066_1Counts {
             incremental,
             full,
-            skipped,
             edges_seen,
+            lifted,
+            lifted_incremental,
         }
     }
 
@@ -3042,7 +3207,14 @@ import q.R;",
             c.incremental
         );
         assert!(c.full > 3, "quart {k} : {} passes complètes", c.full);
-        assert!(c.skipped < 7, "quart {k} : {} pas sans oracle", c.skipped);
+        assert!(
+            c.lifted > 0,
+            "quart {k} : aucune passe où une dépendance qui disparaît était mentionnée"
+        );
+        assert!(
+            c.lifted_incremental > 0,
+            "quart {k} : aucune passe incrémentale de ce cas"
+        );
         assert!(
             c.edges_seen > 750,
             "quart {k} : {} liens comparés",
@@ -3070,16 +3242,24 @@ import q.R;",
         ac066_1_part(4);
     }
 
-    /// Comparaison d'un graphe réel et d'une copie passée par la passe complète.
-    fn assert_same_as_full_pass(e: &mut Env, what: &str) -> ResolveStats {
+    /// Comparaison d'un graphe réel et d'une copie passée par la passe complète ; rend le bilan
+    /// et les compteurs (complètes, incrémentales) de la seule passe du graphe réel.
+    fn compare_with_full_pass(e: &mut Env, what: &str) -> (ResolveStats, (u64, u64)) {
         let oracle_dir = tempfile::tempdir().unwrap();
         let mut oracle = oracle_copy(e._dir.path(), oracle_dir.path());
+        crate::store::reset_diagnostics();
         let stats = resolve(&mut e.store).unwrap();
+        let d = crate::store::diagnostics();
+        let counts = (d.full_passes(), d.incremental_passes());
         let want_stats = resolve(&mut oracle).unwrap();
         let got = graph_state(e._dir.path(), &e.store, &stats);
         let want = graph_state(oracle_dir.path(), &oracle, &want_stats);
         assert_eq!(got, want, "{what}");
-        stats
+        (stats, counts)
+    }
+
+    fn assert_same_as_full_pass(e: &mut Env, what: &str) -> ResolveStats {
+        compare_with_full_pass(e, what).0
     }
 
     /// Document `docs/d.md` dont une mention d'analyse et une référence `llm` visent `a`.
@@ -3192,6 +3372,75 @@ import q.R;",
     #[test]
     fn req087_ac2_full_pass_links_the_remaining_candidate_after_the_dependency_vanishes() {
         ac087_2(true);
+    }
+
+    /// AC-087-3 : `depends_on` vers `g:a` retiré du `pom.xml` de `m` (module conservé), passe
+    /// incrémentale ; (a) le document qui mentionne `a` est réécrit dans le même pas, (b) il ne
+    /// l'est pas, (c) comme (b) avec le type `p.a`.
+    fn ac087_3(rewrite_document: bool, with_type: bool) {
+        let dep = node_id(NodeKind::Dependency, "g:a");
+        let mut e = env(&["m/pom.xml", "d.md", "p.java"]);
+        if with_type {
+            e.store
+                .replace_file("p.java", &[ty("p.a", "p.java")], &[])
+                .unwrap();
+        }
+        build_module(&mut e, "m/pom.xml", "m", &["g:a"]);
+        resolve(&mut e.store).unwrap();
+        ac087_document(&mut e);
+        resolve(&mut e.store).unwrap();
+        assert!(has_node(&e, &dep));
+        if with_type {
+            assert!(mention_targets(&e).is_empty(), "ambiguïté constatée avant");
+        } else {
+            assert_eq!(mention_targets(&e), vec![dep.clone()]);
+        }
+
+        build_module(&mut e, "m/pom.xml", "m", &[]);
+        if rewrite_document {
+            let sec = node_id(NodeKind::Section, "docs/d.md#s");
+            e.store
+                .replace_file(
+                    "d.md",
+                    &[
+                        plain(NodeKind::Document, "docs/d.md", Some("d.md")),
+                        plain(NodeKind::Section, "docs/d.md#s", Some("d.md")),
+                    ],
+                    &[rf(&sec, EdgeKind::Mentions, "a", None)],
+                )
+                .unwrap();
+        }
+        let (stats, counts) = compare_with_full_pass(&mut e, "AC-087-3");
+        assert_eq!(counts, (0, 1), "passe incrémentale");
+        assert!(!has_node(&e, &dep), "la dépendance a disparu");
+        assert!(!e
+            .store
+            .edges()
+            .unwrap()
+            .iter()
+            .any(|x| x.source == dep || x.target == dep));
+        if with_type {
+            assert_eq!(mention_targets(&e), vec![tid("p.a")]);
+            assert_eq!(stats.unresolved, 0);
+        } else {
+            assert!(mention_targets(&e).is_empty());
+            assert_eq!(stats.unresolved, 1, "la mention `llm` est non résolue");
+        }
+    }
+
+    #[test]
+    fn req087_ac3_a_incremental_pass_with_the_document_rewritten() {
+        ac087_3(true, false);
+    }
+
+    #[test]
+    fn req087_ac3_b_incremental_pass_with_the_document_untouched() {
+        ac087_3(false, false);
+    }
+
+    #[test]
+    fn req087_ac3_c_incremental_pass_links_the_remaining_candidate() {
+        ac087_3(false, true);
     }
 
     /// DEC-077 : la tête d'un nom pointé (`B.m2`) désigne les références à réévaluer quand un

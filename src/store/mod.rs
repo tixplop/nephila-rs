@@ -122,6 +122,9 @@ pub(crate) const INSERT_DEPENDENCY: &str =
      VALUES (?1, 'dependency', ?2, ?3, NULL, NULL, NULL, ?4)";
 pub(crate) const DEPENDS_ON_ENTERING: &str =
     "SELECT 1 FROM edges WHERE target = ?1 AND kind = 'depends_on' LIMIT 1";
+/// Sources des liens `depends_on` qui visent une cible (`idx_edges_target`).
+pub(crate) const DEPENDS_ON_SOURCES: &str =
+    "SELECT source FROM edges WHERE target = ?1 AND kind = 'depends_on'";
 pub(crate) const DELETE_DEPENDENCY: &str = "DELETE FROM nodes WHERE id = ?1 AND kind = 'dependency'
      AND NOT EXISTS (SELECT 1 FROM declarations WHERE node = ?1)";
 pub(crate) const SET_UNRESOLVED: &str = "UPDATE refs SET unresolved = ?2 WHERE id = ?1";
@@ -142,7 +145,7 @@ pub(crate) const SUMMARY_MENTIONS: &str = "SELECT target, COUNT(*) FROM edges
      WHERE target >= 'concept:' AND target < 'concept;' AND kind = 'mentions' GROUP BY target";
 /// Toutes les requêtes ci-dessus, nommées.
 #[cfg(test)]
-pub(crate) const INCREMENTAL_QUERIES: [(&str, &str); 21] = [
+pub(crate) const INCREMENTAL_QUERIES: [(&str, &str); 22] = [
     ("RESOLVE_NODES", RESOLVE_NODES),
     ("REF_SOURCES_BY_KEY", REF_SOURCES_BY_KEY),
     ("REF_SOURCES_BY_HEAD", REF_SOURCES_BY_HEAD),
@@ -157,6 +160,7 @@ pub(crate) const INCREMENTAL_QUERIES: [(&str, &str); 21] = [
     ("DELETE_EDGE", DELETE_EDGE),
     ("INSERT_DEPENDENCY", INSERT_DEPENDENCY),
     ("DEPENDS_ON_ENTERING", DEPENDS_ON_ENTERING),
+    ("DEPENDS_ON_SOURCES", DEPENDS_ON_SOURCES),
     ("DELETE_DEPENDENCY", DELETE_DEPENDENCY),
     ("SET_UNRESOLVED", SET_UNRESOLVED),
     ("COUNT_EDGES", COUNT_EDGES),
@@ -1749,6 +1753,36 @@ impl Store {
     /// Sources des références écrites par le fichier `file`.
     pub(crate) fn ref_sources_of_file(&self, file: &str) -> Result<Vec<String>> {
         self.strings_of(REF_SOURCES_BY_FILE, file)
+    }
+
+    /// Cibles des liens `depends_on` stockés d'une source qui sont des nœuds `dependency`
+    /// (recherche des dépendances qui disparaissent, REQ-087).
+    pub(crate) fn stored_dependencies(&self, source: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare_cached(STORED_REF_EDGES).map_err(db_err)?;
+        let rows = st
+            .query_map([source], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        let prefix = format!("{}:", NodeKind::Dependency.as_str());
+        let mut seen = 0;
+        for row in rows {
+            let (target, kind) = row.map_err(db_err)?;
+            seen += 1;
+            if kind == EdgeKind::DependsOn.as_str() && target.starts_with(&prefix) {
+                out.push(target);
+            }
+        }
+        note_edge_rows(seen);
+        Ok(out)
+    }
+
+    /// Sources des liens `depends_on` stockés qui visent `target`.
+    pub(crate) fn depends_on_sources(&self, target: &str) -> Result<Vec<String>> {
+        let out = self.strings_of(DEPENDS_ON_SOURCES, target)?;
+        note_edge_rows(out.len());
+        Ok(out)
     }
 
     /// Fichiers qui déclarent le nœud `node`.
