@@ -4,6 +4,7 @@
 //! un fichier resté sur disque sans détenteur ne bloque donc personne.
 
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -18,6 +19,7 @@ pub struct RepoLock {
 impl RepoLock {
     /// Prend le verrou sans attendre ; échoue immédiatement s'il est déjà tenu.
     pub fn acquire(repo: &Path) -> Result<RepoLock> {
+        crate::store::ensure_no_symlink(repo)?;
         let dir = repo.join(".nephila");
         std::fs::create_dir_all(&dir)
             .map_err(|e| Error::Message(format!("impossible de créer {} : {e}", dir.display())))?;
@@ -26,6 +28,7 @@ impl RepoLock {
             .create(true)
             .truncate(false)
             .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .map_err(|e| {
                 Error::Message(format!(

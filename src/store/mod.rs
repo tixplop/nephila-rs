@@ -351,6 +351,46 @@ pub fn db_path(repo: &Path) -> PathBuf {
     repo.join(".nephila").join("graph.db")
 }
 
+/// Chemins examinés par `ensure_no_symlink`, relatifs au dépôt, dans l'ordre fixe de DEC-102 :
+/// `.nephila` d'abord, les autres seulement si c'est un dossier réel.
+const GUARDED_PATHS: [&str; 6] = [
+    ".nephila",
+    ".nephila/graph.db",
+    ".nephila/lock",
+    ".nephila/graph.db-wal",
+    ".nephila/graph.db-shm",
+    ".nephila/graph.db-journal",
+];
+
+/// Refuse un `.nephila` ou un de ses fichiers qui est un lien symbolique (REQ-098, E-23), sans
+/// suivre aucun lien. Un chemin absent n'est pas une erreur. À appeler avant toute création ou
+/// ouverture du verrou et de la base.
+pub fn ensure_no_symlink(repo: &Path) -> Result<()> {
+    let is_link = |rel: &str| {
+        std::fs::symlink_metadata(repo.join(rel))
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    };
+    let fail = |rel: &str| {
+        Err(Error::Message(format!(
+            "{rel} est un lien symbolique ; supprimez-le"
+        )))
+    };
+    if is_link(GUARDED_PATHS[0]) {
+        return fail(GUARDED_PATHS[0]);
+    }
+    let real_dir = std::fs::symlink_metadata(repo.join(GUARDED_PATHS[0]))
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false);
+    if !real_dir {
+        return Ok(());
+    }
+    match GUARDED_PATHS[1..].iter().find(|rel| is_link(rel)) {
+        Some(rel) => fail(rel),
+        None => Ok(()),
+    }
+}
+
 pub struct Store {
     conn: Connection,
     read_only: bool,
@@ -475,6 +515,7 @@ impl Store {
 
     /// Ouvre le graphe en écriture, en le créant (dossier `.nephila/`, schéma, WAL) si besoin.
     pub fn open_or_create(repo: &Path) -> Result<Store> {
+        ensure_no_symlink(repo)?;
         let path = db_path(repo);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| {
@@ -505,6 +546,7 @@ impl Store {
     /// Ouvre en écriture un graphe existant, sans rien créer ni migrer : un schéma d'une autre
     /// version (ou une base vide) est refusé avec l'invitation à lancer `nephila build`.
     pub fn open_existing(repo: &Path) -> Result<Store> {
+        ensure_no_symlink(repo)?;
         let path = db_path(repo);
         if !path.is_file() {
             return Err(Error::Message(format!(
@@ -539,6 +581,7 @@ impl Store {
     /// Ouvre le graphe en lecture seule, sans rien créer, dans une transaction de lecture qui
     /// dure autant que le `Store` (REQ-085).
     pub fn open_readonly(repo: &Path) -> Result<Store> {
+        ensure_no_symlink(repo)?;
         let path = db_path(repo);
         if !path.is_file() {
             return Err(Error::Message(format!(
@@ -6428,5 +6471,102 @@ mod tests {
         let after = Store::open_readonly(dir.path()).unwrap();
         assert!(after.files().unwrap().len() < files.len());
         assert!(after.nodes().unwrap().len() < nodes.len());
+    }
+
+    // REQ-098, AC-098-5 : vérification seule, sans suivre de lien.
+    #[cfg(unix)]
+    mod symlink_guard {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        fn msg(r: Result<()>) -> String {
+            match r {
+                Err(Error::Message(m)) => m,
+                other => panic!("erreur attendue, obtenu {other:?}"),
+            }
+        }
+
+        fn expected(rel: &str) -> String {
+            format!("{rel} est un lien symbolique ; supprimez-le")
+        }
+
+        #[test]
+        fn req098_ac5_absent_ou_reel_est_accepte() {
+            let repo = tempdir().unwrap();
+            ensure_no_symlink(repo.path()).unwrap();
+            std::fs::create_dir(repo.path().join(".nephila")).unwrap();
+            ensure_no_symlink(repo.path()).unwrap();
+            std::fs::write(repo.path().join(".nephila/graph.db"), "x").unwrap();
+            std::fs::write(repo.path().join(".nephila/lock"), "").unwrap();
+            ensure_no_symlink(repo.path()).unwrap();
+        }
+
+        #[test]
+        fn req098_ac5_nephila_lien_nomme_nephila_seul() {
+            let repo = tempdir().unwrap();
+            let victim = tempdir().unwrap();
+            symlink(victim.path().join("graph.db"), victim.path().join("lock")).unwrap();
+            symlink(victim.path().join("x"), victim.path().join("graph.db")).unwrap();
+            symlink(victim.path(), repo.path().join(".nephila")).unwrap();
+            assert_eq!(msg(ensure_no_symlink(repo.path())), expected(".nephila"));
+        }
+
+        #[test]
+        fn req098_ac5_nephila_lien_vers_absent() {
+            let repo = tempdir().unwrap();
+            symlink("/nonexistent-nephila-target", repo.path().join(".nephila")).unwrap();
+            assert_eq!(msg(ensure_no_symlink(repo.path())), expected(".nephila"));
+        }
+
+        #[test]
+        fn req098_ac5_chaque_fichier_en_lien_est_nomme() {
+            for name in [
+                "graph.db",
+                "lock",
+                "graph.db-wal",
+                "graph.db-shm",
+                "graph.db-journal",
+            ] {
+                let repo = tempdir().unwrap();
+                std::fs::create_dir(repo.path().join(".nephila")).unwrap();
+                symlink(
+                    "/nonexistent-nephila-target",
+                    repo.path().join(".nephila").join(name),
+                )
+                .unwrap();
+                assert_eq!(
+                    msg(ensure_no_symlink(repo.path())),
+                    expected(&format!(".nephila/{name}"))
+                );
+            }
+        }
+
+        #[test]
+        fn req098_ac5_ordre_fixe_graph_db_avant_lock() {
+            let repo = tempdir().unwrap();
+            std::fs::create_dir(repo.path().join(".nephila")).unwrap();
+            symlink("/nonexistent-a", repo.path().join(".nephila/lock")).unwrap();
+            symlink("/nonexistent-b", repo.path().join(".nephila/graph.db")).unwrap();
+            assert_eq!(
+                msg(ensure_no_symlink(repo.path())),
+                expected(".nephila/graph.db")
+            );
+        }
+
+        #[test]
+        fn req098_ac5_les_trois_ouvertures_et_le_verrou_refusent() {
+            let repo = tempdir().unwrap();
+            let victim = tempdir().unwrap();
+            symlink(victim.path(), repo.path().join(".nephila")).unwrap();
+            let want = expected(".nephila");
+            assert_eq!(msg(Store::open_or_create(repo.path()).map(|_| ())), want);
+            assert_eq!(msg(Store::open_existing(repo.path()).map(|_| ())), want);
+            assert_eq!(msg(Store::open_readonly(repo.path()).map(|_| ())), want);
+            assert_eq!(
+                msg(crate::index::lock::RepoLock::acquire(repo.path()).map(|_| ())),
+                want
+            );
+            assert_eq!(std::fs::read_dir(victim.path()).unwrap().count(), 0);
+        }
     }
 }
