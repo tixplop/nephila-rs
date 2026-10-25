@@ -512,3 +512,110 @@ fn req042_ac10_aucune_trace_ne_contient_la_cle_d_api() {
         assert!(all.contains("(.nephila.toml : model)"), "{sub}: {all}");
     }
 }
+
+/// Lignes de stderr qui contiennent ` non résolues`.
+fn pass_lines(o: &std::process::Output) -> Vec<String> {
+    stderr(o)
+        .lines()
+        .filter(|l| l.contains(" non résolues"))
+        .map(String::from)
+        .collect()
+}
+
+/// Forme d'AC-090-4 : `^trace: [..] résolution: \d+ ms, \d+ liens, \d+ non résolues (…)$`.
+fn pass_kind(line: &str) -> String {
+    assert!(well_formed(line), "{line}");
+    let rest = line.split("] résolution: ").nth(1).expect(line);
+    let (counts, kind) = rest.split_once(" non résolues (").expect(line);
+    let nums: Vec<&str> = counts.split(", ").collect();
+    assert_eq!(nums.len(), 3, "{line}");
+    assert!(
+        nums[0].ends_with(" ms") && nums[1].ends_with(" liens"),
+        "{line}"
+    );
+    assert!(
+        nums.iter().all(|n| n.as_bytes()[0].is_ascii_digit()),
+        "{line}"
+    );
+    kind.strip_suffix(')').expect(line).to_string()
+}
+
+fn refs_in_graph(env: &Env) -> usize {
+    let c = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    c.query_row("SELECT COUNT(*) FROM refs", [], |r| r.get::<_, i64>(0))
+        .unwrap() as usize
+}
+
+#[test]
+fn req090_ac1_full_pass_after_no_llm_build() {
+    let env = Env::mock();
+    let o = env.cmd(&["build", "--no-llm", "--verbose"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let lines = pass_lines(&o);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].ends_with(" non résolues (complète)"),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(pass_kind(&lines[0]), "complète");
+}
+
+#[test]
+fn req090_ac1_incremental_pass_after_a_modified_file() {
+    let env = Env::mock();
+    assert!(env.cmd(&["build", "--no-llm"]).status.success());
+    let java = env
+        .repo
+        .join("core/src/main/java/com/acme/core/OrderService.java");
+    let mut text = fs::read_to_string(&java).unwrap();
+    text.push_str("\n// modifié\n");
+    fs::write(&java, text).unwrap();
+    let o = env.cmd(&["update", "--no-llm", "--verbose"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let lines = pass_lines(&o);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains(" non résolues (incrémentale, "),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].ends_with(" références réévaluées)"),
+        "{}",
+        lines[0]
+    );
+    let kind = pass_kind(&lines[0]);
+    let n: usize = kind
+        .strip_prefix("incrémentale, ")
+        .and_then(|k| k.strip_suffix(" références réévaluées"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(n > 0 && n < refs_in_graph(&env), "n = {n}");
+}
+
+#[test]
+fn req090_ac1_mock_build_has_a_full_then_an_incremental_pass() {
+    let env = Env::mock();
+    let o = env.cmd(&["build", "--verbose"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let all: Vec<String> = stderr(&o).lines().map(String::from).collect();
+    let lines = pass_lines(&o);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(pass_kind(&lines[0]), "complète");
+    assert!(
+        pass_kind(&lines[1]).starts_with("incrémentale, ")
+            && pass_kind(&lines[1]).ends_with(" références réévaluées"),
+        "{}",
+        lines[1]
+    );
+    // AC-090-4 : place des deux lignes par rapport aux appels d'enrichissement.
+    let pos = |pred: &dyn Fn(&String) -> bool| all.iter().position(pred);
+    let rpos = |pred: &dyn Fn(&String) -> bool| all.iter().rposition(pred);
+    let first_start = pos(&|l| l.contains("llm enrich départ")).expect("départ");
+    let last_end = rpos(&|l| l.contains("llm enrich fin")).expect("fin");
+    let full = pos(&|l| l.contains("(complète)")).unwrap();
+    let incr = pos(&|l| l.contains("(incrémentale, ")).unwrap();
+    assert!(full < first_start && incr > last_end, "{all:?}");
+}

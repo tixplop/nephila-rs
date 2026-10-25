@@ -270,14 +270,29 @@ pub(crate) fn finish(report: &BuildReport) -> Result<()> {
 /// Une passe de résolution, résumé global compris (une transaction), tracée.
 fn resolve_pass(store: &mut Store) -> Result<resolve::ResolveStats> {
     let started = Instant::now();
-    let stats = resolve::resolve(store)?;
+    let stats = resolve::resolve(store).map_err(|e| pass_error(&e))?;
+    let kind = match stats.pass {
+        resolve::Pass::Full => "complète".to_string(),
+        resolve::Pass::Incremental { reevaluated } => {
+            format!("incrémentale, {reevaluated} références réévaluées")
+        }
+    };
     trace!(
-        "résolution: {} ms, {} liens, {} non résolues",
+        "résolution: {} ms, {} liens, {} non résolues ({kind})",
         started.elapsed().as_millis(),
         stats.edges,
         stats.unresolved
     );
     Ok(stats)
+}
+
+/// Erreur E-18 (V-006) : phase nommée et remède, sur une seule ligne ; seul point qui pose ce texte.
+fn pass_error(cause: &Error) -> Error {
+    let text = cause.to_string();
+    let first = text.lines().next().unwrap_or("").trim_end();
+    Error::Message(format!(
+        "résolution : {first} ; lancez nephila build pour reconstruire le graphe"
+    ))
 }
 
 pub(crate) fn check_repo(repo: &Path) -> Result<()> {
@@ -905,5 +920,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(!file.exists());
+    }
+
+    /// AC-089-2 : une panne de la base pendant la passe, complète comme incrémentale, donne le texte
+    /// E-18 exact ; `build` et `update` passent par `resolve_pass` (lecture de `finalize`).
+    #[test]
+    fn req089_ac2_failing_pass_renders_the_named_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        copy_dir(&fixture("maven3/repo"), &repo);
+        build_with_mock(&repo, None);
+        let trigger = "CREATE TRIGGER boom BEFORE INSERT ON edges \
+            BEGIN SELECT RAISE(ABORT, 'panne simulée'); END;";
+        exec(&repo, trigger);
+        // SQLite rend `panne simulée` seul pour un RAISE(ABORT) : le texte exact en découle.
+        let expect = |err: Error| {
+            let text = err.to_string();
+            assert!(
+                text.starts_with("résolution : base du graphe : ")
+                    && text.contains("panne simulée")
+                    && text.ends_with(" ; lancez nephila build pour reconstruire le graphe")
+                    && !text.contains('\n'),
+                "{text}"
+            );
+            assert_eq!(text.matches(" ; lancez").count(), 1, "{text}");
+        };
+        // Passe complète : une référence à lier est écrite, graphe à résoudre (aucun journal).
+        exec(
+            &repo,
+            "UPDATE refs SET unresolved = 1 WHERE id = (SELECT MIN(id) FROM refs);
+             UPDATE meta SET value = 'à résoudre' WHERE key = 'resolution'",
+        );
+        let mut store = Store::open_or_create(&repo).unwrap();
+        crate::store::reset_diagnostics();
+        expect(resolve_pass(&mut store).unwrap_err());
+        let d = crate::store::diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (1, 0));
+        drop(store);
+        // Passe incrémentale : graphe résolu, un fichier modifié, `update`.
+        exec(&repo, "DROP TRIGGER boom");
+        let mut store = Store::open_or_create(&repo).unwrap();
+        resolve_pass(&mut store).unwrap();
+        drop(store);
+        exec(&repo, trigger);
+        let java = repo.join("core/src/main/java/com/acme/core/OrderService.java");
+        let mut text = std::fs::read_to_string(&java).unwrap();
+        text.push_str("\nclass Added { void run() { new OrderService(); } }\n");
+        std::fs::write(&java, text).unwrap();
+        let lock = RepoLock::acquire(&repo).unwrap();
+        crate::store::reset_diagnostics();
+        let err = crate::index::update::update(
+            &repo,
+            &IndexOptions::default(),
+            None,
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap_err();
+        expect(err);
+        let d = crate::store::diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (0, 1));
     }
 }

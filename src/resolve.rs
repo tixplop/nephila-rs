@@ -21,6 +21,18 @@ use crate::store::{ChangeLog, FileRef, IncrementalWrite, Store};
 pub struct ResolveStats {
     pub edges: usize,
     pub unresolved: usize,
+    /// Genre de la passe qui a rendu ce bilan (REQ-090, DEC-098).
+    pub pass: Pass,
+}
+
+/// Genre d'une passe de résolution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Pass {
+    /// Toutes les références réévaluées.
+    #[default]
+    Full,
+    /// Références réévaluées par cette passe (valeur ajoutée à `refs_reevaluated`).
+    Incremental { reevaluated: usize },
 }
 
 /// Résultat du calcul : liens et références non résolues.
@@ -77,6 +89,7 @@ fn resolve_full(store: &mut Store) -> Result<ResolveStats> {
     Ok(ResolveStats {
         edges: store.count_edges()?,
         unresolved: store.count_unresolved()?,
+        pass: Pass::Full,
     })
 }
 
@@ -280,6 +293,7 @@ fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStat
     Ok(ResolveStats {
         edges: store.count_edges()?,
         unresolved: store.count_unresolved()?,
+        pass: Pass::Incremental { reevaluated },
     })
 }
 
@@ -1340,7 +1354,7 @@ mod tests {
         let s1 = resolve(&mut e.store).unwrap();
         let before = e.store.edges().unwrap().len();
         let s2 = resolve(&mut e.store).unwrap();
-        assert_eq!(s1, s2);
+        assert_eq!((s1.edges, s1.unresolved), (s2.edges, s2.unresolved));
         assert_eq!(before, e.store.edges().unwrap().len());
         assert_eq!(s1.edges, before);
     }
@@ -3072,7 +3086,10 @@ import q.R;",
             st.nodes().unwrap(),
             st.edges().unwrap(),
             ids,
-            stats.clone(),
+            ResolveStats {
+                pass: Pass::Full,
+                ..stats.clone()
+            },
             un,
             st.summary().unwrap().unwrap().0,
         )
@@ -3651,5 +3668,40 @@ import q.R;",
         for v in &visiting {
             assert!(has_edge(&e, v, EdgeKind::Calls, &mid("pz.Zed.run")), "{v}");
         }
+    }
+
+    /// AC-090-2 : le bilan d'une passe incrémentale porte l'accroissement de `refs_reevaluated` ;
+    /// celui d'une passe complète la marque complète.
+    #[test]
+    fn req090_ac2_stats_carry_the_pass_kind_and_the_reevaluated_count() {
+        let mut e = big_graph();
+        e.store
+            .insert_pending_files(&[pending("Zed.java")])
+            .unwrap();
+        e.store
+            .replace_file(
+                "Zed.java",
+                &[
+                    plain(NodeKind::Package, "pz", Some("Zed.java")),
+                    ty("pz.Zed", "Zed.java"),
+                    method("pz.Zed.run", "Zed.java"),
+                ],
+                &[],
+            )
+            .unwrap();
+        crate::store::reset_diagnostics();
+        let stats = resolve(&mut e.store).unwrap();
+        let d = crate::store::diagnostics();
+        assert_eq!((d.full_passes(), d.incremental_passes()), (0, 1));
+        assert!(d.refs_reevaluated() > 0);
+        assert_eq!(
+            stats.pass,
+            Pass::Incremental {
+                reevaluated: d.refs_reevaluated() as usize
+            }
+        );
+        // Sans journal des changements : passe complète.
+        let stats = resolve_full(&mut e.store).unwrap();
+        assert_eq!(stats.pass, Pass::Full);
     }
 }
