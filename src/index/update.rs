@@ -12,7 +12,7 @@ use crate::index::structure;
 use crate::llm::Llm;
 use crate::model::{FileRecord, FileState};
 use crate::out::Out;
-use crate::scan::ScannedFile;
+use crate::scan::{self, ScannedFile};
 use crate::store::{db_path, Store};
 use crate::trace;
 
@@ -95,7 +95,7 @@ pub fn update(
     let mut store = Store::open_existing(repo)?;
     // Lu à l'ouverture, avant toute écriture de la commande (REQ-088, DEC-097).
     let to_resolve = store.needs_resolution()?;
-    let mut d = diff::compute(repo, &store, matcher, opts.jobs)?;
+    let mut d = diff::compute(repo, &store, matcher, opts.jobs, scan::RETAIN_BUDGET)?;
     trace!(
         "parcours: {} ajoutés, {} modifiés, {} supprimés, {} en attente{}",
         d.paths(Change::Added).count(),
@@ -687,7 +687,7 @@ mod tests {
     fn structure_phase_only(repo: &Path) {
         let mut store = Store::open_existing(repo).unwrap();
         let matcher = Matcher::none();
-        let mut d = diff::compute(repo, &store, &matcher, 1).unwrap();
+        let mut d = diff::compute(repo, &store, &matcher, 1, scan::RETAIN_BUDGET).unwrap();
         assert!(!d.changes.is_empty());
         let changed: std::collections::HashSet<String> =
             d.changes.iter().map(|c| c.path.clone()).collect();

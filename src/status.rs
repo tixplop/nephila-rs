@@ -16,7 +16,7 @@ const TO_RESOLVE_LINE: &str = "graphe à résoudre : lancez nephila update";
 pub fn run(repo: &Path, as_json: bool, out: &mut Out) -> Result<()> {
     let matcher = ProjectFilters::load_matcher(repo)?;
     let store = Store::open_readonly(repo)?;
-    let d = diff::compute(repo, &store, &matcher, crate::index::default_jobs())?;
+    let d = diff::compute(repo, &store, &matcher, crate::index::default_jobs(), 0)?;
     let to_resolve = store.needs_resolution()?;
     let up_to_date = d.is_up_to_date() && !to_resolve;
     let to_enrich = store.count_files_to_enrich()?;

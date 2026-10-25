@@ -65,14 +65,22 @@ impl Diff {
 /// Compare le dépôt avec les fichiers connus du graphe. Un fichier en attente reste « en
 /// attente » même s'il a changé (il sera retraité de toute façon) ; absent du disque, il est
 /// « supprimé » (c'est aussi le cas d'un fichier indexé que `matcher` exclut désormais).
-pub fn compute(repo: &Path, store: &Store, matcher: &Matcher, jobs: usize) -> Result<Diff> {
+/// `budget` : octets de contenus lus qui restent retenus dans `scanned` pour l'analyse qui suit
+/// (REQ-110) ; 0 pour qui n'analyse rien (`status`), `scan::RETAIN_BUDGET` pour `update`.
+pub fn compute(
+    repo: &Path,
+    store: &Store,
+    matcher: &Matcher,
+    jobs: usize,
+    budget: usize,
+) -> Result<Diff> {
     let known = store.files()?;
     let scan::ScanResult {
         files: scanned,
         gradle_settings,
         excluded,
         ..
-    } = scan::scan(repo, &known, matcher, jobs)?;
+    } = scan::scan_with_budget(repo, &known, matcher, jobs, budget)?;
     let on_disk: HashMap<&str, &ScannedFile> =
         scanned.iter().map(|f| (f.path.as_str(), f)).collect();
     // Mise à niveau 0.9 -> 0.10 : un `package.json` enregistré comme document de données doit
@@ -165,4 +173,47 @@ pub fn quick(repo: &Path, store: &Store, matcher: &Matcher) -> Result<usize> {
         })
         .count();
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn req110_ac1_budget_de_retention_de_compute() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::fs::write(repo.join("A.java"), "class A {}\n").unwrap();
+        let mut store = Store::open_or_create(repo).unwrap();
+        store
+            .insert_files(&[FileRecord {
+                path: "A.java".into(),
+                hash: "ancienne".into(),
+                size: 1,
+                mtime: 1,
+                recorded_at: 0,
+                state: FileState::Indexed,
+            }])
+            .unwrap();
+        std::fs::write(repo.join("B.java"), "class B {}\n").unwrap();
+        let matcher = Matcher::none();
+
+        let none = compute(repo, &store, &matcher, 1, 0).unwrap();
+        assert_eq!(none.scanned.len(), 2);
+        assert!(none.scanned.iter().all(|f| f.content.is_none()));
+
+        let all = compute(repo, &store, &matcher, 1, scan::RETAIN_BUDGET).unwrap();
+        assert_eq!(all.changes, none.changes);
+        let kinds: Vec<(&str, Change)> = all
+            .changes
+            .iter()
+            .map(|c| (c.path.as_str(), c.change))
+            .collect();
+        assert_eq!(
+            kinds,
+            [("A.java", Change::Modified), ("B.java", Change::Added)]
+        );
+        assert_eq!(all.scanned.len(), 2);
+        assert!(all.scanned.iter().all(|f| f.content.is_some()));
+    }
 }

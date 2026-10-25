@@ -543,13 +543,48 @@ pub fn walk(
     Ok(res)
 }
 
-/// Lit `rel` sous `root` ; refuse (message d'avertissement) un fichier illisible ou non UTF-8.
+/// Taille des blocs de `read_utf8`.
+const UTF8_BLOCK: usize = 64 * 1024;
+
+/// Contrôle que `abs` se lit et est de l'UTF-8 valide, sans garder son contenu : lecture par
+/// blocs de 64 Kio dans un tampon réutilisé, une séquence coupée en fin de bloc (au plus 3
+/// octets) étant reprise au bloc suivant. Verdict et message identiques à ceux de `read_text`.
 /// Critère unique de `scan` et de `diff::quick` (DEC-068).
-pub fn read_utf8(abs: &Path, rel: &str) -> std::result::Result<Vec<u8>, String> {
-    read_text(abs, rel).map(String::into_bytes)
+pub fn read_utf8(abs: &Path, rel: &str) -> std::result::Result<(), String> {
+    use std::io::Read;
+    let label = crate::escape::path(rel);
+    let mut file = std::fs::File::open(abs).map_err(|e| unreadable(&label, &e))?;
+    // Reste reporté (au plus 3 octets) puis bloc lu.
+    let mut buf = vec![0u8; 3 + UTF8_BLOCK];
+    let mut carry = 0usize;
+    loop {
+        let n = match file.read(&mut buf[carry..]) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(unreadable(&label, &e)),
+        };
+        let end = carry + n;
+        if n == 0 {
+            return if carry == 0 {
+                Ok(())
+            } else {
+                Err(not_utf8(&label))
+            };
+        }
+        match std::str::from_utf8(&buf[..end]) {
+            Ok(_) => carry = 0,
+            Err(e) if e.error_len().is_none() => {
+                // Séquence incomplète en fin de bloc : reprise au bloc suivant.
+                let valid = e.valid_up_to();
+                carry = end - valid;
+                buf.copy_within(valid..end, 0);
+            }
+            Err(_) => return Err(not_utf8(&label)),
+        }
+    }
 }
 
-/// Comme `read_utf8`, le contenu étant rendu en `String` (validée une seule fois, sans copie).
+/// Lit `abs` en entier ; comme `read_utf8` pour le verdict, le contenu étant rendu en `String` (validée une seule fois, sans copie).
 pub fn read_text(abs: &Path, rel: &str) -> std::result::Result<String, String> {
     read_text_as(abs, &crate::escape::path(rel))
 }
@@ -557,9 +592,18 @@ pub fn read_text(abs: &Path, rel: &str) -> std::result::Result<String, String> {
 /// Comme `read_text`, `label` étant le texte déjà échappé de `<où>` : le chemin converti, ou le
 /// nom réel pour un fichier d'un groupe de collision (REQ-102, V-006).
 fn read_text_as(abs: &Path, label: &str) -> std::result::Result<String, String> {
-    let bytes =
-        std::fs::read(abs).map_err(|e| format!("{label} ignoré : lecture impossible ({e})"))?;
-    String::from_utf8(bytes).map_err(|_| format!("{label} ignoré : fichier non UTF-8"))
+    let bytes = std::fs::read(abs).map_err(|e| unreadable(label, &e))?;
+    String::from_utf8(bytes).map_err(|_| not_utf8(label))
+}
+
+/// Message d'un fichier illisible (ouverture ou lecture), commun à `read_utf8` et `read_text_as`.
+fn unreadable(label: &str, e: &std::io::Error) -> String {
+    format!("{label} ignoré : lecture impossible ({e})")
+}
+
+/// Message d'un fichier non UTF-8, commun à `read_utf8` et `read_text_as`.
+fn not_utf8(label: &str) -> String {
+    format!("{label} ignoré : fichier non UTF-8")
 }
 
 /// Empreinte lue d'un fichier et son contenu retenu s'il tient dans le budget.
@@ -870,6 +914,119 @@ mod tests {
         assert_eq!(RETAINED.load(Ordering::SeqCst), base);
         let empty = Retained::reserve(String::new(), base + 10);
         assert!(empty.is_ok());
+    }
+
+    /// Verdict et message de `read_utf8` comparés à `from_utf8` du contenu entier et à `read_text`.
+    fn assert_read_utf8_matches(path: &Path, content: &[u8], what: &str) {
+        std::fs::write(path, content).unwrap();
+        let want_ok = std::str::from_utf8(content).is_ok();
+        let got = read_utf8(path, "f.txt");
+        assert_eq!(got.is_ok(), want_ok, "verdict : {what}");
+        match (got, read_text(path, "f.txt")) {
+            (Ok(()), Ok(_)) => {}
+            (Err(a), Err(b)) => {
+                assert_eq!(a, b, "message : {what}");
+                assert_eq!(a, "f.txt ignoré : fichier non UTF-8", "{what}");
+            }
+            (a, b) => panic!("{what} : {a:?} contre {:?}", b.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn req109_ac1_read_utf8_equivaut_a_from_utf8_autour_des_frontieres() {
+        const B: usize = 65_536;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+        for n in [0, 1, B - 1, B, B + 1, 3 * B - 3, 3 * B, 3 * B + 3] {
+            cases.push((format!("{n} octets"), vec![b'a'; n]));
+        }
+        let chars: [(&str, &[u8]); 3] = [
+            ("2 octets", "é".as_bytes()),
+            ("3 octets", "€".as_bytes()),
+            ("4 octets", "😀".as_bytes()),
+        ];
+        for boundary in [B, 2 * B] {
+            for (name, ch) in chars {
+                for off in boundary - 5..=boundary + 2 {
+                    let mut v = vec![b'a'; off];
+                    v.extend_from_slice(ch);
+                    v.extend_from_slice(b"zz");
+                    cases.push((format!("{name} à {off}"), v));
+                    // Séquence tronquée en fin de fichier, sa fin sur ou près de la frontière.
+                    for cut in 1..ch.len() {
+                        let mut t = vec![b'a'; off];
+                        t.extend_from_slice(&ch[..cut]);
+                        cases.push((format!("{name} tronqué à {cut} après {off}"), t));
+                    }
+                }
+            }
+            for off in [boundary - 1, boundary, boundary + 1] {
+                for bad in [0xFFu8, 0x80, 0xC3] {
+                    let mut v = vec![b'a'; off];
+                    v.push(bad);
+                    v.extend_from_slice(b"zz");
+                    cases.push((format!("octet {bad:#x} à {off}"), v));
+                }
+            }
+            for (name, seq) in [
+                ("forme trop longue 2", &[0xC0u8, 0x80][..]),
+                ("forme trop longue 3", &[0xE0, 0x80, 0x80][..]),
+                ("demi-substitut", &[0xED, 0xA0, 0x80][..]),
+                ("hors plage", &[0xF4, 0x90, 0x80, 0x80][..]),
+            ] {
+                for off in boundary - 4..=boundary + 1 {
+                    let mut v = vec![b'a'; off];
+                    v.extend_from_slice(seq);
+                    cases.push((format!("{name} à {off}"), v.clone()));
+                    v.extend_from_slice(b"zz");
+                    cases.push((format!("{name} suivi de zz à {off}"), v));
+                }
+            }
+        }
+        // Valide : un caractère de 4 octets sur chaque frontière, deux fois de suite.
+        let mut v = vec![b'a'; B - 2];
+        v.extend_from_slice("😀😀".as_bytes());
+        cases.push(("deux caractères de 4 octets sur la frontière".into(), v));
+        for (what, content) in &cases {
+            assert_read_utf8_matches(&path, content, what);
+        }
+    }
+
+    #[test]
+    fn req109_ac1_read_utf8_erreurs_de_lecture() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent.txt");
+        let a = read_utf8(&absent, "absent.txt").unwrap_err();
+        let b = read_text(&absent, "absent.txt").unwrap_err();
+        assert_eq!(a, b);
+        assert!(
+            a.starts_with("absent.txt ignoré : lecture impossible ("),
+            "{a}"
+        );
+        // Un dossier s'ouvre mais ne se lit pas : erreur pendant la lecture.
+        let d = dir.path().join("dossier");
+        std::fs::create_dir(&d).unwrap();
+        let a = read_utf8(&d, "dossier").unwrap_err();
+        assert_eq!(a, read_text(&d, "dossier").unwrap_err());
+        assert!(
+            a.starts_with("dossier ignoré : lecture impossible ("),
+            "{a}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let f = dir.path().join("secret.txt");
+            std::fs::write(&f, "x").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o0)).unwrap();
+            let got = read_utf8(&f, "secret.txt");
+            let want = read_text(&f, "secret.txt");
+            // Vert sans assertion si le processus lit quand même (root).
+            assert_eq!(got.is_ok(), want.is_ok());
+            if let (Err(a), Err(b)) = (got, want) {
+                assert_eq!(a, b);
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1351,8 +1508,8 @@ mod tests {
                     (k.hash.clone(), false)
                 }
                 _ => {
-                    let bytes = match read_utf8(&abs, &rel) {
-                        Ok(b) => b,
+                    let bytes = match read_text(&abs, &rel) {
+                        Ok(b) => b.into_bytes(),
                         Err(msg) => {
                             warn(&msg);
                             res.warnings.push(msg);

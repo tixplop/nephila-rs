@@ -1079,3 +1079,87 @@ fn perf_req080_ac3_export_memoire() {
         "RSS {best} Kio > 50 % de {EXPORT_RSS0_KIB} Kio"
     );
 }
+
+/// AC-109-2 (`big.md` : `.txt` n'est pas un type analysé) : `query search X --check-stale`, dépôt qui gagne un fichier valide de 256 Mio :
+/// pic de mémoire du seul processus < 64 Mio, fichier compté comme ajouté ; avec un octet invalide
+/// final, fichier non compté.
+#[test]
+#[ignore]
+#[cfg(target_os = "linux")]
+fn perf_req109_ac2_check_stale_memoire() {
+    use std::io::Write;
+    let _g = serial();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-check-stale-mem");
+    let _ = std::fs::remove_dir_all(&root);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("A.java"), "class A {}\n").unwrap();
+    let config = root.join("config.toml");
+    std::fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    let f = Fixture {
+        repo: repo.clone(),
+        config,
+        mock: root.join("mock"),
+    };
+    std::fs::create_dir_all(&f.mock).unwrap();
+    backdate(&repo);
+    assert!(timed(&f, &["build", "--no-llm"]).1.status.success());
+    let big = repo.join("big.md");
+    // Supprime le gros fichier et le dossier de travail même si un assert échoue.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    let write_big = |tail: &[u8]| {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&big).unwrap());
+        let line = [b'a'; 1023];
+        for _ in 0..(256 * 1024 - 1) {
+            w.write_all(&line).unwrap();
+            w.write_all(b"\n").unwrap();
+        }
+        w.write_all(&line[..1023 - tail.len()]).unwrap();
+        w.write_all(tail).unwrap();
+        w.flush().unwrap();
+    };
+    let measure = |label: &str| -> (String, i64) {
+        let out = root.join("stderr.txt");
+        let mut c = cmd(&f, &["query", "search", "A", "--check-stale"]);
+        c.stderr(std::fs::File::create(&out).unwrap());
+        use std::process::Stdio;
+        #[allow(clippy::zombie_processes)] // attendu par `libc::wait4` ci-dessous
+        let child = c.stdout(Stdio::null()).spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let mut status: libc::c_int = 0;
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        assert_eq!(r, pid, "wait4 a échoué");
+        let err = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "{label} : sortie inattendue (statut {status}) ; stderr : {err}"
+        );
+        eprintln!("{label} : RSS {} Kio", usage.ru_maxrss);
+        (err, usage.ru_maxrss)
+    };
+    write_big(b"a");
+    let (err, kib) = measure("valide");
+    let _ = std::fs::remove_file(&big);
+    write_big(&[0xFF]);
+    let (err_bad, kib_bad) = measure("octet invalide final");
+    assert!(
+        err.contains("pas à jour"),
+        "fichier ajouté non compté : {err}"
+    );
+    assert!(
+        !err_bad.contains("pas à jour"),
+        "fichier invalide compté : {err_bad}"
+    );
+    assert!(kib < 64 * 1024, "RSS {kib} Kio >= 64 Mio (valide)");
+    assert!(
+        kib_bad < 64 * 1024,
+        "RSS {kib_bad} Kio >= 64 Mio (invalide)"
+    );
+}
