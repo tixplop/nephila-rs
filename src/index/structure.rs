@@ -21,7 +21,7 @@ pub(crate) const EXTRACT_STACK: usize = 16 * 1024 * 1024;
 const BATCH: usize = 200;
 
 enum Outcome {
-    Parsed(Result<PreparedStructure>, Vec<String>),
+    Parsed(String, Result<PreparedStructure>, Vec<String>),
     Failed(String, Error),
 }
 
@@ -52,6 +52,8 @@ pub(crate) fn analyze(
     let retained_before = report.retained;
     trace!("structure: début {total} fichiers, {workers} fils");
     let mut batch: Vec<PreparedStructure> = Vec::new();
+    // Avertissements de la phase, rangés par chemin converti et écrits triés (REQ-104, AC-104-5).
+    let mut notes: Vec<(String, Vec<String>)> = Vec::new();
 
     let mut meter = progress::Meter::start(Phase::Extraction, total);
     let mut spawn_error: Option<Error> = None;
@@ -118,29 +120,33 @@ pub(crate) fn analyze(
             }
             match outcome {
                 Outcome::Failed(path, e) => {
-                    warn(&format!("{path} : {e}"));
+                    notes.push((path.clone(), vec![format!("{path} : {e}")]));
                     report.failed += 1;
                 }
-                Outcome::Parsed(prepared, warnings) => {
+                Outcome::Parsed(path, prepared, warnings) => {
                     if write_error.is_some() {
                         continue;
                     }
-                    for w in &warnings {
-                        warn(w);
-                    }
+                    let mut lines = warnings;
                     let p = match prepared {
                         Ok(p) => p,
                         Err(e) => {
                             queue.lock().unwrap_or_else(|q| q.into_inner()).clear();
+                            if !lines.is_empty() {
+                                notes.push((path, lines));
+                            }
                             write_error = Some(e);
                             continue;
                         }
                     };
                     if p.dropped > 0 {
-                        warn(&format!(
+                        lines.push(format!(
                             "{} : {} référence(s) ignorée(s), source non déclarée",
                             p.path, p.dropped
                         ));
+                    }
+                    if !lines.is_empty() {
+                        notes.push((path, lines));
                     }
                     batch.push(p);
                     if batch.len() >= BATCH {
@@ -153,6 +159,11 @@ pub(crate) fn analyze(
             flush(store, &mut batch, queue, report, &mut write_error);
         }
     });
+    // Ordre des octets du chemin ; le tri est stable, l'ordre interne d'un fichier est gardé.
+    notes.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    for line in notes.iter().flat_map(|(_, lines)| lines) {
+        warn(line);
+    }
     trace!(
         "structure: fin {} ms, {} en attente, {} enrichissements conservés",
         started.elapsed().as_millis(),
@@ -168,7 +179,11 @@ pub(crate) fn analyze(
 fn extract(path: &str, text: &str, ctx: &ParseCtx) -> Outcome {
     match parse::extract(Path::new(path), text, ctx) {
         // Conversion, contrôles et clés : dans le fil d'extraction (DEC-086).
-        Ok(s) => Outcome::Parsed(crate::store::prepare_structure(path, &s), s.warnings),
+        Ok(s) => Outcome::Parsed(
+            path.to_string(),
+            crate::store::prepare_structure(path, &s),
+            s.warnings,
+        ),
         Err(e) => Outcome::Failed(path.to_string(), e),
     }
 }
