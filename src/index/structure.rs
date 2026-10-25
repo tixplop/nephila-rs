@@ -37,6 +37,27 @@ pub(crate) fn analyze(
     store: &mut Store,
     report: &mut BuildReport,
 ) -> Result<()> {
+    analyze_with(
+        repo,
+        files,
+        jobs,
+        gradle_settings,
+        store,
+        report,
+        &crate::workers::Spawner,
+    )
+}
+
+/// `analyze` avec le lanceur de fils donné (DEC-109).
+pub(crate) fn analyze_with<L: crate::workers::Launcher>(
+    repo: &Path,
+    files: Vec<ScannedFile>,
+    jobs: usize,
+    gradle_settings: &HashMap<String, Option<String>>,
+    store: &mut Store,
+    report: &mut BuildReport,
+    launcher: &L,
+) -> Result<()> {
     let ctx = ParseCtx {
         // Chemin absolu : `.` n'a pas de nom de dossier (module Gradle racine).
         repo_root: Some(repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf())),
@@ -60,13 +81,18 @@ pub(crate) fn analyze(
     std::thread::scope(|scope| {
         let queue = &queue;
         let ctx = &ctx;
-        let mut started_workers = 0usize;
-        for _ in 0..workers {
-            let tx = tx.clone();
-            let spawned = std::thread::Builder::new()
-                .name("nephila-extract".into())
-                .stack_size(EXTRACT_STACK)
-                .spawn_scoped(scope, move || loop {
+        let (started_workers, start_error) = crate::workers::start_workers(
+            scope,
+            workers,
+            launcher,
+            || {
+                std::thread::Builder::new()
+                    .name("nephila-extract".into())
+                    .stack_size(EXTRACT_STACK)
+            },
+            || {
+                let tx = tx.clone();
+                Box::new(move || loop {
                     let Some(mut file) =
                         queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front()
                     else {
@@ -95,23 +121,21 @@ pub(crate) fn analyze(
                     if tx.send(outcome).is_err() {
                         break;
                     }
-                });
-            match spawned {
-                Ok(_) => {
-                    started_workers += 1;
-                    #[cfg(test)]
-                    tests::EXTRACT_THREADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                Err(e) => {
-                    if started_workers == 0 {
-                        queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
-                        spawn_error = Some(Error::Message(format!(
-                            "création des fils d'analyse impossible : {e}"
-                        )));
-                    }
-                    break;
-                }
+                })
+            },
+        );
+        #[cfg(test)]
+        tests::EXTRACT_THREADS.fetch_add(started_workers, std::sync::atomic::Ordering::SeqCst);
+        if let Some(e) = start_error {
+            if started_workers == 0 {
+                queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                spawn_error = Some(Error::Message(format!(
+                    "création des fils d'analyse impossible : {e}"
+                )));
             }
+        }
+        if started_workers > 0 && started_workers < workers {
+            trace!("structure: {started_workers} fils démarrés sur {workers} demandés");
         }
         drop(tx);
         for outcome in rx {
@@ -655,5 +679,118 @@ mod tests {
             .any(|(n, rows)| n == "nodes" && rows.len() > 60));
         assert_eq!(tables, oracle);
         assert_eq!(tables1, oracle);
+    }
+
+    type Tables = Vec<(String, Vec<String>)>;
+
+    /// Dépôt de 6 fichiers analysé avec `jobs` et le lanceur donné : (résultat, traces, tables).
+    fn run_with_launcher<L: crate::workers::Launcher>(
+        jobs: usize,
+        launcher: &L,
+    ) -> (Result<()>, Vec<String>, Tables) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        write_repo(repo, 6);
+        let scanned = crate::scan::scan(repo, &[], &crate::filter::Matcher::none(), 1).unwrap();
+        assert_eq!(scanned.files.len(), 6);
+        let mut store = Store::open_or_create(repo).unwrap();
+        store
+            .reset_with_pending_files(&pending_records(&scanned.files))
+            .unwrap();
+        let mut report = BuildReport::default();
+        let (r, events) = crate::trace::capture(|| {
+            analyze_with(
+                repo,
+                scanned.files,
+                jobs,
+                &scanned.gradle_settings,
+                &mut store,
+                &mut report,
+                launcher,
+            )
+        });
+        resolve(&mut store, repo);
+        drop(store);
+        (r, events, dump(repo))
+    }
+
+    fn started_traces(events: &[String]) -> Vec<&String> {
+        events
+            .iter()
+            .filter(|e| e.contains("fils démarrés"))
+            .collect()
+    }
+
+    /// AC-112-1 : échec au 1er démarrage.
+    #[test]
+    fn req112_ac1_echec_au_premier_fil() {
+        let l = crate::workers::tests::FailAt::new(1);
+        let (r, events, tables) = run_with_launcher(4, &l);
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "création des fils d'analyse impossible : refus simulé"
+        );
+        assert!(tables
+            .iter()
+            .all(|(n, rows)| n != "nodes" || rows.is_empty()));
+        assert!(started_traces(&events).is_empty());
+        // AC-112-4 : la fin est tracée.
+        assert!(events.iter().any(|e| e.starts_with("structure: fin ")));
+    }
+
+    /// AC-112-2 et AC-112-4 : échec au 3e démarrage, analyse avec 2 fils.
+    #[test]
+    fn req112_ac2_echec_au_troisieme_fil() {
+        let (_, _, oracle) = run_with_launcher(2, &crate::workers::Spawner);
+        assert!(oracle
+            .iter()
+            .any(|(n, rows)| n == "nodes" && !rows.is_empty()));
+        let before = EXTRACT_THREADS.load(Ordering::SeqCst);
+        let l = crate::workers::tests::FailAt::new(3);
+        let (r, events, tables) = run_with_launcher(4, &l);
+        r.unwrap();
+        assert_eq!(EXTRACT_THREADS.load(Ordering::SeqCst) - before, 2);
+        assert_eq!(tables, oracle);
+        let begin = events
+            .iter()
+            .position(|e| e == "structure: début 6 fichiers, 4 fils")
+            .unwrap();
+        assert_eq!(
+            events[begin + 1],
+            "structure: 2 fils démarrés sur 4 demandés"
+        );
+        assert_eq!(started_traces(&events).len(), 1);
+        let end = events
+            .iter()
+            .position(|e| e.starts_with("structure: fin "))
+            .unwrap();
+        assert!(end > begin + 1);
+    }
+
+    /// AC-112-4 : échec au 2e démarrage, pluriel figé.
+    #[test]
+    fn req112_ac4_un_seul_fil_demarre() {
+        let l = crate::workers::tests::FailAt::new(2);
+        let (r, events, _) = run_with_launcher(4, &l);
+        r.unwrap();
+        let begin = events
+            .iter()
+            .position(|e| e == "structure: début 6 fichiers, 4 fils")
+            .unwrap();
+        assert_eq!(
+            events[begin + 1],
+            "structure: 1 fils démarrés sur 4 demandés"
+        );
+        assert_eq!(started_traces(&events).len(), 1);
+    }
+
+    /// AC-112-3 : aucun échec, aucune trace.
+    #[test]
+    fn req112_ac3_aucun_echec_aucune_trace() {
+        let l = crate::workers::tests::FailAt::new(0);
+        let (r, events, _) = run_with_launcher(4, &l);
+        r.unwrap();
+        assert!(started_traces(&events).is_empty());
+        assert_eq!(l.calls.load(Ordering::SeqCst), 4);
     }
 }

@@ -20,3 +20,4 @@ pub mod store;
 pub mod summary;
 pub mod trace;
 pub mod view;
+pub(crate) mod workers;

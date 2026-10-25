@@ -36,6 +36,10 @@ pub fn format_line(elapsed: Duration, event: &str) -> String {
 
 /// Écrit une trace si elles sont actives.
 pub fn emit(args: fmt::Arguments) {
+    #[cfg(test)]
+    if capture_event(&args) {
+        return;
+    }
     if !enabled() {
         return;
     }
@@ -44,6 +48,41 @@ pub fn emit(args: fmt::Arguments) {
     line.push('\n');
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(line.as_bytes());
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAPTURED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn capture_event(args: &fmt::Arguments) -> bool {
+    CAPTURED.with(|c| match c.borrow_mut().as_mut() {
+        Some(v) => {
+            v.push(args.to_string());
+            true
+        }
+        None => false,
+    })
+}
+
+/// Exécute `f` en rangeant les traces émises par le fil courant (texte après `trace: [..] `),
+/// même si les traces sont désactivées (DEC-109).
+#[cfg(test)]
+pub(crate) fn capture<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    // Garde : la capture se termine même si `f` panique.
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CAPTURED.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let guard = Guard;
+    let r = f();
+    let events = CAPTURED.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    drop(guard);
+    (r, events)
 }
 
 /// Tronque `msg` à `max` caractères (suffixe `…`), sur une ligne.
@@ -96,6 +135,17 @@ mod tests {
             format_line(Duration::from_millis(5), "e"),
             "trace: [0.005s] e"
         );
+    }
+
+    #[test]
+    fn dec109_capture_range_les_traces_du_fil() {
+        let ((), ev) = capture(|| {
+            crate::trace!("a {}", 1);
+            crate::trace!("b");
+        });
+        assert_eq!(ev, vec!["a 1", "b"]);
+        let ((), none) = capture(|| {});
+        assert!(none.is_empty());
     }
 
     #[test]
