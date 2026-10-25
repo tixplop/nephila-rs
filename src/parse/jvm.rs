@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::model::{node_id, EdgeKind, NodeKind, SubKind};
 use crate::parse::{Declared, OrderedSet, Reference};
 
-use super::FileStructure;
+use super::{FileStructure, MAX_NESTING};
 
 /// Nom de la méthode qui représente constructeurs et blocs d'initialisation.
 pub const INIT: &str = "<init>";
@@ -31,6 +31,8 @@ pub struct Builder {
     stack: Vec<String>,
     /// Identifiants des types de premier niveau.
     top_level: Vec<String>,
+    /// Une entrée de type a été refusée par `MAX_NESTING`.
+    nesting_cut: bool,
 }
 
 /// Retire arguments génériques, espaces et accolades de fin d'un nom de type écrit dans le code.
@@ -113,15 +115,22 @@ impl Builder {
         }
     }
 
-    /// Entre dans un type : le déclare et le pose sur la pile. Renvoie son nom qualifié.
-    pub fn enter_type(&mut self, name: &str, subkind: SubKind) -> String {
+    /// Entre dans un type : le déclare et le pose sur la pile. Renvoie son nom qualifié, ou `None`
+    /// (rien déclaré, rien empilé, drapeau levé) si `MAX_NESTING` types l'englobent déjà (DEC-105) :
+    /// l'appelant ne descend alors ni dans le corps ni dans les clauses du type, et n'appelle pas
+    /// `exit_type`.
+    pub fn enter_type(&mut self, name: &str, subkind: SubKind) -> Option<String> {
+        if self.stack.len() >= MAX_NESTING {
+            self.nesting_cut = true;
+            return None;
+        }
         let q = self.qualify_type(name);
         if self.stack.is_empty() {
             self.top_level.push(node_id(NodeKind::Type, &q));
         }
         self.push_declared(NodeKind::Type, q.clone(), Some(subkind));
         self.stack.push(q.clone());
-        q
+        Some(q)
     }
 
     pub fn exit_type(&mut self) {
@@ -225,6 +234,7 @@ impl Builder {
             declares: self.declares,
             references: self.references.into_vec(),
             warnings: Vec::new(),
+            nesting_cut: self.nesting_cut,
         }
     }
 }
@@ -238,9 +248,9 @@ mod tests {
         let mut b = Builder::new();
         b.set_package("a.b");
         let o = b.enter_type("Outer", SubKind::Class);
-        assert_eq!(o, "a.b.Outer");
+        assert_eq!(o, Some("a.b.Outer".to_string()));
         let i = b.enter_type("Inner", SubKind::Class);
-        assert_eq!(i, "a.b.Outer.Inner");
+        assert_eq!(i, Some("a.b.Outer.Inner".to_string()));
         assert_eq!(b.declare_method("m").unwrap(), "a.b.Outer.Inner.m");
         b.exit_type();
         assert_eq!(b.current_type(), Some("a.b.Outer"));
@@ -253,7 +263,7 @@ mod tests {
         assert_eq!(b.declare_file_type("FooKt", SubKind::Class), "a.FooKt");
         assert_eq!(b.current_type(), None);
         assert_eq!(b.declare_method("f"), None);
-        assert_eq!(b.enter_type("T", SubKind::Class), "a.T");
+        assert_eq!(b.enter_type("T", SubKind::Class), Some("a.T".to_string()));
     }
 
     #[test]

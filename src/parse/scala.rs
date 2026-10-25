@@ -79,7 +79,8 @@ impl Ctx<'_> {
         let Some(ft) = self.file_type.clone() else {
             return;
         };
-        self.b.enter_type(&ft, SubKind::Object);
+        // Premier niveau : la pile est vide, `enter_type` ne refuse jamais ; résultat ignoré à dessein.
+        let _ = self.b.enter_type(&ft, SubKind::Object);
         self.member(n);
         self.b.exit_type();
     }
@@ -155,7 +156,9 @@ impl Ctx<'_> {
         if name.is_empty() {
             return;
         }
-        let q = self.b.enter_type(&name, sub);
+        let Some(q) = self.b.enter_type(&name, sub) else {
+            return;
+        };
 
         if let Some(ext) = n.child_by_field_name("extend") {
             let mut cur = ext.walk();
@@ -602,5 +605,16 @@ mod tests {
         );
         let s = run_small_stack("S.scala", src);
         assert!(has_ref(&s, "method:S.m", EdgeKind::Calls, "S.helper"));
+    }
+
+    #[test]
+    fn req104_ac3_imbrication_bornee_a_1000_niveaux() {
+        use crate::parse::nesting_support::check;
+        check(
+            |t| extract(Path::new("Deep.scala"), t).unwrap(),
+            |i| format!("class C{i} {{\n def m(): Unit = {{}}\n"),
+            "}\n",
+            "class B { def m(): Unit = {} }",
+        );
     }
 }

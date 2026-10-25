@@ -537,6 +537,7 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
         declares,
         references,
         warnings,
+        ..FileStructure::default()
     }
 }
 

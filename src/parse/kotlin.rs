@@ -35,7 +35,8 @@ pub fn extract(path: &Path, text: &str) -> Result<FileStructure> {
             "import" => import(&mut b, &mut al, child, src),
             "function_declaration" => {
                 if let Some(ft) = &file_type {
-                    b.enter_type(ft, SubKind::Class);
+                    // Premier niveau : la pile est vide, `enter_type` ne refuse jamais.
+                    let _ = b.enter_type(ft, SubKind::Class);
                     function(&mut b, &mut calls, &al, child, src);
                     b.exit_type();
                 }
@@ -184,7 +185,9 @@ fn declaration(b: &mut Builder, calls: &mut Calls, al: &Aliases, n: Node, src: &
     let Some(name) = name.filter(|s| !s.is_empty()) else {
         return;
     };
-    let q = b.enter_type(&name, sub);
+    let Some(q) = b.enter_type(&name, sub) else {
+        return;
+    };
 
     if let Some(specs) = first_named(n, &["delegation_specifiers"]) {
         let mut cur = specs.walk();
@@ -580,5 +583,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(has_ref(&s, "method:K.m", EdgeKind::Calls, "K.helper"));
+    }
+
+    #[test]
+    fn req104_ac3_imbrication_bornee_a_1000_niveaux() {
+        use crate::parse::nesting_support::check;
+        check(
+            |t| extract(Path::new("Deep.kt"), t).unwrap(),
+            |i| format!("class C{i} {{\n fun m() {{}}\n"),
+            "}\n",
+            "class B {\n fun m() {}\n}",
+        );
     }
 }

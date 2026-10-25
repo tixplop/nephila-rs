@@ -118,7 +118,14 @@ pub struct FileStructure {
     pub references: Vec<Reference>,
     /// Avertissements à remonter (fichier exploité au mieux : XML mal formé…), un message par ligne.
     pub warnings: Vec<String>,
+    /// Au moins une déclaration au-delà de `MAX_NESTING` niveaux a été ignorée (DEC-105) ; consommé
+    /// par `extract`, qui en fait l'avertissement A-8. Non sérialisé.
+    pub nesting_cut: bool,
 }
+
+/// Niveau maximal d'imbrication des déclarations (DEC-105, REQ-104) : une déclaration de type
+/// n'est extraite que si moins de `MAX_NESTING` types l'englobent.
+pub(crate) const MAX_NESTING: usize = 1000;
 
 /// Contexte d'extraction fourni par l'appelant (utile aux scripts Gradle).
 #[derive(Debug, Clone, Default)]
@@ -132,6 +139,21 @@ pub struct ParseCtx {
 /// Extrait la structure de `text`. Java, Kotlin, Scala et Groovy sont extraits ; les autres langages renvoient pour
 /// l'instant une structure vide, comme un fichier de type inconnu.
 pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure> {
+    let mut f = extract_raw(path, text, ctx)?;
+    if std::mem::take(&mut f.nesting_cut) {
+        f.warnings.push(nesting_warning(path));
+    }
+    Ok(f)
+}
+
+/// Avertissement A-8 (V-006), construit ici seulement : `<fichier>` est le chemin converti et échappé.
+fn nesting_warning(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let shown = crate::escape::path(&raw);
+    format!("{shown} : déclarations imbriquées au-delà de {MAX_NESTING} niveaux ignorées")
+}
+
+fn extract_raw(path: &Path, text: &str, ctx: &ParseCtx) -> Result<FileStructure> {
     match Lang::from_path(path) {
         Some(Lang::Java) => java::extract(text),
         Some(Lang::Kotlin) => kotlin::extract(path, text),
@@ -371,6 +393,111 @@ mod tests {
             assert_eq!(f.declares[0].id(), format!("document:{p}"));
             assert_eq!(f.declares[0].subkind, Some(sub));
             assert!(f.warnings.is_empty());
+        }
+    }
+}
+
+/// Assistants de test communs à AC-104-3 (JVM et JS/TS) : source imbriquée sur `depth` niveaux,
+/// exécutée dans un fil à la pile des fils d'analyse.
+#[cfg(test)]
+pub(crate) mod nesting_support {
+    use super::*;
+
+    /// Exécute `f` dans un fil dont la pile est celle d'`EXTRACT_STACK`.
+    pub(crate) fn on_extract_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(crate::index::structure::EXTRACT_STACK)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// Nom qualifié du niveau `k` : `C1.C2…Ck`.
+    pub(crate) fn qualified(k: usize) -> String {
+        (1..=k)
+            .map(|i| format!("C{i}"))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// `C1 { C2 { … C<depth> { <member> } … } B {} }` : `open(i)` ouvre le niveau `i` (la déclaration du niveau et une méthode `m`), `close` le ferme, `sibling` est un frère `B` du niveau 2.
+    pub(crate) fn source(
+        depth: usize,
+        open: &dyn Fn(usize) -> String,
+        close: &str,
+        sibling: &str,
+    ) -> String {
+        let mut s = String::new();
+        for i in 1..=depth {
+            s.push_str(&open(i));
+        }
+        for _ in 2..=depth {
+            s.push_str(close);
+        }
+        s.push_str(sibling);
+        s.push('\n');
+        s.push_str(close);
+        s
+    }
+
+    /// Vérifie AC-104-3 pour 1 000 et 1 001 niveaux : le niveau 1 000 et sa méthode sont déclarés,
+    /// le niveau 1 001 et sa méthode non, le frère `C1.B` l'est dans les deux cas, le drapeau n'est
+    /// levé qu'à 1 001, et 1 000 types `C…` exactement sont déclarés aux deux profondeurs.
+    pub(crate) fn check(
+        extract: fn(&str) -> FileStructure,
+        open: fn(usize) -> String,
+        close: &'static str,
+        sibling: &'static str,
+    ) {
+        for depth in [MAX_NESTING, MAX_NESTING + 1] {
+            let src = source(depth, &open, close, sibling);
+            let s = on_extract_stack(move || extract(&src));
+            let types: HashSet<&str> = s
+                .declares
+                .iter()
+                .filter(|d| d.kind == NodeKind::Type)
+                .map(|d| d.qualified.as_str())
+                .collect();
+            let methods: HashSet<&str> = s
+                .declares
+                .iter()
+                .filter(|d| d.kind == NodeKind::Method)
+                .map(|d| d.qualified.as_str())
+                .collect();
+            let last = qualified(MAX_NESTING);
+            assert!(
+                types.contains(last.as_str()),
+                "niveau 1000 déclaré ({depth})"
+            );
+            assert!(
+                methods.contains(format!("{last}.m").as_str()),
+                "méthode du niveau 1000 déclarée ({depth})"
+            );
+            let beyond = qualified(MAX_NESTING + 1);
+            assert!(
+                !types.contains(beyond.as_str()),
+                "niveau 1001 ignoré ({depth})"
+            );
+            assert!(
+                !methods.contains(format!("{beyond}.m").as_str()),
+                "méthode du niveau 1001 ignorée ({depth})"
+            );
+            assert!(
+                types.contains("C1.B"),
+                "frère de niveau 2 déclaré ({depth})"
+            );
+            assert!(
+                methods.contains("C1.B.m"),
+                "méthode du frère déclarée ({depth})"
+            );
+            let chain = types
+                .iter()
+                .filter(|q| q.rsplit('.').next().is_some_and(|n| n.starts_with('C')))
+                .count();
+            assert_eq!(chain, MAX_NESTING, "types C… déclarés ({depth})");
+            assert_eq!(s.nesting_cut, depth > MAX_NESTING, "drapeau ({depth})");
+            assert!(s.warnings.is_empty());
         }
     }
 }

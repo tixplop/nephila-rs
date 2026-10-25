@@ -121,7 +121,8 @@ impl Ctx<'_> {
             return;
         };
         let name = self.text(name);
-        self.b.enter_type(&st, SubKind::Class);
+        // Premier niveau : la pile est vide, `enter_type` ne refuse jamais ; résultat ignoré à dessein.
+        let _ = self.b.enter_type(&st, SubKind::Class);
         if let Some(q) = self.b.declare_method(&name) {
             self.calls.declare_method(&st_q(&self.b), &name);
             self.method_calls(&q, f);
@@ -133,7 +134,8 @@ impl Ctx<'_> {
         let (Some(st), false) = (self.script_type.clone(), stmts.is_empty()) else {
             return;
         };
-        self.b.enter_type(&st, SubKind::Class);
+        // Premier niveau : la pile est vide, `enter_type` ne refuse jamais ; résultat ignoré à dessein.
+        let _ = self.b.enter_type(&st, SubKind::Class);
         if let Some(q) = self.b.declare_method(SCRIPT_RUN) {
             let types = self.b.type_stack().to_vec();
             for s in stmts {
@@ -153,7 +155,10 @@ impl Ctx<'_> {
         let Some(name) = n.child_by_field_name("name") else {
             return;
         };
-        let q = self.b.enter_type(&self.text(name), sub);
+        let type_name = self.text(name);
+        let Some(q) = self.b.enter_type(&type_name, sub) else {
+            return;
+        };
 
         let mut cur = n.walk();
         for c in n.children(&mut cur) {
@@ -595,5 +600,16 @@ mod tests {
             EdgeKind::Calls,
             "Deep.helper"
         ));
+    }
+
+    #[test]
+    fn req104_ac3_imbrication_bornee_a_1000_niveaux() {
+        use crate::parse::nesting_support::check;
+        check(
+            |t| extract(Path::new("Deep.groovy"), t).unwrap(),
+            |i| format!("class C{i} {{\n void m() {{}}\n"),
+            "}\n",
+            "class B { void m() {} }",
+        );
     }
 }

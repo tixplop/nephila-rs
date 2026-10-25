@@ -90,6 +90,7 @@ impl KeySet {
             declares,
             references,
             warnings,
+            ..FileStructure::default()
         }
     }
 }

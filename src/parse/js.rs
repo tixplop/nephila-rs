@@ -84,6 +84,7 @@ pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
         declares: x.declares,
         references: x.references.into_vec(),
         warnings: Vec::new(),
+        nesting_cut: false,
     })
 }
 

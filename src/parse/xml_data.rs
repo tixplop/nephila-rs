@@ -99,6 +99,7 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
         declares: vec![data::document(path, Format::Xml)],
         references,
         warnings,
+        ..FileStructure::default()
     }
 }
 

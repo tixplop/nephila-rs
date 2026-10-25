@@ -15,7 +15,7 @@ use crate::store::{PreparedStructure, Store};
 use crate::trace;
 
 /// Pile des fils d'analyse : filet pour les récursions restantes (DEC-054).
-const EXTRACT_STACK: usize = 16 * 1024 * 1024;
+pub(crate) const EXTRACT_STACK: usize = 16 * 1024 * 1024;
 
 /// Nombre de fichiers enregistrés par transaction.
 const BATCH: usize = 200;

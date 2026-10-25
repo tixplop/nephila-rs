@@ -83,7 +83,9 @@ fn type_declaration(b: &mut Builder, calls: &mut Calls, n: Node, src: &[u8]) {
     let Some(name) = n.child_by_field_name("name") else {
         return;
     };
-    let q = b.enter_type(&text_of(name, src), sub);
+    let Some(q) = b.enter_type(&text_of(name, src), sub) else {
+        return;
+    };
 
     // extends / implements.
     let mut cur = n.walk();
@@ -641,5 +643,50 @@ interface I extends J, K<X> { void m(); }
         );
         let s = in_small_stack(move || extract(&src)).unwrap();
         assert!(has_ref(&s, "method:Big.m", EdgeKind::Calls, "Big.helper"));
+    }
+
+    #[test]
+    fn req104_ac3_imbrication_bornee_a_1000_niveaux() {
+        use crate::parse::nesting_support::check;
+        check(
+            |t| extract(t).unwrap(),
+            |i| format!("class C{i} {{\n void m() {{}}\n"),
+            "}\n",
+            "class B { void m() {} }",
+        );
+    }
+
+    #[test]
+    fn req104_ac3_clause_extends_du_type_refuse_sans_reference() {
+        use crate::parse::nesting_support::{on_extract_stack, qualified, source};
+        for (depth, expected) in [(1000usize, true), (1001, false)] {
+            let src = source(
+                depth,
+                &|i| {
+                    if i == depth {
+                        format!("class C{i} extends X {{\n")
+                    } else {
+                        format!("class C{i} {{\n")
+                    }
+                },
+                "}\n",
+                "",
+            );
+            let s = on_extract_stack(move || extract(&src).unwrap());
+            let source_id = format!("type:{}", qualified(depth));
+            if expected {
+                assert!(
+                    s.references.iter().any(|r| r.source == source_id
+                        && r.kind == EdgeKind::Extends
+                        && r.target == "X"),
+                    "extends X au niveau {depth}"
+                );
+            } else {
+                assert!(
+                    s.references.iter().all(|r| r.target != "X"),
+                    "aucune référence vers X au niveau {depth}"
+                );
+            }
+        }
     }
 }
