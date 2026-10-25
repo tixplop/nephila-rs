@@ -306,25 +306,6 @@ pub fn escaped(rel: &Path) -> String {
     out
 }
 
-/// Texte d'une erreur d'entrée, identique à celui du parcours séquentiel de la 0.22.0 : le
-/// parcours parallèle de `ignore` omet le « IO error for operation on » que `walkdir` ajoute.
-fn entry_error_text(e: &ignore::Error) -> String {
-    let mut inner = e;
-    while let ignore::Error::WithDepth { err, .. } = inner {
-        inner = err;
-    }
-    if let ignore::Error::WithPath { path, err } = inner {
-        if let ignore::Error::Io(io) = &**err {
-            return format!(
-                "{}: IO error for operation on {}: {io}",
-                path.display(),
-                path.display()
-            );
-        }
-    }
-    e.to_string()
-}
-
 /// Traite une entrée du parcours dans le tampon local d'un fil.
 fn walk_entry(
     root: &Path,
@@ -336,10 +317,8 @@ fn walk_entry(
     let entry = match entry {
         Ok(e) => e,
         Err(e) => {
-            acc.warnings.push((
-                String::new(),
-                format!("entrée illisible ignorée : {}", entry_error_text(&e)),
-            ));
+            acc.warnings
+                .push((String::new(), format!("entrée illisible ignorée : {e}")));
             return;
         }
     };
@@ -441,6 +420,28 @@ pub fn walk(
     jobs: usize,
     known: &[FileRecord],
 ) -> Result<WalkResult> {
+    walk_with(root, matcher, jobs, known, &crate::workers::Spawner)
+}
+
+/// Entrées envoyées ensemble à un fil du parcours.
+const WALK_BATCH: usize = 256;
+
+type WalkEntry = std::result::Result<ignore::DirEntry, ignore::Error>;
+
+/// Fils du parcours démarrés (diagnostic des tests, AC-111-2).
+#[cfg(test)]
+pub(crate) static WALK_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `walk` avec le lanceur de fils injecté (DEC-108, DEC-109) : les entrées sont énumérées dans le
+/// fil appelant et traitées par `jobs` − 1 fils (aucun si `jobs` = 1).
+pub(crate) fn walk_with<L: crate::workers::Launcher>(
+    root: &Path,
+    matcher: &Matcher,
+    jobs: usize,
+    known: &[FileRecord],
+    launcher: &L,
+) -> Result<WalkResult> {
     if !root.is_dir() {
         return Err(Error::Message(format!(
             "{} n'est pas un dossier lisible",
@@ -458,7 +459,6 @@ pub fn walk(
         .git_exclude(false)
         .require_git(false)
         .follow_links(false)
-        .threads(jobs.max(1))
         .filter_entry(move |e| {
             let is_dir = e.file_type().is_some_and(|t| t.is_dir());
             !(is_dir && e.depth() > 0 && {
@@ -467,20 +467,74 @@ pub fn walk(
                     || (defaults && DEFAULT_EXCLUDED_DIRS.contains(&name.as_ref()))
             })
         })
-        .build_parallel();
+        .build();
 
     let shared = std::sync::Mutex::new(WalkAcc::default());
-    walker.run(|| {
+    let export_name = &export_name;
+    if jobs <= 1 {
         let mut local = LocalAcc {
             shared: &shared,
             acc: WalkAcc::default(),
         };
-        let export_name = &export_name;
-        Box::new(move |entry| {
+        for entry in walker {
             walk_entry(root, matcher, export_name, entry, &mut local.acc);
-            ignore::WalkState::Continue
-        })
-    });
+        }
+    } else {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<WalkEntry>>(jobs * 2);
+        let rx = std::sync::Mutex::new(rx);
+        let failed = std::thread::scope(|scope| {
+            let tx = tx;
+            let (started, error) = crate::workers::start_workers(
+                scope,
+                jobs - 1,
+                launcher,
+                || std::thread::Builder::new().name("nephila-walk".into()),
+                || {
+                    let rx = &rx;
+                    let shared = &shared;
+                    Box::new(move || {
+                        let mut local = LocalAcc {
+                            shared,
+                            acc: WalkAcc::default(),
+                        };
+                        loop {
+                            let batch = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok(batch) = batch else { break };
+                            for entry in batch {
+                                walk_entry(root, matcher, export_name, entry, &mut local.acc);
+                            }
+                        }
+                    })
+                },
+            );
+            #[cfg(test)]
+            WALK_THREADS.fetch_add(started, std::sync::atomic::Ordering::SeqCst);
+            let _ = started;
+            if let Some(e) = error {
+                // L'émetteur est lâché en sortant : les fils démarrés finissent.
+                return Some(e);
+            }
+            let mut batch = Vec::with_capacity(WALK_BATCH);
+            for entry in walker {
+                batch.push(entry);
+                if batch.len() == WALK_BATCH {
+                    let full = std::mem::replace(&mut batch, Vec::with_capacity(WALK_BATCH));
+                    if tx.send(full).is_err() {
+                        break;
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let _ = tx.send(batch);
+            }
+            None
+        });
+        if let Some(e) = failed {
+            return Err(Error::Message(format!(
+                "parcours du dépôt impossible : {e}"
+            )));
+        }
+    }
     let acc = shared.into_inner().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = acc.strip_error {
         return Err(Error::Message(e));
@@ -2017,5 +2071,50 @@ mod tests {
     #[test]
     fn req072_ac2_single_file_to_read_spawns_no_thread() {
         assert_eq!(hash_threads_for(39, 8), 0);
+    }
+
+    fn tree50() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            put(&dir.path().join(format!("d{}/f{i:02}.md", i % 5)), b"x");
+        }
+        dir
+    }
+
+    #[test]
+    fn req111_ac1_echec_de_creation_du_fil_est_une_erreur() {
+        use crate::workers::tests::FailAt;
+        let dir = tree50();
+        for k in [1, 2] {
+            let l = FailAt::new(k);
+            let err = walk_with(dir.path(), &Matcher::none(), 4, &[], &l).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "parcours du dépôt impossible : refus simulé",
+                "k {k}"
+            );
+            assert_eq!(l.calls.load(std::sync::atomic::Ordering::SeqCst), k);
+        }
+    }
+
+    #[test]
+    fn req111_ac2_fils_du_parcours_jobs_moins_un() {
+        use std::sync::atomic::Ordering;
+        let dir = tree50();
+        let mut results = Vec::new();
+        for (jobs, threads) in [(1, 0), (2, 1), (8, 7)] {
+            WALK_THREADS.store(0, Ordering::SeqCst);
+            let l = crate::workers::tests::FailAt::new(0);
+            let got = walk_with(dir.path(), &Matcher::none(), jobs, &[], &l).unwrap();
+            assert_eq!(WALK_THREADS.load(Ordering::SeqCst), threads, "jobs {jobs}");
+            assert_eq!(
+                l.calls.load(Ordering::SeqCst),
+                threads,
+                "lanceur, jobs {jobs}"
+            );
+            assert_eq!(got.files.len(), 50);
+            results.push(got.files);
+        }
+        assert!(results.windows(2).all(|w| w[0] == w[1]));
     }
 }
