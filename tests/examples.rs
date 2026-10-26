@@ -1214,10 +1214,31 @@ fn REQ071_AC11_readme_option_jobs() {
             .count();
         assert_eq!(n, 1, "ligne d'usage de {cmd}");
     }
-    let jobs = "| `--jobs <N>` | Nombre de fils du parcours du dépôt et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs disponibles (au plus 256 ; 4 si le système ne le donne pas). Pas de clé de configuration ; indépendant de `concurrency`, qui ne règle que les appels LLM |";
+    let jobs = "| `--jobs <N>` | Nombre de fils du parcours du dépôt et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs disponibles (au plus 256 ; 4 si le système ne le donne pas). Pas de clé de configuration ; indépendant de `concurrency`, qui ne règle que les appels LLM. Quel que soit N, `build` et `update` gardent en mémoire, du parcours à l'extraction, jusqu'à 256 Mio de contenus lus ; au-delà, l'extraction relit les fichiers |";
     assert_eq!(lines.iter().filter(|l| **l == jobs).count(), 1);
     let ij = lines.iter().position(|l| *l == jobs).unwrap();
     assert!(lines[ij + 1].starts_with("| `--batch-files <N>` |"));
+    // REQ136_AC2 : AC-136-2, le plafond écrit est celui du code.
+    let before = jobs.split(" Mio").next().unwrap();
+    let digits: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    assert_eq!(
+        digits.parse::<usize>().unwrap(),
+        nephila::scan::RETAIN_BUDGET / (1024 * 1024)
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("| `--jobs <N>` |"))
+            .count(),
+        1
+    );
     let conc =
         "| `concurrency` | Appels LLM simultanés ; sans effet sur l'extraction, réglée par `--jobs` | 4 |";
     assert_eq!(lines.iter().filter(|l| **l == conc).count(), 1);
@@ -1783,4 +1804,39 @@ fn REQ134_AC2_ligne_config_d_exemple_du_readme_est_la_sortie_reelle() {
         .find(|l| l.starts_with("trace: ") && l.contains("config: llm="))
         .expect("exemple du README");
     assert_eq!(without_timestamp(real), without_timestamp(example));
+}
+
+#[test]
+fn REQ132_AC1_readme_attente_nouveaux_essais() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "### Nouveaux essais HTTP");
+    assert!(sec.contains("(15 s d'attente au plus par appel sans `retry-after` ; jusqu'à 60 s par nouvel essai quand le serveur le demande)"));
+    assert!(!readme.contains("(15 s d'attente au plus par appel)"));
+}
+
+#[test]
+fn REQ137_AC1_readme_tests_non_utf8_macos() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "## Développement");
+    let para = "Sous macOS, les tests des noms de fichiers non UTF-8 (`tests/non_utf8_names.rs` et ceux de `src/scan.rs`) passent sans rien vérifier : APFS refuse de créer ces noms, et chaque test s'arrête aussitôt. Seule la CI Linux les exécute vraiment ; une modification du traitement de ces noms se vérifie sous Linux.";
+    let lines: Vec<&str> = sec.lines().collect();
+    let ip = lines
+        .iter()
+        .position(|l| *l == para)
+        .expect("paragraphe absent");
+    let nx = lines
+        .iter()
+        .position(|l| l.starts_with("Les tests s'exécutent avec [cargo-nextest]"))
+        .unwrap();
+    let fence_open = (nx..lines.len())
+        .find(|&i| lines[i].starts_with("```"))
+        .unwrap();
+    let fence_close = (fence_open + 1..lines.len())
+        .find(|&i| lines[i].starts_with("```"))
+        .unwrap();
+    let banc = lines
+        .iter()
+        .position(|l| l.starts_with("Le banc de performance mesure"))
+        .unwrap();
+    assert!(fence_close < ip && ip < banc);
 }

@@ -125,7 +125,7 @@ nephila update [--no-llm] [-v|--verbose | --show-progress] [--enrich-code] [--jo
 | `--enrich-code` | Enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown, pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
 | `-v, --verbose` | Traces sur stderr (voir [Traces](#traces---verbose)) |
 | `--show-progress` | Avancement des phases sur stderr, voir [Progression](#progression---show-progress) |
-| `--jobs <N>` | Nombre de fils du parcours du dépôt et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs disponibles (au plus 256 ; 4 si le système ne le donne pas). Pas de clé de configuration ; indépendant de `concurrency`, qui ne règle que les appels LLM |
+| `--jobs <N>` | Nombre de fils du parcours du dépôt et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs disponibles (au plus 256 ; 4 si le système ne le donne pas). Pas de clé de configuration ; indépendant de `concurrency`, qui ne règle que les appels LLM. Quel que soit N, `build` et `update` gardent en mémoire, du parcours à l'extraction, jusqu'à 256 Mio de contenus lus ; au-delà, l'extraction relit les fichiers |
 | `--batch-files <N>` | Taille de lot pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
 | `--format-retries <N>` | Nombre de nouveaux essais d'un appel dont la réponse est non conforme, pour cette commande seulement (voir [Réponses non conformes et nouveaux essais](#réponses-non-conformes-et-nouveaux-essais)) |
 | `--exclude <MOTIF>` | Exclut de l'analyse les fichiers qui correspondent au motif ; répétable (voir [Filtrer l'analyse](#filtrer-lanalyse)) |
@@ -609,7 +609,7 @@ avertissement: src/A.java : réponse LLM non conforme au schéma : JSON illisibl
 
 ### Nouveaux essais HTTP
 
-Une surcharge passagère du fournisseur ne fait pas échouer un fichier. Les réponses HTTP 429, 500, 502, 503, 504 et 529, et les erreurs réseau transitoires (connexion refusée, réinitialisée ou fermée avant la réponse), sont renvoyées à l'identique jusqu'à 4 nouveaux essais, soit 5 envois au plus, avec une attente de plus en plus longue : environ 1, 2, 4 puis 8 s, tirées au hasard entre la moitié et la totalité de ces durées (15 s d'attente au plus par appel).
+Une surcharge passagère du fournisseur ne fait pas échouer un fichier. Les réponses HTTP 429, 500, 502, 503, 504 et 529, et les erreurs réseau transitoires (connexion refusée, réinitialisée ou fermée avant la réponse), sont renvoyées à l'identique jusqu'à 4 nouveaux essais, soit 5 envois au plus, avec une attente de plus en plus longue : environ 1, 2, 4 puis 8 s, tirées au hasard entre la moitié et la totalité de ces durées (15 s d'attente au plus par appel sans `retry-after` ; jusqu'à 60 s par nouvel essai quand le serveur le demande).
 
 - **`retry-after`** : si la réponse porte un `retry-after` en secondes, l'attente vaut cette valeur. Au-delà de 60 s, il n'y a aucun nouvel essai : le fichier échoue aussitôt, la commande ne reste pas bloquée.
 - **Jamais renvoyés** : 401 et 403 (clé refusée), la requête refusée (400, 404, 413, 422) et la redirection (300 à 399, jamais suivie), qui arrêtent chacune l'envoi dès le premier appel (voir [Gestion des échecs](#nephila-build-et-nephila-update)), les autres statuts, le délai dépassé, le refus de certificat.
@@ -824,6 +824,8 @@ cargo clippy -q --all-targets --color never -- -D warnings      # lint
 cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf       # performances (dépôt de 10 000 fichiers)
 node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests/view/*.test.js'   # logique de la vue HTML
 ```
+
+Sous macOS, les tests des noms de fichiers non UTF-8 (`tests/non_utf8_names.rs` et ceux de `src/scan.rs`) passent sans rien vérifier : APFS refuse de créer ces noms, et chaque test s'arrête aussitôt. Seule la CI Linux les exécute vraiment ; une modification du traitement de ces noms se vérifie sous Linux.
 
 Le banc de performance mesure `build --no-llm` et `update --no-llm` sur une fixture JavaScript générée sous `target/` (générateur déterministe), sans seuil de temps :
 
