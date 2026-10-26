@@ -406,3 +406,33 @@ fn REQ119_AC1_job_clippy_beta() {
     });
     assert!(ok, "commande clippy beta absente ou incomplète");
 }
+
+fn dependabot() -> yaml_rust2::Yaml {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/dependabot.yml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?} : {e}"));
+    yaml_rust2::YamlLoader::load_from_str(&text)
+        .unwrap_or_else(|e| panic!("dependabot.yml : {e}"))
+        .remove(0)
+}
+
+#[test]
+fn REQ116_AC1_dependabot_actions_et_cargo_chaque_semaine() {
+    let d = dependabot();
+    assert_eq!(d["version"].as_i64(), Some(2));
+    let ups = d["updates"].as_vec().expect("updates");
+    assert_eq!(ups.len(), 2);
+    let eco: BTreeSet<String> = ups
+        .iter()
+        .map(|u| u["package-ecosystem"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(eco, set(&["github-actions", "cargo"]));
+    for u in ups {
+        assert_eq!(u["directory"].as_str(), Some("/"));
+        assert_eq!(u["schedule"]["interval"].as_str(), Some("weekly"));
+        assert_eq!(
+            keys(u),
+            set(&["package-ecosystem", "directory", "schedule"])
+        );
+        assert_eq!(keys(&u["schedule"]), set(&["interval"]));
+    }
+}

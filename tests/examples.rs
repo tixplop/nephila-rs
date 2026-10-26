@@ -1623,3 +1623,18 @@ fn REQ122_AC1_readme_installe_avec_locked() {
         );
     }
 }
+
+#[test]
+fn REQ116_REQ117_REQ123_readme_ci_dependabot_audit_et_chaine_epinglee() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "## Développement");
+    for needle in [
+        ".github/dependabot.yml", // AC-116-2
+        "git ls-remote --tags https://github.com/",
+        "refs/heads/stable",
+        "cargo deny check advisories", // AC-117-4
+        "rust-toolchain.toml",         // AC-123-4
+    ] {
+        assert!(sec.contains(needle), "section Développement : {needle}");
+    }
+}

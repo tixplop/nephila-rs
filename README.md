@@ -803,7 +803,11 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 ## Développement
 
-L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests sur Linux et macOS, et les tests de la vue à chaque push sur `master` et à chaque pull request.
+L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests sur Linux et macOS, les tests de la vue et l'audit des dépendances (`cargo deny check advisories`) à chaque push sur `master` et à chaque pull request ; chaque lundi, elle passe aussi l'audit, les tests de performance et clippy sur la chaîne beta (les performances se lancent aussi à la demande par `workflow_dispatch`).
+
+Les actions sont épinglées par SHA de commit, l'étiquette en commentaire ; Dependabot (`.github/dependabot.yml`) propose chaque semaine la mise à jour des actions et des crates. Pour mettre à jour un SHA à la main, relever le commit de l'étiquette par `git ls-remote --tags https://github.com/<propriétaire>/<action>.git` (ligne terminée par `^{}` si l'étiquette est annotée ; pour `dtolnay/rust-toolchain`, `git ls-remote https://github.com/dtolnay/rust-toolchain.git refs/heads/stable`), puis remplacer le SHA et le commentaire dans toutes les lignes de l'action, dans `ci.yml` et `release.yml`.
+
+La chaîne d'outils est épinglée par `rust-toolchain.toml` à Rust 1.99.0, le plancher de `rust-version` ; rustup l'installe au premier appel de cargo dans le dépôt. Une montée change ensemble `channel`, `rust-version` et les `toolchain:` des workflows.
 
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
