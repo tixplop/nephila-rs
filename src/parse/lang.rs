@@ -206,12 +206,16 @@ pub(crate) mod tests {
         v
     }
 
-    fn check_suite(texts: &[(Lang, String)]) {
-        for round in 0..2 {
-            for (lang, text) in texts {
+    fn check_suite(texts: &[(Lang, String)], refs: &[String], rounds: usize) {
+        for round in 0..rounds {
+            for ((lang, text), expected) in texts.iter().zip(refs) {
                 let a = lang.parse(text).unwrap().root_node().to_sexp();
-                let b = parse_fresh(*lang, text).unwrap().root_node().to_sexp();
-                assert_eq!(a, b, "{lang:?} tour {round} ({} octets)", text.len());
+                assert_eq!(
+                    &a,
+                    expected,
+                    "{lang:?} tour {round} ({} octets)",
+                    text.len()
+                );
             }
         }
     }
@@ -220,12 +224,16 @@ pub(crate) mod tests {
     #[test]
     fn req078_ac2_arbres_identiques_a_un_parser_neuf() {
         let texts = sample_texts();
-        check_suite(&texts);
+        let refs: Vec<String> = texts
+            .iter()
+            .map(|(lang, text)| parse_fresh(*lang, text).unwrap().root_node().to_sexp())
+            .collect();
+        check_suite(&texts, &refs, 2);
         std::thread::scope(|s| {
             for _ in 0..4 {
                 std::thread::Builder::new()
                     .stack_size(16 * 1024 * 1024)
-                    .spawn_scoped(s, || check_suite(&texts))
+                    .spawn_scoped(s, || check_suite(&texts, &refs, 1))
                     .unwrap();
             }
         });

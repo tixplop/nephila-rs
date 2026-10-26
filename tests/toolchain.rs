@@ -546,3 +546,138 @@ fn REQ138_AC1_aucun_element_utilise_seulement_sous_cfg_target_os() {
         "éléments réservés à un système : {found:?}"
     );
 }
+
+/// REQ-139 : violations `<rel>:<ligne> <appel>` : création ou écriture d'un fichier dont le chemin
+/// est construit par `from_bytes(` et qui se termine par `.unwrap()` ou `.expect(`.
+fn raw_name_unwraps(rel: &str, text: &str) -> Vec<String> {
+    const CALLS: [&str; 4] = [
+        "fs::write(",
+        "fs::create_dir(",
+        "fs::create_dir_all(",
+        "File::create(",
+    ];
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut line_start = 0;
+    for (n, line) in text.split('\n').enumerate() {
+        let start = line_start;
+        line_start += line.len() + 1;
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for call in CALLS {
+            let mut from = 0;
+            while let Some(p) = line[from..].find(call) {
+                let at = from + p;
+                from = at + call.len();
+                let prev = line[..at].chars().next_back();
+                if prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let open = start + at + call.len() - 1;
+                let (mut depth, mut i) = (0usize, open);
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() || !text[open..i].contains("from_bytes(") {
+                    continue;
+                }
+                let after = text[i + 1..].trim_start();
+                if after.starts_with(".unwrap()") || after.starts_with(".expect(") {
+                    out.push(format!("{rel}:{} {}", n + 1, call.trim_end_matches('(')));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn REQ139_AC2_aide_raw_name_unwraps_cas_de_l_ac() {
+    let un = "fs::write(d.join(OsStr::from_bytes(b\"A\\xff.java\")), \"x\").unwrap();\n";
+    assert_eq!(raw_name_unwraps("t.rs", un), vec!["t.rs:1 fs::write"]);
+
+    let multi = "fn t() {\n    fs::write(\n        d.join(OsStr::from_bytes(b\"A\\xff.java\")),\n        \"x\",\n    )\n    .unwrap();\n}\n";
+    assert_eq!(raw_name_unwraps("t.rs", multi), vec!["t.rs:2 fs::write"]);
+
+    let garde =
+        "if fs::write(d.join(OsStr::from_bytes(b\"A\\xff\")), \"x\").is_err() {\n    return;\n}\n";
+    assert!(raw_name_unwraps("t.rs", garde).is_empty());
+    let option = "fs::write(d.join(OsStr::from_bytes(b\"A\\xff\")), \"x\").ok()?;\n";
+    assert!(raw_name_unwraps("t.rs", option).is_empty());
+    let utf8 = "fs::write(d.join(\"B.java\"), \"x\").unwrap();\n";
+    assert!(raw_name_unwraps("t.rs", utf8).is_empty());
+    let autre = "my_fs::write(d.join(OsStr::from_bytes(b\"A\\xff\")), \"x\").unwrap();\n";
+    assert!(raw_name_unwraps("t.rs", autre).is_empty());
+    let comm = "// fs::write(d.join(OsStr::from_bytes(b\"A\\xff\")), \"x\").unwrap();\n";
+    assert!(raw_name_unwraps("t.rs", comm).is_empty());
+}
+
+fn tests_de_premier_niveau() -> Vec<(String, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<_> = std::fs::read_dir(root.join("tests"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "rs"))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .map(|p| {
+            let rel = p.strip_prefix(root).unwrap().display().to_string();
+            (rel, std::fs::read_to_string(&p).unwrap())
+        })
+        .filter(|(rel, _)| rel != "tests/toolchain.rs")
+        .collect()
+}
+
+#[test]
+fn REQ139_AC1_aucune_creation_de_nom_en_octets_ne_panique() {
+    let mut found = Vec::new();
+    for (rel, text) in tests_de_premier_niveau() {
+        found.extend(raw_name_unwraps(&rel, &text));
+    }
+    assert!(
+        found.is_empty(),
+        "créations de noms en octets qui paniquent :\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
+fn REQ111_AC8_rlimit_nproc_reserve_a_linux() {
+    const ITEMS: [&str; 7] = [
+        "use ", "fn ", "const ", "static ", "struct ", "impl", "mod ",
+    ];
+    let mut defauts = Vec::new();
+    let mut controles = 0;
+    for (rel, text) in tests_de_premier_niveau() {
+        if !text.contains("libc::RLIMIT_NPROC") {
+            continue;
+        }
+        controles += 1;
+        let first = text
+            .lines()
+            .position(|l| ITEMS.iter().any(|k| l.trim_start().starts_with(k)))
+            .unwrap_or(usize::MAX);
+        let lines: Vec<&str> = text.lines().collect();
+        let avant = &lines[..first.min(lines.len())];
+        let ok =
+            avant.contains(&"#![cfg(target_os = \"linux\")]") && !lines.contains(&"#![cfg(unix)]");
+        if !ok {
+            defauts.push(rel);
+        }
+    }
+    assert!(controles >= 1, "aucun fichier contrôlé");
+    assert!(defauts.is_empty(), "{}", defauts.join("\n"));
+}

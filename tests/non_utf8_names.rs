@@ -436,11 +436,14 @@ fn REQ100_AC3_non_utf8_et_lecture_impossible_echappes() {
     let Some(r) = Repo::new(&files) else {
         return;
     };
-    fs::write(
+    if fs::write(
         r.root.join(OsStr::from_bytes(b"\x1b[1mbad.java")),
         b"class \xff\xfe {}",
     )
-    .unwrap();
+    .is_err()
+    {
+        return;
+    }
     let ro = r.root.join(OsStr::from_bytes(b"\x1b[1mro.java"));
     fs::set_permissions(&ro, fs::Permissions::from_mode(0o000)).unwrap();
     let readable = fs::read(&ro).is_ok();
@@ -604,11 +607,14 @@ fn REQ103_AC2_le_fichier_modifie_perd_sa_priorite() {
     {
         return;
     }
-    fs::write(
+    if fs::write(
         r.root.join(OsStr::from_bytes(b"A\xff.java")),
         "class A22 {}\n",
     )
-    .unwrap();
+    .is_err()
+    {
+        return;
+    }
     let o = r.run(&["update", "--no-llm"]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert_eq!(o.stderr, format!("{A7_FE_FF}\n").as_bytes());
@@ -634,11 +640,14 @@ fn REQ103_AC4_textes_a7_octet_pour_octet() {
     let o = r.run(&["update", "--no-llm"]);
     assert_eq!(a7_lines(&o), vec![A7_FF_FE.as_bytes().to_vec()]);
     assert_eq!(o.stderr.iter().filter(|b| **b == b'\n').count(), 1);
-    fs::write(
+    if fs::write(
         r.root.join(OsStr::from_bytes(b"A\xff.java")),
         "class A22 {}\n",
     )
-    .unwrap();
+    .is_err()
+    {
+        return;
+    }
     let o = r.run(&["update", "--no-llm"]);
     assert_eq!(a7_lines(&o), vec![A7_FE_FF.as_bytes().to_vec()]);
     assert_eq!(o.stderr.iter().filter(|b| **b == b'\n').count(), 1);
@@ -654,7 +663,7 @@ fn both_orders_bytes(files: &[(&[u8], &[u8])]) -> Option<(Repo, Repo)> {
     let (r1, r2) = both_orders(&names)?;
     for r in [&r1, &r2] {
         for (n, body) in files {
-            fs::write(r.root.join(OsStr::from_bytes(n)), body).unwrap();
+            fs::write(r.root.join(OsStr::from_bytes(n)), body).ok()?;
         }
     }
     Some((r1, r2))
@@ -809,7 +818,9 @@ fn REQ102_AC5_update_apres_un_fichier_retenu_devenu_illisible() {
     };
     let o = r.run(&["build", "--no-llm"]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    fs::write(r.root.join(OsStr::from_bytes(b"A\xfe.java")), b"\xff").unwrap();
+    if fs::write(r.root.join(OsStr::from_bytes(b"A\xfe.java")), b"\xff").is_err() {
+        return;
+    }
     let o = r.run(&["status"]);
     assert!(out(&o).contains("modifié\tA\u{FFFD}.java"), "{}", out(&o));
     let o = r.run(&["update", "--no-llm"]);
@@ -961,7 +972,9 @@ fn REQ102_check_stale_compte_le_groupe_si_un_fichier_est_lisible() {
         let o = r.run(&["build", "--no-llm"]);
         assert_eq!(o.status.code(), Some(0), "{}", err(&o));
         for (n, body) in files {
-            fs::write(r.root.join(OsStr::from_bytes(n)), body).unwrap();
+            if fs::write(r.root.join(OsStr::from_bytes(n)), body).is_err() {
+                return;
+            }
         }
         let o = r.run(&["query", "search", "B", "--check-stale"]);
         assert_eq!(!err(&o).is_empty(), stale, "stderr : {}", err(&o));

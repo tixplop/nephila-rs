@@ -1,6 +1,7 @@
 //! Fils refusés par le système (REQ-111) : sous `RLIMIT_NPROC` = 1, le parcours du dépôt rend une
-//! erreur au lieu de paniquer, et `--jobs 1` parcourt sans fil.
-#![cfg(unix)]
+//! erreur au lieu de paniquer, et `--jobs 1` parcourt sans fil. Hors Linux, `RLIMIT_NPROC` ne
+//! borne que les processus, pas les fils : le fichier n'y est pas compilé.
+#![cfg(target_os = "linux")]
 
 use assert_cmd::cargo::cargo_bin;
 use std::fs;
