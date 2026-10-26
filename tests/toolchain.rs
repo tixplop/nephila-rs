@@ -295,3 +295,107 @@ fn REQ124_AC2_aucun_compteur_de_diagnostic_static() {
     cherche_statiques(&root.join("src"), root, &mut found);
     assert!(found.is_empty(), "compteurs static : {found:?}");
 }
+
+/// Fichiers `.rs` de `src/` avec leur contenu, dans l'ordre.
+fn sources(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            sources(&p, out);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&p).unwrap();
+            out.push((p, text));
+        }
+    }
+}
+
+/// Le bloc ou module qui commence à la ligne `at` est précédé de `#[cfg(test)]` (attributs et
+/// commentaires `///` sautés).
+fn precede_cfg_test(lines: &[&str], at: usize) -> bool {
+    let mut i = at;
+    while i > 0 {
+        i -= 1;
+        let l = lines[i].trim();
+        if l == "#[cfg(test)]" {
+            return true;
+        }
+        if !(l.starts_with("///") || l.starts_with("//") || l.starts_with("#[")) {
+            return false;
+        }
+    }
+    false
+}
+
+/// La déclaration de la ligne `at` est dans un `thread_local!` ou un module précédé de
+/// `#[cfg(test)]`.
+fn sous_cfg_test(lines: &[&str], at: usize) -> bool {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let mut depth = indent(lines[at]);
+    for i in (0..at).rev() {
+        let l = lines[i];
+        if l.trim().is_empty() || indent(l) >= depth {
+            continue;
+        }
+        depth = indent(l);
+        let t = l.trim_start();
+        if (t.starts_with("thread_local!") || t.starts_with("mod ") || t.starts_with("pub mod "))
+            && precede_cfg_test(lines, i)
+        {
+            return true;
+        }
+        if depth == 0 {
+            break;
+        }
+    }
+    false
+}
+
+/// AC-129-1 : plus de `cfg_attr(not(test), allow(dead_code))`, une seule `enum ReadKind`, et les
+/// compteurs de diagnostic compilés sous `#[cfg(test)]` seulement.
+#[test]
+fn REQ129_AC1_compteurs_sous_cfg_test_une_seule_read_kind() {
+    const NOMS: [&str; 5] = [
+        "PREPARATIONS",
+        "NAME_KEYS_CALLS",
+        "COMMITS",
+        "PROJECTIONS",
+        "STORE_READS",
+    ];
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    sources(&root.join("src"), &mut files);
+    let mut found = Vec::new();
+    let mut read_kinds = Vec::new();
+    for (p, text) in &files {
+        let rel = p.strip_prefix(root).unwrap().display().to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("cfg_attr(not(test), allow(dead_code))") {
+                found.push(format!(
+                    "{rel}:{} : cfg_attr(not(test), allow(dead_code))",
+                    i + 1
+                ));
+            }
+            if line.contains("enum ReadKind") {
+                read_kinds.push(format!("{rel}:{}", i + 1));
+            }
+            for nom in NOMS {
+                let t = line.trim_start();
+                if t.starts_with(&format!("static {nom}:")) && !sous_cfg_test(&lines, i) {
+                    found.push(format!("{rel}:{} : static {nom} hors #[cfg(test)]", i + 1));
+                }
+            }
+        }
+    }
+    if read_kinds.len() != 1 {
+        found.push(format!(
+            "enum ReadKind déclarée {} fois : {read_kinds:?}",
+            read_kinds.len()
+        ));
+    }
+    assert!(found.is_empty(), "{found:#?}");
+}

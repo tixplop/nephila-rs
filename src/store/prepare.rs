@@ -1,6 +1,7 @@
 //! Structure préparée d'un fichier (DEC-086) : conversion, contrôles et calcul des clés faits par
 //! les fils d'extraction, pour que l'écrivain n'exécute plus que des instructions SQL.
 
+#[cfg(test)]
 use std::cell::Cell;
 use std::collections::HashSet;
 
@@ -34,17 +35,19 @@ pub struct PreparedStructure {
     pub dropped: usize,
 }
 
+#[cfg(test)]
 thread_local! {
     static PREPARATIONS: Cell<u64> = const { Cell::new(0) };
 }
 
 fn note_preparation() {
+    #[cfg(test)]
     PREPARATIONS.with(|c| c.set(c.get() + 1));
     crate::diag::add(crate::diag::Counter::Preparations, 1);
 }
 
 /// Préparations faites par le fil courant (diagnostic, AC-074-2).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn preparations_on_thread() -> u64 {
     PREPARATIONS.with(Cell::get)
 }

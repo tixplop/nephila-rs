@@ -15,6 +15,7 @@ use crate::model::{
     Edge, EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, RefOrigin, SubKind,
 };
 #[cfg(test)]
+#[cfg(test)]
 pub(crate) use prepare::preparations_on_thread;
 pub use prepare::{prepare_raw, prepare_structure, PreparedRef, PreparedStructure};
 
@@ -214,6 +215,7 @@ fn configure_write(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 thread_local! {
     static COMMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static PROJECTIONS: std::cell::RefCell<std::collections::HashMap<String, u64>> =
@@ -223,13 +225,19 @@ thread_local! {
     static STORE_READS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
 }
 
+#[cfg(test)]
 const NODE_ROWS: usize = 0;
+#[cfg(test)]
 const EDGE_ROWS: usize = 1;
+#[cfg(test)]
 const FULL_PASSES: usize = 2;
+#[cfg(test)]
 const INCREMENTAL_PASSES: usize = 3;
+#[cfg(test)]
 const REFS_REEVALUATED: usize = 4;
 
 /// Ajoute `n` au compteur de diagnostic `slot`.
+#[cfg(test)]
 fn bump(slot: usize, n: usize) {
     STORE_READS.with(|c| {
         let mut v = c.get();
@@ -240,20 +248,25 @@ fn bump(slot: usize, n: usize) {
 
 /// Compte des lignes de `nodes` rendues par une lecture du stockage (lecture de la passe
 /// comprise ; un agrégat ne compte pas).
-pub(crate) fn note_node_rows(n: usize) {
-    bump(NODE_ROWS, n);
+#[inline]
+pub(crate) fn note_node_rows(_n: usize) {
+    #[cfg(test)]
+    bump(NODE_ROWS, _n);
 }
 
 /// Compte des lignes de `edges` rendues par une lecture du stockage.
-pub(crate) fn note_edge_rows(n: usize) {
-    bump(EDGE_ROWS, n);
+#[inline]
+pub(crate) fn note_edge_rows(_n: usize) {
+    #[cfg(test)]
+    bump(EDGE_ROWS, _n);
 }
 
 /// Une passe de résolution a eu lieu (`incremental` : passe incrémentale, sinon complète).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn note_pass(incremental: bool) {
+#[inline]
+pub(crate) fn note_pass(_incremental: bool) {
+    #[cfg(test)]
     bump(
-        if incremental {
+        if _incremental {
             INCREMENTAL_PASSES
         } else {
             FULL_PASSES
@@ -263,20 +276,22 @@ pub(crate) fn note_pass(incremental: bool) {
 }
 
 /// `n` références réévaluées par une passe.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn note_refs_reevaluated(n: usize) {
-    bump(REFS_REEVALUATED, n);
+#[inline]
+pub(crate) fn note_refs_reevaluated(_n: usize) {
+    #[cfg(test)]
+    bump(REFS_REEVALUATED, _n);
 }
 
 /// Compteurs de diagnostic du fil courant, lus par les tests seulement.
-#[doc(hidden)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Diagnostics {
+pub(crate) struct Diagnostics {
     commits: u64,
     projections: std::collections::HashMap<String, u64>,
     counters: [u64; 5],
 }
 
+#[cfg(test)]
 impl Diagnostics {
     /// Transactions d'écriture du `Store` validées depuis la dernière remise à zéro.
     pub fn commits(&self) -> u64 {
@@ -319,8 +334,8 @@ impl Diagnostics {
     }
 }
 
-#[doc(hidden)]
-pub fn diagnostics() -> Diagnostics {
+#[cfg(test)]
+pub(crate) fn diagnostics() -> Diagnostics {
     Diagnostics {
         commits: COMMITS.with(std::cell::Cell::get),
         projections: PROJECTIONS.with(|p| p.borrow().clone()),
@@ -328,8 +343,8 @@ pub fn diagnostics() -> Diagnostics {
     }
 }
 
-#[doc(hidden)]
-pub fn reset_diagnostics() {
+#[cfg(test)]
+pub(crate) fn reset_diagnostics() {
     COMMITS.with(|c| c.set(0));
     PROJECTIONS.with(|p| p.borrow_mut().clear());
     STORE_READS.with(|c| c.set([0; 5]));
@@ -338,6 +353,7 @@ pub fn reset_diagnostics() {
 /// Valide une transaction d'écriture et la compte.
 fn commit_counted(tx: rusqlite::Transaction<'_>) -> Result<()> {
     tx.commit().map_err(db_err)?;
+    #[cfg(test)]
     COMMITS.with(|c| c.set(c.get() + 1));
     Ok(())
 }
@@ -413,7 +429,6 @@ pub struct Store {
 /// point 1). Les ensembles se cumulent d'une transaction validée à l'autre, sans annulation
 /// mutuelle (un nœud inséré puis supprimé figure dans les deux : la passe lit plus, jamais moins).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChangeLog {
     /// Identifiants insérés dans `nodes` (dépendances dérivées créées par une passe comprises).
     pub(crate) inserted: std::collections::BTreeSet<String>,
@@ -429,8 +444,8 @@ pub(crate) struct ChangeLog {
     pub(crate) removed_sources: std::collections::BTreeSet<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ChangeLog {
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         *self == ChangeLog::default()
     }
@@ -497,7 +512,6 @@ impl Store {
 
     /// Journal des changements depuis la dernière passe terminée ; `None` si le graphe n'est pas
     /// marqué `à jour` (ouverture d'un graphe `à résoudre`, vidage d'un `build`).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn change_log(&self) -> Option<&ChangeLog> {
         self.log.as_ref()
     }
@@ -2522,6 +2536,7 @@ fn refresh_nodes<S: AsRef<str>>(tx: &rusqlite::Transaction<'_>, ids: &[S]) -> Re
     let mut up = tx.prepare_cached(REFRESH_NODE).map_err(db_err)?;
     for id in ids {
         up.execute([id.as_ref()]).map_err(db_err)?;
+        #[cfg(test)]
         PROJECTIONS.with(|p| {
             *p.borrow_mut().entry(id.as_ref().to_string()).or_insert(0) += 1;
         });

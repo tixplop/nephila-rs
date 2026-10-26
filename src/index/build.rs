@@ -518,8 +518,8 @@ mod tests {
             for p in &paths {
                 assert_eq!(got.get(p), Some(&1), "{rel} : {p} lu {:?} fois", got.get(p));
             }
-            assert_eq!(reads::kind(reads::Kind::Extract), 0, "{rel}");
-            assert_eq!(reads::kind(reads::Kind::Settings), 0, "{rel}");
+            assert_eq!(reads::kind(crate::scan::ReadKind::Extract), 0, "{rel}");
+            assert_eq!(reads::kind(crate::scan::ReadKind::Settings), 0, "{rel}");
 
             reads::reset();
             do_build(&zero, 0);
@@ -587,8 +587,8 @@ mod tests {
         do_build(&small, 1_000);
         let peak = d.retained_peak();
         assert!(peak > 0 && peak <= 1_000, "pic {peak}");
-        assert_eq!(reads::kind(reads::Kind::Hash), 5);
-        assert_eq!(reads::kind(reads::Kind::Extract), 3);
+        assert_eq!(reads::kind(crate::scan::ReadKind::Hash), 5);
+        assert_eq!(reads::kind(crate::scan::ReadKind::Extract), 3);
         do_build(&big, scan::RETAIN_BUDGET);
         assert_eq!(normalized_export(&small), normalized_export(&big));
     }

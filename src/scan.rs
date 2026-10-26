@@ -143,20 +143,15 @@ impl Eq for ScannedFile {}
 pub(crate) mod reads {
     use std::collections::HashMap;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum Kind {
-        Hash,
-        Extract,
-        Settings,
-    }
+    use super::ReadKind;
 
-    fn with<R>(f: impl FnOnce(&mut HashMap<(String, Kind), usize>) -> R) -> Option<R> {
+    fn with<R>(f: impl FnOnce(&mut HashMap<(String, ReadKind), usize>) -> R) -> Option<R> {
         let d = crate::diag::current_diag()?;
         let mut m = d.reads.lock().unwrap_or_else(|p| p.into_inner());
         Some(f(&mut m))
     }
 
-    pub fn record(path: &str, kind: Kind) {
+    pub fn record(path: &str, kind: ReadKind) {
         with(|m| *m.entry((path.to_string(), kind)).or_insert(0) += 1);
     }
 
@@ -165,7 +160,7 @@ pub(crate) mod reads {
     }
 
     /// Lectures d'une sorte.
-    pub fn kind(kind: Kind) -> usize {
+    pub fn kind(kind: ReadKind) -> usize {
         with(|m| {
             m.iter()
                 .filter(|((_, k), _)| *k == kind)
@@ -194,12 +189,8 @@ pub(crate) fn count_read(_path: &str, _kind: ReadKind) {
     reads::record(_path, _kind);
 }
 
-#[cfg(test)]
-pub(crate) use reads::Kind as ReadKind;
-
-/// Sorte de lecture (sans effet hors tests).
-#[cfg(not(test))]
-#[derive(Debug, Clone, Copy)]
+/// Sorte de lecture de contenu comptée par les tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ReadKind {
     Hash,
     Extract,
