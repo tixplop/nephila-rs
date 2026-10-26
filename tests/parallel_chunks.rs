@@ -180,10 +180,13 @@ fn req051_ac1_chunks_run_in_parallel() {
         assert_eq!(calls.len(), 4, "{calls:?}");
         phase_ms(&stderr(&out))
     };
-    let parallel = measure(4);
-    assert!(parallel < 1_200, "concurrency=4 : {parallel} ms");
     let serial = measure(1);
     assert!(serial >= 1_600, "concurrency=1 : {serial} ms");
+    let parallel = measure(4);
+    assert!(
+        2 * parallel < serial,
+        "parallèle {parallel} ms, série {serial} ms"
+    );
 }
 
 #[test]
