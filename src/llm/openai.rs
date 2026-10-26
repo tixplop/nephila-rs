@@ -1,11 +1,6 @@
 //! Adaptateur compatible OpenAI Chat Completions (REQ-002) : OpenAI, Ollama, llama.cpp, vLLM.
 
-use super::ask::{ask_system_prompt, ask_user_prompt, AskReply};
-use super::enrich::{
-    enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt, parse_lot,
-};
-use super::{http, Generation, Llm, Retry, Tls};
-use super::{Enrichment, LotItem};
+use super::{http, Complete, Generation, Retry, Tls};
 use crate::error::{Error, Result, TRUNCATED};
 use std::sync::atomic::AtomicBool;
 
@@ -73,7 +68,9 @@ impl OpenAiLlm {
             None => req,
         }
     }
+}
 
+impl Complete for OpenAiLlm {
     fn complete(
         &self,
         label: Option<&str>,
@@ -98,87 +95,6 @@ impl OpenAiLlm {
             .as_str()
             .map(String::from)
             .ok_or_else(|| Error::Format("réponse de openai sans message".into()))
-    }
-}
-
-impl Llm for OpenAiLlm {
-    fn enrich(
-        &self,
-        file: &str,
-        call: usize,
-        text: &str,
-        requested: &[String],
-        known: &[String],
-    ) -> Result<Enrichment> {
-        self.enrich_with(None, None, file, call, text, requested, known)
-    }
-
-    fn enrich_labeled(
-        &self,
-        label: &str,
-        file: &str,
-        call: usize,
-        text: &str,
-        requested: &[String],
-        known: &[String],
-        stop: &AtomicBool,
-    ) -> Result<Enrichment> {
-        self.enrich_with(Some(label), Some(stop), file, call, text, requested, known)
-    }
-
-    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
-        self.enrich_lot_with(None, None, items)
-    }
-
-    fn enrich_lot_labeled(
-        &self,
-        label: &str,
-        items: &[LotItem],
-        stop: &AtomicBool,
-    ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        self.enrich_lot_with(Some(label), Some(stop), items)
-    }
-
-    fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
-        let out = self.complete(
-            None,
-            None,
-            ask_system_prompt(),
-            ask_user_prompt(question, context),
-        )?;
-        AskReply::parse(http::extract_json(&out)?)
-    }
-}
-
-impl OpenAiLlm {
-    #[allow(clippy::too_many_arguments)]
-    fn enrich_with(
-        &self,
-        label: Option<&str>,
-        stop: Option<&AtomicBool>,
-        file: &str,
-        call: usize,
-        text: &str,
-        requested: &[String],
-        known: &[String],
-    ) -> Result<Enrichment> {
-        let out = self.complete(
-            label,
-            stop,
-            enrichment_system_prompt(),
-            enrichment_user_prompt(file, call, text, requested),
-        )?;
-        Enrichment::parse(http::extract_json(&out)?, file, known)
-    }
-
-    fn enrich_lot_with(
-        &self,
-        label: Option<&str>,
-        stop: Option<&AtomicBool>,
-        items: &[LotItem],
-    ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        let out = self.complete(label, stop, lot_system_prompt(), lot_user_prompt(items))?;
-        Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
     }
 }
 

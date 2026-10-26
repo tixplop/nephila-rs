@@ -14,6 +14,10 @@ use std::sync::atomic::AtomicBool;
 use crate::config::{Config, Effort, Provider};
 use crate::error::{Error, Result};
 pub use ask::AskReply;
+use ask::{ask_system_prompt, ask_user_prompt};
+use enrich::{
+    enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt, parse_lot,
+};
 pub use enrich::{Enrichment, LotItem};
 pub use retry::with_format_retries;
 
@@ -83,6 +87,87 @@ pub trait Llm: Send + Sync {
     }
     /// Répond à une question à partir d'un contexte de graphe.
     fn ask(&self, question: &str, context: &str) -> Result<AskReply>;
+}
+
+/// Appel de complétion d'un adaptateur HTTP : le reste de `Llm` s'en déduit (REQ-127).
+pub(crate) trait Complete: Send + Sync {
+    /// Envoie la consigne système et la requête, retourne le texte de la réponse.
+    fn complete(
+        &self,
+        label: Option<&str>,
+        stop: Option<&AtomicBool>,
+        system: String,
+        user: String,
+    ) -> Result<String>;
+}
+
+impl<T: Complete> Llm for T {
+    fn enrich(
+        &self,
+        file: &str,
+        call: usize,
+        text: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> Result<Enrichment> {
+        let out = self.complete(
+            None,
+            None,
+            enrichment_system_prompt(),
+            enrichment_user_prompt(file, call, text, requested),
+        )?;
+        Enrichment::parse(http::extract_json(&out)?, file, known)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enrich_labeled(
+        &self,
+        label: &str,
+        file: &str,
+        call: usize,
+        text: &str,
+        requested: &[String],
+        known: &[String],
+        stop: &AtomicBool,
+    ) -> Result<Enrichment> {
+        let out = self.complete(
+            Some(label),
+            Some(stop),
+            enrichment_system_prompt(),
+            enrichment_user_prompt(file, call, text, requested),
+        )?;
+        Enrichment::parse(http::extract_json(&out)?, file, known)
+    }
+
+    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+        let out = self.complete(None, None, lot_system_prompt(), lot_user_prompt(items))?;
+        Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
+    }
+
+    fn enrich_lot_labeled(
+        &self,
+        label: &str,
+        items: &[LotItem],
+        stop: &AtomicBool,
+    ) -> Result<Vec<(String, Result<Enrichment>)>> {
+        let out = self.complete(
+            Some(label),
+            Some(stop),
+            lot_system_prompt(),
+            lot_user_prompt(items),
+        )?;
+        Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
+    }
+
+    fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
+        let out = self.complete(
+            None,
+            None,
+            ask_system_prompt(),
+            ask_user_prompt(question, context),
+        )?;
+        AskReply::parse(http::extract_json(&out)?)
+    }
 }
 
 /// Fournisseur qui porte le modèle effectif de la configuration (le simulé n'en a pas).
