@@ -1005,6 +1005,7 @@ fn perf_banc_js() {
 
 /// Pic de mémoire résidente (Kio) du seul processus `export --format json` de la 0.23.2, mesuré
 /// sur HEAD avant le flux (plus petite de 3 mesures) : AC-080-3.
+#[cfg(target_os = "linux")]
 const EXPORT_RSS0_KIB: i64 = 665_432;
 
 /// Lance `cmd` et rend son statut et le `ru_maxrss` (Kio, Linux) du seul processus fils.

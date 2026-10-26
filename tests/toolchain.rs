@@ -399,3 +399,150 @@ fn REQ129_AC1_compteurs_sous_cfg_test_une_seule_read_kind() {
     }
     assert!(found.is_empty(), "{found:#?}");
 }
+
+// ---- REQ-138 : aucun élément de premier niveau des tests utilisé seulement sous `cfg(target_os)`.
+
+struct Item {
+    name: String,
+    decl: usize,
+    first: usize,
+    last: usize,
+    reserved: bool,
+}
+
+fn item_name(line: &str) -> Option<String> {
+    let mut rest = line;
+    if let Some(r) = rest.strip_prefix("pub(crate) ") {
+        rest = r;
+    } else if let Some(r) = rest.strip_prefix("pub ") {
+        rest = r;
+    }
+    let rest = ["fn ", "const ", "static "]
+        .iter()
+        .find_map(|k| rest.strip_prefix(k))?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn est_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn contient_ident(line: &str, name: &str) -> bool {
+    line.match_indices(name).any(|(i, _)| {
+        let avant = line[..i].chars().next_back();
+        let apres = line[i + name.len()..].chars().next();
+        !avant.is_some_and(est_ident) && !apres.is_some_and(est_ident)
+    })
+}
+
+/// Éléments de premier niveau d'un fichier de test (indices de lignes à partir de 0).
+fn items(lines: &[&str]) -> Vec<Item> {
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(name) = item_name(line) else {
+            continue;
+        };
+        let mut first = i;
+        while first > 0
+            && (lines[first - 1].starts_with("#[") || lines[first - 1].starts_with("//"))
+        {
+            first -= 1;
+        }
+        let reserved = lines[first..i]
+            .iter()
+            .any(|l| l.starts_with("#[cfg(") && l.contains("target_os"));
+        let t = line.trim_end();
+        let last = if t.ends_with('}') || t.ends_with(';') {
+            i
+        } else if line.contains("fn ") {
+            (i + 1..lines.len())
+                .find(|&j| lines[j].starts_with('}'))
+                .unwrap_or(lines.len() - 1)
+        } else {
+            (i + 1..lines.len())
+                .find(|&j| lines[j].trim_end().ends_with(';'))
+                .unwrap_or(lines.len() - 1)
+        };
+        out.push(Item {
+            name,
+            decl: i,
+            first,
+            last,
+            reserved,
+        });
+    }
+    out
+}
+
+/// Violations `<rel>:<ligne> <nom>` : éléments non réservés dont les seuls usages sont dans des
+/// éléments réservés à un système (`#[cfg(... target_os ...)]`).
+fn violations(rel: &str, text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let items = items(&lines);
+    let mut out = Vec::new();
+    for it in items.iter().filter(|it| !it.reserved) {
+        let (mut reserve, mut ailleurs) = (false, false);
+        for (j, l) in lines.iter().enumerate() {
+            if j == it.decl || l.trim_start().starts_with("//") || !contient_ident(l, &it.name) {
+                continue;
+            }
+            if items
+                .iter()
+                .any(|o| o.reserved && o.first <= j && j <= o.last)
+            {
+                reserve = true;
+            } else {
+                ailleurs = true;
+            }
+        }
+        if reserve && !ailleurs {
+            out.push(format!("{rel}:{} {}", it.decl + 1, it.name));
+        }
+    }
+    out
+}
+
+#[test]
+fn REQ138_AC2_aide_violations_cas_de_l_ac() {
+    let seul = "/// doc\nconst K: i64 = 1;\n\n#[cfg(target_os = \"linux\")]\nfn f() {\n    let _ = K;\n}\n";
+    assert_eq!(violations("t.rs", seul), vec!["t.rs:2 K"]);
+
+    let aussi = format!("{seul}\nfn g() {{\n    let _ = K;\n}}\n");
+    assert!(violations("t.rs", &aussi).is_empty());
+
+    let commentaire = "/// vaut K\nfn h() {}\n\nconst K: i64 = 1;\n\n#[cfg(target_os = \"linux\")]\nfn f() {\n    let _ = K;\n}\n";
+    assert_eq!(violations("t.rs", commentaire), vec!["t.rs:4 K"]);
+
+    let deux = "#[cfg(target_os = \"linux\")]\nconst E17: i64 = 1;\n#[cfg(not(target_os = \"linux\"))]\nconst E17: i64 = 2;\n\n#[cfg(target_os = \"linux\")]\nfn f() {\n    let _ = E17;\n}\n";
+    assert!(violations("t.rs", deux).is_empty());
+
+    let proche = "const EXPORT_RSS0_KIB: i64 = 1;\nfn g() {\n    let _ = EXPORT_RSS0_KIBX;\n}\n\n#[cfg(target_os = \"linux\")]\nfn f() {\n    let _ = EXPORT_RSS0_KIB;\n}\n";
+    assert_eq!(violations("t.rs", proche), vec!["t.rs:1 EXPORT_RSS0_KIB"]);
+    let proche2 = proche.replace("let _ = EXPORT_RSS0_KIB;", "let _ = 0;");
+    assert!(violations("t.rs", &proche2).is_empty());
+}
+
+#[test]
+fn REQ138_AC1_aucun_element_utilise_seulement_sous_cfg_target_os() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<_> = std::fs::read_dir(root.join("tests"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "rs"))
+        .collect();
+    files.sort();
+    let mut found = Vec::new();
+    for p in files {
+        let text = std::fs::read_to_string(&p).unwrap();
+        let rel = p.strip_prefix(root).unwrap().display().to_string();
+        found.extend(violations(&rel, &text));
+    }
+    assert!(
+        found.is_empty(),
+        "éléments réservés à un système : {found:?}"
+    );
+}
