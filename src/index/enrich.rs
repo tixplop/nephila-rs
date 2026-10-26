@@ -859,6 +859,8 @@ fn finish_unit<'a>(
 
 /// Garde de l'expansion d'une unité : si le fil panique avant `finish_unit`, le compteur
 /// `expanding` est tout de même décrémenté, pour que les autres fils ne l'attendent pas.
+/// La garde ne s'exécute que si la panique se déroule (profils `dev` et `test`) ; en `release`,
+/// `panic = "abort"` (REQ-081) arrête le processus à la panique.
 struct ExpandGuard<'s, 'a> {
     shared: &'s Mutex<Shared<'a>>,
     wake: &'s Condvar,

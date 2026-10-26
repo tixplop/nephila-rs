@@ -575,13 +575,8 @@ mod tests {
         let terms: String = (1..10_000).map(|i| format!(" + \"s{i}\"")).collect();
         let src =
             format!("class K {{\n  fun helper() = \"\"\n  fun m(): String = helper(){terms}\n}}\n");
-        let s = std::thread::Builder::new()
-            .stack_size(512 * 1024)
-            .spawn(move || extract(Path::new("K.kt"), &src))
-            .unwrap()
-            .join()
-            .unwrap()
-            .unwrap();
+        let s =
+            crate::parse::walk::on_small_stack(move || extract(Path::new("K.kt"), &src)).unwrap();
         assert!(has_ref(&s, "method:K.m", EdgeKind::Calls, "K.helper"));
     }
 

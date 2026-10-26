@@ -8,6 +8,7 @@ use nephila::error::Error;
 use nephila::llm::anthropic::AnthropicLlm;
 use nephila::llm::openai::OpenAiLlm;
 use nephila::llm::AskReply;
+use nephila::llm::Generation;
 use nephila::llm::Llm;
 use nephila::llm::LotItem;
 use nephila::llm::Retry;
@@ -17,6 +18,14 @@ const EXTRACTION: &str =
     r#"{"version":2,"summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}"#;
 const VERSION_1: &str =
     r#"{"version":1,"declares":[{"kind":"type","name":"A","subkind":"class"}],"references":[]}"#;
+
+fn default_generation() -> Generation {
+    Generation {
+        effort: nephila::config::DEFAULT_EFFORT,
+        thinking: false,
+        max_output_tokens: nephila::config::DEFAULT_MAX_OUTPUT_TOKENS,
+    }
+}
 
 fn a_ids() -> Vec<String> {
     vec!["type:A".to_string()]
@@ -38,7 +47,7 @@ fn anthropic(s: &FakeServer) -> AnthropicLlm {
         30,
         &Tls::default(),
         1,
-        Default::default(),
+        default_generation(),
     )
     .with_retry(Retry::from_millis(1))
 }
@@ -51,7 +60,7 @@ fn openai(s: &FakeServer, key: Option<&str>) -> OpenAiLlm {
         30,
         &Tls::default(),
         1,
-        Default::default(),
+        default_generation(),
     )
     .with_retry(Retry::from_millis(1))
 }
@@ -106,7 +115,7 @@ fn req002_ac3_connection_refused_is_network() {
         30,
         &Tls::default(),
         1,
-        Default::default(),
+        default_generation(),
     )
     .with_retry(Retry::from_millis(1));
     assert!(matches!(
@@ -194,7 +203,7 @@ fn req002_ac5_base_url_trailing_slash_is_tolerated() {
         30,
         &Tls::default(),
         1,
-        Default::default(),
+        default_generation(),
     );
     llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()).unwrap();
     assert_eq!(s.requests()[0].path, "/v1/messages");
@@ -272,7 +281,7 @@ fn req002_ac8_slow_server_gives_timeout_error() {
         1,
         &Tls::default(),
         1,
-        Default::default(),
+        default_generation(),
     );
     let t = std::time::Instant::now();
     let r = llm.enrich("A.java", 1, "class A {}", &a_ids(), &a_ids());
@@ -290,7 +299,7 @@ fn req002_ac8_openai_slow_server_gives_timeout_error() {
         1,
         &Tls::default(),
         1,
-        Default::default(),
+        default_generation(),
     );
     let r = llm.enrich("A.java", 1, "x", &a_ids(), &a_ids());
     assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
@@ -306,7 +315,7 @@ fn req002_ac8_fast_server_succeeds_within_timeout() {
         1,
         &Tls::default(),
         1,
-        Default::default(),
+        default_generation(),
     );
     assert_eq!(
         llm.enrich("A.java", 1, "class A {}", &a_ids(), &a_ids())

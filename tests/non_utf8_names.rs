@@ -8,7 +8,7 @@ use assert_cmd::cargo::cargo_bin;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 struct Env {
@@ -104,7 +104,6 @@ fn REQ004_AC9_avec_llm_simule_le_fichier_est_enrichi() {
     assert_eq!(first_line(&o), "graphe à jour", "{}", out(&o));
     assert!(!out(&o).contains("à enrichir"), "{}", out(&o));
     assert!(!out(&o).contains("en attente"), "{}", out(&o));
-    let _: &Path = &env.mock;
 }
 
 // ---------------------------------------------------------------------------------------------

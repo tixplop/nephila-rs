@@ -53,6 +53,21 @@ impl<'t> Preorder<'t> {
     }
 }
 
+/// Pile réduite des tests de profondeur (REQ-044).
+#[cfg(test)]
+const SMALL_STACK: usize = 512 * 1024;
+
+/// Exécute `f` dans un fil à petite pile et rend son résultat.
+#[cfg(test)]
+pub(crate) fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(SMALL_STACK)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

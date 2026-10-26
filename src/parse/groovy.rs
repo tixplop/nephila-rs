@@ -570,13 +570,7 @@ mod tests {
     }
 
     fn run_small_stack(name: &'static str, src: String) -> FileStructure {
-        std::thread::Builder::new()
-            .stack_size(512 * 1024)
-            .spawn(move || extract(Path::new(name), &src))
-            .unwrap()
-            .join()
-            .unwrap()
-            .unwrap()
+        crate::parse::walk::on_small_stack(move || extract(Path::new(name), &src)).unwrap()
     }
 
     #[test]

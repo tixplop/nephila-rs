@@ -615,22 +615,13 @@ interface I extends J, K<X> { void m(); }
             .all(|d| d.qualified.starts_with("gen.Big.")));
     }
 
-    fn in_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-        std::thread::Builder::new()
-            .stack_size(512 * 1024)
-            .spawn(f)
-            .unwrap()
-            .join()
-            .unwrap()
-    }
-
     #[test]
     fn req044_ac2_concatenation_de_10000_termes_en_pile_reduite() {
         let terms: String = (1..10_000).map(|i| format!(" + \"s{i}\"")).collect();
         let src = format!(
             "class Big {{\n  String helper() {{ return \"\"; }}\n  String m() {{\n    return helper(){terms};\n  }}\n}}\n"
         );
-        let s = in_small_stack(move || extract(&src)).unwrap();
+        let s = crate::parse::walk::on_small_stack(move || extract(&src)).unwrap();
         assert!(has_ref(&s, "method:Big.m", EdgeKind::Calls, "Big.helper"));
     }
 
@@ -641,7 +632,7 @@ interface I extends J, K<X> { void m(); }
             "(".repeat(5_000),
             ")".repeat(5_000)
         );
-        let s = in_small_stack(move || extract(&src)).unwrap();
+        let s = crate::parse::walk::on_small_stack(move || extract(&src)).unwrap();
         assert!(has_ref(&s, "method:Big.m", EdgeKind::Calls, "Big.helper"));
     }
 

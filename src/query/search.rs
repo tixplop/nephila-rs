@@ -80,11 +80,6 @@ fn rank(f: &Folded, term: &str) -> Option<Rank> {
     }
 }
 
-/// Nœuds correspondants, triés ; départage par nom qualifié puis identifiant.
-pub fn matches<'a>(nodes: &'a [Node], term: &str) -> Vec<&'a Node> {
-    Prepared::new(nodes).matches(term)
-}
-
 fn label(n: &Node) -> &'static str {
     n.subkind.map_or(n.kind.as_str(), |s| s.as_str())
 }
@@ -278,7 +273,8 @@ mod tests {
                     .into_iter()
                     .map(|n| n.id)
                     .collect();
-                let new: Vec<&str> = matches(&nodes, &term)
+                let new: Vec<&str> = Prepared::new(&nodes)
+                    .matches(&term)
                     .into_iter()
                     .map(|n| n.id.as_str())
                     .collect();

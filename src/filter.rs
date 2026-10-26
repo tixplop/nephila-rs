@@ -260,22 +260,10 @@ impl Matcher {
 }
 
 /// Contenu validé du fichier de projet `<dépôt>/.nephila.toml` : filtres et réglages LLM.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectFile {
     pub filters: Filters,
     pub settings: ProjectSettings,
-    /// Clé `exclude_defaults` (défaut `true`).
-    pub exclude_defaults: bool,
-}
-
-impl Default for ProjectFile {
-    fn default() -> Self {
-        ProjectFile {
-            filters: Filters::default(),
-            settings: ProjectSettings::default(),
-            exclude_defaults: true,
-        }
-    }
 }
 
 /// Clés de filtre et d'exclusion du fichier de projet, dans l'ordre de la liste d'E-2.
@@ -368,11 +356,7 @@ impl ProjectFile {
         };
         filters.defaults_off = !exclude_defaults;
         let settings = ProjectSettings::from_table(&table, &shown)?;
-        Ok(ProjectFile {
-            filters,
-            settings,
-            exclude_defaults,
-        })
+        Ok(ProjectFile { filters, settings })
     }
 }
 

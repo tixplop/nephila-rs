@@ -7,12 +7,20 @@ use fake_server::FakeServer;
 use nephila::error::Error;
 use nephila::llm::anthropic::AnthropicLlm;
 use nephila::llm::openai::OpenAiLlm;
-use nephila::llm::{Llm, Tls};
+use nephila::llm::{Generation, Llm, Tls};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
 
 const EXTRACTION: &str =
     r#"{"version":2,"summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}"#;
+
+fn default_generation() -> Generation {
+    Generation {
+        effort: nephila::config::DEFAULT_EFFORT,
+        thinking: false,
+        max_output_tokens: nephila::config::DEFAULT_MAX_OUTPUT_TOKENS,
+    }
+}
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!(
@@ -59,7 +67,7 @@ fn openai(url: &str, tls: &Tls) -> OpenAiLlm {
         30,
         tls,
         1,
-        Default::default(),
+        default_generation(),
     )
 }
 
@@ -71,7 +79,7 @@ fn anthropic(url: &str, tls: &Tls) -> AnthropicLlm {
         30,
         tls,
         1,
-        Default::default(),
+        default_generation(),
     )
 }
 

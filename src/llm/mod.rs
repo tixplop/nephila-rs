@@ -29,16 +29,6 @@ pub struct Generation {
     pub max_output_tokens: u32,
 }
 
-impl Default for Generation {
-    fn default() -> Generation {
-        Generation {
-            effort: crate::config::DEFAULT_EFFORT,
-            thinking: false,
-            max_output_tokens: crate::config::DEFAULT_MAX_OUTPUT_TOKENS,
-        }
-    }
-}
-
 /// Fournisseur LLM. Les implémentations sont partagées entre threads.
 pub trait Llm: Send + Sync {
     /// Modèle effectif, qui entre dans l'empreinte d'enrichissement (REQ-049). Vide par défaut.
