@@ -1917,7 +1917,6 @@ impl Store {
     where
         F: FnOnce(&Store) -> Result<(String, i64)>,
     {
-        use std::collections::{BTreeSet, HashSet};
         self.ensure_writable()?;
         self.end_fresh();
         let tx = rusqlite::Transaction::new_unchecked(
@@ -1926,105 +1925,10 @@ impl Store {
         )
         .map_err(db_err)?;
         let mut log = ChangeLog::default();
-        {
-            let mut ins = tx.prepare_cached(INSERT_DEPENDENCY).map_err(db_err)?;
-            for n in &w.dependencies {
-                let added = ins
-                    .execute(params![
-                        n.id,
-                        n.qualified,
-                        n.short,
-                        reverse_qualified(&n.qualified)
-                    ])
-                    .map_err(db_err)?;
-                if added > 0 {
-                    log.inserted.insert(n.id.clone());
-                }
-            }
-        }
-        let dependency_prefix = format!("{}:", NodeKind::Dependency.as_str());
-        let depends_on = EdgeKind::DependsOn.as_str();
-        let mut candidates: BTreeSet<String> = BTreeSet::new();
-        for (source, wanted) in &w.sources {
-            let stored: Vec<(String, String)> = {
-                let mut st = tx.prepare_cached(STORED_REF_EDGES).map_err(db_err)?;
-                let rows = st
-                    .query_map([source], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .map_err(db_err)?;
-                rows.collect::<std::result::Result<_, _>>()
-                    .map_err(db_err)?
-            };
-            note_edge_rows(stored.len());
-            let wanted_set: HashSet<(&str, &str)> = wanted
-                .iter()
-                .map(|e| (e.target.as_str(), e.kind.as_str()))
-                .collect();
-            let mut del = tx.prepare_cached(DELETE_EDGE).map_err(db_err)?;
-            for (t, k) in &stored {
-                if !wanted_set.contains(&(t.as_str(), k.as_str())) {
-                    del.execute(params![source, t, k]).map_err(db_err)?;
-                    if k == depends_on && t.starts_with(&dependency_prefix) {
-                        candidates.insert(t.clone());
-                    }
-                }
-            }
-            let stored_set: HashSet<(&str, &str)> = stored
-                .iter()
-                .map(|(t, k)| (t.as_str(), k.as_str()))
-                .collect();
-            let mut ins = tx.prepare_cached(INSERT_EDGE).map_err(db_err)?;
-            for e in wanted {
-                if !stored_set.contains(&(e.target.as_str(), e.kind.as_str())) {
-                    ins.execute(params![e.source, e.target, e.kind.as_str()])
-                        .map_err(db_err)?;
-                }
-            }
-        }
-        for (target, wanted) in &w.contained {
-            let stored: Vec<String> = {
-                let mut st = tx.prepare_cached(STORED_CONTAINS).map_err(db_err)?;
-                let rows = st
-                    .query_map([target], |r| r.get::<_, String>(0))
-                    .map_err(db_err)?;
-                rows.collect::<std::result::Result<_, _>>()
-                    .map_err(db_err)?
-            };
-            note_edge_rows(stored.len());
-            let contains = EdgeKind::Contains.as_str();
-            let wanted_set: HashSet<&str> = wanted.iter().map(|e| e.source.as_str()).collect();
-            let mut del = tx.prepare_cached(DELETE_EDGE).map_err(db_err)?;
-            for s in &stored {
-                if !wanted_set.contains(s.as_str()) {
-                    del.execute(params![s, target, contains]).map_err(db_err)?;
-                }
-            }
-            let stored_set: HashSet<&str> = stored.iter().map(String::as_str).collect();
-            let mut ins = tx.prepare_cached(INSERT_EDGE).map_err(db_err)?;
-            for e in wanted {
-                if !stored_set.contains(e.source.as_str()) {
-                    ins.execute(params![e.source, e.target, contains])
-                        .map_err(db_err)?;
-                }
-            }
-        }
-        // Dépendances dérivées qui n'ont plus de lien `depends_on` entrant.
-        for id in &candidates {
-            let still_used = tx
-                .prepare_cached(DEPENDS_ON_ENTERING)
-                .map_err(db_err)?
-                .exists([id])
-                .map_err(db_err)?;
-            if !still_used {
-                let gone = tx
-                    .prepare_cached(DELETE_DEPENDENCY)
-                    .map_err(db_err)?
-                    .execute([id])
-                    .map_err(db_err)?;
-                if gone > 0 {
-                    log.deleted.insert(id.clone());
-                }
-            }
-        }
+        insert_derived_dependencies(&tx, &w.dependencies, &mut log)?;
+        let candidates = diff_source_edges(&tx, &w.sources)?;
+        diff_contains_edges(&tx, &w.contained)?;
+        delete_unused_dependencies(&tx, &candidates, &mut log)?;
         {
             let mut set = tx.prepare_cached(SET_UNRESOLVED).map_err(db_err)?;
             for (id, unresolved) in &w.statuses {
@@ -2350,6 +2254,140 @@ fn set_resolution_tx(conn: &rusqlite::Connection, value: &str) -> Result<()> {
     .map_err(db_err)?
     .execute([value])
     .map_err(db_err)?;
+    Ok(())
+}
+
+/// Insère les dépendances dérivées manquantes ; le journal retient celles réellement créées.
+fn insert_derived_dependencies(
+    conn: &rusqlite::Connection,
+    dependencies: &[Node],
+    log: &mut ChangeLog,
+) -> Result<()> {
+    let mut ins = conn.prepare_cached(INSERT_DEPENDENCY).map_err(db_err)?;
+    for n in dependencies {
+        let added = ins
+            .execute(params![
+                n.id,
+                n.qualified,
+                n.short,
+                reverse_qualified(&n.qualified)
+            ])
+            .map_err(db_err)?;
+        if added > 0 {
+            log.inserted.insert(n.id.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Différence des liens sortants (hors `contains`) de chaque source réévaluée. Rend les
+/// dépendances dérivées dont un lien `depends_on` a été supprimé.
+fn diff_source_edges(
+    conn: &rusqlite::Connection,
+    sources: &[(String, Vec<Edge>)],
+) -> Result<std::collections::BTreeSet<String>> {
+    use std::collections::{BTreeSet, HashSet};
+    let dependency_prefix = format!("{}:", NodeKind::Dependency.as_str());
+    let depends_on = EdgeKind::DependsOn.as_str();
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for (source, wanted) in sources {
+        let stored: Vec<(String, String)> = {
+            let mut st = conn.prepare_cached(STORED_REF_EDGES).map_err(db_err)?;
+            let rows = st
+                .query_map([source], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(db_err)?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?
+        };
+        note_edge_rows(stored.len());
+        let wanted_set: HashSet<(&str, &str)> = wanted
+            .iter()
+            .map(|e| (e.target.as_str(), e.kind.as_str()))
+            .collect();
+        let mut del = conn.prepare_cached(DELETE_EDGE).map_err(db_err)?;
+        for (t, k) in &stored {
+            if !wanted_set.contains(&(t.as_str(), k.as_str())) {
+                del.execute(params![source, t, k]).map_err(db_err)?;
+                if k == depends_on && t.starts_with(&dependency_prefix) {
+                    candidates.insert(t.clone());
+                }
+            }
+        }
+        let stored_set: HashSet<(&str, &str)> = stored
+            .iter()
+            .map(|(t, k)| (t.as_str(), k.as_str()))
+            .collect();
+        let mut ins = conn.prepare_cached(INSERT_EDGE).map_err(db_err)?;
+        for e in wanted {
+            if !stored_set.contains(&(e.target.as_str(), e.kind.as_str())) {
+                ins.execute(params![e.source, e.target, e.kind.as_str()])
+                    .map_err(db_err)?;
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+/// Différence des liens `contains` entrants de chaque cible réévaluée.
+fn diff_contains_edges(
+    conn: &rusqlite::Connection,
+    contained: &[(String, Vec<Edge>)],
+) -> Result<()> {
+    use std::collections::HashSet;
+    let contains = EdgeKind::Contains.as_str();
+    for (target, wanted) in contained {
+        let stored: Vec<String> = {
+            let mut st = conn.prepare_cached(STORED_CONTAINS).map_err(db_err)?;
+            let rows = st
+                .query_map([target], |r| r.get::<_, String>(0))
+                .map_err(db_err)?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?
+        };
+        note_edge_rows(stored.len());
+        let wanted_set: HashSet<&str> = wanted.iter().map(|e| e.source.as_str()).collect();
+        let mut del = conn.prepare_cached(DELETE_EDGE).map_err(db_err)?;
+        for s in &stored {
+            if !wanted_set.contains(s.as_str()) {
+                del.execute(params![s, target, contains]).map_err(db_err)?;
+            }
+        }
+        let stored_set: HashSet<&str> = stored.iter().map(String::as_str).collect();
+        let mut ins = conn.prepare_cached(INSERT_EDGE).map_err(db_err)?;
+        for e in wanted {
+            if !stored_set.contains(e.source.as_str()) {
+                ins.execute(params![e.source, e.target, contains])
+                    .map_err(db_err)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Supprime les dépendances dérivées qui n'ont plus de lien `depends_on` entrant ; le journal
+/// retient celles réellement supprimées.
+fn delete_unused_dependencies(
+    conn: &rusqlite::Connection,
+    candidates: &std::collections::BTreeSet<String>,
+    log: &mut ChangeLog,
+) -> Result<()> {
+    for id in candidates {
+        let still_used = conn
+            .prepare_cached(DEPENDS_ON_ENTERING)
+            .map_err(db_err)?
+            .exists([id])
+            .map_err(db_err)?;
+        if !still_used {
+            let gone = conn
+                .prepare_cached(DELETE_DEPENDENCY)
+                .map_err(db_err)?
+                .execute([id])
+                .map_err(db_err)?;
+            if gone > 0 {
+                log.deleted.insert(id.clone());
+            }
+        }
+    }
     Ok(())
 }
 
