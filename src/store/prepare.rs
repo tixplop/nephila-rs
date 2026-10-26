@@ -3,7 +3,6 @@
 
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{Error, Result};
 use crate::model::{EdgeKind, Node, NodeKind, Ref};
@@ -39,11 +38,9 @@ thread_local! {
     static PREPARATIONS: Cell<u64> = const { Cell::new(0) };
 }
 
-static PREPARED_TOTAL: AtomicUsize = AtomicUsize::new(0);
-
 fn note_preparation() {
     PREPARATIONS.with(|c| c.set(c.get() + 1));
-    PREPARED_TOTAL.fetch_add(1, Ordering::SeqCst);
+    crate::diag::add(crate::diag::Counter::Preparations, 1);
 }
 
 /// Préparations faites par le fil courant (diagnostic, AC-074-2).
@@ -52,10 +49,10 @@ pub(crate) fn preparations_on_thread() -> u64 {
     PREPARATIONS.with(Cell::get)
 }
 
-/// Préparations faites par tous les fils (diagnostic, AC-074-2).
-#[cfg_attr(not(test), allow(dead_code))]
+/// Préparations de la portée de diagnostic courante (diagnostic, AC-074-2).
+#[cfg(test)]
 pub(crate) fn preparations_total() -> usize {
-    PREPARED_TOTAL.load(Ordering::SeqCst)
+    crate::diag::current(crate::diag::Counter::Preparations)
 }
 
 /// Nom court d'un nœud, selon son genre.

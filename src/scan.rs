@@ -439,11 +439,6 @@ const WALK_BATCH: usize = 256;
 
 type WalkEntry = std::result::Result<ignore::DirEntry, ignore::Error>;
 
-/// Fils du parcours démarrés (diagnostic des tests, AC-111-2).
-#[cfg(test)]
-pub(crate) static WALK_THREADS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// `walk` avec le lanceur de fils injecté (DEC-108, DEC-109) : les entrées sont énumérées dans le
 /// fil appelant et traitées par `jobs` − 1 fils (aucun si `jobs` = 1).
 pub(crate) fn walk_with<L: crate::workers::Launcher>(
@@ -527,8 +522,7 @@ pub(crate) fn walk_with<L: crate::workers::Launcher>(
                     })
                 },
             );
-            #[cfg(test)]
-            WALK_THREADS.fetch_add(started, std::sync::atomic::Ordering::SeqCst);
+            crate::diag::add(crate::diag::Counter::WalkThreads, started);
             let _ = started;
             if let Some(e) = error {
                 // L'émetteur est lâché en sortant : les fils démarrés finissent.
@@ -683,11 +677,6 @@ fn not_utf8(label: &str) -> String {
 /// Empreinte lue d'un fichier et son contenu retenu s'il tient dans le budget.
 type Hashed = std::result::Result<(String, Option<Retained>), String>;
 
-/// Fils d'empreintes lancés (diagnostic des tests, AC-072-2).
-#[cfg(test)]
-pub(crate) static HASH_THREADS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Lit et empreinte `files[i]` pour chaque `i` de `todo`, par min(`jobs`, n) fils qui prennent
 /// leurs indices dans une file partagée ; résultat à la position de `todo`. Avec `jobs` = 1 ou un
 /// seul fichier, lecture dans le fil appelant.
@@ -726,14 +715,17 @@ fn hash_files(
     if workers > 1 {
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
+            let inherit = crate::diag::Inherit::capture();
             for _ in 0..workers {
+                let inherit = inherit.clone();
                 match std::thread::Builder::new()
                     .name("nephila-hash".into())
-                    .spawn_scoped(scope, work)
-                {
+                    .spawn_scoped(scope, || {
+                        let _scope = inherit.enter();
+                        work()
+                    }) {
                     Ok(h) => {
-                        #[cfg(test)]
-                        HASH_THREADS.fetch_add(1, Ordering::SeqCst);
+                        crate::diag::add(crate::diag::Counter::HashThreads, 1);
                         handles.push(h);
                     }
                     Err(_) => break,
@@ -2090,7 +2082,6 @@ mod tests {
     /// 40 fichiers dont `reusable` à empreinte réutilisable ; fils d'empreintes lancés.
     fn hash_threads_for(reusable: usize, jobs: usize) -> usize {
         use crate::model::FileState;
-        use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         for i in 0..40 {
@@ -2110,14 +2101,14 @@ mod tests {
                 state: FileState::Indexed,
             })
             .collect();
-        HASH_THREADS.store(0, Ordering::SeqCst);
+        let d = crate::diag::scope();
         let got = scan(root, &known, &Matcher::none(), jobs).unwrap();
         assert_eq!(got.files.len(), 40);
         assert_eq!(
             got.files.iter().filter(|f| f.rehashed).count(),
             40 - reusable
         );
-        HASH_THREADS.load(Ordering::SeqCst)
+        d.get(crate::diag::Counter::HashThreads)
     }
 
     #[test]
@@ -2170,10 +2161,14 @@ mod tests {
         let dir = tree50();
         let mut results = Vec::new();
         for (jobs, threads) in [(1, 0), (2, 1), (8, 7)] {
-            WALK_THREADS.store(0, Ordering::SeqCst);
+            let d = crate::diag::scope();
             let l = crate::workers::tests::FailAt::new(0);
             let got = walk_with(dir.path(), &Matcher::none(), jobs, &[], &l).unwrap();
-            assert_eq!(WALK_THREADS.load(Ordering::SeqCst), threads, "jobs {jobs}");
+            assert_eq!(
+                d.get(crate::diag::Counter::WalkThreads),
+                threads,
+                "jobs {jobs}"
+            );
             assert_eq!(
                 l.calls.load(Ordering::SeqCst),
                 threads,

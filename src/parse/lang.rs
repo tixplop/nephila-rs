@@ -111,7 +111,7 @@ impl Lang {
     /// pris dans un cache propre au fil, un par grammaire (DEC-090) ; l'analyse est toujours complète.
     pub fn parse(self, text: &str) -> Result<tree_sitter::Tree> {
         #[cfg(test)]
-        if tests::FORCE_FRESH.load(std::sync::atomic::Ordering::SeqCst) {
+        if crate::diag::force_fresh() {
             return tests::parse_fresh(self, text);
         }
         let (grammar, slot) = self
@@ -125,8 +125,7 @@ impl Lang {
                 parser.set_language(&grammar).map_err(|e| {
                     Error::Message(format!("grammaire {self:?} incompatible : {e}"))
                 })?;
-                #[cfg(test)]
-                PARSERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::diag::add(crate::diag::Counter::ParsersCreated, 1);
                 parsers[slot] = Some(parser);
             }
             let parser = parsers[slot].as_mut().expect("parser créé ci-dessus");
@@ -145,18 +144,9 @@ thread_local! {
         const { std::cell::RefCell::new([None, None, None, None, None, None, None]) };
 }
 
-/// Compteur de diagnostic : parsers créés, tous fils confondus (tests seulement).
-#[cfg(test)]
-pub(crate) static PARSERS_CREATED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-
-    /// Crochet de test : `Lang::parse` crée un parser neuf par appel (oracle de la 0.23.2).
-    pub(crate) static FORCE_FRESH: AtomicBool = AtomicBool::new(false);
 
     /// Implémentation de la 0.23.2 : un parser neuf par appel.
     pub(crate) fn parse_fresh(lang: Lang, text: &str) -> Result<tree_sitter::Tree> {

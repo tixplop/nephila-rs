@@ -39,8 +39,15 @@ pub(crate) fn start_workers<'scope, 'env, L: Launcher>(
     mut builder: impl FnMut() -> Builder,
     mut work: impl FnMut() -> Work<'scope>,
 ) -> (usize, Option<io::Error>) {
+    let inherit = crate::diag::Inherit::capture();
     for started in 0..wanted {
-        if let Err(e) = launcher.launch(scope, builder(), work()) {
+        let job = work();
+        let inherit = inherit.clone();
+        let job: Work<'scope> = Box::new(move || {
+            let _scope = inherit.enter();
+            job()
+        });
+        if let Err(e) = launcher.launch(scope, builder(), job) {
             return (started, Some(e));
         }
     }

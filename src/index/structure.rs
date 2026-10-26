@@ -124,8 +124,7 @@ pub(crate) fn analyze_with<L: crate::workers::Launcher>(
                 })
             },
         );
-        #[cfg(test)]
-        tests::EXTRACT_THREADS.fetch_add(started_workers, std::sync::atomic::Ordering::SeqCst);
+        crate::diag::add(crate::diag::Counter::ExtractThreads, started_workers);
         if let Some(e) = start_error {
             if started_workers == 0 {
                 queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
@@ -243,10 +242,7 @@ mod tests {
     use crate::model::NodeKind;
     use crate::parse::{Declared, FileStructure};
     use crate::store::prepare_structure;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Compteur de diagnostic (AC-071-3) : fils d'extraction lancés, tous appels confondus.
-    pub(super) static EXTRACT_THREADS: AtomicUsize = AtomicUsize::new(0);
+    use std::sync::atomic::Ordering;
 
     /// Fils d'extraction lancés par `analyze` sur `n` fichiers avec `jobs`.
     fn threads_for(n: usize, jobs: usize) -> usize {
@@ -275,7 +271,7 @@ mod tests {
             })
             .collect();
         store.reset_with_pending_files(&records).unwrap();
-        let before = EXTRACT_THREADS.load(Ordering::SeqCst);
+        let d = crate::diag::scope();
         let mut report = BuildReport::default();
         analyze(
             repo,
@@ -286,7 +282,7 @@ mod tests {
             &mut report,
         )
         .unwrap();
-        EXTRACT_THREADS.load(Ordering::SeqCst) - before
+        d.get(crate::diag::Counter::ExtractThreads)
     }
 
     /// AC-071-3 : le nombre de fils lancés vaut min(jobs, fichiers), au moins 1.
@@ -388,6 +384,7 @@ mod tests {
     #[test]
     fn req074_ac2_preparation_dans_les_fils_tables_identiques() {
         use crate::store::{preparations_on_thread, preparations_total};
+        let _d = crate::diag::scope();
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
         write_repo(a.path(), 50);
@@ -635,7 +632,7 @@ mod tests {
 
     /// Analyse le dépôt mixte avec `jobs` fils ; rend (parsers créés, tables).
     fn analyze_mixed(jobs: usize, fresh: bool) -> (usize, Vec<(String, Vec<String>)>) {
-        use crate::parse::lang::PARSERS_CREATED;
+        let d = crate::diag::scope();
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         write_mixed_repo(repo);
@@ -645,8 +642,7 @@ mod tests {
         store
             .reset_with_pending_files(&pending_records(&scanned.files))
             .unwrap();
-        crate::parse::lang::tests::FORCE_FRESH.store(fresh, Ordering::SeqCst);
-        PARSERS_CREATED.store(0, Ordering::SeqCst);
+        d.set_force_fresh(fresh);
         let mut report = BuildReport::default();
         let r = analyze(
             repo,
@@ -656,9 +652,9 @@ mod tests {
             &mut store,
             &mut report,
         );
-        crate::parse::lang::tests::FORCE_FRESH.store(false, Ordering::SeqCst);
+        d.set_force_fresh(false);
         r.unwrap();
-        let created = PARSERS_CREATED.load(Ordering::SeqCst);
+        let created = d.get(crate::diag::Counter::ParsersCreated);
         resolve(&mut store, repo);
         drop(store);
         (created, dump(repo))
@@ -745,11 +741,11 @@ mod tests {
         assert!(oracle
             .iter()
             .any(|(n, rows)| n == "nodes" && !rows.is_empty()));
-        let before = EXTRACT_THREADS.load(Ordering::SeqCst);
+        let d = crate::diag::scope();
         let l = crate::workers::tests::FailAt::new(3);
         let (r, events, tables) = run_with_launcher(4, &l);
         r.unwrap();
-        assert_eq!(EXTRACT_THREADS.load(Ordering::SeqCst) - before, 2);
+        assert_eq!(d.get(crate::diag::Counter::ExtractThreads), 2);
         assert_eq!(tables, oracle);
         let begin = events
             .iter()

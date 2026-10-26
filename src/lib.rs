@@ -1,6 +1,7 @@
 pub mod chunk;
 pub mod cli;
 pub mod config;
+pub(crate) mod diag;
 pub mod diff;
 pub mod error;
 pub mod escape;
