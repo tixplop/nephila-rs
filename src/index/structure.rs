@@ -71,6 +71,7 @@ pub(crate) fn analyze_with<L: crate::workers::Launcher>(
     let started = std::time::Instant::now();
     let failed_before = report.failed;
     let retained_before = report.retained;
+    let unreadable_before = report.unreadable;
     trace!("structure: début {total} fichiers, {workers} fils");
     let mut batch: Vec<PreparedStructure> = Vec::new();
     // Avertissements de la phase, rangés par chemin converti et écrits triés (REQ-104, AC-104-5).
@@ -187,11 +188,18 @@ pub(crate) fn analyze_with<L: crate::workers::Launcher>(
     for line in notes.iter().flat_map(|(_, lines)| lines) {
         warn(line);
     }
+    let unreadable = report.unreadable - unreadable_before;
+    let unreadable_note = if unreadable > 0 {
+        format!(", {unreadable} enrichissements illisibles écartés")
+    } else {
+        String::new()
+    };
     trace!(
-        "structure: fin {} ms, {} en attente, {} enrichissements conservés",
+        "structure: fin {} ms, {} en attente, {} enrichissements conservés{}",
         started.elapsed().as_millis(),
         report.failed - failed_before,
-        report.retained - retained_before
+        report.retained - retained_before,
+        unreadable_note
     );
     match spawn_error.or(write_error) {
         Some(e) => Err(e),
@@ -224,9 +232,10 @@ fn flush(
         return;
     }
     match store.write_prepared(batch) {
-        Ok(retained) => {
+        Ok(written) => {
             report.processed += batch.len();
-            report.retained += retained;
+            report.retained += written.reapplied;
+            report.unreadable += written.unreadable;
         }
         Err(e) => {
             queue.lock().unwrap_or_else(|p| p.into_inner()).clear();

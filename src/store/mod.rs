@@ -987,23 +987,24 @@ impl Store {
             .iter()
             .map(|(p, n, r)| (p.as_str(), prepare_raw(p, n, r)))
             .collect();
-        self.write_items(prepared)
+        self.write_items(prepared).map(|w| w.reapplied)
     }
 
     /// Écrit des structures préparées (DEC-086) en une seule transaction, tout ou rien : que des
     /// instructions SQL, aucun calcul. Renvoie le nombre de fichiers dont l'enrichissement
-    /// conservé a été réappliqué (DEC-062).
-    pub fn write_prepared(&mut self, items: &[PreparedStructure]) -> Result<usize> {
+    /// conservé a été réappliqué (DEC-062) et celui des entrées conservées illisibles écartées
+    /// (DEC-114).
+    pub fn write_prepared(&mut self, items: &[PreparedStructure]) -> Result<WrittenStructures> {
         self.write_items(items.iter().map(|p| (p.path.as_str(), Ok(p))))
     }
 
     fn write_items<'a, B: Borrow<PreparedStructure>>(
         &mut self,
         items: impl IntoIterator<Item = (&'a str, Result<B>)>,
-    ) -> Result<usize> {
+    ) -> Result<WrittenStructures> {
         self.ensure_writable()?;
         let tx = self.conn.transaction().map_err(db_err)?;
-        let mut reapplied = 0;
+        let mut written = WrittenStructures::default();
         let mut newly: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut any = false;
         let track = self.log.is_some();
@@ -1018,9 +1019,7 @@ impl Store {
             let p: &PreparedStructure = p.borrow();
             let fresh = self.fresh && !self.written.contains(path) && !newly.contains(path);
             if fresh {
-                if write_structure_fresh(&tx, p)? {
-                    reapplied += 1;
-                }
+                written.add(write_structure_fresh(&tx, p)?);
                 newly.insert(path);
                 continue;
             }
@@ -1033,9 +1032,7 @@ impl Store {
                 .map_err(db_err)?
                 .execute([path])
                 .map_err(db_err)?;
-            if reapply_enrichment(&tx, path, &mut touched)? {
-                reapplied += 1;
-            }
+            written.add(reapply_enrichment(&tx, path, &mut touched)?);
             finish_file(&tx, path, &mut touched)?;
             pending.merge(touched.log);
         }
@@ -1048,7 +1045,7 @@ impl Store {
             let done: Vec<String> = newly.iter().map(|p| (*p).to_string()).collect();
             self.written.extend(done);
         }
-        Ok(reapplied)
+        Ok(written)
     }
 
     /// Applique en une transaction le résultat de l'enrichissement d'un fichier : remplace ses
@@ -2399,6 +2396,7 @@ fn write_enrichment(
     apply_enrichment_tx(tx, path, summaries, concept_nodes, refs, &mut touched)?;
     finish_file(tx, path, &mut touched)?;
     let payload = Payload {
+        v: PAYLOAD_VERSION,
         summaries: summaries.to_vec(),
         concepts: concept_nodes
             .iter()
@@ -2792,6 +2790,42 @@ pub struct EnrichmentEntry {
     pub prompt_version: u32,
 }
 
+/// Format courant de la charge utile des enrichissements conservés ; à incrémenter à chaque
+/// changement de forme de `Payload` (DEC-114).
+const PAYLOAD_VERSION: u32 = 1;
+
+/// Bilan de l'écriture de structures : enrichissements conservés réappliqués et entrées
+/// conservées illisibles écartées (DEC-114).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WrittenStructures {
+    pub reapplied: usize,
+    pub unreadable: usize,
+}
+
+impl WrittenStructures {
+    fn add(&mut self, other: Kept) {
+        self.reapplied += usize::from(other.reapplied);
+        self.unreadable += usize::from(other.unreadable);
+    }
+}
+
+/// Issue de la relecture de l'enrichissement conservé d'un fichier.
+enum KeptEnrichment {
+    Absent,
+    Readable(Payload),
+    /// Entrée de même empreinte qui ne se lit plus : supprimée et comptée.
+    Unreadable,
+    /// Entrée d'empreinte différente : supprimée, non comptée.
+    Stale,
+}
+
+/// Effet de la relecture sur un fichier écrit.
+#[derive(Clone, Copy)]
+struct Kept {
+    reapplied: bool,
+    unreadable: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 struct PayloadConcept {
     name: String,
@@ -2807,6 +2841,9 @@ struct PayloadRef {
 
 #[derive(Serialize, Deserialize)]
 struct Payload {
+    /// Numéro de format ; absent (0) = format des versions 0.18.0 à 0.23.2 (DEC-114).
+    #[serde(default)]
+    v: u32,
     summaries: Vec<(String, String)>,
     concepts: Vec<PayloadConcept>,
     refs: Vec<PayloadRef>,
@@ -2840,9 +2877,9 @@ fn apply_enrichment_tx(
 }
 
 /// Lit l'enrichissement conservé d'un fichier dont la structure vient d'être écrite : son contenu
-/// si l'empreinte est celle du fichier ; une entrée de contenu différent (ou illisible) est
-/// supprimée.
-fn load_kept_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Option<Payload>> {
+/// si l'empreinte est celle du fichier et la charge utile se lit ; une entrée périmée (contenu
+/// différent) ou illisible est supprimée, seule l'illisible est signalée (DEC-114).
+fn load_kept_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<KeptEnrichment> {
     let row: Option<(String, String)> = match tx
         .prepare_cached("SELECT e.content_hash, e.payload FROM enrichments e WHERE e.path = ?1")
         .map_err(db_err)?
@@ -2853,25 +2890,28 @@ fn load_kept_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Op
         Err(e) => return Err(db_err(e)),
     };
     let Some((entry_hash, json)) = row else {
-        return Ok(None);
+        return Ok(KeptEnrichment::Absent);
     };
     let file_hash: String = tx
         .prepare_cached("SELECT hash FROM files WHERE path = ?1")
         .map_err(db_err)?
         .query_row([path], |r| r.get(0))
         .map_err(db_err)?;
-    let payload: Option<Payload> = if entry_hash == file_hash {
-        serde_json::from_str(&json).ok()
+    let outcome = if entry_hash != file_hash {
+        KeptEnrichment::Stale
     } else {
-        None
+        match serde_json::from_str::<Payload>(&json) {
+            Ok(p) if p.v <= PAYLOAD_VERSION => KeptEnrichment::Readable(p),
+            _ => KeptEnrichment::Unreadable,
+        }
     };
-    if payload.is_none() {
+    if !matches!(outcome, KeptEnrichment::Readable(_)) {
         tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
             .map_err(db_err)?
             .execute([path])
             .map_err(db_err)?;
     }
-    Ok(payload)
+    Ok(outcome)
 }
 
 /// Éléments de l'enrichissement conservé qui ont un nœud correspondant (les autres sont écartés
@@ -2932,26 +2972,41 @@ fn reapply_enrichment(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
     touched: &mut Touched,
-) -> Result<bool> {
-    let Some(payload) = load_kept_enrichment(tx, path)? else {
-        return Ok(false);
+) -> Result<Kept> {
+    let payload = match load_kept_enrichment(tx, path)? {
+        KeptEnrichment::Readable(p) => p,
+        other => return Ok(Kept::without_payload(&other)),
     };
     let declared: std::collections::HashSet<String> = declared_by(tx, path)?.into_iter().collect();
     let (summaries, concepts, refs) = filter_payload(payload, &declared);
     apply_enrichment_tx(tx, path, &summaries, &concepts, &refs, touched)?;
-    Ok(true)
+    Ok(Kept {
+        reapplied: true,
+        unreadable: false,
+    })
+}
+
+impl Kept {
+    fn without_payload(outcome: &KeptEnrichment) -> Kept {
+        Kept {
+            reapplied: false,
+            unreadable: matches!(outcome, KeptEnrichment::Unreadable),
+        }
+    }
 }
 
 /// Écriture de la structure d'un fichier pas encore écrit sur une base fraîche (DEC-075) : rien
 /// à libérer ni à effacer ; l'enrichissement conservé est fusionné dans les enregistrements avant
-/// leur insertion. Renvoie `true` si un enrichissement conservé a été réappliqué.
-fn write_structure_fresh(tx: &rusqlite::Transaction<'_>, p: &PreparedStructure) -> Result<bool> {
+/// leur insertion. Renvoie ce qu'est devenu l'enrichissement conservé du fichier.
+fn write_structure_fresh(tx: &rusqlite::Transaction<'_>, p: &PreparedStructure) -> Result<Kept> {
     let path = p.path.as_str();
     // Base fraîche : le journal n'est pas tenu (DEC-077 point 1).
     let mut touched = Touched::new(false);
     let mut merged: Option<Vec<Node>> = None;
     let mut kept: Option<(Vec<Node>, Vec<Ref>)> = None;
-    if let Some(payload) = load_kept_enrichment(tx, path)? {
+    let loaded = load_kept_enrichment(tx, path)?;
+    let unreadable = matches!(loaded, KeptEnrichment::Unreadable);
+    if let KeptEnrichment::Readable(payload) = loaded {
         let declared: std::collections::HashSet<String> =
             p.nodes.iter().map(|n| n.id.clone()).collect();
         let (summaries, concepts, llm_refs) = filter_payload(payload, &declared);
@@ -2987,7 +3042,10 @@ fn write_structure_fresh(tx: &rusqlite::Transaction<'_>, p: &PreparedStructure) 
     }
     let ids: Vec<&String> = touched.ids.iter().collect();
     refresh_nodes(tx, &ids)?;
-    Ok(reapplied)
+    Ok(Kept {
+        reapplied,
+        unreadable,
+    })
 }
 
 /// Insère les références d'analyse d'une structure préparée : sources déclarées, clé et tête
@@ -6642,6 +6700,140 @@ mod tests {
                 want
             );
             assert_eq!(std::fs::read_dir(victim.path()).unwrap().count(), 0);
+        }
+    }
+
+    // --- REQ-131 : charge utile d'enrichissement versionnée ---
+
+    fn r131_prepared(path: &str, q: &str) -> PreparedStructure {
+        PreparedStructure {
+            path: path.to_string(),
+            nodes: vec![ty(q, path)],
+            refs: vec![],
+            context: None,
+            dropped: 0,
+        }
+    }
+
+    /// Base avec `n` fichiers `f<i>.java` (type `p.F<i>`) enrichis (résumé « s<i> »), hash `h`.
+    fn r131_enriched_store(dir: &Path, n: usize) -> Store {
+        let mut st = Store::open_or_create(dir).unwrap();
+        let files: Vec<FileRecord> = (0..n).map(|i| file(&format!("f{i}.java"))).collect();
+        st.insert_files(&files).unwrap();
+        for i in 0..n {
+            let path = format!("f{i}.java");
+            let node = ty(&format!("p.F{i}"), &path);
+            st.replace_structure(&path, std::slice::from_ref(&node), &[])
+                .unwrap();
+            st.apply_enrichment(
+                &path,
+                "h",
+                "m",
+                &[(node.id.clone(), format!("s{i}"))],
+                &[],
+                &[],
+            )
+            .unwrap();
+        }
+        st
+    }
+
+    fn r131_set_payload(st: &Store, path: &str, payload: &str) {
+        st.conn
+            .execute(
+                "UPDATE enrichments SET payload = ?2 WHERE path = ?1",
+                params![path, payload],
+            )
+            .unwrap();
+    }
+
+    fn r131_payload_of(st: &Store, path: &str) -> String {
+        st.conn
+            .query_row(
+                "SELECT payload FROM enrichments WHERE path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn r131_entries(st: &Store) -> i64 {
+        st.conn
+            .query_row("SELECT COUNT(*) FROM enrichments", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn r131_summary_of_node(st: &Store, q: &str) -> Option<String> {
+        st.node_by_id(&format!("type:{q}"))
+            .unwrap()
+            .and_then(|n| n.summary)
+    }
+
+    /// Réécrit les structures des `n` premiers fichiers, en non-fraîche ou en fraîche.
+    fn r131_rewrite(st: &mut Store, n: usize, fresh: bool) -> WrittenStructures {
+        if fresh {
+            let files: Vec<FileRecord> = (0..n).map(|i| file(&format!("f{i}.java"))).collect();
+            st.reset_with_pending_files(&files).unwrap();
+        }
+        let items: Vec<PreparedStructure> = (0..n)
+            .map(|i| r131_prepared(&format!("f{i}.java"), &format!("p.F{i}")))
+            .collect();
+        st.write_prepared(&items).unwrap()
+    }
+
+    #[test]
+    fn req131_ac1_payload_is_written_with_v_1_and_reapplied() {
+        let dir = tempdir().unwrap();
+        let mut st = r131_enriched_store(dir.path(), 1);
+        assert!(r131_payload_of(&st, "f0.java").contains("\"v\":1"));
+        let w = r131_rewrite(&mut st, 1, false);
+        assert_eq!((w.reapplied, w.unreadable), (1, 0));
+        assert_eq!(r131_summary_of_node(&st, "p.F0").as_deref(), Some("s0"));
+    }
+
+    #[test]
+    fn req131_ac2_payload_without_v_is_reapplied_and_not_counted() {
+        for fresh in [false, true] {
+            let dir = tempdir().unwrap();
+            let mut st = r131_enriched_store(dir.path(), 1);
+            let id = "type:p.F0";
+            r131_set_payload(
+                &st,
+                "f0.java",
+                &format!("{{\"summaries\":[[\"{id}\",\"old\"]],\"concepts\":[],\"refs\":[]}}"),
+            );
+            let w = r131_rewrite(&mut st, 1, fresh);
+            assert_eq!((w.reapplied, w.unreadable), (1, 0), "fresh={fresh}");
+            assert_eq!(r131_summary_of_node(&st, "p.F0").as_deref(), Some("old"));
+            assert_eq!(r131_entries(&st), 1);
+        }
+    }
+
+    #[test]
+    fn req131_ac3_unreadable_payloads_are_dropped_and_counted() {
+        for fresh in [false, true] {
+            let dir = tempdir().unwrap();
+            let mut st = r131_enriched_store(dir.path(), 4);
+            r131_set_payload(&st, "f0.java", "{");
+            r131_set_payload(
+                &st,
+                "f1.java",
+                "{\"v\":2,\"summaries\":[],\"concepts\":[],\"refs\":[]}",
+            );
+            r131_set_payload(&st, "f2.java", "{\"summaries\":5}");
+            // Quatrième : empreinte différente, périmée et non comptée.
+            st.conn
+                .execute(
+                    "UPDATE enrichments SET content_hash = 'x' WHERE path = 'f3.java'",
+                    [],
+                )
+                .unwrap();
+            let w = r131_rewrite(&mut st, 4, fresh);
+            assert_eq!((w.reapplied, w.unreadable), (0, 3), "fresh={fresh}");
+            assert_eq!(r131_entries(&st), 0);
+            for i in 0..4 {
+                assert_eq!(r131_summary_of_node(&st, &format!("p.F{i}")), None);
+            }
         }
     }
 }

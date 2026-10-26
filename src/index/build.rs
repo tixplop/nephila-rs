@@ -23,6 +23,8 @@ pub struct BuildReport {
     pub processed: usize,
     /// Fichiers dont l'enrichissement conservé a été réappliqué par cette commande (REQ-049).
     pub retained: usize,
+    /// Enrichissements conservés illisibles, écartés par cette commande (REQ-131).
+    pub unreadable: usize,
     pub pending: usize,
     pub nodes: usize,
     pub edges: usize,

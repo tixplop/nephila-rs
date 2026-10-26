@@ -604,3 +604,108 @@ fn req049_ac10_update_of_reapplied_pending_file_counts_one() {
     );
     assert!(env.logged().is_empty());
 }
+
+/// Remplace la charge utile de l'enrichissement conservé de `path` par `{` (illisible).
+fn corrupt_payload(env: &Env, path: &str) {
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let n = conn
+        .execute(
+            "UPDATE enrichments SET payload = '{' WHERE path = ?1",
+            [path],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn req131_ac4_unreadable_entry_is_counted_on_structure_end_line() {
+    let env = Env::new();
+    env.ok(&["build"]);
+    let second = env.ok(&["build", "--verbose"]);
+    let n = processed(&second);
+    assert!(n > 1);
+    assert!(!text(&second.stderr).contains("illisibles"));
+    let baseline = text(&env.ok(&["build"]).stderr);
+
+    corrupt_payload(&env, SVC);
+    let o = env.ok(&["build", "--verbose"]);
+    assert!(
+        structure_end(&o).ends_with(&format!(
+            ", 0 en attente, {} enrichissements conservés, 1 enrichissements illisibles écartés",
+            n - 1
+        )),
+        "{}",
+        structure_end(&o)
+    );
+    assert_eq!(env.logged_paths(), BTreeSet::from([SVC.to_string()]));
+
+    corrupt_payload(&env, SVC);
+    let quiet = env.ok(&["build"]);
+    assert_eq!(text(&quiet.stderr), baseline);
+    assert!(!text(&quiet.stderr).contains("illisibles"));
+}
+
+#[test]
+fn req131_ac7_segment_text_and_silence_elsewhere() {
+    let env = Env::new();
+    env.ok(&["build"]);
+    corrupt_payload(&env, SVC);
+    let db = env.repo.join(".nephila/graph.db");
+    let saved = fs::read(&db).unwrap();
+
+    let o = env.ok(&["build", "--no-llm", "--verbose"]);
+    assert!(
+        structure_end(&o)
+            .ends_with("enrichissements conservés, 1 enrichissements illisibles écartés"),
+        "{}",
+        structure_end(&o)
+    );
+    let others = trace_lines(&o)
+        .into_iter()
+        .filter(|l| l.contains("illisibles"))
+        .count();
+    assert_eq!(others, 1, "{}", text(&o.stderr));
+
+    fs::write(&db, saved).unwrap();
+    let p = env.ok(&["build", "--show-progress"]);
+    let err = text(&p.stderr);
+    assert!(!err.contains("illisibles"), "{err}");
+    assert!(!err.contains("trace:"), "{err}");
+}
+
+#[test]
+fn req131_ac8_payloads_without_v_are_reused_without_reenrichment() {
+    let env = Env::new();
+    env.ok(&["build"]);
+    let second = env.ok(&["build", "--verbose"]);
+    let n = processed(&second);
+    assert!(n > 0);
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE enrichments SET payload = json_remove(payload, '$.v')",
+            [],
+        )
+        .unwrap();
+    assert!(changed > 0);
+    let left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM enrichments WHERE payload LIKE '%\"v\"%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0);
+    drop(conn);
+
+    let o = env.ok(&["build", "--verbose"]);
+    let err = text(&o.stderr);
+    assert!(!err.contains("llm enrich"), "{err}");
+    assert!(!err.contains("illisibles"), "{err}");
+    assert!(
+        structure_end(&o).ends_with(&format!(", 0 en attente, {n} enrichissements conservés")),
+        "{}",
+        structure_end(&o)
+    );
+    assert!(env.logged().is_empty());
+}
