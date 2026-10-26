@@ -93,22 +93,39 @@ fn resolve_full(store: &mut Store) -> Result<ResolveStats> {
     })
 }
 
-/// Passe incrémentale (DEC-077 point 3) : ne réévalue que les références des sources concernées
-/// par le journal et les liens `contains` des cibles concernées ; même résultat que la passe
-/// complète sur le même état.
-fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStats> {
-    crate::store::note_pass(true);
-    let all_nodes = store.resolution_nodes()?;
-    let all_ids: HashSet<&str> = all_nodes.iter().map(|n| n.id.as_str()).collect();
-    let moved: BTreeSet<&str> = log
-        .inserted
+/// Références d'une source avec leur statut « non résolue » avant la passe.
+type SourceRefs = Vec<(FileRef, bool)>;
+
+/// Identifiants des nœuds insérés ou supprimés par le journal.
+fn moved_ids(log: &ChangeLog) -> BTreeSet<&str> {
+    log.inserted
         .iter()
         .chain(&log.deleted)
         .map(String::as_str)
-        .collect();
+        .collect()
+}
 
-    // Sources réévaluées : fichiers dont les références ont changé, sources retirées, et
-    // références dont la clé ou la tête du nom visé est la clé d'un nœud inséré ou supprimé.
+/// Ajoute aux sources celles dont une référence a pour clé (ou tête de nom visé) l'une des clés.
+fn add_sources_by_keys<'k>(
+    store: &Store,
+    keys: impl IntoIterator<Item = &'k str>,
+    sources: &mut BTreeSet<String>,
+) -> Result<()> {
+    for k in keys {
+        sources.extend(store.ref_sources_by_key(k, false)?);
+        sources.extend(store.ref_sources_by_key(k, true)?);
+    }
+    Ok(())
+}
+
+/// Sources réévaluées : fichiers dont les références ont changé, sources retirées, et
+/// références dont la clé ou la tête du nom visé est la clé d'un nœud inséré ou supprimé.
+fn touched_sources(
+    store: &Store,
+    log: &ChangeLog,
+    moved: &BTreeSet<&str>,
+    all_ids: &HashSet<&str>,
+) -> Result<BTreeSet<String>> {
     let mut sources: BTreeSet<String> = log.removed_sources.clone();
     for f in &log.files {
         sources.extend(store.ref_sources_of_file(f)?);
@@ -118,60 +135,236 @@ fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStat
         .filter_map(|id| parse_node_id(id).ok())
         .map(|(_, q)| last_segment(q))
         .collect();
-    for k in keys {
-        sources.extend(store.ref_sources_by_key(k, false)?);
-        sources.extend(store.ref_sources_by_key(k, true)?);
-    }
+    add_sources_by_keys(store, keys, &mut sources)?;
     sources.retain(|s| all_ids.contains(s.as_str()));
+    Ok(sources)
+}
 
-    // Dépendances qui disparaissent (REQ-087, DEC-096 point 2) : les `depends_on` des sources
-    // réévaluées sont évalués d'abord ; ils ne lisent que les identifiants des modules.
-    let mut loaded: HashMap<String, Vec<(FileRef, bool)>> = HashMap::new();
+/// Dépendances candidates à la disparition : celles stockées pour les modules réévalués.
+struct DependencyScan {
+    /// Références déjà chargées des modules réévalués.
+    loaded: HashMap<String, SourceRefs>,
+    /// Dépendances que les `depends_on` réévalués visent encore.
+    wanted: HashSet<String>,
+    /// Dépendances stockées pour ces modules.
+    candidates: BTreeSet<String>,
+}
+
+/// Évalue d'abord les `depends_on` des modules réévalués ; ils ne lisent que les identifiants
+/// des modules (REQ-087, DEC-096 point 2).
+fn scan_dependencies(
+    store: &Store,
+    sources: &BTreeSet<String>,
+    all_ids: &HashSet<&str>,
+) -> Result<DependencyScan> {
     let no_index = Index::new(&[]);
     let empty = FileContext::default();
-    let mut wanted_deps: HashSet<String> = HashSet::new();
-    let mut candidates: BTreeSet<String> = BTreeSet::new();
-    for source in &sources {
+    let mut scan = DependencyScan {
+        loaded: HashMap::new(),
+        wanted: HashSet::new(),
+        candidates: BTreeSet::new(),
+    };
+    for source in sources {
         if !matches!(parse_node_id(source), Ok((NodeKind::Module, _))) {
             continue;
         }
         let refs = store.refs_of_source(source)?;
         for (fr, _) in &refs {
             if fr.r.kind == EdgeKind::DependsOn {
-                if let Outcome::Depends(e, _) = eval_ref(fr, &empty, &all_ids, &no_index) {
-                    wanted_deps.insert(e.target);
+                if let Outcome::Depends(e, _) = eval_ref(fr, &empty, all_ids, &no_index) {
+                    scan.wanted.insert(e.target);
                 }
             }
         }
-        candidates.extend(store.stored_dependencies(source)?);
-        loaded.insert(source.clone(), refs);
+        scan.candidates.extend(store.stored_dependencies(source)?);
+        scan.loaded.insert(source.clone(), refs);
     }
+    Ok(scan)
+}
+
+/// Dépendances dérivées qui disparaissent : plus visées, sans fichier déclarant, et sans source
+/// extérieure aux sources réévaluées.
+fn vanishing_dependencies(
+    store: &Store,
+    scan: &DependencyScan,
+    all_ids: &HashSet<&str>,
+    sources: &BTreeSet<String>,
+) -> Result<HashSet<String>> {
     let mut vanishing: HashSet<String> = HashSet::new();
-    for c in candidates {
-        if wanted_deps.contains(&c) || !all_ids.contains(c.as_str()) {
+    for c in &scan.candidates {
+        if scan.wanted.contains(c) || !all_ids.contains(c.as_str()) {
             continue;
         }
-        if !store.declaring_files(&c)?.is_empty() {
+        if !store.declaring_files(c)?.is_empty() {
             continue;
         }
         if store
-            .depends_on_sources(&c)?
+            .depends_on_sources(c)?
             .iter()
             .any(|s| !sources.contains(s))
         {
             continue;
         }
-        vanishing.insert(c);
+        vanishing.insert(c.clone());
     }
+    Ok(vanishing)
+}
+
+/// Contexte partagé de l'évaluation : identifiants et index des nœuds retenus.
+struct Evaluation<'a> {
+    ids: &'a HashSet<&'a str>,
+    idx: &'a Index<'a>,
+}
+
+/// Réévalue les références des sources ; remplit `write` (liens voulus, statuts changés,
+/// dépendances dérivées) et rend le nombre de références réévaluées.
+fn evaluate_sources(
+    store: &Store,
+    sources: &BTreeSet<String>,
+    mut loaded: HashMap<String, SourceRefs>,
+    ev: &Evaluation,
+    write: &mut IncrementalWrite,
+) -> Result<usize> {
+    let empty = FileContext::default();
+    let mut contexts: HashMap<String, FileContext> = HashMap::new();
+    let mut dependencies: HashMap<String, Node> = HashMap::new();
+    let mut reevaluated = 0;
+    for source in sources {
+        let refs = match loaded.remove(source) {
+            Some(refs) => refs,
+            None => store.refs_of_source(source)?,
+        };
+        reevaluated += refs.len();
+        let mut wanted: Vec<Edge> = Vec::new();
+        for (fr, was_unresolved) in &refs {
+            if fr.origin == RefOrigin::Parse && !contexts.contains_key(&fr.file) {
+                let ctx = parse_context(store.file_context(&fr.file)?.as_deref());
+                contexts.insert(fr.file.clone(), ctx);
+            }
+            let ctx = if fr.origin == RefOrigin::Parse {
+                &contexts[&fr.file]
+            } else {
+                &empty
+            };
+            let mut unresolved = false;
+            match eval_ref(fr, ctx, ev.ids, ev.idx) {
+                Outcome::Ignored => {}
+                Outcome::Unresolved => unresolved = true,
+                Outcome::Linked(e) => wanted.push(e),
+                Outcome::Depends(e, dep) => {
+                    if let Some(d) = dep {
+                        dependencies.entry(d.id.clone()).or_insert(d);
+                    }
+                    wanted.push(e);
+                }
+            }
+            if unresolved != *was_unresolved {
+                write.statuses.push((fr.id, unresolved));
+            }
+        }
+        write.sources.push((source.clone(), wanted));
+    }
+    write.dependencies = dependencies.into_values().collect();
+    write.dependencies.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(reevaluated)
+}
+
+/// Cibles des liens `contains` réévaluées : nœuds insérés, supprimés ou aux déclarations
+/// changées, et enfants (par la règle de `incoming_contains`) des nœuds insérés ou supprimés.
+fn contains_targets<'n>(
+    store: &Store,
+    log: &ChangeLog,
+    moved: &BTreeSet<&str>,
+    nodes: &'n [Node],
+    by_id: &HashMap<&'n str, &'n Node>,
+) -> Result<BTreeSet<&'n str>> {
+    let ids: HashSet<&str> = by_id.keys().copied().collect();
+    let mut targets: BTreeSet<&str> = log
+        .inserted
+        .iter()
+        .chain(&log.deleted)
+        .chain(&log.declarations_changed)
+        .map(String::as_str)
+        .filter_map(|id| ids.get(id).copied())
+        .collect();
+    let parents: HashSet<&str> = moved
+        .iter()
+        .filter_map(|id| parse_node_id(id).ok())
+        .map(|(_, q)| q)
+        .collect();
+    for n in nodes {
+        let parent = match n.kind {
+            NodeKind::Type | NodeKind::Method => parent_of(&n.qualified),
+            NodeKind::Section => n.qualified.split_once('#').map(|(d, _)| d),
+            _ => None,
+        };
+        if parent.is_some_and(|p| parents.contains(p)) {
+            targets.insert(&n.id);
+        }
+    }
+    for id in moved {
+        if let Ok((NodeKind::Document, file)) = parse_node_id(id) {
+            for node in store.declared_nodes(file)? {
+                if by_id
+                    .get(node.as_str())
+                    .is_some_and(|n| matches!(n.kind, NodeKind::Table | NodeKind::Key))
+                {
+                    targets.insert(by_id[node.as_str()].id.as_str());
+                }
+            }
+        }
+    }
+    Ok(targets)
+}
+
+/// Liens `contains` entrants voulus de chaque cible réévaluée.
+fn contained_links(
+    store: &Store,
+    targets: BTreeSet<&str>,
+    by_id: &HashMap<&str, &Node>,
+    nodes: &[Node],
+    idx: &Index,
+) -> Result<Vec<(String, Vec<Edge>)>> {
+    let dirs = ModuleDirs::new(nodes);
+    let mut contained = Vec::new();
+    for id in targets {
+        let n = by_id[id];
+        let declaring = if matches!(n.kind, NodeKind::Package | NodeKind::Table | NodeKind::Key) {
+            store.declaring_files(&n.id)?
+        } else {
+            Vec::new()
+        };
+        let declaring: Vec<&str> = declaring.iter().map(String::as_str).collect();
+        let mut wanted = Vec::new();
+        incoming_contains(n, &declaring, idx, &dirs, &mut wanted);
+        contained.push((n.id.clone(), wanted));
+    }
+    Ok(contained)
+}
+
+/// Passe incrémentale (DEC-077 point 3) : ne réévalue que les références des sources concernées
+/// par le journal et les liens `contains` des cibles concernées ; même résultat que la passe
+/// complète sur le même état.
+fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStats> {
+    crate::store::note_pass(true);
+    let all_nodes = store.resolution_nodes()?;
+    let all_ids: HashSet<&str> = all_nodes.iter().map(|n| n.id.as_str()).collect();
+    let moved = moved_ids(log);
+    let mut sources = touched_sources(store, log, &moved, &all_ids)?;
+
+    // Dépendances qui disparaissent (REQ-087, DEC-096 point 2).
+    let scan = scan_dependencies(store, &sources, &all_ids)?;
+    let vanishing = vanishing_dependencies(store, &scan, &all_ids, &sources)?;
     let vanishing_keys: BTreeSet<String> = vanishing
         .iter()
         .filter_map(|id| parse_node_id(id).ok())
         .map(|(_, q)| last_segment(q).to_string())
         .collect();
-    for k in &vanishing_keys {
-        sources.extend(store.ref_sources_by_key(k, false)?);
-        sources.extend(store.ref_sources_by_key(k, true)?);
-    }
+    add_sources_by_keys(
+        store,
+        vanishing_keys.iter().map(String::as_str),
+        &mut sources,
+    )?;
     sources.retain(|s| all_ids.contains(s.as_str()));
 
     // Ces nœuds sont retirés de l'index et des identifiants : résolus comme s'ils n'existaient
@@ -192,99 +385,15 @@ fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStat
     let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     let mut write = IncrementalWrite::default();
-    let mut contexts: HashMap<String, FileContext> = HashMap::new();
-    let mut dependencies: HashMap<String, Node> = HashMap::new();
-    let mut reevaluated = 0;
-    for source in &sources {
-        let refs = match loaded.remove(source) {
-            Some(refs) => refs,
-            None => store.refs_of_source(source)?,
-        };
-        reevaluated += refs.len();
-        let mut wanted: Vec<Edge> = Vec::new();
-        for (fr, was_unresolved) in &refs {
-            if fr.origin == RefOrigin::Parse && !contexts.contains_key(&fr.file) {
-                let ctx = parse_context(store.file_context(&fr.file)?.as_deref());
-                contexts.insert(fr.file.clone(), ctx);
-            }
-            let ctx = if fr.origin == RefOrigin::Parse {
-                &contexts[&fr.file]
-            } else {
-                &empty
-            };
-            let mut unresolved = false;
-            match eval_ref(fr, ctx, &ids, &idx) {
-                Outcome::Ignored => {}
-                Outcome::Unresolved => unresolved = true,
-                Outcome::Linked(e) => wanted.push(e),
-                Outcome::Depends(e, dep) => {
-                    if let Some(d) = dep {
-                        dependencies.entry(d.id.clone()).or_insert(d);
-                    }
-                    wanted.push(e);
-                }
-            }
-            if unresolved != *was_unresolved {
-                write.statuses.push((fr.id, unresolved));
-            }
-        }
-        write.sources.push((source.clone(), wanted));
-    }
+    let ev = Evaluation {
+        ids: &ids,
+        idx: &idx,
+    };
+    let reevaluated = evaluate_sources(store, &sources, scan.loaded, &ev, &mut write)?;
     crate::store::note_refs_reevaluated(reevaluated);
-    write.dependencies = dependencies.into_values().collect();
-    write.dependencies.sort_by(|a, b| a.id.cmp(&b.id));
 
-    // Cibles des liens `contains` réévaluées : nœuds insérés, supprimés ou aux déclarations
-    // changées, et enfants (par la règle de `incoming_contains`) des nœuds insérés ou supprimés.
-    let mut targets: BTreeSet<&str> = log
-        .inserted
-        .iter()
-        .chain(&log.deleted)
-        .chain(&log.declarations_changed)
-        .map(String::as_str)
-        .filter(|id| ids.contains(id))
-        .collect();
-    let parents: HashSet<&str> = moved
-        .iter()
-        .filter_map(|id| parse_node_id(id).ok())
-        .map(|(_, q)| q)
-        .collect();
-    for n in nodes {
-        let parent = match n.kind {
-            NodeKind::Type | NodeKind::Method => parent_of(&n.qualified),
-            NodeKind::Section => n.qualified.split_once('#').map(|(d, _)| d),
-            _ => None,
-        };
-        if parent.is_some_and(|p| parents.contains(p)) {
-            targets.insert(&n.id);
-        }
-    }
-    for id in &moved {
-        if let Ok((NodeKind::Document, file)) = parse_node_id(id) {
-            for node in store.declared_nodes(file)? {
-                if by_id
-                    .get(node.as_str())
-                    .is_some_and(|n| matches!(n.kind, NodeKind::Table | NodeKind::Key))
-                {
-                    targets.insert(by_id[node.as_str()].id.as_str());
-                }
-            }
-        }
-    }
-    let dirs = ModuleDirs::new(nodes);
-    for id in targets {
-        let n = by_id[id];
-        let declaring = if matches!(n.kind, NodeKind::Package | NodeKind::Table | NodeKind::Key) {
-            store.declaring_files(&n.id)?
-        } else {
-            Vec::new()
-        };
-        let declaring: Vec<&str> = declaring.iter().map(String::as_str).collect();
-        let mut wanted = Vec::new();
-        incoming_contains(n, &declaring, &idx, &dirs, &mut wanted);
-        write.contained.push((n.id.clone(), wanted));
-    }
-
+    let targets = contains_targets(store, log, &moved, nodes, &by_id)?;
+    write.contained = contained_links(store, targets, &by_id, nodes, &idx)?;
     store.write_incremental(&write, |s| {
         Ok(crate::summary::stamped(&crate::summary::from_store(
             s, nodes,
