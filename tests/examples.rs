@@ -1653,3 +1653,14 @@ fn REQ124_AC4_readme_cargo_test_passe_aussi() {
     );
     assert!(!readme.contains("seul nextest"), "« seul nextest » présent");
 }
+
+#[test]
+fn REQ131_AC131_5_readme_traces_enrichissements_illisibles() {
+    let readme = repo_file("README.md");
+    let traces = readme_section(&readme, "### Traces (`--verbose`)");
+    let expected = "`, <r> enrichissements conservés`), suivi, quand des enrichissements conservés ne se lisent plus (graphe écrit par une version plus récente, données abîmées), de leur nombre (`, <M> enrichissements illisibles écartés` ; ces fichiers sont enrichis de nouveau) ; le nombre de fils annoncé";
+    assert!(
+        traces.contains(expected),
+        "phrase absente de la section Traces"
+    );
+}
