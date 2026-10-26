@@ -124,3 +124,83 @@ fn REQ045_AC3_meme_sha_par_action() {
         assert_eq!(*e, (sha, c), "{}:{} : {a} incohérente", u.file, u.line);
     }
 }
+
+/// Étape d'un job, lue par l'analyse YAML (aide partagée avec les tâches suivantes).
+#[allow(dead_code)]
+struct Step {
+    job: String,
+    uses: Option<String>,
+    with: BTreeMap<String, String>,
+    run: Option<String>,
+}
+
+fn scalar(y: &yaml_rust2::Yaml) -> String {
+    use yaml_rust2::Yaml;
+    match y {
+        Yaml::String(s) | Yaml::Real(s) => s.clone(),
+        Yaml::Integer(i) => i.to_string(),
+        Yaml::Boolean(b) => b.to_string(),
+        other => panic!("scalaire attendu, trouvé {other:?}"),
+    }
+}
+
+/// Étapes de chaque job de `file`, dans l'ordre du fichier.
+fn steps(file: &str) -> Vec<Step> {
+    use yaml_rust2::{Yaml, YamlLoader};
+    let docs = YamlLoader::load_from_str(&read(file)).unwrap_or_else(|e| panic!("{file} : {e}"));
+    let jobs = docs[0]["jobs"]
+        .as_hash()
+        .unwrap_or_else(|| panic!("{file} : pas de jobs"));
+    let mut out = Vec::new();
+    for (name, job) in jobs {
+        let Some(list) = job["steps"].as_vec() else {
+            continue;
+        };
+        for s in list {
+            let with = match &s["with"] {
+                Yaml::Hash(h) => h.iter().map(|(k, v)| (scalar(k), scalar(v))).collect(),
+                _ => BTreeMap::new(),
+            };
+            out.push(Step {
+                job: scalar(name),
+                uses: s["uses"].as_str().map(str::to_string),
+                with,
+                run: s["run"].as_str().map(str::to_string),
+            });
+        }
+    }
+    out
+}
+
+#[test]
+fn REQ123_AC2_toolchain_des_workflows_egal_au_channel() {
+    let text = std::fs::read_to_string(format!(
+        "{}/rust-toolchain.toml",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("rust-toolchain.toml");
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let channel = table["toolchain"]["channel"].as_str().expect("channel");
+    let mut vues = 0;
+    for file in FILES {
+        for s in steps(file) {
+            let Some(u) = s.uses.as_deref() else { continue };
+            if !u.starts_with("dtolnay/rust-toolchain@") {
+                continue;
+            }
+            vues += 1;
+            let want = if file == "ci.yml" && s.job == "clippy-beta" {
+                "beta"
+            } else {
+                channel
+            };
+            assert_eq!(
+                s.with.get("toolchain").map(String::as_str),
+                Some(want),
+                "{file}, job {} : with.toolchain",
+                s.job
+            );
+        }
+    }
+    assert!(vues >= 3, "étapes dtolnay/rust-toolchain vues : {vues}");
+}

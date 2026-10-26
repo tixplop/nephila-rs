@@ -220,3 +220,28 @@ fn req086_ac3_aucun_println_et_un_seul_texte_d_erreur_de_stdout() {
     }
     assert_eq!(texts.len(), 1, "texte d'E-17 : {texts:?}");
 }
+
+#[test]
+fn req123_ac1_rust_toolchain_toml() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("rust-toolchain.toml"))
+        .expect("rust-toolchain.toml absent");
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let tc = table["toolchain"].as_table().expect("table toolchain");
+    let channel = tc.get("channel").and_then(|v| v.as_str());
+    assert_eq!(channel, Some("1.99.0"));
+    let cargo: toml::Table =
+        toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+    let rv = cargo["package"]["rust-version"].as_str().unwrap();
+    assert_eq!(channel, Some(format!("{rv}.0").as_str()));
+    let comps: Vec<&str> = tc["components"]
+        .as_array()
+        .expect("components")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        comps.contains(&"rustfmt") && comps.contains(&"clippy"),
+        "{comps:?}"
+    );
+}
