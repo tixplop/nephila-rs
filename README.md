@@ -36,7 +36,7 @@ Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, JavaScript et 
 ## Démarrage rapide
 
 ```sh
-cargo install --path .                      # installe le binaire nephila
+cargo install --locked --path .             # installe le binaire nephila
 cd /chemin/vers/mon-depot
 echo ".nephila/" >> .gitignore              # le graphe est stocké dans .nephila/
 nephila build --no-llm                      # structure seule, aucun appel réseau
@@ -85,9 +85,9 @@ install nephila-$V-$T/nephila ~/.local/bin/
 Prérequis : Rust 1.99 ou plus récent (`cargo`). Aucune dépendance système : SQLite est intégré au binaire.
 
 ```sh
-cargo install --path .        # installe nephila dans ~/.cargo/bin
+cargo install --locked --path . # installe nephila dans ~/.cargo/bin
 # ou, sans installation :
-cargo build --release         # binaire dans target/release/nephila
+cargo build --release           # binaire dans target/release/nephila
 ```
 
 Vérification : `nephila --version`.

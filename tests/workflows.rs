@@ -132,6 +132,7 @@ struct Step {
     uses: Option<String>,
     with: BTreeMap<String, String>,
     run: Option<String>,
+    save_if_is_bool: bool,
 }
 
 fn scalar(y: &yaml_rust2::Yaml) -> String {
@@ -166,6 +167,7 @@ fn steps(file: &str) -> Vec<Step> {
                 uses: s["uses"].as_str().map(str::to_string),
                 with,
                 run: s["run"].as_str().map(str::to_string),
+                save_if_is_bool: matches!(s["with"]["save-if"], Yaml::Boolean(_)),
             });
         }
     }
@@ -203,4 +205,50 @@ fn REQ123_AC2_toolchain_des_workflows_egal_au_channel() {
         }
     }
     assert!(vues >= 3, "étapes dtolnay/rust-toolchain vues : {vues}");
+}
+
+#[test]
+fn REQ120_AC1_ensemble_des_workflows_egal_a_files() {
+    let dir = format!("{}/.github/workflows", env!("CARGO_MANIFEST_DIR"));
+    let found: BTreeSet<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("lecture de {dir} : {e}"))
+        .map(|e| {
+            e.expect("entrée")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|n| n.ends_with(".yml") || n.ends_with(".yaml"))
+        .collect();
+    let want: BTreeSet<String> = FILES.iter().map(|s| s.to_string()).collect();
+    let extra: Vec<&String> = found.difference(&want).collect();
+    let missing: Vec<&String> = want.difference(&found).collect();
+    assert!(
+        extra.is_empty() && missing.is_empty(),
+        "workflows en trop : {extra:?} ; manquants : {missing:?}"
+    );
+}
+
+#[test]
+fn REQ121_AC1_build_de_release_ne_sauvegarde_pas_le_cache() {
+    let caches: Vec<Step> = steps("release.yml")
+        .into_iter()
+        .filter(|s| {
+            s.uses
+                .as_deref()
+                .is_some_and(|u| u.starts_with("Swatinem/rust-cache@"))
+        })
+        .collect();
+    assert_eq!(caches.len(), 1, "étapes rust-cache de release.yml");
+    let c = &caches[0];
+    assert_eq!(c.job, "build");
+    assert_eq!(c.with.get("save-if").map(String::as_str), Some("false"));
+    assert!(
+        c.save_if_is_bool,
+        "with.save-if doit être un booléen YAML, pas une chaîne"
+    );
+    assert_eq!(
+        c.with.get("key").map(String::as_str),
+        Some("${{ matrix.target }}")
+    );
 }

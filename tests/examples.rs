@@ -1607,3 +1607,19 @@ fn REQ111_AC1_readme_documente_les_fils_refuses_par_le_systeme() {
         assert!(!tail.contains(banned), "mot interdit {banned} : {tail}");
     }
 }
+
+#[test]
+fn REQ122_AC1_readme_installe_avec_locked() {
+    let readme = repo_file("README.md");
+    assert!(
+        !readme.contains("cargo install --path ."),
+        "README : `cargo install --path .` sans --locked"
+    );
+    for title in ["## Démarrage rapide", "### Depuis les sources"] {
+        let sec = readme_section(&readme, title);
+        assert!(
+            sec.contains("cargo install --locked --path ."),
+            "{title} : `cargo install --locked --path .` absent"
+        );
+    }
+}
