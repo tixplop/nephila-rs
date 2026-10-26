@@ -3,6 +3,8 @@
 //! REQ-076 : chaîne d'outils minimale déclarée (`rust-version = "1.99"`) et tests de performance
 //! sans attente réelle.
 
+#![allow(non_snake_case)]
+
 use std::path::Path;
 
 fn visit(dir: &Path, root: &Path, found: &mut Vec<String>) {
@@ -244,4 +246,52 @@ fn req123_ac1_rust_toolchain_toml() {
         comps.contains(&"rustfmt") && comps.contains(&"clippy"),
         "{comps:?}"
     );
+}
+
+fn cherche_statiques(dir: &Path, root: &Path, found: &mut Vec<String>) {
+    const NOMS: [&str; 8] = [
+        "EXTRACT_THREADS",
+        "WALK_THREADS",
+        "HASH_THREADS",
+        "PARSERS_CREATED",
+        "PREPARED_TOTAL",
+        "RETAINED_PEAK",
+        "FORCE_FRESH",
+        "READS",
+    ];
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            cherche_statiques(&p, root, found);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&p).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                for nom in NOMS {
+                    let motif = format!("static {nom}");
+                    let declare = line.match_indices(&motif).any(|(at, _)| {
+                        !line[at + motif.len()..]
+                            .starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                    });
+                    if declare {
+                        let rel = p.strip_prefix(root).unwrap().display();
+                        found.push(format!("{rel}:{} : static {nom}", i + 1));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// AC-124-2 : les compteurs de diagnostic vivent dans la portée du test (DEC-112), pas dans des
+/// `static` du processus.
+#[test]
+fn REQ124_AC2_aucun_compteur_de_diagnostic_static() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found = Vec::new();
+    cherche_statiques(&root.join("src"), root, &mut found);
+    assert!(found.is_empty(), "compteurs static : {found:?}");
 }

@@ -1638,3 +1638,18 @@ fn REQ116_REQ117_REQ123_readme_ci_dependabot_audit_et_chaine_epinglee() {
         assert!(sec.contains(needle), "section Développement : {needle}");
     }
 }
+
+/// AC-124-4 : `cargo test` passe aussi, nextest reste la référence.
+#[test]
+fn REQ124_AC4_readme_cargo_test_passe_aussi() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "## Développement");
+    assert!(
+        sec.contains(
+            "`cargo test` passe aussi (tests en parallèle, sans limite de temps par test) ; \
+             `cargo nextest run` reste la commande de référence, celle de la CI."
+        ),
+        "phrase `cargo test` absente de la section Développement"
+    );
+    assert!(!readme.contains("seul nextest"), "« seul nextest » présent");
+}

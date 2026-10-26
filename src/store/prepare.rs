@@ -49,12 +49,6 @@ pub(crate) fn preparations_on_thread() -> u64 {
     PREPARATIONS.with(Cell::get)
 }
 
-/// Préparations de la portée de diagnostic courante (diagnostic, AC-074-2).
-#[cfg(test)]
-pub(crate) fn preparations_total() -> usize {
-    crate::diag::current(crate::diag::Counter::Preparations)
-}
-
 /// Nom court d'un nœud, selon son genre.
 fn short_name(kind: NodeKind, qualified: &str) -> &str {
     let after = |seps: &[char]| qualified.rsplit(seps).next().unwrap_or(qualified);

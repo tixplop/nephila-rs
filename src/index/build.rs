@@ -434,7 +434,6 @@ mod tests {
 
     use super::*;
     use crate::scan::reads;
-    use std::sync::atomic::Ordering;
 
     fn copy_dir(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
@@ -503,6 +502,7 @@ mod tests {
     /// budget nul (aucun contenu retenu : deux lectures par fichier).
     #[test]
     fn req073_ac1_each_file_read_once_same_graph_as_zero_budget() {
+        let _d = crate::diag::scope();
         for rel in ["maven3/repo", "gradle/groovy", "js/mixed"] {
             let dir = tempfile::tempdir().unwrap();
             let one = dir.path().join("one");
@@ -534,6 +534,7 @@ mod tests {
     /// AC-073-2 : second build puis update.
     #[test]
     fn req073_ac2_second_build_and_update_read_each_file_once() {
+        let _d = crate::diag::scope();
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         copy_dir(&fixture("maven3/repo"), &repo);
@@ -565,6 +566,7 @@ mod tests {
     /// AC-073-3 : budget de 1 000 octets, 5 fichiers de 400 octets.
     #[test]
     fn req073_ac3_budget_bounds_retained_contents() {
+        let d = crate::diag::scope();
         let dir = tempfile::tempdir().unwrap();
         let small = dir.path().join("small");
         let big = dir.path().join("big");
@@ -581,9 +583,9 @@ mod tests {
             }
         }
         reads::reset();
-        scan::RETAINED_PEAK.store(0, Ordering::SeqCst);
+        d.set_retained_peak(0);
         do_build(&small, 1_000);
-        let peak = scan::RETAINED_PEAK.load(Ordering::SeqCst);
+        let peak = d.retained_peak();
         assert!(peak > 0 && peak <= 1_000, "pic {peak}");
         assert_eq!(reads::kind(reads::Kind::Hash), 5);
         assert_eq!(reads::kind(reads::Kind::Extract), 3);

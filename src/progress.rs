@@ -3,12 +3,16 @@
 //! seul `write_all` sous le verrou de stderr. Jamais de `\r` ni de séquence ANSI.
 
 use std::io::Write;
+#[cfg(not(test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(test))]
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 thread_local! {
+    /// Activation propre au fil du test : deux tests en parallèle ne s'écrasent pas (REQ-124).
+    static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CAPTURED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -30,11 +34,17 @@ impl Phase {
 
 /// Active ou non la progression.
 pub fn init(enabled: bool) {
+    #[cfg(not(test))]
     ENABLED.store(enabled, Ordering::Relaxed);
+    #[cfg(test)]
+    ENABLED.with(|e| e.set(enabled));
 }
 
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    #[cfg(not(test))]
+    return ENABLED.load(Ordering::Relaxed);
+    #[cfg(test)]
+    return ENABLED.with(std::cell::Cell::get);
 }
 
 /// Ligne complète (sans fin de ligne) : seul endroit qui construit une ligne de progression.

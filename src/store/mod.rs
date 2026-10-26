@@ -15,7 +15,7 @@ use crate::model::{
     Edge, EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, RefOrigin, SubKind,
 };
 #[cfg(test)]
-pub(crate) use prepare::{preparations_on_thread, preparations_total};
+pub(crate) use prepare::preparations_on_thread;
 pub use prepare::{prepare_raw, prepare_structure, PreparedRef, PreparedStructure};
 
 /// Instant courant en millisecondes depuis l'epoch.
@@ -220,7 +220,7 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
     /// Lignes de `nodes`, lignes de `edges`, passes complètes, passes incrémentales, références
     /// réévaluées (REQ-066, hypothèse « mesure »).
-    static READS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
+    static STORE_READS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
 }
 
 const NODE_ROWS: usize = 0;
@@ -231,7 +231,7 @@ const REFS_REEVALUATED: usize = 4;
 
 /// Ajoute `n` au compteur de diagnostic `slot`.
 fn bump(slot: usize, n: usize) {
-    READS.with(|c| {
+    STORE_READS.with(|c| {
         let mut v = c.get();
         v[slot] += n as u64;
         c.set(v);
@@ -324,7 +324,7 @@ pub fn diagnostics() -> Diagnostics {
     Diagnostics {
         commits: COMMITS.with(std::cell::Cell::get),
         projections: PROJECTIONS.with(|p| p.borrow().clone()),
-        counters: READS.with(std::cell::Cell::get),
+        counters: STORE_READS.with(std::cell::Cell::get),
     }
 }
 
@@ -332,7 +332,7 @@ pub fn diagnostics() -> Diagnostics {
 pub fn reset_diagnostics() {
     COMMITS.with(|c| c.set(0));
     PROJECTIONS.with(|p| p.borrow_mut().clear());
-    READS.with(|c| c.set([0; 5]));
+    STORE_READS.with(|c| c.set([0; 5]));
 }
 
 /// Valide une transaction d'écriture et la compte.

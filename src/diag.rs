@@ -45,9 +45,11 @@ mod inert {
 #[cfg(test)]
 mod active {
     use super::Counter;
+    use crate::scan::ReadKind;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     const COUNTERS: usize = 5;
 
@@ -56,6 +58,12 @@ mod active {
     pub(crate) struct Diag {
         counters: [AtomicUsize; COUNTERS],
         force_fresh: AtomicBool,
+        /// Lectures de contenu par chemin et par sorte (ex-`scan::reads`).
+        pub(crate) reads: Mutex<HashMap<(String, ReadKind), usize>>,
+        /// Octets de contenu retenus dans cette portée.
+        pub(crate) retained: AtomicUsize,
+        /// Maximum atteint par `retained`.
+        pub(crate) retained_peak: AtomicUsize,
     }
 
     thread_local! {
@@ -82,6 +90,18 @@ mod active {
         pub(crate) fn get(&self, counter: Counter) -> usize {
             self.diag.counters[counter as usize].load(Ordering::SeqCst)
         }
+        /// Octets retenus dans la portée.
+        pub(crate) fn retained(&self) -> usize {
+            self.diag.retained.load(Ordering::SeqCst)
+        }
+        /// Pic des octets retenus dans la portée.
+        pub(crate) fn retained_peak(&self) -> usize {
+            self.diag.retained_peak.load(Ordering::SeqCst)
+        }
+        /// Remet le pic à `n` (base du compteur, en tête de test).
+        pub(crate) fn set_retained_peak(&self, n: usize) {
+            self.diag.retained_peak.store(n, Ordering::SeqCst);
+        }
         pub(crate) fn set_force_fresh(&self, on: bool) {
             self.diag.force_fresh.store(on, Ordering::SeqCst);
         }
@@ -103,13 +123,9 @@ mod active {
         });
     }
 
-    /// Valeur du compteur dans la portée courante (0 sans portée).
-    pub(crate) fn current(counter: Counter) -> usize {
-        CURRENT.with(|c| {
-            c.borrow()
-                .as_ref()
-                .map_or(0, |d| d.counters[counter as usize].load(Ordering::SeqCst))
-        })
+    /// Portée courante, si le fil en a une.
+    pub(crate) fn current_diag() -> Option<Arc<Diag>> {
+        CURRENT.with(|c| c.borrow().clone())
     }
 
     /// Crochet `FORCE_FRESH` de la portée courante.

@@ -815,7 +815,7 @@ La chaîne d'outils est épinglée par `rust-toolchain.toml` à Rust 1.99.0, le 
 git tag v0.24.0 && git push origin v0.24.0
 ```
 
-Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global.
+Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global. `cargo test` passe aussi (tests en parallèle, sans limite de temps par test) ; `cargo nextest run` reste la commande de référence, celle de la CI.
 
 ```sh
 cargo nextest run --cargo-quiet --color never --test-threads 1 --no-fail-fast --status-level fail --final-status-level fail   # suite complète

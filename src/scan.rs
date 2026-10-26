@@ -60,15 +60,13 @@ pub const RETAIN_BUDGET: usize = 256 * 1024 * 1024;
 /// Octets de contenu actuellement retenus (tous fichiers confondus).
 static RETAINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Maximum atteint par `RETAINED` (diagnostic des tests, AC-073-3).
-#[cfg(test)]
-pub(crate) static RETAINED_PEAK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Contenu UTF-8 d'un fichier retenu en mémoire ; ses octets sont réservés dans le budget tant
 /// qu'il existe et rendus quand il est libéré.
 pub struct Retained {
     text: String,
+    /// Portée de diagnostic active à la réservation : ses octets lui sont rendus (DEC-112).
+    #[cfg(test)]
+    diag: Option<std::sync::Arc<crate::diag::Diag>>,
 }
 
 impl Retained {
@@ -80,15 +78,27 @@ impl Retained {
         if budget == 0 {
             return Err(text);
         }
+        #[cfg(test)]
+        let diag = crate::diag::current_diag();
+        #[cfg(test)]
+        let reservoir = diag.as_ref().map_or(&RETAINED, |d| &d.retained);
+        #[cfg(not(test))]
+        let reservoir = &RETAINED;
         // Réservation atomique : refusée si elle déborde ou dépasse le budget.
-        let Ok(_prev) = RETAINED.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+        let Ok(_prev) = reservoir.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
             cur.checked_add(len).filter(|n| *n <= budget)
         }) else {
             return Err(text);
         };
         #[cfg(test)]
-        RETAINED_PEAK.fetch_max(_prev + len, Ordering::SeqCst);
-        Ok(Retained { text })
+        if let Some(d) = &diag {
+            d.retained_peak.fetch_max(_prev + len, Ordering::SeqCst);
+        }
+        Ok(Retained {
+            text,
+            #[cfg(test)]
+            diag,
+        })
     }
 
     pub fn as_str(&self) -> &str {
@@ -98,7 +108,11 @@ impl Retained {
 
 impl Drop for Retained {
     fn drop(&mut self) {
-        RETAINED.fetch_sub(self.text.len(), std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        let reservoir = self.diag.as_ref().map_or(&RETAINED, |d| &d.retained);
+        #[cfg(not(test))]
+        let reservoir = &RETAINED;
+        reservoir.fetch_sub(self.text.len(), std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -123,11 +137,11 @@ impl PartialEq for ScannedFile {
 
 impl Eq for ScannedFile {}
 
-/// Lectures de contenu comptées par chemin et par sorte (diagnostic des tests, AC-073-1 à 3).
+/// Lectures de contenu comptées par chemin et par sorte dans la portée de diagnostic courante
+/// (diagnostic des tests, AC-073-1 à 3, DEC-112) ; sans portée, rien n'est compté.
 #[cfg(test)]
 pub(crate) mod reads {
     use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum Kind {
@@ -136,35 +150,41 @@ pub(crate) mod reads {
         Settings,
     }
 
-    static READS: LazyLock<Mutex<HashMap<(String, Kind), usize>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    fn with<R>(f: impl FnOnce(&mut HashMap<(String, Kind), usize>) -> R) -> Option<R> {
+        let d = crate::diag::current_diag()?;
+        let mut m = d.reads.lock().unwrap_or_else(|p| p.into_inner());
+        Some(f(&mut m))
+    }
 
     pub fn record(path: &str, kind: Kind) {
-        let mut m = READS.lock().unwrap_or_else(|p| p.into_inner());
-        *m.entry((path.to_string(), kind)).or_insert(0) += 1;
+        with(|m| *m.entry((path.to_string(), kind)).or_insert(0) += 1);
     }
 
     pub fn reset() {
-        READS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        with(HashMap::clear);
     }
 
     /// Lectures d'une sorte.
     pub fn kind(kind: Kind) -> usize {
-        let m = READS.lock().unwrap_or_else(|p| p.into_inner());
-        m.iter()
-            .filter(|((_, k), _)| *k == kind)
-            .map(|(_, n)| n)
-            .sum()
+        with(|m| {
+            m.iter()
+                .filter(|((_, k), _)| *k == kind)
+                .map(|(_, n)| n)
+                .sum()
+        })
+        .unwrap_or(0)
     }
 
     /// Chemins lus, avec leur nombre total de lectures.
     pub fn all() -> HashMap<String, usize> {
-        let m = READS.lock().unwrap_or_else(|p| p.into_inner());
-        let mut out: HashMap<String, usize> = HashMap::new();
-        for ((p, _), n) in m.iter() {
-            *out.entry(p.clone()).or_insert(0) += n;
-        }
-        out
+        with(|m| {
+            let mut out: HashMap<String, usize> = HashMap::new();
+            for ((p, _), n) in m.iter() {
+                *out.entry(p.clone()).or_insert(0) += n;
+            }
+            out
+        })
+        .unwrap_or_default()
     }
 }
 
@@ -523,7 +543,6 @@ pub(crate) fn walk_with<L: crate::workers::Launcher>(
                 },
             );
             crate::diag::add(crate::diag::Counter::WalkThreads, started);
-            let _ = started;
             if let Some(e) = error {
                 // L'émetteur est lâché en sortant : les fils démarrés finissent.
                 return Some(e);
@@ -953,10 +972,11 @@ mod tests {
 
     #[test]
     fn req073_ac6_reservation_concurrente_respecte_le_budget() {
-        use std::sync::atomic::Ordering;
         use std::sync::{Barrier, Mutex};
-        let base = RETAINED.load(Ordering::SeqCst);
-        let peak0 = RETAINED_PEAK.load(Ordering::SeqCst);
+        let d = crate::diag::scope();
+        let base = d.retained();
+        d.set_retained_peak(base);
+        let inherit = crate::diag::Inherit::capture();
         let budget = base + 450;
         let barrier = Barrier::new(8);
         let kept = Mutex::new(Vec::new());
@@ -964,6 +984,7 @@ mod tests {
         std::thread::scope(|s| {
             for _ in 0..8 {
                 s.spawn(|| {
+                    let _g = inherit.clone().enter();
                     barrier.wait();
                     match Retained::reserve("x".repeat(100), budget) {
                         Ok(r) => kept.lock().unwrap().push(r),
@@ -977,13 +998,13 @@ mod tests {
         assert_eq!(kept.len(), 4);
         assert_eq!(errs.len(), 4);
         assert!(errs.iter().all(|t| t.len() == 100));
-        assert_eq!(RETAINED.load(Ordering::SeqCst), base + 400);
-        assert!(RETAINED_PEAK.load(Ordering::SeqCst).max(peak0) <= budget);
+        assert_eq!(d.retained(), base + 400);
+        assert!(d.retained_peak() <= budget);
         drop(kept);
-        assert_eq!(RETAINED.load(Ordering::SeqCst), base);
+        assert_eq!(d.retained(), base);
 
         assert!(Retained::reserve("x".repeat(10), 0).is_err());
-        assert_eq!(RETAINED.load(Ordering::SeqCst), base);
+        assert_eq!(d.retained(), base);
         let empty = Retained::reserve(String::new(), base + 10);
         assert!(empty.is_ok());
     }
@@ -1273,6 +1294,7 @@ mod tests {
         ]) else {
             return;
         };
+        let _d = crate::diag::scope();
         reads::reset();
         let r = scan(dir.path(), &[], &Matcher::none(), 1).unwrap();
         assert_eq!(r.files.len(), 1);

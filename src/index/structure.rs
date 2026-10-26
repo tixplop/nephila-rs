@@ -383,8 +383,7 @@ mod tests {
     /// (base fraîche, puis chemin général).
     #[test]
     fn req074_ac2_preparation_dans_les_fils_tables_identiques() {
-        use crate::store::{preparations_on_thread, preparations_total};
-        let _d = crate::diag::scope();
+        use crate::store::preparations_on_thread;
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
         write_repo(a.path(), 50);
@@ -400,11 +399,8 @@ mod tests {
                 sa.reset_with_pending_files(&pending_records(&scanned.files))
                     .unwrap();
             }
-            let (t0, k0, g0) = (
-                preparations_on_thread(),
-                crate::resolve::name_keys_calls(),
-                preparations_total(),
-            );
+            let d = crate::diag::scope();
+            let (t0, k0) = (preparations_on_thread(), crate::resolve::name_keys_calls());
             let mut report = BuildReport::default();
             analyze(
                 a.path(),
@@ -425,7 +421,7 @@ mod tests {
                 k0,
                 "name_keys sur le fil appelant"
             );
-            assert_eq!(preparations_total() - g0, 50);
+            assert_eq!(d.get(crate::diag::Counter::Preparations), 50);
             assert_eq!(report.processed, 50);
 
             // B : mêmes structures, écrites par l'API brute avec la conversion de la 0.22.0.
