@@ -412,7 +412,14 @@ pub(crate) fn finalize(
         let files = store.files_to_enrich()?;
         // Sans fichier à enrichir, le graphe n'a pas changé : pas de seconde résolution.
         if !files.is_empty() {
-            enrich::enrich_all(repo, abs, &files, opts, llm, store, report)?;
+            enrich::enrich_all(
+                enrich::Sources { repo, abs },
+                &files,
+                opts,
+                llm,
+                store,
+                report,
+            )?;
             stats = resolve_pass(store)?;
         }
     }

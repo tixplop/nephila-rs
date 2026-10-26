@@ -180,7 +180,7 @@ pub enum Query {
         #[arg(long)]
         limit: Option<usize>,
         #[command(flatten)]
-        json: QueryOpts,
+        opts: QueryOpts,
     },
     /// Voisins d'un nœud
     Neighbors {
@@ -190,20 +190,20 @@ pub enum Query {
         #[arg(long)]
         limit: Option<usize>,
         #[command(flatten)]
-        json: QueryOpts,
+        opts: QueryOpts,
     },
     /// Chemin entre deux nœuds
     Path {
         source: String,
         cible: String,
         #[command(flatten)]
-        json: QueryOpts,
+        opts: QueryOpts,
     },
     /// Question en langage naturel
     Ask {
         question: String,
         #[command(flatten)]
-        json: QueryOpts,
+        opts: QueryOpts,
         #[arg(help = FORMAT_RETRIES_HELP, long, value_name = "N", value_parser = parse_format_retries, allow_hyphen_values = true)]
         format_retries: Option<u32>,
     },
@@ -255,49 +255,49 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
         Command::Export { output, format } => {
             crate::export::run(&cli.repo, output.as_deref(), *format, out)
         }
-        Command::Query(Query::Search { terme, limit, json }) => crate::query::search::run(
+        Command::Query(Query::Search { terme, limit, opts }) => crate::query::search::run(
             &cli.repo,
             terme,
             *limit,
-            json.json.json,
-            json.check_stale,
+            opts.json.json,
+            opts.check_stale,
             out,
         ),
         Command::Query(Query::Neighbors {
             nœud,
             depth,
             limit,
-            json,
+            opts,
         }) => crate::query::neighbors::run(
             &cli.repo,
             nœud,
             *depth,
             *limit,
-            json.json.json,
-            json.check_stale,
+            opts.json.json,
+            opts.check_stale,
             out,
         ),
         Command::Query(Query::Path {
             source,
             cible,
-            json,
+            opts,
         }) => crate::query::path::run(
             &cli.repo,
             source,
             cible,
-            json.json.json,
-            json.check_stale,
+            opts.json.json,
+            opts.check_stale,
             out,
         ),
         Command::Query(Query::Ask {
             question,
-            json,
+            opts,
             format_retries,
         }) => crate::query::ask::run(
             &cli.repo,
             question,
-            json.json.json,
-            json.check_stale,
+            opts.json.json,
+            opts.check_stale,
             *format_retries,
             out,
         ),

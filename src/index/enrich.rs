@@ -239,14 +239,29 @@ enum Step<'a> {
     Calls(Vec<Outcome>, Vec<Unit<'a>>),
 }
 
+/// Où lire les fichiers à enrichir : racine du dépôt et chemins réels déjà connus (DEC-070).
+#[derive(Clone, Copy)]
+pub(crate) struct Sources<'a> {
+    pub(crate) repo: &'a Path,
+    pub(crate) abs: &'a HashMap<String, PathBuf>,
+}
+
+impl Sources<'_> {
+    /// Chemin réel d'un fichier : l'entrée d'`abs`, sinon la racine jointe au chemin.
+    fn real_path(&self, path: &str) -> PathBuf {
+        self.abs
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| self.repo.join(path))
+    }
+}
+
 /// Exécute une unité `Lot` ou `Big`. Un fichier illisible échoue seul et sort du lot.
-#[allow(clippy::too_many_arguments)]
 fn run_unit<'a>(
     unit: &Unit<'a>,
-    repo: &Path,
+    sources: Sources<'_>,
     max_chunk_chars: usize,
     llm: &dyn Llm,
-    abs: &HashMap<String, PathBuf>,
     ids: &HashMap<String, Vec<(String, String)>>,
     retries: u32,
     stop: &AtomicBool,
@@ -259,11 +274,7 @@ fn run_unit<'a>(
     let mut outcomes = Vec::new();
     let mut readable: Vec<(&'a FileRecord, String)> = Vec::new();
     for f in files {
-        let real = abs
-            .get(&f.path)
-            .cloned()
-            .unwrap_or_else(|| repo.join(&f.path));
-        match std::fs::read_to_string(real) {
+        match std::fs::read_to_string(sources.real_path(&f.path)) {
             Ok(t) => readable.push((f, t)),
             Err(e) => outcomes.push(Outcome::Failed(
                 f.path.clone(),
@@ -917,10 +928,197 @@ fn flush_group(
     pending.clear();
 }
 
+/// Références partagées par les fils d'enrichissement.
+#[derive(Clone, Copy)]
+struct Ctx<'s, 'a> {
+    shared: &'s Mutex<Shared<'a>>,
+    wake: &'s Condvar,
+    policy: &'s Mutex<Policy>,
+    ids: &'s HashMap<String, Vec<(String, String)>>,
+    llm: &'s dyn Llm,
+    sources: Sources<'s>,
+    max_chunk_chars: usize,
+    format_retries: u32,
+    stop: &'s AtomicBool,
+}
+
+/// Corps d'un fil d'enrichissement : prend des unités jusqu'à l'arrêt ou la fin de la file.
+fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
+    let Ctx {
+        shared,
+        wake,
+        policy,
+        ids,
+        llm,
+        sources,
+        max_chunk_chars,
+        format_retries,
+        stop,
+    } = ctx;
+    while let Some(unit) = next_unit(shared, wake, stop) {
+        let mut expand = ExpandGuard {
+            shared,
+            wake,
+            armed: !matches!(unit, Unit::Call { .. }),
+        };
+        let ticket = policy.lock().unwrap_or_else(|p| p.into_inner()).dispatch();
+        // Résultat de l'unité : l'erreur de l'appel pour la politique s'il y en a eu un.
+        let (call, message, calls, expanded) = match unit {
+            Unit::Call {
+                file,
+                index,
+                count,
+                part,
+                requested,
+                known,
+            } => {
+                let result = run_call(
+                    llm,
+                    &file.path,
+                    index,
+                    count,
+                    &part,
+                    &requested,
+                    &known,
+                    format_retries,
+                    stop,
+                );
+                let err = result.as_ref().err().cloned();
+                // Toute cause d'échec fait sauter les appels non partis du fichier
+                // (AC-051-5) ; la politique enregistre quand même cet appel.
+                if err.is_some() {
+                    shared
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .failed
+                        .insert(file.path.clone());
+                }
+                let result = result.map_err(truncation_advice);
+                (
+                    Some(err),
+                    Some(Msg::Chunk {
+                        file,
+                        index,
+                        count,
+                        result,
+                    }),
+                    Vec::new(),
+                    false,
+                )
+            }
+            unit => {
+                let step = run_unit(
+                    &unit,
+                    sources,
+                    max_chunk_chars,
+                    llm,
+                    ids,
+                    format_retries,
+                    stop,
+                );
+                match step {
+                    Step::Finished(outcomes, call) => (
+                        call,
+                        (!outcomes.is_empty()).then_some(Msg::Outcomes(outcomes)),
+                        Vec::new(),
+                        true,
+                    ),
+                    Step::Calls(outcomes, calls) => (
+                        None,
+                        (!outcomes.is_empty()).then_some(Msg::Outcomes(outcomes)),
+                        calls,
+                        true,
+                    ),
+                }
+            }
+        };
+        expand.armed = false;
+        finish_unit(shared, wake, calls, expanded);
+        let halt = record_policy(policy, shared, ticket, &call);
+        if halt {
+            stop.store(true, Ordering::SeqCst);
+            // Réveille les fils qui attendent des appels.
+            drop(shared.lock().unwrap_or_else(|p| p.into_inner()));
+            wake.notify_all();
+        }
+        if let Some(m) = message {
+            if tx.send(m).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// Enregistre l'appel d'une unité dans la politique d'arrêt (traces `politique: …` comprises) ;
+/// rend `true` si l'envoi doit s'arrêter.
+fn record_policy(
+    policy: &Mutex<Policy>,
+    shared: &Mutex<Shared<'_>>,
+    ticket: Ticket,
+    call: &Option<Option<Error>>,
+) -> bool {
+    let error = call.as_ref().and_then(|e| e.as_ref());
+    let mut guard = policy.lock().unwrap_or_else(|p| p.into_inner());
+    let was_stopped = guard.stop_cause.is_some();
+    let halt = match call {
+        Some(_) => guard.record(ticket, error),
+        None => guard.stop_cause.is_some(),
+    };
+    if trace::enabled() {
+        match error {
+            Some(Error::Network(_)) => trace!(
+                "politique: erreurs réseau consécutives {}/{MAX_CONSECUTIVE_NETWORK_ERRORS}",
+                guard.consecutive_network
+            ),
+            Some(Error::Saturated(_)) => trace!(
+                "politique: erreurs réseau consécutives {}/{MAX_CONSECUTIVE_NETWORK_ERRORS} (fournisseur saturé)",
+                guard.consecutive_network
+            ),
+            Some(Error::Timeout(_)) => trace!(
+                "politique: délais dépassés consécutifs {}/{MAX_CONSECUTIVE_NETWORK_ERRORS}",
+                guard.consecutive_timeout
+            ),
+            _ => {}
+        }
+        if halt && !was_stopped {
+            let left: usize = shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .queue
+                .iter()
+                .map(Unit::file_count)
+                .sum();
+            trace!(
+                "politique: arrêt de l'envoi ({}), {left} fichiers non envoyés",
+                guard.stop_label.as_deref().unwrap_or("")
+            );
+        }
+    }
+    halt
+}
+
+/// Traite un fichier en échec : avertissement (sauf clé ou requête refusée, E-12 et E-19 : l'erreur
+/// finale la dit, aucun fichier n'est nommé), décompte et mémorisation.
+fn record_failure(
+    report: &mut BuildReport,
+    failures: &mut Vec<(String, Error)>,
+    notes: &mut Vec<String>,
+    path: String,
+    e: Error,
+) {
+    if !matches!(
+        e,
+        Error::InvalidKey(_) | Error::Rejected { .. } | Error::Redirected { .. }
+    ) {
+        notes.push(format!("{path} : {e}"));
+    }
+    report.failed += 1;
+    failures.push((path, e));
+}
+
 /// Pool de threads LLM ; le thread courant écrit une transaction par groupe de messages reçus.
 pub(crate) fn enrich_all(
-    repo: &Path,
-    abs: &HashMap<String, PathBuf>,
+    sources: Sources<'_>,
     files: &[FileRecord],
     opts: &IndexOptions,
     llm: &dyn Llm,
@@ -928,8 +1126,7 @@ pub(crate) fn enrich_all(
     report: &mut BuildReport,
 ) -> Result<()> {
     enrich_with_stop(
-        repo,
-        abs,
+        sources,
         files,
         opts,
         llm,
@@ -941,10 +1138,8 @@ pub(crate) fn enrich_all(
 }
 
 /// Corps d'`enrich_all` avec le drapeau d'arrêt injecté (DEC-047) ; rend les fichiers en échec.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn enrich_with_stop(
-    repo: &Path,
-    abs: &HashMap<String, PathBuf>,
+    sources: Sources<'_>,
     files: &[FileRecord],
     opts: &IndexOptions,
     llm: &dyn Llm,
@@ -997,146 +1192,20 @@ pub(crate) fn enrich_with_stop(
     let mut meter = progress::Meter::start(Phase::Enrichment, files.len());
 
     std::thread::scope(|scope| {
-        let shared = &shared;
-        let wake = &wake;
-        let policy = &policy;
-        let ids = &ids;
+        let ctx = Ctx {
+            shared: &shared,
+            wake: &wake,
+            policy: &policy,
+            ids: &ids,
+            llm,
+            sources,
+            max_chunk_chars,
+            format_retries,
+            stop,
+        };
         for _ in 0..workers {
             let tx = tx.clone();
-            scope.spawn(move || {
-                while let Some(unit) = next_unit(shared, wake, stop) {
-                    let mut expand = ExpandGuard {
-                        shared,
-                        wake,
-                        armed: !matches!(unit, Unit::Call { .. }),
-                    };
-                    let ticket = policy.lock().unwrap_or_else(|p| p.into_inner()).dispatch();
-                    // Résultat de l'unité : l'erreur de l'appel pour la politique s'il y en a eu un.
-                    let (call, message, calls, expanded) = match unit {
-                        Unit::Call {
-                            file,
-                            index,
-                            count,
-                            part,
-                            requested,
-                            known,
-                        } => {
-                            let result = run_call(
-                                llm,
-                                &file.path,
-                                index,
-                                count,
-                                &part,
-                                &requested,
-                                &known,
-                                format_retries,
-                                stop,
-                            );
-                            let err = result.as_ref().err().cloned();
-                            // Toute cause d'échec fait sauter les appels non partis du fichier
-                            // (AC-051-5) ; la politique enregistre quand même cet appel.
-                            if err.is_some() {
-                                shared
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .failed
-                                    .insert(file.path.clone());
-                            }
-                            let result = result.map_err(truncation_advice);
-                            (
-                                Some(err),
-                                Some(Msg::Chunk {
-                                    file,
-                                    index,
-                                    count,
-                                    result,
-                                }),
-                                Vec::new(),
-                                false,
-                            )
-                        }
-                        unit => {
-                            let step = run_unit(
-                                &unit,
-                                repo,
-                                max_chunk_chars,
-                                llm,
-                                abs,
-                                ids,
-                                format_retries,
-                                stop,
-                            );
-                            match step {
-                                Step::Finished(outcomes, call) => (
-                                    call,
-                                    (!outcomes.is_empty()).then_some(Msg::Outcomes(outcomes)),
-                                    Vec::new(),
-                                    true,
-                                ),
-                                Step::Calls(outcomes, calls) => (
-                                    None,
-                                    (!outcomes.is_empty()).then_some(Msg::Outcomes(outcomes)),
-                                    calls,
-                                    true,
-                                ),
-                            }
-                        }
-                    };
-                    expand.armed = false;
-                    finish_unit(shared, wake, calls, expanded);
-                    let error = call.as_ref().and_then(|e| e.as_ref());
-                    let halt = {
-                        let mut guard = policy.lock().unwrap_or_else(|p| p.into_inner());
-                        let was_stopped = guard.stop_cause.is_some();
-                        let halt = match call {
-                            Some(_) => guard.record(ticket, error),
-                            None => guard.stop_cause.is_some(),
-                        };
-                        if trace::enabled() {
-                            match error {
-                                Some(Error::Network(_)) => trace!(
-                                    "politique: erreurs réseau consécutives {}/{MAX_CONSECUTIVE_NETWORK_ERRORS}",
-                                    guard.consecutive_network
-                                ),
-                                Some(Error::Saturated(_)) => trace!(
-                                    "politique: erreurs réseau consécutives {}/{MAX_CONSECUTIVE_NETWORK_ERRORS} (fournisseur saturé)",
-                                    guard.consecutive_network
-                                ),
-                                Some(Error::Timeout(_)) => trace!(
-                                    "politique: délais dépassés consécutifs {}/{MAX_CONSECUTIVE_NETWORK_ERRORS}",
-                                    guard.consecutive_timeout
-                                ),
-                                _ => {}
-                            }
-                            if halt && !was_stopped {
-                                let left: usize = shared
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .queue
-                                    .iter()
-                                    .map(Unit::file_count)
-                                    .sum();
-                                trace!(
-                                    "politique: arrêt de l'envoi ({}), {left} fichiers non envoyés",
-                                    guard.stop_label.as_deref().unwrap_or("")
-                                );
-                            }
-                        }
-                        halt
-                    };
-                    if halt {
-                        stop.store(true, Ordering::SeqCst);
-                        // Réveille les fils qui attendent des appels.
-                        drop(shared.lock().unwrap_or_else(|p| p.into_inner()));
-                        wake.notify_all();
-                    }
-                    if let Some(m) = message {
-                        if tx.send(m).is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
+            scope.spawn(move || worker(ctx, tx));
         }
         drop(tx);
         // Un message reçu, puis tous ceux déjà arrivés (sans attente), sont écrits en une seule
@@ -1155,17 +1224,7 @@ pub(crate) fn enrich_with_stop(
                         for outcome in batch {
                             match outcome {
                                 Outcome::Failed(path, e) => {
-                                    // Clé ou requête refusée (E-12, E-19) : l'erreur finale la dit ; aucun fichier n'est nommé.
-                                    if !matches!(
-                                        e,
-                                        Error::InvalidKey(_)
-                                            | Error::Rejected { .. }
-                                            | Error::Redirected { .. }
-                                    ) {
-                                        notes.push(format!("{path} : {e}"));
-                                    }
-                                    report.failed += 1;
-                                    failures.push((path, e));
+                                    record_failure(report, &mut failures, &mut notes, path, e);
                                 }
                                 Outcome::Done(file, x) => {
                                     queue_done(
@@ -1198,17 +1257,13 @@ pub(crate) fn enrich_with_stop(
                             match result {
                                 Err(e) => {
                                     entry.failed = true;
-                                    // Clé ou requête refusée (E-12, E-19) : l'erreur finale la dit ; aucun fichier n'est nommé.
-                                    if !matches!(
+                                    record_failure(
+                                        report,
+                                        &mut failures,
+                                        &mut notes,
+                                        file.path.clone(),
                                         e,
-                                        Error::InvalidKey(_)
-                                            | Error::Rejected { .. }
-                                            | Error::Redirected { .. }
-                                    ) {
-                                        notes.push(format!("{} : {e}", file.path));
-                                    }
-                                    report.failed += 1;
-                                    failures.push((file.path.clone(), e));
+                                    );
                                     adv = 1;
                                 }
                                 Ok(x) => {
@@ -2137,8 +2192,10 @@ mod tests {
             calls_a: AtomicUsize::new(0),
         };
         let mut failures = enrich_with_stop(
-            dir.path(),
-            &HashMap::new(),
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+            },
             &files,
             &opts,
             &llm,
@@ -2206,8 +2263,10 @@ mod tests {
         progress::init(true);
         progress::take_captured();
         enrich_with_stop(
-            dir.path(),
-            &HashMap::new(),
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+            },
             &files,
             &opts,
             &Lots,
@@ -2282,8 +2341,10 @@ mod tests {
         progress::init(true);
         progress::take_captured();
         let failures = enrich_with_stop(
-            dir.path(),
-            &HashMap::new(),
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+            },
             &files,
             &opts,
             &llm,
@@ -2441,8 +2502,10 @@ mod tests {
             enrich_code: false,
         };
         let failures = enrich_with_stop(
-            dir.path(),
-            &HashMap::new(),
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+            },
             files,
             &opts,
             llm,

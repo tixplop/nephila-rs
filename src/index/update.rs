@@ -363,8 +363,15 @@ mod tests {
         let abs = build::abs_paths(&scanned.files);
         let mut report = BuildReport::default();
         reset_diagnostics();
-        crate::index::enrich::enrich_all(repo, &abs, &files, opts, llm, &mut store, &mut report)
-            .unwrap();
+        crate::index::enrich::enrich_all(
+            crate::index::enrich::Sources { repo, abs: &abs },
+            &files,
+            opts,
+            llm,
+            &mut store,
+            &mut report,
+        )
+        .unwrap();
         let commits = diagnostics().commits();
         assert!(commits <= 2, "{commits} validations pour 2 appels");
         assert!(commits >= 1);
