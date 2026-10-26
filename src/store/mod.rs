@@ -1432,11 +1432,7 @@ impl Store {
     /// Liens sortants (`outgoing`) ou entrants du nœud `id`, sous la forme (autre extrémité,
     /// genre), triés par identifiant de l'autre extrémité puis genre.
     pub fn edges_at(&self, id: &str, outgoing: bool) -> Result<Vec<(String, EdgeKind)>> {
-        let sql = if outgoing {
-            "SELECT target, kind FROM edges WHERE source = ?1 ORDER BY target, kind"
-        } else {
-            "SELECT source, kind FROM edges WHERE target = ?1 ORDER BY source, kind"
-        };
+        let sql = if outgoing { EDGES_OUT } else { EDGES_IN };
         let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
         let rows = st
             .query_map([id], |r| {
@@ -2501,13 +2497,14 @@ fn declared_by(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Vec<String>
         .map_err(db_err)
 }
 
-/// Recalcule la ligne des nœuds encore déclarés comme projection de leurs déclarations (DEC-026) :
-/// attributs et fichier de la déclaration de plus petit chemin, résumé de la déclaration de plus
-/// petit chemin ayant un résumé. Les nœuds non déclarés sont ignorés.
-fn refresh_nodes<S: AsRef<str>>(tx: &rusqlite::Transaction<'_>, ids: &[S]) -> Result<()> {
-    let mut up = tx
-        .prepare_cached(
-            "UPDATE nodes SET
+/// Liens sortants d'un nœud (`edges_at`) : parcours de l'index de la clé primaire.
+pub(crate) const EDGES_OUT: &str =
+    "SELECT target, kind FROM edges WHERE source = ?1 ORDER BY target, kind";
+/// Liens entrants d'un nœud (`edges_at`) : parcours de `idx_edges_target`.
+pub(crate) const EDGES_IN: &str =
+    "SELECT source, kind FROM edges WHERE target = ?1 ORDER BY source, kind";
+/// Projection d'un nœud sur ses déclarations (`refresh_nodes`).
+pub(crate) const REFRESH_NODE: &str = "UPDATE nodes SET
                short = (SELECT short FROM declarations WHERE node = nodes.id ORDER BY file LIMIT 1),
                subkind = (SELECT subkind FROM declarations WHERE node = nodes.id ORDER BY file LIMIT 1),
                file = (SELECT CASE WHEN located <> 0 THEN file END FROM declarations
@@ -2516,9 +2513,13 @@ fn refresh_nodes<S: AsRef<str>>(tx: &rusqlite::Transaction<'_>, ids: &[S]) -> Re
                           WHERE node = nodes.id AND summary IS NOT NULL ORDER BY file LIMIT 1),
                summary_file = (SELECT file FROM declarations
                           WHERE node = nodes.id AND summary IS NOT NULL ORDER BY file LIMIT 1)
-             WHERE id = ?1 AND EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)",
-        )
-        .map_err(db_err)?;
+             WHERE id = ?1 AND EXISTS (SELECT 1 FROM declarations WHERE node = nodes.id)";
+
+/// Recalcule la ligne des nœuds encore déclarés comme projection de leurs déclarations (DEC-026) :
+/// attributs et fichier de la déclaration de plus petit chemin, résumé de la déclaration de plus
+/// petit chemin ayant un résumé. Les nœuds non déclarés sont ignorés.
+fn refresh_nodes<S: AsRef<str>>(tx: &rusqlite::Transaction<'_>, ids: &[S]) -> Result<()> {
+    let mut up = tx.prepare_cached(REFRESH_NODE).map_err(db_err)?;
     for id in ids {
         up.execute([id.as_ref()]).map_err(db_err)?;
         PROJECTIONS.with(|p| {
@@ -5668,6 +5669,57 @@ mod tests {
             assert!(!joined.contains("SCAN refs"), "{name} : {joined}");
             assert!(!joined.contains("SCAN declarations"), "{name} : {joined}");
         }
+    }
+
+    /// AC-062-2 : `edges_at` et `refresh_nodes` passent par des index.
+    #[test]
+    fn req062_ac2_edges_and_projection_use_indexes() {
+        let dir = tempdir().unwrap();
+        let st = Store::open_or_create(dir.path()).unwrap();
+        let plan = |sql: &str| -> Vec<String> {
+            let mut stmt = st
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let params = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+            let rows: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(params), |r| r.get(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let joined = rows.join(" | ");
+            assert!(!joined.contains("SCAN edges"), "{joined}");
+            assert!(!joined.contains("SCAN declarations"), "{joined}");
+            rows
+        };
+        let out = plan(EDGES_OUT);
+        assert!(
+            out.iter().any(|l| l.contains("sqlite_autoindex_edges_1")),
+            "{out:?}"
+        );
+        let inc = plan(EDGES_IN);
+        assert!(
+            inc.iter().any(|l| l.contains("idx_edges_target")),
+            "{inc:?}"
+        );
+        let refresh = plan(REFRESH_NODE);
+        let searches: Vec<&String> = refresh
+            .iter()
+            .filter(|l| l.contains("SEARCH declarations"))
+            .collect();
+        assert_eq!(searches.len(), 6, "{refresh:?}");
+        assert!(
+            searches
+                .iter()
+                .all(|l| l.contains("idx_declarations_node_file")),
+            "{refresh:?}"
+        );
+        assert!(
+            !refresh
+                .iter()
+                .any(|l| l.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "{refresh:?}"
+        );
     }
 
     /// AC-069-3, passe incrémentale : le statut stocké et le marqueur suivent la passe.

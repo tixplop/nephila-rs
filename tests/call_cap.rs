@@ -23,6 +23,19 @@ fn java(class: &str, k: usize) -> String {
     s
 }
 
+/// Comme `java`, chaque méthode précédée d'un commentaire de `pad` caractères.
+fn java_commented(class: &str, k: usize, pad: usize) -> String {
+    let mut s = format!("public class {class} {{\n");
+    for i in 0..k {
+        s.push_str(&format!(
+            "    // {}\n    void m{i}() {{}}\n",
+            "x".repeat(pad)
+        ));
+    }
+    s.push_str("}\n");
+    s
+}
+
 fn small(class: &str) -> String {
     java(class, 1)
 }
@@ -444,4 +457,29 @@ fn req047_ac14_deux_morceaux_quatre_lignes() {
             "progression: enrichissement 100 % (1/1 fichiers)"
         ]
     );
+}
+
+#[test]
+fn req048_second_remede_max_chunk_chars() {
+    let src = java_commented("Big", 100, 500);
+    assert!(src.chars().count() < 100_000);
+    assert!(split(&src, 1000).len() > 50);
+    assert_eq!(split(&src, 100_000).len(), 1);
+    let env = Env::new(&[(BIG, src)], "max_chunk_chars = 1000\nconcurrency = 1\n");
+    let o = env.run(&["build"], &[]);
+    let (out, err) = text(&o);
+    assert!(!o.status.success(), "{out} {err}");
+    let a6 = a6_lines(&err);
+    assert_eq!(a6.len(), 1, "{err}");
+    assert!(a6_count(a6[0]) > 50, "{err}");
+    assert!(env.log_lines().is_empty());
+
+    env.project("max_chunk_chars = 100000\n");
+    let o = env.run(&["build"], &[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out} {err}");
+    assert!(warnings(&err).is_empty(), "{err}");
+    let log = env.log_lines();
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert!(log[0].contains(BIG), "{log:?}");
 }
