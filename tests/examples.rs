@@ -1057,7 +1057,7 @@ fn REQ058_AC12_readme_options_llm_table_et_phrase() {
     assert_eq!(lines[first + 3], "");
     assert_eq!(
         lines[first + 4],
-        "Avec thinking = false, aucun champ de réflexion n'est envoyé ; un modèle qui réfléchit toujours le fait quand même. Pour limiter sa réflexion : thinking = true et effort = \"low\". Un modèle qui ne prend pas en charge ces champs refuse la requête (HTTP 400). Ces trois clés ne sont lues que dans la configuration personnelle : .nephila.toml les refuse."
+        "Avec thinking = false, aucun champ de réflexion n'est envoyé ; un modèle qui réfléchit toujours le fait quand même. Pour limiter sa réflexion : thinking = true et effort = \"low\". Un modèle qui ne prend pas en charge ces champs refuse la requête (HTTP 400). Chez anthropic, la réflexion adaptative demande un modèle Claude 4.6 ou suivant : claude-sonnet-4-5, le modèle des exemples, la refuse. Ces trois clés ne sont lues que dans la configuration personnelle : .nephila.toml les refuse."
     );
     let expected = "| 0.20 | Options LLM thinking, effort et max_output_tokens dans la configuration personnelle. Rupture : une limite de sortie de 16384 jetons est envoyée par défaut, à anthropic (au lieu de 8192) et désormais à openai ; un modèle ou un serveur qui ne l'accepte pas refuse la requête (HTTP 400) : baissez max_output_tokens. Une réponse tronquée conseille aussi d'augmenter max_output_tokens. |";
     assert_eq!(lines.iter().filter(|l| **l == expected).count(), 1);
@@ -1663,4 +1663,124 @@ fn REQ131_AC131_5_readme_traces_enrichissements_illisibles() {
         traces.contains(expected),
         "phrase absente de la section Traces"
     );
+}
+
+const THINKING_BLOCK: &str = "# Demande au modèle de réfléchir avant de répondre. Booléen ; défaut : false. true : nephila
+# envoie à « anthropic » \"thinking\": {\"type\": \"adaptive\"} et \"output_config\": {\"effort\": ...},
+# et à « openai » \"reasoning_effort\" ; le niveau est celui de effort. false : aucun champ de
+# réflexion n'est envoyé, mais un modèle qui réfléchit toujours (certains modèles Claude, les
+# modèles de raisonnement d'OpenAI) le fait quand même, à son niveau par défaut ; pour limiter
+# sa réflexion, mettez thinking à true et effort à \"low\". Un modèle qui ne prend pas en charge
+# la réflexion refuse la requête (HTTP 400) : ses fichiers restent à enrichir. Chez « anthropic »,
+# la réflexion adaptative demande un modèle Claude 4.6 ou suivant : claude-sonnet-4-5, le modèle
+# de cet exemple, la refuse. La réflexion n'est jamais affichée ni enregistrée. Sans effet avec
+# « mock ». Lue ici seulement :
+# .nephila.toml la refuse.
+# thinking = false";
+
+const EFFORT_BLOCK: &str = "# Niveau de la réflexion demandée quand thinking vaut true. Texte : \"low\", \"medium\" ou \"high\",
+# en minuscules ; défaut : \"low\". Envoyé à « anthropic » dans \"output_config\" et à « openai »
+# dans \"reasoning_effort\". Sans effet quand thinking vaut false (rien n'est envoyé) et avec
+# « mock ». Un niveau plus haut donne des réponses plus lentes et plus coûteuses, et sa
+# réflexion compte dans max_output_tokens. À \"medium\" ou \"high\", augmentez timeout_secs
+# (600, par exemple) : un appel plus long échoue en délai dépassé, et trois délais dépassés
+# de suite arrêtent l'envoi. Lue ici seulement :
+# .nephila.toml la refuse.
+# effort = \"low\"";
+
+fn example_block_ending_at(key_line: &str) -> String {
+    let text = example("config.toml");
+    let lines: Vec<&str> = text.lines().collect();
+    let at = position_of(&lines, key_line);
+    let mut block = exact_doc_of(&lines, at);
+    block.reverse();
+    block.push(lines[at].to_string());
+    block.join("\n")
+}
+
+#[test]
+fn REQ133_AC1_bloc_thinking_de_l_exemple_de_config_au_texte_exact() {
+    assert_eq!(
+        example_block_ending_at("# thinking = false"),
+        THINKING_BLOCK
+    );
+}
+
+#[test]
+fn REQ133_AC3_modele_de_l_exemple_reste_claude_sonnet_4_5() {
+    assert!(example("config.toml")
+        .lines()
+        .any(|l| l == "model = \"claude-sonnet-4-5\""));
+}
+
+#[test]
+fn REQ135_AC1_bloc_effort_de_l_exemple_de_config_au_texte_exact() {
+    assert_eq!(example_block_ending_at("# effort = \"low\""), EFFORT_BLOCK);
+}
+
+#[test]
+fn REQ135_AC2_readme_ligne_effort_de_la_table_des_cles() {
+    let readme = repo_file("README.md");
+    let wanted = "| `effort` | `\"low\"`, `\"medium\"` ou `\"high\"` : niveau de la réflexion. N'a d'effet qu'avec `thinking = true`. À `\"medium\"` ou `\"high\"`, les appels durent plus longtemps : augmentez `timeout_secs` (600, par exemple), car trois délais dépassés de suite arrêtent l'envoi ; configuration personnelle seulement | `\"low\"` |";
+    let found: Vec<&str> = readme
+        .lines()
+        .filter(|l| l.starts_with("| `effort` |"))
+        .collect();
+    assert_eq!(found, vec![wanted]);
+}
+
+const CONFIG_BULLET: &str = "- la configuration (fournisseur, modèle, `enrich_code`, `thinking`, `effort`, `max_output_tokens`, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;";
+
+fn without_timestamp(line: &str) -> String {
+    let start = line.find('[').expect("horodatage");
+    let end = line[start..].find("s] ").expect("fin d'horodatage") + start + 3;
+    format!("{}{}", &line[..start], &line[end..])
+}
+
+#[test]
+fn REQ134_AC1_readme_traces_puce_de_la_configuration_et_ligne_d_exemple() {
+    let readme = repo_file("README.md");
+    assert_eq!(readme.lines().filter(|l| *l == CONFIG_BULLET).count(), 1);
+    let examples: Vec<&str> = readme
+        .lines()
+        .filter(|l| l.starts_with("trace: ") && l.contains("config: llm="))
+        .collect();
+    assert_eq!(
+        examples,
+        vec!["trace: [0.000s] config: llm=mock model=m-projet enrich_code=false thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)"]
+    );
+}
+
+#[test]
+fn REQ134_AC2_ligne_config_d_exemple_du_readme_est_la_sortie_reelle() {
+    let (tmp, repo) = repo_with_project_file("model = \"m-projet\"\nformat_retries = 1\n");
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        "provider = \"mock\"\nbatch_files = 1\nformat_retries = 1\n",
+    )
+    .unwrap();
+    let mock = tmp.path().join("mock");
+    fs::create_dir_all(&mock).unwrap();
+    let out = Command::cargo_bin("nephila")
+        .unwrap()
+        .env("NEPHILA_CONFIG", &config)
+        .env("NEPHILA_MOCK_DIR", &mock)
+        .arg("-C")
+        .arg(&repo)
+        .args(["build", "--verbose"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let real = stderr
+        .lines()
+        .find(|l| l.contains("config: llm="))
+        .expect("ligne config");
+    let readme = repo_file("README.md");
+    let example = readme
+        .lines()
+        .find(|l| l.starts_with("trace: ") && l.contains("config: llm="))
+        .expect("exemple du README");
+    assert_eq!(without_timestamp(real), without_timestamp(example));
 }

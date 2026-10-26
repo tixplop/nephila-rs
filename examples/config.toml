@@ -115,8 +115,10 @@ api_key_env = "ANTHROPIC_API_KEY"
 # réflexion n'est envoyé, mais un modèle qui réfléchit toujours (certains modèles Claude, les
 # modèles de raisonnement d'OpenAI) le fait quand même, à son niveau par défaut ; pour limiter
 # sa réflexion, mettez thinking à true et effort à "low". Un modèle qui ne prend pas en charge
-# la réflexion refuse la requête (HTTP 400) : ses fichiers restent à enrichir. La réflexion
-# n'est jamais affichée ni enregistrée. Sans effet avec « mock ». Lue ici seulement :
+# la réflexion refuse la requête (HTTP 400) : ses fichiers restent à enrichir. Chez « anthropic »,
+# la réflexion adaptative demande un modèle Claude 4.6 ou suivant : claude-sonnet-4-5, le modèle
+# de cet exemple, la refuse. La réflexion n'est jamais affichée ni enregistrée. Sans effet avec
+# « mock ». Lue ici seulement :
 # .nephila.toml la refuse.
 # thinking = false
 
@@ -124,7 +126,9 @@ api_key_env = "ANTHROPIC_API_KEY"
 # en minuscules ; défaut : "low". Envoyé à « anthropic » dans "output_config" et à « openai »
 # dans "reasoning_effort". Sans effet quand thinking vaut false (rien n'est envoyé) et avec
 # « mock ». Un niveau plus haut donne des réponses plus lentes et plus coûteuses, et sa
-# réflexion compte dans max_output_tokens. Lue ici seulement :
+# réflexion compte dans max_output_tokens. À "medium" ou "high", augmentez timeout_secs
+# (600, par exemple) : un appel plus long échoue en délai dépassé, et trois délais dépassés
+# de suite arrêtent l'envoi. Lue ici seulement :
 # .nephila.toml la refuse.
 # effort = "low"
 

@@ -230,7 +230,7 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 
 Événements tracés :
 
-- la configuration (fournisseur, modèle, `enrich_code`, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;
+- la configuration (fournisseur, modèle, `enrich_code`, `thinking`, `effort`, `max_output_tokens`, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;
 - le parcours des fichiers, avec le segment ` (exclusions par défaut : <d> dossiers, <f> fichiers)` quand des chemins sont exclus par défaut ;
 - la migration du schéma d'un graphe plus ancien : `schéma: migration <X> vers <V> en <N> ms` ;
 - le nombre de fils de l'extraction, quand le système en refuse : `structure: <N> fils démarrés sur <M> demandés` ;
@@ -244,7 +244,7 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, p
 Un fichier non envoyé pour trop d'appels n'a aucune ligne `llm enrich`.
 
 ```
-trace: [0.000s] config: llm=mock model=m-projet enrich_code=false concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
+trace: [0.000s] config: llm=mock model=m-projet enrich_code=false thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
 trace: [0.009s] structure: fin 7 ms, 0 en attente, 3 enrichissements conservés
 trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
 trace: [0.020s] llm enrich attente src/shop/Order.java [1/1] 1000 ms après HTTP 503 (nouvel essai 1/4)
@@ -495,7 +495,7 @@ Six de ces réglages (`model`, `max_chunk_chars`, `concurrency`, `timeout_secs`,
 | `concurrency` | Appels LLM simultanés ; sans effet sur l'extraction, réglée par `--jobs` | 4 |
 | `enrich_code` | Booléen. `true` enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown ; configuration personnelle seulement, `--enrich-code` le demande pour une commande | `false` |
 | `thinking` | Booléen. `true` demande au modèle de réfléchir avant de répondre (réflexion jamais affichée ni enregistrée) ; configuration personnelle seulement | `false` |
-| `effort` | `"low"`, `"medium"` ou `"high"` : niveau de la réflexion. N'a d'effet qu'avec `thinking = true` ; configuration personnelle seulement | `"low"` |
+| `effort` | `"low"`, `"medium"` ou `"high"` : niveau de la réflexion. N'a d'effet qu'avec `thinking = true`. À `"medium"` ou `"high"`, les appels durent plus longtemps : augmentez `timeout_secs` (600, par exemple), car trois délais dépassés de suite arrêtent l'envoi ; configuration personnelle seulement | `"low"` |
 | `max_output_tokens` | Limite de jetons de la réponse du modèle, réflexion comprise, entier > 0 ; configuration personnelle seulement | 16384 |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |
 | `format_retries` | Nouveaux essais d'un appel dont la réponse est non conforme, entier ≥ 0 (2 = au plus 3 appels pour une même requête ; 0 = aucun nouvel essai, comme en 0.12.0) | 2 |
@@ -511,7 +511,7 @@ Ce que chaque clé envoie à chaque fournisseur :
 | `thinking = true` | `"thinking": {"type": "adaptive"}` | aucun champ propre (voir `effort`) | sans effet |
 | `effort` (avec `thinking = true` seulement) | `output_config.effort` | `reasoning_effort` | sans effet |
 
-Avec thinking = false, aucun champ de réflexion n'est envoyé ; un modèle qui réfléchit toujours le fait quand même. Pour limiter sa réflexion : thinking = true et effort = "low". Un modèle qui ne prend pas en charge ces champs refuse la requête (HTTP 400). Ces trois clés ne sont lues que dans la configuration personnelle : .nephila.toml les refuse.
+Avec thinking = false, aucun champ de réflexion n'est envoyé ; un modèle qui réfléchit toujours le fait quand même. Pour limiter sa réflexion : thinking = true et effort = "low". Un modèle qui ne prend pas en charge ces champs refuse la requête (HTTP 400). Chez anthropic, la réflexion adaptative demande un modèle Claude 4.6 ou suivant : claude-sonnet-4-5, le modèle des exemples, la refuse. Ces trois clés ne sont lues que dans la configuration personnelle : .nephila.toml les refuse.
 
 Un modèle ou un serveur local dont la réponse maximale est plus courte que 16384 jetons refuse aussi la requête (HTTP 400) : baissez `max_output_tokens`. L'envoi s'arrête alors sur la ligne `erreur: requête refusée par <fournisseur> (HTTP 400) sur <url> : <message du fournisseur> ; vérifiez model, thinking, effort et max_output_tokens`, au lieu de laisser des fichiers « à enrichir » un par un ; les fichiers non enrichis restent « à enrichir » pour le prochain `nephila update`.
 
