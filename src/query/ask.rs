@@ -91,13 +91,73 @@ fn qualified_terms(question: &str) -> Vec<String> {
     out
 }
 
+/// Identifiants cités par la question (REQ-141) : mots-clés dont une occurrence est un segment
+/// d'un mot écrit en forme de code. Un mot écrit est une suite de segments séparés chacun par
+/// un seul `.` ou `#` ; il est en forme de code s'il compte au moins deux segments, contient
+/// `_`, a un segment avec une majuscule hors première position et une minuscule, ou est suivi
+/// immédiatement de `()`.
+fn cited_identifiers(question: &str) -> HashSet<String> {
+    let is_name = |c: char| c.is_alphanumeric() || c == '_';
+    let chars: Vec<char> = question.chars().collect();
+    let mut out = HashSet::new();
+    let mut add_word = |segments: &[String], called: bool| {
+        let mixed_case = |s: &String| {
+            s.chars().skip(1).any(char::is_uppercase) && s.chars().any(char::is_lowercase)
+        };
+        let code = called
+            || segments.len() >= 2
+            || segments.iter().any(|s| s.contains('_') || mixed_case(s));
+        if code {
+            for s in segments {
+                let w = s.to_lowercase();
+                if w.chars().count() >= MIN_WORD_CHARS && !STOP_WORDS.contains(&w.as_str()) {
+                    out.insert(w);
+                }
+            }
+        }
+    };
+    let mut segments: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if is_name(chars[i]) {
+            let start = i;
+            while i < chars.len() && is_name(chars[i]) {
+                i += 1;
+            }
+            segments.push(chars[start..i].iter().collect());
+            let joined =
+                i + 1 < chars.len() && matches!(chars[i], '.' | '#') && is_name(chars[i + 1]);
+            if joined {
+                i += 1;
+            } else {
+                let called = chars[i..].starts_with(&['(', ')']);
+                add_word(&segments, called);
+                segments.clear();
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Clé de classement d'un nœud pour un terme : (classe, fréquence, rang, position du terme).
 type SeedKey = (u8, usize, u8, usize);
 
+/// Classe d'un mot-clé : 1 ou 2 (exact / autre) pour un identifiant cité, 3 ou 4 sinon.
+fn word_class(cited: bool, rank: u8) -> u8 {
+    (if cited { 1 } else { 3 }) + u8::from(rank != 0)
+}
+
 /// Nœuds de départ : les nœuds qui correspondent à au moins un terme (noms qualifiés cités puis
-/// mots-clés), triés par leur meilleure clé, puis nom qualifié et identifiant ; les 20 premiers.
+/// mots-clés, ceux qui sont des identifiants cités avant les autres), triés par leur meilleure clé, puis nom qualifié et identifiant ; les 20 premiers.
 /// La recherche travaille sur des références ; seuls les nœuds retenus sont copiés.
-fn find_seeds(nodes: &[Node], qualified: &[String], words: &[String]) -> Vec<Node> {
+fn find_seeds(
+    nodes: &[Node],
+    qualified: &[String],
+    words: &[String],
+    cited: &HashSet<String>,
+) -> Vec<Node> {
     let prepared = search::Prepared::new(nodes);
     let mut best: Vec<Option<SeedKey>> = vec![None; nodes.len()];
     let mut offer = |i: usize, key: SeedKey| {
@@ -118,7 +178,12 @@ fn find_seeds(nodes: &[Node], qualified: &[String], words: &[String]) -> Vec<Nod
         for (i, r) in hits {
             offer(
                 i,
-                (if r == 0 { 1 } else { 2 }, freq, r, qualified.len() + k),
+                (
+                    word_class(cited.contains(w), r),
+                    freq,
+                    r,
+                    qualified.len() + k,
+                ),
             );
         }
     }
@@ -276,7 +341,12 @@ pub fn answer(
     format_retries: u32,
 ) -> Result<(String, Vec<Node>)> {
     let nodes = store.nodes()?;
-    let seeds = find_seeds(&nodes, &qualified_terms(question), &keywords(question));
+    let seeds = find_seeds(
+        &nodes,
+        &qualified_terms(question),
+        &keywords(question),
+        &cited_identifiers(question),
+    );
     if seeds.is_empty() {
         return Err(not_found());
     }
@@ -397,10 +467,15 @@ mod tests {
     }
 
     fn seed_ids(nodes: &[Node], question: &str) -> Vec<String> {
-        find_seeds(nodes, &qualified_terms(question), &keywords(question))
-            .into_iter()
-            .map(|n| n.id)
-            .collect()
+        find_seeds(
+            nodes,
+            &qualified_terms(question),
+            &keywords(question),
+            &cited_identifiers(question),
+        )
+        .into_iter()
+        .map(|n| n.id)
+        .collect()
     }
 
     #[test]
@@ -421,6 +496,56 @@ mod tests {
             let unique: HashSet<&String> = ids.iter().collect();
             assert_eq!(unique.len(), 20, "{q}");
         }
+    }
+
+    /// Graphe de la question Q08 de javapoet : `typespec` (164 nœuds), `build` (118) et
+    /// `methods` (99) ; seul le type `TypeSpec` correspond à `typespec` sans les deux autres.
+    fn q08_graph() -> Vec<Node> {
+        let p = "com.squareup.javapoet";
+        let mut v = vec![
+            mk(NodeKind::Type, &format!("{p}.TypeSpec"), None),
+            mk(NodeKind::Type, &format!("{p}.TypeSpecTest"), None),
+        ];
+        for i in 0..162 {
+            v.push(mk(
+                NodeKind::Method,
+                &format!("{p}.TypeSpecTest.t{i}"),
+                None,
+            ));
+        }
+        for i in 0..118 {
+            v.push(mk(NodeKind::Method, &format!("{p}.B{i}.build"), None));
+        }
+        v.push(mk(NodeKind::Section, "README.md#methods", None));
+        for i in 0..98 {
+            v.push(mk(
+                NodeKind::Method,
+                &format!("{p}.Doc.d{i}"),
+                Some("lists methods"),
+            ));
+        }
+        v
+    }
+
+    const Q08: &str = "Which kinds of types can TypeSpec build, and with which factory methods?";
+
+    #[test]
+    fn req141_ac7_cited_identifier_leads_over_ordinary_words() {
+        let nodes = q08_graph();
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|n| n.qualified.to_lowercase().contains("typespec"))
+                .count(),
+            164
+        );
+        let ids = seed_ids(&nodes, Q08);
+        assert_eq!(ids.len(), 20);
+        assert_eq!(ids[0], "type:com.squareup.javapoet.TypeSpec");
+        assert!(
+            ids.iter().all(|i| i.to_lowercase().contains("typespec")),
+            "{ids:?}"
+        );
     }
 
     #[test]
@@ -455,7 +580,7 @@ mod tests {
             mk(NodeKind::Document, "docs/README.md#usage", None),
         ];
         let ids = |term: &str| -> Vec<String> {
-            find_seeds(&nodes, &[term.to_string()], &[])
+            find_seeds(&nodes, &[term.to_string()], &[], &HashSet::new())
                 .into_iter()
                 .map(|n| n.qualified)
                 .collect()
@@ -474,7 +599,7 @@ mod tests {
 
     fn seeds_of(nodes: &[Node], words: &[&str]) -> Vec<String> {
         let w: Vec<String> = words.iter().map(|s| s.to_string()).collect();
-        find_seeds(nodes, &[], &w)
+        find_seeds(nodes, &[], &w, &HashSet::new())
             .into_iter()
             .map(|n| n.qualified)
             .collect()
@@ -502,10 +627,15 @@ mod tests {
         assert_eq!(got[0], "p.common");
         // (c) nom qualifié cité avant correspondance exacte
         let nodes = vec![t("p.foo", None), t("q.Bar.baz", None), t("r.baz", None)];
-        let got: Vec<String> = find_seeds(&nodes, &["bar.baz".to_string()], &["foo".to_string()])
-            .into_iter()
-            .map(|n| n.qualified)
-            .collect();
+        let got: Vec<String> = find_seeds(
+            &nodes,
+            &["bar.baz".to_string()],
+            &["foo".to_string()],
+            &HashSet::new(),
+        )
+        .into_iter()
+        .map(|n| n.qualified)
+        .collect();
         assert_eq!(got, ["q.Bar.baz", "p.foo"]);
         // (d) un nœud à deux termes, une seule fois, à la place de sa meilleure clé
         let nodes = vec![
@@ -522,8 +652,87 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    fn set(words: &[&str]) -> HashSet<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn req141_ac8_cited_identifiers() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "Which kinds of types can TypeSpec build, and with which factory methods?",
+                &["typespec"],
+            ),
+            (
+                "Which method calls CodeWriter.suggestedImports()?",
+                &["codewriter", "suggestedimports"],
+            ),
+            (
+                "Who calls suggestedImports in CodeWriter?",
+                &["suggestedimports", "codewriter"],
+            ),
+            (
+                "What is the effect of JavaFile.Builder.skipJavaLangImports(true)?",
+                &["javafile", "builder", "skipjavalangimports"],
+            ),
+            ("TypeSpec.build and build", &["typespec", "build"]),
+            ("What does build() return?", &["build"]),
+            ("What is max_tokens?", &["max_tokens"]),
+            ("What does Builder do with HTML and JSON?", &[]),
+            (
+                "Which classes extend TypeName in JavaPoet?",
+                &["typename", "javapoet"],
+            ),
+            ("Where is it defined. Then build.", &[]),
+            ("e.g. build", &[]),
+        ];
+        for (q, want) in cases {
+            assert_eq!(cited_identifiers(q), set(want), "{q}");
+        }
+    }
+
+    #[test]
+    fn req141_ac9_ordering_with_cited_identifiers() {
+        let t = |q: &str, s: Option<&str>| mk(NodeKind::Type, q, s);
+        let w = |ws: &[&str]| -> Vec<String> { ws.iter().map(|s| s.to_string()).collect() };
+        let seeds =
+            |nodes: &[Node], quals: &[String], ws: &[&str], cited: &[&str]| -> Vec<String> {
+                find_seeds(nodes, quals, &w(ws), &set(cited))
+                    .into_iter()
+                    .map(|n| n.qualified)
+                    .collect()
+            };
+        // (a) identifiant cité fréquent (préfixe) avant mot ordinaire rare (exact)
+        let mut nodes: Vec<Node> = (0..50)
+            .map(|i| t(&format!("p.common{i:02}"), None))
+            .collect();
+        nodes.push(t("p.rare", None));
+        let got = seeds(&nodes, &[], &["rare", "common"], &["common"]);
+        assert_eq!(got.len(), 20);
+        assert!(got.iter().all(|q| q.starts_with("p.common")), "{got:?}");
+        assert_eq!(seeds(&nodes, &[], &["rare", "common"], &[])[0], "p.rare");
+        // (b) exact d'un identifiant fréquent avant préfixe d'un identifiant rare
+        let mut nodes: Vec<Node> = (0..49)
+            .map(|i| t(&format!("p.n{i:02}"), Some("common")))
+            .collect();
+        nodes.push(t("p.common", None));
+        nodes.push(t("p.zrare1", None));
+        nodes.push(t("p.zrare2", None));
+        let got = seeds(&nodes, &[], &["zrar", "common"], &["zrar", "common"]);
+        assert_eq!(got[0], "p.common");
+        // (c) nom qualifié cité avant exact d'un identifiant cité
+        let nodes = vec![t("p.foo", None), t("q.Bar.baz", None), t("r.baz", None)];
+        let got = seeds(&nodes, &["bar.baz".to_string()], &["foo"], &["foo"]);
+        assert_eq!(got, ["q.Bar.baz", "p.foo"]);
+    }
+
     /// Oracle naïf d'AC-141-5, écrit depuis la définition.
-    fn naive_seeds(nodes: &[Node], quals: &[String], words: &[String]) -> Vec<String> {
+    fn naive_seeds(
+        nodes: &[Node],
+        quals: &[String],
+        words: &[String],
+        cited: &HashSet<String>,
+    ) -> Vec<String> {
         let lower = |s: &str| s.to_lowercase();
         let suffix = |q: &str, t: &str| {
             q == t
@@ -562,7 +771,10 @@ mod tests {
                 let key = if is_q {
                     suffix(&lower(&n.qualified), t).then_some((0, freq, 0, pos))
                 } else {
-                    hit(n, t).map(|r| (if r == 0 { 1 } else { 2 }, freq, r, pos))
+                    hit(n, t).map(|r| {
+                        let base = if cited.contains(t) { 1 } else { 3 };
+                        (if r == 0 { base } else { base + 1 }, freq, r, pos)
+                    })
                 };
                 if let Some(k) = key {
                     best = Some(best.map_or(k, |b: SeedKey| b.min(k)));
@@ -607,9 +819,11 @@ mod tests {
                 };
                 quals.push(q[start..].to_string());
             }
-            let want = naive_seeds(&nodes, &quals, &words);
+            let cited: HashSet<String> =
+                words.iter().filter(|_| rng.next(2) == 0).cloned().collect();
+            let want = naive_seeds(&nodes, &quals, &words, &cited);
             capped |= want.len() == MAX_SEEDS;
-            let got: Vec<String> = find_seeds(&nodes, &quals, &words)
+            let got: Vec<String> = find_seeds(&nodes, &quals, &words, &cited)
                 .into_iter()
                 .map(|n| n.id)
                 .collect();
@@ -627,7 +841,13 @@ mod tests {
             let words = random_words(&mut rng)[..1].to_vec();
             let old = legacy_find_seeds(&nodes, &words);
             truncated |= old.len() == MAX_SEEDS;
-            assert_eq!(old, find_seeds(&nodes, &[], &words), "mots {words:?}");
+            let cited: HashSet<String> =
+                words.iter().filter(|_| rng.next(2) == 0).cloned().collect();
+            assert_eq!(
+                old,
+                find_seeds(&nodes, &[], &words, &cited),
+                "mots {words:?}"
+            );
         }
         assert!(truncated, "le plafond de 20 nœuds n'est jamais atteint");
     }
