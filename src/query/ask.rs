@@ -149,57 +149,113 @@ fn node_line(n: &Node) -> String {
     l
 }
 
-/// Contexte textuel : nœuds trouvés, voisins à profondeur 1 et liens entre eux. Ne contient que
-/// des données du graphe, jamais de contenu de fichier source.
-fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) -> String {
-    let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    let mut included: Vec<&Node> = Vec::new();
-    let mut ids: HashSet<&str> = HashSet::new();
-    let mut add = |n: &'a Node, included: &mut Vec<&'a Node>| {
-        if included.len() < MAX_NODES && ids.insert(n.id.as_str()) {
-            included.push(n);
+/// Remplissage du contexte : lignes de nœuds et de liens écrites, et place restante (REQ-142).
+struct Fill<'a> {
+    nodes_text: String,
+    links_text: String,
+    written: HashSet<&'a str>,
+    neighbours: usize,
+    used: usize,
+}
+
+impl<'a> Fill<'a> {
+    /// Écrit une étape (ligne de nœud éventuelle et ligne de lien éventuelle) si elle tient.
+    fn push(&mut self, node: Option<&'a Node>, link: Option<&Edge>) -> bool {
+        let node_text = node.map(|n| format!("{}\n", node_line(n)));
+        let link_text =
+            link.map(|e| format!("- {} -{}-> {}\n", e.source, e.kind.as_str(), e.target));
+        let cost: usize = [&node_text, &link_text]
+            .into_iter()
+            .flatten()
+            .map(|t| t.chars().count())
+            .sum();
+        if self.used + cost > MAX_CONTEXT_CHARS {
+            return false;
         }
-    };
-    for s in seeds {
-        add(s, &mut included);
+        self.used += cost;
+        if let (Some(n), Some(t)) = (node, node_text) {
+            self.written.insert(n.id.as_str());
+            self.nodes_text.push_str(&t);
+        }
+        if let Some(t) = link_text {
+            self.links_text.push_str(&t);
+        }
+        true
     }
+}
+
+/// Contexte textuel : nœuds de départ dans l'ordre de priorité, chacun suivi de ses liens et de
+/// leurs voisins, tant que le contexte tient (REQ-142). Ne contient que des données du graphe,
+/// jamais de contenu de fichier source.
+fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) -> String {
+    const NODES_HEADER: &str = "Nœuds :\n";
+    const LINKS_HEADER: &str = "Liens :\n";
+    let header_chars = NODES_HEADER.chars().count() + LINKS_HEADER.chars().count();
+    let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let seed_ids: HashSet<&str> = seeds.iter().map(|n| n.id.as_str()).collect();
+    // Liens qui touchent chaque nœud de départ, dans l'ordre de la base (un seul passage).
+    let mut adjacent: HashMap<&str, Vec<&Edge>> = HashMap::new();
     for e in edges {
-        for (a, b) in [(&e.source, &e.target), (&e.target, &e.source)] {
-            if seed_ids.contains(a.as_str()) {
-                if let Some(n) = by_id.get(b.as_str()) {
-                    add(n, &mut included);
-                }
+        if seed_ids.contains(e.source.as_str()) {
+            adjacent.entry(e.source.as_str()).or_default().push(e);
+        }
+        if e.target != e.source && seed_ids.contains(e.target.as_str()) {
+            adjacent.entry(e.target.as_str()).or_default().push(e);
+        }
+    }
+    let neighbour_cap = MAX_NODES.saturating_sub(seed_ids.len());
+    let mut fill = Fill {
+        nodes_text: String::new(),
+        links_text: String::new(),
+        written: HashSet::new(),
+        neighbours: 0,
+        used: header_chars,
+    };
+    let mut done: HashSet<(&str, &str, &str)> = HashSet::new();
+    'seeds: for (rank, s) in seeds.iter().enumerate() {
+        if !fill.written.contains(s.id.as_str()) && !fill.push(Some(s), None) {
+            if rank == 0 {
+                // Seule coupe dans une ligne : celle du premier nœud de départ, seul.
+                let room = MAX_CONTEXT_CHARS - header_chars - 1;
+                let cut: String = node_line(s).chars().take(room).collect();
+                fill.nodes_text = format!("{cut}\n");
+            }
+            break;
+        }
+        for e in adjacent.get(s.id.as_str()).into_iter().flatten() {
+            let key = (e.source.as_str(), e.target.as_str(), e.kind.as_str());
+            if done.contains(&key) {
+                continue;
+            }
+            let other = if e.source == s.id {
+                &e.target
+            } else {
+                &e.source
+            };
+            let Some(&other_node) = by_id.get(other.as_str()) else {
+                continue;
+            };
+            let is_seed = seed_ids.contains(other.as_str());
+            let new_node = if fill.written.contains(other.as_str()) {
+                None
+            } else if is_seed || fill.neighbours < neighbour_cap {
+                Some(other_node)
+            } else {
+                continue;
+            };
+            if !fill.push(new_node, Some(e)) {
+                break 'seeds;
+            }
+            done.insert(key);
+            if new_node.is_some() && !is_seed {
+                fill.neighbours += 1;
             }
         }
     }
-    let mut out = String::from("Nœuds :\n");
-    for n in &included {
-        out.push_str(&node_line(n));
-        out.push('\n');
-    }
-    out.push_str("Liens :\n");
-    for e in edges {
-        if ids.contains(e.source.as_str())
-            && ids.contains(e.target.as_str())
-            && (seed_ids.contains(e.source.as_str()) || seed_ids.contains(e.target.as_str()))
-        {
-            out.push_str(&format!(
-                "- {} -{}-> {}\n",
-                e.source,
-                e.kind.as_str(),
-                e.target
-            ));
-        }
-    }
-    truncate_chars(&mut out, MAX_CONTEXT_CHARS);
-    out
-}
-
-fn truncate_chars(s: &mut String, max: usize) {
-    if let Some((idx, _)) = s.char_indices().nth(max) {
-        s.truncate(idx);
-    }
+    format!(
+        "{NODES_HEADER}{}{LINKS_HEADER}{}",
+        fill.nodes_text, fill.links_text
+    )
 }
 
 fn to_json(n: &Node) -> Value {
@@ -574,5 +630,169 @@ mod tests {
             assert_eq!(old, find_seeds(&nodes, &[], &words), "mots {words:?}");
         }
         assert!(truncated, "le plafond de 20 nœuds n'est jamais atteint");
+    }
+
+    fn edge(source: &Node, target: &Node, kind: crate::model::EdgeKind) -> Edge {
+        Edge {
+            source: source.id.clone(),
+            target: target.id.clone(),
+            kind,
+        }
+    }
+
+    fn link_line(e: &Edge) -> String {
+        format!("- {} -{}-> {}", e.source, e.kind.as_str(), e.target)
+    }
+
+    /// Lignes de nœuds et lignes de liens d'un contexte.
+    fn sections(ctx: &str) -> (Vec<&str>, Vec<&str>) {
+        let body = ctx.strip_prefix("Nœuds :\n").expect("en-tête des nœuds");
+        let (n, l) = body.split_once("Liens :\n").expect("en-tête des liens");
+        (n.lines().collect(), l.lines().collect())
+    }
+
+    #[test]
+    fn req142_ac1_late_seed_link_survives_a_big_earlier_seed() {
+        use crate::model::EdgeKind::{Contains, Imports};
+        let late = mk(NodeKind::Type, "z.Late", Some("tard"));
+        let user = mk(NodeKind::Type, "z.User", Some("utilisateur"));
+        let big = mk(NodeKind::Type, "a.Big", Some("gros"));
+        let mut nodes = vec![late.clone(), user.clone(), big.clone()];
+        let mut edges = Vec::new();
+        for i in 0..80 {
+            let m = mk(
+                NodeKind::Method,
+                &format!("a.Big.m{i}"),
+                Some(&"r".repeat(120)),
+            );
+            edges.push(edge(&big, &m, Contains));
+            nodes.push(m);
+        }
+        edges.push(edge(&user, &late, Imports));
+        let ctx = build_context(&nodes, &edges, &[late.clone(), big.clone()]);
+        assert!(ctx.contains(&node_line(&user)), "{ctx}");
+        assert!(
+            ctx.contains("\n- type:z.User -imports-> type:z.Late\n"),
+            "{ctx}"
+        );
+        assert!(ctx.chars().count() <= MAX_CONTEXT_CHARS);
+        let (n, _) = sections(&ctx);
+        assert!(n.len() <= MAX_NODES, "{}", n.len());
+    }
+
+    #[test]
+    fn req142_ac2_context_is_cut_only_at_line_ends() {
+        use crate::model::EdgeKind::Contains;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut seeds = Vec::new();
+        for i in 0..20 {
+            let s = mk(NodeKind::Type, &format!("p.S{i}"), Some(&"s".repeat(500)));
+            for j in 0..30 {
+                let v = mk(
+                    NodeKind::Method,
+                    &format!("p.S{i}.v{j}"),
+                    Some(&"v".repeat(500)),
+                );
+                edges.push(edge(&s, &v, Contains));
+                nodes.push(v);
+            }
+            seeds.push(s.clone());
+            nodes.push(s);
+        }
+        let ctx = build_context(&nodes, &edges, &seeds);
+        assert!(ctx.chars().count() <= MAX_CONTEXT_CHARS);
+        assert!(ctx.ends_with('\n'));
+        assert_eq!(ctx.matches("Liens :\n").count(), 1);
+        let valid_nodes: HashSet<String> = nodes.iter().map(node_line).collect();
+        let valid_links: HashSet<String> = edges.iter().map(link_line).collect();
+        let (n, l) = sections(&ctx);
+        assert!(!n.is_empty() && !l.is_empty());
+        for line in n {
+            assert!(valid_nodes.contains(line), "ligne de nœud coupée : {line}");
+        }
+        for line in l {
+            assert!(valid_links.contains(line), "ligne de lien coupée : {line}");
+        }
+    }
+
+    #[test]
+    fn req142_ac3_links_grouped_by_seed_priority() {
+        use crate::model::EdgeKind::{Calls, References};
+        let s: Vec<Node> = (1..=3)
+            .map(|i| mk(NodeKind::Method, &format!("p.S{i}"), None))
+            .collect();
+        let n1 = mk(NodeKind::Method, "p.N1", None);
+        let n2 = mk(NodeKind::Method, "p.N2", None);
+        let edges = vec![
+            edge(&s[2], &n1, Calls),
+            edge(&s[1], &n1, Calls),
+            edge(&s[0], &s[1], References),
+            edge(&s[1], &n2, Calls),
+            edge(&n1, &s[0], Calls),
+            edge(&s[2], &s[0], Calls),
+        ];
+        let nodes = vec![
+            n2.clone(),
+            n1.clone(),
+            s[2].clone(),
+            s[1].clone(),
+            s[0].clone(),
+        ];
+        let ctx = build_context(&nodes, &edges, &s);
+        let want: Vec<String> = [2, 4, 5, 1, 3, 0]
+            .iter()
+            .map(|&i| link_line(&edges[i]))
+            .collect();
+        let (n, l) = sections(&ctx);
+        assert_eq!(l, want.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut ids: Vec<&str> = n.iter().map(|x| x.split(" : ").next().unwrap()).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(total, 5);
+        assert_eq!(ids.len(), 5);
+    }
+
+    #[test]
+    fn req142_ac4_neighbours_capped_so_that_seeds_keep_their_place() {
+        use crate::model::EdgeKind::Calls;
+        let seeds: Vec<Node> = (0..20)
+            .map(|i| mk(NodeKind::Method, &format!("p.S{i}"), None))
+            .collect();
+        let mut nodes = seeds.clone();
+        let mut edges = Vec::new();
+        for i in 0..100 {
+            let v = mk(NodeKind::Method, &format!("p.V{i:03}"), None);
+            edges.push(edge(&seeds[0], &v, Calls));
+            nodes.push(v);
+        }
+        let ctx = build_context(&nodes, &edges, &seeds);
+        let (n, l) = sections(&ctx);
+        assert_eq!(n.len(), 60);
+        for s in &seeds {
+            assert!(n.contains(&node_line(s).as_str()));
+        }
+        let want: Vec<String> = edges[..40].iter().map(link_line).collect();
+        assert_eq!(l, want.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(n.contains(&node_line(&nodes[20 + 39]).as_str()));
+        assert!(!n.contains(&node_line(&nodes[20 + 40]).as_str()));
+    }
+
+    #[test]
+    fn req142_ac5_overlong_first_seed_line_is_cut_alone() {
+        use crate::model::EdgeKind::Calls;
+        let s = mk(NodeKind::Type, "p.S", Some(&"é".repeat(20_000)));
+        let v = mk(NodeKind::Method, "p.V", None);
+        let edges = vec![edge(&s, &v, Calls)];
+        let ctx = build_context(&[s.clone(), v], &edges, std::slice::from_ref(&s));
+        assert_eq!(ctx.chars().count(), MAX_CONTEXT_CHARS);
+        assert!(
+            ctx.starts_with(&format!("Nœuds :\n- {} : ", s.id)),
+            "{}",
+            &ctx[..80]
+        );
+        assert!(ctx.ends_with("\nLiens :\n"));
+        assert_eq!(ctx.lines().count(), 3);
     }
 }

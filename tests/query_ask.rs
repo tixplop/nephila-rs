@@ -520,3 +520,86 @@ fn req055_ac2_ask_request_body_identical_to_0_18_0() {
         include_str!("fixtures/ask_body_ac016_1.json").trim_end_matches('\n')
     );
 }
+
+/// Texte des messages de la requête `ask` reçue (JSON décodé : les `\n` sont de vrais retours).
+fn ask_user_message(body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap();
+    v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Dépôt Java sur le modèle de javapoet : le contexte de la question dépasse 12 000 caractères
+/// avant le lien `JavaFile.writeTo -calls-> CodeWriter.suggestedImports` avant REQ-142.
+fn javapoet_like(env: &Env) {
+    let pad = "WithALongDescriptiveNameSoThatTheGraphContextGrowsQuickly";
+    let mut cw = String::from("package com.squareup.javapoet;\n\nclass CodeWriter {\n");
+    for i in 0..35 {
+        cw.push_str(&format!(
+            "    void emit{pad}{i}() {{ emit{pad}{}(); }}\n",
+            (i + 1) % 35
+        ));
+    }
+    cw.push_str("    void suggestedImports() {}\n}\n");
+    env.file("com/squareup/javapoet/CodeWriter.java", &cw);
+    let mut ms = String::from("package com.squareup.javapoet;\n\nclass MethodSpec {\n");
+    for i in 0..30 {
+        ms.push_str(&format!("    void method{pad}{i}() {{}}\n"));
+    }
+    ms.push_str("}\n");
+    env.file("com/squareup/javapoet/MethodSpec.java", &ms);
+    env.file(
+        "com/squareup/javapoet/JavaFile.java",
+        "package com.squareup.javapoet;\n\nclass JavaFile {\n    void writeTo() {\n        CodeWriter w = new CodeWriter();\n        w.suggestedImports();\n    }\n}\n",
+    );
+    let o = env.cmd(&["build", "--no-llm"]).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o.stderr));
+}
+
+#[test]
+fn req142_ac6_late_link_reaches_the_context_for_the_three_questions() {
+    const LINK: &str = "- method:com.squareup.javapoet.JavaFile.writeTo -calls-> method:com.squareup.javapoet.CodeWriter.suggestedImports";
+    let env = Env::new();
+    javapoet_like(&env);
+    // Le graphe contient bien le lien : le rouge ne vient pas de la fixture.
+    let o = env
+        .cmd(&["query", "neighbors", "CodeWriter.suggestedImports"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stdout).contains("calls com.squareup.javapoet.JavaFile.writeTo"),
+        "{}",
+        text(&o.stdout)
+    );
+    let mut missing = Vec::new();
+    for q in [
+        "Which method calls CodeWriter.suggestedImports()?",
+        "Which calls CodeWriter.suggestedImports()?",
+        "Who calls suggestedImports in CodeWriter?",
+    ] {
+        let reply = r#"{"found":true,"answer":"a","nodes":["JavaFile.writeTo"]}"#;
+        let server = FakeServer::start(vec![(
+            200,
+            serde_json::json!({"content":[{"type":"text","text":reply}]}).to_string(),
+        )]);
+        http_env(&env, &server);
+        let o = env
+            .cmd(&["query", "ask", q])
+            .env("NEPHILA_TEST_ASK_KEY", "sk-test")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{q} : {}", text(&o.stderr));
+        let reqs = server.requests();
+        let post = reqs.iter().find(|r| r.method == "POST").unwrap();
+        let msg = ask_user_message(&post.body);
+        if !msg.lines().any(|l| l == LINK) {
+            missing.push(format!("{q} ({} caractères)", msg.chars().count()));
+        }
+    }
+    assert!(missing.is_empty(), "lien absent pour : {missing:?}");
+}
