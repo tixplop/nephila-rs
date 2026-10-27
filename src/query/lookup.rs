@@ -18,7 +18,7 @@ pub enum Lookup {
     NotFound,
 }
 
-fn is_suffix(qualified: &str, name: &str) -> bool {
+pub(super) fn is_suffix(qualified: &str, name: &str) -> bool {
     qualified
         .strip_suffix(name)
         .and_then(|head| head.chars().next_back())

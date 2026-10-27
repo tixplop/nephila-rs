@@ -48,6 +48,38 @@ impl<'a> Prepared<'a> {
         Prepared { items }
     }
 
+    /// Pour chaque nœud correspondant au terme (déjà en minuscules) : sa position dans le
+    /// tableau et son rang (0 exact, 1 préfixe, 2 contenu).
+    pub fn ranks(&self, term: &str) -> Vec<(usize, u8)> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                rank(f, term).map(|r| {
+                    (
+                        i,
+                        match r {
+                            Rank::Exact => 0,
+                            Rank::Prefix => 1,
+                            Rank::Content => 2,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Positions des nœuds dont le nom qualifié en minuscules vaut `name` ou s'y termine à une
+    /// frontière de segment (règle de `lookup`).
+    pub fn qualified_suffix(&self, name: &str) -> Vec<usize> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.qualified == name || super::lookup::is_suffix(&f.qualified, name))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Nœuds correspondants, triés ; départage par nom qualifié puis identifiant.
     pub fn matches(&self, term: &str) -> Vec<&'a Node> {
         let term = term.trim().to_lowercase();
