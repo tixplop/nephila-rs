@@ -410,21 +410,32 @@ fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
         );
     }
     let lists: Vec<Vec<String>> = prompts.iter().map(|p| listed_ids(p)).collect();
-    let literal = |range: std::ops::Range<usize>| -> Vec<String> {
+    let literal = |range: std::ops::Range<usize>, with_type: bool| -> Vec<String> {
         let mut v: Vec<String> = range.map(|i| format!("method:Big.m{i}")).collect();
-        v.push("type:Big".to_string());
+        if with_type {
+            v.push("type:Big".to_string());
+        }
         v.sort();
         v
     };
-    assert_eq!(lists[0], literal(0..AC5_SPLIT), "liste de la requête 1");
-    assert_eq!(lists[1], literal(AC5_SPLIT..199), "liste de la requête 2");
+    assert_eq!(
+        lists[0],
+        literal(0..AC5_SPLIT, true),
+        "liste de la requête 1"
+    );
+    assert_eq!(
+        lists[1],
+        literal(AC5_SPLIT..199, false),
+        "liste de la requête 2"
+    );
     for l in &lists {
         assert!(l.len() <= 150);
     }
-    let all: Vec<String> = literal(0..199);
+    let all: Vec<String> = literal(0..199, true);
     assert_eq!(all.len(), 200);
+    assert_eq!(lists[0].len() + lists[1].len(), 200);
     let big = ids.iter().find(|i| i.starts_with("type:")).unwrap();
-    assert!(lists[0].contains(big) && lists[1].contains(big));
+    assert!(lists[0].contains(big) && !lists[1].contains(big));
     let methods: BTreeSet<&String> = lists[0]
         .iter()
         .filter(|i| i.starts_with("method:"))

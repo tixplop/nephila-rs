@@ -491,10 +491,10 @@ fn traced_lot_once(
 }
 
 /// Plan d'appels d'un fichier (DEC-059, DEC-061) : couples (indice du morceau, liste de nœuds
-/// demandée), dans l'ordre d'envoi. Un seul morceau : la liste complète, découpée par
+/// demandée), dans l'ordre d'envoi (DEC-118 : un nœud n'est demandé qu'une fois). Un seul morceau : la liste complète, découpée par
 /// `node_groups`. Sinon, un nœud présent dans `homes` (identifiant → morceau de son titre, pour
-/// les sections Markdown) va dans la seule liste de ce morceau ; tout autre nœud est demandé aux
-/// morceaux où son nom court figure (mot entier, ou, pour un nom qui n'est pas un mot,
+/// les sections Markdown) va dans la seule liste de ce morceau ; tout autre nœud est demandé au
+/// premier morceau où son nom court figure (mot entier, ou, pour un nom qui n'est pas un mot,
 /// occurrence aux bords contrôlés ; sans casse pour un nœud `table:`, le SQL ne distinguant pas
 /// les majuscules) ; un nœud de nom vide ou absent de tous les morceaux va dans le morceau 1. Au
 /// moins un appel par morceau, liste vide permise.
@@ -540,6 +540,7 @@ fn call_plan(
                 if hit {
                     lists[k].push(id.clone());
                     found = true;
+                    break;
                 }
             }
         }
@@ -1438,7 +1439,7 @@ mod tests {
             call_plan(&parts, &nodes, &HashMap::new()),
             vec![
                 (0, strs(&["A", "foo", "m1", "qux", "vide"])),
-                (1, strs(&["A", "bar", "foo", "m12"])),
+                (1, strs(&["bar", "m12"])),
                 (2, vec![]),
             ]
         );
@@ -1462,6 +1463,42 @@ mod tests {
         let plan = call_plan(&two, &many, &HashMap::new());
         let sizes: Vec<(usize, usize)> = plan.iter().map(|(k, l)| (*k, l.len())).collect();
         assert_eq!(sizes, [(0, 150), (0, 10), (1, 0)]);
+    }
+
+    #[test]
+    fn req144_ac3_noeud_demande_au_premier_morceau_seulement() {
+        let text = |n: usize| -> String { (0..n).map(|i| format!("n{i} ")).collect() };
+        let parts = vec![text(160), text(170), "rien".to_string()];
+        let nodes: Vec<(String, String)> = (0..170)
+            .map(|i| (format!("id{i}"), format!("n{i}")))
+            .collect();
+        let plan = call_plan(&parts, &nodes, &HashMap::new());
+        let sizes: Vec<(usize, usize)> = plan.iter().map(|(k, l)| (*k, l.len())).collect();
+        assert_eq!(sizes, [(0, 150), (0, 10), (1, 10), (2, 0)]);
+    }
+
+    #[test]
+    fn req144_ac4_table_et_section_au_premier_morceau() {
+        let parts = strs(&[
+            "rien
+ guide
+",
+            "ORDERS
+",
+            "orders
+",
+        ]);
+        let nodes = pairs(&[("table:orders", "orders"), ("section:d.md#guide", "guide")]);
+        let mut homes = HashMap::new();
+        homes.insert("section:d.md#guide".to_string(), 2usize);
+        assert_eq!(
+            call_plan(&parts, &nodes, &homes),
+            vec![
+                (0, vec![]),
+                (1, strs(&["table:orders"])),
+                (2, strs(&["section:d.md#guide"])),
+            ]
+        );
     }
 
     #[test]
@@ -1497,6 +1534,8 @@ mod tests {
             })
             .collect();
         let plan = call_plan(&parts, &nodes, &HashMap::new());
+        let total: usize = plan.iter().map(|(_, l)| l.len()).sum();
+        assert_eq!(total, 20_000);
         let expected: usize = (0..5)
             .map(|k| {
                 let n = plan
@@ -1509,7 +1548,7 @@ mod tests {
             .sum();
         assert_eq!(plan.len(), expected);
         assert!(
-            plan.len() <= 20_000usize.div_ceil(150) + 10,
+            plan.len() <= 20_000usize.div_ceil(150) + 5,
             "{}",
             plan.len()
         );
@@ -2766,6 +2805,34 @@ mod plan_index_tests {
         plan
     }
 
+    /// Plan de l'oracle réduit par REQ-144 : chaque identifiant gardé au plus petit morceau où il
+    /// paraît, puis listes redécoupées par 150 (au moins un appel par morceau).
+    fn first_only(plan: Vec<(usize, Vec<String>)>, n_parts: usize) -> Vec<(usize, Vec<String>)> {
+        let mut per_part: Vec<Vec<String>> = vec![Vec::new(); n_parts];
+        for (k, l) in plan {
+            per_part[k].extend(l);
+        }
+        let mut seen = HashSet::new();
+        for list in per_part.iter_mut() {
+            list.retain(|id| seen.insert(id.clone()));
+        }
+        let mut out = Vec::new();
+        for (k, list) in per_part.iter().enumerate() {
+            for g in node_groups(list) {
+                out.push((k, g.to_vec()));
+            }
+        }
+        out
+    }
+
+    fn assert_each_id_once(plan: &[(usize, Vec<String>)], nodes: &[(String, String)]) {
+        let mut all: Vec<&String> = plan.iter().flat_map(|(_, l)| l).collect();
+        all.sort();
+        let mut want: Vec<&String> = nodes.iter().map(|(id, _)| id).collect();
+        want.sort();
+        assert_eq!(all, want);
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -2872,11 +2939,17 @@ mod plan_index_tests {
                     }
                 }
             }
-            assert_eq!(
-                call_plan(&parts, &nodes, &homes),
-                oracle_call_plan(&parts, &nodes, &homes),
-                "cas {case} : {parts:?} {nodes:?}"
-            );
+            let got = call_plan(&parts, &nodes, &homes);
+            let oracle = oracle_call_plan(&parts, &nodes, &homes);
+            let want = if parts.len() > 1 {
+                first_only(oracle, parts.len())
+            } else {
+                oracle
+            };
+            assert_eq!(got, want, "cas {case} : {parts:?} {nodes:?}");
+            if parts.len() > 1 {
+                assert_each_id_once(&got, &nodes);
+            }
         }
         assert!(
             with_non_word_hit >= 500,
@@ -2891,7 +2964,13 @@ mod plan_index_tests {
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
         let got = call_plan(&parts, &nodes, &HashMap::new());
-        assert_eq!(got, oracle_call_plan(&parts, &nodes, &HashMap::new()));
+        let oracle = oracle_call_plan(&parts, &nodes, &HashMap::new());
+        let want = if parts.len() > 1 {
+            first_only(oracle, parts.len())
+        } else {
+            oracle
+        };
+        assert_eq!(got, want);
         got
     }
 
@@ -2913,12 +2992,33 @@ mod plan_index_tests {
                 .flat_map(|(_, l)| l.clone())
                 .collect()
         };
+        // REQ-144 : `dep:a` figure aux morceaux 1 à 3, il n'est demandé qu'au premier.
         assert_eq!(at(0), ["dep:a"]);
-        assert_eq!(at(1), ["dep:a"]);
-        assert_eq!(at(2), ["dep:a"]);
+        assert!(at(1).is_empty() && at(2).is_empty());
         assert!(at(3).is_empty() && at(4).is_empty());
         assert_eq!(at(5), ["dep:b"]);
         assert!(at(6).is_empty());
+        // Un cas discriminant par texte : reconnu, le nœud va au morceau 1 ; sinon repli au 0.
+        let cases = [
+            (
+                "<artifactId>slf4j-api</artifactId>",
+                "dep:a",
+                "slf4j-api",
+                1,
+            ),
+            ("slf4j-api-ext", "dep:a", "slf4j-api", 1),
+            ("slf4j-api.jar", "dep:a", "slf4j-api", 1),
+            ("xslf4j-api", "dep:a", "slf4j-api", 0),
+            ("slf4j-api2", "dep:a", "slf4j-api", 0),
+            ("\"@scope/pkg\":", "dep:b", "@scope/pkg", 1),
+            ("\"@scope/pkgx\"", "dep:b", "@scope/pkg", 0),
+        ];
+        for (text, id, name, home) in cases {
+            let plan = plan_for(&["x", text], &[(id, name)]);
+            let mut want = vec![(0, vec![]), (1, vec![])];
+            want[home].1.push(id.to_string());
+            assert_eq!(plan, want, "texte {text:?}");
+        }
         // nœud `table:` : texte en minuscules
         let plan = plan_for(
             &["x", "SELECT * FROM \"My-Table\" ;", "my-table2"],
