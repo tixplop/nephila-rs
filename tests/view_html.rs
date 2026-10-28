@@ -144,7 +144,15 @@ fn assert_same_graph(html: &str, export: &Value) {
     let (nodes, edges) = decode(&block(html));
     let by_id = |n: &Value| n["id"].as_str().unwrap().to_string();
     let by_edge = |e: &Value| format!("{} {} {}", e["source"], e["target"], e["kind"]);
-    assert_eq!(nodes, sorted(&export["nodes"], by_id));
+    // La page ne porte pas encore les communautés (T-234) : clé `community` de l'export retirée.
+    let without_community: Vec<Value> = sorted(&export["nodes"], by_id)
+        .into_iter()
+        .map(|mut n| {
+            n.as_object_mut().unwrap().remove("community");
+            n
+        })
+        .collect();
+    assert_eq!(nodes, without_community);
     assert_eq!(edges, sorted(&export["edges"], by_edge));
 }
 

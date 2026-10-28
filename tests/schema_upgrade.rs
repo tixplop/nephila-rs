@@ -251,6 +251,14 @@ fn req062_ac5_old_schemas_are_read_unchanged_then_migrated_by_update_or_build() 
                     &expected[..at],
                     "Communautés\n  communautés non calculées (lancez nephila update)\n"
                 )
+            } else if args[0] == "export" {
+                // REQ-149 : un graphe lu sans migration n'a ni numéro ni liste de communautés.
+                let mut doc: serde_json::Value = serde_json::from_str(expected).unwrap();
+                doc["communities"] = serde_json::json!([]);
+                for n in doc["nodes"].as_array_mut().unwrap() {
+                    n["community"] = serde_json::Value::Null;
+                }
+                serde_json::to_string(&doc).unwrap() + "\n"
             } else {
                 expected.clone()
             };

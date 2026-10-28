@@ -773,6 +773,32 @@ mod tests {
             .unwrap();
     }
 
+    /// AC-149-2 : retire du texte d'un export les clés `communities` (premier niveau, en tête) et
+    /// `community` (en tête de chaque nœud). Les clés n'apparaissent avec des guillemets nus que
+    /// comme clés : dans une chaîne, les guillemets sont échappés.
+    fn strip_community_keys(text: &str) -> String {
+        let rest = text
+            .strip_prefix("{\"communities\":[")
+            .expect("l'export commence par la clé communities");
+        let (_, rest) = rest
+            .split_once("],\"edges\":[")
+            .expect("la clé edges suit communities");
+        let mut out = String::from("{\"edges\":[");
+        let mut rest = rest;
+        while let Some(i) = rest.find("{\"community\":") {
+            out.push_str(&rest[..=i]);
+            let after = &rest[i + "{\"community\":".len()..];
+            let (value, tail) = after.split_once(',').expect("une virgule suit community");
+            assert!(
+                value == "null" || value.bytes().all(|b| b.is_ascii_digit()),
+                "{value}"
+            );
+            rest = tail;
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// AC-080-1 : l'export en flux est celui de la 0.23.2, octet pour octet (flux en mémoire, puis
     /// fichier écrit par la commande), pour les dépôts de REQ-065 et pour un graphe vide.
     #[test]
@@ -795,7 +821,8 @@ mod tests {
             let expected = oracle_build_json(&store).unwrap().to_string();
             let mut out: Vec<u8> = Vec::new();
             crate::export::write_json(&store, &mut out).unwrap();
-            assert_eq!(String::from_utf8(out).unwrap(), expected, "{name}");
+            let streamed = String::from_utf8(out).unwrap();
+            assert_eq!(strip_community_keys(&streamed), expected, "{name}");
             drop(store);
             let file = tmp.path().join("out.json");
             crate::export::run(
@@ -806,10 +833,15 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                std::fs::read_to_string(&file).unwrap(),
-                format!("{expected}\n"),
+                strip_community_keys(
+                    std::fs::read_to_string(&file)
+                        .unwrap()
+                        .trim_end_matches('\n')
+                ),
+                expected,
                 "{name} (fichier)"
             );
+            assert!(std::fs::read_to_string(&file).unwrap().ends_with("}\n"));
         }
     }
 
@@ -859,9 +891,11 @@ mod tests {
             assert_eq!(graph_db_hash(&repo), before, "{label} : graph.db modifié");
             let store = Store::open_readonly(&repo).unwrap();
             let doc = oracle_build_json(&store).unwrap();
+            let written = std::fs::read_to_string(&json).unwrap();
+            assert!(written.ends_with("}\n"), "{label}");
             assert_eq!(
-                std::fs::read_to_string(&json).unwrap(),
-                format!("{doc}\n"),
+                strip_community_keys(written.trim_end_matches('\n')),
+                doc.to_string(),
                 "{label}"
             );
             assert_eq!(

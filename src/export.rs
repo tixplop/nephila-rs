@@ -43,6 +43,7 @@ impl From<serde_json::Error> for ExportError {
 /// Éléments sérialisés par référence, champs dans l'ordre alphabétique du document de la 0.23.2.
 #[derive(Serialize)]
 struct NodeOut<'a> {
+    community: Option<i64>,
     file: Option<&'a str>,
     id: &'a str,
     kind: &'a str,
@@ -50,6 +51,15 @@ struct NodeOut<'a> {
     short: &'a str,
     subkind: Option<&'a str>,
     summary: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct CommunityOut<'a> {
+    cohesion: f64,
+    id: i64,
+    label: &'a str,
+    pivot: &'a str,
+    size: i64,
 }
 
 #[derive(Serialize)]
@@ -80,8 +90,20 @@ fn element<W: Write, T: Serialize>(
 /// ouverture (REQ-084, DEC-094), sans `BEGIN` propre.
 pub fn write_json<W: Write>(store: &Store, w: &mut W) -> std::result::Result<(), ExportError> {
     debug_assert!(store.in_read_snapshot());
-    w.write_all(b"{\"edges\":[")?;
+    w.write_all(b"{\"communities\":[")?;
     let mut first = true;
+    for c in store.community_list()? {
+        let item = CommunityOut {
+            cohesion: c.cohesion,
+            id: c.id,
+            label: &c.label,
+            pivot: &c.pivot,
+            size: c.size,
+        };
+        element(w, &mut first, &item)?;
+    }
+    w.write_all(b"],\"edges\":[")?;
+    first = true;
     store.for_each_edge(|e| {
         let item = LinkOut {
             kind: e.kind.as_str(),
@@ -92,8 +114,9 @@ pub fn write_json<W: Write>(store: &Store, w: &mut W) -> std::result::Result<(),
     })?;
     w.write_all(b"],\"nodes\":[")?;
     first = true;
-    store.for_each_node(|n| {
+    store.for_each_node_with_community(|n, community| {
         let item = NodeOut {
+            community,
             file: n.file.as_deref(),
             id: &n.id,
             kind: n.kind.as_str(),

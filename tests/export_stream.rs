@@ -81,7 +81,7 @@ fn req080_ac1_ac7_stdout_and_file_give_the_same_document() {
     let on_stdout = text(&out.stdout);
     assert!(on_stdout.ends_with("}\n") && !on_stdout.ends_with("\n\n"));
     assert!(
-        on_stdout.starts_with("{\"edges\":[{\"kind\":"),
+        on_stdout.starts_with("{\"communities\":[{\"cohesion\":"),
         "{}",
         &on_stdout[..60]
     );

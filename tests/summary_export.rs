@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/schema8.rs"]
+mod schema8;
+
 fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for e in fs::read_dir(from).unwrap() {
@@ -682,4 +685,81 @@ fn req147_summary_json_carries_the_communities_key_and_the_text_is_unchanged() {
         "{text}"
     );
     assert!(section.starts_with(&format!("{total})\n")), "{text}");
+}
+
+/// REQ-149 AC-149-1 : chaque nœud a une `community` entière ; l'ensemble des numéros est celui des
+/// `id` de `communities`, chaque `size` est le nombre de nœuds du numéro, `communities` trié par `id`.
+#[test]
+fn req149_ac1_export_gives_each_node_its_community_and_lists_the_communities() {
+    let env = Env::built();
+    let doc = env.json(&["export", "--output", "-"]);
+    let nodes = doc["nodes"].as_array().unwrap();
+    let list = doc["communities"].as_array().unwrap();
+    assert!(!nodes.is_empty() && list.len() >= 2);
+    let mut counts = std::collections::BTreeMap::new();
+    for n in nodes {
+        let c = n["community"].as_i64().expect("community entière");
+        *counts.entry(c).or_insert(0i64) += 1;
+    }
+    let ids: Vec<i64> = list.iter().map(|c| c["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, counts.keys().copied().collect::<Vec<_>>());
+    for c in list {
+        assert_eq!(
+            c["size"].as_i64().unwrap(),
+            counts[&c["id"].as_i64().unwrap()]
+        );
+        assert!(!c["label"].as_str().unwrap().is_empty());
+        assert!(c["pivot"].is_string() && c["cohesion"].is_f64());
+    }
+}
+
+/// REQ-149 (AC-149-2, place des clés) : le texte complet est du JSON valide, `communities` ouvre
+/// le document avant `edges`, `community` ouvre chaque nœud avant `file`, clés de communauté
+/// dans l'ordre alphabétique.
+#[test]
+fn req149_ac2_new_keys_sit_at_their_alphabetical_place() {
+    let env = Env::built();
+    let out = env.read(&["export", "--output", "-"]);
+    let t = text(&out.stdout);
+    let doc: Value = serde_json::from_str(t.trim_end()).expect("JSON valide");
+    assert_eq!(doc.to_string() + "\n", t);
+    assert!(
+        t.starts_with("{\"communities\":[{\"cohesion\":"),
+        "{}",
+        &t[..60]
+    );
+    let n = t.matches("{\"community\":").count();
+    assert_eq!(n, doc["nodes"].as_array().unwrap().len());
+    assert_eq!(t.matches("\"community\":").count(), n);
+    assert_eq!(
+        t.matches("{\"community\":").count(),
+        t.matches(",\"file\":").count()
+    );
+    assert!(t.contains("\"id\":0,\"label\":"), "{}", &t[..200]);
+    let keys: Vec<&String> = doc.as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys,
+        ["communities", "edges", "nodes", "unresolved", "version"]
+    );
+    assert_eq!(doc["version"], 1);
+}
+
+/// REQ-149 AC-149-3 : graphe de schéma 8 lu sans migration → `community` nul partout,
+/// `communities` vide, `graph.db` inchangé.
+#[test]
+fn req149_ac3_schema8_graph_exports_null_communities_and_stays_unchanged() {
+    let env = Env::built();
+    let db = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    schema8::downgrade_to_8(&db);
+    drop(db);
+    let before = fs::read(env.repo.join(".nephila/graph.db")).unwrap();
+    let doc = env.json(&["export", "--output", "-"]);
+    assert_eq!(doc["communities"], serde_json::json!([]));
+    let nodes = doc["nodes"].as_array().unwrap();
+    assert!(!nodes.is_empty());
+    assert!(nodes.iter().all(|n| n["community"].is_null()));
+    assert_eq!(
+        fs::read(env.repo.join(".nephila/graph.db")).unwrap(),
+        before
+    );
 }

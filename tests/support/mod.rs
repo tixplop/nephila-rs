@@ -167,10 +167,25 @@ pub fn normalized_export(raw: &[u8]) -> String {
     serde_json::to_string(&doc).unwrap()
 }
 
-/// Empreinte d'un export JSON : BLAKE3 (hexadécimal) de l'export normalisé. L'ordre de `unresolved`
-/// n'est pas garanti d'un lancement à l'autre (DEC-081) ; seule définition, utilisée par tous les oracles.
+/// Export normalisé comme `normalized_export`, sans la clé `communities` ni les clés `community`
+/// des nœuds (REQ-149, AC-149-2) : les oracles des versions antérieures à la 0.25.0 les ignorent.
+pub fn normalized_export_without_communities(raw: &[u8]) -> String {
+    let mut doc: serde_json::Value = serde_json::from_str(&normalized_export(raw)).unwrap();
+    let obj = doc.as_object_mut().expect("export JSON : objet");
+    obj.remove("communities");
+    if let Some(nodes) = obj.get_mut("nodes").and_then(|n| n.as_array_mut()) {
+        for n in nodes {
+            n.as_object_mut().unwrap().remove("community");
+        }
+    }
+    serde_json::to_string(&doc).unwrap()
+}
+
+/// Empreinte d'un export JSON : BLAKE3 (hexadécimal) de l'export normalisé, sans les clés de
+/// communauté (REQ-149). L'ordre de `unresolved` n'est pas garanti d'un lancement à l'autre
+/// (DEC-081) ; seule définition, utilisée par tous les oracles.
 pub fn export_fingerprint(raw: &[u8]) -> String {
-    blake3::hash(normalized_export(raw).as_bytes())
+    blake3::hash(normalized_export_without_communities(raw).as_bytes())
         .to_hex()
         .to_string()
 }

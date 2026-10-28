@@ -1393,12 +1393,24 @@ impl Store {
         E: From<Error>,
         F: FnMut(&Node) -> std::result::Result<(), E>,
     {
-        let mut st = self
-            .conn
-            .prepare_cached(
-                "SELECT id, kind, qualified, short, file, subkind, summary FROM nodes ORDER BY id",
-            )
-            .map_err(db_err)?;
+        self.for_each_node_with_community(|n, _| f(n))
+    }
+
+    /// Comme `for_each_node`, avec le numéro de communauté du nœud (jointure de `nodes` avec
+    /// `node_communities`, REQ-149) ; `None` si les communautés ne sont pas calculées ou en
+    /// dessous du schéma 9.
+    pub fn for_each_node_with_community<E, F>(&self, mut f: F) -> std::result::Result<(), E>
+    where
+        E: From<Error>,
+        F: FnMut(&Node, Option<i64>) -> std::result::Result<(), E>,
+    {
+        let sql = if self.version >= SCHEMA_VERSION {
+            "SELECT n.id, n.kind, n.qualified, n.short, n.file, n.subkind, n.summary, m.community \
+             FROM nodes n LEFT JOIN node_communities m ON m.node = n.id ORDER BY n.id"
+        } else {
+            "SELECT id, kind, qualified, short, file, subkind, summary, NULL FROM nodes ORDER BY id"
+        };
+        let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
         let mut rows = st.query([]).map_err(db_err)?;
         while let Some(r) = rows.next().map_err(db_err)? {
             let kind: String = r.get(1).map_err(db_err)?;
@@ -1412,7 +1424,8 @@ impl Store {
                 subkind: subkind.as_deref().map(SubKind::parse).transpose()?,
                 summary: r.get(6).map_err(db_err)?,
             };
-            f(&node)?;
+            let community: Option<i64> = r.get(7).map_err(db_err)?;
+            f(&node, community)?;
         }
         Ok(())
     }

@@ -567,7 +567,7 @@ fn snapshot(env: &Env, repo: &Path, ctx: &str) -> (String, [String; 3]) {
         &["export", "--format", "json", "--output", "-"],
     );
     let snap = [
-        normalized_export(raw.as_bytes()),
+        support::normalized_export_without_communities(raw.as_bytes()),
         ok(env, repo, ctx, &["status"]),
         ok(env, repo, ctx, &["summary"]),
     ];
@@ -893,6 +893,16 @@ fn run_logged(env: &Env, repo: &Path, log: &Path, args: &[&str]) -> std::process
     c.output().unwrap()
 }
 
+/// Export dont les communautés sont ramenées à « non calculées » (`community` nul, `[]`).
+fn without_communities(export: &str) -> String {
+    let mut doc: serde_json::Value = serde_json::from_str(export).unwrap();
+    doc["communities"] = serde_json::json!([]);
+    for n in doc["nodes"].as_array_mut().unwrap() {
+        n["community"] = serde_json::Value::Null;
+    }
+    serde_json::to_string(&doc).unwrap() + "\n"
+}
+
 #[test]
 fn req069_ac5_schema_7_graph_is_read_unchanged_then_migrated_by_update() {
     let reads: [&[&str]; 5] = [
@@ -927,6 +937,9 @@ fn req069_ac5_schema_7_graph_is_read_unchanged_then_migrated_by_update() {
                 &expected[..at],
                 "Communautés\n  communautés non calculées (lancez nephila update)\n"
             )
+        } else if a[0] == "export" {
+            // REQ-149 : un graphe lu sans migration n'a ni numéro ni liste de communautés.
+            without_communities(expected)
         } else {
             expected.clone()
         };
