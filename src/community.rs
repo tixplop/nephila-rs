@@ -13,7 +13,7 @@ use crate::store::CommunityRow;
 
 /// Résolution de la modularité (DEC-121).
 const RESOLUTION: f64 = 1.0;
-/// Aléa du raffinement (valeur `randomness` de graphify).
+/// Aléa du raffinement (paramètre θ de Leiden).
 const THETA: f64 = 0.001;
 /// Graine du générateur.
 const SEED: u64 = 42;
