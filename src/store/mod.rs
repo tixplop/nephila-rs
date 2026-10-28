@@ -2278,6 +2278,29 @@ impl Store {
         }
     }
 
+    /// Degré de chaque membre de la communauté `id` (liens sortants et entrants ; un lien d'un
+    /// nœud vers lui-même compte deux fois, comme dans le résumé), par agrégat limité aux membres.
+    pub fn community_degrees(&self, id: i64) -> Result<std::collections::HashMap<String, u64>> {
+        if self.version < SCHEMA_VERSION {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT m.node,
+                        (SELECT COUNT(*) FROM edges e WHERE e.source = m.node)
+                      + (SELECT COUNT(*) FROM edges e WHERE e.target = m.node)
+                 FROM node_communities m WHERE m.community = ?1",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(db_err)
+    }
+
     /// Nœuds de la communauté `id`, triés par identifiant.
     pub fn community_members(&self, id: i64) -> Result<Vec<Node>> {
         if self.version < SCHEMA_VERSION {

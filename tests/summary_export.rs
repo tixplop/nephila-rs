@@ -674,6 +674,12 @@ fn req147_summary_json_carries_the_communities_key_and_the_text_is_unchanged() {
     }
     let sizes: Vec<u64> = top.iter().map(|e| e["size"].as_u64().unwrap()).collect();
     assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "{sizes:?}");
+    // T-232 : le texte de la 0.24.4 est suivi de la seule section des communautés.
     let text = text(&env.read(&["summary"]).stdout);
-    assert!(!text.contains("ommunaut"), "{text}");
+    let (before, section) = text.split_once("Communautés (").unwrap();
+    assert!(
+        before.ends_with('\n') && !before.contains("ommunaut"),
+        "{text}"
+    );
+    assert!(section.starts_with(&format!("{total})\n")), "{text}");
 }

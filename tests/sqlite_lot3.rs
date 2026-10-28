@@ -34,6 +34,11 @@ fn fingerprints(
         let code = out.status.code().map_or(-1, i64::from);
         let hash = if label == "export" {
             support::export_fingerprint(&out.stdout)
+        } else if label == "summary" {
+            // L'oracle de la 0.20.0 précède la section des communautés (T-232, AC-148-4).
+            let full = String::from_utf8_lossy(&out.stdout).into_owned();
+            let at = full.find("Communautés (").expect("section des communautés");
+            blake3::hash(&full.as_bytes()[..at]).to_hex().to_string()
         } else {
             blake3::hash(&out.stdout).to_hex().to_string()
         };

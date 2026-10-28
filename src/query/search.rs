@@ -116,7 +116,7 @@ fn label(n: &Node) -> &'static str {
     n.subkind.map_or(n.kind.as_str(), |s| s.as_str())
 }
 
-fn line(n: &Node) -> String {
+pub(crate) fn line(n: &Node) -> String {
     let place = match &n.file {
         Some(f) => format!("{}, {f}", label(n)),
         None => label(n).to_string(),
@@ -127,7 +127,7 @@ fn line(n: &Node) -> String {
     }
 }
 
-fn to_json(n: &Node) -> Value {
+pub(crate) fn to_json(n: &Node) -> Value {
     json!({
         "kind": n.kind.as_str(),
         "subkind": n.subkind.map(|s| s.as_str()),

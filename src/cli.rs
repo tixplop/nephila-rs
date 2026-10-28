@@ -65,6 +65,12 @@ fn parse_format_retries(s: &str) -> std::result::Result<u32, String> {
         .map_err(|_| format!("`{s}` n'est pas un entier positif ou nul"))
 }
 
+/// Numéro de communauté : entier positif ou nul (REQ-148).
+fn parse_community_number(s: &str) -> std::result::Result<u64, String> {
+    s.parse::<u64>()
+        .map_err(|_| format!("`{s}` n'est pas un entier positif ou nul"))
+}
+
 const FORMAT_RETRIES_HELP: &str = "Nombre de nouveaux essais d'un appel LLM dont la réponse est non conforme (remplace `format_retries` de la configuration ; défaut 2 ; 0 = aucun nouvel essai)";
 
 /// Motif `--exclude` : compilé seul, pour que l'erreur d'usage le nomme (REQ-037).
@@ -199,6 +205,20 @@ pub enum Query {
         #[command(flatten)]
         opts: QueryOpts,
     },
+    /// Communautés du graphe (sous-systèmes calculés sans LLM par build et update)
+    Community {
+        /// Numéro de la communauté à détailler, 0 étant la plus grande (sans numéro ni --node : liste des communautés)
+        #[arg(value_name = "NUMÉRO", value_parser = parse_community_number, allow_hyphen_values = true, conflicts_with = "node")]
+        number: Option<u64>,
+        /// Détaille la communauté de ce nœud, désigné par son nom ou son identifiant comme pour query neighbors (incompatible avec NUMÉRO)
+        #[arg(long, value_name = "NŒUD")]
+        node: Option<String>,
+        /// Nombre maximal de communautés ou de membres affichés (défaut : 50)
+        #[arg(long)]
+        limit: Option<usize>,
+        #[command(flatten)]
+        opts: QueryOpts,
+    },
     /// Question en langage naturel
     Ask {
         question: String,
@@ -285,6 +305,20 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
             &cli.repo,
             source,
             cible,
+            opts.json.json,
+            opts.check_stale,
+            out,
+        ),
+        Command::Query(Query::Community {
+            number,
+            node,
+            limit,
+            opts,
+        }) => crate::query::community::run(
+            &cli.repo,
+            *number,
+            node.as_deref(),
+            *limit,
             opts.json.json,
             opts.check_stale,
             out,

@@ -167,6 +167,11 @@ fn load(store: &Store) -> Result<Value> {
         ))
     })?;
     v["computed_at"] = json!(at);
+    // Communautés non calculées (schéma 5 à 8 lu sans migration, ou clé absente d'un résumé
+    // stocké avant elles) : `null`.
+    if v.get("communities").is_none() || !store.communities_computed()? {
+        v["communities"] = Value::Null;
+    }
     Ok(v)
 }
 
@@ -225,6 +230,28 @@ pub fn run(repo: &Path, as_json: bool, out: &mut Out) -> Result<()> {
             t["concept"].as_str().unwrap_or("?"),
             t["mentions"]
         );
+        writeln!(out, "{}", crate::escape::data(&l))?;
+    }
+    write_communities(&v["communities"], out)
+}
+
+/// Section des communautés (REQ-148) : total et dix premières, en variante courte.
+fn write_communities(c: &Value, out: &mut Out) -> Result<()> {
+    let Some(top) = c["top"].as_array() else {
+        writeln!(out, "Communautés")?;
+        writeln!(out, "  communautés non calculées (lancez nephila update)")?;
+        return Ok(());
+    };
+    writeln!(out, "Communautés ({})", c["total"])?;
+    for e in top.iter().take(TOP) {
+        let row = CommunityRow {
+            id: e["id"].as_i64().unwrap_or(0),
+            label: e["label"].as_str().unwrap_or("?").to_string(),
+            pivot: String::new(),
+            size: e["size"].as_i64().unwrap_or(0),
+            cohesion: 0.0,
+        };
+        let l = format!("  {}", crate::query::community::community_line(&row, false));
         writeln!(out, "{}", crate::escape::data(&l))?;
     }
     Ok(())

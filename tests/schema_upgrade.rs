@@ -243,6 +243,14 @@ fn req062_ac5_old_schemas_are_read_unchanged_then_migrated_by_update_or_build() 
                     "graphe à résoudre : lancez nephila update",
                     1,
                 )
+            } else if args[0] == "summary" {
+                // T-232 : un graphe lu sans migration n'a pas de communautés calculées.
+                let at = expected.find("Communautés (").unwrap();
+                format!(
+                    "{}{}",
+                    &expected[..at],
+                    "Communautés\n  communautés non calculées (lancez nephila update)\n"
+                )
             } else {
                 expected.clone()
             };

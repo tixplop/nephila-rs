@@ -28,7 +28,7 @@ fn req001_ac1_query_help_lists_subcommands() {
         .get_output()
         .clone();
     let text = String::from_utf8(out.stdout).unwrap();
-    for c in ["search", "neighbors", "path", "ask"] {
+    for c in ["search", "neighbors", "path", "community", "ask"] {
         assert!(text.contains(c), "sous-commande absente : {c}");
     }
 }
@@ -84,7 +84,7 @@ fn normalized_help(args: &[&str]) -> String {
 
 #[test]
 fn req017_ac7_ac8_check_stale_help_of_query_subcommands() {
-    for sub in ["search", "neighbors", "path", "ask"] {
+    for sub in ["search", "neighbors", "path", "community", "ask"] {
         let h = normalized_help(&["query", sub]);
         assert!(h.contains(CHECK_STALE_HELP), "{sub} : {h}");
         let from = h.find("--check-stale").unwrap();
