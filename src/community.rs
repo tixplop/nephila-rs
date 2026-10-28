@@ -428,6 +428,185 @@ pub(crate) fn modularity(n: usize, pairs: &[(u32, u32)], part: &[u32]) -> f64 {
     q
 }
 
+/// Part maximale d'une communauté avant seconde passe (DEC-121).
+const MAX_FRACTION: f64 = 0.25;
+/// Taille au-dessus de laquelle la fraction s'applique seule (plancher du seuil).
+const MIN_SPLIT: usize = 10;
+/// Cohésion en dessous de laquelle une grande communauté est redécoupée.
+const COHESION_SPLIT: f64 = 0.05;
+/// Taille minimale d'une communauté pour le test de cohésion.
+const COHESION_MIN_SIZE: usize = 50;
+
+/// Une communauté finale : membres triés, pivot (indice d'un membre) et cohésion.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Community {
+    pub(crate) members: Vec<u32>,
+    pub(crate) pivot: u32,
+    pub(crate) cohesion: f64,
+}
+
+/// Paires internes de chaque groupe (indices globaux), d'après les paires normalisées.
+fn internal_pairs(n: usize, groups: &[Vec<u32>], norm: &[(u32, u32)]) -> Vec<Vec<(u32, u32)>> {
+    let mut of = vec![usize::MAX; n];
+    for (g, members) in groups.iter().enumerate() {
+        for &m in members {
+            of[m as usize] = g;
+        }
+    }
+    let mut out = vec![Vec::new(); groups.len()];
+    for &(a, b) in norm {
+        let g = of[a as usize];
+        if g != usize::MAX && g == of[b as usize] {
+            out[g].push((a, b));
+        }
+    }
+    out
+}
+
+/// Cohésion : arêtes internes sur k(k-1)/2 ; 1,0 pour un seul membre.
+fn cohesion_of(k: usize, edges: usize) -> f64 {
+    if k <= 1 {
+        return 1.0;
+    }
+    edges as f64 / (k as f64 * (k as f64 - 1.0) / 2.0)
+}
+
+/// Seconde passe sur un groupe (membres triés, paires internes) : `Some(parties)` si elle en rend au moins deux.
+fn resplit(members: &[u32], pairs: &[(u32, u32)]) -> Option<Vec<Vec<u32>>> {
+    let local = |g: u32| members.binary_search(&g).expect("membre du groupe") as u32;
+    let lp: Vec<(u32, u32)> = pairs.iter().map(|&(a, b)| (local(a), local(b))).collect();
+    let part = partition(members.len(), &lp);
+    let count = part.iter().map(|&c| c as usize + 1).max().unwrap_or(0);
+    if count < 2 {
+        return None;
+    }
+    let mut parts = vec![Vec::new(); count];
+    for (i, &c) in part.iter().enumerate() {
+        parts[c as usize].push(members[i]);
+    }
+    Some(parts)
+}
+
+/// Post-traitement d'une partition brute `raw` (une étiquette par nœud) : isolés en singletons, découpe des
+/// communautés trop grandes puis peu cohésives, tri. Rend les groupes dans l'ordre des numéros.
+fn postprocess(n: usize, pairs: &[(u32, u32)], raw: &[u32]) -> Vec<Vec<u32>> {
+    assert_eq!(raw.len(), n, "une étiquette par nœud");
+    let norm = normalize(n, pairs);
+    let mut has_edge = vec![false; n];
+    for &(a, b) in &norm {
+        has_edge[a as usize] = true;
+        has_edge[b as usize] = true;
+    }
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    let mut by: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+    for v in 0..n {
+        if has_edge[v] {
+            by.entry(raw[v]).or_default().push(v as u32);
+        } else {
+            groups.push(vec![v as u32]);
+        }
+    }
+    groups.extend(by.into_values());
+
+    // (3) communautés trop grandes
+    let max_size = MIN_SPLIT.max((MAX_FRACTION * n as f64).floor() as usize);
+    let ip = internal_pairs(n, &groups, &norm);
+    let mut next: Vec<Vec<u32>> = Vec::new();
+    for (members, p) in groups.into_iter().zip(ip) {
+        match (members.len() > max_size)
+            .then(|| resplit(&members, &p))
+            .flatten()
+        {
+            Some(parts) => next.extend(parts),
+            None => next.push(members),
+        }
+    }
+    // (4) communautés peu cohésives
+    let ip = internal_pairs(n, &next, &norm);
+    let mut fin: Vec<Vec<u32>> = Vec::new();
+    for (members, p) in next.into_iter().zip(ip) {
+        let k = members.len();
+        let low = k >= COHESION_MIN_SIZE && cohesion_of(k, p.len()) < COHESION_SPLIT;
+        match low.then(|| resplit(&members, &p)).flatten() {
+            Some(parts) => fin.extend(parts),
+            None => fin.push(members),
+        }
+    }
+    // (5) tris
+    for g in fin.iter_mut() {
+        g.sort_unstable();
+    }
+    fin.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    fin
+}
+
+/// Communautés du graphe, dans l'ordre des numéros (indice = numéro).
+///
+/// Contrat : les indices `0..n` suivent l'ordre d'octets des identifiants `ids` (strictement croissant), ce qui rend la
+/// sortie indépendante de l'ordre d'insertion ; l'appelant réindexe en ce sens. `degree` est le degré du résumé
+/// (REQ-019). Le nom de chaque communauté est posé par l'appelant.
+pub(crate) fn communities(
+    n: usize,
+    pairs: &[(u32, u32)],
+    degree: &[u64],
+    ids: &[&str],
+) -> Vec<Community> {
+    assert_eq!(degree.len(), n, "un degré par nœud");
+    assert_eq!(ids.len(), n, "un identifiant par nœud");
+    debug_assert!(
+        ids.windows(2).all(|w| w[0].as_bytes() < w[1].as_bytes()),
+        "les indices doivent suivre l'ordre d'octets des identifiants"
+    );
+    let norm = normalize(n, pairs);
+    // (1)-(2) : partition des seuls nœuds reliés
+    let mut compact = vec![u32::MAX; n];
+    let mut linked: Vec<u32> = Vec::new();
+    for &(a, b) in &norm {
+        for v in [a, b] {
+            if compact[v as usize] == u32::MAX {
+                compact[v as usize] = 0;
+                linked.push(v);
+            }
+        }
+    }
+    linked.sort_unstable();
+    for (i, &v) in linked.iter().enumerate() {
+        compact[v as usize] = i as u32;
+    }
+    let sub: Vec<(u32, u32)> = norm
+        .iter()
+        .map(|&(a, b)| (compact[a as usize], compact[b as usize]))
+        .collect();
+    let sub_part = partition(linked.len(), &sub);
+    let mut raw = vec![0u32; n];
+    for (i, &v) in linked.iter().enumerate() {
+        raw[v as usize] = sub_part[i];
+    }
+    let groups = postprocess(n, pairs, &raw);
+    let ip = internal_pairs(n, &groups, &norm);
+    groups
+        .into_iter()
+        .zip(ip)
+        .map(|(members, p)| {
+            let pivot = members
+                .iter()
+                .copied()
+                .max_by(|&a, &b| {
+                    degree[a as usize]
+                        .cmp(&degree[b as usize])
+                        .then_with(|| b.cmp(&a))
+                })
+                .expect("communauté non vide");
+            let cohesion = cohesion_of(members.len(), p.len());
+            Community {
+                members,
+                pivot,
+                cohesion,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,5 +847,247 @@ mod tests {
             "{kept} paires internes conservées sur {internal}"
         );
         assert!(d < std::time::Duration::from_secs(1), "durée {d:?}");
+    }
+
+    /// Degré du résumé : chaque lien compte aux deux bouts, une boucle deux fois.
+    fn degrees(n: usize, pairs: &[(u32, u32)]) -> Vec<u64> {
+        let mut d = vec![0u64; n];
+        for &(a, b) in pairs {
+            d[a as usize] += 1;
+            d[b as usize] += 1;
+        }
+        d
+    }
+
+    fn run(n: usize, pairs: &[(u32, u32)]) -> Vec<Community> {
+        let names: Vec<String> = (0..n).map(|i| format!("{i:06}")).collect();
+        let ids: Vec<&str> = names.iter().map(String::as_str).collect();
+        communities(n, pairs, &degrees(n, pairs), &ids)
+    }
+
+    fn clique(pairs: &mut Vec<(u32, u32)>, from: u32, size: u32) {
+        for i in 0..size {
+            for j in i + 1..size {
+                pairs.push((from + i, from + j));
+            }
+        }
+    }
+
+    fn path(pairs: &mut Vec<(u32, u32)>, from: u32, size: u32) {
+        for i in 0..size - 1 {
+            pairs.push((from + i, from + i + 1));
+        }
+    }
+
+    #[test]
+    fn req146_ac1_two_cliques_and_bridge() {
+        // a0..a4 = 0..4, b0..b4 = 5..9, pont a0-b0
+        let mut pairs = Vec::new();
+        clique(&mut pairs, 0, 5);
+        clique(&mut pairs, 5, 5);
+        pairs.push((0, 5));
+        let cs = run(10, &pairs);
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0].members, vec![0, 1, 2, 3, 4]);
+        assert_eq!(cs[0].pivot, 0);
+        assert_eq!(cs[0].cohesion, 1.0);
+        assert_eq!(cs[1].members, vec![5, 6, 7, 8, 9]);
+        assert_eq!(cs[1].pivot, 5);
+        assert_eq!(cs[1].cohesion, 1.0);
+    }
+
+    #[test]
+    fn req146_ac1_pivot_tie_takes_smallest_index() {
+        let cs = run(3, &[(0, 1), (1, 2), (0, 2)]);
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].pivot, 0);
+    }
+
+    #[test]
+    fn req146_ac4_oversized_community_is_split() {
+        let mut pairs = Vec::new();
+        clique(&mut pairs, 0, 20);
+        clique(&mut pairs, 20, 20);
+        pairs.push((0, 20));
+        let raw: Vec<u32> = (0..100u32).map(|v| if v < 40 { 0 } else { v }).collect();
+        let g = postprocess(100, &pairs, &raw);
+        let big: Vec<&Vec<u32>> = g.iter().filter(|m| m.len() > 1).collect();
+        assert_eq!(big.len(), 2);
+        assert_eq!(big[0], &(0..20).collect::<Vec<u32>>());
+        assert_eq!(big[1], &(20..40).collect::<Vec<u32>>());
+        assert_eq!(g.len(), 2 + 60);
+    }
+
+    #[test]
+    fn req146_ac4_community_without_internal_edge_becomes_singletons() {
+        // 30 nœuds sans arête entre eux, chacun relié à un nœud extérieur
+        let pairs: Vec<(u32, u32)> = (0..30u32).map(|i| (i, 30 + i)).collect();
+        let raw: Vec<u32> = (0..100u32).map(|v| if v < 30 { 0 } else { v }).collect();
+        let g = postprocess(100, &pairs, &raw);
+        assert_eq!(g.len(), 100);
+        assert!(g.iter().all(|m| m.len() == 1));
+        // 30 nœuds sans aucun lien
+        let g = postprocess(100, &[], &vec![0; 100]);
+        assert_eq!(g.len(), 100);
+    }
+
+    #[test]
+    fn req146_ac4_low_cohesion_split_threshold() {
+        let mut pairs = Vec::new();
+        path(&mut pairs, 0, 20);
+        path(&mut pairs, 20, 20);
+        path(&mut pairs, 40, 20);
+        pairs.push((19, 20));
+        pairs.push((39, 40));
+        let raw: Vec<u32> = (0..400u32).map(|v| if v < 60 { 0 } else { v }).collect();
+        let g = postprocess(400, &pairs, &raw);
+        assert!(g.iter().all(|m| m.len() < 60), "60 chemins non découpés");
+        assert!(g.iter().filter(|m| m.len() > 1).count() >= 2);
+
+        // 49 nœuds de même forme : gardés
+        let mut pairs = Vec::new();
+        path(&mut pairs, 0, 16);
+        path(&mut pairs, 16, 16);
+        path(&mut pairs, 32, 17);
+        pairs.push((15, 16));
+        pairs.push((31, 32));
+        let raw: Vec<u32> = (0..400u32).map(|v| if v < 49 { 0 } else { v }).collect();
+        let g = postprocess(400, &pairs, &raw);
+        assert_eq!(g[0], (0..49).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn req146_ac5_empty_and_isolated() {
+        assert!(run(0, &[]).is_empty());
+        let cs = run(3, &[]);
+        assert_eq!(cs.len(), 3);
+        for (i, c) in cs.iter().enumerate() {
+            assert_eq!(c.members, vec![i as u32]);
+            assert_eq!(c.pivot, i as u32);
+            assert_eq!(c.cohesion, 1.0);
+        }
+    }
+
+    /// Résultat exprimé en identifiants : (membres, pivot, cohésion) par numéro.
+    type Named = Vec<(Vec<String>, String, u64)>;
+
+    fn named(cs: &[Community], ids: &[&str]) -> Named {
+        cs.iter()
+            .map(|c| {
+                (
+                    c.members
+                        .iter()
+                        .map(|&m| ids[m as usize].to_string())
+                        .collect(),
+                    ids[c.pivot as usize].to_string(),
+                    c.cohesion.to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn req146_ac3_communities_properties_and_permutation() {
+        let mut rng = TestRng(77);
+        for case in 0..200 {
+            let (n, pairs) = random_graph(&mut rng);
+            // identifiants textuels aléatoires, distincts
+            let mut texts: Vec<String> = (0..n)
+                .map(|i| format!("{:x}-{i}", rng.next() % 1_000_000))
+                .collect();
+            // ordre d'origine : ordre arbitraire des nœuds
+            for i in (1..n).rev() {
+                texts.swap(i, rng.below(i + 1));
+            }
+            let deg0 = degrees(n, &pairs);
+            // réindexation : tri des identifiants en ordre d'octets
+            let reindex = |texts: &[String], pairs: &[(u32, u32)]| {
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| texts[a].as_bytes().cmp(texts[b].as_bytes()));
+                let mut new_of = vec![0u32; n];
+                for (new, &old) in order.iter().enumerate() {
+                    new_of[old] = new as u32;
+                }
+                let p: Vec<(u32, u32)> = pairs
+                    .iter()
+                    .map(|&(a, b)| (new_of[a as usize], new_of[b as usize]))
+                    .collect();
+                let sorted: Vec<String> = order.iter().map(|&o| texts[o].clone()).collect();
+                let deg: Vec<u64> = order.iter().map(|&o| deg0[o]).collect();
+                (p, sorted, deg)
+            };
+            let (p1, ids1, d1) = reindex(&texts, &pairs);
+            let refs1: Vec<&str> = ids1.iter().map(String::as_str).collect();
+            let cs1 = communities(n, &p1, &d1, &refs1);
+
+            // propriétés
+            let mut part = vec![u32::MAX; n];
+            for (num, c) in cs1.iter().enumerate() {
+                assert!(c.members.windows(2).all(|w| w[0] < w[1]), "cas {case}");
+                assert!(c.members.contains(&c.pivot), "cas {case}");
+                let best = c.members.iter().map(|&m| d1[m as usize]).max().unwrap();
+                assert_eq!(d1[c.pivot as usize], best, "cas {case}");
+                assert!(
+                    c.members
+                        .iter()
+                        .all(|&m| d1[m as usize] < best || m >= c.pivot),
+                    "cas {case} : pivot non minimal"
+                );
+                for &m in &c.members {
+                    assert_eq!(part[m as usize], u32::MAX, "cas {case} : doublon");
+                    part[m as usize] = num as u32;
+                }
+            }
+            assert!(part.iter().all(|&c| c != u32::MAX), "cas {case}");
+            assert!(cs1.windows(2).all(|w| {
+                (std::cmp::Reverse(w[0].members.len()), &w[0].members)
+                    < (std::cmp::Reverse(w[1].members.len()), &w[1].members)
+            }));
+            assert!(all_connected(n, &p1, &part), "cas {case} : non connexe");
+            let singles: Vec<u32> = (0..n as u32).collect();
+            assert!(
+                modularity(n, &p1, &part) >= modularity(n, &p1, &singles) - 1e-12,
+                "cas {case}"
+            );
+
+            // permutation de l'ordre des nœuds, des paires et de leur orientation
+            let mut perm: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                perm.swap(i, rng.below(i + 1));
+            }
+            let texts2: Vec<String> = perm.iter().map(|&o| texts[o].clone()).collect();
+            let mut inv = vec![0u32; n];
+            for (new, &old) in perm.iter().enumerate() {
+                inv[old] = new as u32;
+            }
+            let mut pairs2: Vec<(u32, u32)> = pairs
+                .iter()
+                .map(|&(a, b)| (inv[a as usize], inv[b as usize]))
+                .collect();
+            for i in (1..pairs2.len()).rev() {
+                pairs2.swap(i, rng.below(i + 1));
+            }
+            for p in pairs2.iter_mut() {
+                if rng.below(2) == 0 {
+                    *p = (p.1, p.0);
+                }
+            }
+            let deg2 = degrees(n, &pairs2);
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| texts2[a].as_bytes().cmp(texts2[b].as_bytes()));
+            let mut new_of = vec![0u32; n];
+            for (new, &old) in order.iter().enumerate() {
+                new_of[old] = new as u32;
+            }
+            let p2: Vec<(u32, u32)> = pairs2
+                .iter()
+                .map(|&(a, b)| (new_of[a as usize], new_of[b as usize]))
+                .collect();
+            let ids2: Vec<String> = order.iter().map(|&o| texts2[o].clone()).collect();
+            let d2: Vec<u64> = order.iter().map(|&o| deg2[o]).collect();
+            let refs2: Vec<&str> = ids2.iter().map(String::as_str).collect();
+            let cs2 = communities(n, &p2, &d2, &refs2);
+            assert_eq!(named(&cs1, &refs1), named(&cs2, &refs2), "cas {case}");
+        }
     }
 }
