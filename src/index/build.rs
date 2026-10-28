@@ -279,11 +279,20 @@ fn resolve_pass(store: &mut Store) -> Result<resolve::ResolveStats> {
             format!("incrémentale, {reevaluated} références réévaluées")
         }
     };
+    // La durée de `résolution:` ne compte pas le calcul des communautés (V-005).
+    let resolution = started
+        .elapsed()
+        .saturating_sub(std::time::Duration::from_millis(stats.community_ms as u64));
     trace!(
         "résolution: {} ms, {} liens, {} non résolues ({kind})",
-        started.elapsed().as_millis(),
+        resolution.as_millis(),
         stats.edges,
         stats.unresolved
+    );
+    trace!(
+        "communautés: {} ms, {} communautés",
+        stats.community_ms,
+        stats.communities
     );
     Ok(stats)
 }

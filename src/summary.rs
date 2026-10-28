@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::model::{Edge, EdgeKind, Node, NodeKind};
-use crate::store::Store;
+use crate::store::{CommunityRow, Store};
 
 /// Nombre de nœuds de plus haut degré et de thèmes retenus.
 const TOP: usize = 10;
@@ -22,14 +22,17 @@ pub(crate) struct ModuleEntry {
     pub depends_on: Vec<String>,
 }
 
-/// Résumé du graphe (modules, nœuds les plus reliés, thèmes), fonction pure de trois entrées
-/// (DEC-078) : les modules avec leurs dépendances, le degré des nœuds reliés (au moins les dix
-/// plus hauts ; un lien d'un nœud vers lui-même compte deux fois) et le nombre de mentions de
-/// chaque concept mentionné. Les égalités sont départagées par identifiant, en ordre d'octets.
+/// Résumé du graphe (modules, nœuds les plus reliés, thèmes, communautés), fonction pure de
+/// quatre entrées (DEC-078, DEC-120) : les modules avec leurs dépendances, le degré des nœuds
+/// reliés (au moins les dix plus hauts ; un lien d'un nœud vers lui-même compte deux fois), le
+/// nombre de mentions de chaque concept mentionné, et les communautés de la passe (le total et
+/// les dix premières, dans l'ordre des numéros). Les égalités sont départagées par identifiant,
+/// en ordre d'octets.
 pub(crate) fn compute(
     mut modules: Vec<ModuleEntry>,
     mut degrees: Vec<(String, u64)>,
     mut mentions: Vec<(String, u64)>,
+    communities: &[CommunityRow],
 ) -> Value {
     modules.sort_by(|a, b| a.id.cmp(&b.id));
     let modules: Vec<Value> = modules
@@ -54,12 +57,22 @@ pub(crate) fn compute(
         .map(|(id, c)| json!({"concept": id, "mentions": c}))
         .collect();
 
-    json!({"modules": modules, "top_nodes": top_nodes, "themes": themes})
+    let top: Vec<Value> = communities
+        .iter()
+        .take(TOP)
+        .map(|c| json!({"id": c.id, "label": c.label, "size": c.size, "cohesion": c.cohesion}))
+        .collect();
+    json!({
+        "modules": modules,
+        "top_nodes": top_nodes,
+        "themes": themes,
+        "communities": {"total": communities.len(), "top": top},
+    })
 }
 
 /// Résumé d'une passe complète, tiré des nœuds chargés par la passe et des liens qu'elle écrit
 /// (dédupliqués comme à l'écriture) : ni `nodes` ni `edges` ne sont relus.
-pub(crate) fn from_pass(nodes: &[Node], edges: &[Edge]) -> Value {
+pub(crate) fn from_pass(nodes: &[Node], edges: &[Edge], communities: &[CommunityRow]) -> Value {
     let mut seen: HashSet<(&str, &str, &str)> = HashSet::new();
     let mut deps: HashMap<&str, Vec<String>> = HashMap::new();
     let mut degree: HashMap<&str, u64> = HashMap::new();
@@ -94,13 +107,17 @@ pub(crate) fn from_pass(nodes: &[Node], edges: &[Edge]) -> Value {
         .into_iter()
         .map(|(i, d)| (i.to_string(), d))
         .collect();
-    compute(modules, degrees, themes)
+    compute(modules, degrees, themes, communities)
 }
 
 /// Résumé d'une passe incrémentale, dans la transaction de la passe et après l'écriture des
 /// liens : modules et concepts viennent des nœuds chargés par la passe ; dépendances, dix plus
 /// hauts degrés et mentions sont lus par requêtes agrégées (DEC-078).
-pub(crate) fn from_store(store: &Store, nodes: &[Node]) -> Result<Value> {
+pub(crate) fn from_store(
+    store: &Store,
+    nodes: &[Node],
+    communities: &[CommunityRow],
+) -> Result<Value> {
     let mut modules = Vec::new();
     for n in nodes.iter().filter(|n| n.kind == NodeKind::Module) {
         modules.push(ModuleEntry {
@@ -119,7 +136,12 @@ pub(crate) fn from_store(store: &Store, nodes: &[Node]) -> Result<Value> {
         .into_iter()
         .filter(|(id, _)| concepts.contains(id.as_str()))
         .collect();
-    Ok(compute(modules, store.top_degrees(TOP)?, mentions))
+    Ok(compute(
+        modules,
+        store.top_degrees(TOP)?,
+        mentions,
+        communities,
+    ))
 }
 
 fn now_millis() -> i64 {

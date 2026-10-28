@@ -637,3 +637,119 @@ fn req090_ac1_unresolved_graph_gets_a_full_pass_without_any_change() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(pass_kind(&lines[0]), "complète");
 }
+
+// ---- REQ-147 : trace des communautés (AC-147-8, AC-147-9) ----
+
+fn communities_in_graph(env: &Env) -> usize {
+    let c = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    c.query_row("SELECT COUNT(*) FROM communities", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .unwrap() as usize
+}
+
+/// Lignes de stderr dont le texte (après le préfixe horodaté) commence par `communautés:`.
+fn community_lines(o: &std::process::Output) -> Vec<String> {
+    stderr(o)
+        .lines()
+        .filter(|l| l.contains("] communautés: "))
+        .map(String::from)
+        .collect()
+}
+
+/// Forme d'AC-147-9 : `trace: [<s>.<mmm>s] communautés: <ms> ms, <n> communautés` ; rend `<n>`.
+fn community_count(line: &str) -> usize {
+    assert!(well_formed(line), "{line}");
+    let rest = line.split("] communautés: ").nth(1).expect(line);
+    let (ms, n) = rest.split_once(" ms, ").expect(line);
+    assert!(
+        !ms.is_empty() && ms.chars().all(|c| c.is_ascii_digit()),
+        "{line}"
+    );
+    let n = n.strip_suffix(" communautés").expect(line);
+    assert!(
+        !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()),
+        "{line}"
+    );
+    n.parse().unwrap()
+}
+
+/// Chaque ligne `communautés:` suit immédiatement une ligne `résolution:` de la même commande.
+fn assert_each_follows_a_resolution(o: &std::process::Output) {
+    let text = stderr(o);
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, l) in lines.iter().enumerate() {
+        if l.contains("] communautés: ") {
+            assert!(
+                i > 0 && lines[i - 1].contains("] résolution: "),
+                "ligne {i} : {l}\nprécédente : {:?}",
+                i.checked_sub(1).map(|j| lines[j])
+            );
+        }
+    }
+}
+
+#[test]
+fn req147_ac8_ac9_no_llm_build_traces_one_communities_line_after_the_resolution() {
+    let env = Env::mock();
+    let o = env.cmd(&["build", "--no-llm", "--verbose"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let lines = community_lines(&o);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let n = community_count(&lines[0]);
+    assert!(n > 0);
+    assert_eq!(n, communities_in_graph(&env));
+    assert_each_follows_a_resolution(&o);
+    assert!(pass_lines(&o)[0].ends_with("(complète)"));
+}
+
+#[test]
+fn req147_ac9_mock_build_traces_one_line_after_each_of_the_two_passes() {
+    let env = Env::mock();
+    let o = env.cmd(&["build", "--verbose"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let lines = community_lines(&o);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_each_follows_a_resolution(&o);
+    let all: Vec<String> = stderr(&o).lines().map(String::from).collect();
+    let at = |needle: &str| all.iter().position(|l| l.contains(needle)).unwrap();
+    // La première suit la passe complète, la seconde l'incrémentale.
+    assert!(all[at("(complète)") + 1].contains("] communautés: "));
+    assert!(all[at("(incrémentale, ") + 1].contains("] communautés: "));
+    // Le nombre de la dernière ligne est celui des tables ; l'enrichissement ajoute des concepts.
+    assert_eq!(community_count(&lines[1]), communities_in_graph(&env));
+}
+
+#[test]
+fn req147_ac9_update_after_a_change_traces_one_line_and_without_change_none() {
+    let env = Env::mock();
+    assert!(env.cmd(&["build", "--no-llm"]).status.success());
+    let java = env
+        .repo
+        .join("core/src/main/java/com/acme/core/OrderService.java");
+    let mut text = fs::read_to_string(&java).unwrap();
+    text.push_str("\n// modifié\n");
+    fs::write(&java, text).unwrap();
+    let o = env.cmd(&["update", "--no-llm", "--verbose"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let lines = community_lines(&o);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(community_count(&lines[0]), communities_in_graph(&env));
+    assert_each_follows_a_resolution(&o);
+    assert!(pass_lines(&o)[0].contains("(incrémentale, "));
+    // Sans changement : ni résolution ni calcul.
+    let o = env.cmd(&["update", "--no-llm", "--verbose"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(community_lines(&o).is_empty(), "{}", stderr(&o));
+    assert!(pass_lines(&o).is_empty());
+}
+
+#[test]
+fn req147_ac9_without_verbose_no_stderr_line_mentions_communities() {
+    let env = Env::mock();
+    for args in [&["build", "--no-llm"][..], &["build"][..]] {
+        let o = env.cmd(args);
+        assert!(o.status.success(), "{}", stderr(&o));
+        assert!(!stderr(&o).contains("communautés"), "{}", stderr(&o));
+    }
+}

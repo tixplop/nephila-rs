@@ -14,7 +14,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::error::Result;
 use crate::model::{node_id, parse_node_id, Edge, EdgeKind, Node, NodeKind, Ref, RefOrigin};
 use crate::scan::module_of;
-use crate::store::{ChangeLog, FileRef, IncrementalWrite, Store};
+use crate::store::{ChangeLog, FileRef, IncrementalWrite, PassSummary, Store};
+use std::time::{Duration, Instant};
 
 /// Bilan d'une passe de résolution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -23,6 +24,11 @@ pub struct ResolveStats {
     pub unresolved: usize,
     /// Genre de la passe qui a rendu ce bilan (REQ-090, DEC-098).
     pub pass: Pass,
+    /// Nombre de communautés écrites par la passe (REQ-147).
+    pub communities: usize,
+    /// Durée du calcul des communautés et de l'écriture de leurs tables, en millisecondes : hors
+    /// de la durée de la résolution tracée (V-005).
+    pub community_ms: u128,
 }
 
 /// Genre d'une passe de résolution.
@@ -80,16 +86,42 @@ fn resolve_full(store: &mut Store) -> Result<ResolveStats> {
         &store.declarations()?,
     );
     let unresolved: Vec<i64> = r.unresolved.iter().map(|&i| refs[i].id).collect();
-    // Résumé tiré des nœuds chargés et des liens calculés : aucune relecture (DEC-078).
-    let stamped = crate::summary::stamped(&crate::summary::from_pass(&nodes, &r.edges));
-    // Dépendances dérivées, liens, statut des références, résumé global et marqueur : une seule
-    // transaction (DEC-074, DEC-076).
-    store.write_resolution(&r.dependencies, &r.edges, &unresolved, |_| Ok(stamped))?;
+    // Dépendances dérivées, liens, statut des références, communautés, résumé global et
+    // marqueur : une seule transaction (DEC-074, DEC-076, DEC-120). Le résumé est tiré des nœuds
+    // chargés et des liens calculés : aucune relecture (DEC-078).
+    let mut computed = Duration::ZERO;
+    let mut count = 0;
+    let written = store.write_resolution(&r.dependencies, &r.edges, &unresolved, |_, log| {
+        let started = Instant::now();
+        let final_nodes: Vec<(&str, &str)> = nodes
+            .iter()
+            .filter(|n| !log.deleted.contains(&n.id))
+            .chain(&r.dependencies)
+            .map(|n| (n.id.as_str(), n.short.as_str()))
+            .collect();
+        let links = r
+            .edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str()));
+        let found = crate::community::for_pass(final_nodes, links);
+        computed = started.elapsed();
+        count = found.rows.len();
+        let summary = crate::summary::from_pass(&nodes, &r.edges, &found.rows);
+        let (text, computed_at) = crate::summary::stamped(&summary);
+        Ok(PassSummary {
+            text,
+            computed_at,
+            communities: found.rows,
+            members: found.members,
+        })
+    })?;
     // Les liens sont dédupliqués par la clé primaire : on compte ce qui est stocké.
     Ok(ResolveStats {
         edges: store.count_edges()?,
         unresolved: store.count_unresolved()?,
         pass: Pass::Full,
+        communities: count,
+        community_ms: (computed + written).as_millis(),
     })
 }
 
@@ -394,15 +426,38 @@ fn resolve_incremental(store: &mut Store, log: &ChangeLog) -> Result<ResolveStat
 
     let targets = contains_targets(store, log, &moved, nodes, &by_id)?;
     write.contained = contained_links(store, targets, &by_id, nodes, &idx)?;
-    store.write_incremental(&write, |s| {
-        Ok(crate::summary::stamped(&crate::summary::from_store(
-            s, nodes,
-        )?))
+    let mut computed = Duration::ZERO;
+    let mut count = 0;
+    let dependencies = &write.dependencies;
+    let written = store.write_incremental(&write, |s, log| {
+        let started = Instant::now();
+        // Graphe final : nœuds de la passe, plus les dépendances créées, moins celles supprimées.
+        let final_nodes: Vec<(&str, &str)> = nodes
+            .iter()
+            .chain(dependencies)
+            .filter(|n| !log.deleted.contains(&n.id))
+            .map(|n| (n.id.as_str(), n.short.as_str()))
+            .collect();
+        let pairs = s.edge_pairs()?;
+        let links = pairs.iter().map(|(a, b)| (a.as_str(), b.as_str()));
+        let found = crate::community::for_pass(final_nodes, links);
+        computed = started.elapsed();
+        count = found.rows.len();
+        let summary = crate::summary::from_store(s, nodes, &found.rows)?;
+        let (text, computed_at) = crate::summary::stamped(&summary);
+        Ok(PassSummary {
+            text,
+            computed_at,
+            communities: found.rows,
+            members: found.members,
+        })
     })?;
     Ok(ResolveStats {
         edges: store.count_edges()?,
         unresolved: store.count_unresolved()?,
         pass: Pass::Incremental { reevaluated },
+        communities: count,
+        community_ms: (computed + written).as_millis(),
     })
 }
 
@@ -2473,7 +2528,80 @@ import q.R;",
             .take(10)
             .map(|(id, c)| json!({"concept": id, "mentions": c}))
             .collect();
-        json!({"modules": modules, "top_nodes": top_nodes, "themes": themes})
+        let (rows, _) = communities_oracle(store);
+        let top: Vec<serde_json::Value> = rows
+            .iter()
+            .take(10)
+            .map(|c| json!({"id": c.id, "label": c.label, "size": c.size, "cohesion": c.cohesion}))
+            .collect();
+        json!({
+            "modules": modules,
+            "top_nodes": top_nodes,
+            "themes": themes,
+            "communities": {"total": rows.len(), "top": top},
+        })
+    }
+
+    /// Communautés du graphe écrit, par `community::communities` appelée directement (REQ-067,
+    /// AC-067-1) : lignes de `communities` et couples (nœud, numéro) attendus.
+    fn communities_oracle(store: &Store) -> (Vec<crate::store::CommunityRow>, Vec<(String, i64)>) {
+        let mut nodes = store.nodes().unwrap();
+        nodes.sort_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+        let index: HashMap<&str, u32> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.as_str(), i as u32))
+            .collect();
+        let mut degree = vec![0u64; nodes.len()];
+        let mut pairs = Vec::new();
+        for e in store.edges().unwrap() {
+            let (a, b) = (index[e.source.as_str()], index[e.target.as_str()]);
+            degree[a as usize] += 1;
+            degree[b as usize] += 1;
+            pairs.push((a, b));
+        }
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        let found = crate::community::communities(nodes.len(), &pairs, &degree, &ids);
+        let mut rows = Vec::new();
+        let mut members = Vec::new();
+        for (i, c) in found.iter().enumerate() {
+            let short = &nodes[c.pivot as usize].short;
+            rows.push(crate::store::CommunityRow {
+                id: i as i64,
+                label: if short.is_empty() {
+                    format!("communauté {i}")
+                } else {
+                    short.clone()
+                },
+                pivot: ids[c.pivot as usize].to_string(),
+                size: c.members.len() as i64,
+                cohesion: c.cohesion,
+            });
+            members.extend(
+                c.members
+                    .iter()
+                    .map(|&m| (ids[m as usize].to_string(), i as i64)),
+            );
+        }
+        members.sort();
+        (rows, members)
+    }
+
+    /// Lignes de `communities` et couples de `node_communities` lus dans la base (ordre des
+    /// numéros, puis des nœuds).
+    fn stored_communities(st: &Store) -> (Vec<crate::store::CommunityRow>, Vec<(String, i64)>) {
+        let rows = st.community_list().unwrap();
+        let mut members = Vec::new();
+        for c in &rows {
+            members.extend(
+                st.community_members(c.id)
+                    .unwrap()
+                    .into_iter()
+                    .map(|n| (n.id, c.id)),
+            );
+        }
+        members.sort();
+        (rows, members)
     }
 
     fn stored_summary(st: &Store) -> String {
@@ -2519,6 +2647,11 @@ import q.R;",
                     stored_summary(&st),
                     want.to_string(),
                     "séquence {seed}, pas {round}"
+                );
+                assert_eq!(
+                    stored_communities(&st),
+                    communities_oracle(&st),
+                    "séquence {seed}, pas {round} : tables des communautés"
                 );
                 themes += want["themes"].as_array().unwrap().len();
                 deps += want["modules"]
@@ -2606,6 +2739,7 @@ import q.R;",
         let d = crate::store::diagnostics();
         assert_eq!(d.full_passes(), 1);
         assert_eq!(d.edge_rows_read(), 0);
+        assert_eq!(d.community_pairs_read(), 0);
         // 13 types + 1 module + 1 dépendance dérivée (créée par la passe, non chargée).
         assert_eq!(d.node_rows_read(), 14);
         assert_eq!(
@@ -2670,6 +2804,12 @@ import q.R;",
         // aucune lecture de `DEPENDS_ON_SOURCES`. Le résumé lit 3 liens de dépendances,
         // 1 concept mentionné et 10 du classement.
         assert_eq!(d.edge_rows_read(), 3 + 3 + 3 + 1 + 10);
+        // Les communautés lisent toutes les paires de `edges` en une requête, comptées à part
+        // et hors des lignes rendues ci-dessus (REQ-147, REQ-129).
+        assert_eq!(
+            d.community_pairs_read(),
+            e.store.count_edges().unwrap() as u64
+        );
         assert_eq!(
             stored_summary(&e.store),
             summary_oracle(&e.store).to_string()
@@ -3176,6 +3316,7 @@ import q.R;",
         ResolveStats,
         Vec<(String, String, String)>,
         String,
+        (Vec<crate::store::CommunityRow>, Vec<(String, i64)>),
     );
 
     fn graph_state(repo: &std::path::Path, st: &Store, stats: &ResolveStats) -> GraphState {
@@ -3199,10 +3340,12 @@ import q.R;",
             ids,
             ResolveStats {
                 pass: Pass::Full,
+                community_ms: 0,
                 ..stats.clone()
             },
             un,
             st.summary().unwrap().unwrap().0,
+            stored_communities(st),
         )
     }
 
@@ -3724,6 +3867,10 @@ import q.R;",
         let summary_edges = summary_edges
             + e.store.top_degrees(10).unwrap().len() as u64
             + e.store.concept_mentions().unwrap().len() as u64;
+        assert_eq!(
+            d.community_pairs_read(),
+            e.store.count_edges().unwrap() as u64
+        );
         let edges_read = d.edge_rows_read() - summary_edges;
         assert!(edges_read <= outgoing + contained, "{edges_read} liens lus");
         assert!(

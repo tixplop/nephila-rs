@@ -9,6 +9,8 @@
 
 use std::collections::VecDeque;
 
+use crate::store::CommunityRow;
+
 /// Résolution de la modularité (DEC-121).
 const RESOLUTION: f64 = 1.0;
 /// Aléa du raffinement (valeur `randomness` de graphify).
@@ -607,6 +609,66 @@ pub(crate) fn communities(
         .collect()
 }
 
+/// Communautés d'une passe de résolution, prêtes à écrire (DEC-120).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PassCommunities {
+    pub(crate) rows: Vec<CommunityRow>,
+    /// Couples (nœud, numéro de communauté), dans l'ordre des identifiants.
+    pub(crate) members: Vec<(String, i64)>,
+}
+
+/// Calcule les communautés du graphe final d'une passe : `nodes` = (identifiant, nom court) de tous les nœuds,
+/// `links` = (source, cible) des liens finaux, un couple par lien (un lien d'un nœud vers lui-même compte deux fois
+/// dans le degré, comme dans le résumé, REQ-019). Les nœuds sont triés par identifiant (ordre d'octets) puis indexés
+/// de 0 à n − 1 ; un lien dont une extrémité n'est pas un nœud est ignoré. Le nom d'une communauté est le nom court
+/// de son pivot, ou `communauté <numéro>` s'il est vide.
+pub(crate) fn for_pass<'a>(
+    mut nodes: Vec<(&'a str, &'a str)>,
+    links: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> PassCommunities {
+    nodes.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    nodes.dedup_by(|a, b| a.0 == b.0);
+    let n = nodes.len();
+    let index: std::collections::HashMap<&str, u32> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, i as u32))
+        .collect();
+    let mut degree = vec![0u64; n];
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    for (s, t) in links {
+        if let (Some(&a), Some(&b)) = (index.get(s), index.get(t)) {
+            degree[a as usize] += 1;
+            degree[b as usize] += 1;
+            pairs.push((a, b));
+        }
+    }
+    let ids: Vec<&str> = nodes.iter().map(|(id, _)| *id).collect();
+    let found = communities(n, &pairs, &degree, &ids);
+    let mut out = PassCommunities::default();
+    for (number, c) in found.iter().enumerate() {
+        let short = nodes[c.pivot as usize].1;
+        let label = if short.is_empty() {
+            format!("communauté {number}")
+        } else {
+            short.to_string()
+        };
+        out.rows.push(CommunityRow {
+            id: number as i64,
+            label,
+            pivot: ids[c.pivot as usize].to_string(),
+            size: c.members.len() as i64,
+            cohesion: c.cohesion,
+        });
+        out.members.extend(
+            c.members
+                .iter()
+                .map(|&m| (ids[m as usize].to_string(), number as i64)),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1089,5 +1151,111 @@ mod tests {
             let cs2 = communities(n, &p2, &d2, &refs2);
             assert_eq!(named(&cs1, &refs1), named(&cs2, &refs2), "cas {case}");
         }
+    }
+
+    // ---- Communautés d'une passe (REQ-147, DEC-120) ----
+
+    fn pass_node(kind: crate::model::NodeKind, name: &str, short: &str) -> crate::model::Node {
+        crate::model::Node {
+            id: crate::model::node_id(kind, name),
+            kind,
+            qualified: name.to_string(),
+            short: short.to_string(),
+            file: None,
+            subkind: None,
+            summary: None,
+        }
+    }
+
+    fn pass_edge(a: &str, b: &str, kind: crate::model::EdgeKind) -> crate::model::Edge {
+        crate::model::Edge {
+            source: crate::model::node_id(crate::model::NodeKind::Type, a),
+            target: crate::model::node_id(crate::model::NodeKind::Type, b),
+            kind,
+        }
+    }
+
+    #[test]
+    fn req147_for_pass_degree_equals_the_summary_degree() {
+        use crate::model::{EdgeKind, NodeKind};
+        let names = ["p.A", "p.B", "p.C", "p.D", "p.E"];
+        let nodes: Vec<_> = names
+            .iter()
+            .map(|n| pass_node(NodeKind::Type, n, &n[2..]))
+            .collect();
+        let edges = vec![
+            pass_edge("p.A", "p.B", EdgeKind::Calls),
+            pass_edge("p.A", "p.B", EdgeKind::Imports),
+            pass_edge("p.A", "p.C", EdgeKind::Calls),
+            pass_edge("p.D", "p.D", EdgeKind::Calls),
+            pass_edge("p.C", "p.A", EdgeKind::Calls),
+        ];
+        let summary = crate::summary::from_pass(&nodes, &edges, &[]);
+        let mut want: Vec<(String, u64)> = summary["top_nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t["id"].as_str().unwrap().to_string(),
+                    t["degree"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        want.sort();
+        // Même degré que le résumé : pivot de la communauté de A, B, C = A (degré 5 : 2 + 1 + 1 + 1).
+        assert_eq!(want[0], ("type:p.A".to_string(), 4));
+        let got = for_pass(
+            nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.short.as_str()))
+                .collect(),
+            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())),
+        );
+        let first = &got.rows[0];
+        assert_eq!(first.size, 3);
+        assert_eq!(first.pivot, "type:p.A");
+        assert_eq!(first.label, "A");
+        // E n'a aucun lien : singleton ; D a un lien vers lui-même : le degré compte deux fois.
+        assert_eq!(got.rows.len(), 3);
+        let degree_d = want.iter().find(|(i, _)| i == "type:p.D").unwrap().1;
+        assert_eq!(degree_d, 2);
+    }
+
+    #[test]
+    fn req147_for_pass_numbers_names_and_ignores_unknown_endpoints() {
+        let nodes = vec![
+            ("type:z", ""),
+            ("type:a", "a"),
+            ("type:b", "b"),
+            ("type:c", ""),
+        ];
+        let links = [
+            ("type:a", "type:b"),
+            ("type:z", "type:gone"),
+            ("type:z", "type:c"),
+        ];
+        let got = for_pass(nodes.clone(), links.iter().copied());
+        assert_eq!(got.rows.len(), 2);
+        for (i, r) in got.rows.iter().enumerate() {
+            assert_eq!(r.id, i as i64);
+        }
+        let labels: Vec<&str> = got.rows.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"a") || labels.contains(&"b"));
+        assert!(
+            labels.iter().any(|l| l.starts_with("communauté ")),
+            "{labels:?}"
+        );
+        let total: i64 = got.rows.iter().map(|r| r.size).sum();
+        assert_eq!(total, 4);
+        assert_eq!(got.members.len(), 4);
+        // Même résultat quel que soit l'ordre des nœuds en entrée.
+        let mut reversed = nodes;
+        reversed.reverse();
+        assert_eq!(for_pass(reversed, links.iter().copied()), got);
+        assert_eq!(
+            for_pass(Vec::new(), std::iter::empty()),
+            PassCommunities::default()
+        );
     }
 }

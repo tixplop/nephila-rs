@@ -175,6 +175,18 @@ pub(crate) const INCREMENTAL_QUERIES: [(&str, &str); 22] = [
     ("SUMMARY_MENTIONS", SUMMARY_MENTIONS),
 ];
 
+/// Ce que la fermeture d'une passe de résolution rend (DEC-120) : le résumé global sérialisé avec
+/// son horodatage, et les communautés calculées sur le graphe final de la passe, écrites par
+/// `replace_communities_tx` avant le résumé.
+#[derive(Debug)]
+pub(crate) struct PassSummary {
+    pub text: String,
+    pub computed_at: i64,
+    pub communities: Vec<CommunityRow>,
+    /// Couples (nœud, numéro de communauté).
+    pub members: Vec<(String, i64)>,
+}
+
 /// Ce qu'une passe incrémentale écrit (DEC-077 point 3), calculé par `resolve`.
 #[derive(Debug, Default)]
 pub(crate) struct IncrementalWrite {
@@ -226,7 +238,7 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
     /// Lignes de `nodes`, lignes de `edges`, passes complètes, passes incrémentales, références
     /// réévaluées (REQ-066, hypothèse « mesure »).
-    static STORE_READS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
+    static STORE_READS: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
 }
 
 #[cfg(test)]
@@ -239,6 +251,8 @@ const FULL_PASSES: usize = 2;
 const INCREMENTAL_PASSES: usize = 3;
 #[cfg(test)]
 const REFS_REEVALUATED: usize = 4;
+#[cfg(test)]
+const COMMUNITY_PAIRS: usize = 5;
 
 /// Ajoute `n` au compteur de diagnostic `slot`.
 #[cfg(test)]
@@ -263,6 +277,14 @@ pub(crate) fn note_node_rows(_n: usize) {
 pub(crate) fn note_edge_rows(_n: usize) {
     #[cfg(test)]
     bump(EDGE_ROWS, _n);
+}
+
+/// Compte des paires (source, cible) lues pour le calcul des communautés d'une passe incrémentale
+/// (REQ-129) : compteur à part, hors des lignes de `edges` rendues (AC-067-2).
+#[inline]
+pub(crate) fn note_community_pairs(_n: usize) {
+    #[cfg(test)]
+    bump(COMMUNITY_PAIRS, _n);
 }
 
 /// Une passe de résolution a eu lieu (`incremental` : passe incrémentale, sinon complète).
@@ -292,7 +314,7 @@ pub(crate) fn note_refs_reevaluated(_n: usize) {
 pub(crate) struct Diagnostics {
     commits: u64,
     projections: std::collections::HashMap<String, u64>,
-    counters: [u64; 5],
+    counters: [u64; 6],
 }
 
 #[cfg(test)]
@@ -320,6 +342,11 @@ impl Diagnostics {
     /// Lignes de la table `edges` rendues par les lectures du stockage.
     pub fn edge_rows_read(&self) -> u64 {
         self.counters[EDGE_ROWS]
+    }
+
+    /// Paires lues pour le calcul des communautés (hors lignes de `edges` rendues).
+    pub fn community_pairs_read(&self) -> u64 {
+        self.counters[COMMUNITY_PAIRS]
     }
 
     /// Passes de résolution complètes.
@@ -351,7 +378,7 @@ pub(crate) fn diagnostics() -> Diagnostics {
 pub(crate) fn reset_diagnostics() {
     COMMITS.with(|c| c.set(0));
     PROJECTIONS.with(|p| p.borrow_mut().clear());
-    STORE_READS.with(|c| c.set([0; 5]));
+    STORE_READS.with(|c| c.set([0; 6]));
 }
 
 /// Valide une transaction d'écriture et la compte.
@@ -1756,15 +1783,15 @@ impl Store {
     ///
     /// Passe complète : le statut des références est remis à zéro (par l'index partiel) puis
     /// posé sur `unresolved` (identifiants de `refs`), et le marqueur passe à `à jour` (DEC-076).
-    pub fn write_resolution<F>(
+    pub(crate) fn write_resolution<F>(
         &mut self,
         deps: &[Node],
         edges: &[Edge],
         unresolved: &[i64],
         summary: F,
-    ) -> Result<()>
+    ) -> Result<std::time::Duration>
     where
-        F: FnOnce(&Store) -> Result<(String, i64)>,
+        F: FnOnce(&Store, &ChangeLog) -> Result<PassSummary>,
     {
         self.ensure_writable()?;
         self.end_fresh();
@@ -1788,15 +1815,15 @@ impl Store {
             }
         }
         // Les lectures du calcul passent par la même connexion : elles voient la transaction.
-        let (text, computed_at) = summary(self)?;
-        set_summary_tx(&tx, &text, computed_at)?;
+        let done = summary(self, &changes)?;
+        let written = write_pass_summary(&tx, &done)?;
         set_resolution_tx(&tx, RESOLUTION_DONE)?;
         commit_counted(tx)?;
         self.stale = false;
         // La passe remet le journal à vide ; ses nœuds `dependency` créés ou supprimés sont ce
         // que la passe suivante doit relire.
         self.log = Some(changes);
-        Ok(())
+        Ok(written)
     }
 
     /// Nœuds de l'index de résolution : identifiant, genre, nom qualifié, nom court, fichier
@@ -1956,9 +1983,13 @@ impl Store {
     /// manquantes, différence des liens de chaque source et des liens `contains` de chaque cible
     /// réévaluées, dépendances devenues inutiles, statut des références, résumé et marqueur.
     /// Le journal repart des seuls nœuds `dependency` créés ou supprimés par la passe.
-    pub(crate) fn write_incremental<F>(&mut self, w: &IncrementalWrite, summary: F) -> Result<()>
+    pub(crate) fn write_incremental<F>(
+        &mut self,
+        w: &IncrementalWrite,
+        summary: F,
+    ) -> Result<std::time::Duration>
     where
-        F: FnOnce(&Store) -> Result<(String, i64)>,
+        F: FnOnce(&Store, &ChangeLog) -> Result<PassSummary>,
     {
         self.ensure_writable()?;
         self.end_fresh();
@@ -1980,13 +2011,13 @@ impl Store {
             }
         }
         // Les lectures du calcul passent par la même connexion : elles voient la transaction.
-        let (text, computed_at) = summary(self)?;
-        set_summary_tx(&tx, &text, computed_at)?;
+        let done = summary(self, &log)?;
+        let written = write_pass_summary(&tx, &done)?;
         set_resolution_tx(&tx, RESOLUTION_DONE)?;
         commit_counted(tx)?;
         self.stale = false;
         self.log = Some(log);
-        Ok(())
+        Ok(written)
     }
 
     /// Cibles des liens `depends_on` d'un module (résumé d'une passe incrémentale, DEC-078).
@@ -2002,6 +2033,24 @@ impl Store {
             .collect::<std::result::Result<_, _>>()
             .map_err(db_err)?;
         note_edge_rows(out.len());
+        Ok(out)
+    }
+
+    /// Toutes les paires (source, cible) de `edges`, en une requête (communautés d'une passe
+    /// incrémentale, DEC-120). Les lectures passent par la connexion de la transaction de la
+    /// passe : elles voient ses écritures. Comptées à part des lignes de `edges` rendues.
+    pub(crate) fn edge_pairs(&self) -> Result<Vec<(String, String)>> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT source, target FROM edges")
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db_err)?;
+        let out: Vec<(String, String)> = rows
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        note_community_pairs(out.len());
         Ok(out)
     }
 
@@ -2590,6 +2639,19 @@ pub fn replace_communities_tx(
         ins.execute(params![node, community]).map_err(db_err)?;
     }
     Ok(())
+}
+
+/// Écrit les deux tables des communautés, puis le résumé (DEC-120) ; rend la durée de l'écriture
+/// des communautés.
+fn write_pass_summary(
+    tx: &rusqlite::Connection,
+    done: &PassSummary,
+) -> Result<std::time::Duration> {
+    let started = std::time::Instant::now();
+    replace_communities_tx(tx, &done.communities, &done.members)?;
+    let elapsed = started.elapsed();
+    set_summary_tx(tx, &done.text, done.computed_at)?;
+    Ok(elapsed)
 }
 
 fn set_summary_tx(conn: &rusqlite::Connection, text: &str, computed_at: i64) -> Result<()> {

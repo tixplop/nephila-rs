@@ -655,3 +655,25 @@ fn req023_ac5_duplicate_titles_get_numbered_section_ids() {
     assert!(ids.contains(&"section:docs/dup.md#exemple"), "{ids:?}");
     assert!(ids.contains(&"section:docs/dup.md#exemple-1"), "{ids:?}");
 }
+
+/// REQ-147 : le résumé stocké porte la clé `communities` (total et au plus dix communautés, par
+/// numéro croissant, de tailles non croissantes) ; le texte de `summary` ne change pas (T-232).
+#[test]
+fn req147_summary_json_carries_the_communities_key_and_the_text_is_unchanged() {
+    let env = Env::built();
+    let s: Value = serde_json::from_slice(&env.read(&["summary", "--json"]).stdout).unwrap();
+    let c = &s["communities"];
+    let total = c["total"].as_u64().unwrap();
+    let top = c["top"].as_array().unwrap();
+    assert!(total >= 2);
+    assert_eq!(top.len() as u64, total.min(10));
+    for (i, e) in top.iter().enumerate() {
+        assert_eq!(e["id"], i);
+        assert!(!e["label"].as_str().unwrap().is_empty());
+        assert!(e["cohesion"].as_f64().unwrap() <= 1.0);
+    }
+    let sizes: Vec<u64> = top.iter().map(|e| e["size"].as_u64().unwrap()).collect();
+    assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "{sizes:?}");
+    let text = text(&env.read(&["summary"]).stdout);
+    assert!(!text.contains("ommunaut"), "{text}");
+}

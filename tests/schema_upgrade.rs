@@ -484,10 +484,43 @@ fn is_migration_trace_7(line: &str) -> bool {
 
 // ---- REQ-147 : schéma 9, tables des communautés (DEC-120) ----
 
-fn count_rows(env: &Env, table: &str) -> i64 {
-    env.db()
-        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+type Communities = (Vec<(i64, String, String, i64, u64)>, Vec<(String, i64)>);
+
+/// Contenu des tables des communautés (cohésion en bits, pour une égalité exacte).
+fn community_tables(env: &Env) -> Communities {
+    let db = env.db();
+    let rows = db
+        .prepare("SELECT id, label, pivot, size, cohesion FROM communities ORDER BY id")
         .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get::<_, f64>(4)?.to_bits(),
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let members = db
+        .prepare("SELECT node, community FROM node_communities ORDER BY node")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    (rows, members)
+}
+
+/// Communautés d'un `build --no-llm` du même dépôt, sans passage par un ancien schéma.
+fn communities_of_a_build() -> Communities {
+    let fresh = Env::new();
+    fresh.ok(&["build", "--no-llm"]);
+    let tables = community_tables(&fresh);
+    assert!(!tables.0.is_empty());
+    tables
 }
 
 #[test]
@@ -521,9 +554,8 @@ fn req147_ac4_update_migrates_schema8_to_9_and_traces_it() {
         "{}",
         text(&o.stderr)
     );
-    // Les deux tables existent, vides : rien ne calcule encore les communautés (T-231).
-    assert_eq!(count_rows(&env, "communities"), 0);
-    assert_eq!(count_rows(&env, "node_communities"), 0);
+    // La passe complète qui suit la migration remplit les deux tables : celles d'un `build`.
+    assert_eq!(community_tables(&env), communities_of_a_build());
     let v: String = env
         .db()
         .query_row(
@@ -556,7 +588,8 @@ fn req147_ac4_schema7_reaches_the_same_result_as_schema8() {
             .collect()
     };
     assert_eq!(names(&from7), names(&from8));
-    assert_eq!(count_rows(&from7, "communities"), 0);
+    assert_eq!(community_tables(&from7), communities_of_a_build());
+    assert_eq!(community_tables(&from8), communities_of_a_build());
     assert_eq!(
         text(&from7.ok(&["status"]).stdout),
         text(&from8.ok(&["status"]).stdout)
