@@ -744,6 +744,8 @@ mod tests {
 
     /// Schéma 7 de la 0.21.0 (copie de l'assistant du module de tests du stockage).
     const SCHEMA7_DOWNGRADE: &str = "BEGIN;
+        DROP TABLE node_communities;
+        DROP TABLE communities;
         DROP INDEX idx_refs_key;
         DROP INDEX idx_refs_head;
         DROP INDEX idx_refs_unresolved;

@@ -27,7 +27,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -39,6 +39,10 @@ const SCHEMA_WITH_REF_CONTEXT: i32 = 6;
 /// Dernier schéma sans clé, tête ni statut des références ni marqueur `meta.resolution`, migré
 /// sur place (DEC-076).
 const SCHEMA_WITH_FILE_CONTEXTS: i32 = 7;
+
+/// Dernier schéma sans les tables `communities` et `node_communities`, migré sur place
+/// (DEC-120).
+const SCHEMA_WITHOUT_COMMUNITIES: i32 = 8;
 
 /// Valeurs de `meta.resolution` (DEC-076) : le graphe est-il le résultat d'une passe terminée ?
 const RESOLUTION_DONE: &str = "à jour";
@@ -546,9 +550,10 @@ impl Store {
         match store.user_version()? {
             0 => store.create_schema()?,
             v if v == SCHEMA_VERSION => {}
-            SCHEMA_WITHOUT_REV | SCHEMA_WITH_REF_CONTEXT | SCHEMA_WITH_FILE_CONTEXTS => {
-                store.migrate_to_current()?
-            }
+            SCHEMA_WITHOUT_REV
+            | SCHEMA_WITH_REF_CONTEXT
+            | SCHEMA_WITH_FILE_CONTEXTS
+            | SCHEMA_WITHOUT_COMMUNITIES => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -580,7 +585,10 @@ impl Store {
                 store.load_resolution_marker()?;
                 Ok(store)
             }
-            SCHEMA_WITHOUT_REV | SCHEMA_WITH_REF_CONTEXT | SCHEMA_WITH_FILE_CONTEXTS => {
+            SCHEMA_WITHOUT_REV
+            | SCHEMA_WITH_REF_CONTEXT
+            | SCHEMA_WITH_FILE_CONTEXTS
+            | SCHEMA_WITHOUT_COMMUNITIES => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
                 Ok(store)
@@ -631,7 +639,8 @@ impl Store {
             v if v == SCHEMA_VERSION
                 || v == SCHEMA_WITHOUT_REV
                 || v == SCHEMA_WITH_REF_CONTEXT
-                || v == SCHEMA_WITH_FILE_CONTEXTS =>
+                || v == SCHEMA_WITH_FILE_CONTEXTS
+                || v == SCHEMA_WITHOUT_COMMUNITIES =>
             {
                 store.version = v
             }
@@ -646,14 +655,14 @@ impl Store {
         self.read_only && !self.conn.is_autocommit()
     }
 
-    /// Version du schéma du graphe ouvert (5 à 7 en lecture seule seulement : DEC-066, DEC-073,
+    /// Version du schéma du graphe ouvert (5 à 8 en lecture seule seulement : DEC-066, DEC-073,
     /// DEC-076).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
-    /// Migre un schéma 5, 6 ou 7 en schéma 8 sur place : 5 -> 6, 6 -> 7, puis 7 -> 8, chacune en
-    /// une seule transaction. Rien n'est perdu.
+    /// Migre un schéma 5, 6, 7 ou 8 en schéma 9 sur place : 5 -> 6, 6 -> 7, 7 -> 8, puis 8 -> 9,
+    /// chacune en une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         let from = self.user_version()?;
         let started = std::time::Instant::now();
@@ -662,12 +671,46 @@ impl Store {
         }
         self.migrate_6_to_7()?;
         self.migrate_7_to_8()?;
+        self.migrate_8_to_9()?;
         // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
         crate::trace!(
             "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
             started.elapsed().as_millis()
         );
         Ok(())
+    }
+
+    /// Migre un schéma 8 en schéma 9 en une transaction `IMMEDIATE` (DEC-120) : création des deux
+    /// tables des communautés (sans `IF NOT EXISTS` : un objet en conflit annule la migration),
+    /// marqueur `à résoudre`, versions.
+    fn migrate_8_to_9(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_COMMUNITIES {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "CREATE TABLE communities (
+                 id       INTEGER PRIMARY KEY,
+                 label    TEXT NOT NULL,
+                 pivot    TEXT NOT NULL,
+                 size     INTEGER NOT NULL,
+                 cohesion REAL NOT NULL
+             );
+             CREATE TABLE node_communities (
+                 node      TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+                 community INTEGER NOT NULL
+             );
+             INSERT OR REPLACE INTO meta(key, value) VALUES ('resolution', '{RESOLUTION_PENDING}');
+             UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
     }
 
     /// Migre un schéma 7 en schéma 8 en une transaction `IMMEDIATE` (DEC-076) : colonnes et index
@@ -714,8 +757,8 @@ impl Store {
              CREATE INDEX idx_refs_head ON refs(target_head) WHERE target_head IS NOT NULL;
              CREATE INDEX idx_refs_unresolved ON refs(unresolved) WHERE unresolved = 1;
              INSERT OR REPLACE INTO meta(key, value) VALUES ('resolution', '{RESOLUTION_PENDING}');
-             UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
-             PRAGMA user_version = {SCHEMA_VERSION};"
+             UPDATE meta SET value = '{SCHEMA_WITHOUT_COMMUNITIES}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITHOUT_COMMUNITIES};"
         ))
         .map_err(db_err)?;
         commit_counted(tx)
@@ -863,7 +906,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -881,7 +924,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -2123,6 +2166,111 @@ impl Store {
         self.end_fresh();
         set_summary_tx(&self.conn, text, computed_at)
     }
+
+    /// Vrai si les communautés sont calculées (DEC-120). Règle : schéma 9 ou plus et au moins une
+    /// ligne dans `communities`, ou graphe sans nœud dont la passe est faite (un graphe vide
+    /// marqué `à jour` au schéma 9 compte comme calculé, avec zéro communauté). Un schéma 5 à 8,
+    /// lu sans migration, n'a pas de communautés : non calculées, sans erreur.
+    pub fn communities_computed(&self) -> Result<bool> {
+        if self.version < SCHEMA_VERSION {
+            return Ok(false);
+        }
+        if self.count("communities")? > 0 {
+            return Ok(true);
+        }
+        Ok(self.count("nodes")? == 0
+            && self.read_resolution_marker()?.as_deref() == Some(RESOLUTION_DONE))
+    }
+
+    /// Communautés triées par identifiant (vide si non calculées).
+    pub fn community_list(&self) -> Result<Vec<CommunityRow>> {
+        if self.version < SCHEMA_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT id, label, pivot, size, cohesion FROM communities ORDER BY id")
+            .map_err(db_err)?;
+        let rows = st.query_map([], community_row).map_err(db_err)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(db_err)
+    }
+
+    /// Communauté d'identifiant `id`.
+    pub fn community(&self, id: i64) -> Result<Option<CommunityRow>> {
+        if self.version < SCHEMA_VERSION {
+            return Ok(None);
+        }
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT id, label, pivot, size, cohesion FROM communities WHERE id = ?1",
+            )
+            .map_err(db_err)?;
+        match st.query_row([id], community_row) {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Identifiant de la communauté du nœud `node_id`.
+    pub fn community_of(&self, node_id: &str) -> Result<Option<i64>> {
+        if self.version < SCHEMA_VERSION {
+            return Ok(None);
+        }
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT community FROM node_communities WHERE node = ?1")
+            .map_err(db_err)?;
+        match st.query_row([node_id], |r| r.get(0)) {
+            Ok(c) => Ok(Some(c)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Nœuds de la communauté `id`, triés par identifiant.
+    pub fn community_members(&self, id: i64) -> Result<Vec<Node>> {
+        if self.version < SCHEMA_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT n.id, n.kind, n.qualified, n.short, n.file, n.subkind, n.summary
+                 FROM node_communities c JOIN nodes n ON n.id = c.node
+                 WHERE c.community = ?1 ORDER BY n.id",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind, qualified, short, file, subkind, summary) = row.map_err(db_err)?;
+            out.push(Node {
+                id,
+                kind: NodeKind::parse(&kind)?,
+                qualified,
+                short,
+                file,
+                subkind: subkind.as_deref().map(SubKind::parse).transpose()?,
+                summary,
+            });
+        }
+        note_node_rows(out.len());
+        Ok(out)
+    }
 }
 
 /// Écrit dans `tx` la différence entre les liens stockés et `edges`.
@@ -2387,6 +2535,59 @@ fn delete_unused_dependencies(
                 log.deleted.insert(id.clone());
             }
         }
+    }
+    Ok(())
+}
+
+/// Une communauté stockée (DEC-120) : `pivot` = identifiant du nœud pivot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommunityRow {
+    pub id: i64,
+    pub label: String,
+    pub pivot: String,
+    pub size: i64,
+    pub cohesion: f64,
+}
+
+fn community_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CommunityRow> {
+    Ok(CommunityRow {
+        id: r.get(0)?,
+        label: r.get(1)?,
+        pivot: r.get(2)?,
+        size: r.get(3)?,
+        cohesion: r.get(4)?,
+    })
+}
+
+/// Remplace le contenu des deux tables des communautés : vide, puis insère `rows` et `members`
+/// (nœud, communauté). Fait partie de la transaction de l'appelant (DEC-120).
+pub fn replace_communities_tx(
+    tx: &rusqlite::Connection,
+    rows: &[CommunityRow],
+    members: &[(String, i64)],
+) -> Result<()> {
+    tx.prepare_cached("DELETE FROM node_communities")
+        .map_err(db_err)?
+        .execute([])
+        .map_err(db_err)?;
+    tx.prepare_cached("DELETE FROM communities")
+        .map_err(db_err)?
+        .execute([])
+        .map_err(db_err)?;
+    let mut ins = tx
+        .prepare_cached(
+            "INSERT INTO communities(id, label, pivot, size, cohesion) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(db_err)?;
+    for c in rows {
+        ins.execute(params![c.id, c.label, c.pivot, c.size, c.cohesion])
+            .map_err(db_err)?;
+    }
+    let mut ins = tx
+        .prepare_cached("INSERT INTO node_communities(node, community) VALUES (?1, ?2)")
+        .map_err(db_err)?;
+    for (node, community) in members {
+        ins.execute(params![node, community]).map_err(db_err)?;
     }
     Ok(())
 }
@@ -3710,6 +3911,13 @@ mod tests {
     /// Assistant « schéma 7 de la 0.21.0 » (DEC-076 point 6), en SQL écrit en dur : index
     /// nouveaux supprimés, trois colonnes de `refs` retirées, clé `meta.resolution` supprimée,
     /// versions 7.
+    const SCHEMA8_DOWNGRADE: &str = "BEGIN;
+        DROP TABLE node_communities;
+        DROP TABLE communities;
+        UPDATE meta SET value = '8' WHERE key = 'schema_version';
+        PRAGMA user_version = 8;
+        COMMIT;";
+
     const SCHEMA7_DOWNGRADE: &str = "BEGIN;
         DROP INDEX idx_refs_key;
         DROP INDEX idx_refs_head;
@@ -3722,8 +3930,17 @@ mod tests {
         PRAGMA user_version = 7;
         COMMIT;";
 
-    /// Ramène un graphe de schéma 8 au schéma 7 de la 0.21.0.
+    /// Ramène un graphe de schéma 9 au schéma 8 de la 0.24.4 (DEC-120).
+    fn downgrade_to_8(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA8_DOWNGRADE)
+            .unwrap();
+    }
+
+    /// Ramène un graphe de schéma 9 au schéma 7 de la 0.21.0 (le schéma 8 d'abord).
     fn downgrade_to_7(repo: &Path) {
+        downgrade_to_8(repo);
         Connection::open(db_path(repo))
             .unwrap()
             .execute_batch(SCHEMA7_DOWNGRADE)
@@ -4628,7 +4845,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        assert_eq!(SCHEMA_VERSION, 8);
+        assert_eq!(SCHEMA_VERSION, 9);
     }
 
     #[test]
@@ -4700,7 +4917,8 @@ mod tests {
         match version {
             5 => downgrade_to_5(dir.path()),
             6 => downgrade_to_6(dir.path()),
-            _ => downgrade_to_7(dir.path()),
+            7 => downgrade_to_7(dir.path()),
+            _ => downgrade_to_8(dir.path()),
         }
         let st = if existing {
             Store::open_existing(dir.path()).unwrap()
@@ -4761,11 +4979,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_to_8_without_touching_the_file() {
-        for version in [8, 7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_9_without_touching_the_file() {
+        for version in [9, 8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                8 => downgrade_to_8(dir.path()),
                 7 => downgrade_to_7(dir.path()),
                 6 => downgrade_to_6(dir.path()),
                 5 => downgrade_to_5(dir.path()),
@@ -5555,11 +5774,11 @@ mod tests {
                 [sql]
             );
         }
-        assert_eq!(st_user_version(dir.path()), 8);
-        assert_eq!(st.schema_version().unwrap(), 8);
+        assert_eq!(st_user_version(dir.path()), 9);
+        assert_eq!(st.schema_version().unwrap(), 9);
         assert_eq!(
             strings(&st, "SELECT value FROM meta WHERE key = 'schema_version'"),
-            ["8"]
+            ["9"]
         );
     }
 
@@ -5952,7 +6171,7 @@ mod tests {
             crate::resolve::resolve(&mut st).unwrap();
             dump(&st, "refs", "id,unresolved")
         };
-        for version in [7, 6, 5] {
+        for version in [8, 7, 6, 5] {
             for existing in [false, true] {
                 let (dir, mut st, before) = migrated_from(version, existing);
                 let ctx = format!("depuis {version}, existing={existing}");
@@ -6872,6 +7091,193 @@ mod tests {
             for i in 0..4 {
                 assert_eq!(r131_summary_of_node(&st, &format!("p.F{i}")), None);
             }
+        }
+    }
+
+    // ---- Schéma 9 : tables des communautés (REQ-147, DEC-120) ----
+
+    fn tid(q: &str) -> String {
+        crate::model::node_id(NodeKind::Type, q)
+    }
+
+    fn crow(id: i64, label: &str, pivot: &str, size: i64, cohesion: f64) -> CommunityRow {
+        CommunityRow {
+            id,
+            label: label.to_string(),
+            pivot: pivot.to_string(),
+            size,
+            cohesion,
+        }
+    }
+
+    fn write_communities(st: &mut Store, rows: &[CommunityRow], members: &[(&str, i64)]) {
+        let members: Vec<(String, i64)> = members.iter().map(|(n, c)| (tid(n), *c)).collect();
+        let tx = st.conn.transaction().unwrap();
+        replace_communities_tx(&tx, rows, &members).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn req147_schema9_insert_then_replace_communities() {
+        let dir = tempdir().unwrap();
+        let mut st = rich(dir.path());
+        assert!(!st.communities_computed().unwrap());
+        assert!(st.community_list().unwrap().is_empty());
+        write_communities(
+            &mut st,
+            &[
+                crow(2, "B", &tid("p.B"), 1, 0.0),
+                crow(1, "A", &tid("p.A"), 2, 0.5),
+            ],
+            &[("p.A", 1), ("p.Shared", 1), ("p.B", 2)],
+        );
+        assert!(st.communities_computed().unwrap());
+        let list = st.community_list().unwrap();
+        assert_eq!(
+            list,
+            vec![
+                crow(1, "A", &tid("p.A"), 2, 0.5),
+                crow(2, "B", &tid("p.B"), 1, 0.0)
+            ]
+        );
+        assert_eq!(st.community(1).unwrap(), Some(list[0].clone()));
+        assert_eq!(st.community(9).unwrap(), None);
+        assert_eq!(st.community_of(&tid("p.Shared")).unwrap(), Some(1));
+        assert_eq!(st.community_of(&tid("p.C")).unwrap(), None);
+        let ids: Vec<String> = st
+            .community_members(1)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(ids, vec![tid("p.A"), tid("p.Shared")]);
+        // Le remplacement vide d'abord.
+        write_communities(&mut st, &[crow(1, "C", &tid("p.C"), 1, 1.0)], &[("p.C", 1)]);
+        assert_eq!(
+            st.community_list().unwrap(),
+            vec![crow(1, "C", &tid("p.C"), 1, 1.0)]
+        );
+        assert_eq!(st.community_of(&tid("p.A")).unwrap(), None);
+        assert_eq!(st.community_of(&tid("p.C")).unwrap(), Some(1));
+        assert_eq!(st.count("node_communities").unwrap(), 1);
+    }
+
+    #[test]
+    fn req147_schema9_node_removal_cascades_to_node_communities() {
+        let dir = tempdir().unwrap();
+        let mut st = rich(dir.path());
+        write_communities(
+            &mut st,
+            &[crow(1, "C", &tid("p.C"), 1, 1.0)],
+            &[("p.C", 1), ("p.A", 1)],
+        );
+        assert!(st.remove_file("C.md").unwrap());
+        assert_eq!(st.community_of(&tid("p.C")).unwrap(), None);
+        assert_eq!(st.community_of(&tid("p.A")).unwrap(), Some(1));
+        assert_eq!(st.count("node_communities").unwrap(), 1);
+    }
+
+    #[test]
+    fn req147_schema9_reset_empties_both_tables() {
+        let dir = tempdir().unwrap();
+        let mut st = rich(dir.path());
+        write_communities(&mut st, &[crow(1, "A", &tid("p.A"), 1, 1.0)], &[("p.A", 1)]);
+        st.reset_with_pending_files(&[file("A.java")]).unwrap();
+        assert_eq!(st.count("communities").unwrap(), 0);
+        assert_eq!(st.count("node_communities").unwrap(), 0);
+        assert!(!st.communities_computed().unwrap());
+    }
+
+    #[test]
+    fn req147_schema9_empty_graph_done_counts_as_computed() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        // Graphe neuf, à résoudre : non calculées.
+        assert!(!st.communities_computed().unwrap());
+        {
+            let tx = st.conn.transaction().unwrap();
+            set_resolution_tx(&tx, RESOLUTION_DONE).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(st.communities_computed().unwrap());
+        assert!(st.community_list().unwrap().is_empty());
+    }
+
+    fn table_shape(
+        st: &Store,
+        table: &str,
+    ) -> Vec<(i64, String, String, i64, Option<String>, i64)> {
+        let mut q = st
+            .conn
+            .prepare(&format!(
+                "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .unwrap();
+        q.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn req147_schema9_migrated_graph_has_the_same_master_as_a_fresh_one() {
+        for existing in [false, true] {
+            let fresh_dir = tempdir().unwrap();
+            let fresh = rich(fresh_dir.path());
+            let (_dir, migrated, _) = migrated_from(8, existing);
+            assert_eq!(objects(&migrated), objects(&fresh));
+            for t in ["communities", "node_communities"] {
+                let shape = table_shape(&fresh, t);
+                assert!(!shape.is_empty());
+                assert_eq!(table_shape(&migrated, t), shape, "{t}");
+            }
+            let names = ["id", "label", "pivot", "size", "cohesion"];
+            let got: Vec<String> = table_shape(&migrated, "communities")
+                .into_iter()
+                .map(|c| c.1)
+                .collect();
+            assert_eq!(got, names);
+            // Sans index autre que ceux créés par les clés primaires.
+            let idx: i64 = migrated
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('communities', 'node_communities') AND sql IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(idx, 0);
+            assert!(!migrated.communities_computed().unwrap());
+        }
+    }
+
+    #[test]
+    fn req147_schema9_schema8_read_only_reports_not_computed_without_error() {
+        for version in [8, 7, 6, 5] {
+            let dir = tempdir().unwrap();
+            drop(rich(dir.path()));
+            match version {
+                8 => downgrade_to_8(dir.path()),
+                7 => downgrade_to_7(dir.path()),
+                6 => downgrade_to_6(dir.path()),
+                _ => downgrade_to_5(dir.path()),
+            }
+            let st = Store::open_readonly(dir.path()).unwrap();
+            assert_eq!(st.opened_schema_version(), version);
+            assert!(!st.communities_computed().unwrap());
+            assert!(st.community_list().unwrap().is_empty());
+            assert_eq!(st.community(1).unwrap(), None);
+            assert_eq!(st.community_of(&tid("p.A")).unwrap(), None);
+            assert!(st.community_members(1).unwrap().is_empty());
         }
     }
 }

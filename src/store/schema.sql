@@ -96,3 +96,17 @@ CREATE TABLE summary (
     -- Instant du calcul, en millisecondes depuis l'epoch Unix.
     computed_at INTEGER NOT NULL
 );
+
+-- Communautés calculées par la dernière passe qui a écrit le résumé (DEC-120) ; sans autre index.
+CREATE TABLE communities (
+    id       INTEGER PRIMARY KEY,
+    label    TEXT NOT NULL,
+    pivot    TEXT NOT NULL,
+    size     INTEGER NOT NULL,
+    cohesion REAL NOT NULL
+);
+
+CREATE TABLE node_communities (
+    node      TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    community INTEGER NOT NULL
+);

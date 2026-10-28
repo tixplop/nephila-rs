@@ -10,6 +10,7 @@ use std::process::Output;
 
 #[path = "support/schema6.rs"]
 mod schema6;
+use schema6::schema7::schema8;
 
 fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
@@ -340,11 +341,12 @@ fn req062_ac6_failed_migration_leaves_the_schema_6_graph_untouched() {
 
 // ---- REQ-115 : trace de la migration du schéma ----
 
-/// Dépôt exemple construit puis ramené au schéma `version` (5, 6 ou 7).
+/// Dépôt exemple construit puis ramené au schéma `version` (5 à 8).
 fn built_at(version: i32) -> Env {
     let env = Env::new();
     env.ok(&["build", "--no-llm"]);
     match version {
+        8 => schema8::downgrade_to_8(&env.db()),
         7 => schema6::schema7::downgrade_to_7(&env.db()),
         6 => schema6::downgrade_to_6(&env.db()),
         5 => schema6::downgrade_to_5(&env.db()),
@@ -396,7 +398,7 @@ fn assert_migration_trace(stderr: &[u8], version: i32) {
 
 #[test]
 fn req115_ac1_update_trace_la_migration_depuis_chaque_schema() {
-    for version in [7, 6, 5] {
+    for version in [8, 7, 6, 5] {
         let env = built_at(version);
         let o = env.ok(&["update", "--no-llm", "--verbose"]);
         assert_migration_trace(&o.stderr, version);
@@ -457,7 +459,7 @@ fn req115_ac3_texte_exact_et_place() {
 }
 
 /// Vérifie le motif de AC-115-3 (pas de dépendance de test nouvelle) :
-/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 8 en [0-9]+ ms$`.
+/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 9 en [0-9]+ ms$`.
 fn is_migration_trace_7(line: &str) -> bool {
     {
         let Some(rest) = line.strip_prefix("trace: [") else {
@@ -478,4 +480,85 @@ fn is_migration_trace_7(line: &str) -> bool {
             .and_then(|r| r.strip_suffix(" ms"))
             .is_some_and(digits)
     }
+}
+
+// ---- REQ-147 : schéma 9, tables des communautés (DEC-120) ----
+
+fn count_rows(env: &Env, table: &str) -> i64 {
+    env.db()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn req147_ac4_schema8_is_read_unchanged_by_status_summary_and_export() {
+    let env = built_at(8);
+    let before = graph_fingerprint(&env);
+    for args in [
+        &["status"][..],
+        &["summary"][..],
+        &["export", "--output", "-"][..],
+    ] {
+        let o = env.ok(args);
+        assert!(!text(&o.stdout).is_empty(), "{args:?}");
+        assert_eq!(env.user_version(), 8, "{args:?}");
+        assert_eq!(graph_fingerprint(&env), before, "{args:?}");
+    }
+    assert!(env.db().prepare("SELECT 1 FROM communities").is_err());
+}
+
+#[test]
+fn req147_ac4_update_migrates_schema8_to_9_and_traces_it() {
+    let env = built_at(8);
+    let o = env.ok(&["update", "--no-llm", "--verbose"]);
+    assert!(o.status.success());
+    assert_eq!(env.user_version(), 9);
+    assert_migration_trace(&o.stderr, 8);
+    assert!(
+        trace_lines(&o.stderr)
+            .iter()
+            .any(|l| l.starts_with("schéma: migration 8 vers 9 en ")),
+        "{}",
+        text(&o.stderr)
+    );
+    // Les deux tables existent, vides : rien ne calcule encore les communautés (T-231).
+    assert_eq!(count_rows(&env, "communities"), 0);
+    assert_eq!(count_rows(&env, "node_communities"), 0);
+    let v: String = env
+        .db()
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, "9");
+}
+
+#[test]
+fn req147_ac4_schema7_reaches_the_same_result_as_schema8() {
+    let from8 = built_at(8);
+    from8.ok(&["update", "--no-llm"]);
+    let from7 = built_at(7);
+    let o = from7.ok(&["update", "--no-llm", "--verbose"]);
+    assert_eq!(from7.user_version(), 9);
+    assert!(
+        trace_lines(&o.stderr)
+            .iter()
+            .any(|l| l.starts_with("schéma: migration 7 vers 9 en ")),
+        "{}",
+        text(&o.stderr)
+    );
+    let names = |env: &Env| -> Vec<(String, String, String)> {
+        master(env)
+            .into_iter()
+            .map(|(t, n, tbl, _)| (t, n, tbl))
+            .collect()
+    };
+    assert_eq!(names(&from7), names(&from8));
+    assert_eq!(count_rows(&from7, "communities"), 0);
+    assert_eq!(
+        text(&from7.ok(&["status"]).stdout),
+        text(&from8.ok(&["status"]).stdout)
+    );
 }
