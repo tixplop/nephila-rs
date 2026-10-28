@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod cli;
+pub(crate) mod community;
 pub mod config;
 pub(crate) mod diag;
 pub mod diff;
