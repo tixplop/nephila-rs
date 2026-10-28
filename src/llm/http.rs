@@ -732,6 +732,9 @@ mod tests {
         use std::net::TcpListener;
         use std::sync::atomic::AtomicUsize;
 
+        /// Marge d'ordonnancement : 453 et 487 ms constatés sous macOS en CI pour 250 + 100 ms attendus.
+        const SCHED_SLACK: Duration = Duration::from_millis(200);
+
         fn ms(n: u64) -> Duration {
             Duration::from_millis(n)
         }
@@ -740,16 +743,22 @@ mod tests {
         fn req095_ac2_stop_set_by_another_thread_ends_the_wait_within_a_slice() {
             let stop = AtomicBool::new(false);
             let t = Instant::now();
-            let interrupted = std::thread::scope(|scope| {
-                scope.spawn(|| {
+            let (interrupted, ended, set_at) = std::thread::scope(|scope| {
+                let setter = scope.spawn(|| {
                     std::thread::sleep(ms(250));
                     stop.store(true, Ordering::SeqCst);
+                    Instant::now()
                 });
-                wait(Duration::from_secs(5), Some(&stop))
+                let interrupted = wait(Duration::from_secs(5), Some(&stop));
+                let ended = Instant::now();
+                (interrupted, ended, setter.join().unwrap())
             });
-            let e = t.elapsed();
             assert!(interrupted);
-            assert!(e >= ms(250) && e < ms(450), "{e:?}");
+            assert!(ended - t >= ms(250), "{:?}", ended - t);
+            let lag = ended.saturating_duration_since(set_at);
+            // Borne littérale (100 ms) : relative à `WAIT_SLICE`, elle suivrait une tranche allongée.
+            let bound = ms(100) + SCHED_SLACK;
+            assert!(lag <= bound, "{lag:?} après l'arrêt, borne {bound:?}");
         }
 
         #[test]
@@ -759,7 +768,10 @@ mod tests {
                 let t = Instant::now();
                 assert!(!wait(ms(350), stop));
                 let e = t.elapsed();
-                assert!(e >= ms(350) && e < ms(500), "{e:?}");
+                assert!(
+                    e >= ms(350) && e < ms(350) + WAIT_SLICE + SCHED_SLACK,
+                    "{e:?}"
+                );
             }
         }
 

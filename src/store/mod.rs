@@ -5613,9 +5613,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn req064_ac4_random_sequences_leave_a_consistent_graph_identical_to_the_general_path() {
-        for seed in 0..200u64 {
+    fn check_random_sequences(seeds: std::ops::Range<u64>) {
+        for seed in seeds {
             let nfiles = 4;
             let mut g = Gen {
                 rng: Lcg(seed * 7919 + 1),
@@ -5696,6 +5695,26 @@ mod tests {
                 .unwrap();
             assert_eq!(orphans, 0, "graine {seed}");
         }
+    }
+
+    #[test]
+    fn req064_ac4_random_sequences_seeds_000_049() {
+        check_random_sequences(0..50);
+    }
+
+    #[test]
+    fn req064_ac4_random_sequences_seeds_050_099() {
+        check_random_sequences(50..100);
+    }
+
+    #[test]
+    fn req064_ac4_random_sequences_seeds_100_149() {
+        check_random_sequences(100..150);
+    }
+
+    #[test]
+    fn req064_ac4_random_sequences_seeds_150_199() {
+        check_random_sequences(150..200);
     }
 
     /// Tables touchées par une suppression de fichiers.
