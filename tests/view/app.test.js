@@ -26,3 +26,11 @@ test("REQ039_app_js_utilise_le_modele", () => {
   }
   assert.ok(!src.includes("d2 > 90000"), "double boucle de répulsion");
 });
+
+test("REQ150_app_js_utilise_le_modele_pour_les_communautes", () => {
+  const src = fs.readFileSync(path.join(dir, "app.js"), "utf8");
+  for (const name of ["nodeColor(", "communityLegend(", "colorChoice(", "color-community", "color-note", "legend"]) {
+    assert.ok(src.includes(name), name);
+  }
+  for (const hex of ["#36b", "#c60", "#888"]) assert.ok(!src.includes(hex), hex + " en dur dans app.js");
+});

@@ -5,6 +5,11 @@ var INITIAL_LIMIT = 100;
 var SEARCH_LIMIT = 20;
 var ALL_LIMIT = 5000;
 var LINKS_DELAY_MS = 150;
+// Couleurs (design-system : palette.kinds, palette.communities, color.community.other), déclarées ici seulement.
+var KIND_PALETTE = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#7f7f7f"];
+var COMMUNITY_PALETTE = ["#36b", "#c60", "#393", "#c33", "#739", "#088", "#855", "#c39"];
+var COMMUNITY_OTHER = "#888";
+var NOTE_NO_COMMUNITIES = "Communautés non calculées : lancez nephila update, puis exportez de nouveau la page";
 
 function readData(text) {
   return JSON.parse(text);
@@ -54,6 +59,8 @@ function load(data) {
     file: new Array(n),
     subkind: new Array(n),
     summary: new Array(n),
+    community: new Int32Array(n).fill(-1),
+    communities: Array.isArray(data.communities) ? data.communities : [],
     src: new Int32Array(m),
     dst: new Int32Array(m),
     ekind: new Int32Array(m),
@@ -70,6 +77,7 @@ function load(data) {
     g.file[i] = r[4] === undefined ? null : r[4];
     g.subkind[i] = r[5] === undefined ? null : r[5];
     g.summary[i] = r[6] === undefined ? null : r[6];
+    if (Number.isInteger(r[7]) && r[7] >= 0) g.community[i] = r[7];
     g.lowShort[i] = String(r[2]).toLowerCase();
     g.lowQualified[i] = String(r[3]).toLowerCase();
   }
@@ -142,6 +150,48 @@ function group(g, csr, i, endArr) {
   return res;
 }
 
+// Couleur de remplissage du nœud i : "community" = palette des communautés (numéro < K), sinon couleur neutre ;
+// tout autre mode = couleur du genre.
+function nodeColor(g, i, mode) {
+  if (mode === "community") {
+    var c = g.community[i];
+    return c >= 0 && c < COMMUNITY_PALETTE.length ? COMMUNITY_PALETTE[c] : COMMUNITY_OTHER;
+  }
+  return KIND_PALETTE[g.kind[i] % KIND_PALETTE.length];
+}
+
+function communityText(g, c) {
+  return c + " " + g.communities[c][0] + " (" + g.communities[c][1] + " nœuds)";
+}
+
+// Légende du mode communauté : les min(K, n) premières communautés, plus « autres » s'il en reste.
+// Retourne [{ color, text }].
+function communityLegend(g) {
+  var k = Math.min(COMMUNITY_PALETTE.length, g.communities.length);
+  var out = [];
+  for (var c = 0; c < k; c++) out.push({ color: COMMUNITY_PALETTE[c], text: communityText(g, c) });
+  if (g.communities.length > k) {
+    var sum = 0;
+    for (var r = k; r < g.communities.length; r++) sum += g.communities[r][1];
+    out.push({ color: COMMUNITY_OTHER, text: "autres (" + sum + " nœuds)" });
+  }
+  return out;
+}
+
+// État du choix « communauté » : { enabled, note }.
+function colorChoice(g) {
+  if (g.n === 0) return { enabled: false, note: "" };
+  if (g.communities.length === 0) return { enabled: false, note: NOTE_NO_COMMUNITIES };
+  return { enabled: true, note: "" };
+}
+
+// { number, name, text } de la communauté du nœud i, null sans communauté.
+function nodeCommunity(g, i) {
+  var c = g.community[i];
+  if (c < 0 || c >= g.communities.length) return null;
+  return { number: c, name: g.communities[c][0], text: c + " " + g.communities[c][0] };
+}
+
 function details(g, i) {
   if (!Number.isInteger(i) || i < 0 || i >= g.n) {
     throw new RangeError("nœud inconnu : " + i);
@@ -152,6 +202,7 @@ function details(g, i) {
     subkind: g.subkind[i],
     qualified: g.qualified[i],
     file: g.file[i],
+    community: nodeCommunity(g, i),
     summary: g.summary[i],
     out: group(g, g.out, i, g.dst),
     in: group(g, g.in, i, g.src),
@@ -399,6 +450,12 @@ if (typeof module !== "undefined") {
     initialView: initialView,
     search: search,
     details: details,
+    KIND_PALETTE: KIND_PALETTE,
+    COMMUNITY_PALETTE: COMMUNITY_PALETTE,
+    COMMUNITY_OTHER: COMMUNITY_OTHER,
+    nodeColor: nodeColor,
+    communityLegend: communityLegend,
+    colorChoice: colorChoice,
     expand: expand,
     neighborsView: neighborsView,
     indexOf: indexOf,

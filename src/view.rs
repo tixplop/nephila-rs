@@ -10,9 +10,9 @@ const MODEL_JS: &str = include_str!("view/model.js");
 const APP_JS: &str = include_str!("view/app.js");
 
 /// Version du format de données embarqué.
-pub const DATA_VERSION: u32 = 1;
+pub const DATA_VERSION: u32 = 2;
 
-/// Données compactes (version 1) à partir de l'export JSON `graph`.
+/// Données compactes (version 2, REQ-150) à partir de l'export JSON `graph`.
 pub fn compact(name: &str, graph: &Value) -> Value {
     let empty = Vec::new();
     let nodes_in = graph["nodes"].as_array().unwrap_or(&empty);
@@ -58,6 +58,7 @@ pub fn compact(name: &str, graph: &Value) -> Value {
                 n["file"],
                 n["subkind"],
                 n["summary"],
+                n["community"].as_i64(),
             ])
         })
         .collect();
@@ -68,8 +69,19 @@ pub fn compact(name: &str, graph: &Value) -> Value {
             Some(json!([a, b, kind_idx(kind, &edge_kinds)]))
         })
         .collect();
+    // `communities` = [[nom, taille], …] indexée par numéro (l'export les donne triées par numéro).
+    let mut comms: Vec<&Value> = graph["communities"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    comms.sort_by_key(|c| c["id"].as_i64().unwrap_or(i64::MAX));
+    let communities: Vec<Value> = comms
+        .iter()
+        .map(|c| json!([c["label"], c["size"]]))
+        .collect();
     json!({
         "version": DATA_VERSION,
+        "communities": communities,
         "name": name,
         "nodeKinds": node_kinds,
         "edgeKinds": edge_kinds,
@@ -136,8 +148,9 @@ mod tests {
 
     fn graph() -> Value {
         json!({"nodes": [
-            {"id": "type:b", "kind": "type", "short": "b", "qualified": "b", "file": null, "subkind": "class", "summary": "x </script> & \u{2028}"},
-            {"id": "method:a", "kind": "method", "short": "a", "qualified": "a", "file": "A.java", "subkind": null, "summary": null}],
+            {"id": "type:b", "kind": "type", "short": "b", "qualified": "b", "file": null, "subkind": "class", "summary": "x </script> & \u{2028}", "community": null},
+            {"id": "method:a", "kind": "method", "short": "a", "qualified": "a", "file": "A.java", "subkind": null, "summary": null, "community": 1}],
+          "communities": [{"id": 1, "label": "A", "size": 2}, {"id": 0, "label": "B", "size": 5}],
           "edges": [
             {"source": "type:b", "target": "method:a", "kind": "contains"},
             {"source": "method:a", "target": "type:b", "kind": "calls"}],
@@ -147,7 +160,10 @@ mod tests {
     #[test]
     fn req025_ac2_compact_is_sorted_and_indexed() {
         let c = compact("p", &graph());
-        assert_eq!(c["version"], 1);
+        assert_eq!(c["version"], 2);
+        assert_eq!(c["communities"], json!([["B", 5], ["A", 2]]));
+        assert_eq!(c["nodes"][0][7], json!(1));
+        assert_eq!(c["nodes"][1][7], json!(null));
         assert_eq!(c["nodeKinds"], json!(["method", "type"]));
         assert_eq!(c["edgeKinds"], json!(["calls", "contains"]));
         assert_eq!(c["nodes"][0][0], "method:a");

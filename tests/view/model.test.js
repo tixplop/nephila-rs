@@ -629,3 +629,161 @@ test("REQ040_AC2 linksShown : déplacement du fond", () => {
   assert.deepEqual(m0, { lastWheel: -Infinity, panning: false });
   assert.deepEqual(m, { lastWheel: -Infinity, panning: true });
 });
+
+// ---- REQ-150 : couleur par communauté ----
+
+const PALETTE8 = ["#36b", "#c60", "#393", "#c33", "#739", "#088", "#855", "#c39"];
+
+// Données de version 2 : n nœuds `type`, communautés de tailles données ; le nœud i a le numéro nums[i].
+function withCommunities(count, sizes) {
+  const data = helpers.noModuleGraph(count);
+  data.version = 2;
+  data.communities = sizes.map((s, c) => ["C" + c, s]);
+  data.nodes.forEach((n, i) => n.push(i < sizes.length ? i : null));
+  return data;
+}
+
+test("REQ150_AC1 AC-150-1 couleur d'un nœud : palette si numéro < K, neutre sinon, genre par défaut", () => {
+  const g = model.load(withCommunities(12, new Array(10).fill(3)));
+  for (let i = 0; i < 8; i++) assert.equal(model.nodeColor(g, i, "community"), PALETTE8[i]);
+  assert.equal(model.nodeColor(g, 8, "community"), "#888");
+  assert.equal(model.nodeColor(g, 9, "community"), "#888");
+  assert.equal(model.nodeColor(g, 11, "community"), "#888"); // sans numéro
+  // mode genre : couleur du genre, comme à la 0.24.4
+  const k = model.load(helpers.loadMaven3());
+  for (let i = 0; i < k.n; i++) {
+    assert.equal(model.nodeColor(k, i, "kind"), model.KIND_PALETTE[k.kind[i] % model.KIND_PALETTE.length]);
+  }
+  assert.deepEqual(model.KIND_PALETTE, ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#7f7f7f"]);
+  // mode communauté sur la fixture : palette si numéro < 8, neutre sinon
+  for (let i = 0; i < k.n; i++) {
+    const c = k.community[i];
+    assert.equal(model.nodeColor(k, i, "community"), c >= 0 && c < 8 ? PALETTE8[c] : "#888");
+  }
+});
+
+test("REQ150_AC1 AC-150-1 la fixture maven3 régénérée porte ses communautés", () => {
+  const data = helpers.loadMaven3();
+  assert.equal(data.version, 2);
+  const g = model.load(data);
+  assert.ok(g.communities.length > 0);
+  const legend = model.communityLegend(g);
+  assert.equal(legend.length, g.communities.length); // 6 communautés : pas d'« autres »
+  legend.forEach((e, c) => {
+    assert.equal(e.color, PALETTE8[c]);
+    assert.equal(e.text, c + " " + g.communities[c][0] + " (" + g.communities[c][1] + " nœuds)");
+  });
+});
+
+test("REQ150_AC7 AC-150-7 palette et couleur neutre", () => {
+  assert.deepEqual(model.COMMUNITY_PALETTE, PALETTE8);
+  assert.equal(model.COMMUNITY_OTHER, "#888");
+});
+
+test("REQ150_AC7 AC-150-7 10 communautés : 9 entrées, les 8 premières puis « autres »", () => {
+  const sizes = [20, 18, 16, 14, 12, 10, 8, 6, 4, 3];
+  const g = model.load(withCommunities(12, sizes));
+  const legend = model.communityLegend(g);
+  assert.equal(legend.length, 9);
+  for (let c = 0; c < 8; c++) {
+    assert.deepEqual(legend[c], { color: PALETTE8[c], text: c + " C" + c + " (" + sizes[c] + " nœuds)" });
+  }
+  assert.deepEqual(legend[8], { color: "#888", text: "autres (7 nœuds)" });
+});
+
+test("REQ150_AC7 AC-150-7 8 communautés ou moins : pas d'entrée « autres »", () => {
+  assert.equal(model.communityLegend(model.load(withCommunities(10, new Array(8).fill(1)))).length, 8);
+  assert.equal(model.communityLegend(model.load(withCommunities(10, [5]))).length, 1);
+});
+
+test("REQ150_AC3 AC-150-3 détails : numéro et nom de la communauté de OrderService", () => {
+  const g = model.load(helpers.loadMaven3());
+  const i = model.indexOf(g, ORDER);
+  const d = model.details(g, i);
+  const c = g.community[i];
+  assert.ok(c >= 0);
+  assert.equal(d.community.number, c);
+  assert.equal(d.community.name, g.communities[c][0]);
+  assert.equal(d.community.text, c + " " + g.communities[c][0]);
+});
+
+test("REQ150_AC3 AC-150-3 sans communautés : choix désactivé, détails sans communauté", () => {
+  const data = helpers.noModuleGraph(5);
+  const g = model.load(data); // version 1 : ni `communities` ni numéros
+  assert.deepEqual(model.colorChoice(g), {
+    enabled: false,
+    note: "Communautés non calculées : lancez nephila update, puis exportez de nouveau la page",
+  });
+  assert.equal(model.details(g, 0).community, null);
+  const n = model.load({ ...data, version: 2, communities: [] });
+  assert.equal(model.colorChoice(n).enabled, false);
+});
+
+test("REQ150_AC7 AC-150-7 graphe vide : choix désactivé, note vide ; avec communautés : activé", () => {
+  const empty = model.load({ version: 2, name: "x", nodeKinds: [], edgeKinds: [], nodes: [], edges: [], communities: [] });
+  assert.deepEqual(model.colorChoice(empty), { enabled: false, note: "" });
+  assert.deepEqual(model.colorChoice(model.load(withCommunities(4, [2, 2]))), { enabled: true, note: "" });
+});
+
+test("REQ150_AC7 AC-150-7 un numéro hors liste ou invalide n'a pas de communauté", () => {
+  const data = withCommunities(3, [1, 1]);
+  data.nodes[2][7] = 99;
+  data.nodes[1][7] = -4;
+  const g = model.load(data);
+  assert.equal(model.details(g, 2).community, null);
+  assert.equal(model.details(g, 1).community, null);
+  assert.equal(model.nodeColor(g, 2, "community"), "#888");
+});
+
+test("REQ150_AC4 AC-150-4 120 000 nœuds avec communautés : chargement, couleurs et légende rapides", () => {
+  const data = helpers.randomGraph(120000, 300000);
+  data.version = 2;
+  data.communities = Array.from({ length: 5000 }, (_, c) => ["C" + c, 24]);
+  data.nodes.forEach((n, i) => n.push(i % 5000));
+  let t = performance.now();
+  const g = model.load(data);
+  const tLoad = performance.now() - t;
+  t = performance.now();
+  let acc = 0;
+  for (let i = 0; i < g.n; i++) acc += model.nodeColor(g, i, "community").length;
+  const tColor = performance.now() - t;
+  const legend = model.communityLegend(g);
+  assert.ok(acc > 0);
+  assert.equal(legend.length, 9);
+  assert.equal(legend[8].text, "autres (" + 4992 * 24 + " nœuds)");
+  t = performance.now();
+  assert.ok(model.search(g, "c1234").length > 0);
+  const tSearch = performance.now() - t;
+  let hub = 0;
+  for (let i = 1; i < g.n; i++) if (g.degree[i] > g.degree[hub]) hub = i;
+  t = performance.now();
+  model.expand(g, new Set([hub]), hub);
+  const tExpand = performance.now() - t;
+  t = performance.now();
+  const all = model.allView(g);
+  const tAll = performance.now() - t;
+  t = performance.now();
+  model.visible(g, all.view, {});
+  const tVisible = performance.now() - t;
+  assert.ok(tSearch < 100, "search " + tSearch);
+  assert.ok(tExpand < 50, "expand " + tExpand);
+  assert.ok(tAll < 200, "allView " + tAll);
+  assert.ok(tVisible < 100, "visible " + tVisible);
+  assert.ok(tLoad < 2000, "load " + tLoad);
+  assert.ok(tColor < 200, "couleurs " + tColor);
+});
+
+function luminance(hex) {
+  const h = hex.length === 4 ? "#" + [...hex.slice(1)].map((c) => c + c).join("") : hex;
+  const ch = [1, 3, 5].map((p) => parseInt(h.slice(p, p + 2), 16) / 255);
+  const [r, g, b] = ch.map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+test("REQ150_AC7 contraste des 8 couleurs et du neutre sur le fond du canevas >= 3:1", () => {
+  const bg = luminance("#fafafa");
+  for (const c of [...model.COMMUNITY_PALETTE, model.COMMUNITY_OTHER]) {
+    const ratio = (bg + 0.05) / (luminance(c) + 0.05);
+    assert.ok(ratio >= 3, c + " : " + ratio);
+  }
+});

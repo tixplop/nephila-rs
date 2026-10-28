@@ -21,6 +21,15 @@
 <button id="expand" type="button" disabled>Étendre</button>
 <div id="message" aria-live="polite"></div>
 </section>
+<section id="coloring">
+<h2 id="color-title">Couleur</h2>
+<div role="radiogroup" aria-labelledby="color-title">
+<label class="filter"><input type="radio" name="color" id="color-kind" value="kind" checked>genre</label>
+<label class="filter"><input type="radio" name="color" id="color-community" value="community" aria-describedby="color-note">communauté</label>
+</div>
+<div id="color-note"></div>
+<ul id="legend" aria-label="Légende des communautés" hidden></ul>
+</section>
 <section>
 <h2>Genres de nœuds</h2>
 <div id="node-filters"></div>

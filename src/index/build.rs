@@ -900,7 +900,14 @@ mod tests {
             );
             assert_eq!(
                 std::fs::read_to_string(&html).unwrap(),
-                format!("{}\n", crate::view::render(&slug, &doc)),
+                // La page porte aussi les communautés (REQ-150) : l'oracle n'en a pas, l'export les donne.
+                format!(
+                    "{}\n",
+                    crate::view::render(
+                        &slug,
+                        &serde_json::from_str::<serde_json::Value>(written.trim_end()).unwrap()
+                    )
+                ),
                 "{label} : page"
             );
         }

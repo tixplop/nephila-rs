@@ -108,7 +108,7 @@ fn block(html: &str) -> Value {
 
 /// Décodage DEC-028 : (nœuds, liens) sous la forme de l'export.
 fn decode(data: &Value) -> (Vec<Value>, Vec<Value>) {
-    assert_eq!(data["version"], 1);
+    assert_eq!(data["version"], 2);
     let nk = data["nodeKinds"].as_array().unwrap();
     let ek = data["edgeKinds"].as_array().unwrap();
     let nodes: Vec<Value> = data["nodes"]
@@ -118,7 +118,7 @@ fn decode(data: &Value) -> (Vec<Value>, Vec<Value>) {
         .map(|n| {
             json!({"id": n[0], "kind": nk[n[1].as_u64().unwrap() as usize],
                    "short": n[2], "qualified": n[3], "file": n[4],
-                   "subkind": n[5], "summary": n[6]})
+                   "subkind": n[5], "summary": n[6], "community": n[7]})
         })
         .collect();
     let edges: Vec<Value> = data["edges"]
@@ -144,15 +144,7 @@ fn assert_same_graph(html: &str, export: &Value) {
     let (nodes, edges) = decode(&block(html));
     let by_id = |n: &Value| n["id"].as_str().unwrap().to_string();
     let by_edge = |e: &Value| format!("{} {} {}", e["source"], e["target"], e["kind"]);
-    // La page ne porte pas encore les communautés (T-234) : clé `community` de l'export retirée.
-    let without_community: Vec<Value> = sorted(&export["nodes"], by_id)
-        .into_iter()
-        .map(|mut n| {
-            n.as_object_mut().unwrap().remove("community");
-            n
-        })
-        .collect();
-    assert_eq!(nodes, without_community);
+    assert_eq!(nodes, sorted(&export["nodes"], by_id));
     assert_eq!(edges, sorted(&export["edges"], by_edge));
 }
 
@@ -333,6 +325,76 @@ fn req039_ac7_button_row_order_and_attributes() {
     let ms = page[..m].rfind('<').unwrap();
     let mtag = &page[ms..ms + page[ms..].find('>').unwrap() + 1];
     assert!(mtag.contains("aria-live=\"polite\""));
+    let css = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/view/style.css"))
+        .unwrap();
+    assert!(!css.contains("outline: none") && !css.contains("outline:none"));
+}
+
+/// AC-150-2 : numéro de communauté par nœud et `communities` = [nom, taille] de l'export.
+#[test]
+fn req150_ac2_block_carries_the_communities_of_the_export() {
+    let env = Env::built();
+    let export = env.export_json();
+    let html = exported_page_of(&env);
+    let data = block(&html);
+    let want: Vec<Value> = export["communities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| json!([c["label"], c["size"]]))
+        .collect();
+    assert!(!want.is_empty(), "le dépôt exemple a des communautés");
+    assert_eq!(data["communities"], Value::Array(want));
+    let (nodes, _) = decode(&data);
+    for n in &nodes {
+        let src = export["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == n["id"])
+            .unwrap();
+        assert_eq!(n["community"], src["community"], "{}", n["id"]);
+        assert!(n["community"].is_u64());
+    }
+    // Les nœuds portent le numéro en dernier élément.
+    assert_eq!(data["nodes"][0].as_array().unwrap().len(), 8);
+}
+
+fn exported_page_of(env: &Env) -> String {
+    let cwd = tempfile::tempdir().unwrap();
+    let out = env.read_in(cwd.path(), &["export", "--format", "html"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    fs::read_to_string(cwd.path().join("repo.html")).unwrap()
+}
+
+/// AC-150-5 et AC-150-6 : éléments exacts, ordre dans la page, pas de `outline: none`.
+#[test]
+fn req150_ac5_ac6_coloring_section_elements_and_order() {
+    let html = exported_page();
+    let (before, _, after) = split_block(&html);
+    let page = format!("{before}{after}");
+    for needle in [
+        "<section id=\"coloring\">",
+        "<h2 id=\"color-title\">Couleur</h2>",
+        "role=\"radiogroup\" aria-labelledby=\"color-title\"",
+        "<input type=\"radio\" name=\"color\" id=\"color-kind\" value=\"kind\" checked>genre",
+        "<input type=\"radio\" name=\"color\" id=\"color-community\" value=\"community\" aria-describedby=\"color-note\">communauté",
+        "<div id=\"color-note\"></div>",
+        "<ul id=\"legend\" aria-label=\"Légende des communautés\" hidden></ul>",
+    ] {
+        assert!(page.contains(needle), "{needle} absent");
+    }
+    let (m, c, g) = (
+        page.find("id=\"message\"").unwrap(),
+        page.find("id=\"coloring\"").unwrap(),
+        page.find("Genres de nœuds").unwrap(),
+    );
+    assert!(m < c && c < g, "ordre message < coloring < Genres de nœuds");
+    for bad in ["http://", "https://", "fetch(", "import(", "innerHTML"] {
+        let app = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/view/app.js"))
+            .unwrap();
+        assert!(!app.contains(bad), "{bad} dans app.js");
+    }
     let css = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/view/style.css"))
         .unwrap();
     assert!(!css.contains("outline: none") && !css.contains("outline:none"));

@@ -6,7 +6,9 @@ main { flex: 1; display: flex; min-height: 0; }
 #side section { margin-bottom: 0.8em; }
 #side h2 { font-size: 1em; margin: 0.6em 0 0.2em; }
 #search { width: 100%; box-sizing: border-box; padding: 0.3em; }
-#results { list-style: none; margin: 0.3em 0 0; padding: 0; }
+#results, #legend { list-style: none; margin: 0.3em 0 0; padding: 0; }
+#legend li { padding: 0.15em 0.3em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.by-community .swatch { visibility: hidden; }
 #results li { cursor: pointer; padding: 0.15em 0.3em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #results li:hover, .link:hover { background: #def; }
 #message { margin-top: 0.4em; color: #a40; }

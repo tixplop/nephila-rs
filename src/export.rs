@@ -155,27 +155,33 @@ pub fn write_json<W: Write>(store: &Store, w: &mut W) -> std::result::Result<(),
 /// Nœuds et liens de l'export, sans les non résolues : entrée de la vue HTML (REQ-025), qui ne les
 /// affiche pas, et donc sans passe de résolution (DEC-092).
 fn nodes_and_edges(store: &Store) -> Result<Value> {
-    let nodes: Vec<Value> = store
-        .nodes()?
+    let mut nodes: Vec<Value> = Vec::new();
+    store.for_each_node_with_community::<Error, _>(|n, community| {
+        nodes.push(json!({
+            "id": n.id,
+            "kind": n.kind.as_str(),
+            "qualified": n.qualified,
+            "short": n.short,
+            "file": n.file,
+            "subkind": n.subkind.map(|s| s.as_str()),
+            "summary": n.summary,
+            "community": community,
+        }));
+        Ok(())
+    })?;
+    let communities: Vec<Value> = store
+        .community_list()?
         .into_iter()
-        .map(|n| {
-            json!({
-                "id": n.id,
-                "kind": n.kind.as_str(),
-                "qualified": n.qualified,
-                "short": n.short,
-                "file": n.file,
-                "subkind": n.subkind.map(|s| s.as_str()),
-                "summary": n.summary,
-            })
-        })
+        .map(|c| json!({"id": c.id, "label": c.label, "size": c.size}))
         .collect();
     let edges: Vec<Value> = store
         .edges()?
         .into_iter()
         .map(|e| json!({"source": e.source, "target": e.target, "kind": e.kind.as_str()}))
         .collect();
-    Ok(json!({"version": EXPORT_VERSION, "nodes": nodes, "edges": edges}))
+    Ok(
+        json!({"version": EXPORT_VERSION, "communities": communities, "nodes": nodes, "edges": edges}),
+    )
 }
 
 /// Nom de base des fichiers d'export : dernier composant du chemin canonique du dépôt,

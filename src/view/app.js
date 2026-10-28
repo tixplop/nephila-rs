@@ -8,7 +8,6 @@
   };
   var canvas = $("canvas");
   var ctx = canvas.getContext("2d");
-  var PALETTE = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#7f7f7f"];
   var RADIUS = 6;
 
   var init = initialView(g);
@@ -19,6 +18,7 @@
   var motion = motionState();
   var linksTimer = null;
   var selected = -1;
+  var colorMode = "kind";
   var hiddenNodeKinds = new Set();
   var hiddenEdgeKinds = new Set();
   var pos = new Map();
@@ -36,7 +36,7 @@
   $("header").textContent = g.name + " : " + g.n + " nœuds, " + g.m + " liens";
 
   function color(i) {
-    return PALETTE[g.kind[i] % PALETTE.length];
+    return nodeColor(g, i, colorMode);
   }
 
   function el(tag, text, cls) {
@@ -387,6 +387,7 @@
       ["Sous-genre", d.subkind],
       ["Nom qualifié", d.qualified],
       ["Fichier", d.file],
+      ["Communauté", d.community && d.community.text],
       ["Résumé", d.summary],
     ].forEach(function (f) {
       if (f[1] === null || f[1] === undefined || f[1] === "") return;
@@ -449,13 +450,43 @@
       label.appendChild(cb);
       if (colored) {
         var sw = el("span", undefined, "swatch");
-        sw.style.background = PALETTE[idx % PALETTE.length];
+        sw.style.background = KIND_PALETTE[idx % KIND_PALETTE.length];
         label.appendChild(sw);
       }
       label.appendChild(document.createTextNode(name));
       container.appendChild(label);
     });
   }
+
+  function renderLegend() {
+    var ul = $("legend");
+    ul.textContent = "";
+    if (colorMode === "community") {
+      communityLegend(g).forEach(function (entry) {
+        var li = el("li");
+        var sw = el("span", undefined, "swatch");
+        sw.style.background = entry.color;
+        li.appendChild(sw);
+        li.appendChild(document.createTextNode(entry.text));
+        li.title = entry.text;
+        ul.appendChild(li);
+      });
+    }
+    ul.hidden = colorMode !== "community";
+    $("node-filters").classList.toggle("by-community", colorMode === "community");
+  }
+
+  var choice = colorChoice(g);
+  $("color-community").disabled = !choice.enabled;
+  $("color-note").textContent = choice.note;
+  ["color-kind", "color-community"].forEach(function (id) {
+    $(id).addEventListener("change", function () {
+      if (!$(id).checked) return;
+      colorMode = $(id).value;
+      renderLegend();
+      dirty = true;
+    });
+  });
 
   filterBox($("node-filters"), g.nodeKinds, hiddenNodeKinds, true);
   filterBox($("edge-filters"), g.edgeKinds, hiddenEdgeKinds, false);
