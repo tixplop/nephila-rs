@@ -106,7 +106,8 @@ CREATE TABLE communities (
     cohesion REAL NOT NULL
 );
 
+-- Sans rowid : la clé primaire est la table elle-même, sans index automatique doublon (DEC-123).
 CREATE TABLE node_communities (
     node      TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
     community INTEGER NOT NULL
-);
+) WITHOUT ROWID;

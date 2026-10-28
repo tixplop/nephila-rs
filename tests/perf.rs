@@ -1081,6 +1081,88 @@ fn perf_req080_ac3_export_memoire() {
     );
 }
 
+/// Durées (ms) des lignes `communautés:` de la sortie d'erreur d'une commande `--verbose`.
+fn communities_ms(out: &Output) -> Vec<u64> {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter_map(|l| l.split("communautés: ").nth(1))
+        .filter_map(|r| r.split(" ms").next()?.trim().parse().ok())
+        .collect()
+}
+
+/// Ajoute une méthode à la classe Java `i` de `gen_repo` (fichier modifié pour un `update`).
+fn touch_java(f: &Fixture, i: usize, label: &str) {
+    let path = f.repo.join(gen_repo::java_path(i));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let k = text.rfind('}').expect("accolade finale");
+    std::fs::write(
+        &path,
+        format!(
+            "{}    public int {label}() {{\n        return 1;\n    }}\n{}",
+            &text[..k],
+            &text[k..]
+        ),
+    )
+    .unwrap();
+}
+
+/// AC-146-7 : sur `gen_js`, `update --verbose` d'un fichier : ligne `communautés:` < 1 000 ms.
+#[test]
+#[ignore]
+fn perf_req146_ac7_communities_gen_js() {
+    let _g = serial();
+    let f = js_fixture_with(Some("provider = \"mock\"\nmodel = \"mock\"\n"));
+    timed(&f, &["build", "--no-llm"]);
+    let path = f.repo.join(gen_js::path(gen_js::EDITED));
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("{text}\nexport function communityExtra(): number {{\n  return 1;\n}}\n"),
+    )
+    .unwrap();
+    let (_, out) = timed(&f, &["update", "--no-llm", "--verbose"]);
+    let ms = communities_ms(&out);
+    assert_eq!(ms.len(), 1, "lignes communautés : {ms:?}");
+    assert_under(
+        "communautés (update, gen_js)",
+        Duration::from_millis(ms[0]),
+        1_000,
+    );
+    let _ = std::fs::remove_dir_all(f.repo.parent().unwrap());
+}
+
+/// AC-147-7 : sur `gen_repo` (10 000 fichiers), la durée de `communautés:` d'un `update` d'un
+/// fichier est relevée (les autres bornes sont tenues par `perf_req021_ac1`, `ac3` et `ac5`).
+/// AC-148-6 : `query community`, `query community 0` et `query community --node <classe>` < 100 ms.
+#[test]
+#[ignore]
+fn perf_req147_ac7_req148_ac6_communities_gen_repo() {
+    let _g = serial();
+    let f = fixture();
+    touch_java(f, 1234, "communityExtra");
+    let (_, out) = timed(f, &["update", "--verbose"]);
+    let ms = communities_ms(&out);
+    // Avec le LLM, la passe de résolution a lieu avant et après l'enrichissement : une ligne par passe.
+    assert!(!ms.is_empty(), "lignes communautés : {ms:?}");
+    eprintln!("MESURE communautés (update, gen_repo) : {ms:?} ms");
+    let class = gen_repo::class_name(1234);
+    let node = ["query", "community", "--node", class.as_str()];
+    let cases: [(&str, &[&str]); 3] = [
+        ("query community", &["query", "community"]),
+        ("query community 0", &["query", "community", "0"]),
+        ("query community --node", &node),
+    ];
+    for (label, args) in cases {
+        let (d, out) = best(f, args);
+        assert!(
+            !out.stdout.is_empty(),
+            "{label} : sortie vide ({})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_under(label, d, 100);
+    }
+}
+
 /// AC-109-2 (`big.md` : `.txt` n'est pas un type analysé) : `query search X --check-stale`, dépôt qui gagne un fichier valide de 256 Mio :
 /// pic de mémoire du seul processus < 64 Mio, fichier compté comme ajouté ; avec un octet invalide
 /// final, fichier non compté.

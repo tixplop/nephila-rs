@@ -40,6 +40,9 @@ const SCHEMA_WITH_REF_CONTEXT: i32 = 6;
 /// sur place (DEC-076).
 const SCHEMA_WITH_FILE_CONTEXTS: i32 = 7;
 
+/// Déclaration de `node_communities`, identique au caractère près à celle de `schema.sql` (DEC-123).
+const NODE_COMMUNITIES_DDL: &str = "CREATE TABLE node_communities (\n    node      TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,\n    community INTEGER NOT NULL\n) WITHOUT ROWID;";
+
 /// Dernier schéma sans les tables `communities` et `node_communities`, migré sur place
 /// (DEC-120).
 const SCHEMA_WITHOUT_COMMUNITIES: i32 = 8;
@@ -728,10 +731,7 @@ impl Store {
                  size     INTEGER NOT NULL,
                  cohesion REAL NOT NULL
              );
-             CREATE TABLE node_communities (
-                 node      TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
-                 community INTEGER NOT NULL
-             );
+             {NODE_COMMUNITIES_DDL}
              INSERT OR REPLACE INTO meta(key, value) VALUES ('resolution', '{RESOLUTION_PENDING}');
              UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
              PRAGMA user_version = {SCHEMA_VERSION};"
@@ -7356,6 +7356,43 @@ mod tests {
             assert_eq!(idx, 0);
             assert!(!migrated.communities_computed().unwrap());
         }
+    }
+
+    #[test]
+    fn req147_ac10_node_communities_without_rowid() {
+        let table_sql = |st: &Store| -> String {
+            st.conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'node_communities'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let fresh_dir = tempdir().unwrap();
+        let fresh = rich(fresh_dir.path());
+        let (_dir, migrated, _) = migrated_from(8, true);
+        for st in [&fresh, &migrated] {
+            let wr: i64 = st
+                .conn
+                .query_row(
+                    "SELECT wr FROM pragma_table_list WHERE name = 'node_communities'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(wr, 1);
+            let auto: i64 = st
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name LIKE 'sqlite_autoindex_node_communities%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(auto, 0);
+        }
+        assert_eq!(table_sql(&fresh), table_sql(&migrated));
     }
 
     #[test]
