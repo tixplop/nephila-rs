@@ -728,7 +728,7 @@ fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
     assert!(line.contains("0.17"));
     let at = |needle: &str| readme.find(needle).unwrap();
     assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.25.0", "git tag v0.25.0 && git push origin v0.25.0"] {
+    for needle in ["V=v0.25.1", "git tag v0.25.1 && git push origin v0.25.1"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
     assert!(!readme.contains("0.17.6"));
@@ -936,8 +936,8 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
         "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
         "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.25.0 ",
-        "git tag v0.25.0 && git push origin v0.25.0",
+        "V=v0.25.1 ",
+        "git tag v0.25.1 && git push origin v0.25.1",
     ] {
         assert!(readme.contains(expected), "absent : {expected}");
     }
@@ -1930,15 +1930,15 @@ Sans argument, `query community` liste les communautés par numéro. Avec un num
 }
 
 #[test]
-fn REQ151_AC2_version_0_25_0() {
+fn REQ153_AC1_version_0_25_1() {
     assert_eq!(cargo_minor(), "0.25");
     let toml = repo_file("Cargo.toml");
-    assert!(toml.lines().any(|l| l == "version = \"0.25.0\""));
+    assert!(toml.lines().any(|l| l == "version = \"0.25.1\""));
     let lock = repo_file("Cargo.lock");
-    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.25.0\""));
+    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.25.1\""));
     let readme = repo_file("README.md");
-    for needle in ["V=v0.25.0", "git tag v0.25.0 && git push origin v0.25.0"] {
+    for needle in ["V=v0.25.1", "git tag v0.25.1 && git push origin v0.25.1"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
-    assert!(!readme.contains("v0.24.4"));
+    assert!(!readme.contains("v0.25.0"));
 }

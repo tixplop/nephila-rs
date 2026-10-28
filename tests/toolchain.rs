@@ -681,3 +681,54 @@ fn REQ111_AC8_rlimit_nproc_reserve_a_linux() {
     assert!(controles >= 1, "aucun fichier contrôlé");
     assert!(defauts.is_empty(), "{}", defauts.join("\n"));
 }
+
+#[test]
+fn REQ152_AC1_pulldown_cmark_corrige_rustsec_2026_0414() {
+    let text =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock")).unwrap();
+    let mut trouves = 0;
+    for bloc in text.split("[[package]]") {
+        if !bloc.lines().any(|l| l == "name = \"pulldown-cmark\"") {
+            continue;
+        }
+        trouves += 1;
+        let v = bloc
+            .lines()
+            .find_map(|l| l.strip_prefix("version = \""))
+            .and_then(|l| l.strip_suffix('"'))
+            .expect("version");
+        let n: Vec<u64> = v.split('.').map(|x| x.parse().unwrap()).collect();
+        let version = (n[0], n[1], n[2]);
+        assert!(
+            version >= (0, 13, 5),
+            "pulldown-cmark {v} < 0.13.5 (RUSTSEC-2026-0414)"
+        );
+    }
+    assert!(trouves >= 1, "aucun bloc pulldown-cmark dans Cargo.lock");
+}
+
+fn cherche_options(dir: &Path, found: &mut Vec<String>) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            cherche_options(&p, found);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&p).unwrap();
+            for (i, l) in text.lines().enumerate() {
+                if l.contains("ENABLE_WIKILINKS") || l.contains("Options::all") {
+                    found.push(format!("{}:{}", p.display(), i + 1));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn REQ152_AC2_aucune_option_de_pulldown_cmark() {
+    let mut found = Vec::new();
+    cherche_options(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut found,
+    );
+    assert!(found.is_empty(), "options interdites : {found:?}");
+}
