@@ -651,122 +651,6 @@ fn readme_section(readme: &str, title: &str) -> String {
     out.join("\n")
 }
 
-#[test]
-fn REQ042_AC13_readme_decrit_les_reglages_de_projet() {
-    let readme = repo_file("README.md");
-    let sec = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
-    assert!(sec.contains(".nephila.toml"));
-    for k in [
-        "model",
-        "max_chunk_chars",
-        "concurrency",
-        "timeout_secs",
-        "batch_files",
-        "format_retries",
-    ] {
-        assert!(sec.contains(k), "réglage absent de la section : {k}");
-    }
-    for needle in [
-        "configuration personnelle",
-        "provider",
-        "base_url",
-        "api_key_env",
-        "tls_ca_cert",
-        "tls_insecure",
-        "--no-llm",
-        "graphe à jour",
-        "nephila build",
-        "build --verbose",
-        "examples/nephila.toml",
-        "au plus 64",
-    ] {
-        assert!(
-            sec.contains(needle),
-            "texte absent de la section : {needle}"
-        );
-    }
-    assert!(sec.contains("option > fichier de projet > configuration personnelle > défaut"));
-    assert!(!readme.contains("configuration globale"));
-    // AC-042-13 modifié : réenrichissement par `update` ou `build` après un changement de modèle.
-    assert!(
-        sec.contains("réenrichi") && sec.contains("nephila update"),
-        "le réenrichissement par update ou build après un changement de modèle n'est pas décrit"
-    );
-    assert!(
-        !sec.contains("Changer de modèle ne réenrichit rien"),
-        "texte périmé : le changement de modèle réenrichit"
-    );
-}
-
-#[test]
-fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
-    let readme = repo_file("README.md");
-    let sec = readme_section(&readme, "## Enrichissement en lots");
-    assert!(sec.contains(
-        "Par défaut, seuls les documents Markdown sont enrichis ; enrich_code = true (configuration personnelle) ou --enrich-code (une commande) enrichit aussi le code source et les fichiers de build et de données."
-    ));
-    for needle in [
-        "enrich_code",
-        "--enrich-code",
-        "conservés",
-        "fichiers à enrichir",
-        "max_chunk_chars",
-        "concurrency",
-    ] {
-        assert!(
-            sec.contains(needle),
-            "texte absent de la section : {needle}"
-        );
-    }
-    let line = readme
-        .lines()
-        .find(|l| l.starts_with("| 0.18 |"))
-        .expect("ligne 0.18 absente du tableau des versions");
-    assert!(line.contains("Rupture : seuls les documents Markdown sont enrichis par défaut"));
-    assert!(line.contains("enrich_code = true"));
-    assert!(line.contains("--enrich-code"));
-    assert!(line.contains("0.17"));
-    let at = |needle: &str| readme.find(needle).unwrap();
-    assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.25.2", "git tag v0.25.2 && git push origin v0.25.2"] {
-        assert!(readme.contains(needle), "absent : {needle}");
-    }
-    assert!(!readme.contains("0.17.6"));
-    // Plus de vérification préalable de la clé (REQ-054).
-    assert!(!readme.contains("/v1/models"));
-    assert!(!readme.contains("verify_key"));
-    assert!(!readme.contains("la vérification de la clé"));
-    let verbose = readme_section(&readme, "### Traces (`--verbose`)");
-    for needle in [
-        "enrichissements conservés",
-        "llm enrich attente",
-        "enrich_code",
-    ] {
-        assert!(verbose.contains(needle), "trace absente : {needle}");
-    }
-    let retries = readme_section(&readme, "## Réponses non conformes et nouveaux essais");
-    for needle in [
-        "429",
-        "503",
-        "529",
-        "retry-after",
-        "60 s",
-        "4 nouveaux essais",
-    ] {
-        assert!(retries.contains(needle), "nouveaux essais HTTP : {needle}");
-    }
-    let dev = readme_section(&readme, "## Développement");
-    assert!(dev.contains("NEPHILA_RETRY_BASE_MS"));
-    assert!(dev.contains("chaque appel échoue en « clé refusée »"));
-    let cfg = readme_section(&readme, "## Configuration du LLM");
-    assert!(cfg.contains("| `enrich_code` |"));
-    assert!(
-        cfg.contains("| `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |")
-    );
-    let upgrade = readme_section(&readme, "## Mise à niveau");
-    assert!(upgrade.contains("schéma 5"));
-}
-
 const CAPS_HEADER: &str = "# Plafonds : ici seulement, chaque réglage entier a un plafond (ligne « Plafond dans ce fichier ») ; la configuration personnelle et les options n'en ont pas.";
 
 #[test]
@@ -803,57 +687,6 @@ fn REQ042_AC20_lignes_de_plafond_de_l_exemple() {
         assert!(!l.contains("maximum"), "{l}");
         assert!(!l.contains("4294967295"));
     }
-}
-
-#[test]
-fn REQ042_AC21_readme_table_des_plafonds() {
-    let readme = repo_file("README.md");
-    let sec = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
-    let lines: Vec<&str> = sec.lines().collect();
-    let head = lines
-        .iter()
-        .position(|l| *l == "| Réglage | Plafond dans `.nephila.toml` |")
-        .expect("en-tête de table absent");
-    assert_eq!(lines[head + 1], "|---|---|");
-    for (i, (key, cap)) in PROJECT_CAPS.iter().enumerate() {
-        assert_eq!(lines[head + 2 + i], format!("| `{key}` | {cap} |"));
-    }
-    assert!(!lines[head + 2..head + 7]
-        .iter()
-        .any(|l| l.contains("`model`")));
-    assert!(lines[head + 7].is_empty());
-    assert_eq!(lines[head + 8], "Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et les options --batch-files et --format-retries n'en ont pas. Un dépôt cloné ne peut ainsi imposer ni plus de fils, ni des appels plus longs ou plus gros, ni plus d'essais.");
-}
-
-#[test]
-fn REQ042_AC23_readme_ligne_0_17() {
-    let readme = repo_file("README.md");
-    let lines: Vec<&str> = readme.lines().collect();
-    let expected = "| 0.17 | Plafonds des réglages entiers de `.nephila.toml` (rupture : une valeur au-dessus est refusée ; pour corriger le fichier, donnez au réglage une valeur au plus égale à son plafond, donné par la table de la section « Fichier de projet `.nephila.toml` », ou déplacez le réglage dans votre configuration personnelle, qui n'a pas de plafond mais vaut pour tous vos dépôts ; les options `--batch-files` et `--format-retries` n'ont pas de plafond non plus, mais ne corrigent pas un fichier refusé) |";
-    assert_eq!(
-        lines.iter().filter(|l| l.starts_with("| 0.17 |")).count(),
-        1
-    );
-    let i = lines
-        .iter()
-        .position(|l| *l == expected)
-        .expect("ligne 0.17 absente");
-    assert!(lines[i + 1].starts_with("| 0.16.1 |"));
-}
-
-#[test]
-fn REQ048_AC11_readme_second_remede() {
-    let readme = repo_file("README.md");
-    let expected = "Deux remèdes : `exclude` dans [`.nephila.toml`](#fichier-de-projet-nephilatoml), qui retire aussi sa structure du graphe ; ou une valeur plus grande de `max_chunk_chars` (dans `.nephila.toml`, au plus 1000000, ou dans la configuration personnelle), qui réduit le nombre de morceaux, donc d'appels, mais vaut pour tous les fichiers et allonge chaque requête. `max_chunk_chars` ne suffit pas pour un fichier de plus de 7500 nœuds (50 appels de 150 nœuds), comme une classe générée de 20 000 méthodes : seul `exclude` règle alors le cas.";
-    let lines: Vec<&str> = readme
-        .lines()
-        .filter(|l| {
-            l.contains("trop d'appels d'enrichissement (134 nécessaires, au plus 50 par fichier)")
-        })
-        .collect();
-    assert_eq!(lines.len(), 1);
-    assert!(lines[0].ends_with(expected), "{}", lines[0]);
-    assert!(!readme.contains("Seul remède"));
 }
 
 #[test]
@@ -924,66 +757,6 @@ fn REQ041_AC10_textes_des_exemples_sur_les_enrichissements_conserves() {
 }
 
 #[test]
-fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
-    let readme = repo_file("README.md");
-    for expected in [
-        "Les requêtes (`query`) ne parcourent pas le dépôt : elles répondent d'après le graphe, même s'il est en retard sur les fichiers. Avec `--check-stale`, elles le vérifient d'abord et le signalent sur stderr (`avertissement: graphe pas à jour : 1 fichier modifié`).",
-        "Toutes les requêtes acceptent `--json` et `--check-stale`.",
-        "**Graphe en retard** : par défaut, une requête ne lit que le graphe et ne dit pas s'il est en retard sur les fichiers. Avant une série de requêtes, `nephila status` le vérifie en comparant les contenus, et `nephila update` le remet à jour. Pour vérifier au moment de la requête, ajoutez `--check-stale` : la requête parcourt d'abord le dépôt et compare la taille et la date de modification de chaque fichier à celles du graphe, sans lire les fichiers déjà indexés (les filtres de `.nephila.toml` s'appliquent). Elle répond ensuite normalement ; si des fichiers diffèrent, stderr commence par `avertissement: graphe pas à jour : <n> fichiers modifiés`, où `<n>` compte les fichiers ajoutés, supprimés, modifiés et en attente. Ce compte est approché, et `nephila status` peut en donner un autre :",
-        "- un fichier seulement touché (date changée, contenu identique, après un aller-retour entre deux branches git par exemple) est compté ; `nephila update` enregistre sa nouvelle date et l'avertissement disparaît ;",
-        "- un fichier réécrit à taille égale, avec sa date d'origine restaurée, n'est pas compté ;",
-        "- un `package.json` d'un graphe 0.9, à réanalyser en fichier de build, n'est pas compté.",
-        "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
-        "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
-        "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.25.2 ",
-        "git tag v0.25.2 && git push origin v0.25.2",
-    ] {
-        assert!(readme.contains(expected), "absent : {expected}");
-    }
-    assert!(!readme
-        .contains("Si le graphe est en retard sur les fichiers, elles le signalent sur stderr"));
-    let lines: Vec<&str> = readme.lines().collect();
-    let i19 = lines
-        .iter()
-        .position(|l| l.starts_with("| 0.19 |"))
-        .expect("ligne 0.19 absente");
-    let i18 = lines
-        .iter()
-        .position(|l| l.starts_with("| 0.18 |"))
-        .expect("ligne 0.18 absente");
-    assert_eq!(i19 + 1, i18);
-    let i192 = lines
-        .iter()
-        .position(|l| l.starts_with("| 0.19.2 |"))
-        .expect("ligne 0.19.2 absente");
-    assert_eq!(i192 + 1, i19);
-    let i20 = lines
-        .iter()
-        .position(|l| l.starts_with("| 0.20 |"))
-        .expect("ligne 0.20 absente");
-    assert_eq!(i20 + 1, i192);
-    let v19 = readme.find("- **Vers 0.19**").expect("puce Vers 0.19");
-    let v18 = readme.find("- **Vers 0.18**").expect("puce Vers 0.18");
-    assert!(v19 < v18);
-}
-
-#[test]
-fn REQ055_AC1_readme_0_19_migration_sur_place() {
-    let readme = repo_file("README.md");
-    let sec = readme_section(&readme, "## Mise à niveau");
-    assert!(sec.contains("schéma 6"));
-    assert!(sec.contains("sans appel LLM"));
-    let row = readme
-        .lines()
-        .find(|l| l.starts_with("| 0.19 |"))
-        .expect("ligne 0.19");
-    for w in ["query ask", "neighbors", "path", "schéma 6"] {
-        assert!(row.contains(w), "{w}");
-    }
-}
-
-#[test]
 fn REQ041_AC11_blocs_des_options_llm_de_l_exemple_de_config() {
     let text = example("config.toml");
     let lines: Vec<&str> = text.lines().collect();
@@ -1022,106 +795,6 @@ fn REQ041_AC11_blocs_des_options_llm_de_l_exemple_de_config() {
     for k in ["effort", "thinking", "max_output_tokens"] {
         assert!(!project.contains(k), "{k} dans nephila.toml");
     }
-}
-
-#[test]
-fn REQ058_AC12_readme_options_llm_table_et_phrase() {
-    let readme = repo_file("README.md");
-    let lines: Vec<&str> = readme.lines().collect();
-    for k in [
-        "effort",
-        "thinking",
-        "max_output_tokens",
-        "max_completion_tokens",
-        "reasoning_effort",
-        "output_config",
-    ] {
-        assert!(readme.contains(k), "absent : {k}");
-    }
-    let rows = [
-        "| `max_output_tokens` | `max_tokens` | `max_completion_tokens` | sans effet |",
-        "| `thinking = true` | `\"thinking\": {\"type\": \"adaptive\"}` | aucun champ propre (voir `effort`) | sans effet |",
-        "| `effort` (avec `thinking = true` seulement) | `output_config.effort` | `reasoning_effort` | sans effet |",
-    ];
-    let first = lines
-        .iter()
-        .position(|l| *l == rows[0])
-        .expect("première ligne de la table absente");
-    assert_eq!(
-        lines[first - 2],
-        "| Clé | `anthropic` | `openai` | `mock` |"
-    );
-    assert_eq!(lines[first - 1], "|---|---|---|---|");
-    assert_eq!(lines[first + 1], rows[1]);
-    assert_eq!(lines[first + 2], rows[2]);
-    assert_eq!(lines[first + 3], "");
-    assert_eq!(
-        lines[first + 4],
-        "Avec thinking = false, aucun champ de réflexion n'est envoyé ; un modèle qui réfléchit toujours le fait quand même. Pour limiter sa réflexion : thinking = true et effort = \"low\". Un modèle qui ne prend pas en charge ces champs refuse la requête (HTTP 400). Chez anthropic, la réflexion adaptative demande un modèle Claude 4.6 ou suivant : claude-sonnet-4-5, le modèle des exemples, la refuse. Ces trois clés ne sont lues que dans la configuration personnelle : .nephila.toml les refuse."
-    );
-    let expected = "| 0.20 | Options LLM thinking, effort et max_output_tokens dans la configuration personnelle. Rupture : une limite de sortie de 16384 jetons est envoyée par défaut, à anthropic (au lieu de 8192) et désormais à openai ; un modèle ou un serveur qui ne l'accepte pas refuse la requête (HTTP 400) : baissez max_output_tokens. Une réponse tronquée conseille aussi d'augmenter max_output_tokens. |";
-    assert_eq!(lines.iter().filter(|l| **l == expected).count(), 1);
-    let sec = readme_section(&readme, "## Configuration du LLM");
-    for w in ["16384", "HTTP 400", "\"low\""] {
-        assert!(sec.contains(w), "section sans : {w}");
-    }
-    assert!(!readme.contains("- **Vers 0.20**"));
-    let cfg = readme
-        .lines()
-        .filter(|l| l.starts_with("| `thinking` |") || l.starts_with("| `effort` |"))
-        .count();
-    assert_eq!(cfg, 2);
-}
-
-#[test]
-fn REQ058_AC15_readme_textes_de_la_reponse_tronquee_revises() {
-    let readme = repo_file("README.md");
-    for expected in [
-        "avertissement: db/schema.sql : réponse tronquée par la limite de jetons ; réduisez max_chunk_chars ou batch_files, ou augmentez max_output_tokens",
-        "erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée ou augmentez max_output_tokens",
-    ] {
-        assert!(readme.lines().any(|l| l == expected), "absent : {expected}");
-    }
-}
-
-#[test]
-fn REQ065_AC1_readme_0_21_stockage_allege() {
-    let readme = repo_file("README.md");
-    let row = "| 0.21 | Stockage SQLite allégé : contexte d'imports stocké une fois par fichier, index inutiles retirés, cache SQLite agrandi à chaque ouverture en écriture, écritures regroupées, build neuf sans recalcul répété des nœuds. Même graphe qu'en 0.20 ; le schéma 7 est migré sur place. |";
-    let bullet = "- **Vers 0.21** : le graphe passe au schéma 7 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.20 tel quel. La place libérée n'est rendue au disque que par `sqlite3 .nephila/graph.db 'VACUUM'`. Un binaire 0.20 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).";
-    let lines: Vec<&str> = readme.lines().collect();
-    assert_eq!(lines.iter().filter(|l| **l == row).count(), 1);
-    let i21 = lines.iter().position(|l| *l == row).unwrap();
-    let i20 = lines
-        .iter()
-        .position(|l| l.starts_with("| 0.20 |"))
-        .expect("ligne 0.20 absente");
-    assert_eq!(i21 + 1, i20);
-    let sec = readme_section(&readme, "## Mise à niveau");
-    let b = sec.find(bullet).expect("puce Vers 0.21 absente");
-    let v19 = sec.find("- **Vers 0.19**").expect("puce Vers 0.19");
-    assert!(b < v19);
-    assert_eq!(sec[b..v19].trim_end(), bullet);
-}
-
-#[test]
-fn REQ066_AC1_readme_0_22_mise_a_jour_incrementale() {
-    let readme = repo_file("README.md");
-    let row = "| 0.22 | Mise à jour incrémentale : `update` ne résout plus que les références touchées par les fichiers changés et ne relit plus toute la table des liens ; résumé global calculé sans relire le graphe ; une seule résolution complète par commande avec LLM. Même graphe qu'en 0.21 ; le schéma 8 est migré sur place. |";
-    let bullet = "- **Vers 0.22** : le graphe passe au schéma 8 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, et la première résolution qui suit est complète ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.21 tel quel. Un binaire 0.21 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).";
-    let lines: Vec<&str> = readme.lines().collect();
-    assert_eq!(lines.iter().filter(|l| **l == row).count(), 1);
-    let i22 = lines.iter().position(|l| *l == row).unwrap();
-    let i21 = lines
-        .iter()
-        .position(|l| l.starts_with("| 0.21 |"))
-        .expect("ligne 0.21 absente");
-    assert_eq!(i22 + 1, i21);
-    let sec = readme_section(&readme, "## Mise à niveau");
-    let b = sec.find(bullet).expect("puce Vers 0.22 absente");
-    let v21 = sec.find("- **Vers 0.21**").expect("puce Vers 0.21");
-    assert!(b < v21);
-    assert_eq!(sec[b..v21].trim_end(), bullet);
 }
 
 fn cargo_minor() -> String {
@@ -1195,69 +868,6 @@ fn REQ071_AC6_exemples_et_readme_sans_fils_d_analyse() {
             assert!(!text.contains(bad), "{name} : {bad}");
         }
     }
-}
-
-#[test]
-fn REQ071_AC11_readme_option_jobs() {
-    let readme = repo_file("README.md");
-    // Les textes de la 0.23 restent dans la puce et la ligne de ce numéro (la 0.24 les suit).
-    let version = "0.23";
-    let lines: Vec<&str> = readme.lines().collect();
-    for cmd in ["build ", "update"] {
-        let prefix = format!("nephila {cmd}");
-        let n = lines
-            .iter()
-            .filter(|l| {
-                l.starts_with(&prefix)
-                    && l.contains(" [--enrich-code] [--jobs <N>] [--batch-files <N>] ")
-            })
-            .count();
-        assert_eq!(n, 1, "ligne d'usage de {cmd}");
-    }
-    let jobs = "| `--jobs <N>` | Nombre de fils du parcours du dépôt et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs disponibles (au plus 256 ; 4 si le système ne le donne pas). Pas de clé de configuration ; indépendant de `concurrency`, qui ne règle que les appels LLM. Quel que soit N, `build` et `update` gardent en mémoire, du parcours à l'extraction, jusqu'à 256 Mio de contenus lus ; au-delà, l'extraction relit les fichiers |";
-    assert_eq!(lines.iter().filter(|l| **l == jobs).count(), 1);
-    let ij = lines.iter().position(|l| *l == jobs).unwrap();
-    assert!(lines[ij + 1].starts_with("| `--batch-files <N>` |"));
-    // REQ136_AC2 : AC-136-2, le plafond écrit est celui du code.
-    let before = jobs.split(" Mio").next().unwrap();
-    let digits: String = before
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    assert_eq!(
-        digits.parse::<usize>().unwrap(),
-        nephila::scan::RETAIN_BUDGET / (1024 * 1024)
-    );
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|l| l.starts_with("| `--jobs <N>` |"))
-            .count(),
-        1
-    );
-    let conc =
-        "| `concurrency` | Appels LLM simultanés ; sans effet sur l'extraction, réglée par `--jobs` | 4 |";
-    assert_eq!(lines.iter().filter(|l| **l == conc).count(), 1);
-    assert!(readme.contains("; le nombre de fils annoncé au début de la phase structure est celui de `--jobs` (au plus le nombre de fichiers), celui de l'enrichissement vient de `concurrency`"));
-    let sec = readme_section(&readme, "## Mise à niveau");
-    let start = format!("- **Vers {version}** : le parcours du dépôt et l'extraction utilisent par défaut un fil par cœur disponible");
-    let b = sec.find(&start).expect("puce Vers 0.23 absente");
-    let v22 = sec.find("**Vers 0.22**").expect("puce Vers 0.22");
-    assert!(b < v22);
-    assert!(sec[b..v22].contains("ajoutez --jobs 1 à nephila build et nephila update."));
-    let row = lines
-        .iter()
-        .find(|l| l.starts_with(&format!("| {version} |")))
-        .expect("ligne de version");
-    assert!(row.contains("Option --jobs de build et update : nombre de fils du parcours du dépôt et de l'extraction, par défaut le nombre de cœurs disponibles ; concurrency ne règle plus que les appels LLM."));
-    assert!(row.contains("arcours du dépôt et empreintes en parallèle, fichier lu une seule fois pour son empreinte et son analyse, écriture SQLite allégée, même graphe qu'en 0.22 quel que soit le nombre de fils"));
-    let i23 = lines.iter().position(|l| l == row).unwrap();
-    assert!(lines[i23 + 1].starts_with("| 0.22 |"));
-    assert!(!readme.contains("Appels simultanés |"));
 }
 
 #[test]
@@ -1347,289 +957,6 @@ fn REQ079_AC7_exemple_de_projet_bloc_exclude_defaults() {
 }
 
 #[test]
-fn REQ079_AC7_readme_sous_section_exclusions_par_defaut() {
-    let readme = repo_file("README.md");
-    assert!(readme.contains("Par défaut, `nephila` analyse tout ce qu'il prend en charge, hors des [exclusions par défaut](#exclusions-par-défaut) (sorties de build, dépendances copiées, réglages d'IDE, JavaScript minifié)."));
-    let sec = readme_section(&readme, "### Exclusions par défaut");
-    for needle in [
-        "Sans réglage, `nephila` n'analyse pas ces chemins, à tout niveau du dépôt (`web/dist/` comme `dist/`) :",
-        "| Exclu par défaut | Contenu habituel |",
-        "| `dist/`, `out/` | sorties de build |",
-        "| `coverage/` | rapports de couverture des tests |",
-        "| `.next/`, `.nuxt/` | sorties de Next.js et de Nuxt |",
-        "| `vendor/` | dépendances copiées dans le dépôt |",
-        "| `.idea/` | réglages des IDE JetBrains |",
-        "| `*.min.js` | JavaScript minifié |",
-        "Le nom doit être exact, casse comprise : `distrib/`, `outils/` et `Dist/` sont analysés, comme `app.min.mjs`. Ces exclusions ne sont pas des filtres : elles ne comptent pas dans « fichiers exclus par les filtres », et `!motif` ne les annule pas.",
-        "Si l'un de ces dossiers contient votre code (un package Java `out` ou `vendor`, par exemple), désactivez-les toutes dans `.nephila.toml` :",
-        "```toml\nexclude_defaults = false\n```",
-        "Ces chemins sont alors analysés comme les autres (types pris en charge, `.gitignore`, filtres). Pour en garder certains exclus, ajoutez-les à `exclude` : `exclude = [\"dist/\", \"*.min.js\"]`. Il n'y a pas d'option de ligne de commande : la clé est lue par toutes les commandes qui parcourent le dépôt, `status` compris. `target/`, `build/`, `.gradle/`, `node_modules/` et les fichiers de verrouillage restent toujours exclus.",
-    ] {
-        assert!(sec.contains(needle), "absent : {needle}");
-    }
-    let at = |needle: &str| readme.find(needle).unwrap();
-    assert!(at("### Exclusions par défaut") < at("### Motifs"));
-    assert!(at("## Filtrer l'analyse") < at("### Exclusions par défaut"));
-    assert!(readme.contains("Les filtres (`exclude`, `exclude_types`), `exclude_defaults` (voir [Exclusions par défaut](#exclusions-par-défaut)) et les six réglages sont facultatifs"));
-}
-
-#[test]
-fn REQ079_AC7_readme_puce_vers_024_et_ligne_du_tableau() {
-    let readme = repo_file("README.md");
-    assert_eq!(cargo_minor(), "0.25");
-    let sec = readme_section(&readme, "## Mise à niveau");
-    let bullet = "- **Vers 0.24** : les dossiers dist/, out/, coverage/, .next/, .nuxt/, vendor/ et .idea/, à tout niveau, et les fichiers *.min.js sont exclus par défaut. nephila status liste comme supprimé chaque fichier du graphe qu'ils contiennent, et le premier nephila update les retire, sans appel LLM. Pour les garder : exclude_defaults = false dans .nephila.toml.";
-    let b = sec.find(bullet).expect("puce Vers 0.24 absente");
-    let ren = sec.find("- **Renommage `rkg`").expect("puce du renommage");
-    let v23 = sec.find("- **Vers 0.23**").expect("puce Vers 0.23");
-    assert!(ren < b && b < v23);
-    assert_eq!(sec[b..v23].trim_end(), bullet);
-    let lines: Vec<&str> = readme.lines().collect();
-    let i = lines
-        .iter()
-        .position(|l| l.starts_with("| 0.24 |"))
-        .expect("ligne 0.24");
-    assert!(lines[i + 1].starts_with("| 0.23 |"));
-    let row = lines[i];
-    assert!(row.starts_with("| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit."));
-    assert!(row.contains("Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe."));
-    for w in [
-        "déduplications linéaires",
-        "un parser par fil",
-        "export en flux sans nouvelle résolution",
-        "profil release optimisé",
-        "banc de performance",
-    ] {
-        assert!(row.contains(w), "ligne 0.24 sans : {w}");
-    }
-    // REQ-102, REQ-103 : collision de noms après conversion, phrase en fin de cellule.
-    assert!(
-        row.contains(
-            "Deux noms identiques après conversion : le fichier déjà indexé reste retenu, un fichier illisible est ignoré et laisse la place au suivant, que l'avertissement nomme par son nom réel. Les déclarations imbriquées"
-        ),
-        "ligne 0.24 : phrase de collision absente avant la phrase d'imbrication"
-    );
-    assert!(
-        !lines.iter().any(|l| l.starts_with("| 0.24.1 |")),
-        "aucune ligne 0.24.1"
-    );
-}
-
-#[test]
-fn req104_req105_readme_declarations_imbriquees_ignorees() {
-    let readme = repo_file("README.md");
-    assert!(readme.contains("déclarations imbriquées au-delà de 1000 niveaux ignorées"));
-    let row = readme
-        .lines()
-        .find(|l| l.starts_with("| 0.24 |"))
-        .expect("ligne 0.24");
-    assert!(
-        row.contains("Les déclarations imbriquées au-delà de 1000 niveaux sont ignorées avec un avertissement, le reste du fichier est indexé ; les avertissements de l'analyse sont écrits triés par chemin, quel que soit --jobs."),
-        "{row}"
-    );
-    assert!(readme.contains(
-        "avertissement: <fichier> : déclarations imbriquées au-delà de 1000 niveaux ignorées"
-    ));
-    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
-    for banned in ["profondeur", "récursion"] {
-        for l in readme.lines().filter(|l| l.contains("imbriquées")) {
-            assert!(!l.contains(banned), "{l}");
-        }
-    }
-}
-
-#[test]
-fn REQ080_AC1_readme_paragraphe_de_l_export_en_flux() {
-    let readme = repo_file("README.md");
-    let json = "**Format JSON** : objet avec `version`, `nodes`, `edges` et `unresolved`.";
-    let para = "Le document est écrit au fil de la lecture du graphe, sans le charger en mémoire. Si l'export échoue en cours de route (disque plein, sortie fermée par le lecteur), la commande s'arrête sur une ligne erreur: et un code non nul : le fichier commencé est supprimé, y compris un export précédent du même nom, et avec --output - stdout peut contenir un début de document. Seul le code de sortie 0 garantit un document complet.";
-    let sec = readme_section(&readme, "## Export et vue HTML");
-    let a = sec.find(json).expect("phrase du format JSON");
-    let b = sec.find(para).expect("paragraphe de l'export en flux");
-    assert!(a < b);
-    assert_eq!(sec[a + json.len()..b].trim(), "");
-}
-
-#[test]
-fn REQ082_AC4_readme_commande_du_banc_et_lignes_banc() {
-    let readme = repo_file("README.md");
-    let sec = readme_section(&readme, "## Développement");
-    let cmd = "cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf_banc";
-    assert!(sec.lines().any(|l| l.starts_with(cmd)), "commande du banc");
-    for needle in [
-        "banc: <commande> --no-llm : parcours",
-        "structure",
-        "résolution",
-        "médiane de 3",
-        "banc: fixture",
-    ] {
-        assert!(sec.contains(needle), "lecture des lignes banc : {needle}");
-    }
-}
-
-#[test]
-fn REQ086_AC5_readme_sortie_standard_fermee() {
-    let readme = repo_file("README.md");
-    let codes = readme_section(&readme, "## Codes de sortie");
-    let prev = "stdout ne contient que le résultat.";
-    let para = "Si stdout est fermée avant la fin de la sortie (lecteur arrêté, | head), toute commande s'arrête sur une seule ligne erreur: écriture sur stdout impossible : <cause> et le code 1, sans rien écrire de plus. build et update ont déjà enregistré le graphe : seul leur bilan manque, et nephila status donne l'état. Une commande qui n'avait rien à écrire sur stdout garde son propre message.";
-    let a = codes.find(prev).expect("phrase précédente");
-    let b = codes.find(para).expect("paragraphe de la sortie fermée");
-    assert_eq!(codes[a + prev.len()..b].trim(), "");
-
-    let export = readme_section(&readme, "## Export et vue HTML");
-    assert!(export.contains("Seul le code de sortie 0 garantit un document complet. Avec --output <fichier>, si seule la ligne du chemin ne peut être écrite sur stdout, le fichier, complet, est gardé, avec la même erreur et le code 1."));
-
-    let row = readme
-        .lines()
-        .find(|l| l.starts_with("| 0.24 |"))
-        .expect("ligne 0.24");
-    assert!(row.starts_with("| 0.24 | Rupture : "));
-    assert!(row.contains("banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. Graphe à résoudre : nephila status l'annonce"));
-    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
-}
-
-#[test]
-fn REQ088_REQ089_REQ090_readme_graphe_a_resoudre_erreur_et_trace() {
-    let readme = repo_file("README.md");
-    for expected in [
-        "graphe à résoudre : lancez nephila update",
-        "erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe",
-        " (incrémentale, <N> références réévaluées)",
-        "un graphe d'une version antérieure à la 0.22 est annoncé « graphe à résoudre » jusqu'au premier `nephila update`",
-    ] {
-        assert!(readme.contains(expected), "absent : {expected}");
-    }
-    let status = readme_section(&readme, "### `nephila status`");
-    assert!(status.contains("graphe à résoudre : lancez nephila update"));
-    let codes = readme_section(&readme, "## Codes de sortie");
-    assert!(codes.contains(
-        "erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe"
-    ));
-    let traces = readme_section(&readme, "### Traces (`--verbose`)");
-    assert!(traces.contains(" (incrémentale, <N> références réévaluées)"));
-    assert!(traces.contains("(complète)"));
-    for banned in ["corrompu", "invalide", "périmé"] {
-        for l in status.lines().chain(traces.lines()) {
-            assert!(
-                !l.contains(banned) || !l.contains("résol"),
-                "mot interdit : {l}"
-            );
-        }
-    }
-    let row = readme
-        .lines()
-        .find(|l| l.starts_with("| 0.24 |"))
-        .expect("ligne 0.24");
-    assert!(row.contains(" Graphe à résoudre : nephila status l'annonce (graphe à résoudre : lancez nephila update) après une commande interrompue ou une passe de résolution en échec (erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe) ; --verbose dit si la passe est complète ou incrémentale."), "ligne 0.24 : {row}");
-    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
-}
-
-#[test]
-fn REQ091_REQ092_REQ093_REQ094_REQ095_REQ096_REQ097_REQ041_readme_causes_d_arret_et_essais_http() {
-    let readme = repo_file("README.md");
-    for expected in [
-        "requête refusée par <fournisseur> (HTTP <code>) sur <url>",
-        "corrigez base_url",
-        "fournisseur saturé : relancez nephila update plus tard ou réduisez concurrency",
-        "délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur",
-        "llm enrich découpe",
-        "après lecture interrompue",
-        "requête redirigée",
-        "politique: délais dépassés consécutifs",
-    ] {
-        assert!(readme.contains(expected), "absent : {expected}");
-    }
-    assert!(!readme.contains("tout le lot échoue"));
-    for banned in [" rejetée", " coupée", " coupées"] {
-        assert!(!readme.contains(banned), "mot interdit : {banned}");
-    }
-    for l in readme.lines() {
-        assert!(
-            !l.contains(" timeout ") && !l.contains(" un timeout"),
-            "timeout en prose : {l}"
-        );
-    }
-    let row = readme
-        .lines()
-        .find(|l| l.starts_with("| 0.24 |"))
-        .expect("ligne 0.24");
-    assert!(row.ends_with(" |"));
-    let tail = row.rsplit("complète ou incrémentale.").next().unwrap();
-    for expected in [
-        "requête refusée",
-        "redirection",
-        "délais dépassés répétés",
-        "redirections ne sont pas suivies",
-    ] {
-        assert!(tail.contains(expected), "ligne 0.24, absent : {expected}");
-    }
-    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
-    let http = readme_section(&readme, "### Nouveaux essais HTTP");
-    for expected in [
-        "requête refusée",
-        "redirection",
-        "saturé",
-        "lecture interrompue",
-        "un seul nouvel envoi",
-    ] {
-        assert!(http.contains(expected), "section HTTP, absent : {expected}");
-    }
-    let tronq = readme_section(&readme, "### Réponse tronquée par la limite de jetons");
-    let que_faire = tronq
-        .lines()
-        .find(|l| l.starts_with("Que faire"))
-        .expect("Que faire");
-    assert!(!que_faire.contains("batch_files") && !que_faire.contains("--batch-files"));
-    assert!(que_faire.contains("max_chunk_chars") && que_faire.contains("max_output_tokens"));
-    assert!(row.contains("`erreur: requête refusée par <fournisseur> (HTTP <code>) sur <url>`"));
-    assert!(row.contains(
-        "`erreur: <fournisseur> redirige (HTTP <code>) vers <adresse> ; corrigez base_url`"
-    ));
-    assert!(!row.contains("trois délais dépassés répétés"));
-    let lots = readme_section(&readme, "## Enrichissement en lots");
-    assert!(lots.contains("llm enrich découpe"));
-}
-
-#[test]
-fn REQ111_AC1_readme_documente_les_fils_refuses_par_le_systeme() {
-    let readme = repo_file("README.md");
-    for expected in [
-        "parcours du dépôt impossible : ",
-        "création des fils d'analyse impossible : ",
-        "--jobs 1",
-        "fils démarrés sur",
-        "exclusions par défaut : ",
-        "schéma: migration",
-    ] {
-        assert!(readme.contains(expected), "absent : {expected}");
-    }
-    let row = readme
-        .lines()
-        .find(|l| l.starts_with("| 0.24 |"))
-        .expect("ligne 0.24");
-    assert!(row.ends_with(" |"));
-    let tail = row.rsplit("quel que soit --jobs.").next().unwrap();
-    for expected in [
-        "refusé par le système",
-        "plafond de processus",
-        "ligne `erreur:`",
-        "--check-stale",
-        "graphe pas à jour",
-        "première de stderr",
-    ] {
-        assert!(tail.contains(expected), "ligne 0.24, absent : {expected}");
-    }
-    assert!(!readme.lines().any(|l| l.starts_with("| 0.24.1 |")));
-    for banned in ["thread", "worker"] {
-        for l in readme.lines().filter(|l| l.contains("impossible : ")) {
-            assert!(!l.contains(banned), "mot interdit {banned} : {l}");
-        }
-        assert!(!tail.contains(banned), "mot interdit {banned} : {tail}");
-    }
-}
-
-#[test]
 fn REQ122_AC1_readme_installe_avec_locked() {
     let readme = repo_file("README.md");
     assert!(
@@ -1643,47 +970,6 @@ fn REQ122_AC1_readme_installe_avec_locked() {
             "{title} : `cargo install --locked --path .` absent"
         );
     }
-}
-
-#[test]
-fn REQ116_REQ117_REQ123_readme_ci_dependabot_audit_et_chaine_epinglee() {
-    let readme = repo_file("README.md");
-    let sec = readme_section(&readme, "## Développement");
-    for needle in [
-        ".github/dependabot.yml", // AC-116-2
-        "git ls-remote --tags https://github.com/",
-        "refs/heads/stable",
-        "cargo deny check advisories", // AC-117-4
-        "rust-toolchain.toml",         // AC-123-4
-    ] {
-        assert!(sec.contains(needle), "section Développement : {needle}");
-    }
-}
-
-/// AC-124-4 : `cargo test` passe aussi, nextest reste la référence.
-#[test]
-fn REQ124_AC4_readme_cargo_test_passe_aussi() {
-    let readme = repo_file("README.md");
-    let sec = readme_section(&readme, "## Développement");
-    assert!(
-        sec.contains(
-            "`cargo test` passe aussi (tests en parallèle, sans limite de temps par test) ; \
-             `cargo nextest run` reste la commande de référence, celle de la CI."
-        ),
-        "phrase `cargo test` absente de la section Développement"
-    );
-    assert!(!readme.contains("seul nextest"), "« seul nextest » présent");
-}
-
-#[test]
-fn REQ131_AC131_5_readme_traces_enrichissements_illisibles() {
-    let readme = repo_file("README.md");
-    let traces = readme_section(&readme, "### Traces (`--verbose`)");
-    let expected = "`, <r> enrichissements conservés`), suivi, quand des enrichissements conservés ne se lisent plus (graphe écrit par une version plus récente, données abîmées), de leur nombre (`, <M> enrichissements illisibles écartés` ; ces fichiers sont enrichis de nouveau) ; le nombre de fils annoncé";
-    assert!(
-        traces.contains(expected),
-        "phrase absente de la section Traces"
-    );
 }
 
 const THINKING_BLOCK: &str = "# Demande au modèle de réfléchir avant de répondre. Booléen ; défaut : false. true : nephila
@@ -1739,37 +1025,10 @@ fn REQ135_AC1_bloc_effort_de_l_exemple_de_config_au_texte_exact() {
     assert_eq!(example_block_ending_at("# effort = \"low\""), EFFORT_BLOCK);
 }
 
-#[test]
-fn REQ135_AC2_readme_ligne_effort_de_la_table_des_cles() {
-    let readme = repo_file("README.md");
-    let wanted = "| `effort` | `\"low\"`, `\"medium\"` ou `\"high\"` : niveau de la réflexion. N'a d'effet qu'avec `thinking = true`. À `\"medium\"` ou `\"high\"`, les appels durent plus longtemps : augmentez `timeout_secs` (600, par exemple), car trois délais dépassés de suite arrêtent l'envoi ; configuration personnelle seulement | `\"low\"` |";
-    let found: Vec<&str> = readme
-        .lines()
-        .filter(|l| l.starts_with("| `effort` |"))
-        .collect();
-    assert_eq!(found, vec![wanted]);
-}
-
-const CONFIG_BULLET: &str = "- la configuration (fournisseur, modèle, `enrich_code`, `thinking`, `effort`, `max_output_tokens`, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;";
-
 fn without_timestamp(line: &str) -> String {
     let start = line.find('[').expect("horodatage");
     let end = line[start..].find("s] ").expect("fin d'horodatage") + start + 3;
     format!("{}{}", &line[..start], &line[end..])
-}
-
-#[test]
-fn REQ134_AC1_readme_traces_puce_de_la_configuration_et_ligne_d_exemple() {
-    let readme = repo_file("README.md");
-    assert_eq!(readme.lines().filter(|l| *l == CONFIG_BULLET).count(), 1);
-    let examples: Vec<&str> = readme
-        .lines()
-        .filter(|l| l.starts_with("trace: ") && l.contains("config: llm="))
-        .collect();
-    assert_eq!(
-        examples,
-        vec!["trace: [0.000s] config: llm=mock model=m-projet enrich_code=false thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)"]
-    );
 }
 
 #[test]
@@ -1807,138 +1066,443 @@ fn REQ134_AC2_ligne_config_d_exemple_du_readme_est_la_sortie_reelle() {
 }
 
 #[test]
-fn REQ132_AC1_readme_attente_nouveaux_essais() {
-    let readme = repo_file("README.md");
-    let sec = readme_section(&readme, "### Nouveaux essais HTTP");
-    assert!(sec.contains("(15 s d'attente au plus par appel sans `retry-after` ; jusqu'à 60 s par nouvel essai quand le serveur le demande)"));
-    assert!(!readme.contains("(15 s d'attente au plus par appel)"));
-}
-
-#[test]
-fn REQ137_AC1_readme_tests_non_utf8_macos() {
-    let readme = repo_file("README.md");
-    let sec = readme_section(&readme, "## Développement");
-    let para = "Sous macOS, les tests des noms de fichiers non UTF-8 (`tests/non_utf8_names.rs` et ceux de `src/scan.rs`) passent sans rien vérifier : APFS refuse de créer ces noms, et chaque test s'arrête aussitôt. Seule la CI Linux les exécute vraiment ; une modification du traitement de ces noms se vérifie sous Linux.";
-    let lines: Vec<&str> = sec.lines().collect();
-    let ip = lines
-        .iter()
-        .position(|l| *l == para)
-        .expect("paragraphe absent");
-    let nx = lines
-        .iter()
-        .position(|l| l.starts_with("Les tests s'exécutent avec [cargo-nextest]"))
-        .unwrap();
-    let fence_open = (nx..lines.len())
-        .find(|&i| lines[i].starts_with("```"))
-        .unwrap();
-    let fence_close = (fence_open + 1..lines.len())
-        .find(|&i| lines[i].starts_with("```"))
-        .unwrap();
-    let banc = lines
-        .iter()
-        .position(|l| l.starts_with("Le banc de performance mesure"))
-        .unwrap();
-    assert!(fence_close < ip && ip < banc);
-}
-
-#[test]
-fn REQ151_AC1_AC3_readme_communautes_textes_exacts() {
-    let readme = repo_file("README.md");
-    let sec_text = r####"## Communautés
-
-Une communauté est un groupe de nœuds plus reliés entre eux qu'avec le reste du graphe : un sous-système du dépôt. nephila les calcule sans LLM, par l'algorithme de Leiden (modularité, résolution 1), avec ces règles : une communauté de plus d'un quart des nœuds (et de plus de 10 nœuds), ou d'au moins 50 nœuds de cohésion inférieure à 0,05, est redécoupée une fois. Tous les liens comptent, quels que soient leur genre et leur sens ; un nœud sans lien forme une communauté à lui seul. Le résultat ne dépend que du graphe : un même graphe donne les mêmes communautés, quel que soit `--jobs`.
-
-- **Numéro** : 0 pour la plus grande, puis par taille décroissante.
-- **Nom** : le nom court du nœud le plus relié de la communauté (son pivot), ou `communauté <numéro>` si ce nom est vide.
-- **Cohésion** : la part des paires de membres directement reliées, de 0 à 1 (1 pour une communauté d'un seul nœud). Proche de 1, un vrai sous-système ; proche de 0, un regroupement lâche.
-
-**Quand** : à chaque `nephila build`, et à chaque `nephila update` qui change le graphe (fichiers ou enrichissement), dans la même passe que le résumé ; un `update` sans changement ne les recalcule pas. Les numéros sont refaits à chaque calcul : pour retrouver une communauté d'un calcul à l'autre, désignez-la par un de ses nœuds (`--node`). Avec `--verbose`, chaque calcul écrit une ligne `communautés: <ms> ms, <n> communautés`, juste après la ligne `résolution:`.
-
-```
-$ nephila query community [<numéro>] [--node <nœud>] [--limit N]
-$ nephila query community
-0 Order (12 nœuds, cohésion 0.35)
-1 Payment (7 nœuds, cohésion 0.52)
-
-$ nephila query community --node shop.Order
-0 Order (12 nœuds, cohésion 0.35)
-  shop.Order (class, src/Order.java) - Une commande.
-  shop.Order.place (method, src/Order.java)
-  ...
-```
-
-Sans argument, `query community` liste les communautés par numéro. Avec un numéro, ou `--node` et un nœud, il affiche la ligne de la communauté puis ses membres, du plus relié au moins relié : le premier est le pivot. `--limit` vaut 50 par défaut, pour la liste comme pour les membres, et `N résultats supplémentaires` annonce le reste. `--json` donne `communities` (liste) ou `community` et `members` (détail), avec `remaining`. Un numéro absent sort avec le code 1 (``erreur: aucun résultat : communauté 99 introuvable (essayez `nephila query community`)``).
-
-- **Résumé** : `nephila summary` se termine par `Communautés (<total>)` et les 10 plus grandes (numéro, nom, taille) ; `--json` ajoute la clé `communities` (`total`, et `top` avec `id`, `label`, `size` et `cohesion`).
-- **Export JSON** : chaque nœud a une clé `community` (son numéro), et le document une clé `communities`, liste de `{"cohesion", "id", "label", "pivot", "size"}` triée par numéro. `version` reste 1.
-- **Vue HTML** : le choix « Couleur » colore les nœuds par genre (défaut) ou par communauté. Les 8 plus grandes ont chacune leur couleur, les autres sont grises ; la légende les nomme, et le panneau de détails donne la communauté du nœud choisi.
-
-**Graphe d'une version précédente** : tant que le premier `nephila update` (ou `build`) ne l'a pas migré, les communautés ne sont pas calculées. `query community` sort alors avec le code 1 (`erreur: communautés non calculées : lancez nephila update`), `summary` affiche `communautés non calculées (lancez nephila update)`, l'export écrit `"community": null` et `"communities": []`, et la vue désactive la couleur par communauté."####;
-    let bullet = r####"- **Vers 0.25** : le graphe passe au schéma 9 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, fait une résolution complète et calcule les communautés ; d'ici là, les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.24 tel quel, sans communautés. Un binaire 0.24 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée)."####;
-    let row = r####"| 0.25 | Communautés : le graphe est partagé en sous-systèmes par l'algorithme de Leiden, sans LLM (découpe des communautés trop grandes ou peu cohésives, nom tiré du nœud le plus relié, cohésion). nephila query community les liste et les détaille, nephila summary donne les 10 plus grandes, l'export JSON donne la communauté de chaque nœud et la vue HTML colore les nœuds par communauté (choix « Couleur »). Le schéma 9 est migré sur place. |"####;
-    let couleur = r####"- **Couleur** : par genre (défaut) ou par communauté ; voir [Communautés](#communautés)."####;
-    let cmd = r####"| `nephila query community [<numéro>]` | Communautés du graphe : liste, ou membres d'une communauté | non |"####;
-    let phrase = r####"La liste des communautés, ou celle d'un nœud et ses membres : [`nephila query community`](#communautés)."####;
-    let at = |needle: &str| {
-        readme
-            .find(needle)
-            .unwrap_or_else(|| panic!("absent : {needle}"))
-    };
-    // Sommaire : ligne juste après « Export et vue HTML ».
-    let lines: Vec<&str> = readme.lines().collect();
-    let i = lines
-        .iter()
-        .position(|l| *l == "- [Export et vue HTML](#export-et-vue-html)")
-        .expect("ligne du sommaire");
-    assert_eq!(lines[i + 1], "- [Communautés](#communautés)");
-    // Section entre Export et Configuration du LLM.
-    let s = at(sec_text);
-    assert!(at("\n## Export et vue HTML") < s && s < at("\n## Configuration du LLM"));
-    assert!(readme[..s].ends_with("\n\n"));
-    assert!(readme[s + sec_text.len()..].starts_with("\n\n## Configuration du LLM"));
-    assert_eq!(readme.matches("\n## Communautés\n").count(), 1);
-    // Puce Couleur juste après Filtres.
-    let f = lines
-        .iter()
-        .position(|l| l.starts_with("- **Filtres** : une case par genre"))
-        .expect("puce Filtres");
-    assert_eq!(lines[f + 1], couleur);
-    // Mise à niveau : puce avant la première puce Vers 0.24.
-    let up = readme_section(&readme, "## Mise à niveau");
-    let b = up.find(bullet).expect("puce Vers 0.25");
-    assert!(up.find("- **Renommage `rkg`").unwrap() < b);
-    assert!(b < up.find("- **Vers 0.24**").unwrap());
-    assert_eq!(up[b..].lines().next().unwrap(), bullet);
-    // Tableau des versions : ligne juste avant | 0.24 |.
-    let r = lines.iter().position(|l| *l == row).expect("ligne 0.25");
-    assert!(lines[r + 1].starts_with("| 0.24 |"));
-    assert!(!readme.lines().any(|l| l.starts_with("| 0.25.0 |")));
-    // Tableau des commandes.
-    let c = lines
-        .iter()
-        .position(|l| *l == cmd)
-        .expect("ligne query community");
-    assert!(lines[c - 1].starts_with("| `nephila query path <source> <cible>` |"));
-    assert!(lines[c + 1].starts_with("| `nephila query ask \"<question>\"` |"));
-    assert!(readme.contains(
-        "| `nephila summary [--json]` | Modules, nœuds les plus reliés, thèmes, communautés | non |"
-    ));
-    // Phrase de query search.
-    assert!(readme.contains(&format!(
-        "Une recherche sans résultat sort avec le code 1 (`erreur: aucun résultat pour « zzz »`). {phrase}"
-    )));
-}
-
-#[test]
-fn REQ154_AC1_version_0_25_2() {
+fn REQ156_AC1_version_0_25_3() {
     assert_eq!(cargo_minor(), "0.25");
     let toml = repo_file("Cargo.toml");
-    assert!(toml.lines().any(|l| l == "version = \"0.25.2\""));
+    assert!(toml.lines().any(|l| l == "version = \"0.25.3\""));
     let lock = repo_file("Cargo.lock");
-    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.25.2\""));
+    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.25.3\""));
     let readme = repo_file("README.md");
-    for needle in ["V=v0.25.2", "git tag v0.25.2 && git push origin v0.25.2"] {
+    for needle in ["V=v0.25.3", "git tag v0.25.3 && git push origin v0.25.3"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
-    assert!(!readme.contains("v0.25.1"));
+    assert!(!readme.contains("v0.25.2"));
+}
+
+/// Titres du README (niveau 1 et plus), hors blocs de code, tels qu'écrits.
+fn headings(readme: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in readme.lines() {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        let depth = line.chars().take_while(|c| *c == '#').count();
+        if !in_fence && depth > 0 && line.chars().nth(depth) == Some(' ') {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
+/// Lignes du README hors blocs de code.
+fn prose_lines(readme: &str) -> Vec<&str> {
+    let mut in_fence = false;
+    let mut out = Vec::new();
+    for line in readme.lines() {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Ancre d'un titre à la manière de GitHub.
+fn github_anchor(title: &str) -> String {
+    title
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == ' ')
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect()
+}
+
+#[test]
+fn github_anchor_calcule_les_ancres_de_reference() {
+    for (title, anchor) in [
+        ("Filtrer l'analyse", "filtrer-lanalyse"),
+        (
+            "Fichier de projet `.nephila.toml`",
+            "fichier-de-projet-nephilatoml",
+        ),
+        ("Arrêt de l'envoi", "arrêt-de-lenvoi"),
+        (
+            "LLM simulé (`provider = \"mock\"`)",
+            "llm-simulé-provider--mock",
+        ),
+    ] {
+        assert_eq!(github_anchor(title), anchor, "{title}");
+    }
+}
+
+const PLAN: [&str; 32] = [
+    "# Nephila",
+    "## Sommaire",
+    "## Démarrage rapide",
+    "## Installation",
+    "### Binaires précompilés",
+    "### Depuis les sources",
+    "## Commandes",
+    "### `nephila build` et `nephila update`",
+    "### `nephila status`",
+    "### `nephila query`",
+    "### `nephila summary`",
+    "### Traces et progression",
+    "## Usage par un agent",
+    "## Codes de sortie",
+    "## Filtrer l'analyse",
+    "### Exclusions par défaut",
+    "### Motifs et types",
+    "### Fichier de projet `.nephila.toml`",
+    "## Configuration du LLM",
+    "### Certificats TLS",
+    "## Enrichissement",
+    "### Lots et gros fichiers",
+    "### Échecs et nouveaux essais",
+    "### Arrêt de l'envoi",
+    "## Export et vue HTML",
+    "## Communautés",
+    "## Ce que l'analyse extrait",
+    "## Limites connues",
+    "## Mise à niveau",
+    "## Développement",
+    "### LLM simulé (`provider = \"mock\"`)",
+    "## Licence",
+];
+
+#[test]
+fn REQ155_AC1_readme_condense() {
+    let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .unwrap()
+        .len();
+    assert!(size <= 40_000, "README : {size} octets");
+    let readme = repo_file("README.md");
+    assert!(!readme.contains("| Version | Nouveautés |"));
+    assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
+    let upgrade = readme_section(&readme, "## Mise à niveau");
+    assert!(!upgrade.contains("rkg"));
+    for d in 0..=7 {
+        let bad = format!("Vers 0.1{d}");
+        assert!(!upgrade.contains(&bad), "absent attendu : {bad}");
+    }
+    for bad in ["Vers 0.9", "Depuis 0.2"] {
+        assert!(!upgrade.contains(bad), "absent attendu : {bad}");
+    }
+}
+
+#[test]
+fn REQ155_AC2_sommaire_sections_et_liens() {
+    let readme = repo_file("README.md");
+    let all = headings(&readme);
+    let level2: Vec<&String> = all.iter().filter(|h| h.starts_with("## ")).collect();
+    let expected2: Vec<&str> = PLAN
+        .iter()
+        .copied()
+        .filter(|h| h.starts_with("## "))
+        .collect();
+    assert_eq!(level2, expected2);
+    let after: Vec<&str> = expected2[1..].to_vec();
+    let wanted: Vec<String> = after
+        .iter()
+        .map(|h| {
+            let t = &h[3..];
+            format!("- [{t}](#{})", github_anchor(t))
+        })
+        .collect();
+    let found: Vec<String> = readme_section(&readme, "## Sommaire")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(found, wanted);
+    let anchors: BTreeSet<String> = all
+        .iter()
+        .map(|h| github_anchor(h.trim_start_matches('#').trim_start()))
+        .collect();
+    for line in prose_lines(&readme) {
+        let mut rest = line;
+        while let Some(i) = rest.find("](#") {
+            rest = &rest[i + 3..];
+            let end = rest.find(')').expect("lien interne non fermé");
+            assert!(
+                anchors.contains(&rest[..end]),
+                "ancre sans titre : #{}",
+                &rest[..end]
+            );
+            rest = &rest[end..];
+        }
+    }
+}
+
+#[test]
+fn REQ155_AC4_essentiel_pour_l_utilisateur() {
+    let readme = repo_file("README.md");
+    for needle in [
+        "SHA256SUMS",
+        ".nephila/",
+        ".gitignore",
+        "NEPHILA_CONFIG",
+        "$XDG_CONFIG_HOME/nephila/config.toml",
+        "~/.config/nephila/config.toml",
+        "en attente",
+        "à enrichir",
+        "graphe à résoudre : lancez nephila update",
+        "exclude_defaults = false",
+        "trop d'appels d'enrichissement",
+        "`exclude`",
+        "`max_chunk_chars`",
+        "réponse tronquée par la limite de jetons",
+        "retry-after",
+        "tls_ca_cert",
+        "tls_insecure",
+    ] {
+        assert!(readme.contains(needle), "absent : {needle}");
+    }
+}
+
+#[test]
+fn REQ155_AC5_essentiel_pour_un_agent() {
+    let readme = repo_file("README.md");
+    let agent = readme_section(&readme, "## Usage par un agent");
+    for needle in [
+        "nephila status --json",
+        "a_jour",
+        "nephila update",
+        "nephila query search --json",
+        "nephila query neighbors --json",
+        "nephila query path --json",
+        "nephila query community",
+        "--check-stale",
+        "nephila summary --json",
+        "nephila export --output -",
+    ] {
+        assert!(agent.contains(needle), "Usage par un agent : {needle}");
+    }
+    let codes = readme_section(&readme, "## Codes de sortie");
+    for needle in [
+        "| 0 |",
+        "| 1 |",
+        "| 2 |",
+        "erreur:",
+        "avertissement:",
+        "stderr",
+        "stdout",
+    ] {
+        assert!(codes.contains(needle), "Codes de sortie : {needle}");
+    }
+}
+
+#[test]
+fn REQ155_AC10_plan_des_titres() {
+    let readme = repo_file("README.md");
+    assert_eq!(headings(&readme), PLAN);
+}
+
+#[test]
+fn REQ155_AC11_usage_par_un_agent_en_trois_etapes() {
+    let readme = repo_file("README.md");
+    let agent = readme_section(&readme, "## Usage par un agent");
+    let numbered: Vec<&str> = agent
+        .lines()
+        .filter(|l| l.chars().next().is_some_and(|c| c.is_ascii_digit()) && l.contains(". "))
+        .collect();
+    assert_eq!(numbered.len(), 3, "{numbered:?}");
+    assert_eq!(
+        numbered[0],
+        "1. `nephila status --json` : si `a_jour` vaut `false`, lancer `nephila update`."
+    );
+    assert!(numbered[1].starts_with("2. "));
+    assert!(numbered[1].contains("nephila query community --json --node"));
+    assert!(numbered[2].starts_with("3. "));
+    for needle in ["genre:nom", "--check-stale", "nephila <commande> --help"] {
+        assert!(agent.contains(needle), "absent : {needle}");
+    }
+}
+
+/// Lignes de table qui suivent la ligne d'en-tête `header` et sa ligne `separator`.
+fn table_rows<'a>(section: &'a str, header: &str, separator: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = section.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| *l == header)
+        .unwrap_or_else(|| panic!("en-tête absent : {header}"));
+    assert_eq!(lines[at + 1], separator);
+    lines[at + 2..]
+        .iter()
+        .copied()
+        .take_while(|l| l.starts_with('|'))
+        .collect()
+}
+
+fn cell(row: &str, n: usize) -> &str {
+    row.split('|').nth(n + 1).expect("cellule").trim()
+}
+
+#[test]
+fn REQ155_AC12_table_d_arret_de_l_envoi() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "### Arrêt de l'envoi");
+    let rows = table_rows(&sec, "| Cause | Quand | Que faire |", "|---|---|---|");
+    let causes = [
+        ("Clé refusée", "`api_key_env`"),
+        ("Requête refusée", "`max_output_tokens`"),
+        ("Redirection", "`base_url`"),
+        ("Fournisseur saturé", "`concurrency`"),
+        ("Panne réseau", "`base_url`"),
+        ("Délais dépassés", "`timeout_secs`"),
+    ];
+    assert_eq!(rows.len(), 6, "{rows:?}");
+    for (row, (cause, action)) in rows.iter().zip(causes) {
+        assert_eq!(cell(row, 0), cause);
+        assert!(cell(row, 2).contains(action), "{row} : {action}");
+    }
+    for needle in ["erreur:", "nephila update", "à enrichir"] {
+        assert!(sec.contains(needle), "absent : {needle}");
+    }
+    assert!(!sec
+        .lines()
+        .any(|l| l.starts_with("erreur:") || l.starts_with("- `erreur:")));
+}
+
+#[test]
+fn REQ155_AC13_mise_a_niveau_en_cinq_actions() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "## Mise à niveau");
+    let bullets: Vec<&str> = sec.lines().filter(|l| l.starts_with("- **Vers ")).collect();
+    let wanted = [
+        ("- **Vers 0.25** :", ".nephila/"),
+        ("- **Vers 0.24** :", "exclude_defaults = false"),
+        ("- **Vers 0.23** :", "--jobs 1"),
+        ("- **Vers 0.19** :", "--check-stale"),
+        ("- **Vers 0.18** :", "enrich_code = true"),
+    ];
+    assert_eq!(bullets.len(), 5, "{bullets:?}");
+    for (bullet, (prefix, needle)) in bullets.iter().zip(wanted) {
+        assert!(bullet.starts_with(prefix), "{bullet}");
+        assert!(bullet.contains(needle), "{bullet} : {needle}");
+    }
+    assert!(sec.contains("https://github.com/tixplop/nephila-rs/releases"));
+    assert!(sec.contains("Un graphe 0.18 à 0.24 est migré sur place"));
+}
+
+#[test]
+fn REQ155_AC14_options_de_build_en_une_ligne() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "### `nephila build` et `nephila update`");
+    let rows = table_rows(&sec, "| Option | Effet |", "|---|---|");
+    let options = [
+        "`--no-llm`",
+        "`--enrich-code`",
+        "`-v, --verbose`",
+        "`--show-progress`",
+        "`--jobs <N>`",
+        "`--batch-files <N>`",
+        "`--format-retries <N>`",
+        "`--exclude <MOTIF>`",
+        "`--exclude-type <TYPES>`",
+    ];
+    assert_eq!(rows.len(), 9, "{rows:?}");
+    for (row, option) in rows.iter().zip(options) {
+        assert_eq!(cell(row, 0), option);
+        assert!(row.chars().count() <= 160, "{row}");
+    }
+    assert!(rows[3].contains("incompatible avec `--verbose`"));
+    assert!(rows[4].contains("`concurrency`"));
+    for needle in [
+        "en attente",
+        "à enrichir",
+        "erreur: indexation déjà en cours sur ce dépôt",
+    ] {
+        assert!(sec.contains(needle), "absent : {needle}");
+    }
+    assert!(!sec.contains("Mio"));
+}
+
+#[test]
+fn REQ155_AC15_traces_et_progression_sans_enumeration() {
+    let readme = repo_file("README.md");
+    let traces: Vec<&str> = readme
+        .lines()
+        .filter(|l| l.starts_with("trace: "))
+        .collect();
+    assert!(traces.len() <= 4, "{traces:?}");
+    assert_eq!(
+        traces.iter().filter(|l| l.contains("config: llm=")).count(),
+        1
+    );
+    assert!(!readme.lines().any(|l| l.starts_with("progression: ")));
+    let sec = readme_section(&readme, "### Traces et progression");
+    for needle in [
+        "progression: <phase> <p> % (<k>/<n> fichiers)",
+        "grep '^progression:'",
+        "incompatibles",
+        "Les traces ne contiennent jamais de contenu de fichier, de prompt, de réponse du LLM ni de clé d'API.",
+    ] {
+        assert!(sec.contains(needle), "absent : {needle}");
+    }
+    for bad in [
+        "politique: arrêt de l'envoi",
+        "llm enrich attente",
+        "llm enrich découpe",
+    ] {
+        assert!(!sec.contains(bad), "présent : {bad}");
+    }
+}
+
+#[test]
+fn REQ155_AC16_fichier_de_projet_et_etats() {
+    let readme = repo_file("README.md");
+    let project = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
+    for needle in [
+        "Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les six réglages `model`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`",
+        "Priorité : option > fichier de projet > configuration personnelle > défaut.",
+        "| Réglage | Plafond dans `.nephila.toml` |",
+    ] {
+        assert!(project.contains(needle), "absent : {needle}");
+    }
+    let status = readme_section(&readme, "### `nephila status`");
+    assert!(status.contains("graphe à résoudre : lancez nephila update"));
+    assert!(status.contains("nephila build"));
+    let codes = readme_section(&readme, "## Codes de sortie");
+    assert!(codes.contains("erreur: écriture sur stdout impossible : <cause>"));
+}
+
+#[test]
+fn REQ155_AC17_tables_et_liens_lisibles() {
+    let readme = repo_file("README.md");
+    let lines = prose_lines(&readme);
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].starts_with('|') {
+            let second = lines.get(i + 1).copied().unwrap_or("");
+            assert!(
+                !second.is_empty() && second.chars().all(|c| c == '|' || c == '-'),
+                "table sans ligne d'en-tête : {}",
+                lines[i]
+            );
+            while i < lines.len() && lines[i].starts_with('|') {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    for line in &lines {
+        let mut rest = *line;
+        while let Some(i) = rest.find("](") {
+            let start = rest[..i].rfind('[').expect("lien sans crochet ouvrant");
+            let text = &rest[start + 1..i];
+            assert!(
+                !["ici", "ce lien", "cette section"].contains(&text),
+                "texte de lien : {text}"
+            );
+            rest = &rest[i + 2..];
+        }
+    }
+    assert!(!readme.contains("!["));
 }

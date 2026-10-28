@@ -19,16 +19,14 @@ Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, JavaScript et 
 - [Démarrage rapide](#démarrage-rapide)
 - [Installation](#installation)
 - [Commandes](#commandes)
+- [Usage par un agent](#usage-par-un-agent)
+- [Codes de sortie](#codes-de-sortie)
 - [Filtrer l'analyse](#filtrer-lanalyse)
+- [Configuration du LLM](#configuration-du-llm)
+- [Enrichissement](#enrichissement)
 - [Export et vue HTML](#export-et-vue-html)
 - [Communautés](#communautés)
-- [Configuration du LLM](#configuration-du-llm)
-- [Proxy d'entreprise et certificats auto-signés](#proxy-dentreprise-et-certificats-auto-signés)
-- [Enrichissement en lots](#enrichissement-en-lots)
 - [Ce que l'analyse extrait](#ce-que-lanalyse-extrait)
-- [Fonctionnement](#fonctionnement)
-- [Codes de sortie](#codes-de-sortie)
-- [Usage par un agent](#usage-par-un-agent)
 - [Limites connues](#limites-connues)
 - [Mise à niveau](#mise-à-niveau)
 - [Développement](#développement)
@@ -50,7 +48,7 @@ Exemple sur un petit dépôt Maven de trois modules :
 
 ```
 $ nephila -C demo build --no-llm
-build terminé : 11 fichiers traités, 23 nœuds, 30 liens, 0 références non résolues, 0 fichiers en attente, 11 fichiers à enrichir, enrichissement : désactivé
+build terminé : 11 fichiers traités, 23 nœuds, 30 liens, 0 références non résolues, 0 fichiers en attente, 3 fichiers à enrichir, enrichissement : désactivé
 
 $ nephila -C demo summary
 Modules (3)
@@ -72,7 +70,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.25.2                                      # version voulue
+V=v0.25.3                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -119,191 +117,135 @@ nephila build  [--no-llm] [-v|--verbose | --show-progress] [--enrich-code] [--jo
 nephila update [--no-llm] [-v|--verbose | --show-progress] [--enrich-code] [--jobs <N>] [--batch-files <N>] [--format-retries <N>] [--exclude <MOTIF>] [--exclude-type <TYPES>]
 ```
 
-`build` analyse chaque fichier puis, si le LLM est actif, enrichit le graphe. Par défaut, seuls les documents Markdown sont enrichis ; le code l'est avec `--enrich-code` ou `enrich_code = true`. Les enrichissements sont conservés d'un `build` à l'autre : un fichier dont le contenu et le modèle n'ont pas changé n'est pas renvoyé au LLM, et un second `build` sans changement ne fait aucun appel. `update` ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus ceux restés en attente ou à enrichir.
+`build` reconstruit le graphe ; `update` ne retraite que les fichiers ajoutés, modifiés ou supprimés, plus ceux en attente ou à enrichir. Enrichissement : voir [Enrichissement](#enrichissement).
 
 | Option | Effet |
 |---|---|
-| `--no-llm` | Structure seule : la configuration n'est pas lue (même invalide) et aucun appel n'est fait |
-| `--enrich-code` | Enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown, pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
-| `-v, --verbose` | Traces sur stderr (voir [Traces](#traces---verbose)) |
-| `--show-progress` | Avancement des phases sur stderr, voir [Progression](#progression---show-progress) |
-| `--jobs <N>` | Nombre de fils du parcours du dépôt et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs disponibles (au plus 256 ; 4 si le système ne le donne pas). Pas de clé de configuration ; indépendant de `concurrency`, qui ne règle que les appels LLM. Quel que soit N, `build` et `update` gardent en mémoire, du parcours à l'extraction, jusqu'à 256 Mio de contenus lus ; au-delà, l'extraction relit les fichiers |
-| `--batch-files <N>` | Taille de lot pour cette commande seulement (voir [Enrichissement en lots](#enrichissement-en-lots)) |
-| `--format-retries <N>` | Nombre de nouveaux essais d'un appel dont la réponse est non conforme, pour cette commande seulement (voir [Réponses non conformes et nouveaux essais](#réponses-non-conformes-et-nouveaux-essais)) |
-| `--exclude <MOTIF>` | Exclut de l'analyse les fichiers qui correspondent au motif ; répétable (voir [Filtrer l'analyse](#filtrer-lanalyse)) |
-| `--exclude-type <TYPES>` | Exclut un ou plusieurs types de fichiers, séparés par des virgules ; répétable |
+| `--no-llm` | Structure seule : la configuration n'est pas lue, aucun appel LLM |
+| `--enrich-code` | Enrichit aussi le code, pour cette commande (voir [Enrichissement](#enrichissement)) |
+| `-v, --verbose` | Traces sur stderr (voir [Traces et progression](#traces-et-progression)) |
+| `--show-progress` | Avancement des phases sur stderr ; incompatible avec `--verbose` |
+| `--jobs <N>` | Fils du parcours et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs. Sans effet sur `concurrency` (appels LLM) |
+| `--batch-files <N>` | Fichiers par appel d'enrichissement, pour cette commande |
+| `--format-retries <N>` | Nouveaux essais d'une réponse non conforme, pour cette commande |
+| `--exclude <MOTIF>` | Exclut les fichiers qui correspondent au motif, pour cette commande ; répétable |
+| `--exclude-type <TYPES>` | Exclut des types, séparés par des virgules, pour cette commande ; répétable |
 
 ```
 $ nephila -C repo update
-update terminé : 2 fichiers traités, 2 nœuds, 1 liens, 0 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir
+update terminé : 2 fichiers traités, 24 nœuds, 28 liens, 2 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir
 ```
 
 Le bilan donne deux compteurs :
 
-- **en attente** : l'analyse du fichier n'a pas abouti ou n'a pas été faite. La commande sort avec le code 1 ; `nephila update` le retraite.
-- **à enrichir** : la structure du fichier est dans le graphe, mais son contenu actuel n'a pas été enrichi par le LLM (réponse non conforme, réponse tronquée, trop d'appels d'enrichissement (aucun envoyé), erreur, `--no-llm`, ou fichier modifié depuis). Avec le LLM actif, la commande sort avec le code 1 et `nephila update` ne renvoie au LLM que ces fichiers. Sans LLM, ce n'est pas une erreur (code 0, `enrichissement : désactivé`).
+- **en attente** : l'analyse du fichier n'a pas abouti ; code de sortie 1 ; `nephila update` le reprend.
+- **à enrichir** : la structure du fichier est dans le graphe, mais le LLM ne l'a pas enrichie (réponse non conforme ou tronquée, trop d'appels, erreur, `--no-llm`, fichier modifié depuis) ; code 1 avec le LLM actif, 0 sans lui ; `nephila update` le reprend.
 
-Réanalyser un fichier modifié efface ses résumés et concepts ; un fichier inchangé garde les siens, même après `build --no-llm`.
-
-**Gestion des échecs** :
-
-- un fichier en échec reste « en attente » ou « à enrichir », est nommé sur stderr avec sa cause, et le traitement des autres continue ;
-- il n'y a pas de vérification préalable de la clé d'API : l'extraction a lieu d'abord, et le premier appel révèle une clé refusée (HTTP 401/403). L'envoi s'arrête alors, la ligne de bilan est affichée, et stderr porte une seule ligne `erreur: clé d'API refusée par <fournisseur> (HTTP <code>) ; vérifiez la variable désignée par api_key_env`, avec le code 1. Une fois la variable corrigée, `nephila update` n'envoie que les fichiers à enrichir. Sans fichier à enrichir, aucun appel n'a lieu et une clé fausse passe inaperçue ;
-- l'envoi au LLM s'arrête aussi, sur une clé refusée, une requête refusée ou une redirection (dès le premier appel), ou après 3 erreurs réseau consécutives ou 3 délais dépassés consécutifs, comptés une fois les nouveaux essais épuisés (une réussite remet le compte à zéro). Chaque cause a sa seule ligne `erreur:`, la dernière de stderr, après la ligne de bilan ; code 1 ; la première cause constatée l'emporte :
-  - `erreur: requête refusée par <fournisseur> (HTTP <code>) sur <url> : <message du fournisseur> ; vérifiez model, thinking, effort et max_output_tokens` : HTTP 400, 404, 413 ou 422, un seul appel. Le message du fournisseur dit quel réglage corriger ; sans message utilisable, la ligne s'écrit sans ` : <message du fournisseur>` ;
-  - `erreur: <fournisseur> redirige (HTTP <code>) vers <adresse> ; corrigez base_url` (ou `sans destination`) : la redirection n'est jamais suivie, et rien n'est envoyé à l'adresse de destination, clé comprise. Corrigez `base_url` d'après l'adresse affichée, si vous faites confiance à cet hôte ;
-  - `erreur: envoi interrompu : fournisseur saturé : relancez nephila update plus tard ou réduisez concurrency` : trois appels de suite en échec définitif sur HTTP 429 ou 529. Les avertissements par fichier gardent le code HTTP ;
-  - `erreur: envoi interrompu : délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur` : trois appels de suite sans réponse dans `timeout_secs`. Un délai isolé suivi d'une réussite ne change rien ;
-  - ces deux dernières lignes se terminent par les comptes habituels (` ; <n> fichier(s) à enrichir`). Les fichiers d'une requête refusée ou redirigée n'ont aucune ligne `avertissement:` ; tous restent « à enrichir » et `nephila update` les reprend, eux seuls. `query ask` écrit les deux premières lignes seules sur stderr, stdout vide ;
-- les appels déjà en cours se terminent et sont enregistrés, et la ligne de bilan est toujours affichée ;
-- une référence dont le genre de lien est inconnu ou non autorisé pour son nœud source est écartée avec un avertissement ; le fichier est indexé normalement.
-- des déclarations imbriquées au-delà de 1000 niveaux sont ignorées, le reste du fichier est indexé : `avertissement: <fichier> : déclarations imbriquées au-delà de 1000 niveaux ignorées`, une seule ligne par fichier. Les avertissements de l'analyse (cette ligne, `XML mal formé, lu au mieux`, références ignorées) sont écrits triés par chemin, quel que soit `--jobs`.
+Un fichier en échec est nommé sur stderr avec sa cause, et le traitement des autres continue ; si l'envoi au LLM s'arrête, voir [Arrêt de l'envoi](#arrêt-de-lenvoi).
+Un seul `build` ou `update` à la fois par dépôt : une seconde commande échoue aussitôt (`erreur: indexation déjà en cours sur ce dépôt`).
 
 ### `nephila status`
 
 ```
 $ nephila status
 graphe pas à jour
-supprimé	src/Order.java
-ajouté	src/Order2.java
-modifié	src/Payment.java
+ajouté	core/Extra.java
+supprimé	core/Order.java
+...
 
 $ nephila status --json
-{"a_jour":false,"fichiers":[{"chemin":"src/Order.java","état":"supprimé"},...]}
+{"a_jour":false,"fichiers":[{"chemin":"core/Extra.java","état":"ajouté"},...]}
 ```
 
 Graphe à jour : `graphe à jour`.
 
-Graphe à résoudre : `graphe à résoudre : lancez nephila update`, code 0, sans fichier listé (`--json` : `"a_jour":false` et `fichiers` vide). Les liens du graphe sont à recalculer : une commande a été interrompue entre l'analyse des fichiers et la fin de la résolution, ou une passe de résolution a échoué (voir [Codes de sortie](#codes-de-sortie)). Lancez `nephila update` : sans fichier changé, il refait toute la passe de résolution, sans appel LLM pour les fichiers déjà enrichis. Si l'erreur `résolution` revient, lancez `nephila build`.
+Graphe à résoudre : `graphe à résoudre : lancez nephila update`, code 0, sans fichier listé (`--json` : `"a_jour":false`, `fichiers` vide). Une commande a été interrompue, ou la passe de résolution des liens a échoué : lancez `nephila update`, puis `nephila build` si l'erreur `résolution` revient.
+
+`status` compare les contenus (empreintes) ; c'est la vérification exacte.
 
 ### `nephila query`
 
-Un nœud se désigne par son nom (`shop.Order`) ou par son identifiant `genre:nom` (`method:shop.Order.place`). Toutes les requêtes acceptent `--json` et `--check-stale`.
+Un nœud se désigne par son nom (`com.acme.core.OrderService`) ou par son identifiant `genre:nom` (`method:com.acme.core.OrderService.place`). Toutes les requêtes acceptent `--json` et `--check-stale`.
 
 ```
 $ nephila query search order [--limit N]
-shop.Order (class, src/Order.java) - Une commande.
-shop.Order.place (method, src/Order.java)
+com.acme.domain.Order (class, core/src/main/java/com/acme/domain/Order.java)
+...
 
-$ nephila query neighbors method:shop.Order.place [--depth N] [--limit N]
+$ nephila query neighbors method:com.acme.core.OrderService.place [--depth N] [--limit N]
 utilise :
-  calls shop.Payment.pay (method, src/Payment.java)
-utilisé par :
-  contains shop.Order (class, src/Order.java)
+  calls com.acme.core.OrderRepository.save (method, core/src/main/java/com/acme/core/OrderRepository.java)
+...
 
-$ nephila query path method:shop.Order.place method:shop.Payment.pay
-shop.Order.place calls shop.Payment.pay
+$ nephila query path method:com.acme.core.OrderService.place type:com.acme.core.OrderRepository
+com.acme.core.OrderService.place calls com.acme.core.OrderRepository.save
+...
 ```
 
 `--depth` vaut 1 par défaut. Une recherche sans résultat sort avec le code 1 (`erreur: aucun résultat pour « zzz »`). La liste des communautés, ou celle d'un nœud et ses membres : [`nephila query community`](#communautés).
 
-`query ask` est la seule requête qui appelle le LLM. Le contexte qu'il reçoit est fait des nœuds du graphe trouvés par les mots de la question et de leurs voisins, jamais du contenu des fichiers.
+`query ask` est la seule requête qui appelle le LLM. Son contexte est fait des nœuds du graphe trouvés par les mots de la question et de leurs voisins, jamais du contenu des fichiers.
 
 ```
-$ nephila query ask "Que fait Order ?"
-Order.place appelle Payment.pay.
+$ nephila query ask "Que fait place ?"
+OrderService.place appelle OrderRepository.save.
 Nœuds cités :
-- shop.Order.place (method, src/Order.java)
+- com.acme.core.OrderService.place (method, core/src/main/java/com/acme/core/OrderService.java)
 ```
 
-Si rien ne correspond : `erreur: pas trouvé dans le graphe` (code 1).
+`--format-retries <N>` renvoie une réponse non conforme jusqu'à `N` fois (voir [Échecs et nouveaux essais](#échecs-et-nouveaux-essais)).
 
-`query ask` accepte `--format-retries <N>` : une réponse non conforme est renvoyée aussitôt, jusqu'à `N` fois (voir [Réponses non conformes et nouveaux essais](#réponses-non-conformes-et-nouveaux-essais)). Si la dernière réponse est encore non conforme, stdout reste vide et stderr porte une ligne `erreur: … (<k> essais sur <t>)`.
-
-**Graphe en retard** : par défaut, une requête ne lit que le graphe et ne dit pas s'il est en retard sur les fichiers. Avant une série de requêtes, `nephila status` le vérifie en comparant les contenus, et `nephila update` le remet à jour. Pour vérifier au moment de la requête, ajoutez `--check-stale` : la requête parcourt d'abord le dépôt et compare la taille et la date de modification de chaque fichier à celles du graphe, sans lire les fichiers déjà indexés (les filtres de `.nephila.toml` s'appliquent). Elle répond ensuite normalement ; si des fichiers diffèrent, stderr commence par `avertissement: graphe pas à jour : <n> fichiers modifiés`, où `<n>` compte les fichiers ajoutés, supprimés, modifiés et en attente. Ce compte est approché, et `nephila status` peut en donner un autre :
-
-- un fichier seulement touché (date changée, contenu identique, après un aller-retour entre deux branches git par exemple) est compté ; `nephila update` enregistre sa nouvelle date et l'avertissement disparaît ;
-- un fichier réécrit à taille égale, avec sa date d'origine restaurée, n'est pas compté ;
-- un `package.json` d'un graphe 0.9, à réanalyser en fichier de build, n'est pas compté.
+**Graphe en retard** : une requête ne lit que le graphe et ne dit pas s'il est en retard. Avant une série de requêtes, `nephila status` le vérifie et `nephila update` le remet à jour. Avec `--check-stale`, la requête compare d'abord la taille et la date de chaque fichier à celles du graphe ; si des fichiers diffèrent, la première ligne de stderr est `avertissement: graphe pas à jour : <n> fichiers modifiés`. Ce compte est approché : un fichier seulement touché (date changée, contenu identique) est compté, jusqu'au prochain `nephila update`.
 
 ### `nephila summary`
 
 ```
 $ nephila summary
-Modules (0)
-Nœuds les plus reliés
-  method:shop.Order.place (degré 2)
+Modules (3)
+  com.acme:api -> module:com.acme:core
   ...
 ```
 
-### Traces (`--verbose`)
+### Traces et progression
 
-Avec `-v`, `build` et `update` écrivent sur stderr une ligne par événement, préfixée `trace:` et horodatée depuis le lancement. stdout est inchangé : `nephila build -v 2>trace.log` garde le bilan lisible. `--verbose` est incompatible avec `--show-progress` (erreur d'usage) : voir [Progression](#progression---show-progress).
-
-Événements tracés :
-
-- la configuration (fournisseur, modèle, `enrich_code`, `thinking`, `effort`, `max_output_tokens`, `concurrency`, `timeout_secs`, `max_chunk_chars`, `batch_files`, `format_retries`, ou `llm inactif`), complétée de ` tls_ca_cert=<chemin résolu>` si cette clé est donnée et de ` tls_insecure` si elle vaut `true` ; quand un réglage vient de `.nephila.toml`, la ligne se termine par ` (.nephila.toml : <réglages>)` ;
-- le parcours des fichiers, avec le segment ` (exclusions par défaut : <d> dossiers, <f> fichiers)` quand des chemins sont exclus par défaut ;
-- la migration du schéma d'un graphe plus ancien : `schéma: migration <X> vers <V> en <N> ms` ;
-- le nombre de fils de l'extraction, quand le système en refuse : `structure: <N> fils démarrés sur <M> demandés` ;
-- le début et la fin de chaque phase (structure, résolution, enrichissement) ; la ligne de fin de la résolution se termine par ` (complète)` ou ` (incrémentale, <N> références réévaluées)` selon la passe, et un `update` sur un graphe à résoudre commence par une passe complète ; la fin de la phase structure donne le nombre de fichiers dont les résumés ont été repris sans appel (`, <r> enrichissements conservés`), suivi, quand des enrichissements conservés ne se lisent plus (graphe écrit par une version plus récente, données abîmées), de leur nombre (`, <M> enrichissements illisibles écartés` ; ces fichiers sont enrichis de nouveau) ; le nombre de fils annoncé au début de la phase structure est celui de `--jobs` (au plus le nombre de fichiers), celui de l'enrichissement vient de `concurrency` ;
-- le départ et la fin de chaque appel LLM, avec son résultat (`ok`, `délai dépassé`, `réseau`, `clé refusée`, `requête refusée`, `requête redirigée`, `erreur` ou `tronquée`) et sa durée ; `[i/n]` compte les appels du fichier (morceaux et groupes de 150 nœuds confondus) ; le départ d'un nouvel essai porte la marque ` (essai <e>/<t>)`, où `<t>` vaut `format_retries` + 1 (le premier essai n'a pas de marque) ;
-- chaque attente avant un nouvel essai HTTP, entre le départ et la fin de l'appel : `llm enrich attente <chemin> [i/n] <ms> ms après HTTP 503 (nouvel essai 1/4)` (cause `HTTP <code>`, `erreur réseau` ou `lecture interrompue`) ;
-- la découpe d'un lot dont la réponse est tronquée : `llm enrich découpe <lot> [1/1] en <moitié 1> et <moitié 2>` ;
-- les comptes de la politique d'arrêt : `politique: erreurs réseau consécutives <k>/3` (suivi de ` (fournisseur saturé)` quand la dernière erreur est un 429 ou un 529) et `politique: délais dépassés consécutifs <k>/3` ;
-- les décisions d'arrêt : `politique: arrêt de l'envoi (<cause>), <q> fichiers non envoyés`, où `<cause>` est `clé d'API refusée par le fournisseur`, `requête refusée par le fournisseur`, `requête redirigée par le fournisseur`, `panne réseau répétée (3 erreurs réseau consécutives)`, `fournisseur saturé` ou `délais dépassés répétés`. Le message du fournisseur et l'adresse de redirection ne figurent jamais dans une trace : ils sont dans la ligne `erreur:`.
-
-Un fichier non envoyé pour trop d'appels n'a aucune ligne `llm enrich`.
+Avec `-v`, `build` et `update` écrivent sur stderr une ligne `trace:` par événement, horodatée : configuration effective (et réglages venus de `.nephila.toml`), parcours, migration du schéma, phases, chaque appel LLM avec son résultat et ses nouveaux essais, découpes, politique d'arrêt. stdout est inchangé : `nephila build -v 2>trace.log` garde le bilan lisible.
 
 ```
 trace: [0.000s] config: llm=mock model=m-projet enrich_code=false thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
 trace: [0.009s] structure: fin 7 ms, 0 en attente, 3 enrichissements conservés
 trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
-trace: [0.020s] llm enrich attente src/shop/Order.java [1/1] 1000 ms après HTTP 503 (nouvel essai 1/4)
 trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts) 19 ms
-trace: [0.003s] llm enrich fin src/A.java [1/1] erreur 0 ms : réponse LLM non conforme au schéma
-trace: [0.003s] llm enrich départ src/A.java [1/1] 24 car. (essai 2/3)
-trace: [0.003s] llm enrich fin src/A.java [1/1] erreur 0 ms : réponse LLM non conforme au schéma
-trace: [0.003s] llm enrich départ src/A.java [1/1] 24 car. (essai 3/3)
-trace: [0.003s] llm enrich fin src/A.java [1/1] ok (0 résumés, 0 concepts) 0 ms
-trace: [1.410s] llm enrich fin src/Big.java [2/3] tronquée 770 ms : réponse tronquée par la limite de jetons
-trace: [1.040s] llm enrich fin docs/guide.md [1/1] délai dépassé 1003 ms : délai dépassé avec openai sur https://api.openai.com/v1/chat/completions ; augmentez timeout_secs
-trace: [1.053s] politique: arrêt de l'envoi (clé d'API refusée par le fournisseur), 3 fichiers non envoyés
 ```
 
 Les traces ne contiennent jamais de contenu de fichier, de prompt, de réponse du LLM ni de clé d'API.
 
-### Progression (`--show-progress`)
+Avec `--show-progress`, `build` et `update` écrivent l'avancement de l'extraction puis de l'enrichissement, une ligne au départ puis une par palier de 10 %, sur le gabarit `progression: <phase> <p> % (<k>/<n> fichiers)`. Les lignes ne sont jamais réécrites : elles se filtrent par `grep '^progression:'`. `--verbose` et `--show-progress` sont incompatibles (erreur d'usage).
 
-Avec `--show-progress`, `build` et `update` écrivent sur stderr l'avancement de leurs deux phases, `extraction` puis `enrichissement`, et elles seules. Chaque ligne suit le gabarit `progression: <phase> <p> % (<k>/<n> fichiers)`. stdout est inchangé.
+## Usage par un agent
 
-- L'unité est le fichier : `k` fichiers traités sur `n`. Un lot avance d'un bloc ; les morceaux et les nouveaux essais ne sont pas comptés ; un fichier en échec est compté comme traité.
-- Une ligne au départ de la phase (`0 %`), puis une par palier de 10 % franchi : au plus 11 lignes par phase, quelle que soit la taille du dépôt.
-- `update` ne compte que les fichiers à traiter.
-- Si l'envoi au LLM s'arrête (clé refusée, panne répétée), la dernière ligne d'enrichissement reste sous 100 % : l'écart `n` − `k` est le nombre de fichiers non envoyés.
-- Aucune ligne pour une phase sans fichier, ni pour l'enrichissement avec `--no-llm`.
-- Les lignes sont entières et jamais réécrites : elles restent lisibles redirigées dans un fichier et se filtrent par `grep '^progression:'`.
-- `--show-progress` est incompatible avec `--verbose` (erreur d'usage).
+Les sorties `--json` sont stables et sans décoration ; les messages vont sur stderr et le code de sortie dit si la commande a réussi (voir [Codes de sortie](#codes-de-sortie)). Séquence type :
 
-Exemple, `build --show-progress --batch-files 4` sur 10 fichiers Java avec le LLM simulé :
+1. `nephila status --json` : si `a_jour` vaut `false`, lancer `nephila update`.
+2. `nephila query search --json <terme>` pour localiser un élément, `nephila query neighbors --json <nœud> --depth 2` pour explorer ses dépendances, `nephila query path --json <a> <b>` pour relier deux éléments, `nephila query community --json --node <nœud>` pour situer un élément dans son sous-système.
+3. `nephila summary --json` pour une vue d'ensemble, `nephila export --output -` pour charger tout le graphe.
 
-```
-$ nephila build --show-progress --batch-files 4
-progression: extraction 0 % (0/10 fichiers)
-progression: extraction 10 % (1/10 fichiers)
-progression: extraction 20 % (2/10 fichiers)
-progression: extraction 30 % (3/10 fichiers)
-progression: extraction 40 % (4/10 fichiers)
-progression: extraction 50 % (5/10 fichiers)
-progression: extraction 60 % (6/10 fichiers)
-progression: extraction 70 % (7/10 fichiers)
-progression: extraction 80 % (8/10 fichiers)
-progression: extraction 90 % (9/10 fichiers)
-progression: extraction 100 % (10/10 fichiers)
-progression: enrichissement 0 % (0/10 fichiers)
-progression: enrichissement 40 % (4/10 fichiers)
-progression: enrichissement 80 % (8/10 fichiers)
-progression: enrichissement 100 % (10/10 fichiers)
-build terminé : 10 fichiers traités, 11 nœuds, 10 liens, 0 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir
-```
+Les requêtes ne vérifient pas que le graphe est à jour : faites l'étape 1 avant une série de requêtes, ou ajoutez `--check-stale` à une requête isolée. Désignez un nœud par son identifiant `genre:nom` (`method:shop.Order.place`), qui n'est jamais ambigu, et une communauté par un de ses nœuds (`--node`) : les numéros changent à chaque calcul. Le détail de chaque commande est dans `nephila <commande> --help` ; chaque ligne `erreur:` dit quoi corriger.
+
+## Codes de sortie
+
+| Code | Signification |
+|---|---|
+| 0 | Succès |
+| 1 | Erreur d'exécution : configuration, graphe absent, aucun résultat, arrêt de l'envoi au LLM, fichiers en attente ou à enrichir avec le LLM actif… |
+| 2 | Erreur d'usage : commande ou option inconnue, valeur invalide |
+
+stdout ne contient que le résultat. Les messages vont sur stderr, préfixés `erreur:` ou `avertissement:` (et `trace:` ou `progression:` sur demande). Une erreur tient sur une ligne et dit quoi corriger. Si stdout est fermée avant la fin (`| head`), la commande s'arrête sur `erreur: écriture sur stdout impossible : <cause>` et le code 1 ; `build` et `update` ont déjà enregistré le graphe, et `nephila status` donne son état.
 
 ## Filtrer l'analyse
 
 Par défaut, `nephila` analyse tout ce qu'il prend en charge, hors des [exclusions par défaut](#exclusions-par-défaut) (sorties de build, dépendances copiées, réglages d'IDE, JavaScript minifié). Les filtres retirent de l'analyse des fichiers sans intérêt (code généré, fichiers minifiés, données). Ils ne font qu'exclure : aucun filtre ne fait indexer un fichier que `.gitignore` ou les exclusions fixes (dossiers `.git/`, `target/`, `node_modules/`, fichiers de verrouillage…) écartent déjà.
 
 ### Exclusions par défaut
-
-Sans réglage, `nephila` n'analyse pas ces chemins, à tout niveau du dépôt (`web/dist/` comme `dist/`) :
 
 | Exclu par défaut | Contenu habituel |
 |---|---|
@@ -314,17 +256,15 @@ Sans réglage, `nephila` n'analyse pas ces chemins, à tout niveau du dépôt (`
 | `.idea/` | réglages des IDE JetBrains |
 | `*.min.js` | JavaScript minifié |
 
-Le nom doit être exact, casse comprise : `distrib/`, `outils/` et `Dist/` sont analysés, comme `app.min.mjs`. Ces exclusions ne sont pas des filtres : elles ne comptent pas dans « fichiers exclus par les filtres », et `!motif` ne les annule pas.
-
-Si l'un de ces dossiers contient votre code (un package Java `out` ou `vendor`, par exemple), désactivez-les toutes dans `.nephila.toml` :
+Le nom doit être exact, casse comprise, à tout niveau (`web/dist/` comme `dist/`) ; ni un filtre ni `!motif` ne les annule. Si l'un de ces dossiers contient votre code (un package Java `out` ou `vendor`, par exemple), désactivez-les toutes dans `.nephila.toml` :
 
 ```toml
 exclude_defaults = false
 ```
 
-Ces chemins sont alors analysés comme les autres (types pris en charge, `.gitignore`, filtres). Pour en garder certains exclus, ajoutez-les à `exclude` : `exclude = ["dist/", "*.min.js"]`. Il n'y a pas d'option de ligne de commande : la clé est lue par toutes les commandes qui parcourent le dépôt, `status` compris. `target/`, `build/`, `.gradle/`, `node_modules/` et les fichiers de verrouillage restent toujours exclus.
+Pour en garder certains exclus, ajoutez-les à `exclude`. `target/`, `build/`, `.gradle/`, `node_modules/` et les fichiers de verrouillage restent toujours exclus.
 
-### Motifs
+### Motifs et types
 
 Un motif suit la syntaxe `.gitignore`, relativement à la racine du dépôt, et est sensible à la casse :
 
@@ -333,8 +273,6 @@ Un motif suit la syntaxe `.gitignore`, relativement à la racine du dépôt, et 
 - un `/` final désigne un dossier : tout son contenu est exclu ;
 - `**` traverse les dossiers : `**/generated/**` ;
 - `!motif` réinclut un fichier exclu par un motif précédent de la liste : `!docs/garde.md`.
-
-### Types
 
 Chaque fichier pris en charge appartient à un seul type.
 
@@ -356,19 +294,13 @@ Chaque fichier pris en charge appartient à un seul type.
 | `gradle` | tout `.gradle` (scripts appliqués compris), `build.gradle.kts`, `settings.gradle.kts` |
 | `npm` | `package.json` |
 
-Il n'y a pas de groupe : `--exclude-type sql,xml,json,yaml` exclut les fichiers de données.
+`--exclude-type sql,xml,json,yaml` exclut les fichiers de données.
 
-### En ligne de commande
-
-```
-nephila build --exclude '*.min.js' --exclude-type json,yaml
-```
-
-`--exclude` et `--exclude-type` (de `build` et `update`) valent pour la commande seulement et ne sont enregistrées nulle part ; la commande écrit un avertissement sur stderr. `status` ne les accepte pas : il compare le graphe au parcours filtré par le seul fichier de projet.
+En ligne de commande, `--exclude` et `--exclude-type` (de `build` et `update`) valent pour la commande seulement, avec un avertissement ; pour un filtre durable, écrivez-les dans `.nephila.toml`. Les motifs du fichier puis ceux de l'option forment une seule liste, où le dernier motif qui s'applique l'emporte. Un fichier indexé puis exclu est retiré par `nephila update`, comme un fichier supprimé.
 
 ### Fichier de projet `.nephila.toml`
 
-Pour un filtre durable, créez `.nephila.toml` à la racine du dépôt (le dossier de `-C`) et versionnez-le avec le dépôt :
+Pour un filtre durable, créez `.nephila.toml` à la racine du dépôt et versionnez-le :
 
 ```toml
 # Filtres d'analyse de nephila (exclusions seulement)
@@ -376,9 +308,7 @@ exclude = ["docs/legacy/", "*.min.js"]   # motifs .gitignore, relatifs à la rac
 exclude_types = ["json"]                 # types : voir nephila build --help
 ```
 
-Les filtres (`exclude`, `exclude_types`), `exclude_defaults` (voir [Exclusions par défaut](#exclusions-par-défaut)) et les six réglages sont facultatifs ; toute autre clé est une erreur (`enrich_code` comprise : elle reste dans la configuration personnelle). Le fichier est lu par `build`, `update`, `status` et `query` (pour l'avertissement « graphe pas à jour » et, avec `query ask`, pour les réglages ci-dessous), pas par `export` ni `summary`. Il n'active pas le LLM et ne remplace pas la [configuration du LLM](#configuration-du-llm), qui reste personnelle. `.nephila.toml` n'est jamais indexé.
-
-Le même fichier porte aussi les réglages LLM du dépôt, au premier niveau, avec le même nom et le même type que dans la configuration personnelle : on copie une ligne d'un fichier à l'autre.
+Le même fichier porte les réglages LLM du dépôt :
 
 ```toml
 # Réglages LLM du dépôt (prioritaires sur la configuration personnelle)
@@ -386,7 +316,7 @@ model = "qwen2.5-coder:14b"
 format_retries = 4
 ```
 
-Les six réglages sont `model` (chaîne non vide), `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` (entiers ≥ 1) et `format_retries` (entier ≥ 0). Un réglage du fichier de projet remplace celui de la configuration personnelle ; un réglage absent garde la valeur personnelle, ou le défaut. Priorité : option > fichier de projet > configuration personnelle > défaut (les options sont `--batch-files` et `--format-retries`).
+Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les six réglages `model`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`, au premier niveau, avec le nom et le type de la configuration personnelle. Toute autre clé est une erreur. Priorité : option > fichier de projet > configuration personnelle > défaut.
 
 | Réglage | Plafond dans `.nephila.toml` |
 |---|---|
@@ -398,114 +328,15 @@ Les six réglages sont `model` (chaîne non vide), `max_chunk_chars`, `concurren
 
 Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et les options --batch-files et --format-retries n'en ont pas. Un dépôt cloné ne peut ainsi imposer ni plus de fils, ni des appels plus longs ou plus gros, ni plus d'essais.
 
-- **Clés de connexion refusées** : `provider`, `base_url`, `api_key_env`, `tls_ca_cert` et `tls_insecure` ne sont permises que dans la configuration personnelle. Le fichier de projet est versionné et vient souvent d'un dépôt cloné : s'il pouvait changer l'adresse du serveur ou la variable qui contient la clé, cloner un dépôt suffirait à envoyer votre code et une clé d'API (ou un autre secret de l'environnement) à un serveur tiers, ou à désactiver le contrôle des certificats.
-- **Sans LLM actif** (aucune configuration personnelle, ou `--no-llm`), les réglages n'ont aucun effet et aucun message : un collègue sans configuration ne voit rien. Le fichier reste validé en entier.
-- **Changer de modèle réenrichit une fois** : `nephila update` ou `nephila build` envoie ensuite chaque fichier de la portée de l'enrichissement, puis plus rien tant que le modèle ne change pas. `status` compte selon le modèle du dernier `build` ou `update` : il peut encore dire `graphe à jour` jusqu'à cet `update`. Changer `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` ou `format_retries` ne réenrichit rien.
-- **Dépôt tiers** : un dépôt cloné peut choisir un modèle plus coûteux ou une `concurrency` plus forte que les vôtres (au plus 64). Vérifiez avec `nephila build --verbose` : la ligne `config` donne les valeurs effectives et nomme les réglages venus de `.nephila.toml` (voir [Traces](#traces---verbose)).
+- **Clés de connexion refusées** : `provider`, `base_url`, `api_key_env`, `tls_ca_cert` et `tls_insecure` ne sont permises que dans la configuration personnelle : un dépôt cloné ne doit pas pouvoir envoyer votre code ou votre clé à un autre serveur, ni couper le contrôle des certificats.
+- **Sans LLM actif**, les réglages n'ont aucun effet ni message.
+- **Changer `model` réenrichit une fois** chaque fichier de la portée ; les autres réglages ne réenrichissent rien. Pour vérifier les valeurs effectives : `nephila build --verbose` (ligne `config`).
 
-Un exemple commenté est fourni dans [`examples/nephila.toml`](examples/nephila.toml).
-
-### Fusion des deux sources
-
-Les types sont réunis. Les motifs forment une seule liste, ceux du fichier puis ceux de l'option, et le dernier motif qui s'applique l'emporte : `--exclude '!docs/garde.md'` réinclut un fichier exclu par le fichier de projet.
-
-### Effet incrémental
-
-Un fichier indexé puis exclu est traité par `update` comme supprimé (nœuds, références et liens retirés) ; un fichier qui cesse d'être exclu est traité comme ajouté. `update` suffit : pas besoin de `build`. Un fichier de build exclu (`pom.xml`, `package.json`, `build.gradle`…) ne déclare pas de module.
+Un exemple commenté est fourni dans [`examples/nephila.toml`](examples/nephila.toml). Un fichier invalide arrête toute commande qui parcourt le dépôt, avant toute analyse, sur une ligne qui nomme la clé et la valeur attendue :
 
 ```
-$ nephila build --exclude '*.min.js' --exclude-type json --verbose
-trace: [0.001s] config: llm inactif (aucune configuration)
-trace: [0.018s] parcours: 1 fichiers (filtres : 1 motifs, types json, 2 fichiers exclus)
-build terminé : 1 fichiers traités, 1 nœuds, 0 liens, 0 références non résolues, 0 fichiers en attente, 1 fichiers à enrichir, enrichissement : désactivé, 2 fichiers exclus par les filtres
-avertissement: --exclude et --exclude-type valent pour cette commande seulement : status et update sans option ne les appliquent pas (filtre durable : .nephila.toml)
-```
-
-Le segment `fichiers exclus par les filtres` n'apparaît que si un filtre est actif ; un compte à `0` révèle un motif qui ne correspond à rien. Avec `--verbose` (exemple ci-dessus), la ligne `parcours` se termine par le détail des filtres (`filtres : 1 motifs, types json, 2 fichiers exclus`).
-
-### Erreurs
-
-Un fichier de projet invalide arrête toute commande qui parcourt le dépôt, avant toute analyse :
-
-```
-erreur: ./.nephila.toml : clé `exclude_types` : type inconnu `python` (types valides : markdown, java, kotlin, groovy, scala, javascript, typescript, sql, xml, json, yaml, maven, ivy, gradle, npm)
-```
-
-Une clé de connexion et un réglage invalide donnent chacun une ligne :
-
-```
-erreur: ./.nephila.toml : clé `base_url` permise seulement dans la configuration personnelle (/home/vous/.config/nephila/config.toml)
 erreur: ./.nephila.toml : clé `concurrency` : valeur invalide `-1` (entier strictement positif attendu, au plus 64)
-erreur: ./.nephila.toml : clé `format_retries` : valeur invalide `50` (entier positif ou nul attendu, au plus 10)
 ```
-
-La première ne reprend pas la valeur écrite (une `base_url` peut contenir un jeton).
-
-## Export et vue HTML
-
-```
-nephila export [--format json|html] [--output <fichier>|-]
-```
-
-Sans `--output`, l'export est écrit **dans le dossier courant** (pas dans le dépôt analysé), sous le nom `<slug>.json` ou `<slug>.html`, et stdout ne contient que le chemin du fichier écrit. Un fichier existant est remplacé.
-
-```
-$ nephila -C repo export
-repo.json
-$ nephila export --output graphe.json
-graphe.json
-$ nephila export --output - | jq '.nodes | length'
-23
-$ xdg-open "$(nephila export --format html)"
-```
-
-Le slug est le nom du dossier analysé en minuscules ASCII. Chaque suite de caractères hors `[a-z0-9]` y devient un seul `-` : `Mon Dépôt_2` donne `mon-d-p-t-2`. Si le nom est vide, le slug vaut `graphe`. Les fichiers `.json` et `.html` ne sont pas analysés : un export écrit dans le dépôt ne change ni le graphe ni `status`.
-
-**Format JSON** : objet avec `version`, `nodes`, `edges` et `unresolved`.
-
-Le document est écrit au fil de la lecture du graphe, sans le charger en mémoire. Si l'export échoue en cours de route (disque plein, sortie fermée par le lecteur), la commande s'arrête sur une ligne erreur: et un code non nul : le fichier commencé est supprimé, y compris un export précédent du même nom, et avec --output - stdout peut contenir un début de document. Seul le code de sortie 0 garantit un document complet. Avec --output <fichier>, si seule la ligne du chemin ne peut être écrite sur stdout, le fichier, complet, est gardé, avec la même erreur et le code 1.
-
-**Page HTML** : fichier unique, CSS et JS embarqués, sans aucune ressource externe ni requête réseau. Elle s'ouvre en `file://`. Elle n'affiche jamais tout le graphe, mais une vue partielle que l'on étend :
-
-- **Vue initiale** : les 100 modules les plus reliés et les liens entre eux, avec « N modules non affichés » si certains sont écartés. Sans module, ce sont les 100 nœuds les plus reliés.
-- **Recherche** : sur le nom court ou qualifié, sans casse, 20 résultats au plus. Choisir un résultat affiche le nœud et ses voisins.
-- **Détails** : un clic sur un nœud ouvre un panneau (genre, nom qualifié, fichier, résumé, liens par genre). Les liens y sont cliquables.
-- **Extension** : un double-clic ou le bouton « Étendre » ajoute les voisins directs. Hors « Tout étendre », la vue est plafonnée à 300 nœuds : les voisins les plus reliés sont retenus, et la page indique « N voisins non affichés ». Si la vue est pleine, naviguer vers un nouveau nœud remplace la vue par ce nœud et ses voisins.
-- **Filtres** : une case par genre de nœud et par genre de lien. Le bouton « Vue initiale » ramène à la vue de départ.
-- **Couleur** : par genre (défaut) ou par communauté ; voir [Communautés](#communautés).
-- **Tout étendre** : affiche tout le graphe jusqu'à 5000 nœuds. Au-delà, les 5000 nœuds les plus reliés sont retenus et la page indique « N nœuds non affichés ». « Étendre » et les liens du panneau travaillent ensuite avec ce plafond de 5000 ; « Vue initiale » ou un résultat de recherche ramène au plafond de 300.
-- Déplacement, zoom et glisser d'un nœud à la souris. Les liens ne sont pas dessinés pendant la molette et le déplacement du fond ; ils reviennent 150 ms après le dernier cran ou au relâchement. Glisser un nœud garde ses liens.
-
-## Communautés
-
-Une communauté est un groupe de nœuds plus reliés entre eux qu'avec le reste du graphe : un sous-système du dépôt. nephila les calcule sans LLM, par l'algorithme de Leiden (modularité, résolution 1), avec ces règles : une communauté de plus d'un quart des nœuds (et de plus de 10 nœuds), ou d'au moins 50 nœuds de cohésion inférieure à 0,05, est redécoupée une fois. Tous les liens comptent, quels que soient leur genre et leur sens ; un nœud sans lien forme une communauté à lui seul. Le résultat ne dépend que du graphe : un même graphe donne les mêmes communautés, quel que soit `--jobs`.
-
-- **Numéro** : 0 pour la plus grande, puis par taille décroissante.
-- **Nom** : le nom court du nœud le plus relié de la communauté (son pivot), ou `communauté <numéro>` si ce nom est vide.
-- **Cohésion** : la part des paires de membres directement reliées, de 0 à 1 (1 pour une communauté d'un seul nœud). Proche de 1, un vrai sous-système ; proche de 0, un regroupement lâche.
-
-**Quand** : à chaque `nephila build`, et à chaque `nephila update` qui change le graphe (fichiers ou enrichissement), dans la même passe que le résumé ; un `update` sans changement ne les recalcule pas. Les numéros sont refaits à chaque calcul : pour retrouver une communauté d'un calcul à l'autre, désignez-la par un de ses nœuds (`--node`). Avec `--verbose`, chaque calcul écrit une ligne `communautés: <ms> ms, <n> communautés`, juste après la ligne `résolution:`.
-
-```
-$ nephila query community [<numéro>] [--node <nœud>] [--limit N]
-$ nephila query community
-0 Order (12 nœuds, cohésion 0.35)
-1 Payment (7 nœuds, cohésion 0.52)
-
-$ nephila query community --node shop.Order
-0 Order (12 nœuds, cohésion 0.35)
-  shop.Order (class, src/Order.java) - Une commande.
-  shop.Order.place (method, src/Order.java)
-  ...
-```
-
-Sans argument, `query community` liste les communautés par numéro. Avec un numéro, ou `--node` et un nœud, il affiche la ligne de la communauté puis ses membres, du plus relié au moins relié : le premier est le pivot. `--limit` vaut 50 par défaut, pour la liste comme pour les membres, et `N résultats supplémentaires` annonce le reste. `--json` donne `communities` (liste) ou `community` et `members` (détail), avec `remaining`. Un numéro absent sort avec le code 1 (``erreur: aucun résultat : communauté 99 introuvable (essayez `nephila query community`)``).
-
-- **Résumé** : `nephila summary` se termine par `Communautés (<total>)` et les 10 plus grandes (numéro, nom, taille) ; `--json` ajoute la clé `communities` (`total`, et `top` avec `id`, `label`, `size` et `cohesion`).
-- **Export JSON** : chaque nœud a une clé `community` (son numéro), et le document une clé `communities`, liste de `{"cohesion", "id", "label", "pivot", "size"}` triée par numéro. `version` reste 1.
-- **Vue HTML** : le choix « Couleur » colore les nœuds par genre (défaut) ou par communauté. Les 8 plus grandes ont chacune leur couleur, les autres sont grises ; la légende les nomme, et le panneau de détails donne la communauté du nœud choisi.
-
-**Graphe d'une version précédente** : tant que le premier `nephila update` (ou `build`) ne l'a pas migré, les communautés ne sont pas calculées. `query community` sort alors avec le code 1 (`erreur: communautés non calculées : lancez nephila update`), `summary` affiche `communautés non calculées (lancez nephila update)`, l'export écrit `"community": null` et `"communities": []`, et la vue désactive la couleur par communauté.
 
 ## Configuration du LLM
 
@@ -515,27 +346,25 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 2. `$XDG_CONFIG_HOME/nephila/config.toml` ;
 3. `~/.config/nephila/config.toml`.
 
-Six de ces réglages (`model`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files`, `format_retries`) peuvent être remplacés par dépôt dans `.nephila.toml` (voir [Fichier de projet](#fichier-de-projet-nephilatoml)) ; les autres clés restent personnelles.
-
-[`examples/config.toml`](examples/config.toml) documente toutes les clés et toutes les variables (fournisseurs, options communes, TLS, LLM simulé).
+[`examples/config.toml`](examples/config.toml) documente toutes les clés et variables.
 
 | Clé | Rôle | Défaut |
 |---|---|---|
-| `provider` | `anthropic`, `openai` (protocole compatible OpenAI) ou `mock` | obligatoire |
+| `provider` | `anthropic`, `openai` (compatible OpenAI) ou `mock` | obligatoire |
 | `model` | Nom du modèle | obligatoire, sauf `mock` |
 | `api_key_env` | **Nom** de la variable d'environnement qui contient la clé | obligatoire pour `anthropic` |
 | `base_url` | URL du serveur, **sans** `/v1` final | celle du fournisseur |
 | `max_chunk_chars` | Taille maximale d'un morceau envoyé au LLM | 60000 |
-| `concurrency` | Appels LLM simultanés ; sans effet sur l'extraction, réglée par `--jobs` | 4 |
-| `enrich_code` | Booléen. `true` enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown ; configuration personnelle seulement, `--enrich-code` le demande pour une commande | `false` |
-| `thinking` | Booléen. `true` demande au modèle de réfléchir avant de répondre (réflexion jamais affichée ni enregistrée) ; configuration personnelle seulement | `false` |
-| `effort` | `"low"`, `"medium"` ou `"high"` : niveau de la réflexion. N'a d'effet qu'avec `thinking = true`. À `"medium"` ou `"high"`, les appels durent plus longtemps : augmentez `timeout_secs` (600, par exemple), car trois délais dépassés de suite arrêtent l'envoi ; configuration personnelle seulement | `"low"` |
-| `max_output_tokens` | Limite de jetons de la réponse du modèle, réflexion comprise, entier > 0 ; configuration personnelle seulement | 16384 |
+| `concurrency` | Appels LLM simultanés ; l'extraction est réglée par `--jobs` | 4 |
+| `enrich_code` | `true` enrichit aussi le code ; configuration personnelle seulement | `false` |
+| `thinking` | `true` demande au modèle de réfléchir ; configuration personnelle seulement ; chez anthropic, modèle Claude 4.6 ou suivant | `false` |
+| `effort` | `"low"`, `"medium"` ou `"high"`, avec `thinking = true` ; à `"medium"` ou `"high"`, augmentez `timeout_secs` ; configuration personnelle seulement | `"low"` |
+| `max_output_tokens` | Limite de jetons de la réponse, entier > 0 ; configuration personnelle seulement | 16384 |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |
-| `format_retries` | Nouveaux essais d'un appel dont la réponse est non conforme, entier ≥ 0 (2 = au plus 3 appels pour une même requête ; 0 = aucun nouvel essai, comme en 0.12.0) | 2 |
-| `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 (la connexion reste limitée à 10 s) | 300 |
-| `tls_ca_cert` | Chemin d'un fichier PEM d'autorités de certification, **ajoutées** aux autorités publiques embarquées. Absolu, `~/…`, ou relatif au dossier du fichier de configuration. Le magasin du système n'est pas lu (pour s'y fier : `/etc/ssl/certs/ca-certificates.crt`) | aucun |
-| `tls_insecure` | Booléen. `true` désactive tout contrôle du certificat du serveur, comme `curl -k` ; un avertissement est écrit à chaque commande | `false` |
+| `format_retries` | Nouveaux essais d'une réponse non conforme, entier ≥ 0 | 2 |
+| `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 | 300 |
+| `tls_ca_cert` | Fichier PEM d'autorités ajoutées aux autorités publiques ; chemin absolu, `~/…` ou relatif | aucun |
+| `tls_insecure` | `true` désactive le contrôle du certificat du serveur, comme `curl -k` | `false` |
 
 Ce que chaque clé envoie à chaque fournisseur :
 
@@ -545,11 +374,9 @@ Ce que chaque clé envoie à chaque fournisseur :
 | `thinking = true` | `"thinking": {"type": "adaptive"}` | aucun champ propre (voir `effort`) | sans effet |
 | `effort` (avec `thinking = true` seulement) | `output_config.effort` | `reasoning_effort` | sans effet |
 
-Avec thinking = false, aucun champ de réflexion n'est envoyé ; un modèle qui réfléchit toujours le fait quand même. Pour limiter sa réflexion : thinking = true et effort = "low". Un modèle qui ne prend pas en charge ces champs refuse la requête (HTTP 400). Chez anthropic, la réflexion adaptative demande un modèle Claude 4.6 ou suivant : claude-sonnet-4-5, le modèle des exemples, la refuse. Ces trois clés ne sont lues que dans la configuration personnelle : .nephila.toml les refuse.
+Un modèle ou un serveur qui refuse ces champs, ou une limite de 16384 jetons, refuse la requête (HTTP 400) : voir [Arrêt de l'envoi](#arrêt-de-lenvoi).
 
-Un modèle ou un serveur local dont la réponse maximale est plus courte que 16384 jetons refuse aussi la requête (HTTP 400) : baissez `max_output_tokens`. L'envoi s'arrête alors sur la ligne `erreur: requête refusée par <fournisseur> (HTTP 400) sur <url> : <message du fournisseur> ; vérifiez model, thinking, effort et max_output_tokens`, au lieu de laisser des fichiers « à enrichir » un par un ; les fichiers non enrichis restent « à enrichir » pour le prochain `nephila update`.
-
-La clé d'API n'est jamais écrite dans le fichier. `nephila` ne la vérifie pas avant le traitement : une clé refusée est constatée au premier appel, après l'extraction (voir [`nephila build` et `nephila update`](#nephila-build-et-nephila-update)).
+La clé d'API n'est jamais écrite dans le fichier. `nephila` ne la vérifie pas avant le traitement : une clé refusée est constatée au premier appel, après l'extraction.
 
 <details>
 <summary>Exemples : Anthropic, OpenAI, modèle local, simulé</summary>
@@ -582,7 +409,7 @@ provider = "mock"
 
 </details>
 
-`nephila` ajoute lui-même `/v1/chat/completions` à `base_url`. Avec `http://localhost:11434/v1`, les requêtes partiraient donc vers `/v1/v1/…`.
+`nephila` ajoute lui-même `/v1/chat/completions` à `base_url` : avec `/v1`, les requêtes partiraient vers `/v1/v1/…`.
 
 **Comportement selon la configuration**
 
@@ -592,7 +419,7 @@ provider = "mock"
 | Fichier valide | structure et enrichissement | répond |
 | Fichier invalide | échoue (sauf avec `--no-llm`) | échoue |
 
-## Proxy d'entreprise et certificats auto-signés
+### Certificats TLS
 
 Si le serveur (proxy d'entreprise, serveur local) présente un certificat signé par une autorité privée, donnez le PEM de cette autorité :
 
@@ -603,73 +430,100 @@ base_url = "https://127.0.0.1:8443"
 tls_ca_cert = "certs/ca.pem"   # relatif au fichier de configuration
 ```
 
-Les autorités publiques restent reconnues. En dernier recours, `tls_insecure = true` désactive le contrôle (chaîne, dates, nom d'hôte) ; la connexion reste chiffrée. À éviter hors d'un poste de développement.
+Les autorités publiques restent reconnues. En dernier recours, `tls_insecure = true` désactive le contrôle. Un certificat refusé donne une erreur qui nomme `tls_ca_cert` et `tls_insecure`. Ni `mock`, ni `http://`, ni TLS mutuel.
 
-Un certificat refusé produit une erreur contenant « certificat » et nommant `tls_ca_cert` et `tls_insecure` : ajoutez l'autorité avec `tls_ca_cert`, ou, faute de mieux, activez `tls_insecure`. Ces clés n'ont aucun effet avec `provider = "mock"` ni avec une `base_url` en `http://`. Le TLS mutuel (certificat client) n'est pas pris en charge.
+## Enrichissement
 
-## Enrichissement en lots
+Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, concepts des documents). `enrich_code = true` dans la configuration personnelle, ou `--enrich-code` pour une commande, enrichit aussi le code et les fichiers de build et de données ; sans lui, un fichier de code n'est ni envoyé ni compté « à enrichir ». Un fichier garde ses enrichissements tant que son contenu et le modèle ne changent pas : un second `build` sans changement ne fait aucun appel, et changer `model` réenrichit une fois chaque fichier de la portée.
 
-Par défaut, seuls les documents Markdown sont enrichis ; enrich_code = true (configuration personnelle) ou --enrich-code (une commande) enrichit aussi le code source et les fichiers de build et de données.
+### Lots et gros fichiers
 
-- **Portée** : sans `enrich_code`, un fichier de code n'est ni envoyé ni compté dans `fichiers à enrichir`, et il ne rend pas le code de sortie non nul. `enrich_code` n'est permis que dans la configuration personnelle ; dans `.nephila.toml`, la clé est refusée. Les concepts restent réservés aux documents.
-- **Enrichissements conservés** : un fichier enrichi garde ses résumés tant que son contenu et le modèle ne changent pas. Repasser à la portée des documents seuls ne retire rien : les résumés de code déjà faits restent dans le graphe tant que le fichier ne change pas. Un fichier de code modifié perd ses résumés, n'est pas envoyé et n'est pas compté « à enrichir ». Passer à `enrich_code = true` rend « à enrichir » les fichiers de code sans résumé conservé, et `nephila update --enrich-code` les envoie.
-- **Changement de modèle** : le `build` ou l'`update` suivant envoie une fois chaque fichier de la portée.
+- **Lots** : `batch_files` fichiers par appel (défaut 10), dans la limite de `max_chunk_chars` ; jusqu'à `concurrency` appels en même temps.
+- **Gros fichier** : envoyé seul, en morceaux de `max_chunk_chars`, au plus 150 nœuds demandés par appel.
+- **Plafond** : un fichier qui demanderait plus de 50 appels n'est pas envoyé et reste « à enrichir », nommé par l'avertissement `trop d'appels d'enrichissement`. Deux remèdes : `exclude` dans `.nephila.toml`, qui retire aussi sa structure du graphe, ou un `max_chunk_chars` plus grand, qui réduit le nombre de morceaux pour tous les fichiers. Au-delà de 7500 nœuds, seul `exclude` suffit.
 
-Par défaut (`batch_files = 10`), un appel LLM regroupe jusqu'à dix fichiers, ce qui réduit le nombre d'appels pour un dépôt fait de nombreux petits fichiers. `batch_files = 1` envoie un fichier par appel.
+### Échecs et nouveaux essais
 
-- Les fichiers sont pris dans l'ordre des chemins. Un lot ne dépasse ni `batch_files` fichiers ni `max_chunk_chars` octets au total (le budget d'un lot). Un fichier plus gros que `max_chunk_chars` part seul, en morceaux. Ces morceaux sont envoyés en parallèle, dans la limite de `concurrency` appels simultanés tous fichiers confondus, et le résultat fusionné est le même qu'en série.
-- Un appel demande au plus 150 nœuds ; la somme des nœuds d'un lot reste au plus égale à 150. Un fichier de plus de 150 nœuds est envoyé seul, en plusieurs appels : chaque nœud d'un gros fichier n'est demandé qu'une fois, avec le premier morceau où son nom court figure, en groupes de 150 ; un nœud cité nulle part est demandé avec le premier morceau ; une section Markdown est demandée avec le morceau qui porte son titre, et un nom de table SQL est cherché sans tenir compte de la casse. Sans réglage. Un fichier qui demanderait plus de 50 appels n'est pas envoyé, reste à enrichir, et est nommé par la ligne `avertissement: src/gen/Big.java : trop d'appels d'enrichissement (134 nécessaires, au plus 50 par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml`. Deux remèdes : `exclude` dans [`.nephila.toml`](#fichier-de-projet-nephilatoml), qui retire aussi sa structure du graphe ; ou une valeur plus grande de `max_chunk_chars` (dans `.nephila.toml`, au plus 1000000, ou dans la configuration personnelle), qui réduit le nombre de morceaux, donc d'appels, mais vaut pour tous les fichiers et allonge chaque requête. `max_chunk_chars` ne suffit pas pour un fichier de plus de 7500 nœuds (50 appels de 150 nœuds), comme une classe générée de 20 000 méthodes : seul `exclude` règle alors le cas.
-- `--batch-files <N>` remplace la clé pour la commande en cours, sans rien écrire. Priorité : option, puis clé `batch_files`, puis défaut 10. Sans LLM actif, l'option est acceptée sans effet.
-- Jusqu'à `concurrency` appels (lots ou morceaux) sont en vol en même temps. Les connexions HTTP sont réutilisées d'un appel à l'autre.
-- Si un lot échoue, tous ses fichiers restent « à enrichir » et sont repris par le prochain `nephila update`. L'échec compte pour un seul appel dans la politique d'arrêt. Un fichier absent de la réponse échoue seul.
-- Si la réponse du modèle à un lot est tronquée par la limite de jetons, le lot n'échoue pas : il est découpé en deux moitiés, envoyées aussitôt, puis chaque moitié tronquée est découpée à son tour, jusqu'au fichier seul. Sans `--verbose`, rien ne le montre ; avec `--verbose`, chaque découpe a sa ligne `llm enrich découpe`. Seul un fichier envoyé seul peut encore recevoir l'avertissement de [Réponse tronquée par la limite de jetons](#réponse-tronquée-par-la-limite-de-jetons).
+- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2) ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`.
+- **Surcharge passagère** (HTTP 429, 500, 502, 503, 504, 529, erreur réseau transitoire) : jusqu'à 4 nouveaux essais, avec une attente croissante ; un `retry-after` en secondes est respecté, et au-delà de 60 s le fichier échoue aussitôt.
+- **Réponse tronquée** : `réponse tronquée par la limite de jetons`, jamais renvoyée ; un lot tronqué est découpé en deux, jusqu'au fichier seul ; pour un fichier seul, réduisez `max_chunk_chars` ou augmentez `max_output_tokens`.
+- **Ce qui reste** : un fichier en échec reste « à enrichir », et `nephila update` ne renvoie que ceux-là. Aucune de ces causes n'arrête l'envoi tant qu'elle reste isolée.
 
-## Réponses non conformes et nouveaux essais
+### Arrêt de l'envoi
 
-Un modèle, surtout local, rate parfois son JSON. Quand un appel aboutit mais que la réponse est inexploitable, `nephila` renvoie aussitôt la même requête, à l'identique, jusqu'à `format_retries` fois (défaut 2, soit au plus 3 appels).
+Six causes arrêtent l'envoi au LLM. Chacune a sa ligne `erreur:`, la dernière de stderr, après la ligne de bilan, avec le code 1 :
 
-- **Retenté** : réponse reçue mais inexploitable (JSON illisible, aucun objet JSON dans le texte, schéma non respecté).
-- **Jamais retenté** : réponse tronquée par la limite de jetons (voir ci-dessous), délai dépassé, erreur réseau, clé refusée, requête refusée, redirection (ils relèvent de la politique d'arrêt), fichier illisible, éléments écartés d'une réponse conforme, fichier absent d'une réponse de lot conforme (il reste « à enrichir » pour le prochain `update`).
-- **Unité d'essai** : l'appel. Un morceau d'un gros fichier est retenté seul ; un lot est retenté en entier.
-- **Un essai réussi ne laisse aucune trace** : ni avertissement, ni changement du bilan ; seul `--verbose` montre les essais.
-- **Échec final** : le fichier reste « à enrichir » et une ligne le nomme, avec le nombre d'essais faits :
+| Cause | Quand | Que faire |
+|---|---|---|
+| Clé refusée | HTTP 401 ou 403, dès le premier appel | corriger la variable nommée par `api_key_env` |
+| Requête refusée | HTTP 400, 404, 413 ou 422, dès le premier appel | corriger `model`, `thinking`, `effort` ou `max_output_tokens`, d'après le message du fournisseur |
+| Redirection | HTTP 300 à 399, jamais suivie | corriger `base_url` d'après l'adresse affichée |
+| Fournisseur saturé | 3 appels de suite en échec sur HTTP 429 ou 529 | relancer plus tard, ou réduire `concurrency` |
+| Panne réseau | 3 erreurs réseau de suite | vérifier le réseau et `base_url` |
+| Délais dépassés | 3 appels de suite sans réponse dans `timeout_secs` | augmenter `timeout_secs`, ou vérifier le fournisseur |
 
-```
-avertissement: src/A.java : réponse LLM non conforme au schéma : JSON illisible (NEPHILA_MOCK_MALFORMED) (3 essais sur 3)
-```
+Les appels en cours se terminent et sont enregistrés. Les fichiers non envoyés restent « à enrichir » : une fois la cause corrigée, `nephila update` ne renvoie qu'eux. Sans fichier à enrichir, aucun appel n'a lieu, et une clé fausse passe inaperçue.
 
-- Toute la suite d'essais d'un appel compte pour **un seul appel** dans la politique d'arrêt.
-- `--format-retries <N>` de `build`, `update` et `query ask` remplace la clé pour la commande seulement, sans rien écrire. Priorité : option, puis clé `format_retries`, puis défaut 2. Sans LLM actif, l'option est acceptée sans effet.
-
-### Nouveaux essais HTTP
-
-Une surcharge passagère du fournisseur ne fait pas échouer un fichier. Les réponses HTTP 429, 500, 502, 503, 504 et 529, et les erreurs réseau transitoires (connexion refusée, réinitialisée ou fermée avant la réponse), sont renvoyées à l'identique jusqu'à 4 nouveaux essais, soit 5 envois au plus, avec une attente de plus en plus longue : environ 1, 2, 4 puis 8 s, tirées au hasard entre la moitié et la totalité de ces durées (15 s d'attente au plus par appel sans `retry-after` ; jusqu'à 60 s par nouvel essai quand le serveur le demande).
-
-- **`retry-after`** : si la réponse porte un `retry-after` en secondes, l'attente vaut cette valeur. Au-delà de 60 s, il n'y a aucun nouvel essai : le fichier échoue aussitôt, la commande ne reste pas bloquée.
-- **Jamais renvoyés** : 401 et 403 (clé refusée), la requête refusée (400, 404, 413, 422) et la redirection (300 à 399, jamais suivie), qui arrêtent chacune l'envoi dès le premier appel (voir [Gestion des échecs](#nephila-build-et-nephila-update)), les autres statuts, le délai dépassé, le refus de certificat.
-- **Fournisseur saturé** : un 429 ou un 529 qui résiste aux 5 envois compte comme une erreur réseau ; la troisième de suite arrête l'envoi sur `fournisseur saturé : relancez nephila update plus tard ou réduisez concurrency` (réduire `concurrency` aide pour un 429, seule l'attente aide pour un 529).
-- **Attente interrompue par l'arrêt** : quand une autre cause arrête l'envoi (une clé refusée, par exemple) pendant l'attente d'un appel, la commande finit aussitôt, sans finir l'attente ni renvoyer. L'appel qui attendait garde l'avertissement de sa dernière erreur.
-- **Lecture interrompue** : quand la réponse arrive (HTTP 200) mais que la connexion se ferme avant la fin du corps, le fournisseur a déjà produit la réponse : un seul nouvel envoi, et non quatre. Avec `--verbose`, `llm enrich attente <chemin> [1/1] <ms> ms après lecture interrompue (nouvel essai 1/4)`. Si ce nouvel envoi échoue aussi, le fichier reste « à enrichir » avec l'avertissement `… : lecture de la réponse : <cause>` (ou celui de la nouvelle erreur).
-- **Politique d'arrêt** : les essais sont internes à l'appel. Seul l'échec final compte, et les 3 erreurs réseau consécutives et les 3 délais dépassés consécutifs qui arrêtent l'envoi sont ceux d'appels dont les essais sont épuisés. Un succès à un nouvel essai ne laisse aucune trace, sauf avec `--verbose` (lignes `llm enrich attente`).
-- **Échec final** : l'avertissement habituel, `avertissement: <chemin> : erreur de openai (HTTP 503) sur <url>`, sans mention des essais.
-
-Un modèle qui échoue souvent au format se règle mieux en changeant de modèle ou en réduisant `batch_files` qu'en augmentant les essais.
-
-### Réponse tronquée par la limite de jetons
-
-Le fournisseur signale la troncature de la réponse (`stop_reason`, `finish_reason`). `nephila` ne la renvoie jamais, quelle que soit `format_retries` : la même requête rendrait la même réponse. Le fichier reste « à enrichir », une seule ligne le nomme, sans suffixe d'essais, et la commande sort avec le code 1 :
+## Export et vue HTML
 
 ```
-avertissement: db/schema.sql : réponse tronquée par la limite de jetons ; réduisez max_chunk_chars ou batch_files, ou augmentez max_output_tokens
+nephila export [--format json|html] [--output <fichier>|-]
 ```
 
-Pour `nephila query ask`, une seule ligne sur stderr, stdout vide :
+Sans `--output`, l'export est écrit **dans le dossier courant** (pas dans le dépôt analysé), sous le nom `<slug>.json` ou `<slug>.html`, et stdout ne contient que le chemin du fichier écrit. Un fichier existant est remplacé.
 
 ```
-erreur: réponse tronquée par la limite de jetons ; posez une question plus ciblée ou augmentez max_output_tokens
+$ nephila -C repo export
+repo.json
+$ nephila export --output graphe.json
+graphe.json
+$ nephila export --output - | jq '.nodes | length'
+23
+$ xdg-open "$(nephila export --format html)"
 ```
 
-Que faire : donner à `max_chunk_chars` une valeur plus petite dans `.nephila.toml` ou dans la configuration personnelle, ou augmenter `max_output_tokens` dans la configuration personnelle (la réflexion compte dans cette limite). Une troncature n'arrête jamais l'envoi : les autres fichiers continuent. Avec `--verbose`, l'appel se termine par le résultat `tronquée`.
+Le slug est le nom du dossier en minuscules ASCII, chaque suite de caractères hors `[a-z0-9]` devenant un `-` : `Mon Dépôt_2` donne `mon-d-p-t-2`. **Format JSON** : objet avec `version`, `nodes`, `edges` et `unresolved`.
+
+Le document est écrit au fil de la lecture du graphe. Seul le code de sortie 0 garantit un document complet : en cas d'échec, le fichier commencé est supprimé, et avec `--output -` stdout peut contenir un début de document.
+
+**Page HTML** : fichier unique, hors ligne, qui affiche une vue partielle du graphe que l'on étend.
+
+- **Vue initiale** : les 100 modules les plus reliés.
+- **Recherche** : sur le nom court ou qualifié, sans casse ; choisir un résultat affiche le nœud et ses voisins.
+- **Détails** : un clic sur un nœud ouvre un panneau (genre, fichier, résumé, liens).
+- **Extension** : « Étendre » (ou un double-clic) ajoute les voisins directs ; « Tout étendre » affiche tout le graphe, dans la limite de 5000 nœuds.
+- **Filtres** : une case par genre de nœud et par genre de lien ; « Vue initiale » ramène au départ.
+- **Couleur** : par genre (défaut) ou par communauté ; voir [Communautés](#communautés).
+
+## Communautés
+
+Une communauté est un groupe de nœuds plus reliés entre eux qu'avec le reste du graphe : un sous-système. `nephila` les calcule sans LLM, par l'algorithme de Leiden ; un même graphe donne les mêmes communautés.
+
+- **Numéro** : 0 pour la plus grande, puis par taille décroissante.
+- **Nom** : le nom court du nœud le plus relié de la communauté (son pivot), ou `communauté <numéro>` si ce nom est vide.
+- **Cohésion** : la part des paires de membres directement reliées, de 0 à 1.
+
+**Quand** : à chaque `build` et à chaque `update` qui change le graphe. Les numéros sont refaits à chaque calcul : désignez une communauté par un de ses nœuds (`--node`).
+
+```
+$ nephila query community [<numéro>] [--node <nœud>] [--limit N]
+$ nephila query community
+0 OrderRepository (6 nœuds, cohésion 0.40)
+...
+
+$ nephila query community --node com.acme.core.OrderService
+1 OrderService (6 nœuds, cohésion 0.40)
+  com.acme.core.OrderService (class, core/src/main/java/com/acme/core/OrderService.java)
+  ...
+```
+
+Sans argument, `query community` liste les communautés. Avec un numéro, ou `--node` et un nœud, il affiche la communauté puis ses membres, le pivot d'abord. `--limit` vaut 50 par défaut ; `--json` est accepté.
+
+- **Résumé** : `nephila summary` se termine par `Communautés (<total>)` et les 10 plus grandes.
+- **Export JSON** : chaque nœud a une clé `community`, et le document une clé `communities`.
+- **Vue HTML** : le choix « Couleur » colore les nœuds par communauté.
+
+**Graphe d'une version précédente** : tant que le premier `nephila update` (ou `build`) ne l'a pas migré, les communautés ne sont pas calculées et `query community` sort avec le code 1 (`erreur: communautés non calculées : lancez nephila update`).
 
 ## Ce que l'analyse extrait
 
@@ -677,237 +531,96 @@ Chaque fichier est analysé localement : tree-sitter pour les langages JVM, Java
 
 | Fichier | Nœuds | Liens |
 |---|---|---|
-| `.java`, `.kt`, `.kts` (hors Gradle), `.groovy`, `.scala` | package, types (class, interface, enum, annotation, object, trait Scala ; imbriqués `Externe.Interne`), méthodes (constructeurs `<init>`) ; fonctions de premier niveau rattachées au type de fichier conventionnel (`NomFichierKt`, `NomFichier`, `NomFichier$package`) | `imports`, `extends`, `implements`, `calls` |
-| `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.mts`, `.cts`, `.tsx` | package (un fichier = un module ES, nommé par son chemin sans extension : `src/app/order.service`), types (class, interface, enum ; sous-genres `alias` pour `type X = …` et `object` pour `namespace`), méthodes (constructeurs `<init>`) ; fonctions de premier niveau contenues par le package | `imports`, `extends`, `implements`, `calls` |
-| `package.json` | module = champ `name` (sinon nom du dossier) | `depends_on` : clés de `dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies` |
-| `pom.xml`, `ivy.xml` | module `groupId:artifactId` ou `organisation:module` | `depends_on` (hors `dependencyManagement`, plugins et `parent`) |
-| `build.gradle(.kts)`, `settings.gradle(.kts)` | module = chemin de projet (`:services:api`) ; `settings` est suivi mais ne crée pas de nœud | `depends_on` : `project(':core')`, chaînes `g:a[:v]`, notation map ; seul le bloc `dependencies { }` de premier niveau compte |
+| `.java`, `.kt`, `.kts` (hors Gradle), `.groovy`, `.scala` | package, types (class, interface, enum, annotation, object, trait Scala), méthodes | `imports`, `extends`, `implements`, `calls` |
+| `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.mts`, `.cts`, `.tsx` | package (un module ES), types (class, interface, enum, alias, object), méthodes | `imports`, `extends`, `implements`, `calls` |
+| `package.json` | module = champ `name` (sinon nom du dossier) | `depends_on` : toutes les dépendances |
+| `pom.xml`, `ivy.xml` | module `groupId:artifactId` ou `organisation:module` | `depends_on` |
+| `build.gradle(.kts)`, `settings.gradle(.kts)` | module = chemin de projet (`:services:api`) | `depends_on` : bloc `dependencies { }` de premier niveau |
 | autre `.gradle` | analysé comme un script Groovy | comme Groovy |
-| `.md`, `.markdown` | document, sections (ancres à la GitHub) | `links_to` (liens relatifs vers un `.md`), `mentions` (code en ligne au format de nom JVM : `Order`, `shop.Order`, `place()`, `Order#place`) |
-| `.sql` | document (sous-genre `sql`), `table` (sous-genre `table` ou `view`) | `references` (clé étrangère, ou table lue par une vue) |
-| `.xml` autre que `pom.xml` et `ivy.xml` | document (sous-genre `xml`), sans nœud par élément | `mentions` (noms JVM cités) |
-| `.json` | document (sous-genre `json`), `key` par clé feuille | `mentions` (noms JVM cités) |
-| `.yaml`, `.yml` | document (sous-genre `yaml`), `key` par clé feuille | `mentions` (noms JVM cités) |
+| `.md`, `.markdown` | document, sections | `links_to` (liens vers un `.md`), `mentions` (noms JVM en code en ligne) |
+| `.sql` | document, `table` (ou `view`) | `references` (clé étrangère, table lue par une vue) |
+| autre `.xml` | document, sans nœud par élément | `mentions` (noms JVM cités) |
+| `.json` | document, `key` par clé feuille | `mentions` (noms JVM cités) |
+| `.yaml`, `.yml` | document, `key` par clé feuille | `mentions` (noms JVM cités) |
 
-**JavaScript et TypeScript.** Grammaires : `.ts`, `.mts`, `.cts` en TypeScript, `.tsx` en TSX, `.js`, `.mjs`, `.cjs`, `.jsx` en JavaScript (JSX compris). Un fichier est un module ES, nœud `package` nommé par son chemin sans extension ; `src/a.ts` et `src/a.d.ts` partagent le même nœud. Les fonctions de premier niveau (`function f`, `const f = () => …`) sont des méthodes contenues par le package. Formes d'import reconnues : `import { a, b as c } from`, `import type`, `import X from`, `import * as ns from`, `const ns = require(…)` et `const { a } = require(…)` ; seuls les spécifieurs relatifs (`./`, `../`) et les alias `@/`, `~/` sont suivis (ces derniers par nom simple unique), un paquet npm est externe. Appels : `f()` vise la fonction du fichier ou le nom importé, `this.m()` la classe englobante, `x.m()` le type annoté ou construit par `new T()` de `x` (paramètres-propriétés de constructeur compris), `T.m()` et `ns.f()` la classe ou le module visé ; un global (`fetch`, `console`), un appel `f()` sur un paramètre ou un receveur inconnu ne crée aucun lien. En JSX, `<Button/>` (majuscule) est un appel de `Button`, `<div>` n'en est pas un. `node_modules/` et les fichiers de verrouillage (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`) ne sont jamais indexés.
+- **JavaScript et TypeScript** : un fichier est un module ES nommé par son chemin sans extension ; les imports relatifs et les alias `@/`, `~/` sont suivis, un paquet npm est externe.
+- **Données** : noms SQL en minuscules ; en JSON et YAML, un nœud `key` par clé feuille, au plus 1000 par fichier.
+- **Noms JVM cités** : dans les fichiers XML, JSON et YAML, un nom d'au moins deux segments (`com.acme.Repo#save`) donne une `mention`, non résolue tant que le nom est absent du graphe.
+- **Résolution des appels** : le type du receveur est cherché dans le fichier seulement ; s'il est inconnu (chaîne d'appels, `var` sans initialiseur reconnaissable), aucun lien n'est créé, car un lien manquant coûte moins cher qu'un lien faux.
 
-**Fichiers `package.json`.** Fichier de build de l'écosystème JS/TS : le module porte le champ `name` (`@shop/web`, nom court `web`). Les paquets des espaces de travail sont reliés aux modules du dépôt de même nom, les autres dépendances à un nœud `dependency`. Un module ES se rattache au `package.json` ancêtre le plus proche, un nœud de code JVM au fichier de build JVM le plus proche. `scripts`, `workspaces` et `engines` ne donnent rien.
-
-Dans un dépôt où le module `@shop/web` (un `package.json`) dépend de `lodash` et du module `shop` du même dépôt :
-
-```
-$ nephila query search formatPrice
-src/utils/format.formatPrice (method, src/utils/format.ts)
-
-$ nephila query neighbors @shop/web
-utilise :
-  depends_on lodash (dependency)
-  depends_on shop (module, package.json)
-```
-
-**Fichiers SQL.** Le lecteur est indépendant du dialecte : il n'exécute rien et ne se connecte à aucune base. Il reconnaît `CREATE [modificateurs] TABLE`, `CREATE [modificateurs] VIEW` (dont `MATERIALIZED`) et `ALTER TABLE`, avec identifiants entre `"…"`, `` `…` `` ou `[…]` ; les noms sont mis en minuscules (`"Orders"` donne `orders`, `shop.products` reste qualifié). Une table déclarée par plusieurs fichiers (création, puis `ALTER TABLE` d'une migration) est un seul nœud. Les liens `references` viennent de `REFERENCES <table>` dans un `CREATE TABLE` ou un `ALTER TABLE`, et de chaque table qui suit `FROM` ou `JOIN` dans une vue (ni fonctions, ni sous-requêtes, ni noms de CTE). Hors périmètre : colonnes, index, séquences, fonctions, procédures, triggers, `INSERT`/`UPDATE`/`DELETE`, `DROP` (le graphe décrit les déclarations des fichiers, pas l'état de la base après migrations), `CREATE TABLE … AS SELECT` (table sans référence) et changelogs Liquibase.
-
-**Fichiers XML.** Hors `pom.xml` et `ivy.xml`, un fichier XML donne son document seul, sans nœud par élément. Les noms JVM cités dans les valeurs d'attributs et dans les textes ou CDATA d'éléments donnent des `mentions` depuis le document.
-
-**Fichiers JSON et YAML.** Chaque clé feuille (valeur scalaire, `null`, tableau ou objet vide) donne un nœud `key` d'identifiant `key:<fichier>#a.b.c` (nom court `a.b.c`), contenu par le document ; les objets non vides sont parcourus, pas les tableaux. Les noms JVM cités dans les valeurs, y compris dans les tableaux, donnent des `mentions` depuis la clé. Un fichier est limité à 1 000 clés (les premières par ordre lexicographique de chemin ; `avertissement:` indiquant le nombre non retenu). Un YAML de plusieurs documents (`---`) réunit leurs clés (un chemin = un nœud) ; la clé de fusion `<<` est ignorée et un alias `*a` n'est pas développé (clé feuille, sans candidat).
-
-**Noms JVM cités.** Dans les fichiers XML, JSON et YAML, chaque valeur est découpée sur les blancs, `,` et `;`. Un morceau est un candidat s'il a au moins deux segments séparés par `.` ou `$` (chaque segment : lettre ASCII ou `_`, puis lettres, chiffres ou `_`), éventuellement suivi de `()` ou de `#segment`. Exemples : `com.acme.Outer$Inner` vise `com.acme.Outer.Inner`, `com.acme.Repo#save` vise `com.acme.Repo.save`, `com.acme.A, com.acme.B;com.acme.C` donne trois candidats ; `orderService`, `1.0`, `v1.2`, `${db.url}`, `http://x.org/a.b`, `classpath:com.acme` et `a..b` n'en sont pas. Les candidats sont des `mentions` non résolues tant que le nom est absent du graphe, sans figurer dans les références non résolues ; au plus 1 000 par fichier (`avertissement:` indiquant le nombre ignoré).
-
-Exemples sur un dépôt contenant `application.yml` et `db/V1__init.sql` :
-
-```
-$ nephila query search spring.datasource.url
-src/main/resources/application.yml#spring.datasource.url (key, src/main/resources/application.yml)
-
-$ nephila query neighbors orders
-utilise :
-  references customers (table, db/V1__init.sql)
-utilisé par :
-  contains db/V1__init.sql (sql, db/V1__init.sql)
-```
-
-**Résolution des appels.** Le type du receveur est cherché dans le fichier seulement : paramètre, variable locale, ou champ typé ou initialisé par un constructeur. Un receveur non déclaré qui commence par une majuscule est traité comme un appel statique. `this.m()` et `m()` visent le type englobant s'il déclare `m`. Quand le type du receveur est inconnu (chaîne d'appels, `var` sans initialiseur reconnaissable), aucun lien n'est créé : un lien manquant coûte moins cher qu'un lien faux.
-
-Les références qui ne trouvent pas de cible sont comptées dans « références non résolues ». Un fichier mal formé est exploité au mieux, sans faire échouer la commande.
-
-## Fonctionnement
-
-- **Stockage** : le graphe est une base SQLite dans `<dépôt>/.nephila/`. Ajoutez `.nephila/` au `.gitignore` du dépôt analysé.
-- **Fichiers ignorés** : `.nephila/`, `target/`, `build/`, `.gradle/`, `.git/` et tout ce qu'exclut le `.gitignore` du dépôt.
-- **Détection des changements** : par empreinte du contenu. Un fichier modifié moins de 2 secondes avant son enregistrement est relu au passage suivant, pour ne manquer aucune modification. Cela coûte une lecture, jamais un appel LLM. Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).
-- **Concurrence** : un seul `build` ou `update` à la fois par dépôt, grâce au verrou `.nephila/lock`. Une seconde commande échoue aussitôt (`erreur: indexation déjà en cours sur ce dépôt`). Le verrou disparaît avec le processus, même après un arrêt brutal.
-
-## Codes de sortie
-
-| Code | Signification |
-|---|---|
-| 0 | Succès |
-| 1 | Erreur d'exécution : configuration, clé refusée, requête refusée, redirection, réseau, graphe absent, aucun résultat, fichiers en attente ou à enrichir avec le LLM actif… |
-| 2 | Erreur d'usage : commande ou option inconnue, valeur invalide |
-
-Les messages sont écrits sur stderr, préfixés `erreur:` ou `avertissement:`. stdout ne contient que le résultat.
-
-Si stdout est fermée avant la fin de la sortie (lecteur arrêté, | head), toute commande s'arrête sur une seule ligne erreur: écriture sur stdout impossible : <cause> et le code 1, sans rien écrire de plus. build et update ont déjà enregistré le graphe : seul leur bilan manque, et nephila status donne l'état. Une commande qui n'avait rien à écrire sur stdout garde son propre message.
-
-Si la passe de résolution des liens échoue (`build` ou `update`), la commande s'arrête sur une seule ligne `erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe` et le code 1, sans ligne de bilan : les fichiers ont été lus et enregistrés, seuls les liens ne sont pas recalculés. `nephila status` annonce alors `graphe à résoudre : lancez nephila update` ; essayez d'abord `nephila update`, puis `nephila build` si l'erreur revient.
-
-Si le système refuse de démarrer un fil du parcours du dépôt (plafond de processus : `ulimit -u`, `pids.max` d'un conteneur), `build`, `update`, `status` et `query … --check-stale` s'arrêtent sur une seule ligne et le code 1, sans modifier le graphe existant :
-
-```
-erreur: parcours du dépôt impossible : Resource temporarily unavailable (os error 11)
-```
-
-`nephila build --jobs 1` parcourt le dépôt sans créer de fil. Si le système refuse aussi le fil de l'extraction, la commande s'arrête sur `erreur: création des fils d'analyse impossible : <cause>` : relevez alors le plafond. `status` et les requêtes n'ont pas `--jobs` ; relevez le plafond. Quand l'extraction obtient moins de fils que demandé, la commande continue avec les fils démarrés et le graphe est le même ; seul `--verbose` le dit (`structure: 2 fils démarrés sur 4 demandés`).
-
-Avec `--check-stale`, les avertissements du parcours (dossier ou métadonnées illisibles) sont écrits après la ligne `avertissement: graphe pas à jour : …`, qui reste la première de stderr.
-
-## Usage par un agent
-
-Les sorties `--json` sont stables et sans décoration. Séquence type :
-
-1. `nephila status --json` : si `a_jour` vaut `false`, lancer `nephila update`.
-2. `nephila query search --json <terme>` pour localiser un élément, `nephila query neighbors --json <nœud> --depth 2` pour explorer ses dépendances, `nephila query path --json <a> <b>` pour relier deux éléments.
-3. `nephila summary --json` pour une vue d'ensemble, `nephila export --output -` pour charger tout le graphe.
-
-Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
+Les références sans cible sont comptées dans « références non résolues ». Un fichier mal formé est exploité au mieux.
 
 ## Limites connues
 
-- **`trait` Groovy** : la grammaire utilisée ne reconnaît pas `trait`. Un trait ne produit ni nœud ni méthode, sans avertissement. Une classe qui l'implémente garde une référence `implements` non résolue.
-- **Premier niveau d'un script Groovy** : un appel sans parenthèses (`helper 42`, `println "hello"`, `apply plugin: 'java'`) et une fermeture isolée `{ … }` sont ignorés. Écrivez `helper(42)` pour obtenir le lien `calls`. Dans le corps d'une fonction, l'appel sans parenthèses reste reconnu, sauf directement dans le bloc d'une méthode de classe.
-- **`println x` en Groovy** : un appel sans parenthèses dont l'argument est un identifiant seul est lu comme une déclaration de variable et ne crée pas de lien.
-- **Chemins Gradle relatifs** : `project("core")` (sans `:` initial) est ignoré. Écrivez `project(':core')`.
-- **JSONC et JSON5** : non pris en charge. Un JSON à commentaires, à virgule finale ou tronqué donne le document seul, sans clé ni candidat, avec un `avertissement:`.
-- **Nom SQL qualifié** : `public.orders` ne trouve pas une table déclarée `orders` (l'inverse fonctionne si `public.orders` est seul).
-- **Ré-exportations** : `export … from` et `export *` ne sont pas suivis. Un nom importé depuis un barrel (`index.ts`) se résout par nom simple unique, ou reste non résolu s'il est ambigu.
-- **`tsconfig.json`** : ses `paths` ne sont pas lus. Les imports `@/…` et `~/…` visent le nom importé par nom simple unique. Un `tsconfig.json` à commentaires est un JSON mal formé : document seul, avec avertissement.
-- **Imports dynamiques** : `import()` n'est pas suivi.
-- **`.vue`, `.svelte`, `.astro`** : non pris en charge.
-- **Syntaxe TypeScript récente** : une syntaxe postérieure à la grammaire embarquée est exploitée au mieux.
-- **Pas de lecture propre à Spring ou Kubernetes** : `application.yml`, manifestes et workflows CI sont des YAML comme les autres.
-- **Gros JSON de données** (fixtures, exports de données) : indexés dans la limite de 1 000 clés ; excluez-les par `.gitignore`.
-- **Export dans le dépôt** : un export écrit dans le dépôt sous un autre nom que `<slug>.json` est indexé comme n'importe quel JSON ; excluez-le par `.gitignore`.
-- **`query path`** : renvoie le plus court chemin sans tenir compte du sens des liens. Il peut donc passer par un `import` ou un package plutôt que par des appels.
+- **`trait` Groovy** : la grammaire ne le reconnaît pas ; un trait ne produit ni nœud ni méthode.
+- **Script Groovy** : un appel sans parenthèses (`helper 42`, `println x`) ne crée pas de lien ; écrivez `helper(42)`.
+- **Gradle** : `project("core")` est ignoré ; écrivez `project(':core')`.
+- **JSONC et JSON5** : non pris en charge (document seul, avec un `avertissement:`).
+- **Nom SQL qualifié** : `public.orders` ne trouve pas une table déclarée `orders`.
+- **JS/TS** : `export … from`, `export *` et `import()` ne sont pas suivis ; les `paths` de `tsconfig.json` ne sont pas lus.
+- **Gros JSON et exports** : indexés dans la limite de 1 000 clés ; excluez-les.
+- **`query path`** : ignore le sens des liens.
 
 ## Mise à niveau
 
-- **Renommage `rkg` → `nephila`** : le binaire s'appelle `nephila`, le graphe est stocké dans `.nephila/` (au lieu de `.rkg/`), la configuration dans `~/.config/nephila/config.toml` et les variables d'environnement sont préfixées `NEPHILA_` (`NEPHILA_CONFIG`, `NEPHILA_MOCK_DIR`…). Déplacez votre configuration (`mv ~/.config/rkg ~/.config/nephila`), puis reconstruisez le graphe avec `nephila build` et supprimez l'ancien dossier `.rkg/`.
-- **Vers 0.25** : le graphe passe au schéma 9 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, fait une résolution complète et calcule les communautés ; d'ici là, les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.24 tel quel, sans communautés. Un binaire 0.24 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).
-- **Vers 0.24** (graphe à résoudre) : un graphe d'une version antérieure à la 0.22 est annoncé « graphe à résoudre » jusqu'au premier `nephila update`, qui le migre et fait une passe complète.
-- **Vers 0.24** : les dossiers dist/, out/, coverage/, .next/, .nuxt/, vendor/ et .idea/, à tout niveau, et les fichiers *.min.js sont exclus par défaut. nephila status liste comme supprimé chaque fichier du graphe qu'ils contiennent, et le premier nephila update les retire, sans appel LLM. Pour les garder : exclude_defaults = false dans .nephila.toml.
-- **Vers 0.23** : le parcours du dépôt et l'extraction utilisent par défaut un fil par cœur disponible, quelle que soit concurrency, qui ne règle plus que les appels LLM. Pour limiter ces fils comme concurrency = 1 le faisait, ajoutez --jobs 1 à nephila build et nephila update.
-- **Vers 0.22** : le graphe passe au schéma 8 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, et la première résolution qui suit est complète ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.21 tel quel. Un binaire 0.21 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).
-- **Vers 0.21** : le graphe passe au schéma 7 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.20 tel quel. La place libérée n'est rendue au disque que par `sqlite3 .nephila/graph.db 'VACUUM'`. Un binaire 0.20 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).
-- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles. Le graphe passe au schéma 6 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés ; les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 tel quel.
-- **Vers 0.18** : le graphe passe au schéma 5. Un graphe 0.17 est refusé (`… lancez nephila build`) : le premier `nephila build` avec le LLM actif le remplace et enrichit une fois tous les fichiers de la portée (documents Markdown, ou tout avec `enrich_code`), puis les `build` suivants n'envoient que les fichiers nouveaux ou modifiés. Le code n'est plus enrichi par défaut et `batch_files` vaut 10.
-- **Vers 0.10** : un graphe 0.9 est complété par `nephila update`, sans `build` : les fichiers JS/TS sont ajoutés, les `package.json` sont réanalysés en fichiers de build (leur document et leurs clés disparaissent) et les fichiers de verrouillage (`package-lock.json`…) sont retirés.
-- **Vers 0.9** : un graphe 0.8 est complété par `nephila update` : les fichiers `.sql`, `.xml`, `.json`, `.yaml` et `.yml`, nouvellement pris en charge, sont ajoutés sans reconstruction.
-- **Vers 0.4** : `nephila export` sans option écrit dans un fichier au lieu de stdout. Pour l'ancien comportement, utilisez `nephila export --output -`.
-- **Depuis 0.2** : le schéma du graphe a changé. Un graphe ancien est refusé (`… lancez nephila build`) : reconstruisez-le avec `nephila build`. Les fixtures du fournisseur `mock` passent au schéma version 2.
+Les versions qui demandent une action, la plus récente d'abord. L'historique des nouveautés est dans les tags git et sur la page [Releases](https://github.com/tixplop/nephila-rs/releases).
 
-| Version | Nouveautés |
-|---|---|
-| 0.25 | Communautés : le graphe est partagé en sous-systèmes par l'algorithme de Leiden, sans LLM (découpe des communautés trop grandes ou peu cohésives, nom tiré du nœud le plus relié, cohésion). nephila query community les liste et les détaille, nephila summary donne les 10 plus grandes, l'export JSON donne la communauté de chaque nœud et la vue HTML colore les nœuds par communauté (choix « Couleur »). Le schéma 9 est migré sur place. |
-| 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit. Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe. Nouveautés : déduplications linéaires, un parser par fil, export en flux sans nouvelle résolution, profil release optimisé, banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. Graphe à résoudre : nephila status l'annonce (graphe à résoudre : lancez nephila update) après une commande interrompue ou une passe de résolution en échec (erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe) ; --verbose dit si la passe est complète ou incrémentale. Envoi au LLM : une requête refusée (HTTP 400, 404, 413, 422), une redirection ou des délais dépassés répétés l'arrêtent chacun avec une ligne erreur: dédiée (`erreur: requête refusée par <fournisseur> (HTTP <code>) sur <url>`, `erreur: <fournisseur> redirige (HTTP <code>) vers <adresse> ; corrigez base_url`) ; les redirections ne sont pas suivies. Deux noms identiques après conversion : le fichier déjà indexé reste retenu, un fichier illisible est ignoré et laisse la place au suivant, que l'avertissement nomme par son nom réel. Les déclarations imbriquées au-delà de 1000 niveaux sont ignorées avec un avertissement, le reste du fichier est indexé ; les avertissements de l'analyse sont écrits triés par chemin, quel que soit --jobs. Un fil refusé par le système (plafond de processus) arrête la commande sur une ligne `erreur:` au lieu d'une panique ; avec --check-stale, la ligne « graphe pas à jour » reste la première de stderr. |
-| 0.23 | Option --jobs de build et update : nombre de fils du parcours du dépôt et de l'extraction, par défaut le nombre de cœurs disponibles ; concurrency ne règle plus que les appels LLM. Parcours du dépôt et empreintes en parallèle, fichier lu une seule fois pour son empreinte et son analyse, écriture SQLite allégée, même graphe qu'en 0.22 quel que soit le nombre de fils. |
-| 0.22 | Mise à jour incrémentale : `update` ne résout plus que les références touchées par les fichiers changés et ne relit plus toute la table des liens ; résumé global calculé sans relire le graphe ; une seule résolution complète par commande avec LLM. Même graphe qu'en 0.21 ; le schéma 8 est migré sur place. |
-| 0.21 | Stockage SQLite allégé : contexte d'imports stocké une fois par fichier, index inutiles retirés, cache SQLite agrandi à chaque ouverture en écriture, écritures regroupées, build neuf sans recalcul répété des nœuds. Même graphe qu'en 0.20 ; le schéma 7 est migré sur place. |
-| 0.20 | Options LLM thinking, effort et max_output_tokens dans la configuration personnelle. Rupture : une limite de sortie de 16384 jetons est envoyée par défaut, à anthropic (au lieu de 8192) et désormais à openai ; un modèle ou un serveur qui ne l'accepte pas refuse la requête (HTTP 400) : baissez max_output_tokens. Une réponse tronquée conseille aussi d'augmenter max_output_tokens. |
-| 0.19.2 | Fichiers aux noms non UTF-8 lus par leur chemin réel (ils ne restent plus en attente) ; deux noms identiques après conversion : un seul est indexé, l'autre est nommé par un avertissement, au lieu d'un échec de build |
-| 0.19 | Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers. `query ask` ne copie plus le graphe pour chercher les mots-clés, `neighbors` et `path` restent linéaires autour d'un nœud très relié, la résolution d'un nom passe par un index. Le schéma 6 est migré sur place. |
-| 0.18 | Rupture : seuls les documents Markdown sont enrichis par défaut ; enrich_code = true dans la configuration personnelle, ou --enrich-code, rétablit le comportement de la 0.17. Les résumés sont conservés d'un build à l'autre : le premier build en 0.18 remplace le graphe et enrichit une fois tous les fichiers de la portée, les suivants n'envoient que les fichiers nouveaux ou modifiés. Une clé d'API refusée est constatée au premier appel, après l'extraction. Lots de 10 fichiers par défaut (`batch_files = 10`), morceaux d'un gros fichier envoyés en parallèle, nouveaux essais HTTP avec attente progressive, connexions réutilisées. |
-| 0.17.5 | Liste de nœuds propre à chaque morceau d'un gros fichier ; au plus 50 appels d'enrichissement par fichier, au-delà le fichier est nommé et laissé à enrichir |
-| 0.17.4 | Réponse tronquée par la limite de jetons reconnue et jamais renvoyée ; au plus 150 nœuds demandés par appel d'enrichissement |
-| 0.17 | Plafonds des réglages entiers de `.nephila.toml` (rupture : une valeur au-dessus est refusée ; pour corriger le fichier, donnez au réglage une valeur au plus égale à son plafond, donné par la table de la section « Fichier de projet `.nephila.toml` », ou déplacez le réglage dans votre configuration personnelle, qui n'a pas de plafond mais vaut pour tous vos dépôts ; les options `--batch-files` et `--format-retries` n'ont pas de plafond non plus, mais ne corrigent pas un fichier refusé) |
-| 0.16.1 | Analyse des expressions très imbriquées (Java, Kotlin, Scala, Groovy) sans débordement de pile |
-| 0.16 | Option `--show-progress` de `build` et `update` |
-| 0.15 | Réglages LLM du dépôt dans `.nephila.toml` |
-| 0.14.1 | Exemples de configuration complets (`examples/config.toml`, `examples/nephila.toml`), vérifiés par les tests |
-| 0.14 | Vue HTML : bouton « Tout étendre », liens masqués pendant le zoom et le déplacement |
-| 0.13 | Nouveaux essais des réponses LLM non conformes (`format_retries`, `--format-retries`) |
-| 0.12.0 | Filtres d'analyse (`--exclude`, `--exclude-type`, `.nephila.toml`) |
-| 0.11.0 | Certificats d'autorité et désactivation du contrôle TLS (clés `tls_ca_cert`, `tls_insecure`) |
-| 0.10.0 | JavaScript et TypeScript (modules ES, imports, appels, JSX), `package.json` comme fichier de build ; sous-genres `alias` et `object` ; modules désignés par leur nom qualifié |
-| 0.9.0 | Fichiers de données : SQL (tables, vues, `references`), XML, JSON et YAML (clés, noms JVM cités) ; genres `table` et `key` |
-| 0.8.1 | Premiers binaires précompilés (Linux musl, macOS) publiés par la CI |
-| 0.8 | Renommage `rkg` → `nephila` (binaire, dossier `.nephila/`, configuration, variables `NEPHILA_*`) |
-| 0.7 | Option `--batch-files <N>` de `build` et `update` |
-| 0.6 | Enrichissement en lots (clé `batch_files`) |
-| 0.5 | Option `-v, --verbose` de `build` et `update` |
-| 0.4 | Export dans un fichier, page HTML d'exploration |
-| 0.3 | Structure extraite par analyse syntaxique, sans LLM ; LLM facultatif |
+- **Vers 0.25** : le premier `nephila update` (ou `build`) migre le graphe et calcule les communautés, sans appel LLM ; d'ici là, `query community` répond `communautés non calculées`. Pour revenir à une version antérieure, supprimez `.nephila/` : le build suivant réenrichit tous les fichiers de la portée.
+- **Vers 0.24** : `dist/`, `out/`, `coverage/`, `.next/`, `.nuxt/`, `vendor/`, `.idea/` et `*.min.js` sont exclus par défaut, et le premier `nephila update` retire leurs fichiers du graphe. Pour les garder : `exclude_defaults = false` dans `.nephila.toml`.
+- **Vers 0.23** : l'extraction utilise un fil par cœur, quelle que soit `concurrency`. Pour la limiter comme `concurrency = 1` le faisait : `--jobs 1`.
+- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute `--check-stale` à ses requêtes, ou lance `nephila status` avant elles.
+- **Vers 0.18** : seuls les documents Markdown sont enrichis par défaut ; pour le code, `enrich_code = true` dans la configuration personnelle. Le premier `nephila build` remplace un graphe 0.17 et enrichit une fois tous les fichiers de la portée.
+
+Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans appel LLM et sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`.
 
 ## Développement
 
-L'intégration continue (`.github/workflows/ci.yml`) lance le lint, les tests sur Linux et macOS, les tests de la vue et l'audit des dépendances (`cargo deny check advisories`) à chaque push sur `master` et à chaque pull request ; chaque lundi, elle passe aussi l'audit, les tests de performance et clippy sur la chaîne beta (les performances se lancent aussi à la demande par `workflow_dispatch`).
+La CI (`.github/workflows/ci.yml`) lance le lint, les tests sur Linux et macOS, les tests de la vue et `cargo deny check advisories` à chaque push sur `master` et pull request ; chaque lundi, elle passe aussi l'audit, les performances et clippy beta.
 
-Les actions sont épinglées par SHA de commit, l'étiquette en commentaire ; Dependabot (`.github/dependabot.yml`) propose chaque semaine la mise à jour des actions et des crates. Pour mettre à jour un SHA à la main, relever le commit de l'étiquette par `git ls-remote --tags https://github.com/<propriétaire>/<action>.git` (ligne terminée par `^{}` si l'étiquette est annotée ; pour `dtolnay/rust-toolchain`, `git ls-remote https://github.com/dtolnay/rust-toolchain.git refs/heads/stable`), puis remplacer le SHA et le commentaire dans toutes les lignes de l'action, dans `ci.yml` et `release.yml`.
+Les actions sont épinglées par SHA et Dependabot (`.github/dependabot.yml`) propose les mises à jour. La chaîne d'outils est épinglée par `rust-toolchain.toml` à Rust 1.99.0 ; une montée change ensemble `channel`, `rust-version` et les `toolchain:` des workflows.
 
-La chaîne d'outils est épinglée par `rust-toolchain.toml` à Rust 1.99.0, le plancher de `rust-version` ; rustup l'installe au premier appel de cargo dans le dépôt. Une montée change ensemble `channel`, `rust-version` et les `toolchain:` des workflows.
-
-**Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
+**Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, puis pousser un tag identique ; `release.yml` publie les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.25.2 && git push origin v0.25.2
+git tag v0.25.3 && git push origin v0.25.3
 ```
 
-Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global. `cargo test` passe aussi (tests en parallèle, sans limite de temps par test) ; `cargo nextest run` reste la commande de référence, celle de la CI.
+Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml`) ; `cargo test` passe aussi.
 
 ```sh
 cargo nextest run --cargo-quiet --color never --test-threads 1 --no-fail-fast --status-level fail --final-status-level fail   # suite complète
-cargo fmt --all -- --check
+cargo fmt --all -- --check                                      # format
 cargo clippy -q --all-targets --color never -- -D warnings      # lint
-cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf       # performances (dépôt de 10 000 fichiers)
+cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf       # performances
+cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf_banc  # banc
 node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests/view/*.test.js'   # logique de la vue HTML
 ```
 
-Sous macOS, les tests des noms de fichiers non UTF-8 (`tests/non_utf8_names.rs` et ceux de `src/scan.rs`) passent sans rien vérifier : APFS refuse de créer ces noms, et chaque test s'arrête aussitôt. Seule la CI Linux les exécute vraiment ; une modification du traitement de ces noms se vérifie sous Linux.
+Sous macOS, les tests des noms de fichiers non UTF-8 ne vérifient rien (APFS les refuse) : seule la CI Linux les exécute.
 
-Le banc de performance mesure `build --no-llm` et `update --no-llm` sur une fixture JavaScript générée sous `target/` (générateur déterministe), sans seuil de temps :
-
-```sh
-cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf_banc   # banc
-```
-
-La première ligne, `banc: fixture <empreinte>`, donne l'empreinte BLAKE3 de l'arbre de la fixture : deux lancements doivent la retrouver à l'identique. Chaque ligne `banc: <commande> --no-llm : parcours … ms, structure … ms, résolution … ms, autres … ms, total … ms (médiane de 3, <n> fichiers, <w> fils)` donne la durée de chaque phase, médiane de trois exécutions, pour le nombre de fichiers et de fils indiqués. Comparez ces lignes d'une version à l'autre sur la même machine.
-
-`NEPHILA_RETRY_BASE_MS` (entier ≥ 0, en millisecondes) remplace la base de 1 s de l'attente entre deux envois HTTP, pour des tests rapides ; `retry-after` reste respecté. Une valeur mal formée donne `erreur: NEPHILA_RETRY_BASE_MS : entier attendu, reçu « abc »`.
-
-Les certificats de test TLS (`tests/fixtures/tls/`) se régénèrent par `tests/fixtures/tls/gen.sh` (nécessite `openssl`).
-
-La logique de la vue HTML est un module JS pur, testé par `node --test`. Node 20 ou plus est requis pour ces tests seulement, sans npm ni dépendance : le produit n'en dépend pas. Un test Rust compare les données de la vue à la fixture `tests/view/fixtures/maven3.json`. Après un changement volontaire de l'export, régénérez-la avec `NEPHILA_UPDATE_VIEW_FIXTURE=1 cargo nextest run view_fixture`. Le rendu et les interactions souris se vérifient à la main ; `node tests/view/synthetic_page.js <page exportée> <n> <sortie>` remplace les données d'une page exportée par un graphe synthétique de n nœuds (sortie sous `target/view-check/`) pour ces contrôles.
+`NEPHILA_RETRY_BASE_MS` (entier ≥ 0, en millisecondes) remplace la base de 1 s de l'attente entre deux envois HTTP, pour des tests rapides ; `retry-after` reste respecté.
 
 ### LLM simulé (`provider = "mock"`)
 
-Le fournisseur `mock` remplace le LLM par des fixtures et se pilote par l'environnement :
+Le fournisseur `mock` remplace le LLM par des fixtures, piloté par l'environnement :
 
 | Variable | Effet |
 |---|---|
-| `NEPHILA_MOCK_DIR` | Dossier de fixtures : `<dir>/<chemin relatif>.json` (ou `<chemin>.<i>.json` pour l'appel i, à partir de 1 ; i est le numéro du morceau avec 150 nœuds ou moins) est la réponse d'enrichissement ; `_ask.json` est la réponse de `query ask`. Sans fixture, la réponse est vide et valide. |
-| `NEPHILA_MOCK_LOG` | Journal des appels : une ligne `chemin<TAB>n°appel` par appel (égal au numéro de morceau avec 150 nœuds ou moins), ou `chemin_1;chemin_2;…<TAB>1` pour un lot |
+| `NEPHILA_MOCK_DIR` | Dossier de fixtures : `<dir>/<chemin relatif>.json` est la réponse d'enrichissement, `_ask.json` celle de `query ask` |
+| `NEPHILA_MOCK_LOG` | Journal des appels : une ligne `chemin<TAB>n°appel` par appel |
 | `NEPHILA_MOCK_FAIL_AFTER` | Nombre d'appels réussis avant des erreurs réseau simulées |
 | `NEPHILA_MOCK_INVALID_KEY` | Si non vide et différent de `0`, chaque appel échoue en « clé refusée » |
 | `NEPHILA_MOCK_DELAY_MS` | Délai ajouté à chaque appel |
-| `NEPHILA_MOCK_TIMEOUT_FILES` | Chemins relatifs, séparés par des virgules, dont l'enrichissement échoue par délai dépassé |
+| `NEPHILA_MOCK_TIMEOUT_FILES` | Chemins relatifs, séparés par des virgules, dont l'appel échoue par délai dépassé |
 | `NEPHILA_MOCK_KEY_REVOKED_AFTER` | Nombre d'appels d'enrichissement avant des refus de clé simulés |
-| `NEPHILA_MOCK_MALFORMED` | `<chemin>:<k>[,<chemin>:<k>…]` (`_ask` pour `query ask`, k entier > 0) : les k premiers appels qui portent ce fichier (un morceau, ou un lot qui le contient) reçoivent une réponse non conforme, les suivants la réponse habituelle |
+| `NEPHILA_MOCK_MALFORMED` | `<chemin>:<k>[,…]` : les k premiers appels de ce fichier reçoivent une réponse non conforme |
 
-Une fixture d'enrichissement (schéma version 2) contient obligatoirement `version`, `summaries` et `concepts`, avec des listes vides au besoin. Les résumés visent des nœuds du fichier par leur identifiant `genre:nom`. Les concepts ne sont acceptés que pour un fichier Markdown et citent ses sections par leur identifiant complet. Tout le reste est écarté avec un avertissement, et une fixture ne crée jamais de nœud de structure.
-
-Pour `src/shop/Order.java`, le fichier `<dir>/src/shop/Order.java.json` :
+Une fixture contient obligatoirement `version`, `summaries` et `concepts` (listes vides au besoin) ; les concepts sont réservés aux fichiers Markdown, et tout le reste est écarté avec un avertissement. Pour `src/shop/Order.java`, le fichier `<dir>/src/shop/Order.java.json` :
 
 ```json
 {"version":2,
  "summaries":[{"node":"type:shop.Order","summary":"Une commande."}],
  "concepts":[]}
-```
-
-Pour `docs/guide.md`, le fichier `<dir>/docs/guide.md.json` :
-
-```json
-{"version":2,
- "summaries":[],
- "concepts":[{"name":"Facturation","summary":"Paiement des commandes.","sections":["section:docs/guide.md#facturation"]}]}
 ```
 
 Format de `_ask.json` : `{"found":true,"answer":"...","nodes":["method:shop.Order.place"]}` ou `{"found":false}`.
