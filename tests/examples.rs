@@ -1506,3 +1506,181 @@ fn REQ155_AC17_tables_et_liens_lisibles() {
     }
     assert!(!readme.contains("!["));
 }
+
+// --- REQ-155 AC-155-3 : cohérence du README avec le code (DEC-125) ---
+
+/// Sortie standard de `nephila <args>`.
+fn help_of(args: &[&str]) -> String {
+    let out = Command::cargo_bin("nephila")
+        .unwrap()
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{args:?} a échoué");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Sous-commandes de la section `Commands:` d'une aide, `help` exclu.
+fn subcommands_of(help: &str) -> Vec<String> {
+    help.lines()
+        .skip_while(|l| *l != "Commands:")
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|name| *name != "help")
+        .map(String::from)
+        .collect()
+}
+
+/// Options longues des lignes d'options d'une aide, `--help` et `--version` exclus.
+fn long_options_of(help: &str) -> Vec<String> {
+    help.lines()
+        .skip_while(|l| *l != "Options:")
+        .skip(1)
+        .take_while(|l| l.starts_with(' '))
+        .filter(|l| l.trim_start().starts_with('-'))
+        .flat_map(|l| {
+            let spec = l.trim_start().split("  ").next().unwrap_or("");
+            spec.split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|w| w.starts_with("--"))
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|o| o != "--help" && o != "--version")
+        .collect()
+}
+
+#[test]
+fn REQ155_AC3a_sous_commandes() {
+    let readme = repo_file("README.md");
+    let table = readme_section(&readme, "## Commandes");
+    let rows: Vec<&str> = table.lines().filter(|l| l.starts_with("| ")).collect();
+    let top = subcommands_of(&help_of(&["--help"]));
+    let query = subcommands_of(&help_of(&["query", "--help"]));
+    assert!(top.len() >= 6 && query.len() >= 5, "{top:?} {query:?}");
+    for (prefix, names) in [("nephila", top), ("nephila query", query)] {
+        for name in names {
+            let start = format!("| `{prefix} {name}");
+            assert!(
+                rows.iter().any(|r| r.starts_with(&start)),
+                "sous-commande absente de la table de `## Commandes` : {prefix} {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn REQ155_AC3b_options_longues() {
+    let readme = repo_file("README.md");
+    let mut commands: Vec<Vec<&str>> = ["build", "update", "status", "summary", "export"]
+        .iter()
+        .map(|c| vec![*c])
+        .collect();
+    for q in ["search", "neighbors", "path", "community", "ask"] {
+        commands.push(vec!["query", q]);
+    }
+    for mut args in commands {
+        let label = args.join(" ");
+        args.push("--help");
+        let options = long_options_of(&help_of(&args));
+        assert!(!options.is_empty(), "aucune option lue pour {label}");
+        for option in options {
+            assert!(
+                readme.contains(&option),
+                "option absente du README : {option} (nephila {label})"
+            );
+        }
+    }
+}
+
+#[test]
+fn REQ155_AC3c_cles_de_configuration() {
+    let readme = repo_file("README.md");
+    let llm = readme_section(&readme, "## Configuration du LLM");
+    for key in accepted_keys() {
+        let start = format!("| `{key}` |");
+        assert!(
+            llm.lines().any(|l| l.starts_with(&start)),
+            "clé absente de la table de `## Configuration du LLM` : {key}"
+        );
+    }
+    let project = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
+    for key in project_accepted_keys() {
+        assert!(
+            project.contains(&format!("`{key}`")),
+            "clé absente de `### Fichier de projet` : {key}"
+        );
+    }
+}
+
+#[test]
+fn REQ155_AC3d_types_de_fichiers() {
+    let readme = repo_file("README.md");
+    let section = readme_section(&readme, "### Motifs et types");
+    for t in FileType::ALL {
+        let start = format!("| `{}` |", t.name());
+        assert!(
+            section.lines().any(|l| l.starts_with(&start)),
+            "type absent de la table de `### Motifs et types` : {}",
+            t.name()
+        );
+    }
+}
+
+#[test]
+fn REQ155_AC3e_plafonds() {
+    let readme = repo_file("README.md");
+    let section = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
+    for (key, cap) in PROJECT_CAPS {
+        let row = format!("| `{key}` | {cap} |");
+        assert!(
+            section.lines().any(|l| l == row),
+            "ligne de plafond absente : {row}"
+        );
+    }
+}
+
+#[test]
+fn REQ155_AC3f_variables_du_llm_simule() {
+    let readme = repo_file("README.md");
+    let section = readme_section(&readme, "### LLM simulé (`provider = \"mock\"`)");
+    let in_code = mock_vars(MOCK_SOURCE);
+    let cited = mock_vars(&section);
+    assert!(in_code.len() >= 8, "{in_code:?}");
+    let missing: Vec<_> = in_code.difference(&cited).collect();
+    let unknown: Vec<_> = cited.difference(&in_code).collect();
+    assert!(
+        missing.is_empty(),
+        "variables du code absentes du README : {missing:?}"
+    );
+    assert!(
+        unknown.is_empty(),
+        "variables du README inconnues du code : {unknown:?}"
+    );
+    let dev = readme_section(&readme, "## Développement");
+    assert!(
+        dev.contains("NEPHILA_RETRY_BASE_MS"),
+        "NEPHILA_RETRY_BASE_MS absente de `## Développement`"
+    );
+}
+
+#[test]
+fn REQ155_AC3g_memoire_en_mio() {
+    let readme = repo_file("README.md");
+    let expected = nephila::scan::RETAIN_BUDGET / (1024 * 1024);
+    for (at, _) in readme.match_indices(" Mio") {
+        let digits: String = readme[..at]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert_eq!(
+            digits,
+            expected.to_string(),
+            "nombre de Mio du README différent de RETAIN_BUDGET"
+        );
+    }
+}
