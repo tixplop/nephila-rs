@@ -21,6 +21,7 @@ Langages et formats pris en charge : Java, Kotlin, Groovy, Scala, JavaScript et 
 - [Commandes](#commandes)
 - [Filtrer l'analyse](#filtrer-lanalyse)
 - [Export et vue HTML](#export-et-vue-html)
+- [Communautés](#communautés)
 - [Configuration du LLM](#configuration-du-llm)
 - [Proxy d'entreprise et certificats auto-signés](#proxy-dentreprise-et-certificats-auto-signés)
 - [Enrichissement en lots](#enrichissement-en-lots)
@@ -71,7 +72,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.24.4                                      # version voulue
+V=v0.25.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -104,8 +105,9 @@ Option globale : `-C, --repo <dossier>`, la racine du dépôt (défaut : dossier
 | `nephila query search <terme>` | Cherche des nœuds par nom | non |
 | `nephila query neighbors <nœud>` | Voisins d'un nœud | non |
 | `nephila query path <source> <cible>` | Plus court chemin entre deux nœuds | non |
+| `nephila query community [<numéro>]` | Communautés du graphe : liste, ou membres d'une communauté | non |
 | `nephila query ask "<question>"` | Question en langage naturel | requis |
-| `nephila summary [--json]` | Modules, nœuds les plus reliés, thèmes | non |
+| `nephila summary [--json]` | Modules, nœuds les plus reliés, thèmes, communautés | non |
 | `nephila export` | Export JSON ou page HTML | non |
 
 Les commandes sans LLM ne lisent aucune configuration. Les requêtes (`query`) ne parcourent pas le dépôt : elles répondent d'après le graphe, même s'il est en retard sur les fichiers. Avec `--check-stale`, elles le vérifient d'abord et le signalent sur stderr (`avertissement: graphe pas à jour : 1 fichier modifié`).
@@ -193,7 +195,7 @@ $ nephila query path method:shop.Order.place method:shop.Payment.pay
 shop.Order.place calls shop.Payment.pay
 ```
 
-`--depth` vaut 1 par défaut. Une recherche sans résultat sort avec le code 1 (`erreur: aucun résultat pour « zzz »`).
+`--depth` vaut 1 par défaut. Une recherche sans résultat sort avec le code 1 (`erreur: aucun résultat pour « zzz »`). La liste des communautés, ou celle d'un nœud et ses membres : [`nephila query community`](#communautés).
 
 `query ask` est la seule requête qui appelle le LLM. Le contexte qu'il reçoit est fait des nœuds du graphe trouvés par les mots de la question et de leurs voisins, jamais du contenu des fichiers.
 
@@ -470,8 +472,40 @@ Le document est écrit au fil de la lecture du graphe, sans le charger en mémoi
 - **Détails** : un clic sur un nœud ouvre un panneau (genre, nom qualifié, fichier, résumé, liens par genre). Les liens y sont cliquables.
 - **Extension** : un double-clic ou le bouton « Étendre » ajoute les voisins directs. Hors « Tout étendre », la vue est plafonnée à 300 nœuds : les voisins les plus reliés sont retenus, et la page indique « N voisins non affichés ». Si la vue est pleine, naviguer vers un nouveau nœud remplace la vue par ce nœud et ses voisins.
 - **Filtres** : une case par genre de nœud et par genre de lien. Le bouton « Vue initiale » ramène à la vue de départ.
+- **Couleur** : par genre (défaut) ou par communauté ; voir [Communautés](#communautés).
 - **Tout étendre** : affiche tout le graphe jusqu'à 5000 nœuds. Au-delà, les 5000 nœuds les plus reliés sont retenus et la page indique « N nœuds non affichés ». « Étendre » et les liens du panneau travaillent ensuite avec ce plafond de 5000 ; « Vue initiale » ou un résultat de recherche ramène au plafond de 300.
 - Déplacement, zoom et glisser d'un nœud à la souris. Les liens ne sont pas dessinés pendant la molette et le déplacement du fond ; ils reviennent 150 ms après le dernier cran ou au relâchement. Glisser un nœud garde ses liens.
+
+## Communautés
+
+Une communauté est un groupe de nœuds plus reliés entre eux qu'avec le reste du graphe : un sous-système du dépôt. nephila les calcule sans LLM, par l'algorithme de Leiden (modularité, résolution 1), avec les règles de graphify : une communauté de plus d'un quart des nœuds (et de plus de 10 nœuds), ou d'au moins 50 nœuds de cohésion inférieure à 0,05, est redécoupée une fois. Tous les liens comptent, quels que soient leur genre et leur sens ; un nœud sans lien forme une communauté à lui seul. Le résultat ne dépend que du graphe : un même graphe donne les mêmes communautés, quel que soit `--jobs`.
+
+- **Numéro** : 0 pour la plus grande, puis par taille décroissante.
+- **Nom** : le nom court du nœud le plus relié de la communauté (son pivot), ou `communauté <numéro>` si ce nom est vide.
+- **Cohésion** : la part des paires de membres directement reliées, de 0 à 1 (1 pour une communauté d'un seul nœud). Proche de 1, un vrai sous-système ; proche de 0, un regroupement lâche.
+
+**Quand** : à chaque `nephila build`, et à chaque `nephila update` qui change le graphe (fichiers ou enrichissement), dans la même passe que le résumé ; un `update` sans changement ne les recalcule pas. Les numéros sont refaits à chaque calcul : pour retrouver une communauté d'un calcul à l'autre, désignez-la par un de ses nœuds (`--node`). Avec `--verbose`, chaque calcul écrit une ligne `communautés: <ms> ms, <n> communautés`, juste après la ligne `résolution:`.
+
+```
+$ nephila query community [<numéro>] [--node <nœud>] [--limit N]
+$ nephila query community
+0 Order (12 nœuds, cohésion 0.35)
+1 Payment (7 nœuds, cohésion 0.52)
+
+$ nephila query community --node shop.Order
+0 Order (12 nœuds, cohésion 0.35)
+  shop.Order (class, src/Order.java) - Une commande.
+  shop.Order.place (method, src/Order.java)
+  ...
+```
+
+Sans argument, `query community` liste les communautés par numéro. Avec un numéro, ou `--node` et un nœud, il affiche la ligne de la communauté puis ses membres, du plus relié au moins relié : le premier est le pivot. `--limit` vaut 50 par défaut, pour la liste comme pour les membres, et `N résultats supplémentaires` annonce le reste. `--json` donne `communities` (liste) ou `community` et `members` (détail), avec `remaining`. Un numéro absent sort avec le code 1 (``erreur: aucun résultat : communauté 99 introuvable (essayez `nephila query community`)``).
+
+- **Résumé** : `nephila summary` se termine par `Communautés (<total>)` et les 10 plus grandes (numéro, nom, taille) ; `--json` ajoute la clé `communities` (`total`, et `top` avec `id`, `label`, `size` et `cohesion`).
+- **Export JSON** : chaque nœud a une clé `community` (son numéro), et le document une clé `communities`, liste de `{"cohesion", "id", "label", "pivot", "size"}` triée par numéro. `version` reste 1.
+- **Vue HTML** : le choix « Couleur » colore les nœuds par genre (défaut) ou par communauté. Les 8 plus grandes ont chacune leur couleur, les autres sont grises ; la légende les nomme, et le panneau de détails donne la communauté du nœud choisi.
+
+**Graphe d'une version précédente** : tant que le premier `nephila update` (ou `build`) ne l'a pas migré, les communautés ne sont pas calculées. `query community` sort alors avec le code 1 (`erreur: communautés non calculées : lancez nephila update`), `summary` affiche `communautés non calculées (lancez nephila update)`, l'export écrit `"community": null` et `"communities": []`, et la vue désactive la couleur par communauté.
 
 ## Configuration du LLM
 
@@ -758,6 +792,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 ## Mise à niveau
 
 - **Renommage `rkg` → `nephila`** : le binaire s'appelle `nephila`, le graphe est stocké dans `.nephila/` (au lieu de `.rkg/`), la configuration dans `~/.config/nephila/config.toml` et les variables d'environnement sont préfixées `NEPHILA_` (`NEPHILA_CONFIG`, `NEPHILA_MOCK_DIR`…). Déplacez votre configuration (`mv ~/.config/rkg ~/.config/nephila`), puis reconstruisez le graphe avec `nephila build` et supprimez l'ancien dossier `.rkg/`.
+- **Vers 0.25** : le graphe passe au schéma 9 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, fait une résolution complète et calcule les communautés ; d'ici là, les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.24 tel quel, sans communautés. Un binaire 0.24 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée).
 - **Vers 0.24** (graphe à résoudre) : un graphe d'une version antérieure à la 0.22 est annoncé « graphe à résoudre » jusqu'au premier `nephila update`, qui le migre et fait une passe complète.
 - **Vers 0.24** : les dossiers dist/, out/, coverage/, .next/, .nuxt/, vendor/ et .idea/, à tout niveau, et les fichiers *.min.js sont exclus par défaut. nephila status liste comme supprimé chaque fichier du graphe qu'ils contiennent, et le premier nephila update les retire, sans appel LLM. Pour les garder : exclude_defaults = false dans .nephila.toml.
 - **Vers 0.23** : le parcours du dépôt et l'extraction utilisent par défaut un fil par cœur disponible, quelle que soit concurrency, qui ne règle plus que les appels LLM. Pour limiter ces fils comme concurrency = 1 le faisait, ajoutez --jobs 1 à nephila build et nephila update.
@@ -772,6 +807,7 @@ Testez le code de sortie (0, 1, 2) et lisez stderr pour les messages.
 
 | Version | Nouveautés |
 |---|---|
+| 0.25 | Communautés : le graphe est partagé en sous-systèmes par l'algorithme de Leiden, sans LLM, avec les règles de graphify (découpe des communautés trop grandes ou peu cohésives, nom tiré du nœud le plus relié, cohésion). nephila query community les liste et les détaille, nephila summary donne les 10 plus grandes, l'export JSON donne la communauté de chaque nœud et la vue HTML colore les nœuds par communauté (choix « Couleur »). Le schéma 9 est migré sur place. |
 | 0.24 | Rupture : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ne sont plus analysés par défaut ; exclude_defaults = false dans .nephila.toml les rétablit. Export JSON écrit au fil de la lecture du graphe, sans recalculer les références non résolues ; même document qu'en 0.23 pour un même graphe. Nouveautés : déduplications linéaires, un parser par fil, export en flux sans nouvelle résolution, profil release optimisé, banc de performance. Sortie standard fermée par le lecteur (head, par exemple) : toutes les commandes s'arrêtent sur une ligne erreur: écriture sur stdout impossible et le code 1, sans panique. Graphe à résoudre : nephila status l'annonce (graphe à résoudre : lancez nephila update) après une commande interrompue ou une passe de résolution en échec (erreur: résolution : <cause> ; lancez nephila build pour reconstruire le graphe) ; --verbose dit si la passe est complète ou incrémentale. Envoi au LLM : une requête refusée (HTTP 400, 404, 413, 422), une redirection ou des délais dépassés répétés l'arrêtent chacun avec une ligne erreur: dédiée (`erreur: requête refusée par <fournisseur> (HTTP <code>) sur <url>`, `erreur: <fournisseur> redirige (HTTP <code>) vers <adresse> ; corrigez base_url`) ; les redirections ne sont pas suivies. Deux noms identiques après conversion : le fichier déjà indexé reste retenu, un fichier illisible est ignoré et laisse la place au suivant, que l'avertissement nomme par son nom réel. Les déclarations imbriquées au-delà de 1000 niveaux sont ignorées avec un avertissement, le reste du fichier est indexé ; les avertissements de l'analyse sont écrits triés par chemin, quel que soit --jobs. Un fil refusé par le système (plafond de processus) arrête la commande sur une ligne `erreur:` au lieu d'une panique ; avec --check-stale, la ligne « graphe pas à jour » reste la première de stderr. |
 | 0.23 | Option --jobs de build et update : nombre de fils du parcours du dépôt et de l'extraction, par défaut le nombre de cœurs disponibles ; concurrency ne règle plus que les appels LLM. Parcours du dépôt et empreintes en parallèle, fichier lu une seule fois pour son empreinte et son analyse, écriture SQLite allégée, même graphe qu'en 0.22 quel que soit le nombre de fils. |
 | 0.22 | Mise à jour incrémentale : `update` ne résout plus que les références touchées par les fichiers changés et ne relit plus toute la table des liens ; résumé global calculé sans relire le graphe ; une seule résolution complète par commande avec LLM. Même graphe qu'en 0.21 ; le schéma 8 est migré sur place. |
@@ -812,7 +848,7 @@ La chaîne d'outils est épinglée par `rust-toolchain.toml` à Rust 1.99.0, le 
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, commiter, puis pousser un tag `vX.Y.Z` identique à cette version. Le workflow `.github/workflows/release.yml` vérifie la correspondance, relance la CI, compile les quatre cibles et publie la release GitHub avec les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.24.4 && git push origin v0.24.4
+git tag v0.25.0 && git push origin v0.25.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml` : 10 s pour les tests unitaires, 60 s pour les tests d'intégration, 300 s pour les tests de performance) ; un test trop long est tué et nommé. Préfixer une commande par `timeout -k 10 540` sert de filet global. `cargo test` passe aussi (tests en parallèle, sans limite de temps par test) ; `cargo nextest run` reste la commande de référence, celle de la CI.

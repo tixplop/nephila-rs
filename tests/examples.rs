@@ -728,7 +728,7 @@ fn REQ050_AC9_readme_decrit_la_portee_de_l_enrichissement() {
     assert!(line.contains("0.17"));
     let at = |needle: &str| readme.find(needle).unwrap();
     assert!(at("| 0.18 |") < at("| 0.17.5 |"));
-    for needle in ["V=v0.24.4", "git tag v0.24.4 && git push origin v0.24.4"] {
+    for needle in ["V=v0.25.0", "git tag v0.25.0 && git push origin v0.25.0"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
     assert!(!readme.contains("0.17.6"));
@@ -936,8 +936,8 @@ fn REQ017_AC1_readme_0_19_requetes_sans_parcours_du_depot() {
         "Les requêtes avec --check-stale ne comparent que la taille et la date (voir [`nephila query`](#nephila-query)).",
         "- **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute --check-stale à ses requêtes, ou lance nephila status avant elles.",
         "Rupture : les requêtes ne parcourent plus le dépôt et n'avertissent plus d'un graphe en retard par défaut ; --check-stale rétablit l'avertissement, calculé sur la taille et la date des fichiers.",
-        "V=v0.24.4 ",
-        "git tag v0.24.4 && git push origin v0.24.4",
+        "V=v0.25.0 ",
+        "git tag v0.25.0 && git push origin v0.25.0",
     ] {
         assert!(readme.contains(expected), "absent : {expected}");
     }
@@ -1376,7 +1376,7 @@ fn REQ079_AC7_readme_sous_section_exclusions_par_defaut() {
 #[test]
 fn REQ079_AC7_readme_puce_vers_024_et_ligne_du_tableau() {
     let readme = repo_file("README.md");
-    assert_eq!(cargo_minor(), "0.24");
+    assert_eq!(cargo_minor(), "0.25");
     let sec = readme_section(&readme, "## Mise à niveau");
     let bullet = "- **Vers 0.24** : les dossiers dist/, out/, coverage/, .next/, .nuxt/, vendor/ et .idea/, à tout niveau, et les fichiers *.min.js sont exclus par défaut. nephila status liste comme supprimé chaque fichier du graphe qu'ils contiennent, et le premier nephila update les retire, sans appel LLM. Pour les garder : exclude_defaults = false dans .nephila.toml.";
     let b = sec.find(bullet).expect("puce Vers 0.24 absente");
@@ -1839,4 +1839,106 @@ fn REQ137_AC1_readme_tests_non_utf8_macos() {
         .position(|l| l.starts_with("Le banc de performance mesure"))
         .unwrap();
     assert!(fence_close < ip && ip < banc);
+}
+
+#[test]
+fn REQ151_AC1_AC3_readme_communautes_textes_exacts() {
+    let readme = repo_file("README.md");
+    let sec_text = r####"## Communautés
+
+Une communauté est un groupe de nœuds plus reliés entre eux qu'avec le reste du graphe : un sous-système du dépôt. nephila les calcule sans LLM, par l'algorithme de Leiden (modularité, résolution 1), avec les règles de graphify : une communauté de plus d'un quart des nœuds (et de plus de 10 nœuds), ou d'au moins 50 nœuds de cohésion inférieure à 0,05, est redécoupée une fois. Tous les liens comptent, quels que soient leur genre et leur sens ; un nœud sans lien forme une communauté à lui seul. Le résultat ne dépend que du graphe : un même graphe donne les mêmes communautés, quel que soit `--jobs`.
+
+- **Numéro** : 0 pour la plus grande, puis par taille décroissante.
+- **Nom** : le nom court du nœud le plus relié de la communauté (son pivot), ou `communauté <numéro>` si ce nom est vide.
+- **Cohésion** : la part des paires de membres directement reliées, de 0 à 1 (1 pour une communauté d'un seul nœud). Proche de 1, un vrai sous-système ; proche de 0, un regroupement lâche.
+
+**Quand** : à chaque `nephila build`, et à chaque `nephila update` qui change le graphe (fichiers ou enrichissement), dans la même passe que le résumé ; un `update` sans changement ne les recalcule pas. Les numéros sont refaits à chaque calcul : pour retrouver une communauté d'un calcul à l'autre, désignez-la par un de ses nœuds (`--node`). Avec `--verbose`, chaque calcul écrit une ligne `communautés: <ms> ms, <n> communautés`, juste après la ligne `résolution:`.
+
+```
+$ nephila query community [<numéro>] [--node <nœud>] [--limit N]
+$ nephila query community
+0 Order (12 nœuds, cohésion 0.35)
+1 Payment (7 nœuds, cohésion 0.52)
+
+$ nephila query community --node shop.Order
+0 Order (12 nœuds, cohésion 0.35)
+  shop.Order (class, src/Order.java) - Une commande.
+  shop.Order.place (method, src/Order.java)
+  ...
+```
+
+Sans argument, `query community` liste les communautés par numéro. Avec un numéro, ou `--node` et un nœud, il affiche la ligne de la communauté puis ses membres, du plus relié au moins relié : le premier est le pivot. `--limit` vaut 50 par défaut, pour la liste comme pour les membres, et `N résultats supplémentaires` annonce le reste. `--json` donne `communities` (liste) ou `community` et `members` (détail), avec `remaining`. Un numéro absent sort avec le code 1 (``erreur: aucun résultat : communauté 99 introuvable (essayez `nephila query community`)``).
+
+- **Résumé** : `nephila summary` se termine par `Communautés (<total>)` et les 10 plus grandes (numéro, nom, taille) ; `--json` ajoute la clé `communities` (`total`, et `top` avec `id`, `label`, `size` et `cohesion`).
+- **Export JSON** : chaque nœud a une clé `community` (son numéro), et le document une clé `communities`, liste de `{"cohesion", "id", "label", "pivot", "size"}` triée par numéro. `version` reste 1.
+- **Vue HTML** : le choix « Couleur » colore les nœuds par genre (défaut) ou par communauté. Les 8 plus grandes ont chacune leur couleur, les autres sont grises ; la légende les nomme, et le panneau de détails donne la communauté du nœud choisi.
+
+**Graphe d'une version précédente** : tant que le premier `nephila update` (ou `build`) ne l'a pas migré, les communautés ne sont pas calculées. `query community` sort alors avec le code 1 (`erreur: communautés non calculées : lancez nephila update`), `summary` affiche `communautés non calculées (lancez nephila update)`, l'export écrit `"community": null` et `"communities": []`, et la vue désactive la couleur par communauté."####;
+    let bullet = r####"- **Vers 0.25** : le graphe passe au schéma 9 sur place : le premier `nephila build` ou `nephila update` le migre sans appel LLM et sans perdre les résumés, fait une résolution complète et calcule les communautés ; d'ici là, les requêtes, `status`, `export` et `summary` lisent un graphe 0.18 à 0.24 tel quel, sans communautés. Un binaire 0.24 refuse ensuite ce graphe : pour revenir en arrière, supprimez `.nephila/` (le build suivant réenrichit alors tous les fichiers de la portée)."####;
+    let row = r####"| 0.25 | Communautés : le graphe est partagé en sous-systèmes par l'algorithme de Leiden, sans LLM, avec les règles de graphify (découpe des communautés trop grandes ou peu cohésives, nom tiré du nœud le plus relié, cohésion). nephila query community les liste et les détaille, nephila summary donne les 10 plus grandes, l'export JSON donne la communauté de chaque nœud et la vue HTML colore les nœuds par communauté (choix « Couleur »). Le schéma 9 est migré sur place. |"####;
+    let couleur = r####"- **Couleur** : par genre (défaut) ou par communauté ; voir [Communautés](#communautés)."####;
+    let cmd = r####"| `nephila query community [<numéro>]` | Communautés du graphe : liste, ou membres d'une communauté | non |"####;
+    let phrase = r####"La liste des communautés, ou celle d'un nœud et ses membres : [`nephila query community`](#communautés)."####;
+    let at = |needle: &str| {
+        readme
+            .find(needle)
+            .unwrap_or_else(|| panic!("absent : {needle}"))
+    };
+    // Sommaire : ligne juste après « Export et vue HTML ».
+    let lines: Vec<&str> = readme.lines().collect();
+    let i = lines
+        .iter()
+        .position(|l| *l == "- [Export et vue HTML](#export-et-vue-html)")
+        .expect("ligne du sommaire");
+    assert_eq!(lines[i + 1], "- [Communautés](#communautés)");
+    // Section entre Export et Configuration du LLM.
+    let s = at(sec_text);
+    assert!(at("\n## Export et vue HTML") < s && s < at("\n## Configuration du LLM"));
+    assert!(readme[..s].ends_with("\n\n"));
+    assert!(readme[s + sec_text.len()..].starts_with("\n\n## Configuration du LLM"));
+    assert_eq!(readme.matches("\n## Communautés\n").count(), 1);
+    // Puce Couleur juste après Filtres.
+    let f = lines
+        .iter()
+        .position(|l| l.starts_with("- **Filtres** : une case par genre"))
+        .expect("puce Filtres");
+    assert_eq!(lines[f + 1], couleur);
+    // Mise à niveau : puce avant la première puce Vers 0.24.
+    let up = readme_section(&readme, "## Mise à niveau");
+    let b = up.find(bullet).expect("puce Vers 0.25");
+    assert!(up.find("- **Renommage `rkg`").unwrap() < b);
+    assert!(b < up.find("- **Vers 0.24**").unwrap());
+    assert_eq!(up[b..].lines().next().unwrap(), bullet);
+    // Tableau des versions : ligne juste avant | 0.24 |.
+    let r = lines.iter().position(|l| *l == row).expect("ligne 0.25");
+    assert!(lines[r + 1].starts_with("| 0.24 |"));
+    assert!(!readme.lines().any(|l| l.starts_with("| 0.25.0 |")));
+    // Tableau des commandes.
+    let c = lines
+        .iter()
+        .position(|l| *l == cmd)
+        .expect("ligne query community");
+    assert!(lines[c - 1].starts_with("| `nephila query path <source> <cible>` |"));
+    assert!(lines[c + 1].starts_with("| `nephila query ask \"<question>\"` |"));
+    assert!(readme.contains(
+        "| `nephila summary [--json]` | Modules, nœuds les plus reliés, thèmes, communautés | non |"
+    ));
+    // Phrase de query search.
+    assert!(readme.contains(&format!(
+        "Une recherche sans résultat sort avec le code 1 (`erreur: aucun résultat pour « zzz »`). {phrase}"
+    )));
+}
+
+#[test]
+fn REQ151_AC2_version_0_25_0() {
+    assert_eq!(cargo_minor(), "0.25");
+    let toml = repo_file("Cargo.toml");
+    assert!(toml.lines().any(|l| l == "version = \"0.25.0\""));
+    let lock = repo_file("Cargo.lock");
+    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.25.0\""));
+    let readme = repo_file("README.md");
+    for needle in ["V=v0.25.0", "git tag v0.25.0 && git push origin v0.25.0"] {
+        assert!(readme.contains(needle), "absent : {needle}");
+    }
+    assert!(!readme.contains("v0.24.4"));
 }
