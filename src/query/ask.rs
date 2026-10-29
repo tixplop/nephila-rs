@@ -1,5 +1,7 @@
 //! `query ask` (REQ-016) : question en langage naturel posée au LLM, avec pour seul contexte
 //! des données du graphe (nœuds trouvés par les mots de la question et leurs voisins directs).
+//! Les nœuds cités par la réponse sont résolus parmi les seuls nœuds montrés dans ce contexte ;
+//! une réponse sans citation retenue est affichée avec un avertissement (REQ-161, DEC-130).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -219,6 +221,8 @@ struct Fill<'a> {
     nodes_text: String,
     links_text: String,
     written: HashSet<&'a str>,
+    /// Nœuds écrits, dans l'ordre des lignes (REQ-161).
+    shown: Vec<&'a Node>,
     neighbours: usize,
     used: usize,
 }
@@ -240,6 +244,7 @@ impl<'a> Fill<'a> {
         self.used += cost;
         if let (Some(n), Some(t)) = (node, node_text) {
             self.written.insert(n.id.as_str());
+            self.shown.push(n);
             self.nodes_text.push_str(&t);
         }
         if let Some(t) = link_text {
@@ -249,10 +254,20 @@ impl<'a> Fill<'a> {
     }
 }
 
+/// Contexte envoyé au LLM : son texte et les nœuds montrés, dans l'ordre des lignes de nœuds
+/// (REQ-161, DEC-130).
+struct Context<'a> {
+    text: String,
+    shown: Vec<&'a Node>,
+}
+
 /// Contexte textuel : nœuds de départ dans l'ordre de priorité, chacun suivi de ses liens et de
 /// leurs voisins, tant que le contexte tient (REQ-142). Ne contient que des données du graphe,
-/// jamais de contenu de fichier source.
-fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) -> String {
+/// jamais de contenu de fichier source. Rend aussi les nœuds montrés (lignes de nœuds écrites,
+/// dans l'ordre ; extrémités des liens comprises) : les citations de la réponse sont résolues
+/// parmi eux (REQ-161, DEC-130). Le premier nœud de départ coupé n'est montré que si sa ligne
+/// coupée contient encore `- <identifiant> :`.
+fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) -> Context<'a> {
     const NODES_HEADER: &str = "Nœuds :\n";
     const LINKS_HEADER: &str = "Liens :\n";
     let header_chars = NODES_HEADER.chars().count() + LINKS_HEADER.chars().count();
@@ -273,6 +288,7 @@ fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) ->
         nodes_text: String::new(),
         links_text: String::new(),
         written: HashSet::new(),
+        shown: Vec::new(),
         neighbours: 0,
         used: header_chars,
     };
@@ -283,6 +299,9 @@ fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) ->
                 // Seule coupe dans une ligne : celle du premier nœud de départ, seul.
                 let room = MAX_CONTEXT_CHARS - header_chars - 1;
                 let cut: String = node_line(s).chars().take(room).collect();
+                if cut.starts_with(&format!("- {} :", s.id)) {
+                    fill.shown.push(s);
+                }
                 fill.nodes_text = format!("{cut}\n");
             }
             break;
@@ -317,10 +336,13 @@ fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) ->
             }
         }
     }
-    format!(
-        "{NODES_HEADER}{}{LINKS_HEADER}{}",
-        fill.nodes_text, fill.links_text
-    )
+    Context {
+        text: format!(
+            "{NODES_HEADER}{}{LINKS_HEADER}{}",
+            fill.nodes_text, fill.links_text
+        ),
+        shown: fill.shown,
+    }
 }
 
 fn to_json(n: &Node) -> Value {
@@ -333,7 +355,10 @@ fn to_json(n: &Node) -> Value {
     })
 }
 
-/// Pose la question ; retourne la réponse et les nœuds cités existant dans le graphe.
+/// Pose la question ; retourne la réponse et les nœuds cités retenus, éventuellement aucun
+/// (REQ-161, DEC-130). Chaque citation est résolue parmi les seuls nœuds montrés dans le
+/// contexte envoyé, sans requête à la base ; une citation introuvable ou ambiguë parmi eux est
+/// écartée. `found: false` et l'absence de nœud de départ donnent « pas trouvé ».
 pub fn answer(
     store: &Store,
     llm: &dyn Llm,
@@ -350,9 +375,10 @@ pub fn answer(
     if seeds.is_empty() {
         return Err(not_found());
     }
-    let context = build_context(&nodes, &store.edges()?, &seeds);
+    let edges = store.edges()?;
+    let context = build_context(&nodes, &edges, &seeds);
     let stop = AtomicBool::new(false);
-    let reply = with_format_retries(format_retries, &stop, |_| llm.ask(question, &context))
+    let reply = with_format_retries(format_retries, &stop, |_| llm.ask(question, &context.text))
         .map_err(|e| match e {
             Error::Truncated(_) => Error::Truncated(format!(
                 "{TRUNCATED} ; posez une question plus ciblée ou augmentez max_output_tokens"
@@ -365,22 +391,28 @@ pub fn answer(
             answer,
             nodes: cited,
         } => {
-            let mut seen = HashSet::new();
-            let mut existing = Vec::new();
-            for name in &cited {
-                if let Lookup::Found(n) = lookup::resolve(store, name)? {
-                    if seen.insert(n.id.clone()) {
-                        existing.push(n);
-                    }
-                }
-            }
-            if existing.is_empty() {
-                return Err(not_found());
-            }
-            Ok((answer, existing))
+            let retained = retain_cited(&context.shown, &cited);
+            Ok((answer, retained))
         }
     }
 }
+
+/// Citations résolues parmi les nœuds montrés (REQ-161), dans l'ordre des citations, sans doublon.
+fn retain_cited(shown: &[&Node], cited: &[String]) -> Vec<Node> {
+    let mut seen = HashSet::new();
+    let mut retained = Vec::new();
+    for name in cited {
+        if let Lookup::Found(n) = lookup::resolve_among(shown.iter().copied(), name) {
+            if seen.insert(n.id.clone()) {
+                retained.push(n);
+            }
+        }
+    }
+    retained
+}
+
+/// Avertissement A-9 : réponse affichée sans aucun nœud cité retenu (V-006).
+const UNVERIFIABLE: &str = "réponse non vérifiable : aucun nœud cité ne figure dans le contexte envoyé ; vérifiez-la avec nephila query search";
 
 pub fn run(
     repo: &Path,
@@ -399,15 +431,20 @@ pub fn run(
     let llm = build_llm(&config)?;
     let store = super::open(repo, check_stale)?;
     let (answer, cited) = answer(&store, llm.as_ref(), question, config.format_retries)?;
+    if cited.is_empty() {
+        crate::error::warn(UNVERIFIABLE);
+    }
     if as_json {
         let nodes: Vec<Value> = cited.iter().map(to_json).collect();
         writeln!(out, "{}", json!({"answer": answer, "nodes": nodes}))?;
     } else {
         writeln!(out, "{}", crate::escape::ask_answer(&answer))?;
-        writeln!(out, "Nœuds cités :")?;
-        for n in &cited {
-            let l = format!("- {}", super::describe(n));
-            writeln!(out, "{}", crate::escape::data(&l))?;
+        if !cited.is_empty() {
+            writeln!(out, "Nœuds cités :")?;
+            for n in &cited {
+                let l = format!("- {}", super::describe(n));
+                writeln!(out, "{}", crate::escape::data(&l))?;
+            }
         }
     }
     Ok(())
@@ -889,7 +926,7 @@ mod tests {
             nodes.push(m);
         }
         edges.push(edge(&user, &late, Imports));
-        let ctx = build_context(&nodes, &edges, &[late.clone(), big.clone()]);
+        let ctx = build_context(&nodes, &edges, &[late.clone(), big.clone()]).text;
         assert!(ctx.contains(&node_line(&user)), "{ctx}");
         assert!(
             ctx.contains("\n- type:z.User -imports-> type:z.Late\n"),
@@ -920,7 +957,7 @@ mod tests {
             seeds.push(s.clone());
             nodes.push(s);
         }
-        let ctx = build_context(&nodes, &edges, &seeds);
+        let ctx = build_context(&nodes, &edges, &seeds).text;
         assert!(ctx.chars().count() <= MAX_CONTEXT_CHARS);
         assert!(ctx.ends_with('\n'));
         assert_eq!(ctx.matches("Liens :\n").count(), 1);
@@ -959,7 +996,7 @@ mod tests {
             s[1].clone(),
             s[0].clone(),
         ];
-        let ctx = build_context(&nodes, &edges, &s);
+        let ctx = build_context(&nodes, &edges, &s).text;
         let want: Vec<String> = [2, 4, 5, 1, 3, 0]
             .iter()
             .map(|&i| link_line(&edges[i]))
@@ -987,7 +1024,7 @@ mod tests {
             edges.push(edge(&seeds[0], &v, Calls));
             nodes.push(v);
         }
-        let ctx = build_context(&nodes, &edges, &seeds);
+        let ctx = build_context(&nodes, &edges, &seeds).text;
         let (n, l) = sections(&ctx);
         assert_eq!(n.len(), 60);
         for s in &seeds {
@@ -1005,7 +1042,7 @@ mod tests {
         let s = mk(NodeKind::Type, "p.S", Some(&"é".repeat(20_000)));
         let v = mk(NodeKind::Method, "p.V", None);
         let edges = vec![edge(&s, &v, Calls)];
-        let ctx = build_context(&[s.clone(), v], &edges, std::slice::from_ref(&s));
+        let ctx = build_context(&[s.clone(), v], &edges, std::slice::from_ref(&s)).text;
         assert_eq!(ctx.chars().count(), MAX_CONTEXT_CHARS);
         assert!(
             ctx.starts_with(&format!("Nœuds :\n- {} : ", s.id)),
@@ -1037,7 +1074,7 @@ mod tests {
         let f = Node::new(NodeKind::Method, "p.A.f", "f", Some("p/A.java"), None, None);
         let g = Node::new(NodeKind::Method, "p.B.g", "g", Some("p/B.java"), None, None);
         let edges = vec![edge(&f, &g, Calls)];
-        let ctx = build_context(&[f.clone(), g], &edges, std::slice::from_ref(&f));
+        let ctx = build_context(&[f.clone(), g], &edges, std::slice::from_ref(&f)).text;
         assert!(
             ctx.lines()
                 .any(|l| l == "- method:p.A.f -calls-> method:p.B.g"),
@@ -1046,5 +1083,131 @@ mod tests {
         let prompt = crate::llm::ask::ask_system_prompt();
         assert!(prompt.contains("- <identifiant> : <nom qualifié> (<genre>, <fichier>) - <résumé>"));
         assert!(prompt.contains("- <source> -<genre>-> <cible>"));
+    }
+
+    /// Identifiants des lignes de nœuds d'un contexte, dans l'ordre.
+    fn written_ids(ctx: &str) -> Vec<String> {
+        let (n, _) = sections(ctx);
+        n.iter()
+            .map(|l| {
+                l.split(" : ")
+                    .next()
+                    .unwrap()
+                    .trim_start_matches("- ")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn shown_ids(c: &Context) -> Vec<String> {
+        c.shown.iter().map(|n| n.id.clone()).collect()
+    }
+
+    #[test]
+    fn req161_ac1_shown_nodes_are_the_written_node_lines() {
+        use crate::model::EdgeKind::{Calls, Contains};
+        // Un nœud de départ.
+        let a = mk(NodeKind::Type, "p.A", Some("a"));
+        let m = mk(NodeKind::Method, "p.A.m", None);
+        let x = mk(NodeKind::Method, "p.X.x", None);
+        let nodes = vec![x.clone(), m.clone(), a.clone()];
+        let edges = vec![edge(&a, &m, Contains), edge(&x, &m, Calls)];
+        let c = build_context(&nodes, &edges, std::slice::from_ref(&m));
+        assert_eq!(shown_ids(&c), written_ids(&c.text));
+        assert_eq!(shown_ids(&c).len(), 3);
+        // Plusieurs nœuds de départ, contexte plein coupé en fin de ligne.
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut seeds = Vec::new();
+        for i in 0..20 {
+            let s = mk(NodeKind::Type, &format!("p.S{i}"), Some(&"s".repeat(500)));
+            for j in 0..30 {
+                let v = mk(
+                    NodeKind::Method,
+                    &format!("p.S{i}.v{j}"),
+                    Some(&"v".repeat(500)),
+                );
+                edges.push(edge(&s, &v, Contains));
+                nodes.push(v);
+            }
+            seeds.push(s.clone());
+            nodes.push(s);
+        }
+        let c = build_context(&nodes, &edges, &seeds);
+        let shown = shown_ids(&c);
+        assert_eq!(shown, written_ids(&c.text));
+        assert!(shown.len() > 5);
+        let (_, links) = sections(&c.text);
+        assert!(!links.is_empty());
+        for l in links {
+            let (src, rest) = l.trim_start_matches("- ").split_once(" -").unwrap();
+            let tgt = rest.split_once("-> ").unwrap().1;
+            assert!(shown.iter().any(|i| i == src), "{l}");
+            assert!(shown.iter().any(|i| i == tgt), "{l}");
+        }
+    }
+
+    #[test]
+    fn req161_ac1_cut_first_seed_is_shown_only_if_its_identifier_survives() {
+        // Ligne coupée avec identifiant entier : montré.
+        let s = mk(NodeKind::Type, "p.S", Some(&"é".repeat(20_000)));
+        let c = build_context(std::slice::from_ref(&s), &[], std::slice::from_ref(&s));
+        assert_eq!(shown_ids(&c), vec![s.id.clone()]);
+        // Identifiant plus long que la place disponible : aucun nœud montré.
+        let long = mk(NodeKind::Type, &format!("p.{}", "L".repeat(13_000)), None);
+        let c = build_context(
+            std::slice::from_ref(&long),
+            &[],
+            std::slice::from_ref(&long),
+        );
+        assert!(c.shown.is_empty());
+        assert_eq!(c.text.chars().count(), MAX_CONTEXT_CHARS);
+        // Identifiant entier mais sans le ` :` qui suit : aucun nœud montré.
+        let room = MAX_CONTEXT_CHARS - "Nœuds :\nLiens :\n".chars().count() - 1;
+        let id_len = "type:".len();
+        let name_len = room - "- ".len() - id_len;
+        let edge_case = mk(NodeKind::Type, &"E".repeat(name_len), None);
+        assert_eq!(format!("- {}", edge_case.id).chars().count(), room);
+        let c = build_context(
+            std::slice::from_ref(&edge_case),
+            &[],
+            std::slice::from_ref(&edge_case),
+        );
+        assert!(c.shown.is_empty());
+    }
+
+    fn resolve_cited(shown: &[&Node], cited: &[&str]) -> Vec<String> {
+        let cited: Vec<String> = cited.iter().map(|c| c.to_string()).collect();
+        retain_cited(shown, &cited)
+            .into_iter()
+            .map(|n| n.id)
+            .collect()
+    }
+
+    #[test]
+    fn req161_ac2_citations_are_resolved_among_shown_nodes() {
+        let sa = mk(NodeKind::Method, "p.A.save", None);
+        let sb = mk(NodeKind::Method, "p.B.save", None);
+        let ta = mk(NodeKind::Type, "p.A", None);
+        let shown = [&sa, &sb, &ta];
+        for (name, want) in [
+            ("method:p.A.save", vec!["method:p.A.save"]),
+            ("p.A.save", vec!["method:p.A.save"]),
+            ("A.save", vec!["method:p.A.save"]),
+            ("save", vec![]),
+            ("load", vec![]),
+            ("method:q.C.load", vec![]),
+            ("q.C.load", vec![]),
+            ("Ghost", vec![]),
+        ] {
+            assert_eq!(resolve_cited(&shown, &[name]), want, "{name}");
+        }
+        // Unique dans le contexte, ambigu dans le graphe : retenu.
+        assert_eq!(resolve_cited(&[&sa], &["save"]), vec!["method:p.A.save"],);
+        // Ordre des citations, sans doublon.
+        assert_eq!(
+            resolve_cited(&shown, &["type:p.A", "p.A", "method:p.A.save"]),
+            vec!["type:p.A", "method:p.A.save"]
+        );
     }
 }

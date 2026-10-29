@@ -118,7 +118,7 @@ fn assert_not_found(o: &Output) {
 fn req016_ac1_answer_and_cited_nodes_on_stdout() {
     let env = Env::new();
     env.fixture(
-        r#"{"found":true,"answer":"Le module billing gère la facturation.","nodes":["type:com.acme.billing.BillingService","com.acme.billing.Ledger"]}"#,
+        r#"{"found":true,"answer":"Le module billing gère la facturation.","nodes":["type:com.acme.billing.BillingService","com.acme.billing.BillingService.charge"]}"#,
     );
     let o = env.ask(Q, &[]);
     assert!(o.status.success(), "{}", text(&o.stderr));
@@ -128,7 +128,10 @@ fn req016_ac1_answer_and_cited_nodes_on_stdout() {
         "{out}"
     );
     assert!(out.contains("com.acme.billing.BillingService"), "{out}");
-    assert!(out.contains("com.acme.billing.Ledger"), "{out}");
+    assert!(
+        out.contains("com.acme.billing.BillingService.charge"),
+        "{out}"
+    );
     assert_eq!(env.llm_calls(), 1);
 }
 
@@ -150,7 +153,7 @@ fn req016_ac1_json_output() {
 fn req016_ac2_nonexistent_cited_nodes_removed() {
     let env = Env::new();
     env.fixture(
-        r#"{"found":true,"answer":"reponse","nodes":["com.acme.Ghost","type:com.acme.billing.Ledger","com.acme.billing.Ledger"]}"#,
+        r#"{"found":true,"answer":"reponse","nodes":["com.acme.Ghost","method:com.acme.billing.BillingService.charge","com.acme.billing.BillingService.charge"]}"#,
     );
     let o = env.ask(Q, &["--json"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
@@ -161,24 +164,125 @@ fn req016_ac2_nonexistent_cited_nodes_removed() {
         .iter()
         .map(|n| n["qualified"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["com.acme.billing.Ledger"]);
+    assert_eq!(names, ["com.acme.billing.BillingService.charge"]);
     let o = env.ask(Q, &[]);
     assert!(!text(&o.stdout).contains("Ghost"));
 }
 
+const A9: &str = "avertissement: réponse non vérifiable : aucun nœud cité ne figure dans le contexte envoyé ; vérifiez-la avec nephila query search\n";
+
+/// AC-161-4 : un nœud du graphe absent du contexte de la question n'est pas retenu.
 #[test]
-fn req016_ac2_no_existing_cited_node_is_not_found() {
+fn req161_ac4_cited_node_outside_the_context_is_dropped() {
+    assert!(!CONTEXTE_0_18_0.contains("Island"));
+    assert!(!CONTEXTE_0_18_0.contains("Ledger"));
     let env = Env::new();
-    for nodes in [r#"["com.acme.Ghost"]"#, "[]"] {
+    env.fixture(
+        r#"{"found":true,"answer":"reponse","nodes":["com.acme.other.Island","com.acme.billing.Ledger","method:com.acme.billing.BillingService.charge"]}"#,
+    );
+    // Le nœud existe bien dans le graphe.
+    let s = env.cmd(&["query", "search", "Island"]).output().unwrap();
+    assert!(text(&s.stdout).contains("com.acme.other.Island"));
+    let s = env.cmd(&["query", "search", "Ledger"]).output().unwrap();
+    assert!(text(&s.stdout).contains("com.acme.billing.Ledger"));
+    let o = env.ask(Q, &["--json"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let names: Vec<&str> = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["qualified"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["com.acme.billing.BillingService.charge"]);
+    assert!(!names.contains(&"com.acme.other.Island"));
+    assert!(text(&o.stderr).is_empty());
+    assert_eq!(o.status.code(), Some(0));
+}
+
+#[test]
+fn req161_ac5_answer_without_valid_citation_is_shown() {
+    let env = Env::new();
+    for nodes in [
+        r#"["com.acme.Ghost"]"#,
+        "[]",
+        "",
+        r#"["com.acme.billing.Ledger"]"#,
+    ] {
+        let nodes_field = if nodes.is_empty() {
+            String::new()
+        } else {
+            format!(r#","nodes":{nodes}"#)
+        };
         env.fixture(&format!(
-            r#"{{"found":true,"answer":"inventé","nodes":{nodes}}}"#
+            r#"{{"found":true,"answer":"inventé"{nodes_field}}}"#
         ));
-        for extra in [vec![], vec!["--json"]] {
-            let o = env.ask(Q, &extra);
-            assert_not_found(&o);
-            assert!(!text(&o.stderr).contains("inventé"));
-        }
+        let o = env.ask(Q, &[]);
+        assert_eq!(text(&o.stdout), "inventé\n", "{nodes}");
+        assert_eq!(text(&o.stderr), A9, "{nodes}");
+        assert_eq!(o.status.code(), Some(0), "{nodes}");
+        assert_eq!(env.llm_calls(), 1, "{nodes}");
+        let o = env.ask(Q, &["--json"]);
+        assert_eq!(
+            text(&o.stdout),
+            "{\"answer\":\"inventé\",\"nodes\":[]}\n",
+            "{nodes}"
+        );
+        assert_eq!(text(&o.stderr), A9, "{nodes}");
+        assert_eq!(o.status.code(), Some(0), "{nodes}");
+        assert_eq!(env.llm_calls(), 1, "{nodes}");
     }
+    // Ordre de stderr avec --check-stale : fraîcheur, puis A-9 ; stdout inchangé.
+    env.fixture(r#"{"found":true,"answer":"inventé","nodes":[]}"#);
+    let plain = env.ask(Q, &[]).stdout;
+    let plain_json = env.ask(Q, &["--json"]).stdout;
+    fs::write(env.repo.join("docs.md"), "# nouveau\n").unwrap();
+    for (extra, expected) in [
+        (vec!["--check-stale"], plain),
+        (vec!["--check-stale", "--json"], plain_json),
+    ] {
+        let o = env.ask(Q, &extra);
+        assert_eq!(
+            text(&o.stderr),
+            format!("avertissement: graphe pas à jour : 1 fichier modifié\n{A9}")
+        );
+        assert_eq!(o.stdout, expected);
+        assert_eq!(o.status.code(), Some(0));
+    }
+    // Pas d'A-9 après `found: false`, ni sans nœud de départ.
+    env.fixture(r#"{"found":false}"#);
+    let o = env.ask(Q, &[]);
+    assert_not_found(&o);
+    assert_eq!(text(&o.stderr), "erreur: pas trouvé dans le graphe\n");
+    assert_eq!(o.status.code(), Some(1));
+    env.fixture(r#"{"found":true,"answer":"inventé","nodes":[]}"#);
+    let o = env.ask("zzzabsent qqqabsent ?", &[]);
+    assert_not_found(&o);
+    assert_eq!(text(&o.stderr), "erreur: pas trouvé dans le graphe\n");
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(env.llm_calls(), 0);
+    // Une citation retenue : pas d'A-9, ligne `Nœuds cités :` présente.
+    env.fixture(
+        r#"{"found":true,"answer":"ok","nodes":["com.acme.billing.BillingService.charge"]}"#,
+    );
+    let o = env.ask(Q, &[]);
+    assert!(text(&o.stderr).is_empty(), "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("Nœuds cités :\n"));
+}
+
+#[test]
+fn req161_ac10_answer_without_citation_is_escaped() {
+    let env = Env::new();
+    env.fixture(r#"{"found":true,"answer":"ligne 1\nligne\u001b2","nodes":[]}"#);
+    let o = env.ask(Q, &[]);
+    assert_eq!(text(&o.stdout), "ligne 1\nligne\\u{001B}2\n");
+    assert_eq!(text(&o.stderr), A9);
+    let o = env.ask(Q, &["--json"]);
+    assert_eq!(
+        text(&o.stdout),
+        "{\"answer\":\"ligne 1\\nligne\\u001b2\",\"nodes\":[]}\n"
+    );
+    assert!(!o.stdout.contains(&0x1b) && !o.stderr.contains(&0x1b));
 }
 
 #[test]

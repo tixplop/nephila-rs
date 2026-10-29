@@ -184,7 +184,7 @@ com.acme.core.OrderService.place calls com.acme.core.OrderRepository.save
 
 `--depth` vaut 1 par défaut. Une recherche sans résultat sort avec le code 1 (`erreur: aucun résultat pour « zzz »`). La liste des communautés, ou celle d'un nœud et ses membres : [`nephila query community`](#communautés).
 
-`query ask` est la seule requête qui appelle le LLM. Son contexte est fait des nœuds du graphe trouvés par les mots de la question et de leurs voisins, jamais du contenu des fichiers.
+`query ask` est la seule requête qui appelle le LLM. Son contexte est fait des nœuds du graphe trouvés par les mots de la question et de leurs voisins, jamais du contenu des fichiers. Les nœuds cités sont pris dans ce contexte. Sans nœud cité, la réponse s'affiche seule (`"nodes":[]` en `--json`), précédée sur stderr de `avertissement: réponse non vérifiable`, avec le code 0 : vérifiez-la avec `nephila query search`.
 
 ```
 $ nephila query ask "Que fait place ?"

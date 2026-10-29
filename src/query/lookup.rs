@@ -34,27 +34,42 @@ fn classify(mut found: Vec<Node>) -> Lookup {
     }
 }
 
-pub fn resolve(store: &Store, name: &str) -> Result<Lookup> {
+/// Résolution pure d'un nom parmi des candidats (REQ-161) : identifiant exact, puis nom
+/// qualifié exact, puis nom court ou suffixe à une frontière de segment. Partagée par
+/// [`resolve`] (candidats de `nodes_matching`) et par la résolution des citations de `ask`
+/// (nœuds montrés dans le contexte).
+pub(crate) fn resolve_among<'a>(
+    candidates: impl IntoIterator<Item = &'a Node>,
+    name: &str,
+) -> Lookup {
     if name.is_empty() {
-        return Ok(Lookup::NotFound);
+        return Lookup::NotFound;
     }
-    let nodes = store.nodes_matching(name)?;
+    let nodes: Vec<&Node> = candidates.into_iter().collect();
     if let Some(n) = nodes.iter().find(|n| n.id == name) {
-        return Ok(Lookup::Found(n.clone()));
+        return Lookup::Found((*n).clone());
     }
     let exact: Vec<Node> = nodes
         .iter()
         .filter(|n| n.qualified == name)
-        .cloned()
+        .map(|n| (*n).clone())
         .collect();
     if !exact.is_empty() {
-        return Ok(classify(exact));
+        return classify(exact);
     }
     let loose: Vec<Node> = nodes
         .into_iter()
         .filter(|n| n.short == name || is_suffix(&n.qualified, name))
+        .cloned()
         .collect();
-    Ok(classify(loose))
+    classify(loose)
+}
+
+pub fn resolve(store: &Store, name: &str) -> Result<Lookup> {
+    if name.is_empty() {
+        return Ok(Lookup::NotFound);
+    }
+    Ok(resolve_among(&store.nodes_matching(name)?, name))
 }
 
 /// Comme [`resolve`], mais l'ambiguïté (avec les candidats) et l'absence sont des erreurs.
@@ -253,6 +268,12 @@ mod tests {
         for name in &names {
             let expected = oracle(&st, name);
             assert_eq!(resolve(&st, name).unwrap(), expected, "nom {name:?}");
+            // REQ-161 AC-161-3 : la fonction partagée sur la liste de `nodes_matching`.
+            assert_eq!(
+                resolve_among(&st.nodes_matching(name).unwrap(), name),
+                expected,
+                "resolve_among, nom {name:?}"
+            );
             if !matches!(expected, Lookup::NotFound) {
                 non_trivial += 1;
             }

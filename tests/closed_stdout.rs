@@ -184,6 +184,36 @@ fn req086_ac2_ac6_every_command_stops_on_one_error_line() {
     assert_up_to_date(&env);
 }
 
+/// AC-161-8 : A-9 est écrit avant toute écriture sur stdout.
+#[test]
+fn req161_ac8_unverifiable_answer_on_closed_stdout() {
+    let env = Env::built(3);
+    fs::write(
+        env.mock.join("_ask.json"),
+        r#"{"found":true,"answer":"Réponse.","nodes":[]}"#,
+    )
+    .unwrap();
+    for args in [
+        &["query", "ask", "Que fait method0 ?"][..],
+        &["query", "ask", "Que fait method0 ?", "--json"][..],
+    ] {
+        let o = env.run_closed(args);
+        assert_no_panic(&args.join(" "), &o);
+        let err = text(&o.stderr);
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 2, "{err:?}");
+        assert_eq!(
+            format!("{}\n", lines[0]),
+            "avertissement: réponse non vérifiable : aucun nœud cité ne figure dans le contexte envoyé ; vérifiez-la avec nephila query search\n"
+        );
+        assert!(
+            lines[1].starts_with("erreur: écriture sur stdout impossible : "),
+            "{err:?}"
+        );
+        assert_eq!(o.status.code(), Some(1), "{err:?}");
+    }
+}
+
 #[test]
 fn req086_ac2_build_closed_keeps_the_graph() {
     let closed = Env::built(3);
