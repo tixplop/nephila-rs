@@ -709,3 +709,114 @@ fn req131_ac8_payloads_without_v_are_reused_without_reenrichment() {
     );
     assert!(env.logged().is_empty());
 }
+
+/// Dépôt réduit aux fichiers donnés (chemin, contenu), sans fixture de mock préexistante.
+fn tiny_env(files: &[(&str, &str)]) -> Env {
+    let env = Env::new();
+    fs::remove_dir_all(&env.repo).unwrap();
+    fs::remove_dir_all(&env.mock).unwrap();
+    fs::create_dir_all(&env.mock).unwrap();
+    for (p, c) in files {
+        env.write(p, c);
+    }
+    env
+}
+
+fn to_enrich(env: &Env) -> u64 {
+    let json = env.ok(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    v["to_enrich"].as_u64().unwrap()
+}
+
+#[test]
+fn req167_ac4_prompt_version_1_graph_is_reenriched_once() {
+    let env = tiny_env(&[("a.md", "# Un\n\ntexte\n"), ("b.md", "# Deux\n\ntexte\n")]);
+    for (f, id) in [("a.md", "document:a.md"), ("b.md", "document:b.md")] {
+        fs::write(
+            env.mock.join(format!("{f}.json")),
+            format!(r#"{{"version":2,"summaries":[{{"node":"{id}","summary":"Résumé."}}],"concepts":[]}}"#),
+        )
+        .unwrap();
+    }
+    env.ok(&["build"]);
+    assert_eq!(to_enrich(&env), 0);
+
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let n = conn
+        .execute("UPDATE enrichments SET prompt_version = 1", [])
+        .unwrap();
+    assert_eq!(n, 2);
+    drop(conn);
+    assert_eq!(to_enrich(&env), 2);
+
+    env.ok(&["update"]);
+    assert_eq!(env.logged().len(), 2, "{:?}", env.logged());
+    assert_eq!(env.logged_paths().len(), 2);
+    assert_eq!(to_enrich(&env), 0);
+
+    let again = env.ok(&["update"]);
+    assert_eq!(text(&again.stdout), "graphe à jour\n");
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let versions: Vec<i64> = conn
+        .prepare("SELECT DISTINCT prompt_version FROM enrichments")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(versions, vec![2]);
+}
+
+#[test]
+fn req167_ac5_omitted_trivial_accessor_is_accepted() {
+    let env = tiny_env(&[(
+        "src/A.java",
+        "package p;\npublic class A {\n  private int x;\n  public int getX() { return x; }\n  public void run() { System.out.println(x); }\n}\n",
+    )]);
+    let id_of = |env: &Env, q: &str| {
+        env.store()
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.qualified == q)
+            .unwrap_or_else(|| panic!("nœud absent : {q}"))
+            .id
+    };
+    env.ok(&["build", "--no-llm"]);
+    let class = id_of(&env, "p.A");
+    let run = id_of(&env, "p.A.run");
+    let get = id_of(&env, "p.A.getX");
+    fs::create_dir_all(env.mock.join("src")).unwrap();
+    fs::write(
+        env.mock.join("src/A.java.json"),
+        serde_json::json!({"version":2,"summaries":[
+            {"node": class, "summary": "Porte un compteur et le lance."},
+            {"node": run, "summary": "Affiche la valeur du champ."}
+        ],"concepts":[]})
+        .to_string(),
+    )
+    .unwrap();
+
+    let b = env.ok(&["build"]);
+    assert_eq!(env.logged().len(), 1, "{:?}", env.logged());
+    assert!(
+        !text(&b.stderr).contains("avertissement:"),
+        "{}",
+        text(&b.stderr)
+    );
+    assert!(!text(&b.stdout).contains("avertissement:"));
+    assert_eq!(to_enrich(&env), 0);
+    env.ok(&["update"]);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+
+    let s = env.ok(&["query", "search", "run"]);
+    assert!(
+        text(&s.stdout).contains("Affiche la valeur du champ."),
+        "{}",
+        text(&s.stdout)
+    );
+    assert_eq!(summary_of(&env, &get), None);
+    assert!(summary_of(&env, &run).is_some());
+}

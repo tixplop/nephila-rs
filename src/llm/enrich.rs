@@ -12,8 +12,12 @@ pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 /// Version du prompt d'enrichissement (DEC-062). À incrémenter à chaque changement des consignes
 /// système, des gabarits de requête (fichier seul et lot) ou des schémas de réponse version 2 et
 /// 3 : tout enrichissement conservé avec une autre version est refait. Un test fige l'empreinte
-/// BLAKE3 de ces textes à côté de cette valeur.
-pub const ENRICH_PROMPT_VERSION: u32 = 1;
+/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 2 depuis la 0.26.0
+/// (consignes de forme des résumés, REQ-167).
+pub const ENRICH_PROMPT_VERSION: u32 = 2;
+
+/// Consignes de forme des résumés : ligne commune aux deux prompts système (DEC-135).
+pub const SUMMARY_RULES: &str = "Résumés (de nœud ou de concept) : une phrase de 25 mots au plus, qui dit le rôle ou la responsabilité de l'élément (ce qu'il fait et à quoi il sert), pas sa syntaxe ni sa signature ; ne répète pas son nom ; n'écris que ce que le contenu montre, sans rien supposer ni inventer. Omets (aucune entrée dans \"summaries\") un accesseur ou un mutateur trivial (il lit ou écrit un champ, sans autre effet) et une section vide ou réduite à son titre.";
 
 /// Concept proposé pour un document Markdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,9 +164,10 @@ pub fn enrichment_system_prompt() -> String {
         "Tu enrichis le graphe d'un dépôt à partir d'un fichier (code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, \
          build Maven/Gradle/Ivy, ou Markdown) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
          Schéma (version {ENRICH_SCHEMA_VERSION}) : {{\"version\": {ENRICH_SCHEMA_VERSION}, \
-         \"summaries\": [{{\"node\": \"<identifiant de la liste>\", \"summary\": \"une phrase\"}}], \
-         \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"une phrase (optionnel)\", \
+         \"summaries\": [{{\"node\": \"<identifiant de la liste>\", \"summary\": \"<25 mots au plus>\"}}], \
+         \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \
          \"sections\": [\"<identifiant de section de la liste>\"]}}]}}.\n\
+         {SUMMARY_RULES}\n\
          Les résumés ne portent que sur les nœuds de la liste fournie. Les concepts ne concernent \
          que les fichiers Markdown et ne citent que des sections de la liste. Tu ne crées, ne \
          renomme ni ne supprimes aucun nœud et tu ne produis aucun autre lien. \
@@ -290,8 +295,9 @@ pub fn lot_system_prompt() -> String {
          nœuds puis de son contenu, jusqu'à la ligne `=== FIN DU FICHIER : <chemin> ===`.\n\
          Schéma (version {ENRICH_LOT_SCHEMA_VERSION}) : {{\"version\": {ENRICH_LOT_SCHEMA_VERSION}, \"files\": \
          [{{\"file\": \"<chemin exact du fichier>\", \"summaries\": [{{\"node\": \"<identifiant de la liste de ce fichier>\", \
-         \"summary\": \"une phrase\"}}], \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"une phrase (optionnel)\", \
+         \"summary\": \"<25 mots au plus>\"}}], \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \
          \"sections\": [\"<identifiant de section de la liste de ce fichier>\"]}}]}}]}}.\n\
+         {SUMMARY_RULES}\n\
          Produis exactement une entrée par fichier fourni. Les résumés ne portent que sur les nœuds de la \
          liste du fichier concerné. Les concepts ne concernent que les fichiers Markdown et ne citent que des \
          sections de la liste du même fichier. Tu ne crées, ne renomme ni ne supprimes aucun nœud et tu ne \
@@ -320,6 +326,10 @@ mod tests {
 
     /// Empreinte BLAKE3 des consignes, gabarits et schémas (version 2 et 3) d'enrichissement.
     fn prompts_fingerprint() -> String {
+        fingerprint_with(|t| t)
+    }
+
+    fn fingerprint_with(f: impl Fn(String) -> String) -> String {
         let items = [
             LotItem {
                 file: "a.md".into(),
@@ -334,14 +344,14 @@ mod tests {
         ];
         let all = [
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
-            enrichment_system_prompt(),
+            f(enrichment_system_prompt()),
             enrichment_user_prompt(
                 "a.md",
                 2,
                 "texte a",
                 &ids(&["document:a.md", "section:a.md#x"]),
             ),
-            lot_system_prompt(),
+            f(lot_system_prompt()),
             lot_user_prompt(&items),
         ]
         .join("\n<<<->>>\n");
@@ -352,11 +362,39 @@ mod tests {
     fn req049_ac4_prompt_texts_are_frozen_next_to_the_prompt_version() {
         // Changer une consigne, un gabarit ou un schéma : incrémenter `ENRICH_PROMPT_VERSION`,
         // puis mettre à jour les deux littéraux ci-dessous.
-        assert_eq!(ENRICH_PROMPT_VERSION, 1);
+        assert_eq!(ENRICH_PROMPT_VERSION, 2);
         assert_eq!(
             prompts_fingerprint(),
-            "9d89eb9166852d117d282e3559895d7e2e5e3caf46da37b53548f491a589f8c5",
+            "a15bf9ef481fcf8b4d4b23cd4c073a7c341de03e0642b46c77c7c4cb0bd06f36",
             "les textes du prompt ont changé : incrémentez ENRICH_PROMPT_VERSION"
+        );
+    }
+
+    #[test]
+    fn req167_ac1_summary_rules_in_both_system_prompts() {
+        assert_eq!(
+            SUMMARY_RULES,
+            "Résumés (de nœud ou de concept) : une phrase de 25 mots au plus, qui dit le rôle ou la responsabilité de l'élément (ce qu'il fait et à quoi il sert), pas sa syntaxe ni sa signature ; ne répète pas son nom ; n'écris que ce que le contenu montre, sans rien supposer ni inventer. Omets (aucune entrée dans \"summaries\") un accesseur ou un mutateur trivial (il lit ou écrit un champ, sans autre effet) et une section vide ou réduite à son titre."
+        );
+        let needle = format!("\n{SUMMARY_RULES}\n");
+        for p in [enrichment_system_prompt(), lot_system_prompt()] {
+            assert_eq!(p.matches(&needle).count(), 1);
+            // « une phrase » figure dans SUMMARY_RULES : on vérifie l'absence de l'ancienne valeur d'exemple.
+            assert!(!p.contains("\"summary\": \"une phrase"));
+            assert!(p.contains("\"summary\": \"<25 mots au plus>\""));
+            assert!(p.contains("\"summary\": \"<25 mots au plus> (optionnel)\""));
+        }
+    }
+
+    #[test]
+    fn req167_ac2_only_the_rules_and_the_example_value_changed() {
+        let strip = |t: String| {
+            t.replace(&format!("{SUMMARY_RULES}\n"), "")
+                .replace("<25 mots au plus>", "une phrase")
+        };
+        assert_eq!(
+            fingerprint_with(strip),
+            "9d89eb9166852d117d282e3559895d7e2e5e3caf46da37b53548f491a589f8c5"
         );
     }
 

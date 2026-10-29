@@ -1952,3 +1952,51 @@ fn REQ165_AC16_readme_traces_sentence() {
         .len();
     assert!(size <= 42_000, "README : {size} octets");
 }
+
+#[test]
+fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
+    let readme = repo_file("README.md");
+    let sec = readme_section(&readme, "## Mise à niveau");
+    let first = sec
+        .lines()
+        .find(|l| l.starts_with("- **Vers "))
+        .expect("puce de tête");
+    let lead = "- **Vers 0.26** : le premier `nephila build` ou `nephila update` réenrichit une fois chaque fichier de la portée. ";
+    assert!(first.starts_with(lead), "{first}");
+    assert!(first.contains("`effort` (défaut"), "{first}");
+    assert!(
+        first.find("réenrichit").unwrap() < first.find("`effort`").unwrap(),
+        "{first}"
+    );
+    for needle in ["output_config", "effort = \"default\"", "requête refusée"] {
+        assert!(first.contains(needle), "{first} : {needle}");
+    }
+    assert!(first.ends_with("puis lancez `nephila update`."), "{first}");
+    assert_eq!(
+        sec.lines().filter(|l| l.starts_with("- **Vers ")).count(),
+        6
+    );
+    let v25 = sec
+        .lines()
+        .find(|l| l.starts_with("- **Vers 0.25** :"))
+        .unwrap();
+    assert!(v25.contains("sans appel LLM"));
+
+    assert!(!sec.contains("sans appel LLM et sans perdre"));
+    assert!(sec.contains("Un graphe 0.18 à 0.24 est migré sur place"));
+    assert!(sec
+        .contains("par le premier `nephila update` ou `nephila build`, sans perdre les résumés."));
+
+    let enr = readme_section(&readme, "## Enrichissement");
+    let para = enr.split("### Lots et gros fichiers").next().unwrap();
+    assert!(para.contains(
+        "tant que son contenu, le modèle et le prompt de la version de nephila ne changent pas"
+    ));
+    assert!(para.contains("changer `model` réenrichit une fois chaque fichier de la portée"));
+    assert!(!para.contains("tant que son contenu et le modèle"));
+
+    let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .unwrap()
+        .len();
+    assert!(size <= 42_000, "README : {size} octets");
+}

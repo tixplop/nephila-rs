@@ -441,7 +441,7 @@ Les autorités publiques restent reconnues. En dernier recours, `tls_insecure = 
 
 ## Enrichissement
 
-Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, concepts des documents). `enrich_code = true` dans la configuration personnelle, ou `--enrich-code` pour une commande, enrichit aussi le code et les fichiers de build et de données ; sans lui, un fichier de code n'est ni envoyé ni compté « à enrichir ». Un fichier garde ses enrichissements tant que son contenu et le modèle ne changent pas : un second `build` sans changement ne fait aucun appel, et changer `model` réenrichit une fois chaque fichier de la portée.
+Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, concepts des documents). `enrich_code = true` dans la configuration personnelle, ou `--enrich-code` pour une commande, enrichit aussi le code et les fichiers de build et de données ; sans lui, un fichier de code n'est ni envoyé ni compté « à enrichir ». Un fichier garde ses enrichissements tant que son contenu, le modèle et le prompt de la version de nephila ne changent pas : un second `build` sans changement ne fait aucun appel, et changer `model` réenrichit une fois chaque fichier de la portée.
 
 ### Lots et gros fichiers
 
@@ -572,14 +572,14 @@ Les références sans cible sont comptées dans « références non résolues »
 
 Les versions qui demandent une action, la plus récente d'abord. L'historique des nouveautés est dans les tags git et sur la page [Releases](https://github.com/tixplop/nephila-rs/releases).
 
-- **Vers 0.26** : `effort` (défaut `"low"`) est envoyé aussi sans `thinking` : à `anthropic` dans `output_config`, sauf pour un modèle sorti avant Claude Opus 4.5, et à `openai` si la clé est écrite. Si votre serveur ou votre modèle refuse ce champ (requête refusée, HTTP 400), écrivez `effort = "default"` dans la configuration personnelle, puis lancez `nephila update`.
+- **Vers 0.26** : le premier `nephila build` ou `nephila update` réenrichit une fois chaque fichier de la portée. `effort` (défaut `"low"`) est envoyé aussi sans `thinking` : à `anthropic` dans `output_config`, sauf pour un modèle sorti avant Claude Opus 4.5, et à `openai` si la clé est écrite. Si votre serveur ou votre modèle refuse ce champ (requête refusée, HTTP 400), écrivez `effort = "default"` dans la configuration personnelle, puis lancez `nephila update`.
 - **Vers 0.25** : le premier `nephila update` (ou `build`) migre le graphe et calcule les communautés, sans appel LLM ; d'ici là, `query community` répond `communautés non calculées`. Pour revenir à une version antérieure, supprimez `.nephila/` : le build suivant réenrichit tous les fichiers de la portée.
 - **Vers 0.24** : `dist/`, `out/`, `coverage/`, `.next/`, `.nuxt/`, `vendor/`, `.idea/` et `*.min.js` sont exclus par défaut, et le premier `nephila update` retire leurs fichiers du graphe. Pour les garder : `exclude_defaults = false` dans `.nephila.toml`.
 - **Vers 0.23** : l'extraction utilise un fil par cœur, quelle que soit `concurrency`. Pour la limiter comme `concurrency = 1` le faisait : `--jobs 1`.
 - **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute `--check-stale` à ses requêtes, ou lance `nephila status` avant elles.
 - **Vers 0.18** : seuls les documents Markdown sont enrichis par défaut ; pour le code, `enrich_code = true` dans la configuration personnelle. Le premier `nephila build` remplace un graphe 0.17 et enrichit une fois tous les fichiers de la portée.
 
-Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans appel LLM et sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`.
+Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`.
 
 ## Développement
 
