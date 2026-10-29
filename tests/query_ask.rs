@@ -490,10 +490,13 @@ fn req016_ac5_ac6_ask_option_priority_over_config() {
     assert!(o.status.success(), "{}", text(&o.stderr));
 }
 
-/// AC-055-2 : le corps de la requête `ask` de la question d'AC-016-1 est identique octet pour
-/// octet à celui produit par la 0.18.0 (figé dans `tests/fixtures/ask_body_ac016_1.json`).
+/// Contexte de la requête `ask` de la question d'AC-016-1, tel que la 0.18.0 l'écrivait.
+const CONTEXTE_0_18_0: &str = "Nœuds :\n- type:com.acme.billing.BillingService : com.acme.billing.BillingService (class, billing/BillingService.java) - Gère la facturation des commandes\n- package:com.acme.billing : com.acme.billing (package, billing/BillingService.java)\n- method:com.acme.billing.BillingService.charge : com.acme.billing.BillingService.charge (method, billing/BillingService.java)\nLiens :\n- package:com.acme.billing -contains-> type:com.acme.billing.BillingService\n- type:com.acme.billing.BillingService -contains-> method:com.acme.billing.BillingService.charge\n";
+
+/// AC-160-5 : le corps de la requête `ask` de la question d'AC-016-1 est identique octet pour
+/// octet à `tests/fixtures/ask_body_ac016_1.json`, et son contexte reste celui de la 0.18.0.
 #[test]
-fn req055_ac2_ask_request_body_identical_to_0_18_0() {
+fn req160_ac5_ask_request_body_context_of_0_18_0() {
     let env = Env::new();
     let reply = r#"{"found":true,"answer":"billing","nodes":["BillingService"]}"#;
     let server = FakeServer::start(vec![(
@@ -518,6 +521,11 @@ fn req055_ac2_ask_request_body_identical_to_0_18_0() {
     assert_eq!(
         post.body,
         include_str!("fixtures/ask_body_ac016_1.json").trim_end_matches('\n')
+    );
+    let v: Value = serde_json::from_str(&post.body).unwrap();
+    assert_eq!(
+        v["messages"][0]["content"].as_str().unwrap(),
+        format!("Contexte :\n{CONTEXTE_0_18_0}\nQuestion : {Q}")
     );
 }
 

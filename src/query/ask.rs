@@ -1015,4 +1015,36 @@ mod tests {
         assert!(ctx.ends_with("\nLiens :\n"));
         assert_eq!(ctx.lines().count(), 3);
     }
+
+    #[test]
+    fn req160_ac4_legend_follows_node_and_link_lines() {
+        use crate::model::{EdgeKind::Calls, SubKind};
+        let a = Node::new(
+            NodeKind::Type,
+            "p.A",
+            "A",
+            Some("p/A.java"),
+            Some(SubKind::Class),
+            Some("Rôle de A."),
+        );
+        assert_eq!(
+            node_line(&a),
+            "- type:p.A : p.A (class, p/A.java) - Rôle de A."
+        );
+        assert!(a.id.starts_with("type:"));
+        let c = Node::new(NodeKind::Concept, "x", "x", None, None, None);
+        assert_eq!(node_line(&c), "- concept:x : x (concept)");
+        let f = Node::new(NodeKind::Method, "p.A.f", "f", Some("p/A.java"), None, None);
+        let g = Node::new(NodeKind::Method, "p.B.g", "g", Some("p/B.java"), None, None);
+        let edges = vec![edge(&f, &g, Calls)];
+        let ctx = build_context(&[f.clone(), g], &edges, std::slice::from_ref(&f));
+        assert!(
+            ctx.lines()
+                .any(|l| l == "- method:p.A.f -calls-> method:p.B.g"),
+            "{ctx}"
+        );
+        let prompt = crate::llm::ask::ask_system_prompt();
+        assert!(prompt.contains("- <identifiant> : <nom qualifié> (<genre>, <fichier>) - <résumé>"));
+        assert!(prompt.contains("- <source> -<genre>-> <cible>"));
+    }
 }
