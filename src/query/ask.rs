@@ -16,7 +16,7 @@ use super::search;
 use crate::config::Config;
 use crate::error::{Error, Result, TRUNCATED};
 use crate::filter::ProjectFile;
-use crate::llm::{build_llm, with_format_retries, AskReply, CallStats, Llm};
+use crate::llm::{build_llm, calls_line, with_format_retries, AskReply, CallStats, Llm, LlmTotals};
 use crate::model::{Edge, Node};
 use crate::store::Store;
 
@@ -387,10 +387,17 @@ pub fn answer(
     let edges = store.edges()?;
     let context = build_context(&nodes, &edges, &seeds, limits);
     let stop = AtomicBool::new(false);
-    let reply = with_format_retries(format_retries, &stop, |_| {
-        llm.ask_with(question, &context.text, &CallStats::default())
-    })
-    .map_err(|e| match e {
+    let mut totals = LlmTotals::default();
+    let result = with_format_retries(format_retries, &stop, |attempt| {
+        let stats = CallStats::default();
+        let r = llm.ask_with(question, &context.text, &stats);
+        totals.add(&stats, attempt >= 2);
+        r
+    });
+    if totals.calls > 0 {
+        crate::trace!("{}", calls_line(&totals));
+    }
+    let reply = result.map_err(|e| match e {
         Error::Truncated(_) => Error::Truncated(format!(
             "{TRUNCATED} ; posez une question plus ciblée ou augmentez max_output_tokens"
         )),

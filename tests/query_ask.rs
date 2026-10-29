@@ -721,6 +721,9 @@ fn req142_ac6_late_link_reaches_the_context_for_the_three_questions() {
 const MOCK_CFG: &str = "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n";
 const CFG_DEFAULT: &str = "config: llm=mock model=mock thinking=false effort=low max_output_tokens=16384 max_context_chars=12000 max_seeds=20 max_nodes=60 timeout_secs=300 format_retries=2";
 
+const CALLS_UNKNOWN: &str =
+    "appels: 1 appels, 0 nouveaux essais de format, 1 envois HTTP, jetons : inconnus";
+
 /// Lignes `trace:` de stderr, horodatage retiré.
 fn traces(o: &Output) -> Vec<String> {
     text(&o.stderr)
@@ -743,15 +746,15 @@ fn req162_ac10_ac13_config_line_template_marks_and_stdout() {
     // (a) gabarit exact, stdout identique, `-v` équivaut à `--verbose`.
     for flag in ["--verbose", "-v"] {
         let o = env.ask(Q, &[flag]);
-        assert_eq!(traces(&o), [CFG_DEFAULT], "{flag}");
-        assert_eq!(text(&o.stderr).lines().count(), 1);
+        assert_eq!(traces(&o), [CFG_DEFAULT, CALLS_UNKNOWN], "{flag}");
+        assert_eq!(text(&o.stderr).lines().count(), 2);
         assert_eq!(o.stdout, plain.stdout);
         assert_eq!(o.status.code(), Some(0));
     }
     let json = env.ask(Q, &["--json"]);
     let o = env.ask(Q, &["--json", "--verbose"]);
     assert_eq!(o.stdout, json.stdout);
-    assert_eq!(traces(&o), [CFG_DEFAULT]);
+    assert_eq!(traces(&o), [CFG_DEFAULT, CALLS_UNKNOWN]);
     for bad in ["enrich_code=", "concurrency=", "batch_files="] {
         assert!(!CFG_DEFAULT.contains(bad));
     }
@@ -819,7 +822,7 @@ fn req162_ac14_config_line_place_in_stderr() {
     let o = env.ask(Q, &["--verbose", "--check-stale"]);
     let err = text(&o.stderr);
     let lines: Vec<&str> = err.lines().collect();
-    assert_eq!(lines.len(), 2, "{err}");
+    assert_eq!(lines.len(), 3, "{err}");
     assert_eq!(
         lines[0],
         "avertissement: graphe pas à jour : 1 fichier modifié"
@@ -828,6 +831,7 @@ fn req162_ac14_config_line_place_in_stderr() {
         lines[1].starts_with("trace: [") && lines[1].ends_with(CFG_DEFAULT),
         "{err}"
     );
+    assert!(lines[2].ends_with(CALLS_UNKNOWN), "{err}");
     let o = env.ask(Q, &["--check-stale"]);
     assert!(!text(&o.stderr).contains("trace:"));
     // (b) aucun nœud de départ : config puis erreur.
@@ -843,12 +847,18 @@ fn req162_ac14_config_line_place_in_stderr() {
     let o = env.ask(Q, &["--verbose"]);
     let err = text(&o.stderr);
     let lines: Vec<&str> = err.lines().collect();
-    assert_eq!(lines.len(), 2, "{err}");
+    assert_eq!(lines.len(), 3, "{err}");
     assert!(lines[0].ends_with(CFG_DEFAULT), "{err}");
-    assert_eq!(format!("{}\n", lines[1]), A9);
+    assert!(lines[1].ends_with(CALLS_UNKNOWN), "{err}");
+    assert_eq!(format!("{}\n", lines[2]), A9);
     assert_eq!(o.status.code(), Some(0));
-    let o = env.ask(Q, &[]);
-    assert_eq!(text(&o.stderr), A9);
+    let plain = env.ask(Q, &[]);
+    assert_eq!(text(&plain.stderr), A9);
+    // AC-166-7 : stdout identique, texte et `--json`.
+    assert_eq!(o.stdout, plain.stdout);
+    let j_plain = env.ask(Q, &["--json"]);
+    let j = env.ask(Q, &["--json", "--verbose"]);
+    assert_eq!(j.stdout, j_plain.stdout);
     // (d) erreur de configuration : seule la ligne E-15, aucune trace.
     fs::write(&env.config, format!("{MOCK_CFG}[ask]\neffort = \"max\"\n")).unwrap();
     let o = env.ask(Q, &["--verbose"]);

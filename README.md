@@ -208,7 +208,7 @@ Modules (3)
 
 ### Traces et progression
 
-Avec `-v`, `build` et `update` écrivent sur stderr une ligne `trace:` par événement, horodatée : configuration effective (et réglages venus de `.nephila.toml`), parcours, migration du schéma, phases, chaque appel LLM avec son résultat et ses nouveaux essais, découpes, politique d'arrêt. stdout est inchangé : `nephila build -v 2>trace.log` garde le bilan lisible.
+Avec `-v`, `build` et `update` écrivent sur stderr une ligne `trace:` par événement, horodatée : configuration effective (et réglages venus de `.nephila.toml`), parcours, migration du schéma, phases, chaque appel LLM avec son résultat, ses jetons et ses nouveaux essais, découpes, politique d'arrêt, bilan des appels et des jetons (que `query ask -v` écrit aussi). stdout est inchangé : `nephila build -v 2>trace.log` garde le bilan lisible.
 
 ```
 trace: [0.000s] config: llm=mock model=m-projet enrich_code=false thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)

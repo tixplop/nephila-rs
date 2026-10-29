@@ -991,3 +991,215 @@ fn req165_ac10_no_secret_in_traces_with_usage() {
         check_safety(&err);
     }
 }
+
+// ---- REQ-166 : ligne `appels:` de `query ask --verbose` ----
+
+const ASK_Q: &str = "Que fait BillingService ?";
+const ASK_JSON: &str = r#"{"found":true,"answer":"Il facture.","nodes":["BillingService"]}"#;
+const ASK_KEY: &str = "NEPHILA_T253_KEY";
+
+/// Dépôt indexé sans LLM, configuration du fournisseur `provider` (`mock` : dossier simulé).
+struct AskEnv {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    config: PathBuf,
+    mock: PathBuf,
+}
+
+impl AskEnv {
+    fn new(provider: &str, base_url: &str) -> AskEnv {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let mock = tmp.path().join("mock");
+        fs::create_dir_all(repo.join("billing")).unwrap();
+        fs::create_dir_all(&mock).unwrap();
+        fs::write(
+            repo.join("billing/BillingService.java"),
+            "package com.acme.billing;\n\npublic class BillingService {\n    public void charge() {}\n}\n",
+        )
+        .unwrap();
+        fs::write(mock.join("_ask.json"), ASK_JSON).unwrap();
+        let config = tmp.path().join("config.toml");
+        fs::write(&config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+        let env = AskEnv {
+            _tmp: tmp,
+            repo,
+            config,
+            mock,
+        };
+        let o = env.cmd(&["build", "--no-llm"], &[]);
+        assert!(o.status.success(), "{}", stderr(&o));
+        fs::write(
+            &env.config,
+            format!(
+                "provider = \"{provider}\"\nmodel = \"m\"\napi_key_env = \"{ASK_KEY}\"\nbase_url = \"{base_url}\"\n"
+            ),
+        )
+        .unwrap();
+        env
+    }
+
+    fn cmd(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let mut c = Command::new(cargo_bin("nephila"));
+        c.env_remove("NO_COLOR")
+            .env_remove("NEPHILA_MOCK_MALFORMED")
+            .env("NEPHILA_RETRY_BASE_MS", "10")
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_MOCK_DIR", &self.mock)
+            .env(ASK_KEY, "sk-test")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args);
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    }
+
+    fn ask(&self, extra: &[&str], envs: &[(&str, &str)]) -> Output {
+        let mut a = vec!["query", "ask", ASK_Q];
+        a.extend_from_slice(extra);
+        self.cmd(&a, envs)
+    }
+}
+
+fn ask_http(provider: &str, replies: Vec<(u16, String)>) -> (AskEnv, FakeServer) {
+    let server = FakeServer::start(replies);
+    let env = AskEnv::new(provider, &server.base_url);
+    (env, server)
+}
+
+fn no_enrich_trace(err: &str) {
+    assert!(
+        !err.contains("llm enrich") && !err.contains("(jetons :"),
+        "{err}"
+    );
+}
+
+#[test]
+fn req166_ac1_ac6_ac7_one_call_each_provider_same_stdout() {
+    for p in ["openai", "anthropic"] {
+        let reply = body(p, ASK_JSON, ok_stop(p), Some(u(900, 100, 40)));
+        let (env, _s) = ask_http(p, vec![(200, reply.clone()); 4]);
+        let plain = env.ask(&[], &[]);
+        assert!(plain.status.success(), "{}", stderr(&plain));
+        assert!(!stderr(&plain).contains("appels:") && !stderr(&plain).contains("jetons"));
+        let o = env.ask(&["--verbose"], &[]);
+        let err = stderr(&o);
+        let t = traces(&err);
+        assert_eq!(t.len(), 2, "{p} : {err}");
+        assert!(t[0].starts_with("config: llm="), "{err}");
+        assert_eq!(
+            t[1],
+            "appels: 1 appels, 0 nouveaux essais de format, 1 envois HTTP, jetons : entrée 900 dont cache 100, sortie 40"
+        );
+        assert_eq!(err.lines().count(), 2, "{err}");
+        no_enrich_trace(&err);
+        assert_eq!(o.stdout, plain.stdout, "{p}");
+        let j_plain = env.ask(&["--json"], &[]);
+        let j = env.ask(&["--json", "--verbose"], &[]);
+        assert_eq!(j.stdout, j_plain.stdout, "{p} json");
+    }
+}
+
+#[test]
+fn req166_ac2_ac6_mock_format_retries() {
+    let env = AskEnv::new("mock", "");
+    fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    let plain = env.ask(&[], &[("NEPHILA_MOCK_MALFORMED", "_ask:1")]);
+    assert!(plain.status.success(), "{}", stderr(&plain));
+    assert_eq!(stderr(&plain), "");
+    let o = env.ask(&["--verbose"], &[("NEPHILA_MOCK_MALFORMED", "_ask:1")]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let t = traces(&stderr(&o));
+    assert_eq!(t.len(), 2, "{}", stderr(&o));
+    assert_eq!(
+        t[1],
+        "appels: 2 appels, 1 nouveaux essais de format, 2 envois HTTP, jetons : inconnus"
+    );
+    assert_eq!(o.stdout, plain.stdout);
+    // Échec final : la ligne `appels:` précède la ligne `erreur:`, dernière de stderr.
+    let o = env.ask(
+        &["--verbose", "--format-retries", "2"],
+        &[("NEPHILA_MOCK_MALFORMED", "_ask:3")],
+    );
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert_eq!(
+        traces(&err)[1],
+        "appels: 3 appels, 2 nouveaux essais de format, 3 envois HTTP, jetons : inconnus"
+    );
+    assert_eq!(
+        lines[2],
+        "erreur: réponse LLM non conforme au schéma : JSON illisible (NEPHILA_MOCK_MALFORMED) (3 essais sur 3)",
+        "{err}"
+    );
+    no_enrich_trace(&err);
+}
+
+#[test]
+fn req166_ac3_no_call_no_calls_line() {
+    let env = AskEnv::new("mock", "");
+    fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    let o = env.cmd(&["query", "ask", "zzzabsent qqqabsent ?", "--verbose"], &[]);
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    assert_eq!(err.lines().count(), 2, "{err}");
+    assert!(!err.contains("appels:"), "{err}");
+    assert!(err.lines().nth(1).unwrap().starts_with("erreur:"), "{err}");
+    let o = env.cmd(&["query", "ask", "zzzabsent qqqabsent ?"], &[]);
+    assert!(!stderr(&o).contains("appels:"));
+}
+
+#[test]
+fn req166_ac4_ac6_refused_key_and_http_retries() {
+    let (env, _s) = ask_http("openai", vec![(401, "{}".into())]);
+    let o = env.ask(&["--verbose"], &[]);
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert!(lines[0].starts_with("trace: [") && lines[0].contains("config: llm="));
+    assert!(lines[1].ends_with(
+        "appels: 1 appels, 0 nouveaux essais de format, 1 envois HTTP, jetons : entrée 0 dont cache 0, sortie 0"
+    ), "{err}");
+    assert_eq!(
+        lines[2],
+        "erreur: clé d'API refusée par openai (HTTP 401) ; vérifiez la variable désignée par api_key_env",
+        "{err}"
+    );
+    no_enrich_trace(&err);
+
+    let ok = body("openai", ASK_JSON, ok_stop("openai"), Some(u(900, 100, 40)));
+    let (env, _s) = ask_http(
+        "openai",
+        vec![(503, "{}".into()), (503, "{}".into()), (200, ok)],
+    );
+    let o = env.ask(&["--verbose"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let t = traces(&stderr(&o));
+    assert_eq!(t.len(), 2, "{}", stderr(&o));
+    assert_eq!(
+        t[1],
+        "appels: 1 appels, 0 nouveaux essais de format, 3 envois HTTP, jetons : entrée 900 dont cache 100, sortie 40"
+    );
+}
+
+#[test]
+fn req166_ac6_not_found_reply_still_writes_calls_line() {
+    let env = AskEnv::new("mock", "");
+    fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    fs::write(env.mock.join("_ask.json"), r#"{"found":false}"#).unwrap();
+    let o = env.ask(&["--verbose"], &[]);
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert_eq!(
+        traces(&err)[1],
+        "appels: 1 appels, 0 nouveaux essais de format, 1 envois HTTP, jetons : inconnus"
+    );
+    assert_eq!(lines[2], "erreur: pas trouvé dans le graphe");
+}

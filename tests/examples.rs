@@ -1936,3 +1936,19 @@ fn REQ164_AC2_section_ask_du_fichier_de_projet() {
         assert!(value <= cap, "{key} = {value} dépasse {cap}");
     }
 }
+
+#[test]
+fn REQ165_AC16_readme_traces_sentence() {
+    let readme = repo_file("README.md");
+    let new = "chaque appel LLM avec son résultat, ses jetons et ses nouveaux essais, découpes, politique d'arrêt, bilan des appels et des jetons (que `query ask -v` écrit aussi). stdout est inchangé";
+    assert_eq!(readme.matches(new).count(), 1);
+    assert!(!readme.contains("avec son résultat et ses nouveaux essais"));
+    assert_eq!(readme.matches("config: llm=").count(), 1);
+    assert!(!readme
+        .lines()
+        .any(|l| l.starts_with("trace:") && l.contains("appels: ")));
+    let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .unwrap()
+        .len();
+    assert!(size <= 42_000, "README : {size} octets");
+}
