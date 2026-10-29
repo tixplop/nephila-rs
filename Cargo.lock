@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "nephila-rs"
-version = "0.25.3"
+version = "0.26.0"
 dependencies = [
  "assert_cmd",
  "blake3",

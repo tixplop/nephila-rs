@@ -70,7 +70,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.25.3                                      # version voulue
+V=v0.26.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -358,7 +358,7 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 | `concurrency` | Appels LLM simultanés ; l'extraction est réglée par `--jobs` | 4 |
 | `enrich_code` | `true` enrichit aussi le code ; configuration personnelle seulement | `false` |
 | `thinking` | `true` demande au modèle de réfléchir ; configuration personnelle seulement ; chez anthropic, modèle Claude 4.6 ou suivant | `false` |
-| `effort` | `"low"`, `"medium"` ou `"high"`, avec `thinking = true` ; à `"medium"` ou `"high"`, augmentez `timeout_secs` ; configuration personnelle seulement | `"low"` |
+| `effort` | Niveau d'effort, avec ou sans `thinking` : `"low"`, `"medium"`, `"high"`, ou `"default"` pour n'en envoyer aucun ; à `"medium"` ou `"high"`, augmentez `timeout_secs` ; configuration personnelle seulement | `"low"` |
 | `max_output_tokens` | Limite de jetons de la réponse, entier > 0 ; configuration personnelle seulement | 16384 |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |
 | `format_retries` | Nouveaux essais d'une réponse non conforme, entier ≥ 0 | 2 |
@@ -371,10 +371,10 @@ Ce que chaque clé envoie à chaque fournisseur :
 | Clé | `anthropic` | `openai` | `mock` |
 |---|---|---|---|
 | `max_output_tokens` | `max_tokens` | `max_completion_tokens` | sans effet |
-| `thinking = true` | `"thinking": {"type": "adaptive"}` | aucun champ propre (voir `effort`) | sans effet |
-| `effort` (avec `thinking = true` seulement) | `output_config.effort` | `reasoning_effort` | sans effet |
+| `thinking = true` | `"thinking": {"type": "adaptive"}` | `reasoning_effort`, même si `effort` n'est pas écrit | sans effet |
+| `effort` | `output_config.effort` ; sans `thinking`, rien pour un modèle sorti avant Claude Opus 4.5 (`claude-sonnet-4-5`, par exemple) | `reasoning_effort` ; sans `thinking`, seulement si `effort` est écrit | sans effet |
 
-Un modèle ou un serveur qui refuse ces champs, ou une limite de 16384 jetons, refuse la requête (HTTP 400) : voir [Arrêt de l'envoi](#arrêt-de-lenvoi).
+Avec `effort = "default"`, aucun niveau n'est envoyé, à aucun fournisseur, et le modèle garde le sien. Un modèle ou un serveur qui refuse ces champs, ou une limite de 16384 jetons, refuse la requête (HTTP 400) : voir [Arrêt de l'envoi](#arrêt-de-lenvoi).
 
 La clé d'API n'est jamais écrite dans le fichier. `nephila` ne la vérifie pas avant le traitement : une clé refusée est constatée au premier appel, après l'extraction.
 
@@ -456,7 +456,7 @@ Six causes arrêtent l'envoi au LLM. Chacune a sa ligne `erreur:`, la dernière 
 | Cause | Quand | Que faire |
 |---|---|---|
 | Clé refusée | HTTP 401 ou 403, dès le premier appel | corriger la variable nommée par `api_key_env` |
-| Requête refusée | HTTP 400, 404, 413 ou 422, dès le premier appel | corriger `model`, `thinking`, `effort` ou `max_output_tokens`, d'après le message du fournisseur |
+| Requête refusée | HTTP 400, 404, 413 ou 422, dès le premier appel | corriger `model`, `thinking`, `effort` ou `max_output_tokens`, d'après le message du fournisseur ; s'il nomme `output_config` ou `reasoning_effort`, écrire `effort = "default"` |
 | Redirection | HTTP 300 à 399, jamais suivie | corriger `base_url` d'après l'adresse affichée |
 | Fournisseur saturé | 3 appels de suite en échec sur HTTP 429 ou 529 | relancer plus tard, ou réduire `concurrency` |
 | Panne réseau | 3 erreurs réseau de suite | vérifier le réseau et `base_url` |
@@ -565,6 +565,7 @@ Les références sans cible sont comptées dans « références non résolues »
 
 Les versions qui demandent une action, la plus récente d'abord. L'historique des nouveautés est dans les tags git et sur la page [Releases](https://github.com/tixplop/nephila-rs/releases).
 
+- **Vers 0.26** : `effort` (défaut `"low"`) est envoyé aussi sans `thinking` : à `anthropic` dans `output_config`, sauf pour un modèle sorti avant Claude Opus 4.5, et à `openai` si la clé est écrite. Si votre serveur ou votre modèle refuse ce champ (requête refusée, HTTP 400), écrivez `effort = "default"` dans la configuration personnelle, puis lancez `nephila update`.
 - **Vers 0.25** : le premier `nephila update` (ou `build`) migre le graphe et calcule les communautés, sans appel LLM ; d'ici là, `query community` répond `communautés non calculées`. Pour revenir à une version antérieure, supprimez `.nephila/` : le build suivant réenrichit tous les fichiers de la portée.
 - **Vers 0.24** : `dist/`, `out/`, `coverage/`, `.next/`, `.nuxt/`, `vendor/`, `.idea/` et `*.min.js` sont exclus par défaut, et le premier `nephila update` retire leurs fichiers du graphe. Pour les garder : `exclude_defaults = false` dans `.nephila.toml`.
 - **Vers 0.23** : l'extraction utilise un fil par cœur, quelle que soit `concurrency`. Pour la limiter comme `concurrency = 1` le faisait : `--jobs 1`.
@@ -582,7 +583,7 @@ Les actions sont épinglées par SHA et Dependabot (`.github/dependabot.yml`) pr
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, puis pousser un tag identique ; `release.yml` publie les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.25.3 && git push origin v0.25.3
+git tag v0.26.0 && git push origin v0.26.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml`) ; `cargo test` passe aussi.

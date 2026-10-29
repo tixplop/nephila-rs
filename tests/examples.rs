@@ -983,25 +983,30 @@ fn REQ122_AC1_readme_installe_avec_locked() {
 }
 
 const THINKING_BLOCK: &str = "# Demande au modèle de réfléchir avant de répondre. Booléen ; défaut : false. true : nephila
-# envoie à « anthropic » \"thinking\": {\"type\": \"adaptive\"} et \"output_config\": {\"effort\": ...},
-# et à « openai » \"reasoning_effort\" ; le niveau est celui de effort. false : aucun champ de
-# réflexion n'est envoyé, mais un modèle qui réfléchit toujours (certains modèles Claude, les
-# modèles de raisonnement d'OpenAI) le fait quand même, à son niveau par défaut ; pour limiter
-# sa réflexion, mettez thinking à true et effort à \"low\". Un modèle qui ne prend pas en charge
-# la réflexion refuse la requête (HTTP 400) : ses fichiers restent à enrichir. Chez « anthropic »,
-# la réflexion adaptative demande un modèle Claude 4.6 ou suivant : claude-sonnet-4-5, le modèle
-# de cet exemple, la refuse. La réflexion n'est jamais affichée ni enregistrée. Sans effet avec
-# « mock ». Lue ici seulement :
+# envoie à « anthropic » \"thinking\": {\"type\": \"adaptive\"} et à « openai » \"reasoning_effort\",
+# même sans clé effort ; le niveau est celui de effort. false : aucun champ \"thinking\" n'est
+# envoyé, mais un modèle qui réfléchit toujours (certains modèles Claude, les modèles de
+# raisonnement d'OpenAI) le fait quand même ; effort règle aussi son niveau (voir ci-dessous).
+# Un modèle qui ne prend pas en charge la réflexion refuse la requête (HTTP 400) : ses fichiers
+# restent à enrichir. Chez « anthropic », la réflexion adaptative demande un modèle Claude 4.6
+# ou suivant : claude-sonnet-4-5, le modèle de cet exemple, la refuse. La réflexion n'est
+# jamais affichée ni enregistrée. Sans effet avec « mock ». Lue ici seulement :
 # .nephila.toml la refuse.
 # thinking = false";
 
-const EFFORT_BLOCK: &str = "# Niveau de la réflexion demandée quand thinking vaut true. Texte : \"low\", \"medium\" ou \"high\",
-# en minuscules ; défaut : \"low\". Envoyé à « anthropic » dans \"output_config\" et à « openai »
-# dans \"reasoning_effort\". Sans effet quand thinking vaut false (rien n'est envoyé) et avec
-# « mock ». Un niveau plus haut donne des réponses plus lentes et plus coûteuses, et sa
-# réflexion compte dans max_output_tokens. À \"medium\" ou \"high\", augmentez timeout_secs
-# (600, par exemple) : un appel plus long échoue en délai dépassé, et trois délais dépassés
-# de suite arrêtent l'envoi. Lue ici seulement :
+const EFFORT_BLOCK: &str =
+    "# Niveau d'effort demandé au modèle, avec ou sans thinking : il vaut pour toute la réponse,
+# réflexion comprise. Texte : \"low\", \"medium\", \"high\" ou \"default\", en minuscules ; défaut :
+# \"low\". Envoyé à « anthropic » dans \"output_config\", sauf quand thinking vaut false et que le
+# modèle est sorti avant Claude Opus 4.5, comme claude-sonnet-4-5, le modèle de cet exemple :
+# ces modèles refusent le champ. Envoyé à « openai » dans \"reasoning_effort\" si cette clé est
+# écrite ou si thinking vaut true ; un modèle sans raisonnement (gpt-4o-mini, celui de la
+# section OpenAI) le refuse. \"default\" n'envoie rien, et le modèle garde son niveau par défaut :
+# c'est le remède quand un serveur ou un modèle refuse la requête (HTTP 400) à cause de ce
+# champ. Sans effet avec « mock ». Un niveau plus haut donne des réponses plus lentes et plus
+# coûteuses, et sa réflexion compte dans max_output_tokens.
+# À \"medium\" ou \"high\", augmentez timeout_secs (600, par exemple) : un appel plus long échoue
+# en délai dépassé, et trois délais dépassés de suite arrêtent l'envoi. Lue ici seulement :
 # .nephila.toml la refuse.
 # effort = \"low\"";
 
@@ -1033,6 +1038,115 @@ fn REQ133_AC3_modele_de_l_exemple_reste_claude_sonnet_4_5() {
 #[test]
 fn REQ135_AC1_bloc_effort_de_l_exemple_de_config_au_texte_exact() {
     assert_eq!(example_block_ending_at("# effort = \"low\""), EFFORT_BLOCK);
+}
+
+#[test]
+fn REQ157_AC9_AC13_blocs_thinking_et_effort_de_l_exemple() {
+    let thinking = example_block_ending_at("# thinking = false");
+    let effort = example_block_ending_at("# effort = \"low\"");
+    assert_eq!(thinking.lines().count(), 11);
+    assert_eq!(effort.lines().count(), 14);
+    for needle in [
+        "aucun champ \"thinking\"",
+        "effort règle aussi son niveau (voir ci-dessous)",
+        "4.6",
+        "claude-sonnet-4-5",
+    ] {
+        assert!(thinking.contains(needle), "thinking : {needle}");
+    }
+    for bad in [
+        "aucun champ de réflexion",
+        "mettez thinking à true et effort à \"low\"",
+    ] {
+        assert!(!thinking.contains(bad), "thinking : {bad}");
+    }
+    assert_eq!(
+        effort.lines().next().unwrap(),
+        "# Niveau d'effort demandé au modèle, avec ou sans thinking : il vaut pour toute la réponse,"
+    );
+    for needle in [
+        "\"low\", \"medium\", \"high\" ou \"default\"",
+        "sorti avant Claude Opus 4.5",
+        "gpt-4o-mini",
+        "\"default\" n'envoie rien",
+        "claude-sonnet-4-5",
+        "timeout_secs",
+        "trois délais dépassés",
+    ] {
+        assert!(effort.contains(needle), "effort : {needle}");
+    }
+    assert!(!effort.contains("Sans effet quand thinking vaut false"));
+    assert!(effort
+        .lines()
+        .any(|l| l.starts_with("# À \"medium\" ou \"high\", augmentez timeout_secs")));
+    for l in thinking.lines().chain(effort.lines()) {
+        assert!(l.chars().count() <= 100, "ligne trop longue : {l}");
+    }
+}
+
+#[test]
+fn REQ157_AC10_AC14_readme_effort_sans_thinking() {
+    let readme = repo_file("README.md");
+    let conf = readme_section(&readme, "## Configuration du LLM");
+    let key_row = conf
+        .lines()
+        .find(|l| l.starts_with("| `effort` |") && !l.contains("output_config"))
+        .expect("ligne effort de la table des clés");
+    assert!(key_row.contains("\"default\""), "{key_row}");
+    assert!(!key_row.contains("avec `thinking = true`"), "{key_row}");
+    assert!(conf.contains("effort = \"default\""));
+    assert!(!readme.contains("(avec `thinking = true` seulement)"));
+    let rows = table_rows(
+        &conf,
+        "| Clé | `anthropic` | `openai` | `mock` |",
+        "|---|---|---|---|",
+    );
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(cell(rows[0], 0), "`max_output_tokens`");
+    assert_eq!(cell(rows[1], 0), "`thinking = true`");
+    assert_eq!(cell(rows[2], 0), "`effort`");
+    assert!(cell(rows[1], 2).contains("reasoning_effort"), "{}", rows[1]);
+    assert!(
+        cell(rows[2], 1).contains("output_config.effort"),
+        "{}",
+        rows[2]
+    );
+    assert!(cell(rows[2], 1).contains("Opus 4.5"), "{}", rows[2]);
+    assert!(
+        cell(rows[2], 1).contains("claude-sonnet-4-5"),
+        "{}",
+        rows[2]
+    );
+    assert!(cell(rows[2], 2).contains("reasoning_effort"), "{}", rows[2]);
+    assert!(!rows[2].contains("thinking = true"), "{}", rows[2]);
+    let stop = readme_section(&readme, "### Arrêt de l'envoi");
+    let stop_rows = table_rows(&stop, "| Cause | Quand | Que faire |", "|---|---|---|");
+    let refused = stop_rows
+        .iter()
+        .find(|r| cell(r, 0) == "Requête refusée")
+        .expect("ligne Requête refusée");
+    for needle in [
+        "`output_config`",
+        "`reasoning_effort`",
+        "`effort = \"default\"`",
+        "`max_output_tokens`",
+    ] {
+        assert!(cell(refused, 2).contains(needle), "{refused} : {needle}");
+    }
+    let upgrade = readme_section(&readme, "## Mise à niveau");
+    let first = upgrade
+        .lines()
+        .find(|l| l.starts_with("- **Vers "))
+        .expect("première puce");
+    assert!(first.starts_with("- **Vers 0.26** :"), "{first}");
+    for needle in [
+        "output_config",
+        "effort = \"default\"",
+        "requête refusée",
+        "nephila update",
+    ] {
+        assert!(first.contains(needle), "{first} : {needle}");
+    }
 }
 
 fn without_timestamp(line: &str) -> String {
@@ -1076,17 +1190,17 @@ fn REQ134_AC2_ligne_config_d_exemple_du_readme_est_la_sortie_reelle() {
 }
 
 #[test]
-fn REQ156_AC1_version_0_25_3() {
-    assert_eq!(cargo_minor(), "0.25");
+fn REQ158_AC1_version_0_26_0() {
+    assert_eq!(cargo_minor(), "0.26");
     let toml = repo_file("Cargo.toml");
-    assert!(toml.lines().any(|l| l == "version = \"0.25.3\""));
+    assert!(toml.lines().any(|l| l == "version = \"0.26.0\""));
     let lock = repo_file("Cargo.lock");
-    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.25.3\""));
+    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.26.0\""));
     let readme = repo_file("README.md");
-    for needle in ["V=v0.25.3", "git tag v0.25.3 && git push origin v0.25.3"] {
+    for needle in ["V=v0.26.0", "git tag v0.26.0 && git push origin v0.26.0"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
-    assert!(!readme.contains("v0.25.2"));
+    assert!(!readme.contains("v0.25.3"));
 }
 
 /// Titres du README (niveau 1 et plus), hors blocs de code, tels qu'écrits.
@@ -1190,7 +1304,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 40_000, "README : {size} octets");
+    assert!(size <= 41_000, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1380,21 +1494,25 @@ fn REQ155_AC12_table_d_arret_de_l_envoi() {
 }
 
 #[test]
-fn REQ155_AC13_mise_a_niveau_en_cinq_actions() {
+fn REQ155_AC13_mise_a_niveau_en_six_actions() {
     let readme = repo_file("README.md");
     let sec = readme_section(&readme, "## Mise à niveau");
     let bullets: Vec<&str> = sec.lines().filter(|l| l.starts_with("- **Vers ")).collect();
     let wanted = [
+        ("- **Vers 0.26** :", "output_config"),
         ("- **Vers 0.25** :", ".nephila/"),
         ("- **Vers 0.24** :", "exclude_defaults = false"),
         ("- **Vers 0.23** :", "--jobs 1"),
         ("- **Vers 0.19** :", "--check-stale"),
         ("- **Vers 0.18** :", "enrich_code = true"),
     ];
-    assert_eq!(bullets.len(), 5, "{bullets:?}");
+    assert_eq!(bullets.len(), 6, "{bullets:?}");
     for (bullet, (prefix, needle)) in bullets.iter().zip(wanted) {
         assert!(bullet.starts_with(prefix), "{bullet}");
         assert!(bullet.contains(needle), "{bullet} : {needle}");
+    }
+    for needle in ["effort = \"default\"", "requête refusée", "nephila update"] {
+        assert!(bullets[0].contains(needle), "{} : {needle}", bullets[0]);
     }
     assert!(sec.contains("https://github.com/tixplop/nephila-rs/releases"));
     assert!(sec.contains("Un graphe 0.18 à 0.24 est migré sur place"));
