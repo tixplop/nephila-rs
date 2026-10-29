@@ -294,6 +294,10 @@ fn run_unit<'a>(
         1 => {
             let (f, text) = &readable[0];
             match plan_calls(f, text, max_chunk_chars, &nodes(f)) {
+                Ok(calls) if calls.is_empty() => {
+                    outcomes.push(Outcome::Done((*f).clone(), Enrichment::default()));
+                    Step::Finished(outcomes, None)
+                }
                 Ok(calls) => Step::Calls(outcomes, calls),
                 Err(e) => {
                     outcomes.push(Outcome::Failed(
@@ -497,7 +501,8 @@ fn traced_lot_once(
 /// premier morceau où son nom court figure (mot entier, ou, pour un nom qui n'est pas un mot,
 /// occurrence aux bords contrôlés ; sans casse pour un nœud `table:`, le SQL ne distinguant pas
 /// les majuscules) ; un nœud de nom vide ou absent de tous les morceaux va dans le morceau 1. Au
-/// moins un appel par morceau, liste vide permise.
+/// moins un appel par morceau, liste vide permise : le filtrage des appels vides se fait dans
+/// `plan_calls`.
 fn call_plan(
     parts: &[String],
     nodes: &[(String, String)],
@@ -674,9 +679,10 @@ fn section_homes(
     homes
 }
 
-/// Appels d'un fichier envoyé seul selon `call_plan`, numérotés 1..n dans l'ordre du plan. Le
-/// plafond de `MAX_CALLS_PER_FILE` est vérifié ici, avant qu'un seul appel soit mis en file
-/// (REQ-048).
+/// Appels d'un fichier envoyé seul selon `call_plan`, privé de ses appels à liste vide (sauf
+/// Markdown ayant au moins une section, REQ-159), numérotés 1..n dans l'ordre du plan. Le
+/// plafond de `MAX_CALLS_PER_FILE` est vérifié ici sur le plan filtré, avant qu'un seul appel
+/// soit mis en file (REQ-048).
 fn plan_calls<'a>(
     file: &'a FileRecord,
     text: &str,
@@ -687,7 +693,14 @@ fn plan_calls<'a>(
     let spans = chunk::split_spans(text, max_chunk_chars);
     let homes = section_homes(text, &spans, nodes);
     let parts: Vec<String> = spans.into_iter().map(|(part, _)| part).collect();
-    let plan = call_plan(&parts, nodes, &homes);
+    let mut plan = call_plan(&parts, nodes, &homes);
+    // REQ-159 : un appel à liste vide ne peut rien apporter, sauf pour un Markdown à sections
+    // (un morceau de suite peut porter des concepts citant des sections connues).
+    let keep_empty = crate::llm::enrich::is_markdown(&file.path)
+        && nodes.iter().any(|(id, _)| id.starts_with("section:"));
+    if !keep_empty {
+        plan.retain(|(_, list)| !list.is_empty());
+    }
     let count = plan.len();
     if count > MAX_CALLS_PER_FILE {
         return Err(Error::TooManyCalls {
@@ -1162,8 +1175,13 @@ pub(crate) fn enrich_with_stop(
     let started = Instant::now();
     let failed_before = report.failed;
     let mut succeeded = 0usize;
+    // REQ-159 : un fichier sans nœud à demander est enregistré vide, sans lecture ni appel.
+    let (with_nodes, without_nodes): (Vec<FileRecord>, Vec<FileRecord>) = files
+        .iter()
+        .cloned()
+        .partition(|f| !ids.get(&f.path).is_none_or(Vec::is_empty));
     let units = form_units_by_nodes(
-        files,
+        &with_nodes,
         |f| ids.get(&f.path).map_or(0, Vec::len),
         batch_files,
         max_chunk_chars,
@@ -1185,6 +1203,14 @@ pub(crate) fn enrich_with_stop(
     let wake = Condvar::new();
     let policy = Mutex::new(Policy::default());
     let (tx, rx) = mpsc::channel::<Msg>();
+    if !without_nodes.is_empty() {
+        let empty = without_nodes
+            .iter()
+            .map(|f| Outcome::Done(f.clone(), Enrichment::default()))
+            .collect();
+        // Le récepteur est encore là : l'envoi ne peut pas échouer.
+        let _ = tx.send(Msg::Outcomes(empty));
+    }
     let mut write_error: Option<Error> = None;
     let mut failures: Vec<(String, Error)> = Vec::new();
     let mut partials: HashMap<String, Partial> = HashMap::new();
@@ -1796,6 +1822,22 @@ mod tests {
         assert!(p.stop_cause.is_none());
     }
 
+    /// Déclare un nœud `method` par fichier : sans nœud à demander, un fichier n'est pas envoyé
+    /// (REQ-159).
+    fn declare_one_node(store: &mut Store, files: &[FileRecord]) {
+        for f in files {
+            let node = Node::new(
+                NodeKind::Method,
+                &format!("{}.m", f.path),
+                "m",
+                Some(&f.path),
+                None,
+                None,
+            );
+            store.replace_structure(&f.path, &[node], &[]).unwrap();
+        }
+    }
+
     /// Faux `Llm` qui compte ses appels d'extraction.
     struct Counting(std::sync::atomic::AtomicUsize);
     impl Llm for Counting {
@@ -1846,20 +1888,152 @@ mod tests {
                 llm, path, index, count, &part, &requested, &known, retries, stop,
             )?);
         }
-        if results.len() == 1 {
-            return Ok(results.remove(0));
+        match results.len() {
+            0 => Ok(Enrichment::default()),
+            1 => Ok(results.remove(0)),
+            _ => Ok(chunk::merge_enrichments(results)),
         }
-        Ok(chunk::merge_enrichments(results))
+    }
+
+    /// Appels de `plan_calls` : `(index, count, morceau, liste, connus)`.
+    type PlannedCall = (usize, usize, String, Vec<String>, Vec<String>);
+
+    fn planned(path: &str, text: &str, max: usize, nodes: &[(String, String)]) -> Vec<PlannedCall> {
+        let file = rec(path, text.len() as u64);
+        plan_calls(&file, text, max, nodes)
+            .unwrap()
+            .into_iter()
+            .map(|u| match u {
+                Unit::Call {
+                    index,
+                    count,
+                    part,
+                    requested,
+                    known,
+                    ..
+                } => (
+                    index,
+                    count,
+                    part.to_string(),
+                    requested,
+                    known.iter().cloned().collect(),
+                ),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    fn node(id: &str, short: &str) -> (String, String) {
+        (id.to_string(), short.to_string())
+    }
+
+    #[test]
+    fn req159_ac1_appels_a_liste_vide_retires() {
+        // JSON : un seul nœud, au morceau 1 ; les morceaux 2 et 3 n'ont rien à demander.
+        let text = "aaaaaaaaa\n".repeat(3);
+        assert_eq!(chunk::split_spans(&text, 10).len(), 3);
+        let spans = chunk::split_spans(&text, 10);
+        let nodes = [node("document:data/big.json", "")];
+        let calls = planned("data/big.json", &text, 10, &nodes);
+        assert_eq!(calls.len(), 1);
+        let (index, count, part, requested, known) = &calls[0];
+        assert_eq!((*index, *count), (1, 1));
+        assert_eq!(part, &spans[0].0);
+        assert_eq!(requested, &vec!["document:data/big.json".to_string()]);
+        assert_eq!(known, &vec!["document:data/big.json".to_string()]);
+
+        // Java : nœuds aux morceaux 1 et 3 seulement.
+        let text = "alpha xxx\nbbbbbbbbb\ngamma xxx\n";
+        let spans = chunk::split_spans(text, 10);
+        assert_eq!(spans.len(), 3);
+        let nodes = [node("class:A", "alpha"), node("method:A.g", "gamma")];
+        let parts: Vec<String> = spans.iter().map(|(p, _)| p.clone()).collect();
+        let homes = section_homes(text, &spans, &nodes);
+        let plan = call_plan(&parts, &nodes, &homes);
+        assert_eq!(plan.len(), 3);
+        assert!(plan[1].1.is_empty());
+        let calls = planned("src/A.java", text, 10, &nodes);
+        assert_eq!(calls.len(), 2);
+        let known: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
+        for (n, k) in [(0usize, 0usize), (1, 2)] {
+            let (index, count, part, requested, kn) = &calls[n];
+            assert_eq!((*index, *count), (n + 1, 2));
+            assert_eq!(part, &parts[k]);
+            assert_eq!(requested, &plan[k].1);
+            assert_eq!(kn, &known);
+        }
+    }
+
+    #[test]
+    fn req159_ac2_markdown_garde_les_appels_a_liste_vide() {
+        let text = "# t0\nxxxxxxx\n# t2\n";
+        let spans = chunk::split_spans(text, 8);
+        assert_eq!(spans.len(), 3);
+        let nodes = [
+            node("document:docs/g.md", ""),
+            node("section:docs/g.md#t0", "t0"),
+            node("section:docs/g.md#t2", "t2"),
+        ];
+        let homes = section_homes(text, &spans, &nodes);
+        let parts: Vec<String> = spans.into_iter().map(|(p, _)| p).collect();
+        let plan = call_plan(&parts, &nodes, &homes);
+        assert_eq!(plan.len(), 3);
+        assert!(plan[1].1.is_empty());
+        let calls = planned("docs/g.md", text, 8, &nodes);
+        assert_eq!(calls.len(), 3);
+        for (i, c) in calls.iter().enumerate() {
+            assert_eq!((c.0, c.1), (i + 1, 3));
+            assert_eq!(c.2, parts[plan[i].0]);
+            assert_eq!(c.3, plan[i].1);
+        }
+        // Sans titre : seul le nœud `document:` existe, un seul appel.
+        let text = "xxxxxxx\n".repeat(3);
+        assert_eq!(chunk::split_spans(&text, 8).len(), 3);
+        let calls = planned("docs/n.md", &text, 8, &[node("document:docs/n.md", "")]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].0, calls[0].1), (1, 1));
+    }
+
+    #[test]
+    fn req159_ac3_plafond_apres_filtrage() {
+        let stop = AtomicBool::new(false);
+        let run = |lines: usize, with_node: usize| {
+            let text: String = (0..lines).map(|i| format!("n{i:02} xxxxx\n")).collect();
+            assert_eq!(chunk::split(&text, 10).len(), lines);
+            let nodes: Vec<(String, String)> = (0..with_node)
+                .map(|i| (format!("id{i}"), format!("n{i:02}")))
+                .collect();
+            let llm = Counting(std::sync::atomic::AtomicUsize::new(0));
+            let r = enrich_chunks(&llm, "x", &text, 10, &nodes, 0, &stop);
+            (r, llm.0.load(Ordering::SeqCst))
+        };
+        let (r, calls) = run(60, 50);
+        assert!(r.is_ok());
+        assert_eq!(calls, 50);
+        let (r, calls) = run(61, 51);
+        assert_eq!(calls, 0);
+        let e = r.unwrap_err();
+        assert_eq!(e, Error::TooManyCalls { calls: 51, max: 50 });
+        assert_eq!(
+            format!("avertissement: x : {e}"),
+            "avertissement: x : trop d'appels d'enrichissement (51 nécessaires, au plus 50 par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml"
+        );
+        let (r, calls) = run(51, 0);
+        assert_eq!(r.unwrap(), Enrichment::default());
+        assert_eq!(calls, 0);
     }
 
     #[test]
     fn req048_ac1_plafond_de_50_appels() {
         let stop = AtomicBool::new(false);
         let run = |lines: usize| {
-            let text = "aaaaaaaaa\n".repeat(lines);
+            let text: String = (0..lines).map(|i| format!("n{i:02} xxxxx\n")).collect();
             assert_eq!(chunk::split(&text, 10).len(), lines);
+            let nodes: Vec<(String, String)> = (0..lines)
+                .map(|i| (format!("id{i}"), format!("n{i:02}")))
+                .collect();
             let llm = Counting(std::sync::atomic::AtomicUsize::new(0));
-            let r = enrich_chunks(&llm, "x", &text, 10, &[], 0, &stop);
+            let r = enrich_chunks(&llm, "x", &text, 10, &nodes, 0, &stop);
             (r, llm.0.load(Ordering::SeqCst))
         };
         let (r, calls) = run(51);
@@ -2212,6 +2386,8 @@ mod tests {
         }
         let files = [rec("A.java", 30), rec("B.java", 30)];
         let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(&files).unwrap();
+        declare_one_node(&mut store, &files);
         let mut report = BuildReport::default();
         let opts = IndexOptions {
             jobs: 1,
@@ -2292,6 +2468,7 @@ mod tests {
         }
         let mut store = Store::open_or_create(dir.path()).unwrap();
         store.insert_files(&files).unwrap();
+        declare_one_node(&mut store, &files);
         let mut report = BuildReport::default();
         let opts = IndexOptions {
             jobs: 1,
@@ -2369,6 +2546,7 @@ mod tests {
         }
         let mut store = Store::open_or_create(dir.path()).unwrap();
         store.insert_files(&files).unwrap();
+        declare_one_node(&mut store, &files);
         let mut report = BuildReport::default();
         let opts = IndexOptions {
             jobs: 1,
@@ -2503,7 +2681,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut files = Vec::new();
         for (name, lines) in big {
-            std::fs::write(dir.path().join(name), "aaaaaaaaa\n".repeat(*lines)).unwrap();
+            // Une ligne de 10 octets par morceau (`max_chunk_chars = 10`), de mot unique `w<i>`.
+            let text: String = (0..*lines).map(|i| format!("w{i} xxxxxxx\n")).collect();
+            std::fs::write(dir.path().join(name), text).unwrap();
             files.push(rec(name, 10 * *lines as u64));
         }
         for i in 0..small {
@@ -2530,8 +2710,28 @@ mod tests {
                 Node::new(NodeKind::Section, &name, &name, Some("Big.txt"), None, None)
             })
             .collect();
-        if files.iter().any(|f| f.path == "Big.txt") {
-            store.replace_structure("Big.txt", &sections, &[]).unwrap();
+        // Chaque morceau d'un fichier porte un nœud (REQ-159) : le mot de sa première ligne.
+        for f in files {
+            let text = std::fs::read_to_string(dir.path().join(&f.path)).unwrap();
+            let mut nodes: Vec<Node> = text
+                .lines()
+                .map(|l| {
+                    let word = l.split(' ').next().unwrap();
+                    let qualified = format!("{}.{word}", f.path);
+                    Node::new(
+                        NodeKind::Method,
+                        &qualified,
+                        word,
+                        Some(&f.path),
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+            if f.path == "Big.txt" {
+                nodes.extend(sections.iter().cloned());
+            }
+            store.replace_structure(&f.path, &nodes, &[]).unwrap();
         }
         let mut report = BuildReport::default();
         let opts = IndexOptions {

@@ -614,9 +614,12 @@ fn req042_ac4_fils_morceaux_et_delai() {
     );
     fs::write(
         e.repo.join("src/F02.java"),
+        // Chaque morceau porte une méthode : aucun appel à liste vide (REQ-159).
         format!(
-            "package p;\npublic class F02 {{}}\n{}",
-            "// remplissage\n".repeat(100)
+            "package p;\npublic class F02 {{\n{}}}\n",
+            (0..200)
+                .map(|i| format!("    void m{i}() {{}}\n"))
+                .collect::<String>()
         ),
     )
     .unwrap();

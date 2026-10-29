@@ -182,9 +182,12 @@ fn req027_ac3_ten_files_batch_four_gives_4_4_2() {
 fn req027_ac3_oversized_file_is_isolated_and_lots_respect_byte_bound() {
     let env = Env::new(6, 4, 1);
     // F02 est gros : plusieurs morceaux ; les autres font ~40 octets, deux ne tiennent pas ensemble.
+    // Chaque morceau porte une méthode : aucun appel à liste vide (REQ-159).
     let big = format!(
-        "package p;\npublic class F02 {{}}\n{}",
-        "// remplissage\n".repeat(20)
+        "package p;\npublic class F02 {{\n{}}}\n",
+        (0..20)
+            .map(|i| format!("void m{i}() {{}}\n"))
+            .collect::<String>()
     );
     fs::write(env.repo.join("src/F02.java"), &big).unwrap();
     for i in [0, 1, 3, 4, 5] {
