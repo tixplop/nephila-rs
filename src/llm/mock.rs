@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use super::ask::AskReply;
 use super::enrich::parse_lot;
-use super::{Enrichment, Llm, LotItem};
+use super::{CallStats, Enrichment, Llm, LotItem};
 use crate::error::{Error, Result};
 use serde_json::Value;
 
@@ -101,7 +101,7 @@ impl MockLlm {
     }
 
     /// Journalise, temporise, puis échoue si le quota d'appels est dépassé.
-    fn begin_call(&self, file: &str, chunk: usize) -> Result<()> {
+    fn begin_call(&self, file: &str, chunk: usize, stats: &CallStats) -> Result<()> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(log) = &self.opts.log {
             let line = format!("{file}\t{chunk}\n");
@@ -116,6 +116,7 @@ impl MockLlm {
             f.write_all(line.as_bytes())
                 .map_err(|e| Error::Message(format!("écriture du journal mock : {e}")))?;
         }
+        stats.add_send();
         if self.opts.delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.opts.delay_ms));
         }
@@ -151,9 +152,9 @@ impl MockLlm {
 
     /// Journalise l'appel (`label`), temporise et applique les échecs simulés ; `files` = fichiers
     /// concernés par l'appel (délai dépassé si l'un est dans `NEPHILA_MOCK_TIMEOUT_FILES`).
-    fn gate(&self, label: &str, chunk: usize, files: &[&str]) -> Result<()> {
+    fn gate(&self, label: &str, chunk: usize, files: &[&str], stats: &CallStats) -> Result<()> {
         let n = self.extractions.fetch_add(1, Ordering::SeqCst);
-        self.begin_call(label, chunk)?;
+        self.begin_call(label, chunk, stats)?;
         if let Some(file) = files
             .iter()
             .find(|f| self.opts.timeout_files.iter().any(|t| t == *f))
@@ -171,6 +172,7 @@ impl MockLlm {
                 )));
             }
         }
+        stats.record_response(None);
         Ok(())
     }
 
@@ -192,9 +194,9 @@ impl MockLlm {
     }
 
     /// Journalise l'appel, applique les échecs simulés et lit la fixture du morceau.
-    fn fixture_json(&self, file: &str, call: usize) -> Result<Option<String>> {
+    fn fixture_json(&self, file: &str, call: usize, stats: &CallStats) -> Result<Option<String>> {
         check_relative(file)?;
-        self.gate(file, call, &[file])?;
+        self.gate(file, call, &[file], stats)?;
         self.check_malformed(&[file])?;
         let by_chunk = self.read_fixture(&format!("{file}.{call}.json"))?;
         let json = match by_chunk {
@@ -243,27 +245,30 @@ fn check_relative(file: &str) -> Result<()> {
     }
 }
 
-impl Llm for MockLlm {
-    fn enrich(
+impl MockLlm {
+    fn enrich_stats(
         &self,
         file: &str,
         call: usize,
-        _text: &str,
-        _requested: &[String],
         known: &[String],
+        stats: &CallStats,
     ) -> Result<Enrichment> {
-        match self.fixture_json(file, call)? {
+        match self.fixture_json(file, call, stats)? {
             Some(j) => Enrichment::parse(&j, file, known),
             None => Ok(Enrichment::default()),
         }
     }
 
-    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+    fn enrich_lot_stats(
+        &self,
+        items: &[LotItem],
+        stats: &CallStats,
+    ) -> Result<Vec<(String, Result<Enrichment>)>> {
         for it in items {
             check_relative(&it.file)?;
         }
         let files: Vec<&str> = items.iter().map(|it| it.file.as_str()).collect();
-        self.gate(&files.join(";"), 1, &files)?;
+        self.gate(&files.join(";"), 1, &files, stats)?;
         self.check_malformed(&files)?;
         let mut entries = Vec::with_capacity(items.len());
         for it in items {
@@ -293,12 +298,111 @@ impl Llm for MockLlm {
         Ok(parse_lot(&reply, items)?.into_results())
     }
 
-    fn ask(&self, _question: &str, _context: &str) -> Result<AskReply> {
-        self.begin_call("_ask", 1)?;
+    fn ask_stats(&self, stats: &CallStats) -> Result<AskReply> {
+        self.begin_call("_ask", 1, stats)?;
+        stats.record_response(None);
         self.check_malformed(&["_ask"])?;
         match self.read_fixture("_ask.json")? {
             Some(j) => AskReply::parse(&j),
             None => Ok(AskReply::NotFound),
         }
+    }
+}
+
+impl Llm for MockLlm {
+    fn enrich(
+        &self,
+        file: &str,
+        call: usize,
+        _text: &str,
+        _requested: &[String],
+        known: &[String],
+    ) -> Result<Enrichment> {
+        self.enrich_stats(file, call, known, &CallStats::default())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enrich_labeled(
+        &self,
+        _label: &str,
+        file: &str,
+        call: usize,
+        _text: &str,
+        _requested: &[String],
+        known: &[String],
+        _stop: &std::sync::atomic::AtomicBool,
+        stats: &CallStats,
+    ) -> Result<Enrichment> {
+        self.enrich_stats(file, call, known, stats)
+    }
+
+    fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+        self.enrich_lot_stats(items, &CallStats::default())
+    }
+
+    fn enrich_lot_labeled(
+        &self,
+        _label: &str,
+        items: &[LotItem],
+        _stop: &std::sync::atomic::AtomicBool,
+        stats: &CallStats,
+    ) -> Result<Vec<(String, Result<Enrichment>)>> {
+        self.enrich_lot_stats(items, stats)
+    }
+
+    fn ask(&self, _question: &str, _context: &str) -> Result<AskReply> {
+        self.ask_stats(&CallStats::default())
+    }
+
+    fn ask_with(&self, _question: &str, _context: &str, stats: &CallStats) -> Result<AskReply> {
+        self.ask_stats(stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn mock(fail_after: Option<usize>) -> MockLlm {
+        MockLlm::new(MockOptions {
+            fail_after,
+            ..MockOptions::default()
+        })
+    }
+
+    #[test]
+    fn req165_ac7_successful_mock_calls_have_one_send_a_response_and_no_usage() {
+        let m = mock(None);
+        let s = CallStats::default();
+        m.enrich_labeled("l", "A.java", 1, "t", &[], &[], &AtomicBool::new(false), &s)
+            .unwrap();
+        assert_eq!((s.sends(), s.responded(), s.usage()), (1, true, None));
+
+        let s = CallStats::default();
+        let items = [LotItem {
+            file: "A.java".into(),
+            text: "t".into(),
+            node_ids: vec![],
+        }];
+        let r = m.enrich_lot_labeled("l", &items, &AtomicBool::new(false), &s);
+        assert!(r.is_ok());
+        assert_eq!((s.sends(), s.responded(), s.usage()), (1, true, None));
+
+        let s = CallStats::default();
+        m.ask_with("q", "c", &s).unwrap();
+        assert_eq!((s.sends(), s.responded(), s.usage()), (1, true, None));
+    }
+
+    #[test]
+    fn req165_ac7_fail_after_zero_has_one_send_and_no_response() {
+        let m = mock(Some(0));
+        let s = CallStats::default();
+        let r = m.enrich_labeled("l", "A.java", 1, "t", &[], &[], &AtomicBool::new(false), &s);
+        assert!(matches!(r, Err(Error::Network(_))));
+        assert_eq!((s.sends(), s.responded()), (1, false));
+        let s = CallStats::default();
+        assert!(m.ask_with("q", "c", &s).is_err());
+        assert_eq!((s.sends(), s.responded()), (1, false));
     }
 }

@@ -8,6 +8,8 @@ pub use http::{Retry, Tls};
 pub mod mock;
 pub mod openai;
 pub mod retry;
+mod usage;
+pub use usage::{anthropic_usage, openai_usage, CallStats, Usage};
 
 use std::sync::atomic::AtomicBool;
 
@@ -60,8 +62,9 @@ pub trait Llm: Send + Sync {
         requested: &[String],
         known: &[String],
         stop: &AtomicBool,
+        stats: &CallStats,
     ) -> Result<Enrichment> {
-        let _ = (label, stop);
+        let _ = (label, stop, stats);
         self.enrich(file, call, text, requested, known)
     }
     /// Enrichit un lot de 2 fichiers ou plus en un seul appel (schéma version 3, DEC-033).
@@ -73,12 +76,18 @@ pub trait Llm: Send + Sync {
         label: &str,
         items: &[LotItem],
         stop: &AtomicBool,
+        stats: &CallStats,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        let _ = (label, stop);
+        let _ = (label, stop, stats);
         self.enrich_lot(items)
     }
     /// Répond à une question à partir d'un contexte de graphe.
     fn ask(&self, question: &str, context: &str) -> Result<AskReply>;
+    /// Comme `ask`, en relevant l'appel dans `stats`. Par défaut, le relevé est ignoré.
+    fn ask_with(&self, question: &str, context: &str, stats: &CallStats) -> Result<AskReply> {
+        let _ = stats;
+        self.ask(question, context)
+    }
 }
 
 /// Appel de complétion d'un adaptateur HTTP : le reste de `Llm` s'en déduit (REQ-127).
@@ -88,6 +97,7 @@ pub(crate) trait Complete: Send + Sync {
         &self,
         label: Option<&str>,
         stop: Option<&AtomicBool>,
+        stats: &CallStats,
         system: String,
         user: String,
     ) -> Result<String>;
@@ -105,6 +115,7 @@ impl<T: Complete> Llm for T {
         let out = self.complete(
             None,
             None,
+            &CallStats::default(),
             enrichment_system_prompt(),
             enrichment_user_prompt(file, call, text, requested),
         )?;
@@ -121,10 +132,12 @@ impl<T: Complete> Llm for T {
         requested: &[String],
         known: &[String],
         stop: &AtomicBool,
+        stats: &CallStats,
     ) -> Result<Enrichment> {
         let out = self.complete(
             Some(label),
             Some(stop),
+            stats,
             enrichment_system_prompt(),
             enrichment_user_prompt(file, call, text, requested),
         )?;
@@ -132,7 +145,13 @@ impl<T: Complete> Llm for T {
     }
 
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
-        let out = self.complete(None, None, lot_system_prompt(), lot_user_prompt(items))?;
+        let out = self.complete(
+            None,
+            None,
+            &CallStats::default(),
+            lot_system_prompt(),
+            lot_user_prompt(items),
+        )?;
         Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
     }
 
@@ -141,10 +160,12 @@ impl<T: Complete> Llm for T {
         label: &str,
         items: &[LotItem],
         stop: &AtomicBool,
+        stats: &CallStats,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
         let out = self.complete(
             Some(label),
             Some(stop),
+            stats,
             lot_system_prompt(),
             lot_user_prompt(items),
         )?;
@@ -152,9 +173,14 @@ impl<T: Complete> Llm for T {
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
+        self.ask_with(question, context, &CallStats::default())
+    }
+
+    fn ask_with(&self, question: &str, context: &str, stats: &CallStats) -> Result<AskReply> {
         let out = self.complete(
             None,
             None,
+            stats,
             ask_system_prompt(),
             ask_user_prompt(question, context),
         )?;
@@ -193,9 +219,10 @@ impl Llm for WithModel {
         requested: &[String],
         known: &[String],
         stop: &AtomicBool,
+        stats: &CallStats,
     ) -> Result<Enrichment> {
         self.inner
-            .enrich_labeled(label, file, call, text, requested, known, stop)
+            .enrich_labeled(label, file, call, text, requested, known, stop, stats)
     }
 
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
@@ -207,12 +234,17 @@ impl Llm for WithModel {
         label: &str,
         items: &[LotItem],
         stop: &AtomicBool,
+        stats: &CallStats,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        self.inner.enrich_lot_labeled(label, items, stop)
+        self.inner.enrich_lot_labeled(label, items, stop, stats)
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
         self.inner.ask(question, context)
+    }
+
+    fn ask_with(&self, question: &str, context: &str, stats: &CallStats) -> Result<AskReply> {
+        self.inner.ask_with(question, context, stats)
     }
 }
 

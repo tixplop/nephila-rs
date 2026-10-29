@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::chunk;
 use crate::error::{warn, Error, Result, TRUNCATED};
 use crate::index::build::{BuildReport, IndexOptions};
-use crate::llm::{with_format_retries, Enrichment, Llm, LotItem};
+use crate::llm::{with_format_retries, CallStats, Enrichment, Llm, LotItem};
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
 use crate::parse::markdown;
 use crate::progress::{self, Phase};
@@ -418,7 +418,16 @@ fn traced_enrich(
 ) -> Result<Enrichment> {
     if !trace::enabled() {
         let label = format!("{path} [{index}/{total}]");
-        return llm.enrich_labeled(&label, path, index, text, requested, known, stop);
+        return llm.enrich_labeled(
+            &label,
+            path,
+            index,
+            text,
+            requested,
+            known,
+            stop,
+            &CallStats::default(),
+        );
     }
     trace!(
         "llm enrich départ {path} [{index}/{total}] {} car.{}",
@@ -427,7 +436,16 @@ fn traced_enrich(
     );
     let started = Instant::now();
     let label = format!("{path} [{index}/{total}]");
-    let result = llm.enrich_labeled(&label, path, index, text, requested, known, stop);
+    let result = llm.enrich_labeled(
+        &label,
+        path,
+        index,
+        text,
+        requested,
+        known,
+        stop,
+        &CallStats::default(),
+    );
     let ms = started.elapsed().as_millis();
     match &result {
         Ok(x) => trace!(
@@ -465,7 +483,12 @@ fn traced_lot_once(
 ) -> Result<Vec<(String, Result<Enrichment>)>> {
     let label = format!("lot {} +{}", items[0].file, items.len() - 1);
     if !trace::enabled() {
-        return llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop);
+        return llm.enrich_lot_labeled(
+            &format!("{label} [1/1]"),
+            items,
+            stop,
+            &CallStats::default(),
+        );
     }
     trace!(
         "llm enrich départ {label} [1/1] {} car.{}",
@@ -473,7 +496,12 @@ fn traced_lot_once(
         attempt.mark()
     );
     let started = Instant::now();
-    let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop);
+    let result = llm.enrich_lot_labeled(
+        &format!("{label} [1/1]"),
+        items,
+        stop,
+        &CallStats::default(),
+    );
     let ms = started.elapsed().as_millis();
     match &result {
         Ok(results) => {

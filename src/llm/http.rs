@@ -11,6 +11,7 @@ use rustls::crypto::{ring, CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 
+use super::usage::CallStats;
 use crate::error::{Error, Result};
 
 /// Réglages TLS d'un fournisseur (REQ-036).
@@ -221,7 +222,7 @@ enum Attempt {
 /// 400/404/413/422 -> `Rejected` (jamais retentée), autres échecs -> `Network`. Retourne le corps de la réponse. `label` nomme l'appel dans la
 /// trace d'attente (`<chemin> [i/n]`) ; `None` (`query ask`) : aucune ligne d'attente. `stop` :
 /// arrêt de l'envoi (REQ-095) ; posé, l'attente s'interrompt, aucun nouvel envoi n'a lieu et
-/// l'erreur du dernier envoi est rendue.
+/// l'erreur du dernier envoi est rendue. `stats` compte chaque envoi réel (REQ-165).
 pub fn send(
     provider: &str,
     req: ureq::Request,
@@ -229,10 +230,12 @@ pub fn send(
     retry: &Retry,
     label: Option<&str>,
     stop: Option<&AtomicBool>,
+    stats: &CallStats,
 ) -> Result<String> {
     let mut k = 0;
     let mut definitive = false;
     loop {
+        stats.add_send();
         match attempt(provider, req.clone(), body) {
             Attempt::Done(r) => return r,
             Attempt::Retry { error, .. } if definitive => return Err(error),
@@ -802,6 +805,7 @@ mod tests {
                 &Retry::default(),
                 None,
                 Some(&stop),
+                &CallStats::default(),
             );
             assert!(t.elapsed() < Duration::from_secs(2));
             assert!(matches!(r, Err(Error::Network(_))), "{r:?}");
@@ -943,7 +947,16 @@ mod tests {
                         let body = serde_json::json!({});
                         for round in 0..2 {
                             let req = agent.post(url);
-                            send("test", req, Some(&body), retry, None, None).unwrap();
+                            send(
+                                "test",
+                                req,
+                                Some(&body),
+                                retry,
+                                None,
+                                None,
+                                &CallStats::default(),
+                            )
+                            .unwrap();
                             if round == 0 {
                                 barrier.wait();
                             }
@@ -962,6 +975,52 @@ mod tests {
         #[test]
         fn req053_ac3_idle_pool_keeps_one_tls_connection_per_thread() {
             assert_eq!(connections_for(true), THREADS);
+        }
+    }
+
+    mod counted_sends {
+        use super::*;
+        use crate::llm::usage::fake_server;
+
+        fn run(replies: Vec<(u16, String)>) -> (Result<String>, u32) {
+            let base = fake_server(replies);
+            let agent = agent(10, 1, &Tls::default());
+            let stats = CallStats::default();
+            let r = send(
+                "test",
+                agent.post(&format!("{base}/x")),
+                Some(&serde_json::json!({})),
+                &Retry::from_millis(1),
+                None,
+                None,
+                &stats,
+            );
+            (r, stats.sends())
+        }
+
+        #[test]
+        fn req165_ac5_every_attempt_is_counted() {
+            let (r, n) = run(vec![
+                (503, "{}".into()),
+                (503, "{}".into()),
+                (200, "{}".into()),
+            ]);
+            assert!(r.is_ok(), "{r:?}");
+            assert_eq!(n, 3);
+        }
+
+        #[test]
+        fn req165_ac5_a_refused_key_is_one_send() {
+            let (r, n) = run(vec![(401, "{}".into())]);
+            assert!(matches!(r, Err(Error::InvalidKey(_))), "{r:?}");
+            assert_eq!(n, 1);
+        }
+
+        #[test]
+        fn req165_ac5_exhausted_retries_count_five_sends() {
+            let (r, n) = run(vec![(500, "{}".into())]);
+            assert!(r.is_err());
+            assert_eq!(n, 5);
         }
     }
 }

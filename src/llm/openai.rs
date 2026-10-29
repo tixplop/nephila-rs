@@ -1,6 +1,6 @@
 //! Adaptateur compatible OpenAI Chat Completions (REQ-002) : OpenAI, Ollama, llama.cpp, vLLM.
 
-use super::{http, Complete, Generation, Retry, Tls};
+use super::{http, openai_usage, CallStats, Complete, Generation, Retry, Tls};
 use crate::config::Effort;
 use crate::error::{Error, Result, TRUNCATED};
 use std::sync::atomic::AtomicBool;
@@ -76,6 +76,7 @@ impl Complete for OpenAiLlm {
         &self,
         label: Option<&str>,
         stop: Option<&AtomicBool>,
+        stats: &CallStats,
         system: String,
         user: String,
     ) -> Result<String> {
@@ -87,8 +88,10 @@ impl Complete for OpenAiLlm {
             &self.retry,
             label,
             stop,
+            stats,
         )?;
         let v = http::parse_body("openai", &raw)?;
+        stats.record_response(openai_usage(&v));
         if v["choices"][0]["finish_reason"] == "length" {
             return Err(Error::Truncated(TRUNCATED.into()));
         }
@@ -159,5 +162,108 @@ mod tests {
         assert_eq!(b["reasoning_effort"], "medium");
         assert_eq!(b["max_completion_tokens"], 16384);
         assert!(b.get("max_tokens").is_none());
+    }
+
+    use crate::llm::usage::{fake_server, openai_usage, CallStats, Usage};
+    use serde_json::json;
+
+    fn ou(u: serde_json::Value) -> Option<Usage> {
+        openai_usage(&json!({ "usage": u }))
+    }
+
+    #[test]
+    fn req165_ac2_openai_usage_is_normalized() {
+        let full = ou(json!({"prompt_tokens":100,"completion_tokens":20,
+            "prompt_tokens_details":{"cached_tokens":64},
+            "completion_tokens_details":{"reasoning_tokens":8}}));
+        assert_eq!(
+            full,
+            Some(Usage {
+                input: 100,
+                cache_read: 64,
+                cache_write: 0,
+                output: 20,
+                reasoning: Some(8)
+            })
+        );
+        let plain = Some(Usage {
+            input: 100,
+            cache_read: 0,
+            cache_write: 0,
+            output: 20,
+            reasoning: None,
+        });
+        assert_eq!(
+            ou(json!({"prompt_tokens":100,"completion_tokens":20})),
+            plain
+        );
+        assert_eq!(
+            ou(json!({"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":null})),
+            plain
+        );
+        assert_eq!(
+            ou(json!({"prompt_tokens":100,"completion_tokens":20,
+                "completion_tokens_details":{"reasoning_tokens":null}})),
+            plain
+        );
+    }
+
+    #[test]
+    fn req165_ac2_openai_usage_missing_or_invalid_gives_none() {
+        assert_eq!(openai_usage(&json!({})), None);
+        assert_eq!(openai_usage(&json!({"usage": null})), None);
+        assert_eq!(ou(json!({"prompt_tokens":100})), None);
+        assert_eq!(
+            ou(json!({"prompt_tokens":"100","completion_tokens":20})),
+            None
+        );
+        assert_eq!(ou(json!({"prompt_tokens":-1,"completion_tokens":20})), None);
+    }
+
+    #[test]
+    fn req165_ac3_truncated_and_messageless_answers_are_still_measured() {
+        let usage = r#""usage":{"prompt_tokens":10,"completion_tokens":3}"#;
+        let want = Usage {
+            input: 10,
+            cache_read: 0,
+            cache_write: 0,
+            output: 3,
+            reasoning: None,
+        };
+        let cases = [
+            (
+                format!(
+                    r#"{{"choices":[{{"finish_reason":"length","message":{{"content":"x"}}}}],{usage}}}"#
+                ),
+                true,
+            ),
+            (format!(r#"{{"choices":[],{usage}}}"#), false),
+        ];
+        for (body, truncated) in cases {
+            let l = OpenAiLlm::new(
+                Some(fake_server(vec![(200, body)])),
+                "m".into(),
+                None,
+                10,
+                &Tls::default(),
+                1,
+                gen(false, Effort::Low, false, 100),
+            );
+            let stats = CallStats::default();
+            let e = l
+                .complete(None, None, &stats, "s".into(), "u".into())
+                .unwrap_err();
+            if truncated {
+                assert!(matches!(&e, Error::Truncated(m) if m == TRUNCATED), "{e:?}");
+            } else {
+                assert!(
+                    matches!(&e, Error::Format(m) if m == "réponse de openai sans message"),
+                    "{e:?}"
+                );
+            }
+            assert!(stats.responded());
+            assert_eq!(stats.usage(), Some(want));
+            assert_eq!(stats.sends(), 1);
+        }
     }
 }

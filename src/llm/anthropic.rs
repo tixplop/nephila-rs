@@ -1,6 +1,6 @@
 //! Adaptateur Anthropic Messages (REQ-002).
 
-use super::{http, Complete, Generation, Retry, Tls};
+use super::{anthropic_usage, http, CallStats, Complete, Generation, Retry, Tls};
 use crate::config::Effort;
 use crate::error::{Error, Result, TRUNCATED};
 use std::sync::atomic::AtomicBool;
@@ -128,6 +128,7 @@ impl Complete for AnthropicLlm {
         &self,
         label: Option<&str>,
         stop: Option<&AtomicBool>,
+        stats: &CallStats,
         system: String,
         user: String,
     ) -> Result<String> {
@@ -139,8 +140,10 @@ impl Complete for AnthropicLlm {
             &self.retry,
             label,
             stop,
+            stats,
         )?;
         let v = http::parse_body("anthropic", &raw)?;
+        stats.record_response(anthropic_usage(&v));
         if v["stop_reason"] == "max_tokens" {
             return Err(Error::Truncated(TRUNCATED.into()));
         }
@@ -283,6 +286,118 @@ mod tests {
         ];
         for m in current {
             assert!(!is_legacy_claude(m), "{m:?} ne devrait pas etre ancien");
+        }
+    }
+
+    use crate::llm::usage::{anthropic_usage, fake_server, CallStats, Usage};
+    use serde_json::json;
+
+    fn au(u: serde_json::Value) -> Option<Usage> {
+        anthropic_usage(&json!({ "usage": u }))
+    }
+
+    #[test]
+    fn req165_ac1_anthropic_usage_is_normalized() {
+        let full = au(json!({"input_tokens":100,"output_tokens":20,
+            "cache_read_input_tokens":30,"cache_creation_input_tokens":5}));
+        assert_eq!(
+            full,
+            Some(Usage {
+                input: 135,
+                cache_read: 30,
+                cache_write: 5,
+                output: 20,
+                reasoning: None
+            })
+        );
+        let plain = au(json!({"input_tokens":100,"output_tokens":20}));
+        assert_eq!(
+            plain,
+            Some(Usage {
+                input: 100,
+                cache_read: 0,
+                cache_write: 0,
+                output: 20,
+                reasoning: None
+            })
+        );
+        let null =
+            au(json!({"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":null}));
+        assert_eq!(null, plain);
+        let text =
+            au(json!({"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":"5"}));
+        assert_eq!(text, plain);
+    }
+
+    #[test]
+    fn req165_ac1_anthropic_usage_missing_or_invalid_gives_none() {
+        assert_eq!(anthropic_usage(&json!({})), None);
+        assert_eq!(anthropic_usage(&json!({"usage": null})), None);
+        assert_eq!(au(json!({"output_tokens":20})), None);
+        for bad in [json!("100"), json!(-1), json!(1.5)] {
+            assert_eq!(
+                au(json!({"input_tokens":bad,"output_tokens":20})),
+                None,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn req165_ac1_anthropic_sums_saturate() {
+        let u = au(json!({"input_tokens":u64::MAX,"output_tokens":1,"cache_read_input_tokens":5}));
+        assert_eq!(u.unwrap().input, u64::MAX);
+    }
+
+    fn llm(base: String) -> AnthropicLlm {
+        AnthropicLlm::new(
+            Some(base),
+            "m".into(),
+            "k".into(),
+            10,
+            &Tls::default(),
+            1,
+            gen(false, Effort::Low, 100),
+        )
+    }
+
+    #[test]
+    fn req165_ac3_truncated_and_textless_answers_are_still_measured() {
+        let usage = r#""usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":4}"#;
+        let want = Usage {
+            input: 14,
+            cache_read: 4,
+            cache_write: 0,
+            output: 3,
+            reasoning: None,
+        };
+        let cases = [
+            (
+                format!(r#"{{"stop_reason":"max_tokens","content":[],{usage}}}"#),
+                true,
+            ),
+            (
+                format!(r#"{{"stop_reason":"end_turn","content":[],{usage}}}"#),
+                false,
+            ),
+        ];
+        for (body, truncated) in cases {
+            let l = llm(fake_server(vec![(200, body)]));
+            let stats = CallStats::default();
+            let e = l
+                .complete(None, None, &stats, "s".into(), "u".into())
+                .unwrap_err();
+            if truncated {
+                assert!(matches!(&e, Error::Truncated(m) if m == TRUNCATED), "{e:?}");
+            } else {
+                assert!(
+                    matches!(&e, Error::Format(m) if m == "réponse de anthropic sans bloc texte"),
+                    "{e:?}"
+                );
+            }
+            assert!(stats.responded());
+            assert_eq!(stats.usage(), Some(want));
+            assert_eq!(stats.sends(), 1);
         }
     }
 }
