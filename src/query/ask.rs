@@ -20,12 +20,32 @@ use crate::llm::{build_llm, with_format_retries, AskReply, Llm};
 use crate::model::{Edge, Node};
 use crate::store::Store;
 
-/// Nombre maximal de nœuds trouvés par les mots de la question.
-const MAX_SEEDS: usize = 20;
-/// Nombre maximal de nœuds (trouvés + voisins) décrits dans le contexte.
-const MAX_NODES: usize = 60;
-/// Taille maximale du contexte, en caractères.
-const MAX_CONTEXT_CHARS: usize = 12_000;
+/// Nombre maximal de nœuds trouvés par les mots de la question, par défaut.
+pub const DEFAULT_ASK_MAX_SEEDS: usize = 20;
+/// Nombre maximal de nœuds (trouvés + voisins) décrits dans le contexte, par défaut.
+pub const DEFAULT_ASK_MAX_NODES: usize = 60;
+/// Taille maximale du contexte, en caractères, par défaut.
+pub const DEFAULT_ASK_MAX_CONTEXT_CHARS: usize = 12_000;
+/// Taille minimale admise pour le contexte, en caractères.
+pub const ASK_MIN_CONTEXT_CHARS: usize = 1000;
+
+/// Bornes du contexte de `query ask` (REQ-163).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AskLimits {
+    pub max_context_chars: usize,
+    pub max_seeds: usize,
+    pub max_nodes: usize,
+}
+
+impl Default for AskLimits {
+    fn default() -> Self {
+        AskLimits {
+            max_context_chars: DEFAULT_ASK_MAX_CONTEXT_CHARS,
+            max_seeds: DEFAULT_ASK_MAX_SEEDS,
+            max_nodes: DEFAULT_ASK_MAX_NODES,
+        }
+    }
+}
 /// Longueur minimale d'un mot de la question pour être cherché.
 const MIN_WORD_CHARS: usize = 3;
 
@@ -152,13 +172,14 @@ fn word_class(cited: bool, rank: u8) -> u8 {
 }
 
 /// Nœuds de départ : les nœuds qui correspondent à au moins un terme (noms qualifiés cités puis
-/// mots-clés, ceux qui sont des identifiants cités avant les autres), triés par leur meilleure clé, puis nom qualifié et identifiant ; les 20 premiers.
+/// mots-clés, ceux qui sont des identifiants cités avant les autres), triés par leur meilleure clé, puis nom qualifié et identifiant ; les `min(max_seeds, max_nodes)` premiers.
 /// La recherche travaille sur des références ; seuls les nœuds retenus sont copiés.
 fn find_seeds(
     nodes: &[Node],
     qualified: &[String],
     words: &[String],
     cited: &HashSet<String>,
+    limits: &AskLimits,
 ) -> Vec<Node> {
     let prepared = search::Prepared::new(nodes);
     let mut best: Vec<Option<SeedKey>> = vec![None; nodes.len()];
@@ -202,7 +223,7 @@ fn find_seeds(
     let mut seen = HashSet::new();
     hit.into_iter()
         .filter(|&(_, i)| seen.insert(nodes[i].id.as_str()))
-        .take(MAX_SEEDS)
+        .take(limits.max_seeds.min(limits.max_nodes))
         .map(|(_, i)| nodes[i].clone())
         .collect()
 }
@@ -218,6 +239,7 @@ fn node_line(n: &Node) -> String {
 
 /// Remplissage du contexte : lignes de nœuds et de liens écrites, et place restante (REQ-142).
 struct Fill<'a> {
+    max_chars: usize,
     nodes_text: String,
     links_text: String,
     written: HashSet<&'a str>,
@@ -238,7 +260,7 @@ impl<'a> Fill<'a> {
             .flatten()
             .map(|t| t.chars().count())
             .sum();
-        if self.used + cost > MAX_CONTEXT_CHARS {
+        if self.used + cost > self.max_chars {
             return false;
         }
         self.used += cost;
@@ -267,7 +289,12 @@ struct Context<'a> {
 /// dans l'ordre ; extrémités des liens comprises) : les citations de la réponse sont résolues
 /// parmi eux (REQ-161, DEC-130). Le premier nœud de départ coupé n'est montré que si sa ligne
 /// coupée contient encore `- <identifiant> :`.
-fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) -> Context<'a> {
+fn build_context<'a>(
+    nodes: &'a [Node],
+    edges: &'a [Edge],
+    seeds: &'a [Node],
+    limits: &AskLimits,
+) -> Context<'a> {
     const NODES_HEADER: &str = "Nœuds :\n";
     const LINKS_HEADER: &str = "Liens :\n";
     let header_chars = NODES_HEADER.chars().count() + LINKS_HEADER.chars().count();
@@ -283,8 +310,9 @@ fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) ->
             adjacent.entry(e.target.as_str()).or_default().push(e);
         }
     }
-    let neighbour_cap = MAX_NODES.saturating_sub(seed_ids.len());
+    let neighbour_cap = limits.max_nodes.saturating_sub(seed_ids.len());
     let mut fill = Fill {
+        max_chars: limits.max_context_chars,
         nodes_text: String::new(),
         links_text: String::new(),
         written: HashSet::new(),
@@ -297,7 +325,7 @@ fn build_context<'a>(nodes: &'a [Node], edges: &'a [Edge], seeds: &'a [Node]) ->
         if !fill.written.contains(s.id.as_str()) && !fill.push(Some(s), None) {
             if rank == 0 {
                 // Seule coupe dans une ligne : celle du premier nœud de départ, seul.
-                let room = MAX_CONTEXT_CHARS - header_chars - 1;
+                let room = limits.max_context_chars.saturating_sub(header_chars + 1);
                 let cut: String = node_line(s).chars().take(room).collect();
                 if cut.starts_with(&format!("- {} :", s.id)) {
                     fill.shown.push(s);
@@ -364,6 +392,7 @@ pub fn answer(
     llm: &dyn Llm,
     question: &str,
     format_retries: u32,
+    limits: &AskLimits,
 ) -> Result<(String, Vec<Node>)> {
     let nodes = store.nodes()?;
     let seeds = find_seeds(
@@ -371,12 +400,13 @@ pub fn answer(
         &qualified_terms(question),
         &keywords(question),
         &cited_identifiers(question),
+        limits,
     );
     if seeds.is_empty() {
         return Err(not_found());
     }
     let edges = store.edges()?;
-    let context = build_context(&nodes, &edges, &seeds);
+    let context = build_context(&nodes, &edges, &seeds, limits);
     let stop = AtomicBool::new(false);
     let reply = with_format_retries(format_retries, &stop, |_| llm.ask(question, &context.text))
         .map_err(|e| match e {
@@ -430,7 +460,13 @@ pub fn run(
     let (config, _) = config.with_project(&project.settings, None, format_retries);
     let llm = build_llm(&config)?;
     let store = super::open(repo, check_stale)?;
-    let (answer, cited) = answer(&store, llm.as_ref(), question, config.format_retries)?;
+    let (answer, cited) = answer(
+        &store,
+        llm.as_ref(),
+        question,
+        config.format_retries,
+        &AskLimits::default(),
+    )?;
     if cited.is_empty() {
         crate::error::warn(UNVERIFIABLE);
     }
@@ -467,7 +503,7 @@ mod tests {
                 }
             }
         }
-        seeds.truncate(MAX_SEEDS);
+        seeds.truncate(DEFAULT_ASK_MAX_SEEDS);
         seeds
     }
 
@@ -509,6 +545,7 @@ mod tests {
             &qualified_terms(question),
             &keywords(question),
             &cited_identifiers(question),
+            &AskLimits::default(),
         )
         .into_iter()
         .map(|n| n.id)
@@ -617,10 +654,16 @@ mod tests {
             mk(NodeKind::Document, "docs/README.md#usage", None),
         ];
         let ids = |term: &str| -> Vec<String> {
-            find_seeds(&nodes, &[term.to_string()], &[], &HashSet::new())
-                .into_iter()
-                .map(|n| n.qualified)
-                .collect()
+            find_seeds(
+                &nodes,
+                &[term.to_string()],
+                &[],
+                &HashSet::new(),
+                &AskLimits::default(),
+            )
+            .into_iter()
+            .map(|n| n.qualified)
+            .collect()
         };
         let mut got = ids("codewriter.suggestedimports");
         got.sort();
@@ -636,7 +679,7 @@ mod tests {
 
     fn seeds_of(nodes: &[Node], words: &[&str]) -> Vec<String> {
         let w: Vec<String> = words.iter().map(|s| s.to_string()).collect();
-        find_seeds(nodes, &[], &w, &HashSet::new())
+        find_seeds(nodes, &[], &w, &HashSet::new(), &AskLimits::default())
             .into_iter()
             .map(|n| n.qualified)
             .collect()
@@ -669,6 +712,7 @@ mod tests {
             &["bar.baz".to_string()],
             &["foo".to_string()],
             &HashSet::new(),
+            &AskLimits::default(),
         )
         .into_iter()
         .map(|n| n.qualified)
@@ -734,7 +778,7 @@ mod tests {
         let w = |ws: &[&str]| -> Vec<String> { ws.iter().map(|s| s.to_string()).collect() };
         let seeds =
             |nodes: &[Node], quals: &[String], ws: &[&str], cited: &[&str]| -> Vec<String> {
-                find_seeds(nodes, quals, &w(ws), &set(cited))
+                find_seeds(nodes, quals, &w(ws), &set(cited), &AskLimits::default())
                     .into_iter()
                     .map(|n| n.qualified)
                     .collect()
@@ -830,7 +874,7 @@ mod tests {
         keyed
             .into_iter()
             .filter(|(_, n)| seen.insert(n.id.clone()))
-            .take(MAX_SEEDS)
+            .take(DEFAULT_ASK_MAX_SEEDS)
             .map(|(_, n)| n.id.clone())
             .collect()
     }
@@ -859,11 +903,12 @@ mod tests {
             let cited: HashSet<String> =
                 words.iter().filter(|_| rng.next(2) == 0).cloned().collect();
             let want = naive_seeds(&nodes, &quals, &words, &cited);
-            capped |= want.len() == MAX_SEEDS;
-            let got: Vec<String> = find_seeds(&nodes, &quals, &words, &cited)
-                .into_iter()
-                .map(|n| n.id)
-                .collect();
+            capped |= want.len() == DEFAULT_ASK_MAX_SEEDS;
+            let got: Vec<String> =
+                find_seeds(&nodes, &quals, &words, &cited, &AskLimits::default())
+                    .into_iter()
+                    .map(|n| n.id)
+                    .collect();
             assert_eq!(want, got, "noms {quals:?} mots {words:?}");
         }
         assert!(capped, "le plafond de 20 nœuds n'est jamais atteint");
@@ -877,12 +922,12 @@ mod tests {
             let nodes = random_nodes(&mut rng);
             let words = random_words(&mut rng)[..1].to_vec();
             let old = legacy_find_seeds(&nodes, &words);
-            truncated |= old.len() == MAX_SEEDS;
+            truncated |= old.len() == DEFAULT_ASK_MAX_SEEDS;
             let cited: HashSet<String> =
                 words.iter().filter(|_| rng.next(2) == 0).cloned().collect();
             assert_eq!(
                 old,
-                find_seeds(&nodes, &[], &words, &cited),
+                find_seeds(&nodes, &[], &words, &cited, &AskLimits::default()),
                 "mots {words:?}"
             );
         }
@@ -926,15 +971,21 @@ mod tests {
             nodes.push(m);
         }
         edges.push(edge(&user, &late, Imports));
-        let ctx = build_context(&nodes, &edges, &[late.clone(), big.clone()]).text;
+        let ctx = build_context(
+            &nodes,
+            &edges,
+            &[late.clone(), big.clone()],
+            &AskLimits::default(),
+        )
+        .text;
         assert!(ctx.contains(&node_line(&user)), "{ctx}");
         assert!(
             ctx.contains("\n- type:z.User -imports-> type:z.Late\n"),
             "{ctx}"
         );
-        assert!(ctx.chars().count() <= MAX_CONTEXT_CHARS);
+        assert!(ctx.chars().count() <= DEFAULT_ASK_MAX_CONTEXT_CHARS);
         let (n, _) = sections(&ctx);
-        assert!(n.len() <= MAX_NODES, "{}", n.len());
+        assert!(n.len() <= DEFAULT_ASK_MAX_NODES, "{}", n.len());
     }
 
     #[test]
@@ -957,8 +1008,8 @@ mod tests {
             seeds.push(s.clone());
             nodes.push(s);
         }
-        let ctx = build_context(&nodes, &edges, &seeds).text;
-        assert!(ctx.chars().count() <= MAX_CONTEXT_CHARS);
+        let ctx = build_context(&nodes, &edges, &seeds, &AskLimits::default()).text;
+        assert!(ctx.chars().count() <= DEFAULT_ASK_MAX_CONTEXT_CHARS);
         assert!(ctx.ends_with('\n'));
         assert_eq!(ctx.matches("Liens :\n").count(), 1);
         let valid_nodes: HashSet<String> = nodes.iter().map(node_line).collect();
@@ -996,7 +1047,7 @@ mod tests {
             s[1].clone(),
             s[0].clone(),
         ];
-        let ctx = build_context(&nodes, &edges, &s).text;
+        let ctx = build_context(&nodes, &edges, &s, &AskLimits::default()).text;
         let want: Vec<String> = [2, 4, 5, 1, 3, 0]
             .iter()
             .map(|&i| link_line(&edges[i]))
@@ -1024,7 +1075,7 @@ mod tests {
             edges.push(edge(&seeds[0], &v, Calls));
             nodes.push(v);
         }
-        let ctx = build_context(&nodes, &edges, &seeds).text;
+        let ctx = build_context(&nodes, &edges, &seeds, &AskLimits::default()).text;
         let (n, l) = sections(&ctx);
         assert_eq!(n.len(), 60);
         for s in &seeds {
@@ -1042,13 +1093,137 @@ mod tests {
         let s = mk(NodeKind::Type, "p.S", Some(&"é".repeat(20_000)));
         let v = mk(NodeKind::Method, "p.V", None);
         let edges = vec![edge(&s, &v, Calls)];
-        let ctx = build_context(&[s.clone(), v], &edges, std::slice::from_ref(&s)).text;
-        assert_eq!(ctx.chars().count(), MAX_CONTEXT_CHARS);
+        let ctx = build_context(
+            &[s.clone(), v],
+            &edges,
+            std::slice::from_ref(&s),
+            &AskLimits::default(),
+        )
+        .text;
+        assert_eq!(ctx.chars().count(), DEFAULT_ASK_MAX_CONTEXT_CHARS);
         assert!(
             ctx.starts_with(&format!("Nœuds :\n- {} : ", s.id)),
             "{}",
             &ctx[..80]
         );
+        assert!(ctx.ends_with("\nLiens :\n"));
+        assert_eq!(ctx.lines().count(), 3);
+    }
+
+    fn limits_chars(max_context_chars: usize) -> AskLimits {
+        AskLimits {
+            max_context_chars,
+            ..AskLimits::default()
+        }
+    }
+
+    #[test]
+    fn req163_ac1_context_chars_limit_is_a_parameter() {
+        use crate::model::EdgeKind::Contains;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut seeds = Vec::new();
+        for i in 0..20 {
+            let s = mk(NodeKind::Type, &format!("p.S{i}"), Some(&"s".repeat(500)));
+            for j in 0..30 {
+                let v = mk(
+                    NodeKind::Method,
+                    &format!("p.S{i}.v{j}"),
+                    Some(&"v".repeat(500)),
+                );
+                edges.push(edge(&s, &v, Contains));
+                nodes.push(v);
+            }
+            seeds.push(s.clone());
+            nodes.push(s);
+        }
+        let valid_nodes: HashSet<String> = nodes.iter().map(node_line).collect();
+        let valid_links: HashSet<String> = edges.iter().map(link_line).collect();
+        let at = |n: usize| build_context(&nodes, &edges, &seeds, &limits_chars(n)).text;
+        for (limit, min) in [(2000, 1500), (30_000, 12_001)] {
+            let ctx = at(limit);
+            let len = ctx.chars().count();
+            assert!(len <= limit && len >= min, "{limit} : {len}");
+            assert!(ctx.ends_with('\n'));
+            let (n, l) = sections(&ctx);
+            assert!(n.iter().all(|x| valid_nodes.contains(*x)));
+            assert!(l.iter().all(|x| valid_links.contains(*x)));
+            assert!(!l.is_empty());
+        }
+        let default = build_context(&nodes, &edges, &seeds, &AskLimits::default()).text;
+        assert_eq!(at(DEFAULT_ASK_MAX_CONTEXT_CHARS), default);
+        assert!(default.chars().count() <= DEFAULT_ASK_MAX_CONTEXT_CHARS);
+    }
+
+    fn cap_graph() -> (Vec<Node>, Vec<Edge>, Vec<Node>) {
+        use crate::model::EdgeKind::Calls;
+        let seeds: Vec<Node> = (0..20)
+            .map(|i| mk(NodeKind::Method, &format!("p.Seed{i:02}"), None))
+            .collect();
+        let mut nodes = seeds.clone();
+        let mut edges = Vec::new();
+        for i in 0..100 {
+            let v = mk(NodeKind::Method, &format!("p.V{i:03}"), None);
+            edges.push(edge(&seeds[0], &v, Calls));
+            nodes.push(v);
+        }
+        (nodes, edges, seeds)
+    }
+
+    #[test]
+    fn req163_ac2_max_nodes_and_max_seeds_are_parameters() {
+        let (nodes, edges, _) = cap_graph();
+        let run = |max_nodes: usize, max_seeds: usize| {
+            let limits = AskLimits {
+                max_nodes,
+                max_seeds,
+                ..AskLimits::default()
+            };
+            let seeds = find_seeds(&nodes, &[], &["seed".to_string()], &HashSet::new(), &limits);
+            let ctx = build_context(&nodes, &edges, &seeds, &limits).text;
+            let (n, l) = sections(&ctx);
+            (seeds.len(), n.len(), l.len())
+        };
+        assert_eq!(run(60, 20), (20, 60, 40));
+        assert_eq!(run(30, 20), (20, 30, 10));
+        assert_eq!(run(10, 20), (10, 10, 0));
+        assert_eq!(run(60, 5), (5, 60, 55));
+        let ids = |max_nodes: usize, max_seeds: usize| -> Vec<String> {
+            let limits = AskLimits {
+                max_nodes,
+                max_seeds,
+                ..AskLimits::default()
+            };
+            find_seeds(&nodes, &[], &["seed".to_string()], &HashSet::new(), &limits)
+                .into_iter()
+                .map(|n| n.id)
+                .collect()
+        };
+        let all = ids(60, 20);
+        assert_eq!(all.len(), 20);
+        assert_eq!(ids(10, 20), all[..10]);
+        assert_eq!(ids(60, 5), all[..5]);
+        // Une borne de contexte absurde ne fait pas paniquer.
+        let seeds = &nodes[..1];
+        let ctx = build_context(&nodes, &edges, seeds, &limits_chars(3)).text;
+        assert!(ctx.starts_with("Nœuds :\n"));
+    }
+
+    #[test]
+    fn req163_ac3_first_seed_line_is_cut_at_the_given_limit() {
+        use crate::model::EdgeKind::Calls;
+        let s = mk(NodeKind::Type, "p.S", Some(&"é".repeat(20_000)));
+        let v = mk(NodeKind::Method, "p.V", None);
+        let edges = vec![edge(&s, &v, Calls)];
+        let ctx = build_context(
+            &[s.clone(), v],
+            &edges,
+            std::slice::from_ref(&s),
+            &limits_chars(ASK_MIN_CONTEXT_CHARS),
+        )
+        .text;
+        assert_eq!(ctx.chars().count(), ASK_MIN_CONTEXT_CHARS);
+        assert!(ctx.starts_with(&format!("Nœuds :\n- {} : ", s.id)));
         assert!(ctx.ends_with("\nLiens :\n"));
         assert_eq!(ctx.lines().count(), 3);
     }
@@ -1074,7 +1249,13 @@ mod tests {
         let f = Node::new(NodeKind::Method, "p.A.f", "f", Some("p/A.java"), None, None);
         let g = Node::new(NodeKind::Method, "p.B.g", "g", Some("p/B.java"), None, None);
         let edges = vec![edge(&f, &g, Calls)];
-        let ctx = build_context(&[f.clone(), g], &edges, std::slice::from_ref(&f)).text;
+        let ctx = build_context(
+            &[f.clone(), g],
+            &edges,
+            std::slice::from_ref(&f),
+            &AskLimits::default(),
+        )
+        .text;
         assert!(
             ctx.lines()
                 .any(|l| l == "- method:p.A.f -calls-> method:p.B.g"),
@@ -1112,7 +1293,12 @@ mod tests {
         let x = mk(NodeKind::Method, "p.X.x", None);
         let nodes = vec![x.clone(), m.clone(), a.clone()];
         let edges = vec![edge(&a, &m, Contains), edge(&x, &m, Calls)];
-        let c = build_context(&nodes, &edges, std::slice::from_ref(&m));
+        let c = build_context(
+            &nodes,
+            &edges,
+            std::slice::from_ref(&m),
+            &AskLimits::default(),
+        );
         assert_eq!(shown_ids(&c), written_ids(&c.text));
         assert_eq!(shown_ids(&c).len(), 3);
         // Plusieurs nœuds de départ, contexte plein coupé en fin de ligne.
@@ -1133,7 +1319,7 @@ mod tests {
             seeds.push(s.clone());
             nodes.push(s);
         }
-        let c = build_context(&nodes, &edges, &seeds);
+        let c = build_context(&nodes, &edges, &seeds, &AskLimits::default());
         let shown = shown_ids(&c);
         assert_eq!(shown, written_ids(&c.text));
         assert!(shown.len() > 5);
@@ -1151,7 +1337,12 @@ mod tests {
     fn req161_ac1_cut_first_seed_is_shown_only_if_its_identifier_survives() {
         // Ligne coupée avec identifiant entier : montré.
         let s = mk(NodeKind::Type, "p.S", Some(&"é".repeat(20_000)));
-        let c = build_context(std::slice::from_ref(&s), &[], std::slice::from_ref(&s));
+        let c = build_context(
+            std::slice::from_ref(&s),
+            &[],
+            std::slice::from_ref(&s),
+            &AskLimits::default(),
+        );
         assert_eq!(shown_ids(&c), vec![s.id.clone()]);
         // Identifiant plus long que la place disponible : aucun nœud montré.
         let long = mk(NodeKind::Type, &format!("p.{}", "L".repeat(13_000)), None);
@@ -1159,11 +1350,12 @@ mod tests {
             std::slice::from_ref(&long),
             &[],
             std::slice::from_ref(&long),
+            &AskLimits::default(),
         );
         assert!(c.shown.is_empty());
-        assert_eq!(c.text.chars().count(), MAX_CONTEXT_CHARS);
+        assert_eq!(c.text.chars().count(), DEFAULT_ASK_MAX_CONTEXT_CHARS);
         // Identifiant entier mais sans le ` :` qui suit : aucun nœud montré.
-        let room = MAX_CONTEXT_CHARS - "Nœuds :\nLiens :\n".chars().count() - 1;
+        let room = DEFAULT_ASK_MAX_CONTEXT_CHARS - "Nœuds :\nLiens :\n".chars().count() - 1;
         let id_len = "type:".len();
         let name_len = room - "- ".len() - id_len;
         let edge_case = mk(NodeKind::Type, &"E".repeat(name_len), None);
@@ -1172,6 +1364,7 @@ mod tests {
             std::slice::from_ref(&edge_case),
             &[],
             std::slice::from_ref(&edge_case),
+            &AskLimits::default(),
         );
         assert!(c.shown.is_empty());
     }
