@@ -959,3 +959,190 @@ fn req042_ac22_valeurs_egales_au_plafond_et_sans_couleur() {
     assert!(!plain.stderr.contains(&0x1B));
     assert!(text(&plain.stderr).contains("valeur invalide `65`"));
 }
+
+// ---- T-248 : validation de `[ask]` dans `.nephila.toml` et portée (REQ-162, REQ-163) ----
+
+const ASK_KEYS: &str =
+    "model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes";
+
+/// (lignes TOML, fin du message après `<fichier> : `)
+fn ask_project_faults() -> Vec<(&'static str, String)> {
+    let inv =
+        |key: &str, v: &str, exp: &str| format!("clé `ask.{key}` : valeur invalide `{v}` ({exp})");
+    let unknown =
+        |k: &str| format!("clé inconnue `ask.{k}` (clés permises dans [ask] : {ASK_KEYS})");
+    let int = "entier strictement positif attendu";
+    vec![
+        (
+            "[ask]\nmodel = \"\"",
+            inv("model", "\"\"", "chaîne non vide attendue"),
+        ),
+        (
+            "[ask]\nthinking = \"oui\"",
+            inv("thinking", "\"oui\"", "booléen attendu, true ou false"),
+        ),
+        (
+            "[ask]\neffort = \"max\"",
+            inv(
+                "effort",
+                "\"max\"",
+                "\"low\", \"medium\", \"high\" ou \"default\" attendu",
+            ),
+        ),
+        (
+            "[ask]\nmax_output_tokens = 0",
+            inv("max_output_tokens", "0", &format!("{int}, au plus 16384")),
+        ),
+        (
+            "[ask]\nmax_output_tokens = 16385",
+            inv(
+                "max_output_tokens",
+                "16385",
+                &format!("{int}, au plus 16384"),
+            ),
+        ),
+        (
+            "[ask]\nmax_context_chars = 100001",
+            inv(
+                "max_context_chars",
+                "100001",
+                "entier d'au moins 1000 attendu, au plus 100000",
+            ),
+        ),
+        (
+            "[ask]\nmax_seeds = 101",
+            inv("max_seeds", "101", &format!("{int}, au plus 100")),
+        ),
+        (
+            "[ask]\nmax_nodes = 501",
+            inv("max_nodes", "501", &format!("{int}, au plus 500")),
+        ),
+        ("[ask]\nzz = 1", unknown("zz")),
+        (
+            "[ask]\nbase_url = \"http://127.0.0.1:9\"",
+            unknown("base_url"),
+        ),
+        (
+            "ask = 3",
+            "clé `ask` : valeur invalide `3` (table [ask] attendue)".into(),
+        ),
+    ]
+}
+
+#[test]
+fn req162_ac8_ask_du_fichier_de_projet_invalide_refuse_sans_effet() {
+    let e = Env::new();
+    let server = FakeServer::start(vec![]);
+    fs::write(
+        &e.config,
+        format!(
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let absent = e.config.with_file_name("absent.toml");
+    for (toml, tail) in ask_project_faults() {
+        e.project(&format!("{toml}\n"));
+        let want = format!("erreur: {} : {tail}\n", e.shown());
+        for args in COMMANDS {
+            let o = e.run(args);
+            assert!(!o.status.success(), "{toml} {args:?}");
+            assert!(o.stdout.is_empty(), "{toml} {args:?}");
+            assert_eq!(text(&o.stderr), want, "{toml} {args:?}");
+        }
+        // `--no-llm` et sans configuration personnelle : même refus.
+        for args in [
+            &["build", "--no-llm"][..],
+            &["update", "--no-llm"],
+            &["status"],
+            &["query", "search", "x"],
+            &["query", "ask", "x"],
+        ] {
+            let o = e
+                .command()
+                .env("NEPHILA_CONFIG", &absent)
+                .arg("-C")
+                .arg(&e.repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(!o.status.success(), "{toml} {args:?}");
+            assert!(o.stdout.is_empty(), "{toml} {args:?}");
+            assert_eq!(text(&o.stderr), want, "{toml} {args:?}");
+        }
+        assert!(!e.repo.join(".nephila").exists(), "{toml}");
+    }
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn req162_ac8_ask_invalide_graphe_existant_inchange_export_et_summary_ok() {
+    let e = Env::new();
+    assert!(e.run(&["build"]).status.success());
+    assert!(e.run(&["summary"]).status.success());
+    let before = snapshot(&e.repo.join(".nephila"));
+    let log_before = fs::read(&e.log).ok();
+    for (toml, _) in ask_project_faults() {
+        e.project(&format!("{toml}\n"));
+        for args in COMMANDS {
+            assert!(!e.run(args).status.success(), "{toml} {args:?}");
+        }
+        assert_eq!(snapshot(&e.repo.join(".nephila")), before, "{toml}");
+        assert_eq!(fs::read(&e.log).ok(), log_before, "{toml}");
+        assert!(
+            e.run(&["export", "--output", "-"]).status.success(),
+            "{toml}"
+        );
+        assert!(e.run(&["summary"]).status.success(), "{toml}");
+    }
+}
+
+#[test]
+fn req162_ac11_texte_exact_de_la_ligne_du_fichier_de_projet() {
+    let e = Env::new();
+    for (toml, tail) in ask_project_faults() {
+        e.project(&format!("{toml}\n"));
+        for args in [&["build"][..], &["query", "ask", "x"][..]] {
+            let o = e
+                .command()
+                .current_dir(&e.repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert_eq!(o.status.code(), Some(1), "{toml} {args:?}");
+            assert!(o.stdout.is_empty(), "{toml} {args:?}");
+            let err = text(&o.stderr);
+            assert_eq!(err, format!("erreur: ./.nephila.toml : {tail}\n"), "{toml}");
+            assert_eq!(err.lines().count(), 1);
+            for banned in ["TOML", "invalid type", "127.0.0.1"] {
+                assert!(!err.contains(banned), "{err}");
+            }
+        }
+    }
+}
+
+#[test]
+fn req162_ac11_cle_inconnue_du_premier_niveau_liste_ask() {
+    let e = Env::new();
+    e.project("zz = 1\n");
+    let o = e
+        .command()
+        .current_dir(&e.repo)
+        .args(["build"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        text(&o.stderr),
+        "erreur: ./.nephila.toml : clé inconnue `zz` (clés permises : exclude, exclude_types, exclude_defaults, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n"
+    );
+}
+
+#[test]
+fn req163_ac5_plafonds_de_ask_acceptes_au_plafond_dans_le_fichier_de_projet() {
+    let e = Env::new();
+    e.project("[ask]\nmax_context_chars = 100000\nmax_seeds = 100\nmax_nodes = 500\nmax_output_tokens = 16384\n");
+    let o = e.run(&["build"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+}

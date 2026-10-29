@@ -778,3 +778,219 @@ fn REQ157_AC12_ligne_e15_exacte_en_build_et_en_ask_sur_depot_indexe() {
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert!(!stderr(&o).contains("erreur:"));
 }
+
+// ---- T-248 : validation de `[ask]` dans la configuration personnelle et portée (REQ-162/163) ----
+
+/// Fautes de la table `[ask]` personnelle : (lignes TOML, clé, attendu, valeur réécrite). Le
+/// texte d'une faute de clé inconnue est celui du lecteur TOML (`known == false`).
+struct AskFault {
+    toml: &'static str,
+    key: &'static str,
+    expected: &'static str,
+    got: &'static str,
+    known: bool,
+}
+
+fn ask_faults() -> Vec<AskFault> {
+    let f = |toml, key, expected, got| AskFault {
+        toml,
+        key,
+        expected,
+        got,
+        known: true,
+    };
+    let u = |toml, key| AskFault {
+        toml,
+        key,
+        expected: "",
+        got: "",
+        known: false,
+    };
+    vec![
+        f(
+            "[ask]\nmodel = \"\"",
+            "ask.model",
+            "une chaîne non vide",
+            "\"\"",
+        ),
+        f("[ask]\nthinking = \"oui\"", "ask.thinking", BOOL, "\"oui\""),
+        f("[ask]\neffort = \"max\"", "ask.effort", EFFORT, "\"max\""),
+        f(
+            "[ask]\nmax_output_tokens = 0",
+            "ask.max_output_tokens",
+            INT,
+            "0",
+        ),
+        f(
+            "[ask]\nmax_context_chars = 999",
+            "ask.max_context_chars",
+            "un entier d'au moins 1000",
+            "999",
+        ),
+        f("[ask]\nmax_seeds = 0", "ask.max_seeds", INT, "0"),
+        f("[ask]\nmax_nodes = -1", "ask.max_nodes", INT, "-1"),
+        f("ask = 3", "ask", "une table [ask]", "3"),
+        u("[ask]\nzz = 1", "zz"),
+        u("[ask]\nbase_url = \"http://127.0.0.1:9\"", "base_url"),
+    ]
+}
+
+/// Liste triée (chemin relatif, contenu) de tous les fichiers sous `dir`.
+fn tree_digest(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(base, &p, out);
+            } else {
+                let rel = p.strip_prefix(base).unwrap().display().to_string();
+                out.push((rel, fs::read(&p).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+fn ask_want(env: &Env, f: &AskFault) -> String {
+    format!(
+        "erreur: configuration invalide ({}) : clé « {} » doit être {} (reçu : {})\n",
+        env.config.display(),
+        f.key,
+        f.expected,
+        f.got
+    )
+}
+
+#[test]
+fn req162_ac7_ask_personnel_invalide_refuse_avant_tout_parcours_et_tout_appel() {
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", server.local_addr().unwrap());
+    for f in ask_faults() {
+        let env = Env::new(&format!(
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{url}\"\n{}\n",
+            f.toml
+        ));
+        for args in [&["build"][..], &["update"][..], &["query", "ask", "x"][..]] {
+            let o = env.run(args);
+            assert!(!o.status.success(), "{} {args:?}", f.toml);
+            assert!(o.stdout.is_empty(), "{} {args:?}", f.toml);
+            let err = stderr(&o);
+            if f.known {
+                assert_eq!(err, ask_want(&env, &f), "{} {args:?}", f.toml);
+            } else {
+                let head = format!(
+                    "erreur: configuration invalide ({}) : ",
+                    env.config.display()
+                );
+                assert!(err.starts_with(&head), "{err}");
+                assert!(err.contains(f.key), "{err}");
+            }
+            assert!(!env.repo.join(".nephila").exists(), "{} {args:?}", f.toml);
+        }
+        // `--no-llm` : la configuration personnelle n'est pas lue.
+        for sub in ["build", "update"] {
+            let o = env.run(&[sub, "--no-llm"]);
+            assert_eq!(o.status.code(), Some(0), "{} {sub}: {}", f.toml, stderr(&o));
+            assert_eq!(stderr(&o), "", "{} {sub}", f.toml);
+        }
+    }
+    assert!(
+        server.accept().is_err(),
+        "le faux serveur a reçu une connexion"
+    );
+}
+
+#[test]
+fn req162_ac7_ask_personnel_invalide_graphe_existant_inchange() {
+    let env = Env::new(MOCK);
+    assert!(env.run(&["build", "--no-llm"]).status.success());
+    let before = tree_digest(&env.repo.join(".nephila"));
+    for f in ask_faults() {
+        env.write_config(&format!("{MOCK}{}\n", f.toml));
+        for args in [&["build"][..], &["update"][..], &["query", "ask", "x"][..]] {
+            let o = env.run(args);
+            assert!(!o.status.success(), "{} {args:?}", f.toml);
+            assert_eq!(
+                tree_digest(&env.repo.join(".nephila")),
+                before,
+                "{} {args:?}",
+                f.toml
+            );
+        }
+    }
+}
+
+#[test]
+fn req163_ac5_plafonds_personnels_absents() {
+    let env = Env::new(MOCK);
+    env.write_config(&format!(
+        "{MOCK}[ask]\nmax_context_chars = 1000000\nmax_seeds = 1000\nmax_nodes = 10000\n"
+    ));
+    for args in [&["build"][..], &["update"][..]] {
+        let o = env.run(args);
+        assert_eq!(o.status.code(), Some(0), "{args:?} {}", stderr(&o));
+        assert!(!stderr(&o).contains("erreur:"), "{}", stderr(&o));
+    }
+}
+
+#[test]
+fn req162_ac11_texte_exact_de_la_ligne_personnelle_en_build_et_en_ask() {
+    for f in ask_faults().into_iter().filter(|f| f.known) {
+        let env = Env::new(&format!("{MOCK}{}\n", f.toml));
+        let want = ask_want(&env, &f);
+        for args in [&["build"][..], &["query", "ask", "x"][..]] {
+            let o = env.run(args);
+            assert_eq!(o.status.code(), Some(1), "{} {args:?}", f.toml);
+            assert!(o.stdout.is_empty(), "{} {args:?}", f.toml);
+            let err = stderr(&o);
+            assert_eq!(err, want, "{} {args:?}", f.toml);
+            assert_eq!(err.lines().count(), 1);
+            for banned in ["TOML", "invalid type", "127.0.0.1"] {
+                assert!(!err.contains(banned), "{err}");
+            }
+        }
+    }
+}
+
+const ASK_ALL: &str = "[ask]\nmodel = \"m-ask\"\nthinking = true\neffort = \"high\"\nmax_output_tokens = 4096\nmax_context_chars = 3000\nmax_seeds = 5\nmax_nodes = 30\n";
+
+/// Ligne `config` de `build --verbose`, horodatage retiré.
+fn bare_config_line(env: &Env, log: &std::path::Path) -> String {
+    let o = mock_run(env, log, &["build", "--verbose"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let l = config_line(&o);
+    l[l.find("config:").unwrap()..].to_string()
+}
+
+#[test]
+fn req162_ac9_ask_sans_effet_sur_update_et_sur_la_ligne_config_de_build() {
+    let env = Env::new(MOCK);
+    let log = env.repo.parent().unwrap().join("mock.log");
+    let b = mock_run(&env, &log, &["build"]);
+    assert_eq!(b.status.code(), Some(0), "{}", stderr(&b));
+    assert!(!fs::read_to_string(&log).unwrap().is_empty());
+    let baseline = bare_config_line(&env, &log);
+    assert!(!baseline.contains("ask"), "{baseline}");
+    let project = env.repo.join(".nephila.toml");
+    for place in ["personnelle", "projet"] {
+        if place == "personnelle" {
+            env.write_config(&format!("{MOCK}{ASK_ALL}"));
+        } else {
+            env.write_config(MOCK);
+            fs::write(&project, ASK_ALL).unwrap();
+        }
+        let before = fs::read_to_string(&log).unwrap();
+        let u = mock_run(&env, &log, &["update"]);
+        assert_eq!(u.status.code(), Some(0), "{place}: {}", stderr(&u));
+        assert_eq!(String::from_utf8_lossy(&u.stdout).trim(), "graphe à jour");
+        assert_eq!(before, fs::read_to_string(&log).unwrap(), "{place}");
+        let line = bare_config_line(&env, &log);
+        assert_eq!(line, baseline, "{place}");
+        assert!(!line.contains("ask"), "{line}");
+    }
+}
