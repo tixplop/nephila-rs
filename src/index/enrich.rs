@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use crate::chunk;
 use crate::error::{warn, Error, Result, TRUNCATED};
 use crate::index::build::{BuildReport, IndexOptions};
-use crate::llm::{with_format_retries, CallStats, Enrichment, Llm, LotItem};
+use crate::llm::{
+    calls_line, tokens_segment, with_format_retries, CallStats, Enrichment, Llm, LlmTotals, LotItem,
+};
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
 use crate::parse::markdown;
 use crate::progress::{self, Phase};
@@ -257,6 +259,7 @@ impl Sources<'_> {
 }
 
 /// Exécute une unité `Lot` ou `Big`. Un fichier illisible échoue seul et sort du lot.
+#[allow(clippy::too_many_arguments)]
 fn run_unit<'a>(
     unit: &Unit<'a>,
     sources: Sources<'_>,
@@ -265,6 +268,7 @@ fn run_unit<'a>(
     ids: &HashMap<String, Vec<(String, String)>>,
     retries: u32,
     stop: &AtomicBool,
+    totals: &Mutex<LlmTotals>,
 ) -> Step<'a> {
     let files: Vec<&'a FileRecord> = match unit {
         Unit::Lot(v) => v.clone(),
@@ -317,7 +321,7 @@ fn run_unit<'a>(
                     node_ids: node_ids(f),
                 })
                 .collect();
-            match traced_lot(llm, &items, retries, stop) {
+            match traced_lot(llm, &items, retries, stop, totals) {
                 // Lot tronqué (REQ-096, DEC-101) : deux moitiés remises en tête de file ; aucune
                 // issue pour le lot lui-même, ses fichiers en recevront par leurs moitiés.
                 Err(Error::Truncated(_)) => {
@@ -415,19 +419,14 @@ fn traced_enrich(
     known: &[String],
     attempt: Attempt,
     stop: &AtomicBool,
+    totals: &Mutex<LlmTotals>,
 ) -> Result<Enrichment> {
+    let stats = CallStats::default();
+    let label = format!("{path} [{index}/{total}]");
     if !trace::enabled() {
-        let label = format!("{path} [{index}/{total}]");
-        return llm.enrich_labeled(
-            &label,
-            path,
-            index,
-            text,
-            requested,
-            known,
-            stop,
-            &CallStats::default(),
-        );
+        let result = llm.enrich_labeled(&label, path, index, text, requested, known, stop, &stats);
+        add_totals(totals, &stats, attempt);
+        return result;
     }
     trace!(
         "llm enrich départ {path} [{index}/{total}] {} car.{}",
@@ -435,31 +434,39 @@ fn traced_enrich(
         attempt.mark()
     );
     let started = Instant::now();
-    let label = format!("{path} [{index}/{total}]");
-    let result = llm.enrich_labeled(
-        &label,
-        path,
-        index,
-        text,
-        requested,
-        known,
-        stop,
-        &CallStats::default(),
-    );
+    let result = llm.enrich_labeled(&label, path, index, text, requested, known, stop, &stats);
     let ms = started.elapsed().as_millis();
+    add_totals(totals, &stats, attempt);
+    let tokens = tokens_suffix(&stats);
     match &result {
         Ok(x) => trace!(
-            "llm enrich fin {path} [{index}/{total}] ok ({} résumés, {} concepts) {ms} ms",
+            "llm enrich fin {path} [{index}/{total}] ok ({} résumés, {} concepts) {ms} ms{tokens}",
             x.summaries.len(),
             x.concepts.len()
         ),
         Err(e) => trace!(
-            "llm enrich fin {path} [{index}/{total}] {} {ms} ms : {}",
+            "llm enrich fin {path} [{index}/{total}] {} {ms} ms : {}{tokens}",
             trace::classify(e),
             trace::short(&trace_detail(e), trace::MAX_MESSAGE_CHARS)
         ),
     }
     result
+}
+
+/// Ajoute le relevé d'un appel aux totaux de la phase.
+fn add_totals(totals: &Mutex<LlmTotals>, stats: &CallStats, attempt: Attempt) {
+    totals
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .add(stats, attempt.current >= 2);
+}
+
+/// Fin de la ligne `llm enrich fin` : ` (<segment de jetons>)`, ou rien sans compte de jetons.
+fn tokens_suffix(stats: &CallStats) -> String {
+    stats
+        .usage()
+        .map(|u| format!(" ({})", tokens_segment(&u)))
+        .unwrap_or_default()
 }
 
 /// Un appel `llm.enrich_lot` encadré de ses traces de départ et de fin (jamais de contenu).
@@ -468,10 +475,11 @@ fn traced_lot(
     items: &[LotItem],
     retries: u32,
     stop: &AtomicBool,
+    totals: &Mutex<LlmTotals>,
 ) -> Result<Vec<(String, Result<Enrichment>)>> {
     let total = retries.saturating_add(1);
     with_format_retries(retries, stop, |current| {
-        traced_lot_once(llm, items, Attempt { current, total }, stop)
+        traced_lot_once(llm, items, Attempt { current, total }, stop, totals)
     })
 }
 
@@ -480,15 +488,14 @@ fn traced_lot_once(
     items: &[LotItem],
     attempt: Attempt,
     stop: &AtomicBool,
+    totals: &Mutex<LlmTotals>,
 ) -> Result<Vec<(String, Result<Enrichment>)>> {
     let label = format!("lot {} +{}", items[0].file, items.len() - 1);
+    let stats = CallStats::default();
     if !trace::enabled() {
-        return llm.enrich_lot_labeled(
-            &format!("{label} [1/1]"),
-            items,
-            stop,
-            &CallStats::default(),
-        );
+        let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop, &stats);
+        add_totals(totals, &stats, attempt);
+        return result;
     }
     trace!(
         "llm enrich départ {label} [1/1] {} car.{}",
@@ -496,13 +503,10 @@ fn traced_lot_once(
         attempt.mark()
     );
     let started = Instant::now();
-    let result = llm.enrich_lot_labeled(
-        &format!("{label} [1/1]"),
-        items,
-        stop,
-        &CallStats::default(),
-    );
+    let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop, &stats);
     let ms = started.elapsed().as_millis();
+    add_totals(totals, &stats, attempt);
+    let tokens = tokens_suffix(&stats);
     match &result {
         Ok(results) => {
             let (r, k) = results
@@ -511,10 +515,10 @@ fn traced_lot_once(
                 .fold((0, 0), |(r, k), x| {
                     (r + x.summaries.len(), k + x.concepts.len())
                 });
-            trace!("llm enrich fin {label} [1/1] ok ({r} résumés, {k} concepts) {ms} ms")
+            trace!("llm enrich fin {label} [1/1] ok ({r} résumés, {k} concepts) {ms} ms{tokens}")
         }
         Err(e) => trace!(
-            "llm enrich fin {label} [1/1] {} {ms} ms : {}",
+            "llm enrich fin {label} [1/1] {} {ms} ms : {}{tokens}",
             trace::classify(e),
             trace::short(&trace_detail(e), trace::MAX_MESSAGE_CHARS)
         ),
@@ -764,6 +768,7 @@ fn run_call(
     known: &[String],
     retries: u32,
     stop: &AtomicBool,
+    totals: &Mutex<LlmTotals>,
 ) -> Result<Enrichment> {
     let total = retries.saturating_add(1);
     with_format_retries(retries, stop, |current| {
@@ -777,6 +782,7 @@ fn run_call(
             known,
             Attempt { current, total },
             stop,
+            totals,
         )
     })
 }
@@ -984,6 +990,7 @@ struct Ctx<'s, 'a> {
     max_chunk_chars: usize,
     format_retries: u32,
     stop: &'s AtomicBool,
+    totals: &'s Mutex<LlmTotals>,
 }
 
 /// Corps d'un fil d'enrichissement : prend des unités jusqu'à l'arrêt ou la fin de la file.
@@ -998,6 +1005,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
         max_chunk_chars,
         format_retries,
         stop,
+        totals,
     } = ctx;
     while let Some(unit) = next_unit(shared, wake, stop) {
         let mut expand = ExpandGuard {
@@ -1026,6 +1034,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     &known,
                     format_retries,
                     stop,
+                    totals,
                 );
                 let err = result.as_ref().err().cloned();
                 // Toute cause d'échec fait sauter les appels non partis du fichier
@@ -1059,6 +1068,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     ids,
                     format_retries,
                     stop,
+                    totals,
                 );
                 match step {
                     Step::Finished(outcomes, call) => (
@@ -1230,6 +1240,7 @@ pub(crate) fn enrich_with_stop(
     });
     let wake = Condvar::new();
     let policy = Mutex::new(Policy::default());
+    let totals = Mutex::new(LlmTotals::default());
     let (tx, rx) = mpsc::channel::<Msg>();
     if !without_nodes.is_empty() {
         let empty = without_nodes
@@ -1259,6 +1270,7 @@ pub(crate) fn enrich_with_stop(
             max_chunk_chars,
             format_retries,
             stop,
+            totals: &totals,
         };
         for _ in 0..workers {
             let tx = tx.clone();
@@ -1373,6 +1385,9 @@ pub(crate) fn enrich_with_stop(
         started.elapsed().as_millis(),
         report.failed - failed_before
     );
+    let totals = totals.into_inner().unwrap_or_else(|p| p.into_inner());
+    trace!("{}", calls_line(&totals));
+    report.llm = totals;
     let policy = policy.into_inner().unwrap_or_else(|p| p.into_inner());
     report.stop_cause = policy.stop_cause;
     report.refused = policy.refused;
@@ -1899,6 +1914,7 @@ mod tests {
         stop: &AtomicBool,
     ) -> Result<Enrichment> {
         let file = rec(path, text.len() as u64);
+        let totals = Mutex::new(LlmTotals::default());
         let mut results = Vec::new();
         for unit in plan_calls(&file, text, max_chunk_chars, nodes)? {
             let Unit::Call {
@@ -1913,7 +1929,7 @@ mod tests {
                 unreachable!()
             };
             results.push(run_call(
-                llm, path, index, count, &part, &requested, &known, retries, stop,
+                llm, path, index, count, &part, &requested, &known, retries, stop, &totals,
             )?);
         }
         match results.len() {

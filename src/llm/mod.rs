@@ -9,7 +9,9 @@ pub mod mock;
 pub mod openai;
 pub mod retry;
 mod usage;
-pub use usage::{anthropic_usage, openai_usage, CallStats, Usage};
+pub use usage::{
+    anthropic_usage, calls_line, openai_usage, tokens_segment, CallStats, LlmTotals, Usage,
+};
 
 use std::sync::atomic::AtomicBool;
 

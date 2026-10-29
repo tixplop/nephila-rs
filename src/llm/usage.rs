@@ -78,6 +78,82 @@ impl CallStats {
     }
 }
 
+/// Totaux des appels d'une commande (REQ-165, DEC-134).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlmTotals {
+    pub calls: u64,
+    pub format_retries: u64,
+    pub sends: u64,
+    pub responded: u64,
+    pub without_usage: u64,
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub output: u64,
+    pub reasoning: Option<u64>,
+}
+
+impl LlmTotals {
+    /// Ajoute le relevé d'un appel ; `format_retry` : l'appel est un nouvel essai de format.
+    pub fn add(&mut self, stats: &CallStats, format_retry: bool) {
+        self.calls = self.calls.saturating_add(1);
+        if format_retry {
+            self.format_retries = self.format_retries.saturating_add(1);
+        }
+        self.sends = self.sends.saturating_add(u64::from(stats.sends()));
+        if !stats.responded() {
+            return;
+        }
+        self.responded = self.responded.saturating_add(1);
+        match stats.usage() {
+            None => self.without_usage = self.without_usage.saturating_add(1),
+            Some(u) => {
+                self.input = self.input.saturating_add(u.input);
+                self.cache_read = self.cache_read.saturating_add(u.cache_read);
+                self.cache_write = self.cache_write.saturating_add(u.cache_write);
+                self.output = self.output.saturating_add(u.output);
+                if let Some(r) = u.reasoning {
+                    self.reasoning = Some(self.reasoning.unwrap_or(0).saturating_add(r));
+                }
+            }
+        }
+    }
+}
+
+/// Construction commune du segment de jetons.
+fn tokens_text(input: u64, cache: u64, output: u64, reasoning: Option<u64>) -> String {
+    let mut s = format!("jetons : entrée {input} dont cache {cache}, sortie {output}");
+    if let Some(r) = reasoning {
+        s.push_str(&format!(" dont réflexion {r}"));
+    }
+    s
+}
+
+/// Segment de jetons d'un appel : `jetons : entrée <e> dont cache <c>, sortie <s>[ dont réflexion <r>]`.
+pub fn tokens_segment(u: &Usage) -> String {
+    tokens_text(u.input, u.cache_read, u.output, u.reasoning)
+}
+
+/// Ligne de bilan `appels: …` d'une commande.
+pub fn calls_line(t: &LlmTotals) -> String {
+    let tokens = if t.responded > 0 && t.responded == t.without_usage {
+        "jetons : inconnus".to_string()
+    } else {
+        let mut s = tokens_text(t.input, t.cache_read, t.output, t.reasoning);
+        if t.without_usage > 0 && t.without_usage < t.responded {
+            s.push_str(&format!(
+                " ({} appels sans compte de jetons)",
+                t.without_usage
+            ));
+        }
+        s
+    };
+    format!(
+        "appels: {} appels, {} nouveaux essais de format, {} envois HTTP, {tokens}",
+        t.calls, t.format_retries, t.sends
+    )
+}
+
 /// Faux serveur HTTP des tests : une réponse par connexion, dans l'ordre ; la dernière se répète.
 #[cfg(test)]
 pub(crate) fn fake_server(replies: Vec<(u16, String)>) -> String {
@@ -129,5 +205,88 @@ mod tests {
         s.record_response(Some(Usage::default()));
         assert_eq!((s.sends(), s.responded()), (2, true));
         assert_eq!(s.usage(), Some(Usage::default()));
+    }
+
+    fn stats(sends: u32, usage: Option<Option<Usage>>) -> CallStats {
+        let s = CallStats::default();
+        for _ in 0..sends {
+            s.add_send();
+        }
+        if let Some(u) = usage {
+            s.record_response(u);
+        }
+        s
+    }
+
+    fn usage(i: u64, c: u64, o: u64, r: Option<u64>) -> Usage {
+        Usage {
+            input: i,
+            cache_read: c,
+            cache_write: 7,
+            output: o,
+            reasoning: r,
+        }
+    }
+
+    #[test]
+    fn tokens_segment_with_and_without_reasoning() {
+        assert_eq!(
+            tokens_segment(&usage(1000, 200, 50, None)),
+            "jetons : entrée 1000 dont cache 200, sortie 50"
+        );
+        assert_eq!(
+            tokens_segment(&usage(1000, 0, 50, Some(10))),
+            "jetons : entrée 1000 dont cache 0, sortie 50 dont réflexion 10"
+        );
+    }
+
+    #[test]
+    fn calls_line_four_states() {
+        let mut t = LlmTotals::default();
+        assert_eq!(
+            calls_line(&t),
+            "appels: 0 appels, 0 nouveaux essais de format, 0 envois HTTP, jetons : entrée 0 dont cache 0, sortie 0"
+        );
+        t.add(&stats(3, Some(None)), false);
+        t.add(&stats(1, Some(None)), false);
+        assert_eq!(
+            calls_line(&t),
+            "appels: 2 appels, 0 nouveaux essais de format, 4 envois HTTP, jetons : inconnus"
+        );
+        let mut t = LlmTotals::default();
+        for _ in 0..2 {
+            t.add(&stats(1, Some(Some(usage(1000, 200, 50, Some(10))))), false);
+        }
+        assert_eq!(
+            calls_line(&t),
+            "appels: 2 appels, 0 nouveaux essais de format, 2 envois HTTP, jetons : entrée 2000 dont cache 400, sortie 100 dont réflexion 20"
+        );
+        t.add(&stats(1, Some(None)), true);
+        assert_eq!(
+            calls_line(&t),
+            "appels: 3 appels, 1 nouveaux essais de format, 3 envois HTTP, jetons : entrée 2000 dont cache 400, sortie 100 dont réflexion 20 (1 appels sans compte de jetons)"
+        );
+    }
+
+    #[test]
+    fn totals_add_counts_without_response_and_cache_write() {
+        let mut t = LlmTotals::default();
+        t.add(&stats(5, None), false);
+        assert_eq!((t.calls, t.sends, t.responded), (1, 5, 0));
+        t.add(&stats(1, Some(Some(usage(10, 2, 3, None)))), true);
+        assert_eq!((t.format_retries, t.cache_write, t.reasoning), (1, 7, None));
+        assert!(!calls_line(&t).contains('7'));
+        t.add(&stats(1, Some(Some(usage(1, 0, 1, Some(4))))), false);
+        assert_eq!(t.reasoning, Some(4));
+    }
+
+    #[test]
+    fn totals_add_saturates() {
+        let mut t = LlmTotals {
+            input: u64::MAX - 1,
+            ..Default::default()
+        };
+        t.add(&stats(1, Some(Some(usage(10, 0, 0, None)))), false);
+        assert_eq!(t.input, u64::MAX);
     }
 }

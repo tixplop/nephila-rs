@@ -9,7 +9,7 @@ use crate::error::{warn, Error, Result};
 use crate::filter::{Filters, Matcher, ProjectFile};
 use crate::index::lock::RepoLock;
 use crate::index::{enrich, structure};
-use crate::llm::{build_llm, Llm};
+use crate::llm::{build_llm, Llm, LlmTotals};
 use crate::model::{FileRecord, FileState};
 use crate::out::Out;
 use crate::resolve;
@@ -21,6 +21,8 @@ use crate::trace;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuildReport {
     pub processed: usize,
+    /// Totaux des appels LLM de la phase d'enrichissement (REQ-165).
+    pub llm: LlmTotals,
     /// Fichiers dont l'enrichissement conservé a été réappliqué par cette commande (REQ-049).
     pub retained: usize,
     /// Enrichissements conservés illisibles, écartés par cette commande (REQ-131).
