@@ -20,32 +20,11 @@ use crate::llm::{build_llm, with_format_retries, AskReply, Llm};
 use crate::model::{Edge, Node};
 use crate::store::Store;
 
-/// Nombre maximal de nœuds trouvés par les mots de la question, par défaut.
-pub const DEFAULT_ASK_MAX_SEEDS: usize = 20;
-/// Nombre maximal de nœuds (trouvés + voisins) décrits dans le contexte, par défaut.
-pub const DEFAULT_ASK_MAX_NODES: usize = 60;
-/// Taille maximale du contexte, en caractères, par défaut.
-pub const DEFAULT_ASK_MAX_CONTEXT_CHARS: usize = 12_000;
-/// Taille minimale admise pour le contexte, en caractères.
-pub const ASK_MIN_CONTEXT_CHARS: usize = 1000;
+pub use crate::config::{
+    AskLimits, ASK_MIN_CONTEXT_CHARS, DEFAULT_ASK_MAX_CONTEXT_CHARS, DEFAULT_ASK_MAX_NODES,
+    DEFAULT_ASK_MAX_SEEDS,
+};
 
-/// Bornes du contexte de `query ask` (REQ-163).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AskLimits {
-    pub max_context_chars: usize,
-    pub max_seeds: usize,
-    pub max_nodes: usize,
-}
-
-impl Default for AskLimits {
-    fn default() -> Self {
-        AskLimits {
-            max_context_chars: DEFAULT_ASK_MAX_CONTEXT_CHARS,
-            max_seeds: DEFAULT_ASK_MAX_SEEDS,
-            max_nodes: DEFAULT_ASK_MAX_NODES,
-        }
-    }
-}
 /// Longueur minimale d'un mot de la question pour être cherché.
 const MIN_WORD_CHARS: usize = 3;
 

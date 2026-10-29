@@ -193,3 +193,54 @@ api_key_env = "ANTHROPIC_API_KEY"
 # commande. L'emporte sur tls_ca_cert. À réserver à un poste de développement. Sans effet avec
 # « mock » et avec une base_url en http://.
 # tls_insecure = false
+
+# --- Réglages de query ask ---
+# Section [ask] : elle ne vaut que pour nephila query ask. L'enrichissement (build, update)
+# n'en lit rien, et la changer ne réenrichit rien. Les quatre premières clés remplacent, pour
+# query ask seulement, les clés du même nom du premier niveau ; les trois dernières bornent le
+# contexte envoyé au LLM. Une clé absente reprend la valeur de l'enrichissement, ou le défaut
+# indiqué. Le fournisseur, la clé d'API, timeout_secs et format_retries restent ceux du
+# premier niveau. Un dépôt peut avoir sa propre section [ask] dans .nephila.toml, prioritaire
+# sur celle-ci. Valeurs effectives : nephila query ask --verbose (ligne config).
+# Placez cette section à la fin du fichier : toute clé écrite après la ligne [ask] en fait partie.
+# [ask]
+
+# Modèle qui répond aux questions. Texte non vide. Absente : le modèle de l'enrichissement.
+# Par exemple : enrichir avec un modèle rapide, et répondre avec un modèle plus fort.
+# Priorité : [ask] de .nephila.toml > ce fichier > model de .nephila.toml > model du premier niveau.
+# model = "claude-opus-5-5"
+
+# Réflexion demandée pour query ask. Booléen, true ou false. Absente : thinking du premier
+# niveau, sinon false. Mêmes champs envoyés et mêmes modèles requis qu'au premier niveau.
+# Priorité : [ask] de .nephila.toml > ce fichier > thinking du premier niveau > défaut.
+# thinking = true
+
+# Niveau d'effort pour query ask. Texte : "low", "medium", "high" ou "default". Absente : la
+# valeur d'effort du premier niveau, sinon "low". Envoyé selon les règles du premier niveau,
+# appliquées au modèle de query ask ; écrite ici, la clé compte comme écrite pour « openai ».
+# À "medium" ou "high", augmentez timeout_secs, au premier niveau.
+# Priorité : [ask] de .nephila.toml > ce fichier > effort du premier niveau > défaut.
+# effort = "medium"
+
+# Nombre maximal de jetons de la réponse de query ask, réflexion comprise. Entier > 0. Absente :
+# la valeur du premier niveau, sinon 16384. Atteinte, elle donne « réponse tronquée par la
+# limite de jetons » : posez une question plus ciblée, ou augmentez-la.
+# Priorité : [ask] de .nephila.toml > ce fichier > max_output_tokens du premier niveau > défaut.
+# max_output_tokens = 4096
+
+# Nombre maximal de caractères du contexte envoyé au LLM (nœuds et liens trouvés pour la
+# question), en-têtes compris. Entier, au moins 1000 ; absente : 12000. Plus grand, la réponse
+# s'appuie sur une plus grande part du graphe, et chaque question coûte plus. Le nombre de nœuds
+# reste borné par max_nodes. Remplacée, pour une question, par l'option --context-chars.
+# Priorité : --context-chars > [ask] de .nephila.toml > ce fichier > défaut.
+# max_context_chars = 30000
+
+# Nombre maximal de nœuds de départ : ceux que trouvent les mots de la question, avant leurs
+# voisins. Entier > 0 ; absente : 20. Jamais plus que max_nodes.
+# Priorité : [ask] de .nephila.toml > ce fichier > défaut.
+# max_seeds = 30
+
+# Nombre maximal de nœuds du contexte, nœuds de départ et voisins compris. Entier > 0 ;
+# absente : 60. Pour élargir le contexte, augmentez-le avec max_context_chars.
+# Priorité : [ask] de .nephila.toml > ce fichier > défaut.
+# max_nodes = 120

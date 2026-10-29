@@ -316,7 +316,7 @@ model = "qwen2.5-coder:14b"
 format_retries = 4
 ```
 
-Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les six réglages `model`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`, au premier niveau, avec le nom et le type de la configuration personnelle. Toute autre clé est une erreur. Priorité : option > fichier de projet > configuration personnelle > défaut.
+Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les six réglages `model`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`, au premier niveau, avec le nom et le type de la configuration personnelle, puis la section `[ask]` en fin de fichier. Toute autre clé est une erreur. Priorité : option > fichier de projet > configuration personnelle > défaut.
 
 | Réglage | Plafond dans `.nephila.toml` |
 |---|---|
@@ -325,6 +325,10 @@ Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, e
 | `timeout_secs` | 3600 |
 | `batch_files` | 100 |
 | `format_retries` | 10 |
+| `ask.max_output_tokens` | 16384 |
+| `ask.max_context_chars` | 100000 |
+| `ask.max_seeds` | 100 |
+| `ask.max_nodes` | 500 |
 
 Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et les options --batch-files et --format-retries n'en ont pas. Un dépôt cloné ne peut ainsi imposer ni plus de fils, ni des appels plus longs ou plus gros, ni plus d'essais.
 
@@ -365,6 +369,7 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 | `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 | 300 |
 | `tls_ca_cert` | Fichier PEM d'autorités ajoutées aux autorités publiques ; chemin absolu, `~/…` ou relatif | aucun |
 | `tls_insecure` | `true` désactive le contrôle du certificat du serveur, comme `curl -k` | `false` |
+| `ask` | Réglages de `query ask` seul : voir **Section `[ask]`** ci-dessous | aucun |
 
 Ce que chaque clé envoie à chaque fournisseur :
 
@@ -375,6 +380,8 @@ Ce que chaque clé envoie à chaque fournisseur :
 | `effort` | `output_config.effort` ; sans `thinking`, rien pour un modèle sorti avant Claude Opus 4.5 (`claude-sonnet-4-5`, par exemple) | `reasoning_effort` ; sans `thinking`, seulement si `effort` est écrit | sans effet |
 
 Avec `effort = "default"`, aucun niveau n'est envoyé, à aucun fournisseur, et le modèle garde le sien. Un modèle ou un serveur qui refuse ces champs, ou une limite de 16384 jetons, refuse la requête (HTTP 400) : voir [Arrêt de l'envoi](#arrêt-de-lenvoi).
+
+**Section `[ask]`** : écrite en fin de configuration personnelle ou de `.nephila.toml`, elle ne règle que `query ask`. `model`, `thinking`, `effort` et `max_output_tokens` y remplacent les clés du premier niveau ; `max_context_chars` (caractères, au moins 1000, défaut 12000), `max_seeds` (nœuds de départ, défaut 20) et `max_nodes` (nœuds, défaut 60) bornent le contexte envoyé. Priorité : `--context-chars` > `[ask]` de `.nephila.toml` > `[ask]` personnel > premier niveau > défaut. Sans `max_nodes`, un `max_context_chars` plus grand garde 60 nœuds au plus. Un dépôt cloné peut choisir le modèle de `query ask` : `query ask --verbose` montre les valeurs effectives.
 
 La clé d'API n'est jamais écrite dans le fichier. `nephila` ne la vérifie pas avant le traitement : une clé refusée est constatée au premier appel, après l'extraction.
 

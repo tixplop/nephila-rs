@@ -306,10 +306,11 @@ impl ProjectFile {
                     "{shown} : clé `{key}` permise seulement dans la configuration personnelle ({at})"
                 )));
             }
-            if !FILTER_KEYS.contains(&key) && !PROJECT_SETTINGS.contains(&key) {
+            if !FILTER_KEYS.contains(&key) && !PROJECT_SETTINGS.contains(&key) && key != "ask" {
                 let allowed = FILTER_KEYS
                     .into_iter()
                     .chain(PROJECT_SETTINGS)
+                    .chain(["ask"])
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(Error::Message(format!(

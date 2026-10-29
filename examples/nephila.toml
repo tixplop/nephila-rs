@@ -114,3 +114,50 @@
 # Plafond dans ce fichier : au plus 10.
 # Priorité : --format-retries > ce fichier > configuration personnelle > défaut.
 # format_retries = 4
+
+# --- Réglages de query ask ---
+# Section [ask] : elle ne vaut que pour nephila query ask. L'enrichissement n'en lit rien, et la
+# changer ne réenrichit rien. Chaque clé l'emporte, pour query ask, sur la même clé de la
+# configuration personnelle (section [ask] comprise) et, pour model, sur model ci-dessus.
+# Un dépôt cloné peut ainsi choisir le modèle de query ask et y demander la réflexion : lisez
+# cette section avant d'interroger un dépôt tiers. Valeurs effectives et clés venues de ce
+# fichier : nephila query ask --verbose (ligne config). Clés de connexion refusées ici aussi.
+# Placez cette section à la fin du fichier : toute clé écrite après la ligne [ask] en fait partie.
+# [ask]
+
+# Modèle qui répond aux questions. Texte non vide. Absente : le modèle de l'enrichissement.
+# Priorité : ce fichier > [ask] de la configuration personnelle > model ci-dessus > model personnel.
+# model = "claude-opus-5-5"
+
+# Réflexion demandée pour query ask. Booléen, true ou false ; absente : celle de la
+# configuration personnelle, sinon false. Permise ici dans [ask] seulement.
+# Priorité : ce fichier > configuration personnelle ([ask], puis premier niveau) > défaut.
+# thinking = true
+
+# Niveau d'effort pour query ask : "low", "medium", "high" ou "default" ; absente : celui de la
+# configuration personnelle, sinon "low". Permise ici dans [ask] seulement.
+# Priorité : ce fichier > configuration personnelle ([ask], puis premier niveau) > défaut.
+# effort = "medium"
+
+# Nombre maximal de jetons de la réponse de query ask, réflexion comprise. Entier > 0 ;
+# absente : celui de la configuration personnelle, sinon 16384.
+# Plafond dans ce fichier : au plus 16384.
+# Priorité : ce fichier > configuration personnelle ([ask], puis premier niveau) > défaut.
+# max_output_tokens = 4096
+
+# Nombre maximal de caractères du contexte envoyé au LLM, en-têtes compris. Entier, au moins
+# 1000 ; absente : 12000. Le nombre de nœuds reste borné par max_nodes.
+# Plafond dans ce fichier : au plus 100000.
+# Priorité : --context-chars > ce fichier > configuration personnelle > défaut.
+# max_context_chars = 30000
+
+# Nombre maximal de nœuds de départ, ceux que trouvent les mots de la question. Entier > 0 ;
+# absente : 20 ; jamais plus que max_nodes.
+# Plafond dans ce fichier : au plus 100.
+# Priorité : ce fichier > configuration personnelle > défaut.
+# max_seeds = 30
+
+# Nombre maximal de nœuds du contexte, nœuds de départ compris. Entier > 0 ; absente : 60.
+# Plafond dans ce fichier : au plus 500.
+# Priorité : ce fichier > configuration personnelle > défaut.
+# max_nodes = 120

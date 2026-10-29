@@ -45,6 +45,72 @@ pub fn project_cap(key: &str) -> Option<u64> {
         .map(|(_, c)| *c)
 }
 
+/// Clés de la section `[ask]`, dans l'ordre de REQ-162. Seule déclaration de la liste : l'aide,
+/// l'erreur de clé inconnue et les tests s'en servent.
+pub const ASK_SETTINGS: [&str; 7] = [
+    "model",
+    "thinking",
+    "effort",
+    "max_output_tokens",
+    "max_context_chars",
+    "max_seeds",
+    "max_nodes",
+];
+
+/// Plafonds inclus des entiers de `[ask]` dans le fichier de projet seulement (DEC-132). Seule
+/// source du message d'erreur, de l'exemple et du README ; la configuration personnelle et
+/// `--context-chars` n'en ont pas.
+pub const ASK_CAPS: [(&str, u64); 4] = [
+    ("max_output_tokens", 16384),
+    ("max_context_chars", 100_000),
+    ("max_seeds", 100),
+    ("max_nodes", 500),
+];
+
+/// Plafond de `key` dans la section `[ask]` du fichier de projet, s'il en a un.
+pub fn ask_cap(key: &str) -> Option<u64> {
+    ASK_CAPS.iter().find(|(k, _)| *k == key).map(|(_, c)| *c)
+}
+
+/// Nombre maximal de nœuds trouvés par les mots de la question, par défaut.
+pub const DEFAULT_ASK_MAX_SEEDS: usize = 20;
+/// Nombre maximal de nœuds (trouvés + voisins) décrits dans le contexte, par défaut.
+pub const DEFAULT_ASK_MAX_NODES: usize = 60;
+/// Taille maximale du contexte, en caractères, par défaut.
+pub const DEFAULT_ASK_MAX_CONTEXT_CHARS: usize = 12_000;
+/// Taille minimale admise pour le contexte, en caractères.
+pub const ASK_MIN_CONTEXT_CHARS: usize = 1000;
+
+/// Bornes du contexte de `query ask` (REQ-163).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AskLimits {
+    pub max_context_chars: usize,
+    pub max_seeds: usize,
+    pub max_nodes: usize,
+}
+
+impl Default for AskLimits {
+    fn default() -> Self {
+        AskLimits {
+            max_context_chars: DEFAULT_ASK_MAX_CONTEXT_CHARS,
+            max_seeds: DEFAULT_ASK_MAX_SEEDS,
+            max_nodes: DEFAULT_ASK_MAX_NODES,
+        }
+    }
+}
+
+/// Valeurs de la section `[ask]` d'un fichier, telles qu'écrites (REQ-162, REQ-163).
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct AskOverrides {
+    pub model: Option<String>,
+    pub thinking: Option<bool>,
+    pub effort: Option<Effort>,
+    pub max_output_tokens: Option<u32>,
+    pub max_context_chars: Option<usize>,
+    pub max_seeds: Option<usize>,
+    pub max_nodes: Option<usize>,
+}
+
 /// Clés de connexion : permises dans la configuration personnelle seulement (DEC-052).
 pub const CONNECTION_KEYS: [&str; 5] = [
     "provider",
@@ -63,6 +129,8 @@ pub struct ProjectSettings {
     pub timeout_secs: Option<u64>,
     pub batch_files: Option<usize>,
     pub format_retries: Option<u32>,
+    /// Section `[ask]` (REQ-162).
+    pub ask: AskOverrides,
 }
 
 impl ProjectSettings {
@@ -108,8 +176,82 @@ impl ProjectSettings {
                 _ => unreachable!("réglage hors de PROJECT_SETTINGS : {key}"),
             }
         }
+        if let Some(value) = table.get("ask") {
+            out.ask = ask_from_value(value, shown)?;
+        }
         Ok(out)
     }
+}
+
+/// Lit la section `[ask]` du fichier de projet, clé par clé dans l'ordre d'`ASK_SETTINGS`.
+fn ask_from_value(value: &toml::Value, shown: &str) -> Result<AskOverrides> {
+    let toml::Value::Table(t) = value else {
+        return Err(Error::Message(format!(
+            "{shown} : clé `ask` : valeur invalide `{value}` (table [ask] attendue)"
+        )));
+    };
+    // Toute clé hors de la section, clés de connexion comprises, donne la même erreur : la
+    // valeur n'est jamais reprise.
+    if let Some(unknown) = t.keys().find(|k| !ASK_SETTINGS.contains(&k.as_str())) {
+        return Err(Error::Message(format!(
+            "{shown} : clé inconnue `ask.{unknown}` (clés permises dans [ask] : {})",
+            ASK_SETTINGS.join(", ")
+        )));
+    }
+    let mut out = AskOverrides::default();
+    for key in ASK_SETTINGS {
+        let Some(v) = t.get(key) else {
+            continue;
+        };
+        let invalid = |expected: &str| {
+            Error::Message(format!(
+                "{shown} : clé `ask.{key}` : valeur invalide `{v}` ({expected})"
+            ))
+        };
+        let capped = |min: i64, expected: &str| -> Result<u64> {
+            let cap = ask_cap(key).unwrap_or_else(|| unreachable!("entier sans plafond : {key}"));
+            match v {
+                toml::Value::Integer(n) if *n >= min && (*n as u64) <= cap => Ok(*n as u64),
+                _ => Err(invalid(&format!("{expected}, au plus {cap}"))),
+            }
+        };
+        match key {
+            "model" => match v {
+                toml::Value::String(s) if !s.trim().is_empty() => out.model = Some(s.clone()),
+                _ => return Err(invalid("chaîne non vide attendue")),
+            },
+            "thinking" => match v {
+                toml::Value::Boolean(b) => out.thinking = Some(*b),
+                _ => return Err(invalid("booléen attendu, true ou false")),
+            },
+            "effort" => match v.as_str().and_then(Effort::parse) {
+                Some(e) => out.effort = Some(e),
+                None => {
+                    return Err(invalid(
+                        "\"low\", \"medium\", \"high\" ou \"default\" attendu",
+                    ))
+                }
+            },
+            "max_output_tokens" => {
+                out.max_output_tokens =
+                    Some(capped(1, "entier strictement positif attendu")? as u32)
+            }
+            "max_context_chars" => {
+                out.max_context_chars = Some(capped(
+                    ASK_MIN_CONTEXT_CHARS as i64,
+                    &format!("entier d'au moins {ASK_MIN_CONTEXT_CHARS} attendu"),
+                )? as usize)
+            }
+            "max_seeds" => {
+                out.max_seeds = Some(capped(1, "entier strictement positif attendu")? as usize)
+            }
+            "max_nodes" => {
+                out.max_nodes = Some(capped(1, "entier strictement positif attendu")? as usize)
+            }
+            _ => unreachable!("réglage hors de ASK_SETTINGS : {key}"),
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +285,17 @@ pub const DEFAULT_EFFORT: Effort = Effort::Low;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 
 impl Effort {
+    /// Niveau écrit dans un fichier : `low`, `medium`, `high` ou `default`.
+    pub fn parse(s: &str) -> Option<Effort> {
+        match s {
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            "default" => Some(Effort::ModelDefault),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Effort::Low => "low",
@@ -183,6 +336,8 @@ pub struct Config {
     pub tls_ca_certs: Vec<CertificateDer<'static>>,
     /// Désactive le contrôle du certificat du serveur (REQ-036).
     pub tls_insecure: bool,
+    /// Section `[ask]` de la configuration personnelle (REQ-162).
+    pub ask: AskOverrides,
 }
 
 #[derive(Deserialize)]
@@ -203,6 +358,21 @@ struct RawConfig {
     max_output_tokens: Option<toml::Value>,
     tls_ca_cert: Option<String>,
     tls_insecure: Option<bool>,
+    ask: Option<toml::Value>,
+}
+
+/// Section `[ask]` de la configuration personnelle : une clé inconnue garde le message du
+/// lecteur TOML (REQ-162) ; les valeurs sont validées à la main.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAsk {
+    model: Option<toml::Value>,
+    thinking: Option<toml::Value>,
+    effort: Option<toml::Value>,
+    max_output_tokens: Option<toml::Value>,
+    max_context_chars: Option<toml::Value>,
+    max_seeds: Option<toml::Value>,
+    max_nodes: Option<toml::Value>,
 }
 
 /// Chemin du fichier de configuration : `NEPHILA_CONFIG`, sinon
@@ -276,6 +446,80 @@ impl Config {
             from_project.retain(|k| *k != "format_retries");
         }
         (self, from_project)
+    }
+
+    /// Configuration, bornes du contexte et marque de source de `query ask` (REQ-162, DEC-132) :
+    /// pour chaque clé de `[ask]`, la première valeur présente parmi l'option, `[ask]` du fichier
+    /// de projet, `[ask]` personnel, la valeur effective de l'enrichissement, le défaut propre.
+    /// Rend les clés du fichier de projet qui donnent une valeur de la ligne `config`, dans
+    /// l'ordre de ses champs.
+    pub fn for_ask(
+        self,
+        project: &ProjectSettings,
+        format_retries: Option<u32>,
+        context_chars: Option<usize>,
+    ) -> (Config, AskLimits, Vec<&'static str>) {
+        let personal = self.ask.clone();
+        let (mut cfg, from_project) = self.with_project(project, None, format_retries);
+        let pa = &project.ask;
+        let mut marks: Vec<&'static str> = Vec::new();
+        if pa.model.is_some() {
+            marks.push("ask.model");
+        } else if from_project.contains(&"model") && personal.model.is_none() {
+            marks.push("model");
+        }
+        if let Some(v) = pa.model.clone().or(personal.model.clone()) {
+            cfg.model = v;
+        }
+        if let Some(v) = pa.thinking.or(personal.thinking) {
+            cfg.thinking = v;
+        }
+        if pa.thinking.is_some() {
+            marks.push("ask.thinking");
+        }
+        if let Some(v) = pa.effort.or(personal.effort) {
+            cfg.effort = v;
+            cfg.effort_explicit = true;
+        }
+        if pa.effort.is_some() {
+            marks.push("ask.effort");
+        }
+        if let Some(v) = pa.max_output_tokens.or(personal.max_output_tokens) {
+            cfg.max_output_tokens = v;
+        }
+        if pa.max_output_tokens.is_some() {
+            marks.push("ask.max_output_tokens");
+        }
+        let limits = AskLimits {
+            max_context_chars: context_chars
+                .or(pa.max_context_chars)
+                .or(personal.max_context_chars)
+                .unwrap_or(DEFAULT_ASK_MAX_CONTEXT_CHARS),
+            max_seeds: pa
+                .max_seeds
+                .or(personal.max_seeds)
+                .unwrap_or(DEFAULT_ASK_MAX_SEEDS),
+            max_nodes: pa
+                .max_nodes
+                .or(personal.max_nodes)
+                .unwrap_or(DEFAULT_ASK_MAX_NODES),
+        };
+        if pa.max_context_chars.is_some() && context_chars.is_none() {
+            marks.push("ask.max_context_chars");
+        }
+        if pa.max_seeds.is_some() {
+            marks.push("ask.max_seeds");
+        }
+        if pa.max_nodes.is_some() {
+            marks.push("ask.max_nodes");
+        }
+        if from_project.contains(&"timeout_secs") {
+            marks.push("timeout_secs");
+        }
+        if from_project.contains(&"format_retries") {
+            marks.push("format_retries");
+        }
+        (cfg, limits, marks)
     }
 
     /// Charge et valide la configuration depuis l'environnement du processus.
@@ -461,6 +705,65 @@ impl Config {
                 ))
             }
         };
+        let ask = match &raw.ask {
+            None => AskOverrides::default(),
+            Some(toml::Value::Table(t)) => {
+                let a = RawAsk::deserialize(toml::Value::Table(t.clone()))
+                    .map_err(|e| Error::Message(format!("configuration invalide ({at}) : {e}")))?;
+                let key = |k: &str| format!("ask.{k}");
+                let int = |k: &str, v: &Option<toml::Value>, min: i64, what: &str| match v {
+                    None => Ok(None),
+                    Some(toml::Value::Integer(n)) if *n >= min => Ok(Some(*n)),
+                    Some(v) => Err(invalid(&key(k), what, v)),
+                };
+                let positive = "un entier strictement positif";
+                let min_chars = format!("un entier d'au moins {ASK_MIN_CONTEXT_CHARS}");
+                AskOverrides {
+                    model: match &a.model {
+                        None => None,
+                        Some(toml::Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+                        Some(v) => return Err(invalid("ask.model", "une chaîne non vide", v)),
+                    },
+                    thinking: match &a.thinking {
+                        None => None,
+                        Some(toml::Value::Boolean(b)) => Some(*b),
+                        Some(v) => {
+                            return Err(invalid("ask.thinking", "un booléen, true ou false", v))
+                        }
+                    },
+                    effort: match &a.effort {
+                        None => None,
+                        Some(v) => match v.as_str().and_then(Effort::parse) {
+                            Some(e) => Some(e),
+                            None => {
+                                return Err(invalid(
+                                    "ask.effort",
+                                    "\"low\", \"medium\", \"high\" ou \"default\"",
+                                    v,
+                                ))
+                            }
+                        },
+                    },
+                    max_output_tokens: match &a.max_output_tokens {
+                        None => None,
+                        Some(toml::Value::Integer(n)) if (1..=i64::from(u32::MAX)).contains(n) => {
+                            Some(*n as u32)
+                        }
+                        Some(v) => return Err(invalid("ask.max_output_tokens", positive, v)),
+                    },
+                    max_context_chars: int(
+                        "max_context_chars",
+                        &a.max_context_chars,
+                        ASK_MIN_CONTEXT_CHARS as i64,
+                        &min_chars,
+                    )?
+                    .map(|n| n as usize),
+                    max_seeds: int("max_seeds", &a.max_seeds, 1, positive)?.map(|n| n as usize),
+                    max_nodes: int("max_nodes", &a.max_nodes, 1, positive)?.map(|n| n as usize),
+                }
+            }
+            Some(v) => return Err(invalid("ask", "une table [ask]", v)),
+        };
         Ok(Config {
             provider,
             model,
@@ -487,6 +790,7 @@ impl Config {
             tls_ca_cert,
             tls_ca_certs,
             tls_insecure: raw.tls_insecure.unwrap_or(false),
+            ask,
         })
     }
 
@@ -584,6 +888,7 @@ mod project_tests {
             tls_ca_cert: None,
             tls_ca_certs: Vec::new(),
             tls_insecure: true,
+            ask: AskOverrides::default(),
         }
     }
 
@@ -995,5 +1300,506 @@ mod llm_options_tests {
                 "{line}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+
+    const P: &str = "/x/config.toml";
+
+    fn personal(extra: &str) -> Result<Config> {
+        Config::parse(&format!("provider = \"mock\"\n{extra}"), Path::new(P))
+    }
+
+    fn project(toml: &str) -> Result<ProjectSettings> {
+        ProjectSettings::from_table(&toml.parse().unwrap(), "./.nephila.toml")
+    }
+
+    #[test]
+    fn req162_ac1_chargeur_personnel() {
+        assert_eq!(personal("").unwrap().ask, AskOverrides::default());
+        assert_eq!(
+            personal("[ask]\n").unwrap().ask,
+            AskOverrides::default(),
+            "[ask] vide"
+        );
+        let c = personal(
+            "model = \"m-glob\"\nmax_output_tokens = 99\n[ask]\nmodel = \"m-ask\"\nthinking = true\n\
+             effort = \"default\"\nmax_output_tokens = 2048\nmax_context_chars = 30000\n\
+             max_seeds = 30\nmax_nodes = 120\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.ask,
+            AskOverrides {
+                model: Some("m-ask".into()),
+                thinking: Some(true),
+                effort: Some(Effort::ModelDefault),
+                max_output_tokens: Some(2048),
+                max_context_chars: Some(30000),
+                max_seeds: Some(30),
+                max_nodes: Some(120),
+            }
+        );
+        // Les clés globales ne bougent pas.
+        assert_eq!((c.model.as_str(), c.max_output_tokens), ("m-glob", 99));
+        assert!(!c.thinking && !c.effort_explicit);
+        // Table en ligne : une table.
+        let inline = personal("ask = { model = \"m\" }").unwrap();
+        assert_eq!(inline.ask.model.as_deref(), Some("m"));
+        // Les 7 clés acceptées dans la section.
+        let e = personal("[ask]\nzz = 1").unwrap_err().to_string();
+        assert!(
+            e.starts_with("configuration invalide (/x/config.toml) : "),
+            "{e}"
+        );
+        assert!(e.contains("zz"), "{e}");
+        for key in ASK_SETTINGS {
+            assert!(e.contains(&format!("`{key}`")), "{key} : {e}");
+        }
+        let e = personal("[ask]\nbase_url = \"http://127.0.0.1:9\"").unwrap_err();
+        assert!(e.to_string().contains("base_url"), "{e}");
+    }
+
+    #[test]
+    fn req162_ac7_fautes_de_la_configuration_personnelle() {
+        let cases = [
+            ("model = \"\"", "ask.model", "une chaîne non vide", "\"\""),
+            (
+                "thinking = \"oui\"",
+                "ask.thinking",
+                "un booléen, true ou false",
+                "\"oui\"",
+            ),
+            (
+                "effort = \"max\"",
+                "ask.effort",
+                "\"low\", \"medium\", \"high\" ou \"default\"",
+                "\"max\"",
+            ),
+            (
+                "max_output_tokens = 0",
+                "ask.max_output_tokens",
+                "un entier strictement positif",
+                "0",
+            ),
+            (
+                "max_context_chars = 999",
+                "ask.max_context_chars",
+                "un entier d'au moins 1000",
+                "999",
+            ),
+            (
+                "max_seeds = 0",
+                "ask.max_seeds",
+                "un entier strictement positif",
+                "0",
+            ),
+            (
+                "max_nodes = -1",
+                "ask.max_nodes",
+                "un entier strictement positif",
+                "-1",
+            ),
+        ];
+        for (line, key, expected, shown) in cases {
+            let e = personal(&format!("[ask]\n{line}")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "configuration invalide ({P}) : clé « {key} » doit être {expected} (reçu : {shown})"
+                )
+            );
+        }
+        for v in ["3", "\"x\""] {
+            let e = personal(&format!("ask = {v}")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("configuration invalide ({P}) : clé « ask » doit être une table [ask] (reçu : {v})")
+            );
+        }
+        // Sans plafond : acceptés (AC-163-5).
+        let c = personal("[ask]\nmax_context_chars = 1000000\nmax_seeds = 1000\nmax_nodes = 10000\nmax_output_tokens = 99999")
+            .unwrap();
+        assert_eq!(c.ask.max_context_chars, Some(1_000_000));
+        assert_eq!(c.ask.max_seeds, Some(1000));
+        assert_eq!(c.ask.max_nodes, Some(10_000));
+        assert_eq!(c.ask.max_output_tokens, Some(99_999));
+        let c = personal("[ask]\nmax_context_chars = 1000").unwrap();
+        assert_eq!(c.ask.max_context_chars, Some(ASK_MIN_CONTEXT_CHARS));
+    }
+
+    #[test]
+    fn req162_ac2_from_table() {
+        assert_eq!(
+            ASK_CAPS,
+            [
+                ("max_output_tokens", 16384),
+                ("max_context_chars", 100_000),
+                ("max_seeds", 100),
+                ("max_nodes", 500)
+            ]
+        );
+        assert_eq!(ask_cap("max_nodes"), Some(500));
+        assert_eq!(ask_cap("model"), None);
+        assert_eq!(
+            ASK_SETTINGS,
+            [
+                "model",
+                "thinking",
+                "effort",
+                "max_output_tokens",
+                "max_context_chars",
+                "max_seeds",
+                "max_nodes"
+            ]
+        );
+        let s = project(
+            "[ask]\nmodel = \"m\"\nthinking = false\neffort = \"high\"\nmax_output_tokens = 16384\n\
+             max_context_chars = 100000\nmax_seeds = 100\nmax_nodes = 500\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.ask,
+            AskOverrides {
+                model: Some("m".into()),
+                thinking: Some(false),
+                effort: Some(Effort::High),
+                max_output_tokens: Some(16384),
+                max_context_chars: Some(100_000),
+                max_seeds: Some(100),
+                max_nodes: Some(500),
+            }
+        );
+        assert_eq!(project("").unwrap().ask, AskOverrides::default());
+        // Tous les réglages du premier niveau et les 7 clés au plafond, ensemble.
+        let all = project(
+            "model = \"m\"\nmax_chunk_chars = 1000000\nconcurrency = 64\ntimeout_secs = 3600\n\
+             batch_files = 100\nformat_retries = 10\n[ask]\nmax_output_tokens = 16384\n\
+             max_context_chars = 100000\nmax_seeds = 100\nmax_nodes = 500\n",
+        )
+        .unwrap();
+        assert_eq!(all.ask.max_nodes, Some(500));
+        assert_eq!(all.format_retries, Some(10));
+        // Plafond et texte d'E-10.
+        for (key, cap) in ASK_CAPS {
+            let e = project(&format!("[ask]\n{key} = {}", cap + 1)).unwrap_err();
+            let expected = if key == "max_context_chars" {
+                "entier d'au moins 1000 attendu".to_string()
+            } else {
+                "entier strictement positif attendu".to_string()
+            };
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "./.nephila.toml : clé `ask.{key}` : valeur invalide `{}` ({expected}, au plus {cap})",
+                    cap + 1
+                )
+            );
+        }
+        let e = project("[ask]\nmax_output_tokens = 16385").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "./.nephila.toml : clé `ask.max_output_tokens` : valeur invalide `16385` (entier strictement positif attendu, au plus 16384)"
+        );
+        // Valeurs de AC-163-5 en projet.
+        for (key, v) in [
+            ("max_context_chars", "100001"),
+            ("max_context_chars", "999"),
+            ("max_seeds", "101"),
+            ("max_seeds", "0"),
+            ("max_nodes", "501"),
+            ("max_nodes", "-1"),
+        ] {
+            let e = project(&format!("[ask]\n{key} = {v}")).unwrap_err();
+            assert!(
+                e.to_string().starts_with(&format!(
+                    "./.nephila.toml : clé `ask.{key}` : valeur invalide `{v}` ("
+                )),
+                "{e}"
+            );
+        }
+        let e = project("[ask]\nmax_context_chars = 1000").unwrap();
+        assert_eq!(e.ask.max_context_chars, Some(1000));
+        // Valeurs sans plafond : réglages invalides de types.
+        for (line, key, shown, expected) in [
+            ("model = \"\"", "model", "\"\"", "chaîne non vide attendue"),
+            (
+                "thinking = \"oui\"",
+                "thinking",
+                "\"oui\"",
+                "booléen attendu, true ou false",
+            ),
+            (
+                "effort = \"max\"",
+                "effort",
+                "\"max\"",
+                "\"low\", \"medium\", \"high\" ou \"default\" attendu",
+            ),
+        ] {
+            let e = project(&format!("[ask]\n{line}")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "./.nephila.toml : clé `ask.{key}` : valeur invalide `{shown}` ({expected})"
+                )
+            );
+        }
+        // Clés inconnues, clés de connexion comprises ; `ask` qui n'est pas une table.
+        let list = ASK_SETTINGS.join(", ");
+        for key in [
+            "zz",
+            "base_url",
+            "provider",
+            "tls_insecure",
+            "format_retries",
+        ] {
+            let e = project(&format!("[ask]\n{key} = \"http://127.0.0.1:9\"")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("./.nephila.toml : clé inconnue `ask.{key}` (clés permises dans [ask] : {list})")
+            );
+        }
+        let e = project("ask = 3").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "./.nephila.toml : clé `ask` : valeur invalide `3` (table [ask] attendue)"
+        );
+        // Premier niveau d'abord, puis [ask].
+        let e = project("[ask]\nmax_nodes = 501\n").unwrap_err();
+        assert!(e.to_string().contains("ask.max_nodes"));
+        let e = project("concurrency = 0\n[ask]\nmodel = \"\"\n").unwrap_err();
+        assert!(e.to_string().contains("clé `concurrency`"), "{e}");
+    }
+
+    fn base() -> Config {
+        personal("model = \"m-perso\"").unwrap()
+    }
+
+    fn with_ask(ask: AskOverrides) -> Config {
+        Config { ask, ..base() }
+    }
+
+    #[test]
+    fn req162_ac3_fusion_for_ask() {
+        // Sans [ask] : valeurs de l'enrichissement, défauts propres.
+        let (c, l, m) = base().for_ask(&ProjectSettings::default(), None, None);
+        assert_eq!(
+            (
+                c.model.as_str(),
+                c.thinking,
+                c.effort,
+                c.effort_explicit,
+                c.max_output_tokens
+            ),
+            ("m-perso", false, Effort::Low, false, 16384)
+        );
+        assert_eq!(l, AskLimits::default());
+        assert!(m.is_empty());
+
+        // model : global projet, [ask] personnel, [ask] projet.
+        let proj_model = ProjectSettings {
+            model: Some("m-projet".into()),
+            ..Default::default()
+        };
+        let (c, _, m) = base().for_ask(&proj_model, None, None);
+        assert_eq!(c.model, "m-projet");
+        assert_eq!(m, vec!["model"]);
+        let perso_ask = AskOverrides {
+            model: Some("m-ask".into()),
+            ..Default::default()
+        };
+        let (c, _, m) = with_ask(perso_ask.clone()).for_ask(&proj_model, None, None);
+        assert_eq!(c.model, "m-ask");
+        assert!(m.is_empty(), "{m:?}");
+        let proj_ask = ProjectSettings {
+            ask: AskOverrides {
+                model: Some("m-ask-projet".into()),
+                ..Default::default()
+            },
+            ..proj_model.clone()
+        };
+        let (c, _, m) = with_ask(perso_ask).for_ask(&proj_ask, None, None);
+        assert_eq!(c.model, "m-ask-projet");
+        assert_eq!(m, vec!["ask.model"]);
+
+        // thinking, effort, max_output_tokens : même gradation, chacun seul.
+        let glob = Config {
+            thinking: true,
+            effort: Effort::Medium,
+            effort_explicit: true,
+            max_output_tokens: 777,
+            ..base()
+        };
+        let (c, _, _) = glob
+            .clone()
+            .for_ask(&ProjectSettings::default(), None, None);
+        assert_eq!(
+            (c.thinking, c.effort, c.effort_explicit, c.max_output_tokens),
+            (true, Effort::Medium, true, 777)
+        );
+        let perso = Config {
+            ask: AskOverrides {
+                thinking: Some(false),
+                effort: Some(Effort::High),
+                max_output_tokens: Some(2048),
+                ..Default::default()
+            },
+            ..glob
+        };
+        let (c, _, m) = perso
+            .clone()
+            .for_ask(&ProjectSettings::default(), None, None);
+        assert_eq!(
+            (c.thinking, c.effort, c.max_output_tokens),
+            (false, Effort::High, 2048)
+        );
+        assert!(m.is_empty());
+        let proj = ProjectSettings {
+            ask: AskOverrides {
+                thinking: Some(true),
+                effort: Some(Effort::Low),
+                max_output_tokens: Some(1024),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (c, _, m) = perso.for_ask(&proj, None, None);
+        assert_eq!(
+            (c.thinking, c.effort, c.max_output_tokens),
+            (true, Effort::Low, 1024)
+        );
+        assert_eq!(
+            m,
+            vec!["ask.thinking", "ask.effort", "ask.max_output_tokens"]
+        );
+
+        // effort_explicit : [ask].effort d'un fichier ou effort global écrit, rien d'autre.
+        let (c, _, _) = base().for_ask(
+            &ProjectSettings {
+                ask: AskOverrides {
+                    effort: Some(Effort::Low),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+        assert!(c.effort_explicit);
+        let (c, _, _) = with_ask(AskOverrides {
+            effort: Some(Effort::Low),
+            ..Default::default()
+        })
+        .for_ask(&ProjectSettings::default(), None, None);
+        assert!(c.effort_explicit);
+        let (c, _, _) = Config {
+            effort_explicit: true,
+            ..base()
+        }
+        .for_ask(&ProjectSettings::default(), None, None);
+        assert!(c.effort_explicit);
+        let (c, _, _) = with_ask(AskOverrides {
+            thinking: Some(true),
+            ..Default::default()
+        })
+        .for_ask(&ProjectSettings::default(), None, None);
+        assert!(!c.effort_explicit);
+    }
+
+    #[test]
+    fn req162_ac3_bornes_option_projet_personnel_defaut() {
+        let perso = with_ask(AskOverrides {
+            max_context_chars: Some(5000),
+            max_seeds: Some(7),
+            max_nodes: Some(70),
+            ..Default::default()
+        });
+        let (_, l, m) = perso
+            .clone()
+            .for_ask(&ProjectSettings::default(), None, None);
+        assert_eq!(
+            l,
+            AskLimits {
+                max_context_chars: 5000,
+                max_seeds: 7,
+                max_nodes: 70
+            }
+        );
+        assert!(m.is_empty());
+        let proj = ProjectSettings {
+            timeout_secs: Some(600),
+            format_retries: Some(3),
+            ask: AskOverrides {
+                max_context_chars: Some(2000),
+                max_seeds: Some(8),
+                max_nodes: Some(30),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (c, l, m) = perso.clone().for_ask(&proj, None, None);
+        assert_eq!(
+            l,
+            AskLimits {
+                max_context_chars: 2000,
+                max_seeds: 8,
+                max_nodes: 30
+            }
+        );
+        assert_eq!((c.timeout_secs, c.format_retries), (600, 3));
+        assert_eq!(
+            m,
+            vec![
+                "ask.max_context_chars",
+                "ask.max_seeds",
+                "ask.max_nodes",
+                "timeout_secs",
+                "format_retries"
+            ]
+        );
+        // Options : --context-chars l'emporte et sort de la marque, --format-retries aussi.
+        let (c, l, m) = perso.for_ask(&proj, Some(1), Some(20_000));
+        assert_eq!(l.max_context_chars, 20_000);
+        assert_eq!(c.format_retries, 1);
+        assert_eq!(m, vec!["ask.max_seeds", "ask.max_nodes", "timeout_secs"]);
+    }
+
+    #[test]
+    fn req162_ac3_enrichissement_egal_a_with_project() {
+        let p = ProjectSettings {
+            model: Some("m-projet".into()),
+            concurrency: Some(3),
+            ask: AskOverrides {
+                model: Some("m-ask".into()),
+                max_nodes: Some(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let without_ask = ProjectSettings {
+            ask: AskOverrides::default(),
+            ..p.clone()
+        };
+        let b = with_ask(AskOverrides {
+            thinking: Some(true),
+            ..Default::default()
+        });
+        let (enrich, from) = b.clone().with_project(&p, None, Some(0));
+        let (reference, from_ref) = Config {
+            ask: AskOverrides::default(),
+            ..b.clone()
+        }
+        .with_project(&without_ask, None, Some(0));
+        assert_eq!(enrich.model, reference.model);
+        assert_eq!(enrich.thinking, reference.thinking);
+        assert_eq!(from, from_ref);
+        assert_eq!(enrich.model, "m-projet");
+        // `for_ask` partage le reste avec `with_project`.
+        let (ask, _, _) = b.for_ask(&p, None, None);
+        assert_eq!(ask.concurrency, 3);
+        assert_eq!(ask.model, "m-ask");
     }
 }

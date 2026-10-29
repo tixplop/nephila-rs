@@ -247,6 +247,21 @@ fn REQ058_AC15_aide_sans_les_options_llm() {
             .unwrap();
         assert!(o.status.success());
         let h = String::from_utf8_lossy(&o.stdout);
+        // Les deux lignes « Réglages de query ask seulement » de l'aide de `build` et `update`
+        // (design.md V-001, REQ-164) nomment les clés de `[ask]` : hors de ces lignes seulement.
+        let mut skip = 0u8;
+        let h: String = h
+            .lines()
+            .filter(|l| {
+                if l.starts_with("Réglages de query ask seulement") {
+                    skip = 2;
+                }
+                let drop = skip > 0;
+                skip = skip.saturating_sub(1);
+                !drop
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         for k in ["thinking", "effort", "max_output_tokens"] {
             assert!(!h.contains(k), "{args:?} contient {k}");
         }

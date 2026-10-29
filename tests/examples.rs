@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use nephila::config::{
-    Config, ProjectSettings, Provider, DEFAULT_BATCH_FILES, DEFAULT_CONCURRENCY,
-    DEFAULT_FORMAT_RETRIES, DEFAULT_MAX_CHUNK_CHARS, DEFAULT_TIMEOUT_SECS, PROJECT_CAPS,
-    PROJECT_SETTINGS,
+    AskOverrides, Config, ProjectSettings, Provider, ASK_CAPS, ASK_SETTINGS, DEFAULT_BATCH_FILES,
+    DEFAULT_CONCURRENCY, DEFAULT_FORMAT_RETRIES, DEFAULT_MAX_CHUNK_CHARS, DEFAULT_TIMEOUT_SECS,
+    PROJECT_CAPS, PROJECT_SETTINGS,
 };
 use nephila::filter::{FileType, Filters, ProjectFile, ProjectFilters};
 
@@ -34,9 +34,32 @@ fn key_of(line: &str) -> Option<&str> {
     is_key(key).then_some(key)
 }
 
-/// Clés écrites dans le texte (lignes actives ou désactivées), dans l'ordre, sans doublon.
+/// Ligne qui ouvre la section `[ask]`, désactivée dans les exemples (REQ-164).
+const ASK_HEADER: &str = "# [ask]";
+
+/// Clés du premier niveau écrites dans le texte (lignes actives ou désactivées), sans doublon,
+/// plus `ask` quand la ligne `# [ask]` est écrite ; les clés qui la suivent sont celles de la
+/// section (`ask_keys_written`).
 fn keys_written(text: &str) -> BTreeSet<String> {
-    text.lines().filter_map(key_of).map(String::from).collect()
+    let mut keys: BTreeSet<String> = text
+        .lines()
+        .take_while(|l| *l != ASK_HEADER)
+        .filter_map(key_of)
+        .map(String::from)
+        .collect();
+    if text.lines().any(|l| l == ASK_HEADER) {
+        keys.insert("ask".to_string());
+    }
+    keys
+}
+
+/// Clés écrites après la ligne `# [ask]`, c'est-à-dire dans la section.
+fn ask_keys_written(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .skip_while(|l| *l != ASK_HEADER)
+        .filter_map(key_of)
+        .map(String::from)
+        .collect()
 }
 
 /// Clés acceptées par le chargeur, extraites de son erreur sur une clé inconnue (DEC-051).
@@ -86,7 +109,7 @@ fn reactivate(lines: &[String]) -> Vec<String> {
     lines
         .iter()
         .map(|l| match l.strip_prefix("# ") {
-            Some(rest) if key_of(l).is_some() => rest.to_string(),
+            Some(rest) if key_of(l).is_some() || l == ASK_HEADER => rest.to_string(),
             _ => l.clone(),
         })
         .collect()
@@ -242,6 +265,10 @@ fn REQ041_AC5_chaque_cle_est_documentee() {
     let text = example("config.toml");
     let lines: Vec<&str> = text.lines().collect();
     for key in keys_written(&text) {
+        // `ask` est la section : ses clés sont documentées une à une (AC-164-1).
+        if key == "ask" {
+            continue;
+        }
         let index = lines
             .iter()
             .position(|l| key_of(l) == Some(key.as_str()))
@@ -579,8 +606,10 @@ fn REQ042_AC12_lignes_reactivees_donnent_les_reglages_ecrits() {
     assert_eq!(file.filters, reference);
     assert_eq!(file.filters.patterns, vec!["docs/legacy/", "*.min.js"]);
     // Réglages : égaux aux valeurs écrites.
+    // Premier niveau seulement : la section `[ask]` a ses propres clés (AC-164-2).
     let written: Vec<(&str, String)> = activated
         .iter()
+        .take_while(|l| *l != "[ask]")
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| {
             let key = key_of(l)?;
@@ -685,7 +714,21 @@ fn REQ042_AC20_lignes_de_plafond_de_l_exemple() {
         .iter()
         .filter(|l| l.starts_with("# Plafond dans ce fichier :"))
         .count();
-    assert_eq!(count, 5);
+    assert_eq!(count, 5 + ASK_CAPS.len());
+    for (key, cap) in ASK_CAPS {
+        let at = lines.iter().position(|l| *l == ASK_HEADER).unwrap();
+        let index = at
+            + lines[at..]
+                .iter()
+                .position(|l| key_of(l) == Some(key))
+                .unwrap();
+        assert!(lines[index - 1].starts_with("# Priorité : "), "ask.{key}");
+        assert_eq!(
+            lines[index - 2],
+            format!("# Plafond dans ce fichier : au plus {cap}."),
+            "ask.{key}"
+        );
+    }
     let model = lines
         .iter()
         .position(|l| key_of(l) == Some("model"))
@@ -801,9 +844,11 @@ fn REQ041_AC11_blocs_des_options_llm_de_l_exemple_de_config() {
             assert!(joined.contains(w), "absent : {w}");
         }
     }
+    // Au premier niveau seulement : la section `[ask]`, en fin de fichier, les permet (REQ-162).
     let project = example("nephila.toml");
+    let first_level = project.split(ASK_HEADER).next().unwrap();
     for k in ["effort", "thinking", "max_output_tokens"] {
-        assert!(!project.contains(k), "{k} dans nephila.toml");
+        assert!(!first_level.contains(k), "{k} dans nephila.toml");
     }
 }
 
@@ -1304,7 +1349,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 41_000, "README : {size} octets");
+    assert!(size <= 42_000, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1734,9 +1779,26 @@ fn REQ155_AC3c_cles_de_configuration() {
     }
     let project = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
     for key in project_accepted_keys() {
+        // `ask` est la section : le README l'écrit `[ask]`.
+        let cited = if key == "ask" {
+            "`[ask]`".to_string()
+        } else {
+            format!("`{key}`")
+        };
         assert!(
-            project.contains(&format!("`{key}`")),
+            project.contains(&cited),
             "clé absente de `### Fichier de projet` : {key}"
+        );
+    }
+    // Les clés de `[ask]` (AC-164-3) : dans le paragraphe **Section `[ask]`**.
+    let paragraph = llm
+        .lines()
+        .find(|l| l.starts_with("**Section `[ask]`**"))
+        .expect("paragraphe Section [ask]");
+    for key in ASK_SETTINGS {
+        assert!(
+            paragraph.contains(&format!("`{key}`")),
+            "clé de [ask] absente du paragraphe : {key}"
         );
     }
 }
@@ -1761,6 +1823,13 @@ fn REQ155_AC3e_plafonds() {
     let section = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
     for (key, cap) in PROJECT_CAPS {
         let row = format!("| `{key}` | {cap} |");
+        assert!(
+            section.lines().any(|l| l == row),
+            "ligne de plafond absente : {row}"
+        );
+    }
+    for (key, cap) in ASK_CAPS {
+        let row = format!("| `ask.{key}` | {cap} |");
         assert!(
             section.lines().any(|l| l == row),
             "ligne de plafond absente : {row}"
@@ -1810,5 +1879,60 @@ fn REQ155_AC3g_memoire_en_mio() {
             expected.to_string(),
             "nombre de Mio du README différent de RETAIN_BUDGET"
         );
+    }
+}
+
+#[test]
+fn REQ164_AC1_section_ask_de_la_configuration_personnelle() {
+    let text = example("config.toml");
+    let written = ask_keys_written(&text);
+    let accepted: BTreeSet<String> = ASK_SETTINGS.iter().map(|k| k.to_string()).collect();
+    assert_eq!(written, accepted);
+    // Chaque clé a sa ligne désactivée, et la ligne `# [ask]` est la dernière de ce niveau.
+    assert_eq!(text.lines().filter(|l| *l == ASK_HEADER).count(), 1);
+    // Lignes réactivées : acceptées, et lues telles qu'écrites.
+    let section = reactivate(&section(&text, "Réglages de query ask"));
+    let c = parse(&format!("provider = \"mock\"\n{}", join(&section)));
+    assert_eq!(c.model, "mock");
+    assert_eq!(
+        c.ask,
+        AskOverrides {
+            model: Some("claude-opus-5-5".into()),
+            thinking: Some(true),
+            effort: Some(nephila::config::Effort::Medium),
+            max_output_tokens: Some(4096),
+            max_context_chars: Some(30000),
+            max_seeds: Some(30),
+            max_nodes: Some(120),
+        }
+    );
+}
+
+#[test]
+fn REQ164_AC2_section_ask_du_fichier_de_projet() {
+    let text = example("nephila.toml");
+    let accepted: BTreeSet<String> = ASK_SETTINGS.iter().map(|k| k.to_string()).collect();
+    assert_eq!(ask_keys_written(&text), accepted);
+    let lines = project_example_lines();
+    let (_tmp, repo) = repo_with_project_file(&join(&reactivate(&lines)));
+    let file = ProjectFile::load(&repo).unwrap();
+    let a = &file.settings.ask;
+    assert_eq!(a.model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(a.thinking, Some(true));
+    assert_eq!(a.effort, Some(nephila::config::Effort::Medium));
+    assert_eq!(a.max_output_tokens, Some(4096));
+    assert_eq!(a.max_context_chars, Some(30000));
+    assert_eq!(a.max_seeds, Some(30));
+    assert_eq!(a.max_nodes, Some(120));
+    // Les valeurs écrites sont sous les plafonds, qui viennent d'ASK_CAPS.
+    for (key, cap) in ASK_CAPS {
+        let value: u64 = match key {
+            "max_output_tokens" => a.max_output_tokens.map(u64::from),
+            "max_context_chars" => a.max_context_chars.map(|v| v as u64),
+            "max_seeds" => a.max_seeds.map(|v| v as u64),
+            _ => a.max_nodes.map(|v| v as u64),
+        }
+        .unwrap();
+        assert!(value <= cap, "{key} = {value} dépasse {cap}");
     }
 }

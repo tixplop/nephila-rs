@@ -103,6 +103,8 @@ Filtres durables (lus aussi par status et query) : fichier .nephila.toml à la r
 Exclus par défaut, à tout niveau : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ; pour les analyser : exclude_defaults = false dans le même fichier
 Réglages LLM du dépôt, dans le même fichier (prioritaires sur la configuration personnelle) :
   model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries
+Réglages de query ask seulement, dans une section [ask] à la fin du même fichier :
+  model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes
 Exemple : nephila build --exclude '*.min.js' --exclude-type json,yaml";
 
 #[derive(Debug, Args)]
@@ -343,5 +345,6 @@ mod help_tests {
     #[test]
     fn req037_ac18_aide_cite_les_reglages_de_projet() {
         assert!(super::FILTERS_HELP.contains(&crate::config::PROJECT_SETTINGS.join(", ")));
+        assert!(super::FILTERS_HELP.contains(&crate::config::ASK_SETTINGS.join(", ")));
     }
 }
