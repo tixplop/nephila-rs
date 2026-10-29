@@ -994,3 +994,120 @@ fn req162_ac9_ask_sans_effet_sur_update_et_sur_la_ligne_config_de_build() {
         assert!(!line.contains("ask"), "{line}");
     }
 }
+
+// ---- T-249 : `query ask` suit la section [ask] (REQ-162) ----
+
+/// `build` puis `query ask Alpha` : (corps d'enrichissement, corps `ask`) ; `project` est écrit
+/// dans `.nephila.toml` avant le `build` ; `project_ask` y est ajouté avant la question.
+fn split_bodies(
+    provider: &str,
+    model: &str,
+    extra: &str,
+    project: Option<&str>,
+    project_ask: Option<&str>,
+) -> (serde_json::Value, serde_json::Value) {
+    let h = Http::with_model(
+        provider,
+        model,
+        extra,
+        vec![
+            reply(provider, &enrichment()),
+            reply(provider, ASK_REPLY),
+            reply(provider, ASK_REPLY),
+        ],
+    );
+    let toml = h.env.repo.join(".nephila.toml");
+    if let Some(p) = project {
+        fs::write(&toml, p).unwrap();
+    }
+    let o = h.run(&["build"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    if let Some(p) = project_ask {
+        fs::write(&toml, format!("{}{p}", project.unwrap_or(""))).unwrap();
+    }
+    let o = h.run(&["query", "ask", "Alpha"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let b = h.bodies();
+    assert_eq!(b.len(), 2, "{b:?}");
+    (b[0].clone(), b[1].clone())
+}
+
+#[test]
+fn req162_ac4_modele_et_generation_propres_a_ask_openai() {
+    let (e, a) = split_bodies(
+        "openai",
+        "m-enrich",
+        "[ask]\nmodel = \"m-ask\"\nmax_output_tokens = 2048\neffort = \"medium\"\n",
+        None,
+        None,
+    );
+    assert_eq!(e["model"], "m-enrich");
+    assert_eq!(e["max_completion_tokens"], 16384);
+    no_fields(&e, &["reasoning_effort"]);
+    assert_eq!(a["model"], "m-ask");
+    assert_eq!(a["max_completion_tokens"], 2048);
+    assert_eq!(a["reasoning_effort"], "medium");
+}
+
+#[test]
+fn req162_ac4_modele_et_generation_propres_a_ask_anthropic() {
+    let (e, a) = split_bodies(
+        "anthropic",
+        "m-enrich",
+        "[ask]\nmodel = \"m-ask\"\nmax_output_tokens = 2048\neffort = \"medium\"\nthinking = true\n",
+        None,
+        None,
+    );
+    assert_eq!(e["model"], "m-enrich");
+    assert_eq!(e["max_tokens"], 16384);
+    assert_eq!(e["output_config"], serde_json::json!({"effort": "low"}));
+    no_fields(&e, &["thinking"]);
+    assert_eq!(a["model"], "m-ask");
+    assert_eq!(a["max_tokens"], 2048);
+    assert_eq!(a["thinking"], serde_json::json!({"type": "adaptive"}));
+    assert_eq!(a["output_config"], serde_json::json!({"effort": "medium"}));
+}
+
+#[test]
+fn req162_ac5_priorite_entre_les_fichiers() {
+    let (e, a) = split_bodies(
+        "openai",
+        "m-perso",
+        "[ask]\nmodel = \"m-ask\"\n",
+        Some("model = \"m-projet\"\n"),
+        None,
+    );
+    assert_eq!(e["model"], "m-projet");
+    assert_eq!(a["model"], "m-ask");
+    let (e, a) = split_bodies(
+        "openai",
+        "m-perso",
+        "[ask]\nmodel = \"m-ask\"\n",
+        Some("model = \"m-projet\"\n"),
+        Some("[ask]\nmodel = \"m-ask-projet\"\n"),
+    );
+    assert_eq!(e["model"], "m-projet");
+    assert_eq!(a["model"], "m-ask-projet");
+}
+
+#[test]
+fn req162_ac6_ancien_modele_claude_dans_les_deux_sens() {
+    let (e, a) = split_bodies(
+        "anthropic",
+        "claude-opus-5-5",
+        "[ask]\nmodel = \"claude-sonnet-4-5\"\n",
+        None,
+        None,
+    );
+    assert_eq!(e["output_config"], serde_json::json!({"effort": "low"}));
+    no_fields(&a, &["output_config"]);
+    let (e, a) = split_bodies(
+        "anthropic",
+        "claude-sonnet-4-5",
+        "[ask]\nmodel = \"claude-opus-5-5\"\n",
+        None,
+        None,
+    );
+    no_fields(&e, &["output_config"]);
+    assert_eq!(a["output_config"], serde_json::json!({"effort": "low"}));
+}

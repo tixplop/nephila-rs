@@ -125,13 +125,7 @@ pub(crate) fn setup(
             let (mut config, from_project) =
                 config.with_project(project, batch_files, format_retries);
             config.enrich_code |= enrich_code;
-            let mut tls_trace = String::new();
-            if let Some(p) = &config.tls_ca_cert {
-                tls_trace.push_str(&format!(" tls_ca_cert={}", p.display()));
-            }
-            if config.tls_insecure {
-                tls_trace.push_str(" tls_insecure");
-            }
+            let mut tls_trace = config.tls_trace();
             if !from_project.is_empty() {
                 tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
             }

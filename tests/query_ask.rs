@@ -715,3 +715,205 @@ fn req142_ac6_late_link_reaches_the_context_for_the_three_questions() {
     }
     assert!(missing.is_empty(), "lien absent pour : {missing:?}");
 }
+
+// ---- REQ-162, REQ-163 : ligne `config` d'`ask`, `--context-chars` ----
+
+const MOCK_CFG: &str = "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n";
+const CFG_DEFAULT: &str = "config: llm=mock model=mock thinking=false effort=low max_output_tokens=16384 max_context_chars=12000 max_seeds=20 max_nodes=60 timeout_secs=300 format_retries=2";
+
+/// Lignes `trace:` de stderr, horodatage retiré.
+fn traces(o: &Output) -> Vec<String> {
+    text(&o.stderr)
+        .lines()
+        .filter(|l| l.starts_with("trace:"))
+        .map(|l| l[l.find("] ").unwrap() + 2..].to_string())
+        .collect()
+}
+
+fn ask_ok_fixture(env: &Env) {
+    env.fixture(ASK_OK);
+}
+
+#[test]
+fn req162_ac10_ac13_config_line_template_marks_and_stdout() {
+    let env = Env::new();
+    ask_ok_fixture(&env);
+    let plain = env.ask(Q, &[]);
+    assert!(traces(&plain).is_empty() && text(&plain.stderr).is_empty());
+    // (a) gabarit exact, stdout identique, `-v` équivaut à `--verbose`.
+    for flag in ["--verbose", "-v"] {
+        let o = env.ask(Q, &[flag]);
+        assert_eq!(traces(&o), [CFG_DEFAULT], "{flag}");
+        assert_eq!(text(&o.stderr).lines().count(), 1);
+        assert_eq!(o.stdout, plain.stdout);
+        assert_eq!(o.status.code(), Some(0));
+    }
+    let json = env.ask(Q, &["--json"]);
+    let o = env.ask(Q, &["--json", "--verbose"]);
+    assert_eq!(o.stdout, json.stdout);
+    assert_eq!(traces(&o), [CFG_DEFAULT]);
+    for bad in ["enrich_code=", "concurrency=", "batch_files="] {
+        assert!(!CFG_DEFAULT.contains(bad));
+    }
+    // AC-162-10 : `[ask] model` du fichier de projet, puis `model` du premier niveau.
+    let proj = env.repo.join(".nephila.toml");
+    fs::write(&proj, "[ask]\nmodel = \"m-ask-projet\"\n").unwrap();
+    let o = env.ask(Q, &["-v"]);
+    let l = &traces(&o)[0];
+    assert!(l.contains(" model=m-ask-projet "), "{l}");
+    assert!(l.ends_with(" (.nephila.toml : ask.model)"), "{l}");
+    fs::write(&proj, "model = \"m-projet\"\n").unwrap();
+    let l = traces(&env.ask(Q, &["-v"]))[0].clone();
+    assert!(l.contains(" model=m-projet "), "{l}");
+    assert!(l.ends_with(" (.nephila.toml : model)"), "{l}");
+    // --format-retries retire format_retries de la marque.
+    fs::write(&proj, "format_retries = 3\n").unwrap();
+    let l = traces(&env.ask(Q, &["-v"]))[0].clone();
+    assert!(l.contains(" format_retries=3"), "{l}");
+    assert!(l.ends_with("(.nephila.toml : format_retries)"), "{l}");
+    let l = traces(&env.ask(Q, &["-v", "--format-retries", "1"]))[0].clone();
+    assert!(l.contains(" format_retries=1"), "{l}");
+    assert!(!l.contains(".nephila.toml"), "{l}");
+    // (b) `[ask] model` personnel l'emporte sur `model` de .nephila.toml.
+    fs::write(&proj, "model = \"m-projet\"\n").unwrap();
+    fs::write(&env.config, format!("{MOCK_CFG}[ask]\nmodel = \"m-ask\"\n")).unwrap();
+    let l = traces(&env.ask(Q, &["-v"]))[0].clone();
+    assert!(l.contains(" model=m-ask "), "{l}");
+    assert!(!l.contains(" (.nephila.toml :"), "{l}");
+    // (c) mélange, option `--context-chars`.
+    fs::write(&env.config, MOCK_CFG).unwrap();
+    fs::write(
+        &proj,
+        "timeout_secs = 600\n[ask]\nmodel = \"m-ask-projet\"\nmax_context_chars = 3000\nmax_nodes = 30\n",
+    )
+    .unwrap();
+    let l = traces(&env.ask(Q, &["-v", "--context-chars", "2000"]))[0].clone();
+    for want in [
+        " model=m-ask-projet ",
+        " max_context_chars=2000 ",
+        " max_nodes=30 ",
+        " timeout_secs=600 ",
+    ] {
+        assert!(l.contains(want), "{want} : {l}");
+    }
+    assert!(
+        l.ends_with(" (.nephila.toml : ask.model,ask.max_nodes,timeout_secs)"),
+        "{l}"
+    );
+    // (d) thinking et effort.
+    fs::write(&proj, "[ask]\nthinking = true\neffort = \"high\"\n").unwrap();
+    let l = traces(&env.ask(Q, &["-v"]))[0].clone();
+    assert!(l.contains(" model=mock thinking=true effort=high "), "{l}");
+    assert!(
+        l.ends_with(" (.nephila.toml : ask.thinking,ask.effort)"),
+        "{l}"
+    );
+}
+
+#[test]
+fn req162_ac14_config_line_place_in_stderr() {
+    let env = Env::new();
+    ask_ok_fixture(&env);
+    // (a) --check-stale : fraîcheur, puis config.
+    fs::write(env.repo.join("docs.md"), "# nouveau\n").unwrap();
+    let o = env.ask(Q, &["--verbose", "--check-stale"]);
+    let err = text(&o.stderr);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 2, "{err}");
+    assert_eq!(
+        lines[0],
+        "avertissement: graphe pas à jour : 1 fichier modifié"
+    );
+    assert!(
+        lines[1].starts_with("trace: [") && lines[1].ends_with(CFG_DEFAULT),
+        "{err}"
+    );
+    let o = env.ask(Q, &["--check-stale"]);
+    assert!(!text(&o.stderr).contains("trace:"));
+    // (b) aucun nœud de départ : config puis erreur.
+    let o = env.ask("zzzabsent qqqabsent ?", &["--verbose"]);
+    let err = text(&o.stderr);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 2, "{err}");
+    assert!(lines[0].ends_with(CFG_DEFAULT), "{err}");
+    assert_eq!(lines[1], "erreur: pas trouvé dans le graphe");
+    assert_eq!(o.status.code(), Some(1));
+    // (c) sans citation valide : config puis A-9.
+    env.fixture(r#"{"found":true,"answer":"inventé","nodes":[]}"#);
+    let o = env.ask(Q, &["--verbose"]);
+    let err = text(&o.stderr);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 2, "{err}");
+    assert!(lines[0].ends_with(CFG_DEFAULT), "{err}");
+    assert_eq!(format!("{}\n", lines[1]), A9);
+    assert_eq!(o.status.code(), Some(0));
+    let o = env.ask(Q, &[]);
+    assert_eq!(text(&o.stderr), A9);
+    // (d) erreur de configuration : seule la ligne E-15, aucune trace.
+    fs::write(&env.config, format!("{MOCK_CFG}[ask]\neffort = \"max\"\n")).unwrap();
+    let o = env.ask(Q, &["--verbose"]);
+    let err = text(&o.stderr);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.starts_with("erreur: configuration invalide"), "{err}");
+    assert!(o.stdout.is_empty());
+    assert_eq!(env.llm_calls(), 0);
+}
+
+fn openai_reply(t: &str) -> String {
+    serde_json::json!({"choices":[{"message":{"role":"assistant","content":t}}]}).to_string()
+}
+
+/// Dépôt au contexte volumineux (2000 concepts), configuration `openai` sur le faux serveur ;
+/// rend le contexte du message utilisateur de chaque `query ask`.
+fn context_sizes(personal_ask: &str, project: Option<&str>, runs: &[&[&str]]) -> Vec<usize> {
+    let env = Env::new();
+    javapoet_like(&env);
+    let reply = openai_reply(r#"{"found":true,"answer":"a","nodes":["BillingService"]}"#);
+    let server = FakeServer::start(runs.iter().map(|_| (200, reply.clone())).collect());
+    fs::write(
+        &env.config,
+        format!(
+            "provider = \"openai\"\nmodel = \"m\"\napi_key_env = \"NEPHILA_TEST_ASK_KEY\"\nbase_url = \"{}\"\n{personal_ask}",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    if let Some(p) = project {
+        fs::write(env.repo.join(".nephila.toml"), p).unwrap();
+    }
+    let mut sizes = Vec::new();
+    for extra in runs {
+        let mut args = vec!["query", "ask", "Who calls suggestedImports in CodeWriter?"];
+        args.extend_from_slice(extra);
+        let o = env
+            .cmd(&args)
+            .env("NEPHILA_TEST_ASK_KEY", "sk-test")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", text(&o.stderr));
+        let reqs = server.requests();
+        let msg = ask_user_message(&reqs[sizes.len()].body);
+        let from = msg.find("Contexte :\n").unwrap() + "Contexte :\n".len();
+        let to = msg.rfind("\nQuestion : ").unwrap();
+        sizes.push(msg[from..to].chars().count());
+    }
+    sizes
+}
+
+#[test]
+fn req163_ac4_context_chars_option_and_ask_keys_bound_the_context() {
+    let none: &[&str] = &[];
+    let sizes = context_sizes("", None, &[none, &["--context-chars", "3000"]]);
+    assert!(sizes[0] > 3000, "{sizes:?}");
+    assert!(sizes[1] <= 3000 && sizes[1] > 1500, "{sizes:?}");
+    let personal = "[ask]\nmax_context_chars = 3000\n";
+    let sizes = context_sizes(personal, None, &[none, &["--context-chars", "20000"]]);
+    assert!(sizes[0] <= 3000, "{sizes:?}");
+    assert!(sizes[1] > 3000, "{sizes:?}");
+    let sizes = context_sizes(
+        "[ask]\nmax_context_chars = 5000\n",
+        Some("[ask]\nmax_context_chars = 2000\n"),
+        &[none],
+    );
+    assert!(sizes[0] <= 2000 && sizes[0] > 1000, "{sizes:?}");
+}

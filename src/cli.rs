@@ -71,6 +71,17 @@ fn parse_community_number(s: &str) -> std::result::Result<u64, String> {
         .map_err(|_| format!("`{s}` n'est pas un entier positif ou nul"))
 }
 
+/// Entier d'au moins `ASK_MIN_CONTEXT_CHARS` (REQ-163).
+fn parse_context_chars(s: &str) -> std::result::Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if n >= crate::config::ASK_MIN_CONTEXT_CHARS => Ok(n),
+        _ => Err(format!(
+            "`{s}` n'est pas un entier d'au moins {}",
+            crate::config::ASK_MIN_CONTEXT_CHARS
+        )),
+    }
+}
+
 const FORMAT_RETRIES_HELP: &str = "Nombre de nouveaux essais d'un appel LLM dont la réponse est non conforme (remplace `format_retries` de la configuration ; défaut 2 ; 0 = aucun nouvel essai)";
 
 /// Motif `--exclude` : compilé seul, pour que l'erreur d'usage le nomme (REQ-037).
@@ -226,8 +237,14 @@ pub enum Query {
         question: String,
         #[command(flatten)]
         opts: QueryOpts,
+        /// Configuration effective de l'appel LLM sur stderr, en une ligne (préfixe `trace:`)
+        #[arg(short, long)]
+        verbose: bool,
         #[arg(help = FORMAT_RETRIES_HELP, long, value_name = "N", value_parser = parse_format_retries, allow_hyphen_values = true)]
         format_retries: Option<u32>,
+        /// Nombre maximal de caractères du contexte envoyé au LLM, au moins 1000 (remplace `max_context_chars` de la section [ask] ; défaut 12000)
+        #[arg(long, value_name = "N", value_parser = parse_context_chars, allow_hyphen_values = true)]
+        context_chars: Option<usize>,
     },
 }
 
@@ -328,13 +345,19 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
         Command::Query(Query::Ask {
             question,
             opts,
+            verbose,
             format_retries,
+            context_chars,
         }) => crate::query::ask::run(
             &cli.repo,
             question,
             opts.json.json,
             opts.check_stale,
-            *format_retries,
+            crate::query::ask::AskOptions {
+                verbose: *verbose,
+                format_retries: *format_retries,
+                context_chars: *context_chars,
+            },
             out,
         ),
     }

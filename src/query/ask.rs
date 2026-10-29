@@ -423,28 +423,62 @@ fn retain_cited(shown: &[&Node], cited: &[String]) -> Vec<Node> {
 /// Avertissement A-9 : réponse affichée sans aucun nœud cité retenu (V-006).
 const UNVERIFIABLE: &str = "réponse non vérifiable : aucun nœud cité ne figure dans le contexte envoyé ; vérifiez-la avec nephila query search";
 
+/// Options propres à `query ask` (REQ-038, REQ-162, REQ-163).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AskOptions {
+    pub verbose: bool,
+    pub format_retries: Option<u32>,
+    pub context_chars: Option<usize>,
+}
+
 pub fn run(
     repo: &Path,
     question: &str,
     as_json: bool,
     check_stale: bool,
-    format_retries: Option<u32>,
+    opts: AskOptions,
     out: &mut Out,
 ) -> Result<()> {
+    let AskOptions {
+        verbose,
+        format_retries,
+        context_chars,
+    } = opts;
+    crate::trace::init(verbose);
     if question.trim().is_empty() {
         return Err(Error::Message("la question est vide".to_string()));
     }
     let project = ProjectFile::load(repo)?;
     let config = Config::load()?;
-    let (config, _) = config.with_project(&project.settings, None, format_retries);
+    let (config, limits, marks) = config.for_ask(&project.settings, format_retries, context_chars);
     let llm = build_llm(&config)?;
     let store = super::open(repo, check_stale)?;
+    let mark = if marks.is_empty() {
+        String::new()
+    } else {
+        format!(" (.nephila.toml : {})", marks.join(","))
+    };
+    crate::trace!(
+        "config: llm={} model={} thinking={} effort={} max_output_tokens={} max_context_chars={} max_seeds={} max_nodes={} timeout_secs={} format_retries={}{}{}",
+        config.provider.as_str(),
+        config.model,
+        config.thinking,
+        config.effort.as_str(),
+        config.max_output_tokens,
+        limits.max_context_chars,
+        limits.max_seeds,
+        limits.max_nodes,
+        config.timeout_secs,
+        config.format_retries,
+        config.tls_trace(),
+        mark
+    );
     let (answer, cited) = answer(
         &store,
         llm.as_ref(),
         question,
         config.format_retries,
-        &AskLimits::default(),
+        &limits,
     )?;
     if cited.is_empty() {
         crate::error::warn(UNVERIFIABLE);

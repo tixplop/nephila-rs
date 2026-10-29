@@ -448,6 +448,18 @@ impl Config {
         (self, from_project)
     }
 
+    /// Segments TLS de la ligne `config` (REQ-036), chacun précédé d'une espace.
+    pub fn tls_trace(&self) -> String {
+        let mut s = String::new();
+        if let Some(p) = &self.tls_ca_cert {
+            s.push_str(&format!(" tls_ca_cert={}", p.display()));
+        }
+        if self.tls_insecure {
+            s.push_str(" tls_insecure");
+        }
+        s
+    }
+
     /// Configuration, bornes du contexte et marque de source de `query ask` (REQ-162, DEC-132) :
     /// pour chaque clé de `[ask]`, la première valeur présente parmi l'option, `[ask]` du fichier
     /// de projet, `[ask]` personnel, la valeur effective de l'enrichissement, le défaut propre.

@@ -193,7 +193,7 @@ Nœuds cités :
 - com.acme.core.OrderService.place (method, core/src/main/java/com/acme/core/OrderService.java)
 ```
 
-`--format-retries <N>` renvoie une réponse non conforme jusqu'à `N` fois (voir [Échecs et nouveaux essais](#échecs-et-nouveaux-essais)).
+`--format-retries <N>` renvoie une réponse non conforme jusqu'à `N` fois (voir [Échecs et nouveaux essais](#échecs-et-nouveaux-essais)). Pour une question, `--context-chars <N>` borne le contexte à N caractères ; `--verbose` écrit sur stderr la configuration de l'appel.
 
 **Graphe en retard** : une requête ne lit que le graphe et ne dit pas s'il est en retard. Avant une série de requêtes, `nephila status` le vérifie et `nephila update` le remet à jour. Avec `--check-stale`, la requête compare d'abord la taille et la date de chaque fichier à celles du graphe ; si des fichiers diffèrent, la première ligne de stderr est `avertissement: graphe pas à jour : <n> fichiers modifiés`. Ce compte est approché : un fichier seulement touché (date changée, contenu identique) est compté, jusqu'au prochain `nephila update`.
 
