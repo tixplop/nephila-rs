@@ -502,7 +502,7 @@ fn req055_ac2_ask_request_body_identical_to_0_18_0() {
     )]);
     http_env(&env, &server);
     let mut cfg = fs::read_to_string(&env.config).unwrap();
-    cfg.push_str("max_output_tokens = 8192\n");
+    cfg.push_str("max_output_tokens = 8192\neffort = \"default\"\n");
     fs::write(&env.config, cfg).unwrap();
     let o = env
         .cmd(&["query", "ask", Q])

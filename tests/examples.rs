@@ -164,7 +164,11 @@ fn REQ041_AC3_chaque_section_fournisseur_seule_est_acceptee() {
 #[test]
 fn REQ041_AC4_valeurs_par_defaut_documentees_egales_aux_valeurs_reelles() {
     let text = example("config.toml");
-    let reference = parse(&text);
+    // `effort_explicit` dit seulement si la clé est écrite (REQ-157) : la valeur, elle, est comparée.
+    let reference = Config {
+        effort_explicit: true,
+        ..parse(&text)
+    };
     let common = section(&text, COMMON);
     let without_tls_ca: Vec<String> = common
         .iter()
@@ -178,7 +182,13 @@ fn REQ041_AC4_valeurs_par_defaut_documentees_egales_aux_valeurs_reelles() {
         .flat_map(|l| if common.contains(&l) { None } else { Some(l) })
         .chain(activated.clone())
         .collect();
-    assert_eq!(parse(&join(&replaced)), reference);
+    assert_eq!(
+        Config {
+            effort_explicit: true,
+            ..parse(&join(&replaced))
+        },
+        reference
+    );
     // Les lignes réactivées existent bien (le test ne passe pas à vide).
     let active: Vec<&str> = activated
         .iter()

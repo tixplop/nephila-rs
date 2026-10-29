@@ -1,13 +1,14 @@
 //! Adaptateur compatible OpenAI Chat Completions (REQ-002) : OpenAI, Ollama, llama.cpp, vLLM.
 
 use super::{http, Complete, Generation, Retry, Tls};
+use crate::config::Effort;
 use crate::error::{Error, Result, TRUNCATED};
 use std::sync::atomic::AtomicBool;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
-/// Corps de la requête `/v1/chat/completions` (REQ-058) : `reasoning_effort` seulement si la
-/// réflexion est demandée.
+/// Corps de la requête `/v1/chat/completions` (REQ-058, REQ-157, DEC-126) : `reasoning_effort`
+/// si l'effort n'est pas `"default"` et que la réflexion est demandée ou l'effort écrit.
 pub fn request_body(model: &str, gen: &Generation, system: &str, user: &str) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -17,7 +18,7 @@ pub fn request_body(model: &str, gen: &Generation, system: &str, user: &str) -> 
         ],
         "max_completion_tokens": gen.max_output_tokens,
     });
-    if gen.thinking {
+    if gen.effort != Effort::ModelDefault && (gen.thinking || gen.effort_explicit) {
         body["reasoning_effort"] = gen.effort.as_str().into();
     }
     body
@@ -103,17 +104,31 @@ mod tests {
     use super::*;
     use crate::config::Effort;
 
-    fn gen(thinking: bool, effort: Effort, max: u32) -> Generation {
+    fn gen(thinking: bool, effort: Effort, explicit: bool, max: u32) -> Generation {
         Generation {
             effort,
+            effort_explicit: explicit,
             thinking,
             max_output_tokens: max,
         }
     }
 
+    fn effort_of(thinking: bool, effort: Effort, explicit: bool) -> Option<String> {
+        let b = request_body("m", &gen(thinking, effort, explicit, 1234), "s", "u");
+        let n = b.as_object().unwrap().len();
+        for k in ["thinking", "output_config", "max_tokens"] {
+            assert!(b.get(k).is_none(), "{k}");
+        }
+        let r = b
+            .get("reasoning_effort")
+            .map(|v| v.as_str().unwrap().to_string());
+        assert_eq!(n, if r.is_some() { 4 } else { 3 });
+        r
+    }
+
     #[test]
     fn body_without_thinking_has_no_reasoning_field() {
-        let b = request_body("m", &gen(false, Effort::High, 1234), "s", "u");
+        let b = request_body("m", &gen(false, Effort::Low, false, 1234), "s", "u");
         assert_eq!(
             b,
             serde_json::json!({
@@ -128,8 +143,19 @@ mod tests {
     }
 
     #[test]
+    fn req157_ac3_reasoning_effort_rules() {
+        use Effort::*;
+        assert_eq!(effort_of(false, Low, true).as_deref(), Some("low"));
+        assert_eq!(effort_of(false, Medium, true).as_deref(), Some("medium"));
+        assert_eq!(effort_of(false, ModelDefault, true), None);
+        assert_eq!(effort_of(true, Low, false).as_deref(), Some("low"));
+        assert_eq!(effort_of(true, High, true).as_deref(), Some("high"));
+        assert_eq!(effort_of(true, ModelDefault, true), None);
+    }
+
+    #[test]
     fn body_with_thinking_adds_reasoning_effort() {
-        let b = request_body("m", &gen(true, Effort::Medium, 16384), "s", "u");
+        let b = request_body("m", &gen(true, Effort::Medium, true, 16384), "s", "u");
         assert_eq!(b["reasoning_effort"], "medium");
         assert_eq!(b["max_completion_tokens"], 16384);
         assert!(b.get("max_tokens").is_none());

@@ -68,7 +68,7 @@ fn config_line(o: &Output) -> String {
 }
 
 const MOCK: &str = "provider = \"mock\"\n";
-const EFFORT: &str = "\"low\", \"medium\" ou \"high\"";
+const EFFORT: &str = "\"low\", \"medium\", \"high\" ou \"default\"";
 const BOOL: &str = "un booléen, true ou false";
 const INT: &str = "un entier strictement positif";
 
@@ -79,6 +79,9 @@ fn invalid() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
         ("effort = \"\"", "effort", EFFORT, "\"\""),
         ("effort = \"LOW\"", "effort", EFFORT, "\"LOW\""),
         ("effort = 1", "effort", EFFORT, "1"),
+        ("effort = \"none\"", "effort", EFFORT, "\"none\""),
+        ("effort = \"DEFAULT\"", "effort", EFFORT, "\"DEFAULT\""),
+        ("effort = \"auto\"", "effort", EFFORT, "\"auto\""),
         ("thinking = \"oui\"", "thinking", BOOL, "\"oui\""),
         ("thinking = 1", "thinking", BOOL, "1"),
         ("max_output_tokens = 0", "max_output_tokens", INT, "0"),
@@ -298,9 +301,13 @@ struct Http {
 
 impl Http {
     fn new(provider: &str, extra: &str, bodies: Vec<String>) -> Http {
+        Http::with_model(provider, "m", extra, bodies)
+    }
+
+    fn with_model(provider: &str, model: &str, extra: &str, bodies: Vec<String>) -> Http {
         let server = FakeServer::start(bodies.into_iter().map(|b| (200, b)).collect());
         let env = Env::new(&format!(
-            "provider = \"{provider}\"\nmodel = \"m\"\napi_key_env = \"{KEY_VAR}\"\nbase_url = \"{}\"\nconcurrency = 1\nbatch_files = 1\n{extra}",
+            "provider = \"{provider}\"\nmodel = \"{model}\"\napi_key_env = \"{KEY_VAR}\"\nbase_url = \"{}\"\nconcurrency = 1\nbatch_files = 1\n{extra}",
             server.base_url
         ));
         fs::remove_file(env.repo.join("README.md")).unwrap();
@@ -349,8 +356,13 @@ impl Http {
 }
 
 /// Enrichissement d'un document : corps de la requête.
-fn enrich_body(provider: &str, extra: &str) -> serde_json::Value {
-    let h = Http::new(provider, extra, vec![reply(provider, &enrichment()); 4]);
+fn enrich_body(provider: &str, model: &str, extra: &str) -> serde_json::Value {
+    let h = Http::with_model(
+        provider,
+        model,
+        extra,
+        vec![reply(provider, &enrichment()); 4],
+    );
     let o = h.run(&["build"]);
     assert!(o.status.success(), "{provider} {extra}: {}", stderr(&o));
     let mut b = h.bodies();
@@ -359,8 +371,8 @@ fn enrich_body(provider: &str, extra: &str) -> serde_json::Value {
 }
 
 /// `query ask` : corps de la requête.
-fn ask_body(provider: &str, extra: &str) -> serde_json::Value {
-    let h = Http::new(provider, extra, vec![reply(provider, ASK_REPLY); 4]);
+fn ask_body(provider: &str, model: &str, extra: &str) -> serde_json::Value {
+    let h = Http::with_model(provider, model, extra, vec![reply(provider, ASK_REPLY); 4]);
     let o = h.run(&["build", "--no-llm"]);
     assert!(o.status.success(), "{}", stderr(&o));
     let o = h.run(&["query", "ask", "Alpha"]);
@@ -376,42 +388,86 @@ fn no_fields(b: &serde_json::Value, keys: &[&str]) {
     }
 }
 
-#[test]
-fn REQ058_AC3_anthropic_corps_de_la_requete() {
-    for which in ["enrich", "ask"] {
-        let body = |extra: &str| {
-            if which == "enrich" {
-                enrich_body("anthropic", extra)
-            } else {
-                ask_body("anthropic", extra)
-            }
-        };
-        let b = body("");
-        assert_eq!(b["max_tokens"], 16384, "{which}");
-        no_fields(&b, &["thinking", "output_config", "max_completion_tokens"]);
-        assert_eq!(body("max_output_tokens = 1234\n")["max_tokens"], 1234);
-        let b = body("thinking = true\n");
-        assert_eq!(b["thinking"], serde_json::json!({"type": "adaptive"}));
-        assert_eq!(b["output_config"], serde_json::json!({"effort": "low"}));
-        assert_eq!(b["max_tokens"], 16384);
-        let b = body("thinking = true\neffort = \"high\"\n");
-        assert_eq!(b["output_config"], serde_json::json!({"effort": "high"}));
-        let b = body("effort = \"high\"\n");
-        no_fields(&b, &["thinking", "output_config"]);
-        let keys: Vec<&String> = b.as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 4, "{keys:?}"); // model, max_tokens, system, messages
+/// Corps reçus par les scénarios d'AC-157-4 et d'AC-157-5 (AC-157-6).
+static SEEN: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
+
+fn seen(b: serde_json::Value) -> serde_json::Value {
+    SEEN.lock().unwrap().push(b.clone());
+    b
+}
+
+/// AC-157-6 : ni `disabled`, ni `between_tools`, ni `"none"` ; `thinking` adaptatif ; effort
+/// parmi les trois niveaux.
+fn check_seen(expected_min: usize) {
+    let all = SEEN.lock().unwrap().clone();
+    assert!(all.len() >= expected_min, "{} corps", all.len());
+    for b in all {
+        let text = b.to_string();
+        for bad in ["disabled", "between_tools", "\"none\""] {
+            assert!(!text.contains(bad), "{bad} dans {text}");
+        }
+        if let Some(t) = b.get("thinking") {
+            assert_eq!(*t, serde_json::json!({"type": "adaptive"}));
+        }
+        for e in [
+            b.get("reasoning_effort").cloned(),
+            b.get("output_config").map(|o| o["effort"].clone()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                ["low", "medium", "high"].contains(&e.as_str().unwrap()),
+                "{e}"
+            );
+        }
     }
 }
 
 #[test]
-fn REQ058_AC4_openai_corps_de_la_requete() {
+fn REQ157_AC4_anthropic_corps_de_la_requete() {
+    for which in ["enrich", "ask"] {
+        let body = |model: &str, extra: &str| {
+            seen(if which == "enrich" {
+                enrich_body("anthropic", model, extra)
+            } else {
+                ask_body("anthropic", model, extra)
+            })
+        };
+        let m = "claude-opus-5-5";
+        let b = body(m, "");
+        assert_eq!(b["max_tokens"], 16384, "{which}");
+        assert_eq!(b["output_config"], serde_json::json!({"effort": "low"}));
+        no_fields(&b, &["thinking", "max_completion_tokens"]);
+        assert_eq!(body(m, "max_output_tokens = 1234\n")["max_tokens"], 1234);
+        let b = body(m, "effort = \"high\"\n");
+        assert_eq!(b["output_config"], serde_json::json!({"effort": "high"}));
+        no_fields(&b, &["thinking"]);
+        let b = body(m, "effort = \"default\"\n");
+        no_fields(&b, &["thinking", "output_config"]);
+        assert_eq!(b.as_object().unwrap().len(), 4, "{which}");
+        let b = body(m, "thinking = true\n");
+        assert_eq!(b["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(b["output_config"], serde_json::json!({"effort": "low"}));
+        assert_eq!(b["max_tokens"], 16384);
+        let b = body(m, "thinking = true\neffort = \"high\"\n");
+        assert_eq!(b["output_config"], serde_json::json!({"effort": "high"}));
+        let b = body("claude-sonnet-4-5", "");
+        no_fields(&b, &["thinking", "output_config"]);
+        assert_eq!(b.as_object().unwrap().len(), 4, "{which}");
+    }
+    check_seen(14);
+}
+
+#[test]
+fn REQ157_AC5_openai_corps_de_la_requete() {
     for which in ["enrich", "ask"] {
         let body = |extra: &str| {
-            if which == "enrich" {
-                enrich_body("openai", extra)
+            seen(if which == "enrich" {
+                enrich_body("openai", "m", extra)
             } else {
-                ask_body("openai", extra)
-            }
+                ask_body("openai", "m", extra)
+            })
         };
         let b = body("");
         assert_eq!(b["max_completion_tokens"], 16384, "{which}");
@@ -424,19 +480,55 @@ fn REQ058_AC4_openai_corps_de_la_requete() {
                 "output_config",
             ],
         );
+        assert_eq!(b.as_object().unwrap().len(), 3);
         assert_eq!(
             body("max_output_tokens = 1234\n")["max_completion_tokens"],
             1234
         );
-        let b = body("thinking = true\n");
-        assert_eq!(b["reasoning_effort"], "low");
-        let b = body("thinking = true\neffort = \"medium\"\n");
-        assert_eq!(b["reasoning_effort"], "medium");
-        let b = body("effort = \"medium\"\n");
-        no_fields(&b, &["reasoning_effort"]);
-        let keys: Vec<&String> = b.as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 3, "{keys:?}"); // model, messages, max_completion_tokens
+        assert_eq!(body("effort = \"medium\"\n")["reasoning_effort"], "medium");
+        assert_eq!(body("effort = \"low\"\n")["reasoning_effort"], "low");
+        for extra in [
+            "effort = \"default\"\n",
+            "thinking = true\neffort = \"default\"\n",
+        ] {
+            let b = body(extra);
+            no_fields(&b, &["reasoning_effort"]);
+            assert_eq!(b.as_object().unwrap().len(), 3, "{extra}");
+        }
+        assert_eq!(body("thinking = true\n")["reasoning_effort"], "low");
+        assert_eq!(
+            body("thinking = true\neffort = \"medium\"\n")["reasoning_effort"],
+            "medium"
+        );
     }
+    check_seen(16);
+}
+
+#[test]
+fn REQ157_AC4_nouvel_essai_http_renvoie_le_meme_corps_sans_thinking() {
+    let server = FakeServer::start(vec![
+        (503, "{}".into()),
+        (503, "{}".into()),
+        (200, reply("anthropic", &enrichment())),
+    ]);
+    let h = Http {
+        env: Env::new(&format!(
+            "provider = \"anthropic\"\nmodel = \"claude-opus-5-5\"\napi_key_env = \"{KEY_VAR}\"\nbase_url = \"{}\"\nconcurrency = 1\nbatch_files = 1\n",
+            server.base_url
+        )),
+        server,
+        provider: "anthropic".into(),
+    };
+    fs::remove_file(h.env.repo.join("README.md")).unwrap();
+    fs::create_dir_all(h.env.repo.join("docs")).unwrap();
+    fs::write(h.env.repo.join("docs/d.md"), "# D\n\nTexte.\n").unwrap();
+    let o = h.run(&["build"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let b = h.bodies();
+    assert_eq!(b.len(), 3);
+    assert!(b.iter().all(|x| *x == b[0]));
+    assert_eq!(b[0]["output_config"], serde_json::json!({"effort": "low"}));
+    no_fields(&b[0], &["thinking"]);
 }
 
 #[test]
@@ -598,4 +690,76 @@ fn REQ058_AC8_options_changees_n_entrainent_aucun_reenrichissement() {
     assert_eq!(u.status.code(), Some(0), "{}", stderr(&u));
     assert_eq!(String::from_utf8_lossy(&u.stdout).trim(), "graphe à jour");
     assert_eq!(before, fs::read_to_string(&log).unwrap());
+}
+
+#[test]
+fn REQ157_AC7_ligne_config_effort_default() {
+    let env = Env::new(MOCK);
+    env.write_config(&format!("{MOCK}effort = \"default\"\n"));
+    let l = config_line(&env.run(&["build", "--verbose"]));
+    assert!(
+        l.contains(" effort=default max_output_tokens=16384 "),
+        "{l}"
+    );
+}
+
+#[test]
+fn REQ157_AC8_effort_default_identique_en_mock_et_update_sans_appel() {
+    let env = Env::new(MOCK);
+    let log = env.repo.parent().unwrap().join("mock.log");
+    let mut seen = Vec::new();
+    for extra in ["", "effort = \"default\"\n"] {
+        env.write_config(&format!("{MOCK}{extra}"));
+        let _ = fs::remove_dir_all(env.repo.join(".nephila"));
+        let _ = fs::remove_file(&log);
+        let b = mock_run(&env, &log, &["build"]);
+        assert_eq!(b.status.code(), Some(0), "{}", stderr(&b));
+        let e = mock_run(&env, &log, &["export", "--output", "-"]);
+        assert_eq!(e.status.code(), Some(0));
+        seen.push((
+            fs::read_to_string(&log).unwrap_or_default(),
+            b.stdout,
+            support::normalized_export(&e.stdout),
+        ));
+    }
+    assert!(!seen[0].0.is_empty(), "le journal du mock est vide");
+    assert_eq!(seen[0], seen[1]);
+
+    env.write_config(MOCK);
+    let _ = fs::remove_dir_all(env.repo.join(".nephila"));
+    let b = mock_run(&env, &log, &["build"]);
+    assert_eq!(b.status.code(), Some(0), "{}", stderr(&b));
+    let before = fs::read_to_string(&log).unwrap();
+    env.write_config(&format!("{MOCK}effort = \"default\"\n"));
+    let u = mock_run(&env, &log, &["update"]);
+    assert_eq!(u.status.code(), Some(0), "{}", stderr(&u));
+    assert_eq!(String::from_utf8_lossy(&u.stdout).trim(), "graphe à jour");
+    assert_eq!(before, fs::read_to_string(&log).unwrap());
+}
+
+#[test]
+fn REQ157_AC12_ligne_e15_exacte_en_build_et_en_ask_sur_depot_indexe() {
+    let env = Env::new(MOCK);
+    assert!(env.run(&["build", "--no-llm"]).status.success());
+    for (line, got) in [
+        ("effort = \"none\"", "\"none\""),
+        ("effort = \"DEFAULT\"", "\"DEFAULT\""),
+        ("effort = 1", "1"),
+    ] {
+        env.write_config(&format!("{MOCK}{line}\n"));
+        let want = format!(
+            "erreur: configuration invalide ({}) : clé « effort » doit être \"low\", \"medium\", \"high\" ou \"default\" (reçu : {got})\n",
+            env.config.display()
+        );
+        for args in [&["build"][..], &["query", "ask", "x"][..]] {
+            let o = env.run(args);
+            assert!(!o.status.success(), "{line} {args:?}");
+            assert!(o.stdout.is_empty(), "{line} {args:?}");
+            assert_eq!(stderr(&o), want, "{line} {args:?}");
+        }
+    }
+    env.write_config(&format!("{MOCK}effort = \"none\"\n"));
+    let o = env.run(&["build", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("erreur:"));
 }

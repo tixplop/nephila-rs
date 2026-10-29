@@ -135,6 +135,8 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    /// Aucun niveau envoyé : le modèle garde le sien (REQ-157).
+    ModelDefault,
 }
 
 pub const DEFAULT_EFFORT: Effort = Effort::Low;
@@ -146,6 +148,7 @@ impl Effort {
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
+            Effort::ModelDefault => "default",
         }
     }
 }
@@ -168,8 +171,10 @@ pub struct Config {
     pub enrich_code: bool,
     /// Demande la réflexion au modèle (REQ-058).
     pub thinking: bool,
-    /// Niveau de la réflexion, utilisé seulement avec `thinking` (REQ-058).
+    /// Niveau d'effort demandé au modèle, avec ou sans `thinking` (REQ-058, REQ-157).
     pub effort: Effort,
+    /// Vrai si la clé `effort` est écrite, quelle que soit sa valeur (REQ-157).
+    pub effort_explicit: bool,
     /// Limite de jetons de la réponse, réflexion comprise (REQ-058).
     pub max_output_tokens: u32,
     /// Chemin résolu du PEM d'autorités ajoutées aux autorités publiques (REQ-036).
@@ -436,8 +441,13 @@ impl Config {
             Some(toml::Value::String(s)) if s == "low" => Effort::Low,
             Some(toml::Value::String(s)) if s == "medium" => Effort::Medium,
             Some(toml::Value::String(s)) if s == "high" => Effort::High,
+            Some(toml::Value::String(s)) if s == "default" => Effort::ModelDefault,
             Some(v) => {
-                return Err(invalid("effort", "\"low\", \"medium\" ou \"high\"", v));
+                return Err(invalid(
+                    "effort",
+                    "\"low\", \"medium\", \"high\" ou \"default\"",
+                    v,
+                ));
             }
         };
         let max_output_tokens = match &raw.max_output_tokens {
@@ -472,6 +482,7 @@ impl Config {
             enrich_code,
             thinking,
             effort,
+            effort_explicit: raw.effort.is_some(),
             max_output_tokens,
             tls_ca_cert,
             tls_ca_certs,
@@ -568,6 +579,7 @@ mod project_tests {
             enrich_code: false,
             thinking: false,
             effort: DEFAULT_EFFORT,
+            effort_explicit: false,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             tls_ca_cert: None,
             tls_ca_certs: Vec::new(),
@@ -858,6 +870,32 @@ mod llm_options_tests {
     }
 
     #[test]
+    fn req157_ac7_effort_default_et_effort_ecrit() {
+        let c = parse("effort = \"default\"").unwrap();
+        assert_eq!(c.effort, Effort::ModelDefault);
+        assert_eq!(c.effort.as_str(), "default");
+        assert!(c.effort_explicit);
+        for v in ["low", "medium", "high"] {
+            assert!(parse(&format!("effort = \"{v}\"")).unwrap().effort_explicit);
+        }
+        let c = parse("").unwrap();
+        assert_eq!(c.effort, Effort::Low);
+        assert!(!c.effort_explicit);
+    }
+
+    #[test]
+    fn req157_ac7_none_default_majuscules_et_auto_refuses() {
+        for v in ["none", "DEFAULT", "auto"] {
+            let msg = parse(&format!("effort = \"{v}\"")).unwrap_err().to_string();
+            assert!(
+                msg.contains("\"low\", \"medium\", \"high\" ou \"default\"")
+                    && msg.contains(&format!("(reçu : \"{v}\")")),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
     fn req058_ac1_valeurs_acceptees() {
         assert_eq!(
             parse("effort = \"medium\"").unwrap().effort.as_str(),
@@ -888,25 +926,25 @@ mod llm_options_tests {
             (
                 "effort = \"max\"",
                 "effort",
-                "\"low\", \"medium\" ou \"high\"",
+                "\"low\", \"medium\", \"high\" ou \"default\"",
                 "\"max\"",
             ),
             (
                 "effort = \"\"",
                 "effort",
-                "\"low\", \"medium\" ou \"high\"",
+                "\"low\", \"medium\", \"high\" ou \"default\"",
                 "\"\"",
             ),
             (
                 "effort = \"LOW\"",
                 "effort",
-                "\"low\", \"medium\" ou \"high\"",
+                "\"low\", \"medium\", \"high\" ou \"default\"",
                 "\"LOW\"",
             ),
             (
                 "effort = 1",
                 "effort",
-                "\"low\", \"medium\" ou \"high\"",
+                "\"low\", \"medium\", \"high\" ou \"default\"",
                 "1",
             ),
             (

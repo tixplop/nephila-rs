@@ -25,6 +25,8 @@ pub use retry::with_format_retries;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Generation {
     pub effort: Effort,
+    /// La clé `effort` est écrite dans la configuration (REQ-157).
+    pub effort_explicit: bool,
     pub thinking: bool,
     pub max_output_tokens: u32,
 }
@@ -241,6 +243,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
     }
     let gen = Generation {
         effort: config.effort,
+        effort_explicit: config.effort_explicit,
         thinking: config.thinking,
         max_output_tokens: config.max_output_tokens,
     };

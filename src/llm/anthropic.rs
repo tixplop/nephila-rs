@@ -1,14 +1,68 @@
 //! Adaptateur Anthropic Messages (REQ-002).
 
 use super::{http, Complete, Generation, Retry, Tls};
+use crate::config::Effort;
 use crate::error::{Error, Result, TRUNCATED};
 use std::sync::atomic::AtomicBool;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 
-/// Corps de la requête `/v1/messages` (REQ-058) : `thinking` et `output_config` seulement si la
-/// réflexion est demandée.
+/// Vrai si `model` est un ancien modèle Claude, qui refuse `output_config.effort` (REQ-157).
+///
+/// Normalisation : minuscules, `.`, `@`, `:` et `_` remplacés par `-`. On lit ce qui suit la
+/// dernière occurrence de `claude-`, découpé sur `-`. Liste fermée : seuls les modèles sortis
+/// avant Opus 4.5 sont anciens.
+pub fn is_legacy_claude(model: &str) -> bool {
+    let norm: String = model
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if matches!(c, '.' | '@' | ':' | '_') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let Some(at) = norm.rfind("claude-") else {
+        return false;
+    };
+    let segs: Vec<&str> = norm[at + "claude-".len()..].split('-').collect();
+    let number = |s: &str| -> Option<u32> {
+        if !s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit()) {
+            s.parse().ok()
+        } else {
+            None
+        }
+    };
+    let s0 = segs[0];
+    if let Some(n) = number(s0) {
+        return n <= 3;
+    }
+    if s0 == "instant" {
+        return true;
+    }
+    if !matches!(s0, "opus" | "sonnet" | "haiku") {
+        return false;
+    }
+    let Some(major) = segs.get(1).and_then(|s| number(s)) else {
+        return false;
+    };
+    let minor = segs
+        .get(2)
+        .filter(|s| s.len() <= 2)
+        .and_then(|s| number(s))
+        .unwrap_or(0);
+    if s0 == "opus" && major == 4 && minor == 5 {
+        return false;
+    }
+    major <= 3 || (major == 4 && minor <= 5)
+}
+
+/// Corps de la requête `/v1/messages` (REQ-058, REQ-157, DEC-126) : jamais de `thinking`
+/// désactivé ; `thinking` adaptatif si demandé ; `output_config.effort` sauf `effort = "default"`
+/// ou ancien modèle Claude sans `thinking`.
 pub fn request_body(model: &str, gen: &Generation, system: &str, user: &str) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -18,6 +72,8 @@ pub fn request_body(model: &str, gen: &Generation, system: &str, user: &str) -> 
     });
     if gen.thinking {
         body["thinking"] = serde_json::json!({"type": "adaptive"});
+    }
+    if gen.effort != Effort::ModelDefault && (gen.thinking || !is_legacy_claude(model)) {
         body["output_config"] = serde_json::json!({"effort": gen.effort.as_str()});
     }
     body
@@ -105,21 +161,61 @@ mod tests {
     fn gen(thinking: bool, effort: Effort, max: u32) -> Generation {
         Generation {
             effort,
+            effort_explicit: false,
             thinking,
             max_output_tokens: max,
         }
     }
 
+    fn base_fields() -> serde_json::Value {
+        serde_json::json!({
+            "model": "claude-opus-5-5", "max_tokens": 1234, "system": "s",
+            "messages": [{"role": "user", "content": "u"}],
+        })
+    }
+
     #[test]
-    fn body_without_thinking_has_only_the_base_fields() {
-        let b = request_body("m", &gen(false, Effort::High, 1234), "s", "u");
-        assert_eq!(
-            b,
-            serde_json::json!({
-                "model": "m", "max_tokens": 1234, "system": "s",
-                "messages": [{"role": "user", "content": "u"}],
-            })
+    fn req157_ac1_body_without_thinking_sends_effort_on_current_model() {
+        let m = "claude-opus-5-5";
+        let b = request_body(m, &gen(false, Effort::Low, 1234), "s", "u");
+        let mut want = base_fields();
+        want["output_config"] = serde_json::json!({"effort": "low"});
+        assert_eq!(b, want);
+        assert_eq!(b.as_object().unwrap().len(), 5);
+        assert!(b.get("thinking").is_none());
+
+        let b = request_body(m, &gen(false, Effort::High, 1234), "s", "u");
+        assert_eq!(b["output_config"], serde_json::json!({"effort": "high"}));
+        assert!(b.get("thinking").is_none());
+
+        let b = request_body(m, &gen(false, Effort::ModelDefault, 1234), "s", "u");
+        assert_eq!(b, base_fields());
+    }
+
+    #[test]
+    fn req157_ac1_body_with_thinking_default_has_only_thinking() {
+        let b = request_body(
+            "claude-opus-5-5",
+            &gen(true, Effort::ModelDefault, 1234),
+            "s",
+            "u",
         );
+        assert_eq!(b["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert!(b.get("output_config").is_none());
+        assert_eq!(b.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn req157_ac1_legacy_model_gets_no_effort_without_thinking() {
+        let m = "claude-sonnet-4-5";
+        let b = request_body(m, &gen(false, Effort::High, 1234), "s", "u");
+        let mut want = base_fields();
+        want["model"] = m.into();
+        assert_eq!(b, want);
+        let b = request_body(m, &gen(true, Effort::Medium, 1234), "s", "u");
+        assert_eq!(b["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(b["output_config"], serde_json::json!({"effort": "medium"}));
+        assert_eq!(b.as_object().unwrap().len(), 6);
     }
 
     #[test]
@@ -129,5 +225,64 @@ mod tests {
         assert_eq!(b["output_config"], serde_json::json!({"effort": "medium"}));
         assert_eq!(b["max_tokens"], 16384);
         assert_eq!(b.as_object().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn req157_ac2_is_legacy_claude() {
+        let legacy = [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-1",
+            "claude-opus-4-1-20250805",
+            "claude-opus-4-0",
+            "claude-opus-4-20250514",
+            "claude-opus-4",
+            "claude-sonnet-4-0",
+            "claude-sonnet-4-20250514",
+            "claude-sonnet-4",
+            "claude-3-7-sonnet-latest",
+            "claude-3-5-haiku-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-haiku-20240307",
+            "claude-2.1",
+            "claude-instant-1.2",
+            "CLAUDE-SONNET-4-5",
+            "claude-sonnet-4.5",
+            "anthropic/claude-sonnet-4.5",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "claude-opus-4@20250514",
+        ];
+        for m in legacy {
+            assert!(is_legacy_claude(m), "{m} devrait etre ancien");
+        }
+        let current = [
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-mythos-preview",
+            "claude-x",
+            "m",
+            "x",
+            "mock",
+            "gpt-4o-mini",
+            "",
+        ];
+        for m in current {
+            assert!(!is_legacy_claude(m), "{m:?} ne devrait pas etre ancien");
+        }
     }
 }

@@ -17,6 +17,7 @@ const EXTRACTION: &str =
 fn default_generation() -> Generation {
     Generation {
         effort: nephila::config::DEFAULT_EFFORT,
+        effort_explicit: false,
         thinking: false,
         max_output_tokens: nephila::config::DEFAULT_MAX_OUTPUT_TOKENS,
     }
