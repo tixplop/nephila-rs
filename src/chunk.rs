@@ -7,6 +7,9 @@ use crate::llm::enrich::{Concept, Enrichment};
 /// Nombre de lignes de tête examinées pour trouver package, imports et type englobant.
 const HEADER_SCAN_LINES: usize = 300;
 
+/// Nombre maximal de lignes `import` recopiées dans l'en-tête répété (REQ-170).
+const HEADER_MAX_IMPORTS: usize = 20;
+
 const MODIFIERS: &[&str] = &[
     "public",
     "private",
@@ -23,14 +26,15 @@ const MODIFIERS: &[&str] = &[
     "value",
     "strictfp",
     "non-sealed",
+    "export",
+    "default",
+    "declare",
 ];
 const TYPE_KEYWORDS: &[&str] = &["class", "interface", "enum", "record", "object", "trait"];
 
-/// Vrai si la ligne est une déclaration de type : modificateurs/annotations, mot-clé, puis `{`.
+/// Vrai si la ligne est une déclaration de type : modificateurs/annotations, mot-clé de type,
+/// puis un mot qui commence par une lettre, `_` ou `$` (l'accolade n'est pas exigée, REQ-170).
 fn is_type_declaration(line: &str) -> bool {
-    if !line.contains('{') {
-        return false;
-    }
     let mut words = line.split_whitespace();
     while let Some(w) = words.next() {
         if MODIFIERS.contains(&w) || w.starts_with('@') {
@@ -40,20 +44,31 @@ fn is_type_declaration(line: &str) -> bool {
         if w == "annotation" || w == "fun" {
             continue;
         }
-        return TYPE_KEYWORDS.contains(&w) && words.next().is_some();
+        return TYPE_KEYWORDS.contains(&w)
+            && words
+                .next()
+                .and_then(|n| n.chars().next())
+                .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$');
     }
     false
 }
 
-/// En-tête d'un fichier : lignes `package`, `import` et déclaration du type englobant détectées
-/// en tête. Chaque ligne se termine par `\n` ; vide si rien n'est détecté.
+/// En-tête d'un fichier : lignes `package`, 20 premières lignes `import` et déclaration du type
+/// englobant détectées en tête. Chaque ligne se termine par `\n` ; vide si rien n'est détecté.
 pub fn header(text: &str) -> String {
     let mut out = String::new();
+    let mut imports = 0usize;
     for line in text.lines().take(HEADER_SCAN_LINES) {
         let t = line.trim();
-        if t.starts_with("package ") || t.starts_with("import ") {
+        if t.starts_with("package ") {
             out.push_str(line);
             out.push('\n');
+        } else if t.starts_with("import ") {
+            if imports < HEADER_MAX_IMPORTS {
+                imports += 1;
+                out.push_str(line);
+                out.push('\n');
+            }
         } else if is_type_declaration(t) {
             out.push_str(line);
             out.push('\n');
@@ -85,15 +100,80 @@ pub fn split_spans(text: &str, max_chars: usize) -> Vec<(String, usize)> {
     let head_len = head.chars().count();
     // L'en-tête ne doit pas manger tout le budget : au moins la moitié reste pour le corps.
     let later_budget = max.saturating_sub(head_len).max(max / 2).max(1);
+    split_with(text, max, |_| (head.clone(), later_budget))
+}
 
+/// Comme `split_spans`, avec l'en-tête Markdown (REQ-170) pour un fichier Markdown : chaîne des
+/// titres qui englobent le début du corps de chaque morceau k >= 2, bornée à `max_chars / 2`
+/// caractères (titres externes retirés d'abord), déduite du budget du corps de ce morceau.
+pub fn split_spans_for(path: &str, text: &str, max_chars: usize) -> Vec<(String, usize)> {
+    if !crate::llm::enrich::is_markdown(path) {
+        return split_spans(text, max_chars);
+    }
+    let max = max_chars.max(1);
+    if text.chars().count() <= max {
+        return vec![(text.to_string(), 0)];
+    }
+    let titles = crate::parse::markdown::heading_lines(text);
+    let mut next = 0usize;
+    // Pile des titres englobants : (niveau, ligne d'en-tête terminée par `\n`).
+    let mut stack: Vec<(u8, String)> = Vec::new();
+    split_with(text, max, |pos| {
+        let mut pending = None;
+        while let Some(&(level, start, setext)) = titles.get(next) {
+            if start > pos {
+                break;
+            }
+            next += 1;
+            while stack.last().is_some_and(|(l, _)| *l >= level) {
+                stack.pop();
+            }
+            let line = heading_header_line(text, level, start, setext);
+            if start < pos {
+                stack.push((level, line));
+            } else {
+                // Titre qui ouvre ce corps : absent de son en-tête, présent pour les suivants.
+                pending = Some((level, line));
+            }
+        }
+        let mut first = 0usize;
+        let mut total: usize = stack.iter().map(|(_, l)| l.chars().count()).sum();
+        while first < stack.len() && total > max / 2 {
+            total -= stack[first].1.chars().count();
+            first += 1;
+        }
+        let head: String = stack[first..].iter().map(|(_, l)| l.as_str()).collect();
+        let budget = max.saturating_sub(total).max(1);
+        stack.extend(pending);
+        (head, budget)
+    })
+}
+
+/// Ligne d'en-tête d'un titre : la ligne source d'un titre ATX, `#`×niveau + espace + première
+/// ligne de texte pour un titre souligné ; terminée par `\n`.
+fn heading_header_line(text: &str, level: u8, start: usize, setext: bool) -> String {
+    let line = text[start..].lines().next().unwrap_or("");
+    if setext {
+        format!("{} {}\n", "#".repeat(level as usize), line.trim())
+    } else {
+        format!("{line}\n")
+    }
+}
+
+/// Boucle de coupe commune : `head_at(pos)` donne l'en-tête et le budget du corps du morceau
+/// (k >= 2) dont le corps commence à l'octet `pos` ; le premier morceau a `max` et pas d'en-tête.
+fn split_with<F>(text: &str, max: usize, mut head_at: F) -> Vec<(String, usize)>
+where
+    F: FnMut(usize) -> (String, usize),
+{
     let mut parts: Vec<(String, usize)> = Vec::new();
     let mut cur = String::new();
     let mut cur_start = 0usize;
     let mut cur_len = 0usize;
+    let mut budget = max;
     let mut pos = 0usize;
     for line in text.split_inclusive('\n') {
         let n = line.chars().count();
-        let budget = if parts.is_empty() { max } else { later_budget };
         if cur_len > 0 && cur_len + n > budget {
             parts.push((std::mem::take(&mut cur), cur_start));
             cur_len = 0;
@@ -101,7 +181,9 @@ pub fn split_spans(text: &str, max_chars: usize) -> Vec<(String, usize)> {
         if cur.is_empty() {
             cur_start = pos;
             if !parts.is_empty() {
+                let (head, b) = head_at(pos);
                 cur.push_str(&head);
+                budget = b;
             }
         }
         cur.push_str(line);
@@ -355,5 +437,214 @@ mod tests {
             split_spans("court\n", 200),
             vec![("court\n".to_string(), 0)]
         );
+    }
+
+    #[test]
+    fn req170_ac1_is_type_declaration() {
+        for yes in [
+            "export class Foo {",
+            "export default class extends Base {",
+            "export abstract class Repo<T> {",
+            "declare class Foo {",
+            "export interface Props {",
+            "export enum Color {",
+            "data class X(val a: Int)",
+            "public class Foo",
+            "object Main extends App",
+            "sealed interface Shape",
+            "enum class Color",
+            "public final class A {",
+            "@Service public class S {",
+        ] {
+            assert!(is_type_declaration(yes), "{yes}");
+        }
+        for no in [
+            "record = repo.find(id);",
+            "class",
+            "object : Foo {",
+            "// class Foo {",
+            "* class Foo",
+            "export default function f() {",
+            "export const x = 1;",
+            "import x from 'y';",
+            "export type T = A;",
+            "type T = { a: number }",
+        ] {
+            assert!(!is_type_declaration(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn req170_ac2_header_limits_imports_to_twenty() {
+        let mut t = String::from("package p;\n");
+        for i in 0..60 {
+            t.push_str(&format!("import a.I{i};\n"));
+        }
+        t.push_str("public class Big {\n  int x;\n}\n");
+        let h = header(&t);
+        let mut want = String::from("package p;\n");
+        for i in 0..20 {
+            want.push_str(&format!("import a.I{i};\n"));
+        }
+        want.push_str("public class Big {\n");
+        assert_eq!(h, want);
+        assert_eq!(h.lines().count(), 22);
+
+        let ts = "import { A } from './a';\nexport class Foo {\n  x = 1;\n}\n";
+        assert!(header(ts).contains("export class Foo {\n"));
+        let kt = "package k\ndata class X(val a: Int)\n  fun f() {}\n";
+        assert!(header(kt).ends_with("data class X(val a: Int)\n"));
+    }
+
+    fn md_doc() -> String {
+        let mut t = String::from("# Guide\n\n## A\n\n### A.1\n\n");
+        for i in 0..12 {
+            t.push_str(&format!("mot{i} mot mot mot\n"));
+        }
+        t.push_str("\n## B\n\n```\n# pas un titre\n```\n\n");
+        for i in 0..30 {
+            t.push_str(&format!("texte b{i} texte texte\n"));
+        }
+        t.push_str("\nPartie\n======\n\n");
+        for i in 0..20 {
+            t.push_str(&format!("corps final {i} suite suite\n"));
+        }
+        t
+    }
+
+    #[test]
+    fn req170_ac3_markdown_header_is_enclosing_headings() {
+        let t = md_doc();
+        let b_start = t.find("## B").unwrap();
+        let a1 = t.find("### A.1").unwrap();
+        let partie = t.find("Partie").unwrap();
+        // Limite égale à la longueur du texte avant `## B` : B ouvre un morceau.
+        let lim = t[..b_start].chars().count();
+        let (mut in_a1, mut at_b, mut in_b, mut after_partie) = (false, false, false, false);
+        for limit in [lim, 150] {
+            let spans = split_spans_for("d.md", &t, limit);
+            assert_eq!(spans[0], (t[..spans[1].1].to_string(), 0));
+            for (k, (part, start)) in spans.iter().enumerate().skip(1) {
+                let end = spans.get(k + 1).map_or(t.len(), |(_, s)| *s);
+                let body = &t[*start..end];
+                let head = &part[..part.len() - body.len()];
+                assert!(part.ends_with(body));
+                assert!(!head.contains("pas un titre"));
+                if *start > a1 && *start < b_start {
+                    assert_eq!(head, "# Guide\n## A\n### A.1\n");
+                    in_a1 = true;
+                } else if *start == b_start {
+                    assert_eq!(head, "# Guide\n");
+                    assert!(part.starts_with("# Guide\n## B"));
+                    at_b = true;
+                } else if *start > b_start && *start < partie {
+                    assert_eq!(head, "# Guide\n## B\n");
+                    in_b = true;
+                } else if *start > partie {
+                    assert_eq!(head, "# Partie\n");
+                    after_partie = true;
+                }
+            }
+        }
+        assert!(in_a1 && at_b && in_b && after_partie);
+        // Chemin non Markdown : identique à `split_spans`.
+        assert_eq!(split_spans_for("d.txt", &t, 150), split_spans(&t, 150));
+        assert_eq!(
+            split_spans_for("d.md", "court\n", 150),
+            vec![("court\n".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn req170_ac3_titre_dans_citation_ou_liste_reste_atx() {
+        let t = "# Un\n\n> ## Cité\n\ntexte\n";
+        let h = crate::parse::markdown::heading_lines(t);
+        assert_eq!(h.len(), 2);
+        assert!(!h[1].2);
+        assert!(h[1].1 == t.find("> ##").unwrap());
+    }
+
+    #[test]
+    fn req170_ac4_markdown_budget_property() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..200 {
+            let max = 40 + next(361) as usize;
+            let mut t = String::new();
+            let mut titles: Vec<(usize, usize, String)> = Vec::new();
+            for _ in 0..(5 + next(40)) {
+                if next(3) == 0 {
+                    let lvl = 1 + next(6) as usize;
+                    let line = format!("{} T{}\n", "#".repeat(lvl), next(100));
+                    titles.push((lvl, t.len(), line.clone()));
+                    t.push_str(&line);
+                } else {
+                    let len = 1 + next((max / 2 - 1) as u64) as usize;
+                    t.push_str(&"x".repeat(len.min(max / 2 - 1).max(1)));
+                    t.push('\n');
+                }
+            }
+            let spans = split_spans_for("g.md", &t, max);
+            assert_eq!(spans[0].1, 0);
+            let mut rebuilt = String::new();
+            let mut prev = 0usize;
+            for (k, (part, start)) in spans.iter().enumerate() {
+                let end = spans.get(k + 1).map_or(t.len(), |(_, s)| *s);
+                let body = &t[*start..end];
+                assert!(part.ends_with(body), "{part:?} / {body:?}");
+                let head = &part[..part.len() - body.len()];
+                assert!(part.chars().count() <= max, "{part:?} max {max}");
+                assert!(head.chars().count() <= max / 2);
+                // Pile naïve indépendante : titres avant `start`, puis celui qui y commence.
+                let mut naive: Vec<(usize, &str)> = Vec::new();
+                for (lvl, at, line) in &titles {
+                    if *at > *start {
+                        break;
+                    }
+                    while naive.last().is_some_and(|(l, _)| l >= lvl) {
+                        naive.pop();
+                    }
+                    if *at < *start || k == 0 {
+                        naive.push((*lvl, line));
+                    }
+                }
+                if k > 0 {
+                    let mut want = String::new();
+                    for i in 0..=naive.len() {
+                        let cand: String = naive[i..].iter().map(|(_, l)| *l).collect();
+                        if cand.chars().count() <= max / 2 {
+                            want = cand;
+                            break;
+                        }
+                    }
+                    assert_eq!(head, want, "max {max} start {start}");
+                }
+                assert!(k == 0 && head.is_empty() || k > 0);
+                if k > 0 {
+                    assert!(*start > prev);
+                }
+                prev = *start;
+                rebuilt.push_str(body);
+            }
+            assert_eq!(rebuilt, t);
+        }
+    }
+
+    #[test]
+    fn req170_ac4_outermost_titles_dropped_first() {
+        let t = format!(
+            "# Un\n## Deux\n### Trois\n{}\n{}\n",
+            "a".repeat(20),
+            "b".repeat(20)
+        );
+        // max 40 : plafond 20 ; chaîne complète = 5+8+9 = 22 > 20, le titre externe saute.
+        let spans = split_spans_for("g.md", &t, 40);
+        let second = &spans[1].0;
+        assert!(second.starts_with("## Deux\n### Trois\n"), "{second:?}");
     }
 }

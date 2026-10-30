@@ -722,7 +722,7 @@ fn plan_calls<'a>(
     nodes: &[(String, String)],
 ) -> Result<Vec<Unit<'a>>> {
     let known: Arc<[String]> = nodes.iter().map(|(id, _)| id.clone()).collect();
-    let spans = chunk::split_spans(text, max_chunk_chars);
+    let spans = chunk::split_spans_for(&file.path, text, max_chunk_chars);
     let homes = section_homes(text, &spans, nodes);
     let parts: Vec<String> = spans.into_iter().map(|(part, _)| part).collect();
     let mut plan = call_plan(&parts, nodes, &homes);

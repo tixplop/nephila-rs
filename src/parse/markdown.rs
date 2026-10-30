@@ -99,6 +99,8 @@ struct State {
     seen: HashSet<(String, EdgeKind, String)>,
     /// Ancre (suffixée si besoin) et octet de début de la ligne de chaque titre, dans l'ordre.
     offsets: Vec<(String, usize)>,
+    /// Niveau, octet de début de la ligne et nature setext de chaque titre (REQ-170).
+    headings: Vec<(u8, usize, bool)>,
 }
 
 impl State {
@@ -151,6 +153,12 @@ pub fn section_offsets(text: &str) -> Vec<(String, usize)> {
     scan(String::new(), text).offsets
 }
 
+/// Titres du document dans l'ordre du texte : niveau (1 à 6), octet de début de la ligne du titre
+/// et `true` pour un titre souligné (setext). Même parcours que `section_offsets` (REQ-170).
+pub fn heading_lines(text: &str) -> Vec<(u8, usize, bool)> {
+    scan(String::new(), text).headings
+}
+
 /// Parcours unique du document, commun à `extract` et à `section_offsets`.
 fn scan(doc: String, text: &str) -> State {
     let mut st = State {
@@ -161,6 +169,7 @@ fn scan(doc: String, text: &str) -> State {
         current: None,
         seen: HashSet::new(),
         offsets: Vec::new(),
+        headings: Vec::new(),
     };
     st.out.declares.push(Declared {
         kind: NodeKind::Document,
@@ -173,8 +182,11 @@ fn scan(doc: String, text: &str) -> State {
     let mut heading: Option<(String, Vec<String>, usize)> = None;
     for (ev, range) in Parser::new(text).into_offset_iter() {
         match ev {
-            Event::Start(Tag::Heading { .. }) => {
+            Event::Start(Tag::Heading { level, .. }) => {
                 let line = text[..range.start].rfind('\n').map_or(0, |i| i + 1);
+                // Un titre ATX tient sur une ligne ; un setext couvre son texte et son soulignement.
+                let atx = !text[range.clone()].trim_end().contains('\n');
+                st.headings.push((level as u8, line, !atx));
                 heading = Some((String::new(), Vec::new(), line));
             }
             Event::End(TagEnd::Heading(_)) => {
