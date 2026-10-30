@@ -492,13 +492,64 @@ fn is_timeout(e: &ureq::Error) -> bool {
     false
 }
 
-/// Isole l'objet JSON d'un texte de modèle (clôtures ``` ou texte autour tolérés).
-pub fn extract_json(text: &str) -> Result<&str> {
+/// Du premier `{` au dernier `}` du texte (heuristique de dernier recours).
+fn span(text: &str) -> Result<&str> {
     match (text.find('{'), text.rfind('}')) {
         (Some(a), Some(b)) if a < b => Ok(&text[a..=b]),
         _ => Err(Error::Format(
             "réponse LLM non conforme : aucun objet JSON dans le texte".into(),
         )),
+    }
+}
+
+/// Isole du texte d'un modèle l'objet JSON conforme (REQ-176, DEC-142).
+///
+/// À chaque `{`, de gauche à droite, une valeur JSON complète est lue (texte
+/// éventuel après elle toléré) puis sautée en entier. Un objet portant `key`
+/// au premier niveau est un candidat, validé par `parse` sur sa tranche exacte.
+/// Résultat : le premier candidat validé si tous les candidats validés sont
+/// égaux ; sinon (candidats validés différents) l'erreur de `parse` sur la
+/// tranche du premier `{` au dernier `}` ; candidats tous refusés : l'erreur du
+/// premier ; aucun candidat : `parse` sur cette même tranche.
+pub fn parse_reply<T>(text: &str, key: &str, parse: impl Fn(&str) -> Result<T>) -> Result<T> {
+    let mut first_ok: Option<(serde_json::Value, T)> = None;
+    let mut first_err: Option<Error> = None;
+    let mut ambiguous = false;
+    let mut pos = 0;
+    while let Some(off) = text[pos..].find('{') {
+        let a = pos + off;
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[a..]).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(value)) => {
+                let end = a + stream.byte_offset();
+                if value.as_object().is_some_and(|o| o.contains_key(key)) {
+                    match parse(&text[a..end]) {
+                        Ok(t) => match &first_ok {
+                            None => first_ok = Some((value, t)),
+                            Some((v, _)) if *v != value => ambiguous = true,
+                            Some(_) => {}
+                        },
+                        Err(e) => {
+                            first_err.get_or_insert(e);
+                        }
+                    }
+                }
+                pos = end;
+            }
+            _ => pos = a + 1,
+        }
+    }
+    match (first_ok, first_err) {
+        (Some((_, t)), _) if !ambiguous => Ok(t),
+        (Some(_), _) => match parse(span(text)?) {
+            Err(e) => Err(e),
+            Ok(_) => Err(Error::Format(
+                "réponse LLM non conforme : plusieurs objets JSON différents".into(),
+            )),
+        },
+        (None, Some(e)) => Err(e),
+        (None, None) => parse(span(text)?),
     }
 }
 
@@ -1021,6 +1072,133 @@ mod tests {
             let (r, n) = run(vec![(500, "{}".into())]);
             assert!(r.is_err());
             assert_eq!(n, 5);
+        }
+    }
+
+    // ---- REQ-176 : objet JSON conforme isolé du texte autour ----
+
+    mod reply {
+        use super::super::parse_reply;
+        use crate::error::Error;
+        use crate::llm::enrich::{parse_lot, Enrichment};
+        use crate::llm::{ask::ask_system_prompt, AskReply, LotItem};
+
+        const EXTRACTION: &str =
+            r#"{"version":2,"summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}"#;
+
+        fn ids() -> Vec<String> {
+            vec!["type:A".to_string()]
+        }
+
+        fn enrich(text: &str) -> crate::error::Result<Enrichment> {
+            parse_reply(text, "version", |j| Enrichment::parse(j, "A.java", &ids()))
+        }
+
+        /// Message de la 0.26.0 en cours : `extract_json` puis `Enrichment::parse`.
+        fn old(text: &str) -> String {
+            match (text.find('{'), text.rfind('}')) {
+                (Some(a), Some(b)) if a < b => Enrichment::parse(&text[a..=b], "A.java", &ids())
+                    .unwrap_err()
+                    .to_string(),
+                _ => "réponse LLM non conforme : aucun objet JSON dans le texte".to_string(),
+            }
+        }
+
+        #[test]
+        fn req176_ac1_object_is_accepted_with_text_around() {
+            let with_braces = EXTRACTION.replace("Le A.", "Un { et } dans le texte");
+            let cases = [
+                EXTRACTION.to_string(),
+                format!("```json\n{EXTRACTION}\n```"),
+                format!("{EXTRACTION}\nRemarque : la méthode {{x}} est triviale."),
+                format!("Voir {{x}} :\n{EXTRACTION}"),
+                format!("{{\"note\": \"a\"}}\n{EXTRACTION}"),
+                format!("{EXTRACTION}{{x}}"),
+                format!("{EXTRACTION}\n{EXTRACTION}"),
+                format!("{with_braces}}}"),
+            ];
+            for c in cases {
+                let e = enrich(&c).unwrap_or_else(|e| panic!("{c} : {e}"));
+                assert_eq!(e.summaries.len(), 1, "{c}");
+            }
+        }
+
+        #[test]
+        fn req176_ac2_non_conforming_texts_are_format_errors() {
+            let e = enrich("aucun objet ici").unwrap_err();
+            assert!(matches!(e, Error::Format(_)));
+            assert_eq!(
+                e.to_string(),
+                "réponse LLM non conforme : aucun objet JSON dans le texte"
+            );
+            let v1 = r#"{"version":1,"summaries":[],"concepts":[]}"#;
+            let e = enrich(&format!("{v1}{{x}}")).unwrap_err();
+            assert!(matches!(e, Error::Format(_)));
+            assert!(
+                e.to_string().contains("version 1 non prise en charge"),
+                "{e}"
+            );
+            let other = r#"{"version":2,"summaries":[],"concepts":[]}"#;
+            let e = enrich(&format!("{EXTRACTION}\n{other}")).unwrap_err();
+            assert!(matches!(e, Error::Format(_)));
+        }
+
+        #[test]
+        fn req176_ac2_single_object_messages_are_those_of_the_old_path() {
+            let wrapped = format!(r#"{{"result":{EXTRACTION}}}"#);
+            let cases = [
+                r#"{"version":2,"summaries":["#.to_string(),
+                r#"{"version":1,"summaries":[],"concepts":[]}"#.to_string(),
+                r#"{"version":2,"summaries":[],"concepts":[],"extra":1}"#.to_string(),
+                r#"{"version":2,"summaries":[]}"#.to_string(),
+                wrapped,
+            ];
+            for c in cases {
+                let e = enrich(&c).unwrap_err();
+                assert!(matches!(e, Error::Format(_)), "{c}");
+                assert_eq!(e.to_string(), old(&c), "{c}");
+            }
+        }
+
+        fn lot_items() -> Vec<LotItem> {
+            vec![LotItem {
+                file: "A.java".into(),
+                text: "class A {}".into(),
+                node_ids: vec!["type:A".into()],
+            }]
+        }
+
+        #[test]
+        fn req176_ac3_lot_and_ask_keys() {
+            let items = lot_items();
+            let lot = |t: &str| parse_reply(t, "version", |j| parse_lot(j, &items));
+            let v3 = r#"{"version":3,"files":[{"file":"A.java","summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}]}"#;
+            assert!(lot(&format!("{v3}\n{{x}}")).is_ok());
+            let v2 = r#"{"version":2,"files":[]}"#;
+            assert!(matches!(lot(v2), Err(Error::Format(_))));
+
+            let found_false = |t: &str| parse_reply(t, "found", AskReply::parse);
+            assert_eq!(
+                found_false("{\"found\": false}\n(aucun nœud {x} ne répond)").unwrap(),
+                AskReply::NotFound
+            );
+            let p = ask_system_prompt();
+            let ex = p
+                .lines()
+                .find(|l| l.starts_with("Exemple : "))
+                .expect("exemple");
+            let e = found_false(&format!("{ex}\n{{\"found\": false}}")).unwrap_err();
+            assert!(matches!(e, Error::Format(_)));
+        }
+
+        #[test]
+        fn req176_ac3_many_objects_and_unclosed_openers_stay_fast() {
+            let many = format!("{}{EXTRACTION}", "{\"a\":1}".repeat(300));
+            assert_eq!(enrich(&many).unwrap().summaries.len(), 1);
+            let t = std::time::Instant::now();
+            let deep = format!("{}{EXTRACTION}", "{\"a\":[".repeat(2000));
+            assert_eq!(enrich(&deep).unwrap().summaries.len(), 1);
+            assert!(t.elapsed() < std::time::Duration::from_secs(2));
         }
     }
 }

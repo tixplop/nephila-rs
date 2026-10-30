@@ -685,3 +685,69 @@ fn req024_ac11_openai_node_list_of_package_json_is_its_module() {
     assert!(!body.contains("dependency:"), "{body}");
     assert!(!body.contains("package:"), "{body}");
 }
+
+// ---- AC-176-4 et AC-176-5 : texte autour de l'objet JSON, sans renvoi ----
+
+#[test]
+fn req176_ac4_trailing_remark_is_accepted_by_both_providers() {
+    let enrich_text = format!("{EXTRACTION}\nRemarque : {{x}}");
+    let lot_text = format!("{LOT_REPLY}\nRemarque : {{x}}");
+    let ask_text = "{\"found\":true,\"answer\":\"oui\",\"nodes\":[\"type:A\"]}\n{x}";
+    for provider in ["anthropic", "openai"] {
+        let reply = |t: &str| {
+            if provider == "anthropic" {
+                anthropic_reply(t)
+            } else {
+                openai_reply(t)
+            }
+        };
+        let s = FakeServer::start(vec![(200, reply(&enrich_text))]);
+        let llm: Box<dyn Llm> = if provider == "anthropic" {
+            Box::new(anthropic(&s))
+        } else {
+            Box::new(openai(&s, None))
+        };
+        let e = llm.enrich("A.java", 1, "x", &a_ids(), &a_ids()).unwrap();
+        assert_eq!(e.summaries.len(), 1, "{provider}");
+        assert_eq!(s.requests().len(), 1, "{provider}");
+
+        let s = FakeServer::start(vec![(200, reply(&lot_text))]);
+        let llm: Box<dyn Llm> = if provider == "anthropic" {
+            Box::new(anthropic(&s))
+        } else {
+            Box::new(openai(&s, None))
+        };
+        check_lot_result(llm.enrich_lot(&lot_items()).unwrap());
+        assert_eq!(s.requests().len(), 1, "{provider}");
+
+        let s = FakeServer::start(vec![(200, reply(ask_text))]);
+        let llm: Box<dyn Llm> = if provider == "anthropic" {
+            Box::new(anthropic(&s))
+        } else {
+            Box::new(openai(&s, None))
+        };
+        assert_eq!(
+            llm.ask("q ?", "ctx").unwrap(),
+            AskReply::Found {
+                answer: "oui".into(),
+                nodes: vec!["type:A".into()]
+            },
+            "{provider}"
+        );
+        assert_eq!(s.requests().len(), 1, "{provider}");
+    }
+}
+
+#[test]
+fn req176_ac5_build_accepts_trailing_remark_without_resend() {
+    let reply = format!(
+        "{}\nNote : {{x}}",
+        r#"{"version":2,"summaries":[{"node":"type:web/src/api/client.ApiClient","summary":"Client."}],"concepts":[]}"#
+    );
+    // `openai_build_one_file` vérifie le code 0 et une seule requête POST.
+    openai_build_one_file(
+        "web/src/api/client.ts",
+        "export class ApiClient {}\n",
+        &reply,
+    );
+}

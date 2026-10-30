@@ -112,6 +112,11 @@ pub(crate) trait Complete: Send + Sync {
     ) -> Result<String>;
 }
 
+/// Clé de premier niveau d'une réponse d'enrichissement (fichier ou lot).
+const KEY_VERSION: &str = "version";
+/// Clé de premier niveau d'une réponse de `query ask`.
+const KEY_FOUND: &str = "found";
+
 impl<T: Complete> Llm for T {
     fn summary_language(&self) -> &str {
         Complete::summary_language(self)
@@ -132,7 +137,7 @@ impl<T: Complete> Llm for T {
             enrichment_system_prompt(self.summary_language()),
             enrichment_user_prompt(file, None, text, requested),
         )?;
-        Enrichment::parse(http::extract_json(&out)?, file, known)
+        http::parse_reply(&out, KEY_VERSION, |j| Enrichment::parse(j, file, known))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -155,7 +160,7 @@ impl<T: Complete> Llm for T {
             enrichment_system_prompt(self.summary_language()),
             enrichment_user_prompt(file, excerpt, text, requested),
         )?;
-        Enrichment::parse(http::extract_json(&out)?, file, known)
+        http::parse_reply(&out, KEY_VERSION, |j| Enrichment::parse(j, file, known))
     }
 
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
@@ -166,7 +171,7 @@ impl<T: Complete> Llm for T {
             lot_system_prompt(self.summary_language()),
             lot_user_prompt(items),
         )?;
-        Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
+        Ok(http::parse_reply(&out, KEY_VERSION, |j| parse_lot(j, items))?.into_results())
     }
 
     fn enrich_lot_labeled(
@@ -183,7 +188,7 @@ impl<T: Complete> Llm for T {
             lot_system_prompt(self.summary_language()),
             lot_user_prompt(items),
         )?;
-        Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
+        Ok(http::parse_reply(&out, KEY_VERSION, |j| parse_lot(j, items))?.into_results())
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
@@ -198,7 +203,7 @@ impl<T: Complete> Llm for T {
             ask_system_prompt(),
             ask_user_prompt(question, context),
         )?;
-        AskReply::parse(http::extract_json(&out)?)
+        http::parse_reply(&out, KEY_FOUND, AskReply::parse)
     }
 }
 
