@@ -480,6 +480,72 @@ fn req027_ac6_openai_lot_single_request_applied_per_file() {
     check_lot_result(r);
 }
 
+/// REQ-172 : `llm` construit par `build_llm` depuis la configuration personnelle
+/// `summary_language = "anglais"`, complétée ou non d'un `.nephila.toml` (`project`).
+fn llm_with_language(provider: &str, base_url: &str, project: Option<&str>) -> Box<dyn Llm> {
+    std::env::set_var("NEPHILA_TEST_KEY_172", "sk-test");
+    let text = format!(
+        "provider='{provider}'\nenrich_code = true\nmodel='m'\nbase_url='{base_url}'\napi_key_env='NEPHILA_TEST_KEY_172'\nsummary_language = \"anglais\"\n"
+    );
+    let mut cfg =
+        nephila::config::Config::parse(&text, std::path::Path::new("/x/config.toml")).unwrap();
+    if let Some(p) = project {
+        let table: toml::Table = p.parse().unwrap();
+        let settings =
+            nephila::config::ProjectSettings::from_table(&table, "./.nephila.toml").unwrap();
+        cfg = cfg.with_project(&settings, None, None).0;
+    }
+    nephila::llm::build_llm(&cfg).unwrap()
+}
+
+#[test]
+fn req172_ac5_enrich_and_lot_requests_carry_summary_language() {
+    for (provider, project, language) in [
+        ("anthropic", None, "anglais"),
+        ("openai", None, "anglais"),
+        (
+            "anthropic",
+            Some("summary_language = \"espagnol\"\n"),
+            "espagnol",
+        ),
+        (
+            "openai",
+            Some("summary_language = \"espagnol\"\n"),
+            "espagnol",
+        ),
+    ] {
+        let anth = provider == "anthropic";
+        let ids = vec!["type:A".to_string(), "method:A.f".to_string()];
+        let reply = |t: &str| {
+            if anth {
+                anthropic_reply(t)
+            } else {
+                openai_reply(t)
+            }
+        };
+        let s = FakeServer::start(vec![(200, reply(ENRICHMENT)), (200, reply(LOT_REPLY))]);
+        let llm = llm_with_language(provider, &s.base_url, project);
+        llm.enrich("A.java", 1, "class A {}", &ids, &ids).unwrap();
+        llm.enrich_lot(&lot_items()).unwrap();
+        let reqs = s.requests();
+        assert_eq!(reqs.len(), 2, "{provider}");
+        for r in &reqs {
+            let b: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            let sys = if anth {
+                b["system"].as_str().unwrap()
+            } else {
+                b["messages"][0]["content"].as_str().unwrap()
+            };
+            let rules = nephila::llm::enrich::language_rules(language);
+            assert!(sys.contains(&rules), "{provider} {language} : {sys}");
+            assert!(
+                !sys.contains("en français"),
+                "{provider} {language} : {sys}"
+            );
+        }
+    }
+}
+
 #[test]
 fn req027_ac8_lot_version_2_is_non_conforming_and_errors_classified() {
     let s = FakeServer::start(vec![

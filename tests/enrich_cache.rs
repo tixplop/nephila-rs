@@ -428,6 +428,97 @@ fn req049_ac3_model_survives_build_no_llm() {
     assert_eq!(env.logged_paths(), all_paths(&env));
 }
 
+fn set_personal_language(env: &Env, language: &str) {
+    fs::write(
+        &env.config,
+        format!("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\nsummary_language = \"{language}\"\n"),
+    )
+    .unwrap();
+}
+
+fn enrichment_languages(env: &Env) -> BTreeSet<String> {
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let rows: Vec<String> = conn
+        .prepare("SELECT DISTINCT language FROM enrichments")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.into_iter().collect()
+}
+
+#[test]
+fn req173_ac2_language_change_resends_each_file_once_by_build_and_by_update() {
+    for personal in [true, false] {
+        for verb in ["build", "update"] {
+            let env = Env::new();
+            env.ok(&["build"]);
+            let files = all_paths(&env);
+            assert_eq!(env.logged().len(), files.len());
+            if personal {
+                set_personal_language(&env, "anglais");
+            } else {
+                env.write(".nephila.toml", "summary_language = \"anglais\"\n");
+            }
+            env.ok(&[verb]);
+            let sent = env.logged();
+            assert_eq!(sent.len(), files.len(), "{verb} {personal} : {sent:?}");
+            assert_eq!(env.logged_paths(), files, "{verb} {personal}");
+            assert_eq!(
+                enrichment_languages(&env),
+                BTreeSet::from(["anglais".to_string()])
+            );
+            env.ok(&[verb]);
+            assert!(
+                env.logged().is_empty(),
+                "{verb} {personal} : {:?}",
+                env.logged()
+            );
+            env.ok(&["build"]);
+            assert!(env.logged().is_empty(), "{:?}", env.logged());
+        }
+    }
+}
+
+#[test]
+fn req173_ac2_default_language_written_explicitly_sends_nothing() {
+    let env = Env::new();
+    env.ok(&["build"]);
+    set_personal_language(&env, "français");
+    env.ok(&["build"]);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    env.ok(&["update"]);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+}
+
+#[test]
+fn req173_ac3_language_change_without_llm_command_keeps_state_until_update() {
+    let env = Env::new();
+    env.ok(&["build"]);
+    set_personal_language(&env, "anglais");
+    env.ok(&["build"]);
+    let files = all_paths(&env);
+    assert_eq!(env.logged_paths(), files);
+
+    set_personal_language(&env, "espagnol");
+    assert_eq!(to_enrich(&env), 0);
+    let before = summary_of(&env, "type:com.acme.core.OrderService");
+    assert!(before.is_some());
+    env.ok(&["build", "--no-llm"]);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    assert_eq!(summary_of(&env, "type:com.acme.core.OrderService"), before);
+    assert_eq!(to_enrich(&env), 0);
+
+    env.ok(&["update"]);
+    assert_eq!(env.logged().len(), files.len(), "{:?}", env.logged());
+    assert_eq!(env.logged_paths(), files);
+    assert_eq!(
+        enrichment_languages(&env),
+        BTreeSet::from(["espagnol".to_string()])
+    );
+}
+
 #[test]
 fn req049_ac6_resume_sends_only_files_not_enriched_before_failure() {
     let env = Env::new();
