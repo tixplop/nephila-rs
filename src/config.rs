@@ -338,6 +338,8 @@ pub struct Config {
     pub tls_ca_certs: Vec<CertificateDer<'static>>,
     /// Désactive le contrôle du certificat du serveur (REQ-036).
     pub tls_insecure: bool,
+    /// Langue retenue des résumés et des noms de concepts (REQ-172).
+    pub summary_language: String,
     /// Section `[ask]` de la configuration personnelle (REQ-162).
     pub ask: AskOverrides,
 }
@@ -804,6 +806,7 @@ impl Config {
             tls_ca_cert,
             tls_ca_certs,
             tls_insecure: raw.tls_insecure.unwrap_or(false),
+            summary_language: DEFAULT_SUMMARY_LANGUAGE.to_string(),
             ask,
         })
     }
@@ -902,6 +905,7 @@ mod project_tests {
             tls_ca_cert: None,
             tls_ca_certs: Vec::new(),
             tls_insecure: true,
+            summary_language: DEFAULT_SUMMARY_LANGUAGE.to_string(),
             ask: AskOverrides::default(),
         }
     }

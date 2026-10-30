@@ -791,6 +791,11 @@ fn req171_ac6_prompt_version_3_graph_is_reenriched_once() {
 }
 
 #[test]
+fn req172_ac6_prompt_version_4_graph_is_reenriched_once() {
+    reenriched_once(4);
+}
+
+#[test]
 fn req167_ac5_omitted_trivial_accessor_is_accepted() {
     let env = tiny_env(&[(
         "src/A.java",

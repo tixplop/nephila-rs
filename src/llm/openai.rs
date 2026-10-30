@@ -31,6 +31,7 @@ pub struct OpenAiLlm {
     agent: ureq::Agent,
     retry: http::Retry,
     gen: Generation,
+    summary_language: String,
 }
 
 impl OpenAiLlm {
@@ -51,7 +52,14 @@ impl OpenAiLlm {
             agent: http::agent(timeout_secs, concurrency, tls),
             retry: http::Retry::default(),
             gen,
+            summary_language: crate::config::DEFAULT_SUMMARY_LANGUAGE.to_string(),
         }
+    }
+
+    /// Langue des résumés demandée dans les prompts système (REQ-172).
+    pub fn with_summary_language(mut self, language: String) -> OpenAiLlm {
+        self.summary_language = language;
+        self
     }
 
     /// Base d'attente des nouveaux essais HTTP (REQ-052).
@@ -72,6 +80,10 @@ impl OpenAiLlm {
 }
 
 impl Complete for OpenAiLlm {
+    fn summary_language(&self) -> &str {
+        &self.summary_language
+    }
+
     fn complete(
         &self,
         label: Option<&str>,

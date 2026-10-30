@@ -420,6 +420,9 @@ fn check_system_prompt(sys: &str) {
         "{sys}"
     );
     assert!(sys.contains(nephila::llm::enrich::KIND_RULES), "{sys}");
+    // REQ-172 : configuration sans la clé `summary_language`.
+    let rules = nephila::llm::enrich::language_rules(nephila::config::DEFAULT_SUMMARY_LANGUAGE);
+    assert!(sys.contains(&rules), "{sys}");
 }
 
 fn check_lot_request(system: &str, user: &str) {

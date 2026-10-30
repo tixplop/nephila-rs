@@ -13,10 +13,10 @@ pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 /// Version du prompt d'enrichissement (DEC-062). À incrémenter à chaque changement des consignes
 /// système, des gabarits de requête (fichier seul et lot) ou des schémas de réponse version 2 et
 /// 3 : tout enrichissement conservé avec une autre version est refait. Un test fige l'empreinte
-/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 4 depuis la 0.26.0
+/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 5 depuis la 0.26.0
 /// (consignes de forme des résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers,
-/// REQ-171 ; les valeurs 2 et 3 n'ont pas été livrées).
-pub const ENRICH_PROMPT_VERSION: u32 = 4;
+/// REQ-171 ; langue, REQ-172 ; les valeurs 2 à 4 n'ont pas été livrées).
+pub const ENRICH_PROMPT_VERSION: u32 = 5;
 
 /// Consignes de forme des résumés : ligne commune aux deux prompts système (DEC-135).
 pub const SUMMARY_RULES: &str = "Résumés (de nœud ou de concept) : une phrase de 25 mots au plus, qui dit le rôle ou la responsabilité de l'élément (ce qu'il fait et à quoi il sert), pas sa syntaxe ni sa signature ; ne répète pas son nom ; n'écris que ce que le contenu montre, sans rien supposer ni inventer. Omets (aucune entrée dans \"summaries\") un accesseur ou un mutateur trivial (il lit ou écrit un champ, sans autre effet) et une section vide ou réduite à son titre.";
@@ -236,9 +236,19 @@ impl Enrichment {
     }
 }
 
-/// Prompt système d'enrichissement (identique pour tous les fournisseurs).
-pub fn enrichment_system_prompt() -> String {
+/// Consigne de langue des résumés et des noms de concepts : ligne commune aux deux prompts
+/// système (REQ-172, DEC-139). `language` est écrite telle quelle.
+pub fn language_rules(language: &str) -> String {
+    format!(
+        "Langue : rédige les résumés et les noms de concepts en {language}, quelle que soit la langue du contenu ; garde tels quels les identifiants et les termes techniques."
+    )
+}
+
+/// Prompt système d'enrichissement (identique pour tous les fournisseurs), langue demandée
+/// `language`.
+pub fn enrichment_system_prompt(language: &str) -> String {
     let types = file_types_phrase();
+    let rules = language_rules(language);
     format!(
         "Tu enrichis le graphe d'un dépôt à partir d'un fichier ({types}) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
          Schéma (version {ENRICH_SCHEMA_VERSION}) : {{\"version\": {ENRICH_SCHEMA_VERSION}, \
@@ -248,6 +258,7 @@ pub fn enrichment_system_prompt() -> String {
          {SUMMARY_RULES}\n\
          {EXCERPT_RULES}\n\
          {KIND_RULES}\n\
+         {rules}\n\
          Les résumés ne portent que sur les nœuds de la liste fournie. Les concepts ne concernent \
          que les fichiers Markdown et ne citent que des sections de la liste. Tu ne crées, ne \
          renomme ni ne supprimes aucun nœud et tu ne produis aucun autre lien. \
@@ -380,9 +391,11 @@ pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
     Ok(LotEnrichment { files, rejected })
 }
 
-/// Prompt système d'un lot de fichiers (identique pour tous les fournisseurs).
-pub fn lot_system_prompt() -> String {
+/// Prompt système d'un lot de fichiers (identique pour tous les fournisseurs), langue demandée
+/// `language`.
+pub fn lot_system_prompt(language: &str) -> String {
     let types = file_types_phrase();
+    let rules = language_rules(language);
     format!(
         "Tu enrichis le graphe d'un dépôt à partir de plusieurs fichiers ({types}) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
          Chaque fichier est introduit par une ligne `=== FICHIER : <chemin> ===`, suivie de la liste de ses \
@@ -393,6 +406,7 @@ pub fn lot_system_prompt() -> String {
          \"sections\": [\"<identifiant de section de la liste de ce fichier>\"]}}]}}]}}.\n\
          {SUMMARY_RULES}\n\
          {KIND_RULES}\n\
+         {rules}\n\
          Produis exactement une entrée par fichier fourni. Les résumés ne portent que sur les nœuds de la \
          liste du fichier concerné. Les concepts ne concernent que les fichiers Markdown et ne citent que des \
          sections de la liste du même fichier. Tu ne crées, ne renomme ni ne supprimes aucun nœud et tu ne \
@@ -418,6 +432,7 @@ pub fn lot_user_prompt(items: &[LotItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_SUMMARY_LANGUAGE;
 
     const EXTRAIT: &str = "Un fichier trop long est envoyé en extraits : sa ligne \"Fichier :\" porte alors \"(extrait k/n, lignes a–b)\" et tu ne vois que ces lignes. À partir du deuxième extrait, le contenu commence par une copie partielle du début du fichier (package, imports, déclaration du type englobant, ou titres des sections englobantes), donnée pour contexte : n'en tire aucun résumé. Un nœud de la liste seulement cité dans un extrait se résume d'après ce que l'extrait en montre ; omets-le si l'extrait n'en montre pas le rôle.";
 
@@ -467,10 +482,12 @@ mod tests {
             user_prompt(None).replacen("Fichier : a.md\n", "Fichier : a.md (morceau 2)\n", 1);
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
-            f(texts_v3_system(enrichment_system_prompt())
-                .replace(&format!("{EXCERPT_RULES}\n"), "")),
+            f(
+                texts_v3_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE))
+                    .replace(&format!("{EXCERPT_RULES}\n"), ""),
+            ),
             user,
-            f(texts_v3_system(lot_system_prompt())),
+            f(texts_v3_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE))),
             lot_user_prompt(&lot_items()),
         ]
     }
@@ -478,9 +495,56 @@ mod tests {
     const OLD_TYPES: &str =
         "code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, build Maven/Gradle/Ivy, ou Markdown";
 
+    /// Prompt système de la version 4 : sans la consigne de langue (REQ-172).
+    fn texts_v4_system(p: String) -> String {
+        p.replace(
+            &format!("{}\n", language_rules(DEFAULT_SUMMARY_LANGUAGE)),
+            "",
+        )
+    }
+
+    /// Les six textes figés par la version 4 (AC-172-4).
+    fn texts_v4() -> Vec<String> {
+        vec![
+            format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
+            texts_v4_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
+            user_prompt(None),
+            user_prompt(Some(EXCERPT_2_3)),
+            texts_v4_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
+            lot_user_prompt(&lot_items()),
+        ]
+    }
+
+    #[test]
+    fn req172_ac4_the_six_texts_of_version_4_are_unchanged() {
+        assert_eq!(
+            fingerprint_of(&texts_v4()),
+            "d35c005b92a13804baf653a19ea7facd94edac5e4f25969b44a5ca59209711de"
+        );
+    }
+
+    #[test]
+    fn req172_ac1_language_rules_in_both_system_prompts() {
+        assert_eq!(
+            language_rules("français"),
+            "Langue : rédige les résumés et les noms de concepts en français, quelle que soit la langue du contenu ; garde tels quels les identifiants et les termes techniques."
+        );
+        for l in ["français", "anglais", "portugais du Brésil"] {
+            let r = language_rules(l);
+            let one = format!("\n{KIND_RULES}\n{r}\nLes résumés ne portent que");
+            assert_eq!(enrichment_system_prompt(l).matches(&one).count(), 1, "{l}");
+            let lot =
+                format!("\n{KIND_RULES}\n{r}\nProduis exactement une entrée par fichier fourni.");
+            assert_eq!(lot_system_prompt(l).matches(&lot).count(), 1, "{l}");
+        }
+        assert!(!enrichment_system_prompt("anglais").contains("en français"));
+        assert!(!lot_system_prompt("anglais").contains("en français"));
+    }
+
     /// Prompt système de la version 3 : sans `KIND_RULES`, ancienne parenthèse des types.
     fn texts_v3_system(p: String) -> String {
-        p.replace(&format!("{KIND_RULES}\n"), "")
+        texts_v4_system(p)
+            .replace(&format!("{KIND_RULES}\n"), "")
             .replace(&file_types_phrase(), OLD_TYPES)
     }
 
@@ -488,10 +552,10 @@ mod tests {
     fn texts_v3() -> Vec<String> {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
-            texts_v3_system(enrichment_system_prompt()),
+            texts_v3_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
             user_prompt(None),
             user_prompt(Some(EXCERPT_2_3)),
-            texts_v3_system(lot_system_prompt()),
+            texts_v3_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
             lot_user_prompt(&lot_items()),
         ]
     }
@@ -500,18 +564,18 @@ mod tests {
     fn req049_ac4_prompt_texts_are_frozen_next_to_the_prompt_version() {
         // Changer une consigne, un gabarit ou un schéma : incrémenter `ENRICH_PROMPT_VERSION`,
         // puis mettre à jour les deux littéraux ci-dessous.
-        assert_eq!(ENRICH_PROMPT_VERSION, 4);
+        assert_eq!(ENRICH_PROMPT_VERSION, 5);
         let texts = [
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
-            enrichment_system_prompt(),
+            enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
             user_prompt(None),
             user_prompt(Some(EXCERPT_2_3)),
-            lot_system_prompt(),
+            lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
             lot_user_prompt(&lot_items()),
         ];
         assert_eq!(
             fingerprint_of(&texts),
-            "d35c005b92a13804baf653a19ea7facd94edac5e4f25969b44a5ca59209711de",
+            "dd9ffc5c3e4673a05ec777430b44aa445cf5f2262e251e62a531f9cf097d70f2",
             "les textes du prompt ont changé : incrémentez ENRICH_PROMPT_VERSION"
         );
     }
@@ -529,8 +593,8 @@ mod tests {
     #[test]
     fn req171_ac1_file_types_phrase_in_both_system_prompts() {
         assert_eq!(file_types_phrase(), TYPES);
-        let one = enrichment_system_prompt();
-        let lot = lot_system_prompt();
+        let one = enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE);
+        let lot = lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE);
         let a = format!("à partir d'un fichier ({TYPES}) et tu réponds");
         let b = format!("à partir de plusieurs fichiers ({TYPES}) et tu réponds");
         assert_eq!(one.matches(&a).count(), 1);
@@ -606,8 +670,13 @@ mod tests {
         use crate::model::NodeKind;
         assert_eq!(KIND_RULES, GENRES);
         let one = format!("\n{EXCERPT_RULES}\n{KIND_RULES}\n");
-        assert_eq!(enrichment_system_prompt().matches(&one).count(), 1);
-        let lot_p = lot_system_prompt();
+        assert_eq!(
+            enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)
+                .matches(&one)
+                .count(),
+            1
+        );
+        let lot_p = lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE);
         let lot = format!("\n{SUMMARY_RULES}\n{KIND_RULES}\n");
         assert_eq!(lot_p.matches(&lot).count(), 1);
         assert!(!lot_p.contains(EXCERPT_RULES));
@@ -634,8 +703,13 @@ mod tests {
     fn req169_ac1_excerpt_rules_text_and_placement() {
         assert_eq!(EXCERPT_RULES, EXTRAIT);
         let needle = format!("\n{SUMMARY_RULES}\n{EXCERPT_RULES}\n");
-        assert_eq!(enrichment_system_prompt().matches(&needle).count(), 1);
-        let lot = lot_system_prompt();
+        assert_eq!(
+            enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)
+                .matches(&needle)
+                .count(),
+            1
+        );
+        let lot = lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE);
         assert!(!lot.contains(EXCERPT_RULES));
         assert_eq!(lot.matches(&format!("\n{SUMMARY_RULES}\n")).count(), 1);
     }
@@ -665,7 +739,10 @@ mod tests {
             "Résumés (de nœud ou de concept) : une phrase de 25 mots au plus, qui dit le rôle ou la responsabilité de l'élément (ce qu'il fait et à quoi il sert), pas sa syntaxe ni sa signature ; ne répète pas son nom ; n'écris que ce que le contenu montre, sans rien supposer ni inventer. Omets (aucune entrée dans \"summaries\") un accesseur ou un mutateur trivial (il lit ou écrit un champ, sans autre effet) et une section vide ou réduite à son titre."
         );
         let needle = format!("\n{SUMMARY_RULES}\n");
-        for p in [enrichment_system_prompt(), lot_system_prompt()] {
+        for p in [
+            enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
+            lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
+        ] {
             assert_eq!(p.matches(&needle).count(), 1);
             // « une phrase » figure dans SUMMARY_RULES : on vérifie l'absence de l'ancienne valeur d'exemple.
             assert!(!p.contains("\"summary\": \"une phrase"));

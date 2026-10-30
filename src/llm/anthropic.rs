@@ -86,6 +86,7 @@ pub struct AnthropicLlm {
     agent: ureq::Agent,
     retry: http::Retry,
     gen: Generation,
+    summary_language: String,
 }
 
 impl AnthropicLlm {
@@ -105,7 +106,14 @@ impl AnthropicLlm {
             agent: http::agent(timeout_secs, concurrency, tls),
             retry: http::Retry::default(),
             gen,
+            summary_language: crate::config::DEFAULT_SUMMARY_LANGUAGE.to_string(),
         }
+    }
+
+    /// Langue des résumés demandée dans les prompts système (REQ-172).
+    pub fn with_summary_language(mut self, language: String) -> AnthropicLlm {
+        self.summary_language = language;
+        self
     }
 
     /// Base d'attente des nouveaux essais HTTP (REQ-052).
@@ -123,6 +131,10 @@ impl AnthropicLlm {
 }
 
 impl Complete for AnthropicLlm {
+    fn summary_language(&self) -> &str {
+        &self.summary_language
+    }
+
     /// Appelle `/v1/messages` et retourne le texte de la réponse.
     fn complete(
         &self,

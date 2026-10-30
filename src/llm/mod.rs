@@ -99,6 +99,8 @@ pub trait Llm: Send + Sync {
 
 /// Appel de complétion d'un adaptateur HTTP : le reste de `Llm` s'en déduit (REQ-127).
 pub(crate) trait Complete: Send + Sync {
+    /// Langue des résumés demandée dans les prompts système (REQ-172).
+    fn summary_language(&self) -> &str;
     /// Envoie la consigne système et la requête, retourne le texte de la réponse.
     fn complete(
         &self,
@@ -111,6 +113,10 @@ pub(crate) trait Complete: Send + Sync {
 }
 
 impl<T: Complete> Llm for T {
+    fn summary_language(&self) -> &str {
+        Complete::summary_language(self)
+    }
+
     fn enrich(
         &self,
         file: &str,
@@ -123,7 +129,7 @@ impl<T: Complete> Llm for T {
             None,
             None,
             &CallStats::default(),
-            enrichment_system_prompt(),
+            enrichment_system_prompt(self.summary_language()),
             enrichment_user_prompt(file, None, text, requested),
         )?;
         Enrichment::parse(http::extract_json(&out)?, file, known)
@@ -146,7 +152,7 @@ impl<T: Complete> Llm for T {
             Some(label),
             Some(stop),
             stats,
-            enrichment_system_prompt(),
+            enrichment_system_prompt(self.summary_language()),
             enrichment_user_prompt(file, excerpt, text, requested),
         )?;
         Enrichment::parse(http::extract_json(&out)?, file, known)
@@ -157,7 +163,7 @@ impl<T: Complete> Llm for T {
             None,
             None,
             &CallStats::default(),
-            lot_system_prompt(),
+            lot_system_prompt(self.summary_language()),
             lot_user_prompt(items),
         )?;
         Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
@@ -174,7 +180,7 @@ impl<T: Complete> Llm for T {
             Some(label),
             Some(stop),
             stats,
-            lot_system_prompt(),
+            lot_system_prompt(self.summary_language()),
             lot_user_prompt(items),
         )?;
         Ok(parse_lot(http::extract_json(&out)?, items)?.into_results())
@@ -200,6 +206,7 @@ impl<T: Complete> Llm for T {
 struct WithModel {
     inner: Box<dyn Llm>,
     model: String,
+    summary_language: String,
 }
 
 impl Llm for WithModel {
@@ -208,7 +215,7 @@ impl Llm for WithModel {
     }
 
     fn summary_language(&self) -> &str {
-        self.inner.summary_language()
+        &self.summary_language
     }
 
     fn enrich(
@@ -267,6 +274,7 @@ pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
     Ok(Box::new(WithModel {
         inner: build_provider(config)?,
         model: config.model.clone(),
+        summary_language: config.summary_language.clone(),
     }))
 }
 
@@ -310,7 +318,8 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     config.concurrency,
                     gen,
                 )
-                .with_retry(retry),
+                .with_retry(retry)
+                .with_summary_language(config.summary_language.clone()),
             ))
         }
         Provider::OpenAi => {
@@ -325,7 +334,8 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     config.concurrency,
                     gen,
                 )
-                .with_retry(retry),
+                .with_retry(retry)
+                .with_summary_language(config.summary_language.clone()),
             ))
         }
     }
