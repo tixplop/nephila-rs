@@ -13,10 +13,10 @@ pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 /// Version du prompt d'enrichissement (DEC-062). À incrémenter à chaque changement des consignes
 /// système, des gabarits de requête (fichier seul et lot) ou des schémas de réponse version 2 et
 /// 3 : tout enrichissement conservé avec une autre version est refait. Un test fige l'empreinte
-/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 5 depuis la 0.26.0
+/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 6 depuis la 0.26.0
 /// (consignes de forme des résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers,
-/// REQ-171 ; langue, REQ-172 ; les valeurs 2 à 4 n'ont pas été livrées).
-pub const ENRICH_PROMPT_VERSION: u32 = 5;
+/// REQ-171 ; langue, REQ-172 ; concepts, REQ-175 ; les valeurs 2 à 5 n'ont pas été livrées).
+pub const ENRICH_PROMPT_VERSION: u32 = 6;
 
 /// Consignes de forme des résumés : ligne commune aux deux prompts système (DEC-135).
 pub const SUMMARY_RULES: &str = "Résumés (de nœud ou de concept) : une phrase de 25 mots au plus, qui dit le rôle ou la responsabilité de l'élément (ce qu'il fait et à quoi il sert), pas sa syntaxe ni sa signature ; ne répète pas son nom ; n'écris que ce que le contenu montre, sans rien supposer ni inventer. Omets (aucune entrée dans \"summaries\") un accesseur ou un mutateur trivial (il lit ou écrit un champ, sans autre effet) et une section vide ou réduite à son titre.";
@@ -236,6 +236,10 @@ impl Enrichment {
     }
 }
 
+/// Règles de choix et de nommage des concepts : ligne commune aux deux prompts système, après la
+/// consigne de langue (REQ-175, DEC-141). Règles seulement : aucun contrôle dans le code.
+pub const CONCEPT_RULES: &str = "Concepts : chacun est une notion métier ou technique durable que le document définit ou explique, jamais un titre de section ni un mot générique (introduction, exemple, présentation, sommaire, remarque) ; son nom tient en 1 à 4 mots, au singulier, sans article, et désigne la notion elle-même (« commande », pas « les commandes » ni « gestion des commandes ») ; au plus 8 concepts par fichier dans une même réponse ; sans notion de ce genre, \"concepts\": [].";
+
 /// Consigne de langue des résumés et des noms de concepts : ligne commune aux deux prompts
 /// système (REQ-172, DEC-139). `language` est écrite telle quelle.
 pub fn language_rules(language: &str) -> String {
@@ -259,6 +263,7 @@ pub fn enrichment_system_prompt(language: &str) -> String {
          {EXCERPT_RULES}\n\
          {KIND_RULES}\n\
          {rules}\n\
+         {CONCEPT_RULES}\n\
          Les résumés ne portent que sur les nœuds de la liste fournie. Les concepts ne concernent \
          que les fichiers Markdown et ne citent que des sections de la liste. Tu ne crées, ne \
          renomme ni ne supprimes aucun nœud et tu ne produis aucun autre lien. \
@@ -407,6 +412,7 @@ pub fn lot_system_prompt(language: &str) -> String {
          {SUMMARY_RULES}\n\
          {KIND_RULES}\n\
          {rules}\n\
+         {CONCEPT_RULES}\n\
          Produis exactement une entrée par fichier fourni. Les résumés ne portent que sur les nœuds de la \
          liste du fichier concerné. Les concepts ne concernent que les fichiers Markdown et ne citent que des \
          sections de la liste du même fichier. Tu ne crées, ne renomme ni ne supprimes aucun nœud et tu ne \
@@ -495,9 +501,34 @@ mod tests {
     const OLD_TYPES: &str =
         "code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, build Maven/Gradle/Ivy, ou Markdown";
 
+    /// Prompt système de la version 5 : sans les règles des concepts (REQ-175).
+    fn texts_v5_system(p: String) -> String {
+        p.replace(&format!("{CONCEPT_RULES}\n"), "")
+    }
+
+    /// Les six textes figés par la version 5 (AC-175-2).
+    fn texts_v5() -> Vec<String> {
+        vec![
+            format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
+            texts_v5_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
+            user_prompt(None),
+            user_prompt(Some(EXCERPT_2_3)),
+            texts_v5_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
+            lot_user_prompt(&lot_items()),
+        ]
+    }
+
+    #[test]
+    fn req175_ac2_the_six_texts_of_version_5_are_unchanged() {
+        assert_eq!(
+            fingerprint_of(&texts_v5()),
+            "dd9ffc5c3e4673a05ec777430b44aa445cf5f2262e251e62a531f9cf097d70f2"
+        );
+    }
+
     /// Prompt système de la version 4 : sans la consigne de langue (REQ-172).
     fn texts_v4_system(p: String) -> String {
-        p.replace(
+        texts_v5_system(p).replace(
             &format!("{}\n", language_rules(DEFAULT_SUMMARY_LANGUAGE)),
             "",
         )
@@ -531,10 +562,9 @@ mod tests {
         );
         for l in ["français", "anglais", "portugais du Brésil"] {
             let r = language_rules(l);
-            let one = format!("\n{KIND_RULES}\n{r}\nLes résumés ne portent que");
+            let one = format!("\n{KIND_RULES}\n{r}\n");
             assert_eq!(enrichment_system_prompt(l).matches(&one).count(), 1, "{l}");
-            let lot =
-                format!("\n{KIND_RULES}\n{r}\nProduis exactement une entrée par fichier fourni.");
+            let lot = format!("\n{KIND_RULES}\n{r}\n");
             assert_eq!(lot_system_prompt(l).matches(&lot).count(), 1, "{l}");
         }
         assert!(!enrichment_system_prompt("anglais").contains("en français"));
@@ -564,7 +594,7 @@ mod tests {
     fn req049_ac4_prompt_texts_are_frozen_next_to_the_prompt_version() {
         // Changer une consigne, un gabarit ou un schéma : incrémenter `ENRICH_PROMPT_VERSION`,
         // puis mettre à jour les deux littéraux ci-dessous.
-        assert_eq!(ENRICH_PROMPT_VERSION, 5);
+        assert_eq!(ENRICH_PROMPT_VERSION, 6);
         let texts = [
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
@@ -575,7 +605,7 @@ mod tests {
         ];
         assert_eq!(
             fingerprint_of(&texts),
-            "dd9ffc5c3e4673a05ec777430b44aa445cf5f2262e251e62a531f9cf097d70f2",
+            "0d53830988dade24bd34df822cd23054749d4d8eb426ed86d817f306620348fb",
             "les textes du prompt ont changé : incrémentez ENRICH_PROMPT_VERSION"
         );
     }
@@ -660,6 +690,33 @@ mod tests {
             );
             let t = FileType::of(path).unwrap_or_else(|| panic!("{path}"));
             assert!(words.contains(&file_type_label(t).1), "{path}");
+        }
+    }
+
+    const CONCEPTS: &str = "Concepts : chacun est une notion métier ou technique durable que le document définit ou explique, jamais un titre de section ni un mot générique (introduction, exemple, présentation, sommaire, remarque) ; son nom tient en 1 à 4 mots, au singulier, sans article, et désigne la notion elle-même (« commande », pas « les commandes » ni « gestion des commandes ») ; au plus 8 concepts par fichier dans une même réponse ; sans notion de ce genre, \"concepts\": [].";
+
+    #[test]
+    fn req175_ac1_concept_rules_text_and_placement() {
+        assert_eq!(CONCEPT_RULES, CONCEPTS);
+        for l in ["français", "anglais"] {
+            let r = language_rules(l);
+            let one = format!("\n{r}\n{CONCEPT_RULES}\nLes résumés ne portent que");
+            assert_eq!(enrichment_system_prompt(l).matches(&one).count(), 1, "{l}");
+            let lot = format!(
+                "\n{r}\n{CONCEPT_RULES}\nProduis exactement une entrée par fichier fourni."
+            );
+            assert_eq!(lot_system_prompt(l).matches(&lot).count(), 1, "{l}");
+        }
+        for needle in ["extrait", "morceau"] {
+            assert!(!CONCEPT_RULES.contains(needle), "{needle}");
+        }
+        let items = lot_items();
+        for u in [
+            user_prompt(None),
+            user_prompt(Some(EXCERPT_2_3)),
+            lot_user_prompt(&items),
+        ] {
+            assert!(!u.contains(CONCEPT_RULES) && !u.contains("Concepts :"));
         }
     }
 
