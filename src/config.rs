@@ -12,6 +12,8 @@ use crate::error::{Error, Result};
 pub const DEFAULT_MAX_CHUNK_CHARS: usize = 60_000;
 pub const DEFAULT_CONCURRENCY: usize = 4;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Langue par défaut des résumés (`summary_language`, REQ-172).
+pub const DEFAULT_SUMMARY_LANGUAGE: &str = "français";
 pub const DEFAULT_BATCH_FILES: usize = 10;
 pub const DEFAULT_FORMAT_RETRIES: u32 = 2;
 

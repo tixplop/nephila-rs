@@ -19,7 +19,9 @@ CREATE TABLE enrichments (
     content_hash   TEXT NOT NULL,
     model          TEXT NOT NULL,
     prompt_version INTEGER NOT NULL,
-    payload        TEXT NOT NULL
+    payload        TEXT NOT NULL,
+    -- Langue des résumés demandée (DEC-138), comprise dans l'empreinte.
+    language       TEXT NOT NULL
 );
 
 CREATE TABLE nodes (

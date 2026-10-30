@@ -1016,6 +1016,7 @@ fn queue_done(
 fn flush_group(
     store: &mut Store,
     model: &str,
+    language: &str,
     pending: &mut Vec<EnrichmentWrite>,
     stop: &AtomicBool,
     write_error: &mut Option<Error>,
@@ -1023,7 +1024,7 @@ fn flush_group(
     if pending.is_empty() {
         return;
     }
-    if let Err(e) = store.apply_enrichments(model, pending) {
+    if let Err(e) = store.apply_enrichments(model, language, pending) {
         stop.store(true, Ordering::SeqCst);
         *write_error = Some(e);
     }
@@ -1422,7 +1423,14 @@ pub(crate) fn enrich_with_stop(
                 advances.push((notes, adv));
                 next = rx.try_recv().ok();
             }
-            flush_group(store, llm.model(), &mut pending, stop, &mut write_error);
+            flush_group(
+                store,
+                llm.model(),
+                llm.summary_language(),
+                &mut pending,
+                stop,
+                &mut write_error,
+            );
             // Avertissements et progression de chaque message, dans l'ordre d'arrivée.
             for (notes, adv) in advances {
                 for note in notes {

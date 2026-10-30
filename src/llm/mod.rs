@@ -41,6 +41,10 @@ pub trait Llm: Send + Sync {
     fn model(&self) -> &str {
         ""
     }
+    /// Langue des résumés demandée, enregistrée dans l'empreinte d'enrichissement (REQ-173).
+    fn summary_language(&self) -> &str {
+        crate::config::DEFAULT_SUMMARY_LANGUAGE
+    }
     /// Enrichit un appel : résumés et concepts (schéma version 2). `requested` = nœuds écrits
     /// dans le prompt ; `known` = liste complète du fichier, qui filtre la réponse.
     fn enrich(
@@ -201,6 +205,10 @@ struct WithModel {
 impl Llm for WithModel {
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn summary_language(&self) -> &str {
+        self.inner.summary_language()
     }
 
     fn enrich(

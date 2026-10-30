@@ -31,7 +31,13 @@ struct Env {
     config: PathBuf,
     mock: PathBuf,
     log: PathBuf,
+    /// Journal du simulé (lignes triées) du `build` initial et table `enrichments` d'avant la
+    /// descente de schéma (REQ-173, hypothèse « tests existants »).
+    initial_log: std::cell::RefCell<Vec<String>>,
+    initial_rows: std::cell::RefCell<Vec<EnrichRow>>,
 }
+
+type EnrichRow = (String, String, String, i64, String, String);
 
 impl Env {
     /// Dépôt exemple des tests de requête, mock enrichi (`enrich_code`).
@@ -55,7 +61,27 @@ impl Env {
             config,
             mock,
             log,
+            initial_log: Default::default(),
+            initial_rows: Default::default(),
         }
+    }
+
+    /// `build` avec LLM actif ; relève son journal trié et la table `enrichments`.
+    fn build_enriched(&self) {
+        self.ok(&["build"]);
+        let mut log = self.logged();
+        log.sort();
+        assert!(!log.is_empty());
+        *self.initial_log.borrow_mut() = log;
+        let rows = self.enrichments();
+        assert!(rows.iter().all(|r| r.5 == "français"));
+        *self.initial_rows.borrow_mut() = rows;
+    }
+
+    fn sorted_log(&self) -> Vec<String> {
+        let mut l = self.logged();
+        l.sort();
+        l
     }
 
     /// Exécute la commande avec un journal du mock vide au départ.
@@ -102,7 +128,7 @@ impl Env {
     /// Construit le graphe puis le ramène au schéma 5 (l'assistant du schéma 6 d'abord).
     fn built_at_schema5() -> Env {
         let env = Env::new();
-        env.ok(&["build"]);
+        env.build_enriched();
         assert_eq!(env.user_version(), SCHEMA_VERSION);
         schema6::downgrade_to_5(&env.db());
         assert_eq!(env.user_version(), 5);
@@ -112,20 +138,27 @@ impl Env {
     /// Construit le graphe puis le ramène au schéma 6 de la 0.20.0.
     fn built_at_schema6() -> Env {
         let env = Env::new();
-        env.ok(&["build"]);
+        env.build_enriched();
         assert_eq!(env.user_version(), SCHEMA_VERSION);
         schema6::downgrade_to_6(&env.db());
         assert_eq!(env.user_version(), 6);
         env
     }
 
-    fn enrichments(&self) -> Vec<(String, String, String, i64, String)> {
+    fn enrichments(&self) -> Vec<EnrichRow> {
         let db = self.db();
         let mut q = db
-            .prepare("SELECT path, content_hash, model, prompt_version, payload FROM enrichments ORDER BY path")
+            .prepare("SELECT path, content_hash, model, prompt_version, payload, language FROM enrichments ORDER BY path")
             .unwrap();
         q.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })
         .unwrap()
         .map(|r| r.unwrap())
@@ -137,11 +170,32 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+/// Oracle (a) de l'hypothèse « tests existants, mise à niveau avec LLM actif » (REQ-173) pour un
+/// `update` qui vient de migrer : journal égal à celui du `build` initial, bilan d'indexation sans
+/// fichier restant à enrichir, version courante, `enrichments` égale à celle d'avant la descente.
+fn assert_migrated_update(env: &Env, o: &Output) {
+    assert_eq!(env.sorted_log(), *env.initial_log.borrow());
+    let out = text(&o.stdout);
+    assert!(out.starts_with("update terminé : "), "{out}");
+    assert!(out.contains(", 0 fichiers à enrichir"), "{out}");
+    assert_eq!(env.user_version(), SCHEMA_VERSION);
+    assert_eq!(env.enrichments(), *env.initial_rows.borrow());
+}
+
+/// Oracle (c) : une seconde commande sans changement n'envoie rien et ne change pas la table.
+fn assert_second_run_is_up_to_date(env: &Env, cmd: &str) {
+    let o = env.ok(&[cmd]);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    if cmd == "update" {
+        assert_eq!(text(&o.stdout).trim(), "graphe à jour");
+    }
+    assert_eq!(env.enrichments(), *env.initial_rows.borrow());
+}
+
 #[test]
 fn req057_ac3_schema5_read_only_commands_then_update_migrates_without_llm() {
     let env = Env::built_at_schema5();
-    let enrichments = env.enrichments();
-    assert!(!enrichments.is_empty());
+    assert!(!env.initial_rows.borrow().is_empty());
 
     for args in [
         &["query", "neighbors", "OrderRepository.save"][..],
@@ -171,8 +225,9 @@ fn req057_ac3_schema5_read_only_commands_then_update_migrates_without_llm() {
     }
     assert_eq!(env.user_version(), 5);
 
-    env.ok(&["update"]);
-    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    // LLM actif : les entrées migrées (langue vide) sont réenrichies une fois (DEC-138).
+    let o = env.ok(&["update"]);
+    assert_migrated_update(&env, &o);
     assert_eq!(env.user_version(), SCHEMA_VERSION);
     let db = env.db();
     let (total, filled): (i64, i64) = db
@@ -184,17 +239,18 @@ fn req057_ac3_schema5_read_only_commands_then_update_migrates_without_llm() {
         .unwrap();
     assert!(total > 0);
     assert_eq!(total, filled);
-    assert_eq!(env.enrichments(), enrichments);
+    assert_eq!(env.enrichments(), *env.initial_rows.borrow());
+    assert_second_run_is_up_to_date(&env, "update");
 }
 
 #[test]
 fn req057_ac3_schema5_build_migrates_without_llm() {
     let env = Env::built_at_schema5();
-    let enrichments = env.enrichments();
     env.ok(&["build"]);
-    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    assert_eq!(env.sorted_log(), *env.initial_log.borrow());
     assert_eq!(env.user_version(), SCHEMA_VERSION);
-    assert_eq!(env.enrichments(), enrichments);
+    assert_eq!(env.enrichments(), *env.initial_rows.borrow());
+    assert_second_run_is_up_to_date(&env, "build");
 }
 
 const READS: [&[&str]; 5] = [
@@ -216,7 +272,7 @@ fn graph_fingerprint(env: &Env) -> (u64, String) {
 /// Dépôt exemple au schéma `version` (5 ou 6) et les sorties de lecture d'avant la descente.
 fn downgraded(version: u32) -> (Env, Vec<String>) {
     let env = Env::new();
-    env.ok(&["build"]);
+    env.build_enriched();
     assert_eq!(env.user_version(), SCHEMA_VERSION);
     let outputs: Vec<String> = READS.iter().map(|a| text(&env.ok(a).stdout)).collect();
     if version == 5 {
@@ -266,32 +322,29 @@ fn req062_ac5_old_schemas_are_read_unchanged_then_migrated_by_update_or_build() 
             assert_eq!(env.user_version(), version as i32, "{args:?}");
             assert_eq!(graph_fingerprint(&env), before, "{args:?}");
         }
-        let enrichments = env.enrichments();
-        assert!(!enrichments.is_empty());
+        assert!(!env.initial_rows.borrow().is_empty());
 
-        // Premier `update` : bilan d'une passe complète (graphe à résoudre), aucun appel LLM.
+        // Premier `update` avec LLM actif : les entrées migrées (langue vide) sont réenrichies
+        // une fois (DEC-138), le bilan d'une passe complète remplace `graphe à jour`.
         let o = env.ok(&["update"]);
         assert!(
             text(&o.stdout).starts_with("update terminé : 0 fichiers traités,"),
             "schéma {version} : {}",
             text(&o.stdout)
         );
-        assert!(env.logged().is_empty(), "{:?}", env.logged());
-        assert_eq!(env.user_version(), SCHEMA_VERSION);
+        assert_migrated_update(&env, &o);
         assert_eq!(text(&env.ok(&["status"]).stdout), outputs[2]);
-        let o = env.ok(&["update"]);
-        assert_eq!(text(&o.stdout).trim(), "graphe à jour", "schéma {version}");
-        assert!(env.logged().is_empty(), "{:?}", env.logged());
+        assert_second_run_is_up_to_date(&env, "update");
         assert_eq!(text(&env.ok(READS[4]).stdout), outputs[4]);
-        assert_eq!(env.enrichments(), enrichments);
 
-        // Autre copie du même graphe : `build` migre sans appel LLM.
+        // Autre copie du même graphe : `build` migre et réenrichit de même.
         let (other, _) = downgraded(version);
         other.ok(&["build"]);
-        assert!(other.logged().is_empty(), "{:?}", other.logged());
+        assert_eq!(other.sorted_log(), *other.initial_log.borrow());
         assert_eq!(other.user_version(), SCHEMA_VERSION);
+        assert_eq!(other.enrichments(), *other.initial_rows.borrow());
         assert_eq!(text(&other.ok(READS[4]).stdout), outputs[4]);
-        assert_eq!(other.enrichments(), enrichments);
+        assert_second_run_is_up_to_date(&other, "build");
     }
 }
 
@@ -475,7 +528,7 @@ fn req115_ac3_texte_exact_et_place() {
 }
 
 /// Vérifie le motif de AC-115-3 (pas de dépendance de test nouvelle) :
-/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 9 en [0-9]+ ms$`.
+/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 10 en [0-9]+ ms$`.
 fn is_migration_trace_7(line: &str) -> bool {
     {
         let Some(rest) = line.strip_prefix("trace: [") else {
@@ -557,16 +610,16 @@ fn req147_ac4_schema8_is_read_unchanged_by_status_summary_and_export() {
 }
 
 #[test]
-fn req147_ac4_update_migrates_schema8_to_9_and_traces_it() {
+fn req147_ac4_update_migrates_schema8_to_current_and_traces_it() {
     let env = built_at(8);
     let o = env.ok(&["update", "--no-llm", "--verbose"]);
     assert!(o.status.success());
-    assert_eq!(env.user_version(), 9);
+    assert_eq!(env.user_version(), SCHEMA_VERSION);
     assert_migration_trace(&o.stderr, 8);
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 8 vers 9 en ")),
+            .any(|l| l.starts_with("schéma: migration 8 vers 10 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -580,7 +633,7 @@ fn req147_ac4_update_migrates_schema8_to_9_and_traces_it() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v, "9");
+    assert_eq!(v, "10");
 }
 
 #[test]
@@ -589,11 +642,11 @@ fn req147_ac4_schema7_reaches_the_same_result_as_schema8() {
     from8.ok(&["update", "--no-llm"]);
     let from7 = built_at(7);
     let o = from7.ok(&["update", "--no-llm", "--verbose"]);
-    assert_eq!(from7.user_version(), 9);
+    assert_eq!(from7.user_version(), SCHEMA_VERSION);
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 7 vers 9 en ")),
+            .any(|l| l.starts_with("schéma: migration 7 vers 10 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -610,4 +663,86 @@ fn req147_ac4_schema7_reaches_the_same_result_as_schema8() {
         text(&from7.ok(&["status"]).stdout),
         text(&from8.ok(&["status"]).stdout)
     );
+}
+
+// ---- REQ-173 : schéma 10, langue dans l'empreinte d'enrichissement (DEC-138) ----
+
+fn resolution(env: &Env) -> String {
+    env.db()
+        .query_row("SELECT value FROM meta WHERE key = 'resolution'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+/// Graphe enrichi (mock) ramené au schéma 9 (`from` = 9) ou 8 (`from` = 8).
+fn enriched_at(from: i32) -> (Env, String) {
+    let env = Env::new();
+    env.build_enriched();
+    let status = text(&env.ok(&["status"]).stdout);
+    match from {
+        9 => schema6::schema7::schema8::schema9::downgrade_to_9(&env.db()),
+        8 => schema8::downgrade_to_8(&env.db()),
+        v => panic!("schéma {v}"),
+    }
+    assert_eq!(env.user_version(), from);
+    (env, status)
+}
+
+/// Migration par `update --no-llm --verbose` (entrées conservées, langue vide, journal vide),
+/// puis `update` LLM actif (réenrichissement identique au `build` initial), puis `graphe à jour`.
+fn assert_ac173_4_chain(env: &Env, from: i32) {
+    let entries = env.initial_rows.borrow().clone();
+    assert!(!entries.is_empty());
+    let resolution_before = resolution(env);
+
+    let o = env.ok(&["update", "--no-llm", "--verbose"]);
+    assert_eq!(env.user_version(), SCHEMA_VERSION);
+    let v: String = env
+        .db()
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION.to_string());
+    assert_migration_trace(&o.stderr, from);
+    assert!(
+        trace_lines(&o.stderr)
+            .iter()
+            .any(|l| l.starts_with(&format!("schéma: migration {from} vers 10 en "))),
+        "{}",
+        text(&o.stderr)
+    );
+    let migrated = env.enrichments();
+    assert_eq!(
+        migrated.iter().map(|r| &r.0).collect::<Vec<_>>(),
+        entries.iter().map(|r| &r.0).collect::<Vec<_>>()
+    );
+    for (m, e) in migrated.iter().zip(&entries) {
+        assert_eq!((&m.1, &m.2, m.3, &m.4), (&e.1, &e.2, e.3, &e.4));
+        assert_eq!(m.5, "");
+    }
+    assert_eq!(resolution(env), resolution_before);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+
+    let o = env.ok(&["update"]);
+    assert_migrated_update(env, &o);
+    assert_second_run_is_up_to_date(env, "update");
+}
+
+#[test]
+fn req173_ac4_update_migrates_schema9_to_10_and_keeps_entries() {
+    let (env, before) = enriched_at(9);
+    // Lecture seule : sans erreur, sortie d'avant la descente, schéma inchangé.
+    assert_eq!(text(&env.ok(&["status"]).stdout), before);
+    assert_eq!(env.user_version(), 9);
+    assert_ac173_4_chain(&env, 9);
+}
+
+#[test]
+fn req173_ac4_update_migrates_schema8_to_10_keeping_entries() {
+    let (env, _) = enriched_at(8);
+    assert_ac173_4_chain(&env, 8);
 }

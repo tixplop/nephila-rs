@@ -27,7 +27,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -46,6 +46,9 @@ const NODE_COMMUNITIES_DDL: &str = "CREATE TABLE node_communities (\n    node   
 /// Dernier schéma sans les tables `communities` et `node_communities`, migré sur place
 /// (DEC-120).
 const SCHEMA_WITHOUT_COMMUNITIES: i32 = 8;
+
+/// Dernier schéma sans `enrichments.language`, migré sur place (DEC-138).
+const SCHEMA_WITHOUT_ENRICH_LANGUAGE: i32 = 9;
 
 /// Valeurs de `meta.resolution` (DEC-076) : le graphe est-il le résultat d'une passe terminée ?
 const RESOLUTION_DONE: &str = "à jour";
@@ -583,7 +586,8 @@ impl Store {
             SCHEMA_WITHOUT_REV
             | SCHEMA_WITH_REF_CONTEXT
             | SCHEMA_WITH_FILE_CONTEXTS
-            | SCHEMA_WITHOUT_COMMUNITIES => store.migrate_to_current()?,
+            | SCHEMA_WITHOUT_COMMUNITIES
+            | SCHEMA_WITHOUT_ENRICH_LANGUAGE => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -618,7 +622,8 @@ impl Store {
             SCHEMA_WITHOUT_REV
             | SCHEMA_WITH_REF_CONTEXT
             | SCHEMA_WITH_FILE_CONTEXTS
-            | SCHEMA_WITHOUT_COMMUNITIES => {
+            | SCHEMA_WITHOUT_COMMUNITIES
+            | SCHEMA_WITHOUT_ENRICH_LANGUAGE => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
                 Ok(store)
@@ -670,7 +675,8 @@ impl Store {
                 || v == SCHEMA_WITHOUT_REV
                 || v == SCHEMA_WITH_REF_CONTEXT
                 || v == SCHEMA_WITH_FILE_CONTEXTS
-                || v == SCHEMA_WITHOUT_COMMUNITIES =>
+                || v == SCHEMA_WITHOUT_COMMUNITIES
+                || v == SCHEMA_WITHOUT_ENRICH_LANGUAGE =>
             {
                 store.version = v
             }
@@ -685,13 +691,13 @@ impl Store {
         self.read_only && !self.conn.is_autocommit()
     }
 
-    /// Version du schéma du graphe ouvert (5 à 8 en lecture seule seulement : DEC-066, DEC-073,
+    /// Version du schéma du graphe ouvert (5 à 9 en lecture seule seulement : DEC-066, DEC-073,
     /// DEC-076).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
-    /// Migre un schéma 5, 6, 7 ou 8 en schéma 9 sur place : 5 -> 6, 6 -> 7, 7 -> 8, puis 8 -> 9,
+    /// Migre un schéma 5 à 9 en schéma 10 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, puis 9 -> 10,
     /// chacune en une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         let from = self.user_version()?;
@@ -702,6 +708,7 @@ impl Store {
         self.migrate_6_to_7()?;
         self.migrate_7_to_8()?;
         self.migrate_8_to_9()?;
+        self.migrate_9_to_10()?;
         // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
         crate::trace!(
             "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
@@ -733,6 +740,28 @@ impl Store {
              );
              {NODE_COMMUNITIES_DDL}
              INSERT OR REPLACE INTO meta(key, value) VALUES ('resolution', '{RESOLUTION_PENDING}');
+             UPDATE meta SET value = '{SCHEMA_WITHOUT_ENRICH_LANGUAGE}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITHOUT_ENRICH_LANGUAGE};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
+    }
+
+    /// Migre un schéma 9 en schéma 10 en une transaction `IMMEDIATE` (DEC-138) : colonne
+    /// `enrichments.language` (vide pour les entrées existantes, sans `IF NOT EXISTS` : une
+    /// colonne en conflit annule la migration), versions. Aucun marqueur `à résoudre`.
+    fn migrate_9_to_10(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_ENRICH_LANGUAGE {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "ALTER TABLE enrichments ADD COLUMN language TEXT NOT NULL DEFAULT '';
              UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
@@ -933,7 +962,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -951,7 +980,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_code');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -1124,17 +1153,20 @@ impl Store {
     /// `model`, `ENRICH_PROMPT_VERSION`, payload). `summaries` : couples (identifiant, texte), les
     /// identifiants devant être déclarés par le fichier. Les références `llm` doivent partir d'un
     /// nœud déclaré par le fichier.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_enrichment(
         &mut self,
         path: &str,
         hash: &str,
         model: &str,
+        language: &str,
         summaries: &[(String, String)],
         concept_nodes: &[Node],
         refs: &[Ref],
     ) -> Result<()> {
         self.apply_enrichments(
             model,
+            language,
             &[EnrichmentWrite {
                 path: path.to_string(),
                 hash: hash.to_string(),
@@ -1147,7 +1179,12 @@ impl Store {
 
     /// Comme `apply_enrichment` pour plusieurs fichiers en une seule transaction, tout ou rien
     /// (DEC-074) : mêmes contrôles et même entrée d'enrichissement conservé par fichier.
-    pub fn apply_enrichments(&mut self, model: &str, items: &[EnrichmentWrite]) -> Result<()> {
+    pub fn apply_enrichments(
+        &mut self,
+        model: &str,
+        language: &str,
+        items: &[EnrichmentWrite],
+    ) -> Result<()> {
         self.ensure_writable()?;
         self.end_fresh();
         if items.is_empty() {
@@ -1158,7 +1195,7 @@ impl Store {
         let track = self.log.is_some();
         let mut pending = ChangeLog::default();
         for item in items {
-            pending.merge(write_enrichment(&tx, model, item, track)?);
+            pending.merge(write_enrichment(&tx, model, language, item, track)?);
         }
         commit_counted(tx)?;
         self.merge_log(pending);
@@ -1173,18 +1210,30 @@ impl Store {
     /// pas comparé.
     pub fn files_to_enrich(&self) -> Result<Vec<FileRecord>> {
         let model = self.enrich_model()?;
+        let language = self.enrich_language()?;
         let code = self.enrich_code()?;
+        // Un graphe lu en schéma 5 à 9 n'a pas la colonne : condition d'avant, sans la langue.
+        let with_language = self.version >= SCHEMA_VERSION;
+        let up_to_date = if with_language {
+            UP_TO_DATE
+        } else {
+            UP_TO_DATE_WITHOUT_LANGUAGE
+        };
         let mut st = self
             .conn
             .prepare_cached(&format!(
-                "SELECT f.path FROM files f WHERE f.state = 'indexed' AND NOT EXISTS ({UP_TO_DATE}) ORDER BY f.path"
+                "SELECT f.path FROM files f WHERE f.state = 'indexed' AND NOT EXISTS ({up_to_date}) ORDER BY f.path"
             ))
             .map_err(db_err)?;
-        let paths: Vec<String> = st
-            .query_map(params![ENRICH_PROMPT_VERSION, model], |r| r.get(0))
-            .map_err(db_err)?
-            .collect::<std::result::Result<_, _>>()
-            .map_err(db_err)?;
+        let first = |r: &rusqlite::Row<'_>| r.get::<_, String>(0);
+        let paths: Vec<String> = if with_language {
+            st.query_map(params![ENRICH_PROMPT_VERSION, model, language], first)
+        } else {
+            st.query_map(params![ENRICH_PROMPT_VERSION, model], first)
+        }
+        .map_err(db_err)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(db_err)?;
         let set: std::collections::HashSet<String> = paths
             .into_iter()
             .filter(|p| code || crate::llm::enrich::is_markdown(p))
@@ -1244,6 +1293,35 @@ impl Store {
         }
     }
 
+    /// Langue des résumés du dernier `build`/`update` LLM actif (`None` : aucune depuis la
+    /// réinitialisation ; elle n'est alors pas comparée, DEC-138).
+    pub fn enrich_language(&self) -> Result<Option<String>> {
+        match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'enrich_language'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get::<_, String>(0))
+        {
+            Ok(m) => Ok(Some(m)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Enregistre la langue des résumés d'une commande LLM active.
+    pub fn set_enrich_language(&mut self, language: &str) -> Result<()> {
+        self.ensure_writable()?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO meta(key, value) VALUES ('enrich_language', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .map_err(db_err)?
+            .execute([language])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Enregistre le modèle effectif d'une commande LLM active.
     pub fn set_enrich_model(&mut self, model: &str) -> Result<()> {
         self.ensure_writable()?;
@@ -1268,7 +1346,7 @@ impl Store {
         match self
             .conn
             .prepare_cached(
-                "SELECT content_hash, model, prompt_version FROM enrichments WHERE path = ?1",
+                "SELECT content_hash, model, prompt_version, language FROM enrichments WHERE path = ?1",
             )
             .map_err(db_err)?
             .query_row([path], |r| {
@@ -1276,6 +1354,7 @@ impl Store {
                     content_hash: r.get(0)?,
                     model: r.get(1)?,
                     prompt_version: r.get(2)?,
+                    language: r.get(3)?,
                 })
             }) {
             Ok(e) => Ok(Some(e)),
@@ -1404,7 +1483,7 @@ impl Store {
         E: From<Error>,
         F: FnMut(&Node, Option<i64>) -> std::result::Result<(), E>,
     {
-        let sql = if self.version >= SCHEMA_VERSION {
+        let sql = if self.version >= SCHEMA_WITHOUT_ENRICH_LANGUAGE {
             "SELECT n.id, n.kind, n.qualified, n.short, n.file, n.subkind, n.summary, m.community \
              FROM nodes n LEFT JOIN node_communities m ON m.node = n.id ORDER BY n.id"
         } else {
@@ -1631,7 +1710,7 @@ impl Store {
     /// Vrai si le graphe est de schéma 8 et marqué `à jour` (`meta.resolution`) : le statut
     /// `refs.unresolved` est alors celui d'une résolution terminée. Lecture seule (DEC-092).
     pub fn resolution_is_current(&self) -> Result<bool> {
-        if self.version != SCHEMA_VERSION {
+        if self.version < SCHEMA_WITHOUT_ENRICH_LANGUAGE {
             return Ok(false);
         }
         Ok(self.read_resolution_marker()?.as_deref() == Some(RESOLUTION_DONE))
@@ -2234,7 +2313,7 @@ impl Store {
     /// marqué `à jour` au schéma 9 compte comme calculé, avec zéro communauté). Un schéma 5 à 8,
     /// lu sans migration, n'a pas de communautés : non calculées, sans erreur.
     pub fn communities_computed(&self) -> Result<bool> {
-        if self.version < SCHEMA_VERSION {
+        if self.version < SCHEMA_WITHOUT_ENRICH_LANGUAGE {
             return Ok(false);
         }
         if self.count("communities")? > 0 {
@@ -2246,7 +2325,7 @@ impl Store {
 
     /// Communautés triées par identifiant (vide si non calculées).
     pub fn community_list(&self) -> Result<Vec<CommunityRow>> {
-        if self.version < SCHEMA_VERSION {
+        if self.version < SCHEMA_WITHOUT_ENRICH_LANGUAGE {
             return Ok(Vec::new());
         }
         let mut st = self
@@ -2259,7 +2338,7 @@ impl Store {
 
     /// Communauté d'identifiant `id`.
     pub fn community(&self, id: i64) -> Result<Option<CommunityRow>> {
-        if self.version < SCHEMA_VERSION {
+        if self.version < SCHEMA_WITHOUT_ENRICH_LANGUAGE {
             return Ok(None);
         }
         let mut st = self
@@ -2277,7 +2356,7 @@ impl Store {
 
     /// Identifiant de la communauté du nœud `node_id`.
     pub fn community_of(&self, node_id: &str) -> Result<Option<i64>> {
-        if self.version < SCHEMA_VERSION {
+        if self.version < SCHEMA_WITHOUT_ENRICH_LANGUAGE {
             return Ok(None);
         }
         let mut st = self
@@ -2294,7 +2373,7 @@ impl Store {
     /// Degré de chaque membre de la communauté `id` (liens sortants et entrants ; un lien d'un
     /// nœud vers lui-même compte deux fois, comme dans le résumé), par agrégat limité aux membres.
     pub fn community_degrees(&self, id: i64) -> Result<std::collections::HashMap<String, u64>> {
-        if self.version < SCHEMA_VERSION {
+        if self.version < SCHEMA_WITHOUT_ENRICH_LANGUAGE {
             return Ok(std::collections::HashMap::new());
         }
         let mut st = self
@@ -2316,7 +2395,7 @@ impl Store {
 
     /// Nœuds de la communauté `id`, triés par identifiant.
     pub fn community_members(&self, id: i64) -> Result<Vec<Node>> {
-        if self.version < SCHEMA_VERSION {
+        if self.version < SCHEMA_WITHOUT_ENRICH_LANGUAGE {
             return Ok(Vec::new());
         }
         let mut st = self
@@ -2718,6 +2797,7 @@ pub struct EnrichmentWrite {
 fn write_enrichment(
     tx: &rusqlite::Transaction<'_>,
     model: &str,
+    language: &str,
     item: &EnrichmentWrite,
     track: bool,
 ) -> Result<ChangeLog> {
@@ -2754,14 +2834,21 @@ fn write_enrichment(
     let json = serde_json::to_string(&payload)
         .map_err(|e| Error::Message(format!("enrichissement non sérialisable : {e}")))?;
     tx.prepare_cached(
-        "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(path) DO UPDATE SET content_hash = excluded.content_hash,
              model = excluded.model, prompt_version = excluded.prompt_version,
-             payload = excluded.payload",
+             payload = excluded.payload, language = excluded.language",
     )
     .map_err(db_err)?
-    .execute(params![path, hash, model, ENRICH_PROMPT_VERSION, json])
+    .execute(params![
+        path,
+        hash,
+        model,
+        ENRICH_PROMPT_VERSION,
+        json,
+        language
+    ])
     .map_err(db_err)?;
     Ok(touched.log)
 }
@@ -3115,9 +3202,15 @@ fn release_file(
     Ok(())
 }
 
-/// Condition « enrichissement conservé à jour » (`?1` = version du prompt, `?2` = modèle ou NULL).
-const UP_TO_DATE: &str = "SELECT 1 FROM enrichments e WHERE e.path = f.path
+/// Condition « enrichissement conservé à jour » des schémas 5 à 9 (`?1` = version du prompt,
+/// `?2` = modèle ou NULL).
+const UP_TO_DATE_WITHOUT_LANGUAGE: &str = "SELECT 1 FROM enrichments e WHERE e.path = f.path
     AND e.content_hash = f.hash AND e.prompt_version = ?1 AND (?2 IS NULL OR e.model = ?2)";
+
+/// Comme `UP_TO_DATE_WITHOUT_LANGUAGE`, avec `?3` = langue des résumés ou NULL (DEC-138).
+const UP_TO_DATE: &str = "SELECT 1 FROM enrichments e WHERE e.path = f.path
+    AND e.content_hash = f.hash AND e.prompt_version = ?1 AND (?2 IS NULL OR e.model = ?2)
+    AND (?3 IS NULL OR e.language = ?3)";
 
 /// Entrée d'enrichissement conservée (DEC-062), sans son contenu.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3125,6 +3218,7 @@ pub struct EnrichmentEntry {
     pub content_hash: String,
     pub model: String,
     pub prompt_version: u32,
+    pub language: String,
 }
 
 /// Format courant de la charge utile des enrichissements conservés ; à incrémenter à chaque
@@ -4006,9 +4100,15 @@ mod tests {
         PRAGMA user_version = 6;
         COMMIT;";
 
-    /// Assistant « schéma 7 de la 0.21.0 » (DEC-076 point 6), en SQL écrit en dur : index
-    /// nouveaux supprimés, trois colonnes de `refs` retirées, clé `meta.resolution` supprimée,
-    /// versions 7.
+    /// Assistant « schéma 9 » (DEC-138), en SQL écrit en dur : colonne `enrichments.language` et
+    /// clé `meta.enrich_language` supprimées, versions 9.
+    const SCHEMA9_DOWNGRADE: &str = "BEGIN;
+        ALTER TABLE enrichments DROP COLUMN language;
+        DELETE FROM meta WHERE key = 'enrich_language';
+        UPDATE meta SET value = '9' WHERE key = 'schema_version';
+        PRAGMA user_version = 9;
+        COMMIT;";
+
     const SCHEMA8_DOWNGRADE: &str = "BEGIN;
         DROP TABLE node_communities;
         DROP TABLE communities;
@@ -4016,6 +4116,9 @@ mod tests {
         PRAGMA user_version = 8;
         COMMIT;";
 
+    /// Assistant « schéma 7 de la 0.21.0 » (DEC-076 point 6), en SQL écrit en dur : index
+    /// nouveaux supprimés, trois colonnes de `refs` retirées, clé `meta.resolution` supprimée,
+    /// versions 7.
     const SCHEMA7_DOWNGRADE: &str = "BEGIN;
         DROP INDEX idx_refs_key;
         DROP INDEX idx_refs_head;
@@ -4028,8 +4131,17 @@ mod tests {
         PRAGMA user_version = 7;
         COMMIT;";
 
-    /// Ramène un graphe de schéma 9 au schéma 8 de la 0.24.4 (DEC-120).
+    /// Ramène un graphe de schéma 10 au schéma 9 (DEC-138).
+    fn downgrade_to_9(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA9_DOWNGRADE)
+            .unwrap();
+    }
+
+    /// Ramène un graphe de schéma 10 au schéma 8 de la 0.24.4 (le schéma 9 d'abord, DEC-120).
     fn downgrade_to_8(repo: &Path) {
+        downgrade_to_9(repo);
         Connection::open(db_path(repo))
             .unwrap()
             .execute_batch(SCHEMA8_DOWNGRADE)
@@ -4225,6 +4337,7 @@ mod tests {
             "a.md",
             "h",
             "m",
+            "français",
             &[("type:p.A".into(), "résumé".into())],
             &[concept("idée")],
             &[mention("type:p.A", "idée")],
@@ -4273,6 +4386,7 @@ mod tests {
             "b.md",
             "h",
             "m",
+            "français",
             &[
                 ("concept:pkg".into(), "partagé".into()),
                 ("type:p.B".into(), "propre à b".into()),
@@ -4310,6 +4424,7 @@ mod tests {
             "a.md",
             "h",
             "m",
+            "français",
             &[("concept:pkg".into(), "résumé".into())],
             &[],
             &[],
@@ -4332,16 +4447,24 @@ mod tests {
         st.replace_structure("b.md", &[ty("p.B", "b.md")], &[])
             .unwrap();
         for (f, s) in [("a.md", "type:p.A"), ("b.md", "type:p.B")] {
-            st.apply_enrichment(f, "h", "m", &[], &[concept("c")], &[mention(s, "c")])
-                .unwrap();
+            st.apply_enrichment(
+                f,
+                "h",
+                "m",
+                "français",
+                &[],
+                &[concept("c")],
+                &[mention(s, "c")],
+            )
+            .unwrap();
         }
         assert_eq!(st.nodes().unwrap().len(), 3);
         // a.md est ré-enrichi sans le concept : b.md le déclare encore.
-        st.apply_enrichment("a.md", "h", "m", &[], &[], &[])
+        st.apply_enrichment("a.md", "h", "m", "français", &[], &[], &[])
             .unwrap();
         assert!(st.nodes().unwrap().iter().any(|n| n.id == "concept:c"));
         assert_eq!(st.refs().unwrap().len(), 1);
-        st.apply_enrichment("b.md", "h", "m", &[], &[], &[])
+        st.apply_enrichment("b.md", "h", "m", "français", &[], &[], &[])
             .unwrap();
         assert!(!st.nodes().unwrap().iter().any(|n| n.id == "concept:c"));
         assert_eq!(st.nodes().unwrap().len(), 2);
@@ -4364,10 +4487,10 @@ mod tests {
                 .collect()
         };
         assert_eq!(paths(&st), vec!["a.md"]);
-        st.apply_enrichment("a.md", "autre", "m", &[], &[], &[])
+        st.apply_enrichment("a.md", "autre", "m", "français", &[], &[], &[])
             .unwrap();
         assert_eq!(paths(&st), vec!["a.md"]);
-        st.apply_enrichment("a.md", "h", "m", &[], &[], &[])
+        st.apply_enrichment("a.md", "h", "m", "français", &[], &[], &[])
             .unwrap();
         assert!(paths(&st).is_empty());
         // Contenu modifié : l'empreinte diffère à nouveau.
@@ -4388,6 +4511,7 @@ mod tests {
             "a.md",
             "h",
             "m",
+            "français",
             &[("type:p.A".into(), "résumé".into())],
             &[concept("idée")],
             &[mention("type:p.A", "idée")],
@@ -4485,6 +4609,118 @@ mod tests {
         assert_eq!(st.count_files_to_enrich().unwrap(), 1);
     }
 
+    /// Fichier `a.md` enrichi en `m` / `français`, `meta` alignée sur ces valeurs.
+    fn enriched_with_language() -> (tempfile::TempDir, Store) {
+        let (d, mut st) = enriched_store();
+        st.set_enrich_model("m").unwrap();
+        st.set_enrich_language("français").unwrap();
+        (d, st)
+    }
+
+    #[test]
+    fn req173_ac1_to_enrich_changes_with_the_recorded_language_only() {
+        let (_d, mut st) = enriched_with_language();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        // Autre langue : à enrichir ; la casse compte.
+        st.set_enrich_language("Français").unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+        st.set_enrich_language("English").unwrap();
+        assert_eq!(st.files_to_enrich().unwrap().len(), 1);
+        st.set_enrich_language("français").unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        // Les autres éléments de l'empreinte jouent toujours.
+        st.set_enrich_model("autre").unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+        st.set_enrich_model("m").unwrap();
+        st.conn.execute("UPDATE files SET hash = 'h2'", []).unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+        st.conn.execute("UPDATE files SET hash = 'h'", []).unwrap();
+        st.conn
+            .execute("UPDATE enrichments SET prompt_version = 99", [])
+            .unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+    }
+
+    #[test]
+    fn req173_ac1_without_recorded_language_it_is_not_compared() {
+        let (_d, mut st) = enriched_store();
+        st.set_enrich_model("m").unwrap();
+        assert_eq!(st.enrich_language().unwrap(), None);
+        st.conn
+            .execute("UPDATE enrichments SET language = 'English'", [])
+            .unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        // Une langue enregistrée, l'entrée de langue vide devient à enrichir.
+        st.conn
+            .execute("UPDATE enrichments SET language = ''", [])
+            .unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        st.set_enrich_language("français").unwrap();
+        assert_eq!(st.enrich_language().unwrap().as_deref(), Some("français"));
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+    }
+
+    #[test]
+    fn req173_ac1_entry_reports_the_language_and_apply_records_it() {
+        let (_d, mut st) = enriched_store();
+        assert_eq!(
+            st.enrichment_entry("a.md").unwrap().unwrap().language,
+            "français"
+        );
+        st.apply_enrichment("a.md", "h", "m", "English", &[], &[], &[])
+            .unwrap();
+        assert_eq!(
+            st.enrichment_entry("a.md").unwrap().unwrap().language,
+            "English"
+        );
+    }
+
+    #[test]
+    fn req173_ac1_language_survives_reset_like_the_model() {
+        let (_d, mut st) = enriched_with_language();
+        st.reset().unwrap();
+        assert_eq!(st.enrich_language().unwrap().as_deref(), Some("français"));
+    }
+
+    #[test]
+    fn req173_ac5_existing_language_column_makes_the_migration_fail() {
+        let dir = tempdir().unwrap();
+        drop(Store::open_or_create(dir.path()).unwrap());
+        downgrade_to_9(dir.path());
+        // Colonne déjà présente sur un schéma 9 : l'ajout échoue, rien n'est modifié.
+        Connection::open(db_path(dir.path()))
+            .unwrap()
+            .execute_batch("ALTER TABLE enrichments ADD COLUMN language TEXT")
+            .unwrap();
+        assert!(Store::open_or_create(dir.path()).is_err());
+        assert_eq!(st_user_version(dir.path()), 9);
+        let v: String = Connection::open(db_path(dir.path()))
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, "9");
+    }
+
+    #[test]
+    fn req173_migration_9_to_10_keeps_entries_with_empty_language() {
+        let (d, st) = enriched_with_language();
+        drop(st);
+        downgrade_to_9(d.path());
+        let st = Store::open_readonly(d.path()).unwrap();
+        // Lecture seule d'un schéma 9 : condition d'avant, sans la langue.
+        assert_eq!(st.opened_schema_version(), 9);
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        drop(st);
+        let st = Store::open_or_create(d.path()).unwrap();
+        let e = st.enrichment_entry("a.md").unwrap().unwrap();
+        assert_eq!((e.content_hash.as_str(), e.language.as_str()), ("h", ""));
+        assert_eq!(st.schema_version().unwrap(), 10);
+    }
+
     #[test]
     fn req049_ac4_to_enrich_changes_with_content_model_or_prompt_version_only() {
         let (_d, mut st) = enriched_store();
@@ -4531,6 +4767,7 @@ mod tests {
             "a.md",
             "h",
             "m",
+            "français",
             &[],
             &[concept("c")],
             &[mention("type:p.A", "c")],
@@ -4540,6 +4777,7 @@ mod tests {
             "a.md",
             "h2",
             "m",
+            "français",
             &[("type:inconnu".into(), "x".into())],
             &[],
             &[],
@@ -4548,7 +4786,7 @@ mod tests {
         assert_eq!(st.enriched_hash("a.md").unwrap().as_deref(), Some("h"));
         assert_eq!(st.refs().unwrap().len(), 1);
         assert!(st
-            .apply_enrichment("absent.md", "h", "m", &[], &[], &[])
+            .apply_enrichment("absent.md", "h", "m", "français", &[], &[], &[])
             .is_err());
     }
 
@@ -4597,6 +4835,7 @@ mod tests {
                     f,
                     "h",
                     "m",
+                    "français",
                     &[("type:p.A".into(), format!("res-{f}"))],
                     &[],
                     &[],
@@ -4628,6 +4867,7 @@ mod tests {
                 f,
                 "h",
                 "m",
+                "français",
                 &[("concept:c".into(), format!("r-{f}"))],
                 &[c],
                 &[],
@@ -4754,6 +4994,7 @@ mod tests {
             "a.md",
             "h",
             "m",
+            "français",
             &[(node_id(NodeKind::Type, "p.A"), "r".to_string())],
             &[],
             &[],
@@ -4823,6 +5064,7 @@ mod tests {
             "A.java",
             "h",
             "m",
+            "français",
             &[(a.id.clone(), "résumé de A".to_string())],
             &[concept("facturation")],
             &[mention(&a.id, "facturation"), mention(&a.id, "autre")],
@@ -4943,7 +5185,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        assert_eq!(SCHEMA_VERSION, 9);
+        assert_eq!(SCHEMA_VERSION, 10);
     }
 
     #[test]
@@ -5077,11 +5319,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_to_9_without_touching_the_file() {
-        for version in [9, 8, 7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_10_without_touching_the_file() {
+        for version in [10, 9, 8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                9 => downgrade_to_9(dir.path()),
                 8 => downgrade_to_8(dir.path()),
                 7 => downgrade_to_7(dir.path()),
                 6 => downgrade_to_6(dir.path()),
@@ -5130,6 +5373,7 @@ mod tests {
             "A.java",
             "h",
             "m",
+            "français",
             &[],
             &[concept("c")],
             &[mention(&a.id, "c"), mention(&a.id, "d")],
@@ -5150,8 +5394,16 @@ mod tests {
             }
         }
         // Enrichissement remplacé : la ligne n'est pas touchée.
-        st.apply_enrichment("A.java", "h", "m", &[], &[], &[mention(&a.id, "e")])
-            .unwrap();
+        st.apply_enrichment(
+            "A.java",
+            "h",
+            "m",
+            "français",
+            &[],
+            &[],
+            &[mention(&a.id, "e")],
+        )
+        .unwrap();
         assert_eq!(contexts(&st), [("A.java".to_string(), CTX.to_string())]);
         // Nouvelle structure (même empreinte) : l'enrichissement conservé est réappliqué, la
         // ligne est identique.
@@ -5214,6 +5466,7 @@ mod tests {
                 "A.java",
                 "h",
                 "m",
+                "français",
                 &[],
                 &[],
                 &[pref(&a.id, "x", Some("package a;"))],
@@ -5310,6 +5563,7 @@ mod tests {
                 &f,
                 "h",
                 "m",
+                "français",
                 &[(nodes[1].id.clone(), format!("résumé {i}"))],
                 &[concept(&format!("idée{i}"))],
                 &[mention(&nodes[0].id, &format!("idée{i}"))],
@@ -5431,7 +5685,7 @@ mod tests {
             .iter()
             .map(|n| (n.id.clone(), format!("r {}", n.short)))
             .collect();
-        st.apply_enrichment("x.md", "h", "m", &sums, &[], &[])
+        st.apply_enrichment("x.md", "h", "m", "français", &sums, &[], &[])
             .unwrap();
         let all: Vec<String> = mk(0..40).into_iter().map(|n| n.id).collect();
 
@@ -5454,7 +5708,7 @@ mod tests {
             .map(|n| (n.id.clone(), "s".into()))
             .collect();
         reset_diagnostics();
-        st.apply_enrichment("x.md", "h", "m", &sums, &[concept("c")], &[])
+        st.apply_enrichment("x.md", "h", "m", "français", &sums, &[concept("c")], &[])
             .unwrap();
         let mut ids = all.clone();
         ids.push("concept:c".into());
@@ -5491,7 +5745,9 @@ mod tests {
     fn run_op(st: &mut Store, op: &Op) {
         match op {
             Op::Write(f, n, r) => st.replace_structure(f, n, r).unwrap(),
-            Op::Enrich(f, h, s, c, r) => st.apply_enrichment(f, h, "m", s, c, r).unwrap(),
+            Op::Enrich(f, h, s, c, r) => {
+                st.apply_enrichment(f, h, "m", "français", s, c, r).unwrap()
+            }
             Op::Remove(f) => {
                 st.remove_file(f).unwrap();
             }
@@ -5789,11 +6045,19 @@ mod tests {
         let mut grouped = mk(d1.path());
         let mut single = mk(d2.path());
         reset_diagnostics();
-        grouped.apply_enrichments("m", &writes).unwrap();
+        grouped.apply_enrichments("m", "français", &writes).unwrap();
         assert_eq!(diagnostics().commits(), 1);
         for w in &writes {
             single
-                .apply_enrichment(&w.path, &w.hash, "m", &w.summaries, &w.concepts, &w.refs)
+                .apply_enrichment(
+                    &w.path,
+                    &w.hash,
+                    "m",
+                    "français",
+                    &w.summaries,
+                    &w.concepts,
+                    &w.refs,
+                )
                 .unwrap();
         }
         assert_eq!(graph_dump(&grouped), graph_dump(&single));
@@ -5815,7 +6079,7 @@ mod tests {
             concepts: vec![],
             refs: vec![],
         };
-        assert!(grouped.apply_enrichments("m", &bad).is_err());
+        assert!(grouped.apply_enrichments("m", "français", &bad).is_err());
         assert_eq!(graph_dump(&grouped), before);
     }
 
@@ -5891,11 +6155,11 @@ mod tests {
                 [sql]
             );
         }
-        assert_eq!(st_user_version(dir.path()), 9);
-        assert_eq!(st.schema_version().unwrap(), 9);
+        assert_eq!(st_user_version(dir.path()), SCHEMA_VERSION);
+        assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
             strings(&st, "SELECT value FROM meta WHERE key = 'schema_version'"),
-            ["9"]
+            [SCHEMA_VERSION.to_string()]
         );
     }
 
@@ -5963,7 +6227,7 @@ mod tests {
             .unwrap();
         assert_eq!(key_rows(&st, "parse"), expected_keys());
         // Enrichissement.
-        st.apply_enrichment("a.java", "h", "m", &[], &[], &refs_of(&a.id))
+        st.apply_enrichment("a.java", "h", "m", "français", &[], &[], &refs_of(&a.id))
             .unwrap();
         assert_eq!(key_rows(&st, "llm"), expected_keys());
         let flagged: i64 = st
@@ -6024,6 +6288,7 @@ mod tests {
             "b.md",
             "h",
             "m",
+            "français",
             &[],
             &[concept("idée")],
             &[mention(&doc.id, "Inconnue"), mention(&doc.id, "idée")],
@@ -6058,6 +6323,7 @@ mod tests {
         crate::resolve::resolve(&mut st).unwrap();
         st.apply_enrichments(
             "m",
+            "français",
             &[EnrichmentWrite {
                 path: "b.md".into(),
                 hash: "h".into(),
@@ -6236,6 +6502,7 @@ mod tests {
         assert_eq!(marker(&st).as_deref(), Some("à jour"));
         st.apply_enrichments(
             "m",
+            "français",
             &[EnrichmentWrite {
                 path: "b.md".into(),
                 hash: "h".into(),
@@ -6380,7 +6647,7 @@ mod tests {
             .unwrap();
         let before = all(&st);
         let e = st
-            .apply_enrichment("a.java", "h", "m", &[], &[], &[contains(&a.id)])
+            .apply_enrichment("a.java", "h", "m", "français", &[], &[], &[contains(&a.id)])
             .unwrap_err();
         assert!(
             e.to_string()
@@ -6391,6 +6658,7 @@ mod tests {
         assert!(st
             .apply_enrichments(
                 "m",
+                "français",
                 &[EnrichmentWrite {
                     path: "a.java".into(),
                     hash: "h".into(),
@@ -6578,6 +6846,7 @@ mod tests {
             "a.java",
             "h",
             "m",
+            "français",
             &[("type:p.A".into(), "résumé".into())],
             &[],
             &[],
@@ -6609,6 +6878,7 @@ mod tests {
         let write = |st: &mut Store, concepts: &[&str], refs: &[(&str, &str)]| {
             st.apply_enrichments(
                 "m",
+                "français",
                 &[EnrichmentWrite {
                     path: "a.md".into(),
                     hash: "h".into(),
@@ -6682,6 +6952,7 @@ mod tests {
         assert!(!st.needs_resolution().unwrap());
         st.apply_enrichments(
             "m",
+            "français",
             &[EnrichmentWrite {
                 path: "a.java".into(),
                 hash: "h".into(),
@@ -7103,6 +7374,7 @@ mod tests {
                 &path,
                 "h",
                 "m",
+                "français",
                 &[(node.id.clone(), format!("s{i}"))],
                 &[],
                 &[],

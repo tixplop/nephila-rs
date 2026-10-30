@@ -914,7 +914,35 @@ fn req069_ac5_schema_7_graph_is_read_unchanged_then_migrated_by_update() {
     ];
     let env = Env::new("maven2", Some("mock"));
     let repo = env.repo();
-    ok(&env, &repo, "build", &["build"]);
+    // Journal du `build` initial (lignes triées) et table `enrichments` d'avant la descente.
+    let log = env.root.join("mock.log");
+    let out = run_logged(&env, &repo, &log, &["build"]);
+    assert!(out.status.success());
+    let sorted_log = |log: &Path| -> Vec<String> {
+        let mut l: Vec<String> = fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        l.sort();
+        l
+    };
+    let initial_log = sorted_log(&log);
+    assert!(!initial_log.is_empty());
+    let enrichment_rows = |repo: &Path| -> Vec<Vec<String>> {
+        let db = db_of(repo);
+        let mut q = db
+            .prepare("SELECT path, content_hash, model, prompt_version, payload, language FROM enrichments ORDER BY path")
+            .unwrap();
+        q.query_map([], |r| {
+            (0..6).map(|i| Ok(format!("{:?}", r.get_ref(i)?))).collect()
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    };
+    let initial_rows = enrichment_rows(&repo);
+    assert!(!initial_rows.is_empty());
     assert_eq!(user_version_of(&repo), nephila::store::SCHEMA_VERSION);
     let before: Vec<String> = reads.iter().map(|a| ok(&env, &repo, "avant", a)).collect();
     schema7::downgrade_to_7(&db_of(&repo));
@@ -948,25 +976,30 @@ fn req069_ac5_schema_7_graph_is_read_unchanged_then_migrated_by_update() {
         assert_eq!(graph_hash(&repo), hash, "{a:?}");
     }
 
-    // Aucun changement : le graphe migré est à résoudre, `update` fait une passe complète
-    // (bilan), sans appel LLM ; le suivant dit `graphe à jour`.
-    let log = env.root.join("mock.log");
+    // Premier `update` avec LLM actif : le graphe migré est à résoudre et ses entrées (langue
+    // vide) sont réenrichies une fois (DEC-138) : journal égal à celui du `build` initial, bilan
+    // sans fichier restant à enrichir ; le suivant dit `graphe à jour`, journal vide.
+    let _ = fs::remove_file(&log);
     let out = run_logged(&env, &repo, &log, &["update"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        String::from_utf8_lossy(&out.stdout).starts_with("update terminé : 0 fichiers traités,"),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
+        stdout.starts_with("update terminé : 0 fichiers traités,"),
+        "{stdout}"
     );
-    assert!(fs::read_to_string(&log).unwrap_or_default().is_empty());
+    assert!(stdout.contains(", 0 fichiers à enrichir"), "{stdout}");
+    assert_eq!(sorted_log(&log), initial_log);
     assert_eq!(user_version_of(&repo), nephila::store::SCHEMA_VERSION);
+    assert_eq!(enrichment_rows(&repo), initial_rows);
+    let _ = fs::remove_file(&log);
     let out = run_logged(&env, &repo, &log, &["update"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "graphe à jour");
     assert!(fs::read_to_string(&log).unwrap_or_default().is_empty());
+    assert_eq!(enrichment_rows(&repo), initial_rows);
     assert_eq!(ok(&env, &repo, "status", &["status"]), before[2]);
 
     // Un fichier modifié, un ajouté, un supprimé : même graphe qu'un `build` du même arbre.

@@ -369,6 +369,7 @@ pub(crate) fn build_with_budget(
     store.reset_with_pending_files(&records)?;
     if let Some(llm) = llm {
         store.set_enrich_model(llm.model())?;
+        store.set_enrich_language(llm.summary_language())?;
         store.set_enrich_code(opts.enrich_code)?;
     }
     if records.is_empty() {

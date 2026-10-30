@@ -1964,6 +1964,7 @@ mod tests {
                 "d.md",
                 "h",
                 "m",
+                "français",
                 &[],
                 &[],
                 &[rf(&sec, EdgeKind::Mentions, "concept:Inconnu", None)],
@@ -2380,7 +2381,7 @@ mod tests {
                     })
                     .collect();
                 e.store
-                    .apply_enrichment(f, "h", "m", &[], &[], &llm)
+                    .apply_enrichment(f, "h", "m", "français", &[], &[], &llm)
                     .unwrap();
             }
         }
@@ -2689,6 +2690,7 @@ import q.R;",
         e.store
             .apply_enrichments(
                 "m",
+                "français",
                 &[crate::store::EnrichmentWrite {
                     path: "T.java".into(),
                     hash: "h".into(),
@@ -2775,6 +2777,7 @@ import q.R;",
         e.store
             .apply_enrichments(
                 "m",
+                "français",
                 &[crate::store::EnrichmentWrite {
                     path: "T.java".into(),
                     hash: "h".into(),
@@ -3268,6 +3271,7 @@ import q.R;",
                         .collect();
                     st.apply_enrichments(
                         "m",
+                        "français",
                         &[crate::store::EnrichmentWrite {
                             path: p,
                             hash: "h".into(),
@@ -3551,6 +3555,7 @@ import q.R;",
                 "d.md",
                 "h",
                 "m",
+                "français",
                 &[],
                 &[],
                 &[rf(&sec, EdgeKind::Mentions, "a", None)],

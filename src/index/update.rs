@@ -129,6 +129,7 @@ pub fn update(
     // changement » (REQ-049). Les statuts et commandes LLM inactif comparent à ce modèle.
     if let Some(llm) = llm {
         store.set_enrich_model(llm.model())?;
+        store.set_enrich_language(llm.summary_language())?;
         store.set_enrich_code(opts.enrich_code)?;
     }
     // « Aucun changement » : rien d'ajouté, modifié, supprimé ou en attente, graphe marqué
@@ -356,6 +357,9 @@ mod tests {
     fn update_with_llm(repo: &Path, opts: &IndexOptions, llm: &MockLlm) {
         let mut store = Store::open_existing(repo).unwrap();
         store.set_enrich_model(crate::llm::Llm::model(llm)).unwrap();
+        store
+            .set_enrich_language(crate::llm::Llm::summary_language(llm))
+            .unwrap();
         let files = store.files_to_enrich().unwrap();
         assert_eq!(files.len(), 20);
         let scanned =
