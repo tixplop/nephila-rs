@@ -113,7 +113,7 @@ Filtres durables (lus aussi par status et query) : fichier .nephila.toml à la r
   exclude_types = [\"json\"]
 Exclus par défaut, à tout niveau : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ; pour les analyser : exclude_defaults = false dans le même fichier
 Réglages LLM du dépôt, dans le même fichier (prioritaires sur la configuration personnelle) :
-  model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries
+  model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries
 Réglages de query ask seulement, dans une section [ask] à la fin du même fichier :
   model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes
 Exemple : nephila build --exclude '*.min.js' --exclude-type json,yaml";

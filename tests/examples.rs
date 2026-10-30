@@ -218,7 +218,7 @@ fn REQ041_AC4_valeurs_par_defaut_documentees_egales_aux_valeurs_reelles() {
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| key_of(l))
         .collect();
-    assert_eq!(active.len(), 10, "options communes réactivées : {active:?}");
+    assert_eq!(active.len(), 11, "options communes réactivées : {active:?}");
 }
 
 #[test]
@@ -521,9 +521,11 @@ fn REQ041_AC9_exemple_de_projet_lignes_de_priorite_par_bloc() {
 fn REQ041_AC9_exemple_de_config_lignes_de_priorite() {
     let text = example("config.toml");
     let lines: Vec<&str> = text.lines().collect();
-    assert!(text.contains(
-        "# Un dépôt peut remplacer six réglages par son fichier .nephila.toml (model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries) ; les autres clés ne sont lues qu'ici."
-    ));
+    assert!(text.contains(concat!(
+        "# Un dépôt peut remplacer sept réglages par son fichier .nephila.toml (model, summary_language,\n",
+        "# max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries) ; les autres clés ne\n",
+        "# sont lues qu'ici."
+    )));
     for key in PROJECT_SETTINGS {
         let index = lines.iter().position(|l| key_of(l) == Some(key)).unwrap();
         let block = exact_doc_of(&lines, index);
@@ -780,11 +782,10 @@ fn comments_joined(text: &str) -> String {
 #[test]
 fn REQ041_AC10_textes_des_exemples_sur_les_enrichissements_conserves() {
     let project = example("nephila.toml");
-    assert!(project.lines().any(|l| l
-        == concat!(
-            "# Changer model fait réenrichir les fichiers déjà enrichis, par nephila update ",
-            "comme par nephila build ; les autres réglages ne réenrichissent rien."
-        )));
+    assert!(project.contains(concat!(
+        "# Changer model ou summary_language fait réenrichir les fichiers déjà enrichis, par nephila update\n",
+        "# comme par nephila build ; les autres réglages ne réenrichissent rien.\n"
+    )));
     let project_flat = comments_joined(&project);
     for absent in ["ne réenrichit aucun fichier", "enrich_code"] {
         assert!(!project_flat.contains(absent), "présent : {absent}");
@@ -1349,7 +1350,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 42_000, "README : {size} octets");
+    assert!(size <= 42_500, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1632,7 +1633,7 @@ fn REQ155_AC16_fichier_de_projet_et_etats() {
     let readme = repo_file("README.md");
     let project = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
     for needle in [
-        "Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les six réglages `model`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`",
+        "Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les sept réglages `model`, `summary_language`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`",
         "Priorité : option > fichier de projet > configuration personnelle > défaut.",
         "| Réglage | Plafond dans `.nephila.toml` |",
     ] {
@@ -1950,7 +1951,7 @@ fn REQ165_AC16_readme_traces_sentence() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 42_000, "README : {size} octets");
+    assert!(size <= 42_500, "README : {size} octets");
 }
 
 #[test]
@@ -1990,13 +1991,176 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     let enr = readme_section(&readme, "## Enrichissement");
     let para = enr.split("### Lots et gros fichiers").next().unwrap();
     assert!(para.contains(
-        "tant que son contenu, le modèle et le prompt de la version de nephila ne changent pas"
+        "tant que son contenu, le modèle, la langue des résumés et le prompt de la version de nephila ne changent pas"
     ));
-    assert!(para.contains("changer `model` réenrichit une fois chaque fichier de la portée"));
+    assert!(para.contains(
+        "changer `model` ou `summary_language` réenrichit une fois chaque fichier de la portée"
+    ));
     assert!(!para.contains("tant que son contenu et le modèle"));
 
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 42_000, "README : {size} octets");
+    assert!(size <= 42_500, "README : {size} octets");
+}
+
+// ---- REQ-174 : `summary_language` dans les exemples et le README ----
+
+const LANG_BLOCK_PROJECT: &str = "\
+# Langue des résumés et des noms de concepts pour ce dépôt. Nom de langue de 1 à 40 lettres,
+# espaces, traits d'union ou apostrophes. Remplace la langue de la configuration personnelle
+# (défaut : \"français\") ; la casse compte. La changer réenrichit les fichiers déjà enrichis.
+# Priorité : ce fichier > configuration personnelle > défaut.
+# summary_language = \"anglais\"
+";
+
+const LANG_BLOCK_CONFIG: &str = "\
+# Langue des résumés et des noms de concepts. Nom de langue de 1 à 40 lettres, espaces, traits
+# d'union ou apostrophes (\"anglais\", \"portugais du Brésil\") ; défaut : \"français\".
+# Elle est écrite telle quelle dans la consigne envoyée au modèle, sans traduction : la casse
+# compte (\"Français\" et \"français\" sont deux langues). Une seule langue pour tout le dépôt
+# garde un vocabulaire commun : les concepts se regroupent et query search les retrouve.
+# Changer de langue réenrichit une fois les fichiers déjà enrichis, comme changer de modèle.
+# Les identifiants et les termes techniques restent tels quels.
+# Un dépôt peut la remplacer par son .nephila.toml.
+# Priorité : .nephila.toml du dépôt > ce fichier > défaut.
+# summary_language = \"français\"
+";
+
+#[test]
+fn REQ174_AC4_AC9_blocs_exacts_et_places_de_summary_language() {
+    let project = example("nephila.toml");
+    let config = example("config.toml");
+    assert!(project.contains(&format!(
+        "# model = \"claude-sonnet-4-5\"\n\n{LANG_BLOCK_PROJECT}\n# Taille maximale"
+    )));
+    assert!(config.contains(&format!(
+        "# enrich_code = false\n\n{LANG_BLOCK_CONFIG}\n# Demande au modèle"
+    )));
+    for (name, text) in [("nephila.toml", &project), ("config.toml", &config)] {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = |p: &str| lines.iter().position(|l| l.starts_with(p)).unwrap();
+        let lang = at("# summary_language = ");
+        if name == "nephila.toml" {
+            assert!(at("# model = ") < lang && lang < at("# max_chunk_chars = "));
+        } else {
+            assert!(at("# enrich_code = ") < lang && lang < at("# thinking = "));
+        }
+        // Seule la ligne désactivée commence par `# summary_language =`.
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("# summary_language ="))
+                .count(),
+            1,
+            "{name}"
+        );
+        assert!(keys_written(text).contains("summary_language"), "{name}");
+        // Lignes de cette évolution : 100 caractères au plus.
+        let block = if name == "nephila.toml" {
+            LANG_BLOCK_PROJECT
+        } else {
+            LANG_BLOCK_CONFIG
+        };
+        for l in block.lines() {
+            assert!(l.chars().count() <= 100, "{l}");
+        }
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("# Plafond dans ce fichier :"))
+                .count(),
+            if name == "nephila.toml" { 9 } else { 0 }
+        );
+    }
+    assert_eq!(
+        project
+            .lines()
+            .filter(|l| l.starts_with("# Plafond dans ce fichier :"))
+            .count(),
+        9
+    );
+    // Phrases réécrites, anciennes absentes.
+    assert!(project.contains(concat!(
+        "# Changer model ou summary_language fait réenrichir les fichiers déjà enrichis, par nephila update\n",
+        "# comme par nephila build ; les autres réglages ne réenrichissent rien.\n"
+    )));
+    assert!(!project.contains("# Changer model fait réenrichir les fichiers"));
+    assert!(config.contains(concat!(
+        "# Un dépôt peut remplacer sept réglages par son fichier .nephila.toml (model, summary_language,\n",
+        "# max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries) ; les autres clés ne\n",
+        "# sont lues qu'ici.\n"
+    )));
+    assert!(config.contains(concat!(
+        "# Enrichissements conservés : un fichier déjà enrichi n'est renvoyé au LLM que si son contenu\n",
+        "# change, ou si le modèle, summary_language (ici ou dans .nephila.toml) ou le prompt de la\n",
+        "# version de nephila changent ; les autres réglages ne réenrichissent rien.\n"
+    )));
+    for old in [
+        "six réglages",
+        "si le modèle change (ici ou dans .nephila.toml)",
+    ] {
+        assert!(!config.contains(old), "présent : {old}");
+    }
+    for l in [
+        "# Un dépôt peut remplacer sept réglages par son fichier .nephila.toml (model, summary_language,",
+        "# max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries) ; les autres clés ne",
+        "# change, ou si le modèle, summary_language (ici ou dans .nephila.toml) ou le prompt de la",
+    ] {
+        assert!(l.chars().count() <= 100, "{l}");
+    }
+    // Les lignes réactivées sont acceptées.
+    let lines: Vec<String> = project.lines().map(String::from).collect();
+    let activated = join(&reactivate(&lines));
+    let (_tmp, repo) = repo_with_project_file(&activated);
+    let settings = ProjectFile::load(&repo).unwrap().settings;
+    assert_eq!(settings.summary_language.as_deref(), Some("anglais"));
+    let common: Vec<String> = section(&config, COMMON)
+        .into_iter()
+        .filter(|l| !l.starts_with("# tls_ca_cert ="))
+        .collect();
+    let activated = join(&reactivate(&common));
+    assert_eq!(
+        parse(&format!("provider = \"mock\"\n{activated}")).summary_language,
+        "français"
+    );
+}
+
+#[test]
+fn REQ174_AC5_AC10_readme_lignes_et_phrases_de_summary_language() {
+    let readme = repo_file("README.md");
+    let table = readme_section(&readme, "## Configuration du LLM");
+    let lines: Vec<&str> = table.lines().collect();
+    let model = lines
+        .iter()
+        .position(|l| l.starts_with("| `model` |"))
+        .unwrap();
+    assert_eq!(
+        lines[model + 1],
+        "| `summary_language` | Langue des résumés et des noms de concepts, en toutes lettres (`\"anglais\"`) ; aussi dans `.nephila.toml` | `\"français\"` |"
+    );
+    let project = readme_section(&readme, "### Fichier de projet `.nephila.toml`");
+    assert!(
+        project.contains("et les sept réglages `model`, `summary_language`, `max_chunk_chars`, ")
+    );
+    assert!(project.contains(
+        "- **Changer `model` ou `summary_language` réenrichit une fois** chaque fichier de la portée ; les autres réglages ne réenrichissent rien."
+    ));
+    assert!(readme.contains(
+        "Un fichier garde ses enrichissements tant que son contenu, le modèle, la langue des résumés et le prompt de la version de nephila ne changent pas : un second `build` sans changement ne fait aucun appel, et changer `model` ou `summary_language` réenrichit une fois chaque fichier de la portée."
+    ));
+    assert!(readme.contains(
+        "- **Vers 0.26** : le premier `nephila build` ou `nephila update` réenrichit une fois chaque fichier de la portée. Les résumés y sont écrits en `summary_language` (défaut `\"français\"`) : pour une autre langue, écrivez la clé avant cette commande. `effort` (défaut"
+    ));
+    assert!(readme.contains(
+        "trace: [0.000s] config: llm=mock model=m-projet enrich_code=false summary_language=\"français\" thinking=false effort=low"
+    ));
+    for old in [
+        "les six réglages",
+        "**Changer `model` réenrichit une fois**",
+    ] {
+        assert!(!readme.contains(old), "présent : {old}");
+    }
+    assert_eq!(readme.matches("config: llm=").count(), 1);
+    assert!(readme.len() <= 42_500, "README : {} octets", readme.len());
 }

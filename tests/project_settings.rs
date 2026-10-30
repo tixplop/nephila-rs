@@ -375,7 +375,7 @@ fn req037_ac18_aide_et_cle_proche_inconnue() {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        let want = "Réglages LLM du dépôt, dans le même fichier (prioritaires sur la configuration personnelle) : model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries";
+        let want = "Réglages LLM du dépôt, dans le même fichier (prioritaires sur la configuration personnelle) : model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries";
         let i = help.find(want).unwrap_or_else(|| panic!("{help}"));
         assert!(help[..i].contains("exclude_types = [\"json\"]"));
         assert!(help[i..].contains("Exemple : nephila build"));
@@ -386,7 +386,7 @@ fn req037_ac18_aide_et_cle_proche_inconnue() {
     assert_eq!(
         text(&o.stderr),
         format!(
-            "erreur: {} : clé inconnue `modele` (clés permises : exclude, exclude_types, exclude_defaults, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n",
+            "erreur: {} : clé inconnue `modele` (clés permises : exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n",
             e.shown()
         )
     );
@@ -1135,7 +1135,7 @@ fn req162_ac11_cle_inconnue_du_premier_niveau_liste_ask() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         text(&o.stderr),
-        "erreur: ./.nephila.toml : clé inconnue `zz` (clés permises : exclude, exclude_types, exclude_defaults, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n"
+        "erreur: ./.nephila.toml : clé inconnue `zz` (clés permises : exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n"
     );
 }
 
@@ -1145,4 +1145,162 @@ fn req163_ac5_plafonds_de_ask_acceptes_au_plafond_dans_le_fichier_de_projet() {
     e.project("[ask]\nmax_context_chars = 100000\nmax_seeds = 100\nmax_nodes = 500\nmax_output_tokens = 16384\n");
     let o = e.run(&["build"]);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+}
+
+// ---- REQ-174 : `summary_language` dans `.nephila.toml` ----
+
+const LANG_EXPECTED: &str =
+    "nom de langue de 1 à 40 lettres, espaces, traits d'union ou apostrophes attendu";
+
+#[test]
+fn req174_ac3_aide_cite_summary_language_apres_model() {
+    let e = Env::new();
+    for sub in ["build", "update"] {
+        let o = e.run(&[sub, "--help"]);
+        let help = text(&o.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            help.contains(
+                "model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries"
+            ),
+            "{sub}"
+        );
+    }
+}
+
+#[test]
+fn req174_ac1_ac6_ligne_config_et_marque_de_source() {
+    let e = Env::new();
+    let l = config_line(&text(&e.run(&["build", "--verbose"]).stderr));
+    assert!(
+        l.contains(" enrich_code=true summary_language=\"français\" thinking=false "),
+        "{l}"
+    );
+    assert!(!l.contains("(.nephila.toml"), "{l}");
+
+    e.project("model = \"m-projet\"\nsummary_language = \"anglais\"\n");
+    let l = config_line(&text(&e.run(&["build", "--verbose"]).stderr));
+    assert!(l.contains(" summary_language=\"anglais\" "), "{l}");
+    assert!(
+        l.ends_with(" (.nephila.toml : model,summary_language)"),
+        "{l}"
+    );
+
+    e.project("summary_language = \"portugais du Brésil\"\nformat_retries = 1\n");
+    let l = config_line(&text(&e.run(&["update", "--verbose"]).stderr));
+    assert!(
+        l.contains(" summary_language=\"portugais du Brésil\" "),
+        "{l}"
+    );
+    assert!(
+        l.ends_with(" (.nephila.toml : summary_language,format_retries)"),
+        "{l}"
+    );
+
+    // Valeur du fichier de projet : l'emporte sur la configuration personnelle, sans blancs.
+    fs::write(
+        &e.config,
+        "provider = \"mock\"\nsummary_language = \"espagnol\"\n",
+    )
+    .unwrap();
+    e.project("summary_language = \"  Italiano \"\n");
+    let l = config_line(&text(&e.run(&["build", "--verbose"]).stderr));
+    assert!(l.contains(" summary_language=\"Italiano\" "), "{l}");
+
+    // Lignes inactives : jamais le champ, même avec la clé dans le fichier de projet.
+    let err = text(&e.run(&["build", "--no-llm", "--verbose"]).stderr);
+    assert!(err.contains("config: llm inactif (--no-llm)\n"), "{err}");
+    assert!(!err.contains("summary_language"), "{err}");
+    let absent = e.config.with_file_name("absent.toml");
+    let o = e
+        .command()
+        .env("NEPHILA_CONFIG", &absent)
+        .arg("-C")
+        .arg(&e.repo)
+        .args(["build", "--verbose"])
+        .output()
+        .unwrap();
+    let err = text(&o.stderr);
+    assert!(
+        err.contains("config: llm inactif (aucune configuration)\n"),
+        "{err}"
+    );
+    assert!(!err.contains("summary_language"), "{err}");
+
+    // `query ask --verbose` : ligne `config` sans la clé.
+    fs::write(
+        &e.config,
+        "provider = \"mock\"\nsummary_language = \"espagnol\"\n",
+    )
+    .unwrap();
+    let err = text(&e.run(&["query", "ask", "--verbose", "x"]).stderr);
+    assert!(err.contains("] config: "), "{err}");
+    assert!(!err.contains("summary_language"), "{err}");
+}
+
+#[test]
+fn req174_ac2_ac7_valeur_invalide_du_fichier_de_projet() {
+    let e = Env::new();
+    let long = "a".repeat(41);
+    let cases: Vec<(String, String)> = vec![
+        ("\"\"".into(), "\"\"".into()),
+        ("3".into(), "3".into()),
+        ("\"   \"".into(), "\"   \"".into()),
+        (format!("\"{long}\""), format!("\"{long}\"")),
+        ("\"en_US\"".into(), "\"en_US\"".into()),
+    ];
+    for (raw, shown) in cases {
+        e.project(&format!("summary_language = {raw}\n"));
+        let expected = format!(
+            "erreur: {} : clé `summary_language` : valeur invalide `{shown}` ({LANG_EXPECTED})\n",
+            e.shown()
+        );
+        for args in [
+            &["build"][..],
+            &["build", "--no-llm"],
+            &["status"],
+            &["query", "search", "x"],
+        ] {
+            let o = e.run(args);
+            assert_eq!(o.status.code(), Some(1), "{args:?}");
+            assert!(o.stdout.is_empty(), "{args:?}");
+            assert_eq!(text(&o.stderr), expected, "{args:?}");
+        }
+        assert!(!e.repo.join(".nephila").exists());
+        assert!(!e.log.exists());
+    }
+    // Contrôle C0 et marque de direction : une ligne, rien de brut.
+    e.project("summary_language = \"fr\\u0007\"\n");
+    let o = e.run(&["build"]);
+    let err = text(&o.stderr);
+    assert_eq!(err.lines().count(), 1, "{err:?}");
+    assert!(!err.contains('\u{7}'), "{err:?}");
+    assert!(err.contains("\"fr\\u0007\""), "{err:?}");
+    e.project("summary_language = \"fr\\u202E\"\n");
+    let err = text(&e.run(&["build"]).stderr);
+    assert!(!err.contains('\u{202E}'), "{err:?}");
+    assert!(err.contains("\\u{202E}"), "{err:?}");
+    assert_eq!(err.lines().count(), 1, "{err:?}");
+}
+
+#[test]
+fn req174_ac8_liste_des_cles_et_section_ask() {
+    let e = Env::new();
+    e.project("zz = 1\n");
+    let o = e.run(&["build"]);
+    assert!(text(&o.stderr).contains(
+        "clé inconnue `zz` (clés permises : exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)"
+    ));
+    e.project("[ask]\nsummary_language = \"anglais\"\n");
+    let o = e.run(&["status"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        text(&o.stderr),
+        format!(
+            "erreur: {} : clé inconnue `ask.summary_language` (clés permises dans [ask] : model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes)\n",
+            e.shown()
+        )
+    );
 }

@@ -169,7 +169,7 @@ fn REQ058_AC10_AC13_ligne_config_mock() {
     let l = config_line(&env.run(&["build", "--verbose"]));
     assert!(
         l.contains(
-            " model=mock enrich_code=false thinking=false effort=low max_output_tokens=16384 concurrency=4 "
+            " model=mock enrich_code=false summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 concurrency=4 "
         ),
         "{l}"
     );
@@ -181,7 +181,7 @@ fn REQ058_AC10_AC13_ligne_config_mock() {
     let l = config_line(&env.run(&["build", "--verbose"]));
     assert!(
         l.contains(
-            " enrich_code=false thinking=true effort=high max_output_tokens=4096 concurrency="
+            " enrich_code=false summary_language=\"français\" thinking=true effort=high max_output_tokens=4096 concurrency="
         ),
         "{l}"
     );
@@ -190,7 +190,7 @@ fn REQ058_AC10_AC13_ligne_config_mock() {
     let l = config_line(&env.run(&["build", "--verbose"]));
     assert!(
         l.contains(
-            " enrich_code=true thinking=false effort=medium max_output_tokens=16384 concurrency="
+            " enrich_code=true summary_language=\"français\" thinking=false effort=medium max_output_tokens=16384 concurrency="
         ),
         "{l}"
     );
@@ -228,7 +228,7 @@ fn REQ058_AC10_ligne_config_openai() {
     let o = env.run(&["build", "--verbose"]);
     let l = config_line(&o);
     assert!(
-        l.contains(" llm=openai model=m enrich_code=false thinking=true effort=low max_output_tokens=99 concurrency="),
+        l.contains(" llm=openai model=m enrich_code=false summary_language=\"français\" thinking=true effort=low max_output_tokens=99 concurrency="),
         "{l}"
     );
     assert!(server.accept().is_err());
@@ -1110,4 +1110,57 @@ fn req162_ac6_ancien_modele_claude_dans_les_deux_sens() {
     );
     no_fields(&e, &["output_config"]);
     assert_eq!(a["output_config"], serde_json::json!({"effort": "low"}));
+}
+
+// ---- REQ-174 : `summary_language` de la configuration personnelle ----
+
+#[test]
+fn REQ174_AC1_AC6_ligne_config_de_la_langue_personnelle() {
+    let env = Env::new(MOCK);
+    let l = config_line(&env.run(&["build", "--verbose"]));
+    assert!(
+        l.contains(" enrich_code=false summary_language=\"français\" thinking=false "),
+        "{l}"
+    );
+    env.write_config(&format!("{MOCK}summary_language = \"  English  \"\n"));
+    let l = config_line(&env.run(&["build", "--verbose"]));
+    assert!(l.contains(" summary_language=\"English\" "), "{l}");
+    assert!(!l.contains("(.nephila.toml"), "{l}");
+    // `query ask --verbose` : ligne `config` sans la clé.
+    let o = env.run(&["query", "ask", "--verbose", "x"]);
+    assert!(stderr(&o).contains("] config: "), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("summary_language"), "{}", stderr(&o));
+    // `--no-llm` : ligne inactive, sans la clé.
+    let o = env.run(&["build", "--no-llm", "--verbose"]);
+    assert!(stderr(&o).contains("config: llm inactif (--no-llm)\n"));
+    assert!(!stderr(&o).contains("summary_language"));
+}
+
+#[test]
+fn REQ174_AC2_AC7_valeur_invalide_de_la_configuration_personnelle() {
+    let cases = [
+        ("\"en_US\"", "\"en_US\""),
+        ("\"\"", "\"\""),
+        ("3", "3"),
+        ("[\"fr\"]", "[\"fr\"]"),
+        ("\"fr\\u0007\"", "\"fr\\u0007\""),
+        ("\"fr\\u202E\"", "\"fr\\u{202E}\""),
+    ];
+    for (raw, shown) in cases {
+        let env = Env::new(&format!("{MOCK}summary_language = {raw}\n"));
+        let want = format!(
+            "erreur: configuration invalide ({}) : clé « summary_language » doit être un nom de langue de 1 à 40 lettres, espaces, traits d'union ou apostrophes (reçu : {shown})\n",
+            env.config.display()
+        );
+        for args in [&["build"][..], &["update"], &["query", "ask", "x"]] {
+            let o = env.run(args);
+            assert_eq!(o.status.code(), Some(1), "{raw} {args:?}");
+            assert!(o.stdout.is_empty(), "{raw} {args:?}");
+            assert_eq!(stderr(&o), want, "{raw} {args:?}");
+            assert!(!env.repo.join(".nephila").exists(), "{raw} {args:?}");
+        }
+        let o = env.run(&["build", "--no-llm"]);
+        assert_eq!(o.status.code(), Some(0), "{raw}");
+        assert!(!stderr(&o).contains("summary_language"), "{raw}");
+    }
 }

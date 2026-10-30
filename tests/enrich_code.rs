@@ -206,16 +206,16 @@ fn REQ050_AC8_ligne_config_donne_la_valeur_effective() {
     let o = env.run(&["build", "--verbose"]);
     let l = config_line(&o);
     assert!(
-        l.contains("config: llm=mock model=mock enrich_code=false thinking=false effort=low max_output_tokens=16384 concurrency="),
+        l.contains("config: llm=mock model=mock enrich_code=false summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 concurrency="),
         "{l}"
     );
     let o = env.run(&["build", "--verbose", "--enrich-code"]);
-    assert!(config_line(&o).contains(" model=mock enrich_code=true thinking=false effort=low max_output_tokens=16384 concurrency="));
+    assert!(config_line(&o).contains(" model=mock enrich_code=true summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 concurrency="));
     let o = env.run(&["update", "--verbose", "--enrich-code"]);
     assert!(config_line(&o).contains(" enrich_code=true "));
     env.write_config(&format!("{MOCK}enrich_code = true\n"));
     let o = env.run(&["build", "--verbose"]);
-    assert!(config_line(&o).contains(" model=mock enrich_code=true thinking=false effort=low max_output_tokens=16384 concurrency="));
+    assert!(config_line(&o).contains(" model=mock enrich_code=true summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 concurrency="));
     env.write_config(&format!("{MOCK}enrich_code = false\n"));
     let o = env.run(&["build", "--verbose"]);
     assert!(config_line(&o).contains(" enrich_code=false "));
@@ -232,7 +232,7 @@ fn REQ050_AC8_fin_de_ligne_et_fichier_de_projet() {
     let o = env.run(&["build", "--verbose", "--enrich-code"]);
     let l = config_line(&o);
     assert!(
-        l.contains(" model=m-projet enrich_code=true thinking=false effort=low max_output_tokens=16384 concurrency="),
+        l.contains(" model=m-projet enrich_code=true summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 concurrency="),
         "{l}"
     );
     assert!(l.ends_with(" (.nephila.toml : model)"), "{l}");
@@ -271,7 +271,7 @@ fn REQ050_AC11_nephila_toml_erreur_e2_exacte() {
         .unwrap();
     assert_eq!(
         stderr(&o),
-        "erreur: ./.nephila.toml : clé inconnue `enrich_code` (clés permises : exclude, exclude_types, exclude_defaults, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n"
+        "erreur: ./.nephila.toml : clé inconnue `enrich_code` (clés permises : exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n"
     );
 }
 

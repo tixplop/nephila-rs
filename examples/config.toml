@@ -21,11 +21,13 @@
 #     constatée au premier appel au LLM et arrête l'enrichissement ; la structure du graphe est
 #     déjà construite, et nephila update reprend les fichiers à enrichir.
 #
-# Un dépôt peut remplacer six réglages par son fichier .nephila.toml (model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries) ; les autres clés ne sont lues qu'ici.
+# Un dépôt peut remplacer sept réglages par son fichier .nephila.toml (model, summary_language,
+# max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries) ; les autres clés ne
+# sont lues qu'ici.
 #
 # Enrichissements conservés : un fichier déjà enrichi n'est renvoyé au LLM que si son contenu
-# change ou si le modèle change (ici ou dans .nephila.toml) ; les autres réglages ne
-# réenrichissent rien.
+# change, ou si le modèle, summary_language (ici ou dans .nephila.toml) ou le prompt de la
+# version de nephila changent ; les autres réglages ne réenrichissent rien.
 #
 # Les clés communes à tous les fournisseurs (taille des morceaux, parallélisme, délais, TLS)
 # sont en fin de fichier, dans « Options communes ».
@@ -108,6 +110,17 @@ api_key_env = "ANTHROPIC_API_KEY"
 # .nephila.toml la refuse.
 # Priorité : --enrich-code > ce fichier > défaut.
 # enrich_code = false
+
+# Langue des résumés et des noms de concepts. Nom de langue de 1 à 40 lettres, espaces, traits
+# d'union ou apostrophes ("anglais", "portugais du Brésil") ; défaut : "français".
+# Elle est écrite telle quelle dans la consigne envoyée au modèle, sans traduction : la casse
+# compte ("Français" et "français" sont deux langues). Une seule langue pour tout le dépôt
+# garde un vocabulaire commun : les concepts se regroupent et query search les retrouve.
+# Changer de langue réenrichit une fois les fichiers déjà enrichis, comme changer de modèle.
+# Les identifiants et les termes techniques restent tels quels.
+# Un dépôt peut la remplacer par son .nephila.toml.
+# Priorité : .nephila.toml du dépôt > ce fichier > défaut.
+# summary_language = "français"
 
 # Demande au modèle de réfléchir avant de répondre. Booléen ; défaut : false. true : nephila
 # envoie à « anthropic » "thinking": {"type": "adaptive"} et à « openai » "reasoning_effort",

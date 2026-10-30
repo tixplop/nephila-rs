@@ -74,7 +74,8 @@
 # --- Réglages LLM du dépôt ---
 # Ils remplacent, clé par clé, la configuration personnelle (NEPHILA_CONFIG, sinon ~/.config/nephila/config.toml).
 # Elle seule active le LLM : sans elle, ou avec --no-llm, ces réglages n'ont aucun effet et rien n'est affiché.
-# Changer model fait réenrichir les fichiers déjà enrichis, par nephila update comme par nephila build ; les autres réglages ne réenrichissent rien.
+# Changer model ou summary_language fait réenrichir les fichiers déjà enrichis, par nephila update
+# comme par nephila build ; les autres réglages ne réenrichissent rien.
 # Valeurs effectives et réglages venus de ce fichier : nephila build --verbose (ligne config).
 # Refusées ici (configuration personnelle seulement) : provider, base_url, api_key_env, tls_ca_cert, tls_insecure.
 # Raison : ce fichier est versionné ; un dépôt cloné ne doit pas pouvoir envoyer votre code ou votre clé d'API à un autre serveur, ni couper le contrôle des certificats.
@@ -84,6 +85,12 @@
 # personnelle.
 # Priorité : ce fichier > configuration personnelle > défaut.
 # model = "claude-sonnet-4-5"
+
+# Langue des résumés et des noms de concepts pour ce dépôt. Nom de langue de 1 à 40 lettres,
+# espaces, traits d'union ou apostrophes. Remplace la langue de la configuration personnelle
+# (défaut : "français") ; la casse compte. La changer réenrichit les fichiers déjà enrichis.
+# Priorité : ce fichier > configuration personnelle > défaut.
+# summary_language = "anglais"
 
 # Taille maximale, en caractères, d'un morceau de fichier envoyé au LLM. Entier > 0. Remplace la
 # valeur de la configuration personnelle.

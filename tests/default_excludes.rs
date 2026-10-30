@@ -235,7 +235,7 @@ fn req079_ac4_mise_a_niveau() {
     assert_eq!(e.normalized(), fresh.normalized());
 }
 
-const E2_KEYS: &str = "exclude, exclude_types, exclude_defaults, model, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask";
+const E2_KEYS: &str = "exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask";
 
 #[test]
 fn req079_ac6_ac9_valeur_invalide_et_cles_permises() {

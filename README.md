@@ -211,7 +211,7 @@ Modules (3)
 Avec `-v`, `build` et `update` écrivent sur stderr une ligne `trace:` par événement, horodatée : configuration effective (et réglages venus de `.nephila.toml`), parcours, migration du schéma, phases, chaque appel LLM avec son résultat, ses jetons et ses nouveaux essais, découpes, politique d'arrêt, bilan des appels et des jetons (que `query ask -v` écrit aussi). stdout est inchangé : `nephila build -v 2>trace.log` garde le bilan lisible.
 
 ```
-trace: [0.000s] config: llm=mock model=m-projet enrich_code=false thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
+trace: [0.000s] config: llm=mock model=m-projet enrich_code=false summary_language="français" thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
 trace: [0.009s] structure: fin 7 ms, 0 en attente, 3 enrichissements conservés
 trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
 trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts) 19 ms
@@ -316,7 +316,7 @@ model = "qwen2.5-coder:14b"
 format_retries = 4
 ```
 
-Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les six réglages `model`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`, au premier niveau, avec le nom et le type de la configuration personnelle, puis la section `[ask]` en fin de fichier. Toute autre clé est une erreur. Priorité : option > fichier de projet > configuration personnelle > défaut.
+Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les sept réglages `model`, `summary_language`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`, au premier niveau, avec le nom et le type de la configuration personnelle, puis la section `[ask]` en fin de fichier. Toute autre clé est une erreur. Priorité : option > fichier de projet > configuration personnelle > défaut.
 
 | Réglage | Plafond dans `.nephila.toml` |
 |---|---|
@@ -334,7 +334,7 @@ Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et 
 
 - **Clés de connexion refusées** : `provider`, `base_url`, `api_key_env`, `tls_ca_cert` et `tls_insecure` ne sont permises que dans la configuration personnelle : un dépôt cloné ne doit pas pouvoir envoyer votre code ou votre clé à un autre serveur, ni couper le contrôle des certificats.
 - **Sans LLM actif**, les réglages n'ont aucun effet ni message.
-- **Changer `model` réenrichit une fois** chaque fichier de la portée ; les autres réglages ne réenrichissent rien. Pour vérifier les valeurs effectives : `nephila build --verbose` (ligne `config`).
+- **Changer `model` ou `summary_language` réenrichit une fois** chaque fichier de la portée ; les autres réglages ne réenrichissent rien. Pour vérifier les valeurs effectives : `nephila build --verbose` (ligne `config`).
 
 Un exemple commenté est fourni dans [`examples/nephila.toml`](examples/nephila.toml). Un fichier invalide arrête toute commande qui parcourt le dépôt, avant toute analyse, sur une ligne qui nomme la clé et la valeur attendue :
 
@@ -356,6 +356,7 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 |---|---|---|
 | `provider` | `anthropic`, `openai` (compatible OpenAI) ou `mock` | obligatoire |
 | `model` | Nom du modèle | obligatoire, sauf `mock` |
+| `summary_language` | Langue des résumés et des noms de concepts, en toutes lettres (`"anglais"`) ; aussi dans `.nephila.toml` | `"français"` |
 | `api_key_env` | **Nom** de la variable d'environnement qui contient la clé | obligatoire pour `anthropic` |
 | `base_url` | URL du serveur, **sans** `/v1` final | celle du fournisseur |
 | `max_chunk_chars` | Taille maximale d'un morceau envoyé au LLM | 60000 |
@@ -441,7 +442,7 @@ Les autorités publiques restent reconnues. En dernier recours, `tls_insecure = 
 
 ## Enrichissement
 
-Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, concepts des documents). `enrich_code = true` dans la configuration personnelle, ou `--enrich-code` pour une commande, enrichit aussi le code et les fichiers de build et de données ; sans lui, un fichier de code n'est ni envoyé ni compté « à enrichir ». Un fichier garde ses enrichissements tant que son contenu, le modèle et le prompt de la version de nephila ne changent pas : un second `build` sans changement ne fait aucun appel, et changer `model` réenrichit une fois chaque fichier de la portée.
+Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, concepts des documents). `enrich_code = true` dans la configuration personnelle, ou `--enrich-code` pour une commande, enrichit aussi le code et les fichiers de build et de données ; sans lui, un fichier de code n'est ni envoyé ni compté « à enrichir ». Un fichier garde ses enrichissements tant que son contenu, le modèle, la langue des résumés et le prompt de la version de nephila ne changent pas : un second `build` sans changement ne fait aucun appel, et changer `model` ou `summary_language` réenrichit une fois chaque fichier de la portée.
 
 ### Lots et gros fichiers
 
@@ -572,7 +573,7 @@ Les références sans cible sont comptées dans « références non résolues »
 
 Les versions qui demandent une action, la plus récente d'abord. L'historique des nouveautés est dans les tags git et sur la page [Releases](https://github.com/tixplop/nephila-rs/releases).
 
-- **Vers 0.26** : le premier `nephila build` ou `nephila update` réenrichit une fois chaque fichier de la portée. `effort` (défaut `"low"`) est envoyé aussi sans `thinking` : à `anthropic` dans `output_config`, sauf pour un modèle sorti avant Claude Opus 4.5, et à `openai` si la clé est écrite. Si votre serveur ou votre modèle refuse ce champ (requête refusée, HTTP 400), écrivez `effort = "default"` dans la configuration personnelle, puis lancez `nephila update`.
+- **Vers 0.26** : le premier `nephila build` ou `nephila update` réenrichit une fois chaque fichier de la portée. Les résumés y sont écrits en `summary_language` (défaut `"français"`) : pour une autre langue, écrivez la clé avant cette commande. `effort` (défaut `"low"`) est envoyé aussi sans `thinking` : à `anthropic` dans `output_config`, sauf pour un modèle sorti avant Claude Opus 4.5, et à `openai` si la clé est écrite. Si votre serveur ou votre modèle refuse ce champ (requête refusée, HTTP 400), écrivez `effort = "default"` dans la configuration personnelle, puis lancez `nephila update`.
 - **Vers 0.25** : le premier `nephila update` (ou `build`) migre le graphe et calcule les communautés, sans appel LLM ; d'ici là, `query community` répond `communautés non calculées`. Pour revenir à une version antérieure, supprimez `.nephila/` : le build suivant réenrichit tous les fichiers de la portée.
 - **Vers 0.24** : `dist/`, `out/`, `coverage/`, `.next/`, `.nuxt/`, `vendor/`, `.idea/` et `*.min.js` sont exclus par défaut, et le premier `nephila update` retire leurs fichiers du graphe. Pour les garder : `exclude_defaults = false` dans `.nephila.toml`.
 - **Vers 0.23** : l'extraction utilise un fil par cœur, quelle que soit `concurrency`. Pour la limiter comme `concurrency = 1` le faisait : `--jobs 1`.

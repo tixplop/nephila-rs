@@ -14,19 +14,41 @@ pub const DEFAULT_CONCURRENCY: usize = 4;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// Langue par défaut des résumés (`summary_language`, REQ-172).
 pub const DEFAULT_SUMMARY_LANGUAGE: &str = "français";
+/// Longueur maximale, en caractères, de `summary_language` (REQ-172).
+pub const SUMMARY_LANGUAGE_MAX_CHARS: usize = 40;
 pub const DEFAULT_BATCH_FILES: usize = 10;
 pub const DEFAULT_FORMAT_RETRIES: u32 = 2;
 
 /// Réglages que le fichier de projet peut porter, dans l'ordre d'affichage (REQ-042). Seule
 /// déclaration de la liste : l'aide, l'erreur de clé inconnue et la trace s'en servent.
-pub const PROJECT_SETTINGS: [&str; 6] = [
+pub const PROJECT_SETTINGS: [&str; 7] = [
     "model",
+    "summary_language",
     "max_chunk_chars",
     "concurrency",
     "timeout_secs",
     "batch_files",
     "format_retries",
 ];
+
+/// Règle de `summary_language`, source des deux messages d'erreur (V-006), sans article.
+fn summary_language_expected() -> String {
+    format!(
+        "nom de langue de 1 à {SUMMARY_LANGUAGE_MAX_CHARS} lettres, espaces, traits d'union ou \
+         apostrophes"
+    )
+}
+
+/// Valide une langue des résumés : après `trim`, 1 à 40 caractères, chacun alphabétique, espace,
+/// `-` ou `'` (REQ-172). Rend la valeur retenue.
+pub fn summary_language_of(raw: &str) -> Option<String> {
+    let v = raw.trim();
+    let n = v.chars().count();
+    let ok = (1..=SUMMARY_LANGUAGE_MAX_CHARS).contains(&n)
+        && v.chars()
+            .all(|c| c.is_alphabetic() || c == ' ' || c == '-' || c == '\'');
+    ok.then(|| v.to_string())
+}
 
 /// Plafonds inclus des réglages entiers du fichier de projet seulement (DEC-055), dans l'ordre
 /// de `PROJECT_SETTINGS`, `model` exclu. Seule source du message d'erreur, de l'exemple et du
@@ -126,6 +148,7 @@ pub const CONNECTION_KEYS: [&str; 5] = [
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectSettings {
     pub model: Option<String>,
+    pub summary_language: Option<String>,
     pub max_chunk_chars: Option<usize>,
     pub concurrency: Option<usize>,
     pub timeout_secs: Option<u64>,
@@ -164,6 +187,18 @@ impl ProjectSettings {
                 "model" => match value {
                     toml::Value::String(s) if !s.trim().is_empty() => out.model = Some(s.clone()),
                     _ => return Err(invalid("chaîne non vide attendue")),
+                },
+                "summary_language" => match value {
+                    toml::Value::String(s) if summary_language_of(s).is_some() => {
+                        out.summary_language = summary_language_of(s)
+                    }
+                    _ => {
+                        return Err(Error::Message(format!(
+                            "{shown} : clé `{key}` : valeur invalide `{}` ({} attendu)",
+                            crate::escape::path(&value.to_string()),
+                            summary_language_expected()
+                        )))
+                    }
                 },
                 "max_chunk_chars" => out.max_chunk_chars = Some(positive()? as usize),
                 "concurrency" => out.concurrency = Some(positive()? as usize),
@@ -357,6 +392,7 @@ struct RawConfig {
     batch_files: Option<i64>,
     format_retries: Option<toml::Value>,
     enrich_code: Option<toml::Value>,
+    summary_language: Option<toml::Value>,
     thinking: Option<toml::Value>,
     effort: Option<toml::Value>,
     max_output_tokens: Option<toml::Value>,
@@ -420,6 +456,10 @@ impl Config {
         if let Some(v) = &p.model {
             self.model = v.clone();
             from_project.push("model");
+        }
+        if let Some(v) = &p.summary_language {
+            self.summary_language = v.clone();
+            from_project.push("summary_language");
         }
         if let Some(v) = p.max_chunk_chars {
             self.max_chunk_chars = v;
@@ -686,6 +726,20 @@ impl Config {
                 )))
             }
         };
+        let summary_language = match &raw.summary_language {
+            None => DEFAULT_SUMMARY_LANGUAGE.to_string(),
+            Some(toml::Value::String(s)) if summary_language_of(s).is_some() => {
+                summary_language_of(s).unwrap_or_default()
+            }
+            Some(v) => {
+                return Err(Error::Message(format!(
+                    "configuration invalide ({at}) : clé « summary_language » doit être un {} \
+                     (reçu : {})",
+                    summary_language_expected(),
+                    crate::escape::path(&v.to_string())
+                )))
+            }
+        };
         let invalid = |key: &str, expected: &str, v: &toml::Value| {
             Error::Message(format!(
                 "configuration invalide ({at}) : clé « {key} » doit être {expected} (reçu : {v})"
@@ -806,7 +860,7 @@ impl Config {
             tls_ca_cert,
             tls_ca_certs,
             tls_insecure: raw.tls_insecure.unwrap_or(false),
-            summary_language: DEFAULT_SUMMARY_LANGUAGE.to_string(),
+            summary_language,
             ask,
         })
     }
@@ -925,6 +979,17 @@ mod project_tests {
                 },
                 Config {
                     model: "m".into(),
+                    ..base()
+                },
+            ),
+            (
+                "summary_language",
+                ProjectSettings {
+                    summary_language: Some("anglais".into()),
+                    ..Default::default()
+                },
+                Config {
+                    summary_language: "anglais".into(),
                     ..base()
                 },
             ),
@@ -1098,7 +1163,7 @@ mod project_tests {
         let settings: Vec<&str> = PROJECT_SETTINGS
             .iter()
             .copied()
-            .filter(|k| *k != "model")
+            .filter(|k| *k != "model" && *k != "summary_language")
             .collect();
         assert_eq!(keys, settings);
         assert_eq!(project_cap("concurrency"), Some(64));
@@ -1333,6 +1398,125 @@ mod ask_tests {
 
     fn project(toml: &str) -> Result<ProjectSettings> {
         ProjectSettings::from_table(&toml.parse().unwrap(), "./.nephila.toml")
+    }
+
+    fn forty() -> String {
+        "é".repeat(SUMMARY_LANGUAGE_MAX_CHARS)
+    }
+
+    /// Valeurs TOML (texte source) refusées par les deux fichiers, avec la valeur réécrite.
+    fn bad_languages() -> Vec<(String, String)> {
+        let long = "a".repeat(SUMMARY_LANGUAGE_MAX_CHARS + 1);
+        vec![
+            ("\"\"".into(), "\"\"".into()),
+            ("\"   \"".into(), "\"   \"".into()),
+            (format!("\"{long}\""), format!("\"{long}\"")),
+            ("\"en_US\"".into(), "\"en_US\"".into()),
+            ("\"fr2\"".into(), "\"fr2\"".into()),
+            ("\"français;\"".into(), "\"français;\"".into()),
+            ("\"fr\\u0007\"".into(), "\"fr\\u0007\"".into()),
+            ("3".into(), "3".into()),
+            ("true".into(), "true".into()),
+            ("[\"fr\"]".into(), "[\"fr\"]".into()),
+        ]
+    }
+
+    #[test]
+    fn req172_ac2_langue_de_la_configuration_personnelle() {
+        assert_eq!(personal("").unwrap().summary_language, "français");
+        let good = [
+            ("\"anglais\"", "anglais"),
+            ("\"  English  \"", "English"),
+            ("\"portugais du Brésil\"", "portugais du Brésil"),
+            ("\"bokmål\"", "bokmål"),
+            ("\"zh-Hant\"", "zh-Hant"),
+            ("\"langue d'oc\"", "langue d'oc"),
+        ];
+        for (raw, want) in good {
+            let c = personal(&format!("summary_language = {raw}")).unwrap();
+            assert_eq!(c.summary_language, want, "{raw}");
+        }
+        let c = personal(&format!("summary_language = \"{}\"", forty())).unwrap();
+        assert_eq!(c.summary_language, forty());
+        for (raw, shown) in bad_languages() {
+            let e = personal(&format!("summary_language = {raw}")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "configuration invalide ({P}) : clé « summary_language » doit être un nom de \
+                     langue de 1 à 40 lettres, espaces, traits d'union ou apostrophes (reçu : {shown})"
+                ),
+                "{raw}"
+            );
+        }
+        // Contrôle C1 et marque de direction : écrits sous forme échappée.
+        let e = personal("summary_language = \"fr\u{202E}\u{85}\"").unwrap_err();
+        assert!(
+            e.to_string().ends_with("(reçu : \"fr\\u{202E}\\u{0085}\")"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn req172_ac3_langue_du_fichier_de_projet() {
+        assert_eq!(
+            PROJECT_SETTINGS,
+            [
+                "model",
+                "summary_language",
+                "max_chunk_chars",
+                "concurrency",
+                "timeout_secs",
+                "batch_files",
+                "format_retries"
+            ]
+        );
+        assert_eq!(PROJECT_CAPS.len(), 5);
+        assert_eq!(project_cap("summary_language"), None);
+        let p = project("summary_language = \"  anglais \"").unwrap();
+        assert_eq!(p.summary_language.as_deref(), Some("anglais"));
+        let perso = personal("summary_language = \"espagnol\"").unwrap();
+        let (c, from) = perso.clone().with_project(&p, None, None);
+        assert_eq!(c.summary_language, "anglais");
+        assert_eq!(from, vec!["summary_language"]);
+        let both = project("model = \"m\"\nsummary_language = \"anglais\"").unwrap();
+        let (_, from) = perso.with_project(&both, None, None);
+        assert_eq!(from, vec!["model", "summary_language"]);
+        assert_eq!(
+            project(&format!("summary_language = \"{}\"", forty()))
+                .unwrap()
+                .summary_language,
+            Some(forty())
+        );
+        for (raw, shown) in bad_languages() {
+            let e = project(&format!("summary_language = {raw}")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "./.nephila.toml : clé `summary_language` : valeur invalide `{shown}` (nom de \
+                     langue de 1 à 40 lettres, espaces, traits d'union ou apostrophes attendu)"
+                ),
+                "{raw}"
+            );
+        }
+        let e = project("summary_language = \"fr\u{202E}\u{85}\"").unwrap_err();
+        assert!(e.to_string().contains("`\"fr\\u{202E}\\u{0085}\"`"), "{e}");
+        // `[ask]` : la clé reste inconnue de la section.
+        let e = project("[ask]\nsummary_language = \"anglais\"").unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("clé inconnue `ask.summary_language`"),
+            "{e}"
+        );
+        let e = personal("[ask]\nsummary_language = \"anglais\"").unwrap_err();
+        assert!(e.to_string().contains("summary_language"), "{e}");
+        // `for_ask` ignore la langue : aucune marque.
+        let (_, _, marks) = personal("").unwrap().for_ask(
+            &project("summary_language = \"anglais\"").unwrap(),
+            None,
+            None,
+        );
+        assert!(marks.is_empty(), "{marks:?}");
     }
 
     #[test]
