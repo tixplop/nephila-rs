@@ -450,7 +450,14 @@ fn req046_ac5_gros_fichier_morceau_2_tronque() {
     assert!(!o.status.success());
     let posts = s.posts();
     assert_eq!(posts.len(), 2, "{}", err(&o));
-    assert!(posts[1].contains("(morceau 2)"), "{}", posts[1]);
+    // Le témoin montre un appel par morceau : la requête 2 porte le morceau 2 (REQ-169).
+    let n = nephila::chunk::split(&text, text.len() / 3 + 40).len();
+    assert_eq!(n, 3);
+    assert!(
+        posts[1].contains(&format!("(extrait 2/{n}, lignes ")),
+        "{}",
+        posts[1]
+    );
     assert_eq!(err(&o).matches(&a5("A.java")).count(), 1, "{}", err(&o));
     assert_eq!(s.to_enrich(), 1);
 }

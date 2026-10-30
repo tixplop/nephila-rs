@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use super::ask::AskReply;
 use super::enrich::parse_lot;
-use super::{CallStats, Enrichment, Llm, LotItem};
+use super::{CallStats, Enrichment, Excerpt, Llm, LotItem};
 use crate::error::{Error, Result};
 use serde_json::Value;
 
@@ -327,6 +327,7 @@ impl Llm for MockLlm {
         _label: &str,
         file: &str,
         call: usize,
+        _excerpt: Option<Excerpt>,
         _text: &str,
         _requested: &[String],
         known: &[String],
@@ -375,8 +376,18 @@ mod tests {
     fn req165_ac7_successful_mock_calls_have_one_send_a_response_and_no_usage() {
         let m = mock(None);
         let s = CallStats::default();
-        m.enrich_labeled("l", "A.java", 1, "t", &[], &[], &AtomicBool::new(false), &s)
-            .unwrap();
+        m.enrich_labeled(
+            "l",
+            "A.java",
+            1,
+            None,
+            "t",
+            &[],
+            &[],
+            &AtomicBool::new(false),
+            &s,
+        )
+        .unwrap();
         assert_eq!((s.sends(), s.responded(), s.usage()), (1, true, None));
 
         let s = CallStats::default();
@@ -398,7 +409,17 @@ mod tests {
     fn req165_ac7_fail_after_zero_has_one_send_and_no_response() {
         let m = mock(Some(0));
         let s = CallStats::default();
-        let r = m.enrich_labeled("l", "A.java", 1, "t", &[], &[], &AtomicBool::new(false), &s);
+        let r = m.enrich_labeled(
+            "l",
+            "A.java",
+            1,
+            None,
+            "t",
+            &[],
+            &[],
+            &AtomicBool::new(false),
+            &s,
+        );
         assert!(matches!(r, Err(Error::Network(_))));
         assert_eq!((s.sends(), s.responded()), (1, false));
         let s = CallStats::default();

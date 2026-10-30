@@ -22,7 +22,7 @@ use ask::{ask_system_prompt, ask_user_prompt};
 use enrich::{
     enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt, parse_lot,
 };
-pub use enrich::{Enrichment, LotItem};
+pub use enrich::{Enrichment, Excerpt, LotItem};
 pub use retry::with_format_retries;
 
 /// Options de génération communes aux fournisseurs HTTP (REQ-058, DEC-072).
@@ -60,13 +60,14 @@ pub trait Llm: Send + Sync {
         label: &str,
         file: &str,
         call: usize,
+        excerpt: Option<Excerpt>,
         text: &str,
         requested: &[String],
         known: &[String],
         stop: &AtomicBool,
         stats: &CallStats,
     ) -> Result<Enrichment> {
-        let _ = (label, stop, stats);
+        let _ = (label, excerpt, stop, stats);
         self.enrich(file, call, text, requested, known)
     }
     /// Enrichit un lot de 2 fichiers ou plus en un seul appel (schéma version 3, DEC-033).
@@ -109,7 +110,7 @@ impl<T: Complete> Llm for T {
     fn enrich(
         &self,
         file: &str,
-        call: usize,
+        _call: usize,
         text: &str,
         requested: &[String],
         known: &[String],
@@ -119,7 +120,7 @@ impl<T: Complete> Llm for T {
             None,
             &CallStats::default(),
             enrichment_system_prompt(),
-            enrichment_user_prompt(file, call, text, requested),
+            enrichment_user_prompt(file, None, text, requested),
         )?;
         Enrichment::parse(http::extract_json(&out)?, file, known)
     }
@@ -129,7 +130,8 @@ impl<T: Complete> Llm for T {
         &self,
         label: &str,
         file: &str,
-        call: usize,
+        _call: usize,
+        excerpt: Option<Excerpt>,
         text: &str,
         requested: &[String],
         known: &[String],
@@ -141,7 +143,7 @@ impl<T: Complete> Llm for T {
             Some(stop),
             stats,
             enrichment_system_prompt(),
-            enrichment_user_prompt(file, call, text, requested),
+            enrichment_user_prompt(file, excerpt, text, requested),
         )?;
         Enrichment::parse(http::extract_json(&out)?, file, known)
     }
@@ -217,14 +219,16 @@ impl Llm for WithModel {
         label: &str,
         file: &str,
         call: usize,
+        excerpt: Option<Excerpt>,
         text: &str,
         requested: &[String],
         known: &[String],
         stop: &AtomicBool,
         stats: &CallStats,
     ) -> Result<Enrichment> {
-        self.inner
-            .enrich_labeled(label, file, call, text, requested, known, stop, stats)
+        self.inner.enrich_labeled(
+            label, file, call, excerpt, text, requested, known, stop, stats,
+        )
     }
 
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {

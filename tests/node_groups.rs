@@ -189,6 +189,22 @@ fn user_prompt(body: &str) -> String {
     find(&v).unwrap_or_else(|| panic!("aucun prompt d'enrichissement dans {body}"))
 }
 
+/// Prompt système d'enrichissement d'une requête (message ou champ `system`).
+fn system_prompt(body: &str) -> String {
+    fn find(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::String(s) if s.starts_with("Tu enrichis le graphe") => {
+                Some(s.clone())
+            }
+            serde_json::Value::Array(a) => a.iter().find_map(find),
+            serde_json::Value::Object(o) => o.values().find_map(find),
+            _ => None,
+        }
+    }
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    find(&v).unwrap_or_else(|| panic!("aucun prompt système dans {body}"))
+}
+
 /// Identifiants listés (`- <id>`) après chaque `Nœuds du fichier :` du prompt, dans l'ordre.
 fn listed_ids(prompt: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -258,6 +274,14 @@ fn req047_ac3_http_trois_requetes_de_150_nœuds_au_plus() {
         let mut first_ids: Vec<String> = Vec::new();
         for body in &posts {
             let prompt = user_prompt(body);
+            assert!(
+                prompt.starts_with("Fichier : src/Big.java\n\nNœuds du fichier :\n"),
+                "{provider}: {prompt:.80}"
+            );
+            assert!(
+                !prompt.contains("extrait") && !prompt.contains("morceau"),
+                "{provider}"
+            );
             assert!(
                 content_of(&prompt).contains(&src),
                 "{provider}: contenu entier"
@@ -373,6 +397,7 @@ const AC5_SPLIT: usize = 107;
 fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
     // 199 méthodes + le type = 200 nœuds ; limite de morceau à la moitié du fichier environ.
     let src = java("Big", 199);
+    let src_lines = src.lines().count();
     let limit = AC5_LIMIT;
     let extra = format!("max_chunk_chars = {limit}\n");
     let probe = Env::mock(&[(BIG, src.clone())], &extra);
@@ -402,12 +427,26 @@ fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
         .map(|b| user_prompt(b))
         .collect();
     assert_eq!(prompts.len(), 2);
-    for (i, p) in prompts.iter().enumerate() {
-        assert!(
-            p.contains(&format!("(morceau {})", i + 1)),
-            "appel {}",
-            i + 1
-        );
+    // REQ-169 : première ligne de chaque requête, `<b>` lu dans la requête 1.
+    let total_lines = src_lines;
+    let first1 = prompts[0].lines().next().unwrap();
+    let b: usize = first1
+        .strip_prefix("Fichier : src/Big.java (extrait 1/2, lignes 1–")
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("première ligne : {first1}"))
+        .parse()
+        .unwrap();
+    assert!(b >= 1 && b < total_lines, "b = {b}");
+    assert_eq!(
+        prompts[1].lines().next().unwrap(),
+        format!(
+            "Fichier : src/Big.java (extrait 2/2, lignes {}–{total_lines})",
+            b + 1
+        )
+    );
+    for (p, body) in prompts.iter().zip(env.enrich_posts("openai")) {
+        assert!(!p.contains("(morceau"), "{p}");
+        assert!(system_prompt(&body).contains(nephila::llm::enrich::EXCERPT_RULES));
     }
     let lists: Vec<Vec<String>> = prompts.iter().map(|p| listed_ids(p)).collect();
     let literal = |range: std::ops::Range<usize>, with_type: bool| -> Vec<String> {
@@ -819,7 +858,7 @@ fn req047_ac15_sections_markdown_au_morceau_de_leur_titre() {
     ];
     for (k, p) in prompts.iter().enumerate() {
         assert!(
-            p.contains(&format!("(morceau {})", k + 1)),
+            p.contains(&format!("(extrait {}/3, lignes ", k + 1)),
             "requête {}",
             k + 1
         );

@@ -558,6 +558,38 @@ fn req027_ac7_omitted_file_stays_pending_and_update_resends_only_it() {
 }
 
 #[test]
+fn req169_ac7_lot_request_carries_no_excerpt_wording() {
+    let reply = format!(
+        r#"{{"version":3,"files":[{},{}]}}"#,
+        lot_entry(0),
+        lot_entry(1)
+    );
+    let server = FakeServer::start(vec![(200, openai_reply(&reply))]);
+    let env = server_env(&server, 2);
+    let cfg = fs::read_to_string(&env.config).unwrap();
+    fs::write(
+        &env.config,
+        cfg.replace("batch_files = 3", "batch_files = 2"),
+    )
+    .unwrap();
+    let o = run_server(&env, "build");
+    assert!(o.status.success(), "{}", stderr(&o));
+    let reqs: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    assert_eq!(reqs.len(), 1);
+    let body = &reqs[0].body;
+    assert!(body.contains("=== FICHIER : src/F00.java ===") && body.contains("F01.java"));
+    assert!(
+        !body.contains("extrait") && !body.contains("morceau"),
+        "{body}"
+    );
+    assert!(!body.contains("Un fichier trop long est envoyé en extraits"));
+}
+
+#[test]
 fn req027_ac8_version_2_reply_for_a_lot_fails_all_its_files() {
     let wrong = r#"{"version":2,"summaries":[],"concepts":[]}"#;
     let reply = format!(

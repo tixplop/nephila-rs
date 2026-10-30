@@ -12,7 +12,8 @@ use crate::chunk;
 use crate::error::{warn, Error, Result, TRUNCATED};
 use crate::index::build::{BuildReport, IndexOptions};
 use crate::llm::{
-    calls_line, tokens_segment, with_format_retries, CallStats, Enrichment, Llm, LlmTotals, LotItem,
+    calls_line, tokens_segment, with_format_retries, CallStats, Enrichment, Excerpt, Llm,
+    LlmTotals, LotItem,
 };
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
 use crate::parse::markdown;
@@ -142,6 +143,8 @@ pub(crate) enum Unit<'a> {
         /// Rang de l'appel dans le plan, à partir de 1.
         index: usize,
         count: usize,
+        /// Morceau envoyé : `None` quand le fichier tient en un seul morceau (REQ-169).
+        excerpt: Option<Excerpt>,
         part: Arc<str>,
         requested: Vec<String>,
         /// Liste complète des nœuds du fichier, qui filtre la réponse.
@@ -414,6 +417,7 @@ fn traced_enrich(
     path: &str,
     index: usize,
     total: usize,
+    excerpt: Option<Excerpt>,
     text: &str,
     requested: &[String],
     known: &[String],
@@ -424,7 +428,9 @@ fn traced_enrich(
     let stats = CallStats::default();
     let label = format!("{path} [{index}/{total}]");
     if !trace::enabled() {
-        let result = llm.enrich_labeled(&label, path, index, text, requested, known, stop, &stats);
+        let result = llm.enrich_labeled(
+            &label, path, index, excerpt, text, requested, known, stop, &stats,
+        );
         add_totals(totals, &stats, attempt);
         return result;
     }
@@ -434,7 +440,9 @@ fn traced_enrich(
         attempt.mark()
     );
     let started = Instant::now();
-    let result = llm.enrich_labeled(&label, path, index, text, requested, known, stop, &stats);
+    let result = llm.enrich_labeled(
+        &label, path, index, excerpt, text, requested, known, stop, &stats,
+    );
     let ms = started.elapsed().as_millis();
     add_totals(totals, &stats, attempt);
     let tokens = tokens_suffix(&stats);
@@ -711,6 +719,46 @@ fn section_homes(
     homes
 }
 
+/// Extrait de chaque morceau (REQ-169) : `None` pour un seul morceau, sinon rang, nombre de
+/// morceaux et lignes du corps (numérotées à partir de 1), d'après les débuts de corps de
+/// `spans`. Un seul passage sur le texte : les sauts de ligne sont comptés de façon cumulative.
+fn excerpts_of(text: &str, spans: &[(String, usize)]) -> Vec<Option<Excerpt>> {
+    let total = spans.len();
+    if total <= 1 {
+        return vec![None; total];
+    }
+    let bytes = text.as_bytes();
+    // Lignes terminées avant l'octet `pos` ; `done` est le nombre de sauts de ligne déjà comptés.
+    let mut counted = 0usize;
+    let mut done = 0usize;
+    let mut lines_before = |pos: usize| {
+        let pos = pos.min(bytes.len());
+        if pos > counted {
+            done += bytes[counted..pos].iter().filter(|&&b| b == b'\n').count();
+            counted = pos;
+        }
+        done
+    };
+    let starts: Vec<usize> = spans.iter().map(|(_, s)| *s).collect();
+    let mut out = Vec::with_capacity(total);
+    for k in 0..total {
+        let first_line = lines_before(starts[k]) + 1;
+        let last_line = match starts.get(k + 1) {
+            Some(&next) => lines_before(next),
+            None => {
+                lines_before(bytes.len()) + usize::from(!bytes.is_empty() && !text.ends_with('\n'))
+            }
+        };
+        out.push(Some(Excerpt {
+            rank: k + 1,
+            total,
+            first_line,
+            last_line: last_line.max(first_line),
+        }));
+    }
+    out
+}
+
 /// Appels d'un fichier envoyé seul selon `call_plan`, privé de ses appels à liste vide (sauf
 /// Markdown ayant au moins une section, REQ-159), numérotés 1..n dans l'ordre du plan. Le
 /// plafond de `MAX_CALLS_PER_FILE` est vérifié ici sur le plan filtré, avant qu'un seul appel
@@ -724,6 +772,7 @@ fn plan_calls<'a>(
     let known: Arc<[String]> = nodes.iter().map(|(id, _)| id.clone()).collect();
     let spans = chunk::split_spans_for(&file.path, text, max_chunk_chars);
     let homes = section_homes(text, &spans, nodes);
+    let excerpts = excerpts_of(text, &spans);
     let parts: Vec<String> = spans.into_iter().map(|(part, _)| part).collect();
     let mut plan = call_plan(&parts, nodes, &homes);
     // REQ-159 : un appel à liste vide ne peut rien apporter, sauf pour un Markdown à sections
@@ -748,6 +797,7 @@ fn plan_calls<'a>(
             file,
             index: i + 1,
             count,
+            excerpt: excerpts[k],
             part: Arc::clone(&shared[k]),
             requested,
             known: Arc::clone(&known),
@@ -763,6 +813,7 @@ fn run_call(
     path: &str,
     index: usize,
     count: usize,
+    excerpt: Option<Excerpt>,
     part: &str,
     requested: &[String],
     known: &[String],
@@ -777,6 +828,7 @@ fn run_call(
             path,
             index,
             count,
+            excerpt,
             part,
             requested,
             known,
@@ -1020,6 +1072,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 file,
                 index,
                 count,
+                excerpt,
                 part,
                 requested,
                 known,
@@ -1029,6 +1082,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     &file.path,
                     index,
                     count,
+                    excerpt,
                     &part,
                     &requested,
                     &known,
@@ -1920,6 +1974,7 @@ mod tests {
             let Unit::Call {
                 index,
                 count,
+                excerpt,
                 part,
                 requested,
                 known,
@@ -1929,7 +1984,7 @@ mod tests {
                 unreachable!()
             };
             results.push(run_call(
-                llm, path, index, count, &part, &requested, &known, retries, stop, &totals,
+                llm, path, index, count, excerpt, &part, &requested, &known, retries, stop, &totals,
             )?);
         }
         match results.len() {
@@ -2005,6 +2060,66 @@ mod tests {
             assert_eq!(part, &parts[k]);
             assert_eq!(requested, &plan[k].1);
             assert_eq!(kn, &known);
+        }
+    }
+
+    #[test]
+    fn req169_ac5_excerpt_of_each_call() {
+        // Cinq lignes de 10 octets, limite 20 : trois morceaux (lignes 1-2, 3-4, 5).
+        let text = "alpha xxx\nalpha yyy\nbbbbbbbbb\nbbbbbbbbb\ngamma xxx\n";
+        let spans = chunk::split_spans_for("src/A.java", text, 20);
+        assert_eq!(spans.len(), 3);
+        let line_of = |pos: usize| text[..pos].matches('\n').count();
+        let first = |k: usize| line_of(spans[k].1) + 1;
+        let last = |k: usize| {
+            spans
+                .get(k + 1)
+                .map_or(text.lines().count(), |s| line_of(s.1))
+        };
+        assert_eq!((first(0), last(0)), (1, 2));
+        assert_eq!((first(2), last(2)), (5, 5));
+        // 160 nœuds au morceau 1 (2 groupes), aucun au morceau 2, un au morceau 3.
+        let mut nodes: Vec<(String, String)> = (0..160)
+            .map(|i| node(&format!("method:A.m{i}"), "alpha"))
+            .collect();
+        nodes.push(node("method:A.g", "gamma"));
+        let file = rec("src/A.java", text.len() as u64);
+        let units = plan_calls(&file, text, 20, &nodes).unwrap();
+        let got: Vec<(usize, usize, Option<Excerpt>)> = units
+            .iter()
+            .map(|u| match u {
+                Unit::Call {
+                    index,
+                    count,
+                    excerpt,
+                    ..
+                } => (*index, *count, *excerpt),
+                _ => unreachable!(),
+            })
+            .collect();
+        let ex = |rank: usize, k: usize| {
+            Some(Excerpt {
+                rank,
+                total: 3,
+                first_line: first(k),
+                last_line: last(k),
+            })
+        };
+        assert_eq!(
+            got,
+            vec![(1, 3, ex(1, 0)), (2, 3, ex(1, 0)), (3, 3, ex(3, 2))]
+        );
+        // Un seul morceau, trois groupes : aucun extrait.
+        let many: Vec<(String, String)> = (0..400)
+            .map(|i| node(&format!("method:A.m{i}"), "alpha"))
+            .collect();
+        let units = plan_calls(&file, text, 1000, &many).unwrap();
+        assert_eq!(units.len(), 3);
+        for u in &units {
+            let Unit::Call { excerpt, .. } = u else {
+                unreachable!()
+            };
+            assert_eq!(*excerpt, None);
         }
     }
 

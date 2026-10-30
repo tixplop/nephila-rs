@@ -12,12 +12,27 @@ pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 /// Version du prompt d'enrichissement (DEC-062). À incrémenter à chaque changement des consignes
 /// système, des gabarits de requête (fichier seul et lot) ou des schémas de réponse version 2 et
 /// 3 : tout enrichissement conservé avec une autre version est refait. Un test fige l'empreinte
-/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 2 depuis la 0.26.0
-/// (consignes de forme des résumés, REQ-167).
-pub const ENRICH_PROMPT_VERSION: u32 = 2;
+/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 3 depuis la 0.26.0
+/// (consignes de forme des résumés, REQ-167 ; extraits, REQ-169 ; la valeur 2 n'a pas été livrée).
+pub const ENRICH_PROMPT_VERSION: u32 = 3;
 
 /// Consignes de forme des résumés : ligne commune aux deux prompts système (DEC-135).
 pub const SUMMARY_RULES: &str = "Résumés (de nœud ou de concept) : une phrase de 25 mots au plus, qui dit le rôle ou la responsabilité de l'élément (ce qu'il fait et à quoi il sert), pas sa syntaxe ni sa signature ; ne répète pas son nom ; n'écris que ce que le contenu montre, sans rien supposer ni inventer. Omets (aucune entrée dans \"summaries\") un accesseur ou un mutateur trivial (il lit ou écrit un champ, sans autre effet) et une section vide ou réduite à son titre.";
+
+/// Consignes d'extrait : ligne du prompt système du fichier envoyé seul, après `SUMMARY_RULES`
+/// (REQ-169, DEC-136).
+pub const EXCERPT_RULES: &str = "Un fichier trop long est envoyé en extraits : sa ligne \"Fichier :\" porte alors \"(extrait k/n, lignes a–b)\" et tu ne vois que ces lignes. À partir du deuxième extrait, le contenu commence par une copie partielle du début du fichier (package, imports, déclaration du type englobant, ou titres des sections englobantes), donnée pour contexte : n'en tire aucun résumé. Un nœud de la liste seulement cité dans un extrait se résume d'après ce que l'extrait en montre ; omets-le si l'extrait n'en montre pas le rôle.";
+
+/// Morceau d'un fichier envoyé en plusieurs morceaux (REQ-169) : `rank` à partir de 1 sur `total`
+/// morceaux du fichier, lignes `first_line` à `last_line` (à partir de 1, bornes comprises) de
+/// son corps, en-tête répété exclu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Excerpt {
+    pub rank: usize,
+    pub total: usize,
+    pub first_line: usize,
+    pub last_line: usize,
+}
 
 /// Concept proposé pour un document Markdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +183,7 @@ pub fn enrichment_system_prompt() -> String {
          \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \
          \"sections\": [\"<identifiant de section de la liste>\"]}}]}}.\n\
          {SUMMARY_RULES}\n\
+         {EXCERPT_RULES}\n\
          Les résumés ne portent que sur les nœuds de la liste fournie. Les concepts ne concernent \
          que les fichiers Markdown et ne citent que des sections de la liste. Tu ne crées, ne \
          renomme ni ne supprimes aucun nœud et tu ne produis aucun autre lien. \
@@ -176,9 +192,23 @@ pub fn enrichment_system_prompt() -> String {
 }
 
 /// Message utilisateur d'enrichissement : liste des nœuds puis contenu du morceau.
-pub fn enrichment_user_prompt(file: &str, call: usize, text: &str, requested: &[String]) -> String {
+pub fn enrichment_user_prompt(
+    file: &str,
+    excerpt: Option<Excerpt>,
+    text: &str,
+    requested: &[String],
+) -> String {
     let list: String = requested.iter().map(|n| format!("- {n}\n")).collect();
-    format!("Fichier : {file} (morceau {call})\n\nNœuds du fichier :\n{list}\nContenu :\n{text}")
+    let head = match excerpt {
+        None => format!("Fichier : {file}"),
+        Some(Excerpt {
+            rank,
+            total,
+            first_line,
+            last_line,
+        }) => format!("Fichier : {file} (extrait {rank}/{total}, lignes {first_line}–{last_line})"),
+    };
+    format!("{head}\n\nNœuds du fichier :\n{list}\nContenu :\n{text}")
 }
 
 /// Version du schéma de réponse d'un lot de 2 fichiers ou plus (DEC-033).
@@ -324,13 +354,17 @@ pub fn lot_user_prompt(items: &[LotItem]) -> String {
 mod tests {
     use super::*;
 
-    /// Empreinte BLAKE3 des consignes, gabarits et schémas (version 2 et 3) d'enrichissement.
-    fn prompts_fingerprint() -> String {
-        fingerprint_with(|t| t)
-    }
+    const EXTRAIT: &str = "Un fichier trop long est envoyé en extraits : sa ligne \"Fichier :\" porte alors \"(extrait k/n, lignes a–b)\" et tu ne vois que ces lignes. À partir du deuxième extrait, le contenu commence par une copie partielle du début du fichier (package, imports, déclaration du type englobant, ou titres des sections englobantes), donnée pour contexte : n'en tire aucun résumé. Un nœud de la liste seulement cité dans un extrait se résume d'après ce que l'extrait en montre ; omets-le si l'extrait n'en montre pas le rôle.";
 
-    fn fingerprint_with(f: impl Fn(String) -> String) -> String {
-        let items = [
+    const EXCERPT_2_3: Excerpt = Excerpt {
+        rank: 2,
+        total: 3,
+        first_line: 10,
+        last_line: 20,
+    };
+
+    fn lot_items() -> [LotItem; 2] {
+        [
             LotItem {
                 file: "a.md".into(),
                 text: "texte a".into(),
@@ -341,33 +375,94 @@ mod tests {
                 text: "texte b".into(),
                 node_ids: ids(&["type:p.B"]),
             },
-        ];
-        let all = [
-            format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
-            f(enrichment_system_prompt()),
-            enrichment_user_prompt(
-                "a.md",
-                2,
-                "texte a",
-                &ids(&["document:a.md", "section:a.md#x"]),
-            ),
-            f(lot_system_prompt()),
-            lot_user_prompt(&items),
         ]
-        .join("\n<<<->>>\n");
-        blake3::hash(all.as_bytes()).to_hex().to_string()
+    }
+
+    fn user_prompt(excerpt: Option<Excerpt>) -> String {
+        enrichment_user_prompt(
+            "a.md",
+            excerpt,
+            "texte a",
+            &ids(&["document:a.md", "section:a.md#x"]),
+        )
+    }
+
+    /// Empreinte BLAKE3 d'une liste de textes de prompt.
+    fn fingerprint_of(texts: &[String]) -> String {
+        blake3::hash(texts.join("\n<<<->>>\n").as_bytes())
+            .to_hex()
+            .to_string()
+    }
+
+    /// Les cinq textes de la 0.26.0 reconstruits depuis les textes actuels (REQ-169) : sans
+    /// `EXCERPT_RULES`, requête `None` réécrite en `(morceau 2)`. `f` transforme les prompts
+    /// système.
+    fn texts_0_26(f: impl Fn(String) -> String) -> Vec<String> {
+        let user =
+            user_prompt(None).replacen("Fichier : a.md\n", "Fichier : a.md (morceau 2)\n", 1);
+        vec![
+            format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
+            f(enrichment_system_prompt().replace(&format!("{EXCERPT_RULES}\n"), "")),
+            user,
+            f(lot_system_prompt()),
+            lot_user_prompt(&lot_items()),
+        ]
     }
 
     #[test]
     fn req049_ac4_prompt_texts_are_frozen_next_to_the_prompt_version() {
         // Changer une consigne, un gabarit ou un schéma : incrémenter `ENRICH_PROMPT_VERSION`,
         // puis mettre à jour les deux littéraux ci-dessous.
-        assert_eq!(ENRICH_PROMPT_VERSION, 2);
+        assert_eq!(ENRICH_PROMPT_VERSION, 3);
+        let texts = [
+            format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
+            enrichment_system_prompt(),
+            user_prompt(None),
+            user_prompt(Some(EXCERPT_2_3)),
+            lot_system_prompt(),
+            lot_user_prompt(&lot_items()),
+        ];
         assert_eq!(
-            prompts_fingerprint(),
-            "a15bf9ef481fcf8b4d4b23cd4c073a7c341de03e0642b46c77c7c4cb0bd06f36",
+            fingerprint_of(&texts),
+            "27656c4c231a8abc77a1f39bd2a7c985c33bddaf48c141a06df73557b6b7dc27",
             "les textes du prompt ont changé : incrémentez ENRICH_PROMPT_VERSION"
         );
+    }
+
+    #[test]
+    fn req169_ac3_the_five_texts_of_0_26_0_are_unchanged() {
+        assert_eq!(
+            fingerprint_of(&texts_0_26(|t| t)),
+            "a15bf9ef481fcf8b4d4b23cd4c073a7c341de03e0642b46c77c7c4cb0bd06f36"
+        );
+    }
+
+    #[test]
+    fn req169_ac1_excerpt_rules_text_and_placement() {
+        assert_eq!(EXCERPT_RULES, EXTRAIT);
+        let needle = format!("\n{SUMMARY_RULES}\n{EXCERPT_RULES}\n");
+        assert_eq!(enrichment_system_prompt().matches(&needle).count(), 1);
+        let lot = lot_system_prompt();
+        assert!(!lot.contains(EXCERPT_RULES));
+        assert_eq!(lot.matches(&format!("\n{SUMMARY_RULES}\n")).count(), 1);
+    }
+
+    #[test]
+    fn req169_ac2_user_prompt_first_line() {
+        let none = user_prompt(None);
+        assert_eq!(
+            none,
+            "Fichier : a.md\n\nNœuds du fichier :\n- document:a.md\n- section:a.md#x\n\nContenu :\ntexte a"
+        );
+        assert_eq!(
+            enrichment_user_prompt("a.md", None, "t", &ids(&["document:a.md"])),
+            "Fichier : a.md\n\nNœuds du fichier :\n- document:a.md\n\nContenu :\nt"
+        );
+        let some = user_prompt(Some(EXCERPT_2_3));
+        let (first, rest) = some.split_once('\n').unwrap();
+        assert_eq!(first, "Fichier : a.md (extrait 2/3, lignes 10–20)");
+        assert_eq!(rest, none.split_once('\n').unwrap().1);
+        assert!(!none.contains("morceau") && !some.contains("morceau"));
     }
 
     #[test]
@@ -393,7 +488,7 @@ mod tests {
                 .replace("<25 mots au plus>", "une phrase")
         };
         assert_eq!(
-            fingerprint_with(strip),
+            fingerprint_of(&texts_0_26(strip)),
             "9d89eb9166852d117d282e3559895d7e2e5e3caf46da37b53548f491a589f8c5"
         );
     }
