@@ -366,6 +366,7 @@ fn req024_ac8_anthropic_enrich_request_carries_content_nodes_and_schema() {
     check_enrich_request(b["messages"][0]["content"].as_str().unwrap());
     let sys = b["system"].as_str().unwrap();
     assert!(sys.contains("version\": 2") && sys.contains("summaries") && sys.contains("concepts"));
+    check_system_prompt(sys);
 }
 
 #[test]
@@ -379,6 +380,7 @@ fn req024_ac8_openai_enrich_request_carries_content_nodes_and_schema() {
     check_enrich_request(b["messages"][1]["content"].as_str().unwrap());
     let sys = b["messages"][0]["content"].as_str().unwrap();
     assert!(sys.contains("version\": 2") && sys.contains("summaries") && sys.contains("concepts"));
+    check_system_prompt(sys);
 }
 
 #[test]
@@ -411,6 +413,15 @@ fn lot_items() -> Vec<LotItem> {
     ]
 }
 
+/// REQ-171 : types de fichiers tirés de `FileType` et angle par genre dans le prompt système.
+fn check_system_prompt(sys: &str) {
+    assert!(
+        sys.contains(&nephila::llm::enrich::file_types_phrase()),
+        "{sys}"
+    );
+    assert!(sys.contains(nephila::llm::enrich::KIND_RULES), "{sys}");
+}
+
 fn check_lot_request(system: &str, user: &str) {
     for needle in [
         "A.java",
@@ -427,6 +438,7 @@ fn check_lot_request(system: &str, user: &str) {
         system.contains("version\": 3") && system.contains("files"),
         "{system}"
     );
+    check_system_prompt(system);
 }
 
 fn check_lot_result(r: Vec<(String, nephila::error::Result<nephila::llm::Enrichment>)>) {

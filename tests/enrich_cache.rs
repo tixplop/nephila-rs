@@ -728,8 +728,8 @@ fn to_enrich(env: &Env) -> u64 {
     v["to_enrich"].as_u64().unwrap()
 }
 
-#[test]
-fn req167_ac4_prompt_version_1_graph_is_reenriched_once() {
+/// Graphe enrichi, ramené à la version `old` du prompt, puis réenrichi une seule fois.
+fn reenriched_once(old: i64) {
     let env = tiny_env(&[("a.md", "# Un\n\ntexte\n"), ("b.md", "# Deux\n\ntexte\n")]);
     for (f, id) in [("a.md", "document:a.md"), ("b.md", "document:b.md")] {
         fs::write(
@@ -743,7 +743,10 @@ fn req167_ac4_prompt_version_1_graph_is_reenriched_once() {
 
     let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
     let n = conn
-        .execute("UPDATE enrichments SET prompt_version = 1", [])
+        .execute(
+            &format!("UPDATE enrichments SET prompt_version = {old}"),
+            [],
+        )
         .unwrap();
     assert_eq!(n, 2);
     drop(conn);
@@ -766,48 +769,25 @@ fn req167_ac4_prompt_version_1_graph_is_reenriched_once() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(versions, vec![3]);
+    assert_eq!(
+        versions,
+        vec![i64::from(nephila::llm::enrich::ENRICH_PROMPT_VERSION)]
+    );
+}
+
+#[test]
+fn req167_ac4_prompt_version_1_graph_is_reenriched_once() {
+    reenriched_once(1);
 }
 
 #[test]
 fn req169_ac8_prompt_version_2_graph_is_reenriched_once() {
-    let env = tiny_env(&[("a.md", "# Un\n\ntexte\n"), ("b.md", "# Deux\n\ntexte\n")]);
-    for (f, id) in [("a.md", "document:a.md"), ("b.md", "document:b.md")] {
-        fs::write(
-            env.mock.join(format!("{f}.json")),
-            format!(r#"{{"version":2,"summaries":[{{"node":"{id}","summary":"Résumé."}}],"concepts":[]}}"#),
-        )
-        .unwrap();
-    }
-    env.ok(&["build"]);
-    assert_eq!(to_enrich(&env), 0);
+    reenriched_once(2);
+}
 
-    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
-    let n = conn
-        .execute("UPDATE enrichments SET prompt_version = 2", [])
-        .unwrap();
-    assert_eq!(n, 2);
-    drop(conn);
-    assert_eq!(to_enrich(&env), 2);
-
-    env.ok(&["update"]);
-    assert_eq!(env.logged().len(), 2, "{:?}", env.logged());
-    assert_eq!(env.logged_paths().len(), 2);
-    assert_eq!(to_enrich(&env), 0);
-
-    let again = env.ok(&["update"]);
-    assert_eq!(text(&again.stdout), "graphe à jour\n");
-    assert!(env.logged().is_empty(), "{:?}", env.logged());
-
-    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
-    let versions: Vec<i64> = conn
-        .prepare("SELECT DISTINCT prompt_version FROM enrichments")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(versions, vec![3]);
+#[test]
+fn req171_ac6_prompt_version_3_graph_is_reenriched_once() {
+    reenriched_once(3);
 }
 
 #[test]

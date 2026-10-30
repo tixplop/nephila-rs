@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::filter::FileType;
 
 /// Version du schéma de réponse d'enrichissement.
 pub const ENRICH_SCHEMA_VERSION: u32 = 2;
@@ -12,9 +13,10 @@ pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 /// Version du prompt d'enrichissement (DEC-062). À incrémenter à chaque changement des consignes
 /// système, des gabarits de requête (fichier seul et lot) ou des schémas de réponse version 2 et
 /// 3 : tout enrichissement conservé avec une autre version est refait. Un test fige l'empreinte
-/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 3 depuis la 0.26.0
-/// (consignes de forme des résumés, REQ-167 ; extraits, REQ-169 ; la valeur 2 n'a pas été livrée).
-pub const ENRICH_PROMPT_VERSION: u32 = 3;
+/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 4 depuis la 0.26.0
+/// (consignes de forme des résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers,
+/// REQ-171 ; les valeurs 2 et 3 n'ont pas été livrées).
+pub const ENRICH_PROMPT_VERSION: u32 = 4;
 
 /// Consignes de forme des résumés : ligne commune aux deux prompts système (DEC-135).
 pub const SUMMARY_RULES: &str = "Résumés (de nœud ou de concept) : une phrase de 25 mots au plus, qui dit le rôle ou la responsabilité de l'élément (ce qu'il fait et à quoi il sert), pas sa syntaxe ni sa signature ; ne répète pas son nom ; n'écris que ce que le contenu montre, sans rien supposer ni inventer. Omets (aucune entrée dans \"summaries\") un accesseur ou un mutateur trivial (il lit ou écrit un champ, sans autre effet) et une section vide ou réduite à son titre.";
@@ -22,6 +24,67 @@ pub const SUMMARY_RULES: &str = "Résumés (de nœud ou de concept) : une phrase
 /// Consignes d'extrait : ligne du prompt système du fichier envoyé seul, après `SUMMARY_RULES`
 /// (REQ-169, DEC-136).
 pub const EXCERPT_RULES: &str = "Un fichier trop long est envoyé en extraits : sa ligne \"Fichier :\" porte alors \"(extrait k/n, lignes a–b)\" et tu ne vois que ces lignes. À partir du deuxième extrait, le contenu commence par une copie partielle du début du fichier (package, imports, déclaration du type englobant, ou titres des sections englobantes), donnée pour contexte : n'en tire aucun résumé. Un nœud de la liste seulement cité dans un extrait se résume d'après ce que l'extrait en montre ; omets-le si l'extrait n'en montre pas le rôle.";
+
+/// Angle du résumé selon le genre du nœud : ligne commune aux deux prompts système (DEC-137).
+pub const KIND_RULES: &str = "Angle du résumé selon le genre du nœud, donné par le préfixe de son identifiant : module → ce que le module produit et à quoi lui servent ses dépendances ; type → sa responsabilité ; method → son effet et ce qu'elle renvoie ; table → son rôle métier et ses colonnes clés ; document → le sujet du document, ou ce que décrit ou configure un fichier de données (SQL, XML, JSON, YAML) ; section → le sujet qu'elle traite.";
+
+/// Famille d'un type de fichier dans la phrase des types du prompt (REQ-171).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Code,
+    Build,
+    Data,
+    Doc,
+}
+
+/// Famille et libellé d'un type de fichier dans le prompt ; `match` exhaustif (REQ-171).
+fn file_type_label(t: FileType) -> (Family, &'static str) {
+    match t {
+        FileType::Java => (Family::Code, "Java"),
+        FileType::Kotlin => (Family::Code, "Kotlin"),
+        FileType::Groovy => (Family::Code, "Groovy"),
+        FileType::Scala => (Family::Code, "Scala"),
+        FileType::JavaScript => (Family::Code, "JavaScript"),
+        FileType::TypeScript => (Family::Code, "TypeScript"),
+        FileType::Maven => (Family::Build, "Maven"),
+        FileType::Ivy => (Family::Build, "Ivy"),
+        FileType::Gradle => (Family::Build, "Gradle"),
+        FileType::Npm => (Family::Build, "npm"),
+        FileType::Sql => (Family::Data, "SQL"),
+        FileType::Xml => (Family::Data, "XML"),
+        FileType::Json => (Family::Data, "JSON"),
+        FileType::Yaml => (Family::Data, "YAML"),
+        FileType::Markdown => (Family::Doc, "Markdown"),
+    }
+}
+
+/// Types de fichiers de la première phrase des prompts système, tirés de `FileType::ALL`
+/// (REQ-171) : familles `code`, `build`, `données`, puis les types sans famille nommée, jointes
+/// par `, ` avec `ou ` devant la dernière.
+pub fn file_types_phrase() -> String {
+    let groups: Vec<String> = [
+        (Family::Code, "code "),
+        (Family::Build, "build "),
+        (Family::Data, "données "),
+        (Family::Doc, ""),
+    ]
+    .into_iter()
+    .filter_map(|(family, name)| {
+        let labels: Vec<&str> = FileType::ALL
+            .into_iter()
+            .map(file_type_label)
+            .filter(|(f, _)| *f == family)
+            .map(|(_, l)| l)
+            .collect();
+        (!labels.is_empty()).then(|| format!("{name}{}", labels.join("/")))
+    })
+    .collect();
+    match groups.split_last() {
+        Some((last, head)) if !head.is_empty() => format!("{}, ou {last}", head.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
+    }
+}
 
 /// Morceau d'un fichier envoyé en plusieurs morceaux (REQ-169) : `rank` à partir de 1 sur `total`
 /// morceaux du fichier, lignes `first_line` à `last_line` (à partir de 1, bornes comprises) de
@@ -175,15 +238,16 @@ impl Enrichment {
 
 /// Prompt système d'enrichissement (identique pour tous les fournisseurs).
 pub fn enrichment_system_prompt() -> String {
+    let types = file_types_phrase();
     format!(
-        "Tu enrichis le graphe d'un dépôt à partir d'un fichier (code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, \
-         build Maven/Gradle/Ivy, ou Markdown) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
+        "Tu enrichis le graphe d'un dépôt à partir d'un fichier ({types}) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
          Schéma (version {ENRICH_SCHEMA_VERSION}) : {{\"version\": {ENRICH_SCHEMA_VERSION}, \
          \"summaries\": [{{\"node\": \"<identifiant de la liste>\", \"summary\": \"<25 mots au plus>\"}}], \
          \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \
          \"sections\": [\"<identifiant de section de la liste>\"]}}]}}.\n\
          {SUMMARY_RULES}\n\
          {EXCERPT_RULES}\n\
+         {KIND_RULES}\n\
          Les résumés ne portent que sur les nœuds de la liste fournie. Les concepts ne concernent \
          que les fichiers Markdown et ne citent que des sections de la liste. Tu ne crées, ne \
          renomme ni ne supprimes aucun nœud et tu ne produis aucun autre lien. \
@@ -318,9 +382,9 @@ pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
 
 /// Prompt système d'un lot de fichiers (identique pour tous les fournisseurs).
 pub fn lot_system_prompt() -> String {
+    let types = file_types_phrase();
     format!(
-        "Tu enrichis le graphe d'un dépôt à partir de plusieurs fichiers (code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, \
-         build Maven/Gradle/Ivy, ou Markdown) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
+        "Tu enrichis le graphe d'un dépôt à partir de plusieurs fichiers ({types}) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
          Chaque fichier est introduit par une ligne `=== FICHIER : <chemin> ===`, suivie de la liste de ses \
          nœuds puis de son contenu, jusqu'à la ligne `=== FIN DU FICHIER : <chemin> ===`.\n\
          Schéma (version {ENRICH_LOT_SCHEMA_VERSION}) : {{\"version\": {ENRICH_LOT_SCHEMA_VERSION}, \"files\": \
@@ -328,6 +392,7 @@ pub fn lot_system_prompt() -> String {
          \"summary\": \"<25 mots au plus>\"}}], \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \
          \"sections\": [\"<identifiant de section de la liste de ce fichier>\"]}}]}}]}}.\n\
          {SUMMARY_RULES}\n\
+         {KIND_RULES}\n\
          Produis exactement une entrée par fichier fourni. Les résumés ne portent que sur les nœuds de la \
          liste du fichier concerné. Les concepts ne concernent que les fichiers Markdown et ne citent que des \
          sections de la liste du même fichier. Tu ne crées, ne renomme ni ne supprimes aucun nœud et tu ne \
@@ -402,9 +467,31 @@ mod tests {
             user_prompt(None).replacen("Fichier : a.md\n", "Fichier : a.md (morceau 2)\n", 1);
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
-            f(enrichment_system_prompt().replace(&format!("{EXCERPT_RULES}\n"), "")),
+            f(texts_v3_system(enrichment_system_prompt())
+                .replace(&format!("{EXCERPT_RULES}\n"), "")),
             user,
-            f(lot_system_prompt()),
+            f(texts_v3_system(lot_system_prompt())),
+            lot_user_prompt(&lot_items()),
+        ]
+    }
+
+    const OLD_TYPES: &str =
+        "code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, build Maven/Gradle/Ivy, ou Markdown";
+
+    /// Prompt système de la version 3 : sans `KIND_RULES`, ancienne parenthèse des types.
+    fn texts_v3_system(p: String) -> String {
+        p.replace(&format!("{KIND_RULES}\n"), "")
+            .replace(&file_types_phrase(), OLD_TYPES)
+    }
+
+    /// Les six textes figés par la version 3 (REQ-171, AC-171-4).
+    fn texts_v3() -> Vec<String> {
+        vec![
+            format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
+            texts_v3_system(enrichment_system_prompt()),
+            user_prompt(None),
+            user_prompt(Some(EXCERPT_2_3)),
+            texts_v3_system(lot_system_prompt()),
             lot_user_prompt(&lot_items()),
         ]
     }
@@ -413,7 +500,7 @@ mod tests {
     fn req049_ac4_prompt_texts_are_frozen_next_to_the_prompt_version() {
         // Changer une consigne, un gabarit ou un schéma : incrémenter `ENRICH_PROMPT_VERSION`,
         // puis mettre à jour les deux littéraux ci-dessous.
-        assert_eq!(ENRICH_PROMPT_VERSION, 3);
+        assert_eq!(ENRICH_PROMPT_VERSION, 4);
         let texts = [
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             enrichment_system_prompt(),
@@ -424,9 +511,115 @@ mod tests {
         ];
         assert_eq!(
             fingerprint_of(&texts),
-            "27656c4c231a8abc77a1f39bd2a7c985c33bddaf48c141a06df73557b6b7dc27",
+            "d35c005b92a13804baf653a19ea7facd94edac5e4f25969b44a5ca59209711de",
             "les textes du prompt ont changé : incrémentez ENRICH_PROMPT_VERSION"
         );
+    }
+
+    #[test]
+    fn req171_ac4_the_six_texts_of_version_3_are_unchanged() {
+        assert_eq!(
+            fingerprint_of(&texts_v3()),
+            "27656c4c231a8abc77a1f39bd2a7c985c33bddaf48c141a06df73557b6b7dc27"
+        );
+    }
+
+    const TYPES: &str = "code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, build Maven/Ivy/Gradle/npm, données SQL/XML/JSON/YAML, ou Markdown";
+
+    #[test]
+    fn req171_ac1_file_types_phrase_in_both_system_prompts() {
+        assert_eq!(file_types_phrase(), TYPES);
+        let one = enrichment_system_prompt();
+        let lot = lot_system_prompt();
+        let a = format!("à partir d'un fichier ({TYPES}) et tu réponds");
+        let b = format!("à partir de plusieurs fichiers ({TYPES}) et tu réponds");
+        assert_eq!(one.matches(&a).count(), 1);
+        assert_eq!(lot.matches(&b).count(), 1);
+        assert!(!one.contains("Maven/Gradle/Ivy") && !lot.contains("Maven/Gradle/Ivy"));
+    }
+
+    fn sample_path(l: crate::parse::Lang) -> &'static str {
+        use crate::parse::Lang;
+        match l {
+            Lang::Java => "A.java",
+            Lang::Kotlin => "A.kt",
+            Lang::KotlinGradle => "build.gradle.kts",
+            Lang::Scala => "A.scala",
+            Lang::Groovy => "A.groovy",
+            Lang::GroovyGradle => "build.gradle",
+            Lang::Xml => "pom.xml",
+            Lang::Markdown => "a.md",
+            Lang::Sql => "a.sql",
+            Lang::DataXml => "a.xml",
+            Lang::Json => "a.json",
+            Lang::Yaml => "a.yaml",
+            Lang::JavaScript => "a.js",
+            Lang::TypeScript => "a.ts",
+            Lang::Tsx => "a.tsx",
+            Lang::PackageJson => "package.json",
+        }
+    }
+
+    #[test]
+    fn req171_ac2_every_file_type_and_language_is_named() {
+        use crate::parse::Lang;
+        let phrase = file_types_phrase();
+        let words: Vec<&str> = phrase.split([' ', '/', ',']).collect();
+        for t in FileType::ALL {
+            assert!(words.contains(&file_type_label(t).1), "{t:?}");
+        }
+        let all = [
+            Lang::Java,
+            Lang::Kotlin,
+            Lang::KotlinGradle,
+            Lang::Scala,
+            Lang::Groovy,
+            Lang::GroovyGradle,
+            Lang::Xml,
+            Lang::Markdown,
+            Lang::Sql,
+            Lang::DataXml,
+            Lang::Json,
+            Lang::Yaml,
+            Lang::JavaScript,
+            Lang::TypeScript,
+            Lang::Tsx,
+            Lang::PackageJson,
+        ];
+        assert_eq!(all.len(), 16);
+        for l in all {
+            let path = sample_path(l);
+            assert_eq!(
+                Lang::from_path(std::path::Path::new(path)),
+                Some(l),
+                "{path}"
+            );
+            let t = FileType::of(path).unwrap_or_else(|| panic!("{path}"));
+            assert!(words.contains(&file_type_label(t).1), "{path}");
+        }
+    }
+
+    const GENRES: &str = "Angle du résumé selon le genre du nœud, donné par le préfixe de son identifiant : module → ce que le module produit et à quoi lui servent ses dépendances ; type → sa responsabilité ; method → son effet et ce qu'elle renvoie ; table → son rôle métier et ses colonnes clés ; document → le sujet du document, ou ce que décrit ou configure un fichier de données (SQL, XML, JSON, YAML) ; section → le sujet qu'elle traite.";
+
+    #[test]
+    fn req171_ac3_kind_rules_text_placement_and_genres() {
+        use crate::model::NodeKind;
+        assert_eq!(KIND_RULES, GENRES);
+        let one = format!("\n{EXCERPT_RULES}\n{KIND_RULES}\n");
+        assert_eq!(enrichment_system_prompt().matches(&one).count(), 1);
+        let lot_p = lot_system_prompt();
+        let lot = format!("\n{SUMMARY_RULES}\n{KIND_RULES}\n");
+        assert_eq!(lot_p.matches(&lot).count(), 1);
+        assert!(!lot_p.contains(EXCERPT_RULES));
+        let excluded = ["package", "key", "dependency", "concept"];
+        for k in NodeKind::ALL {
+            let needle = format!("{} → ", k.as_str());
+            if excluded.contains(&k.as_str()) {
+                assert!(!KIND_RULES.contains(&needle), "{needle}");
+            } else {
+                assert_eq!(KIND_RULES.matches(&needle).count(), 1, "{needle}");
+            }
+        }
     }
 
     #[test]
