@@ -8,6 +8,7 @@ pub use http::{Retry, Tls};
 pub mod mock;
 pub mod openai;
 pub mod retry;
+mod tidy;
 mod usage;
 pub use usage::{
     anthropic_usage, calls_line, openai_usage, tokens_segment, CallStats, LlmTotals, Usage,

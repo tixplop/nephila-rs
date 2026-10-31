@@ -101,7 +101,8 @@ pub struct Excerpt {
 /// Concept proposé pour un document Markdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Concept {
-    /// Nom normalisé (minuscules, espaces réduits) = nom qualifié du nœud concept.
+    /// Nom normalisé (REQ-180 : minuscules, espaces réduits, guillemets et ponctuation finale
+    /// retirés) = nom qualifié du nœud concept.
     pub name: String,
     pub summary: Option<String>,
     /// Identifiants des sections du fichier qui mentionnent le concept.
@@ -207,12 +208,27 @@ fn invalid(msg: impl std::fmt::Display) -> Error {
     Error::Format(format!("réponse LLM non conforme au schéma : {msg}"))
 }
 
-/// Minuscules, espaces réduits à un seul.
+/// Nom de concept normalisé (REQ-180) : mots séparés par une espace, en minuscules, puis, jusqu'à
+/// stabilité, guillemets de tête et de fin et ponctuation finale retirés, blancs compris.
 pub fn normalize_concept_name(name: &str) -> String {
-    name.split_whitespace()
+    const QUOTES: [char; 13] = [
+        '"', '\'', '`', '«', '»', '“', '”', '‘', '’', '„', '‹', '›', ' ',
+    ];
+    const PUNCT: [char; 7] = ['.', ',', ';', ':', '!', '?', '…'];
+    let mut cur = name
+        .split_whitespace()
         .map(str::to_lowercase)
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    loop {
+        let next = cur
+            .trim_matches(|c: char| c.is_whitespace() || QUOTES.contains(&c))
+            .trim_end_matches(|c: char| c.is_whitespace() || PUNCT.contains(&c));
+        if next.len() == cur.len() {
+            return cur;
+        }
+        cur = next.to_string();
+    }
 }
 
 /// Vrai si le chemin désigne un fichier Markdown.
@@ -886,6 +902,27 @@ mod tests {
         let ok =
             Enrichment::parse(r#"{"version":2,"summaries":[],"concepts":[]}"#, "a.md", &n).unwrap();
         assert_eq!(ok, Enrichment::default());
+    }
+
+    #[test]
+    fn req180_ac1_normalize_concept_name_table() {
+        for (input, want) in [
+            ("« Facturation ».", "facturation"),
+            ("\"Gestion  des Commandes\"", "gestion des commandes"),
+            ("‘API’", "api"),
+            ("Facturation…", "facturation"),
+            ("Qu'est-ce ?", "qu'est-ce"),
+            ("l'API", "l'api"),
+            ("Node.js", "node.js"),
+            ("C#", "c#"),
+            ("API (REST)", "api (rest)"),
+            ("Facturation  Client", "facturation client"),
+            ("\"...\"", ""),
+            ("« »", ""),
+            (".", ""),
+        ] {
+            assert_eq!(normalize_concept_name(input), want, "{input}");
+        }
     }
 
     #[test]
