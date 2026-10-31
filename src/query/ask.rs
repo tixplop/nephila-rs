@@ -143,6 +143,8 @@ fn cited_identifiers(question: &str) -> HashSet<String> {
 }
 
 /// Clé de classement d'un nœud pour un terme : (classe, fréquence, rang, position du terme).
+/// Le classement final d'un nœud est (classe, couverture décroissante, fréquence, rang, position)
+/// où la couverture est le nombre de termes auxquels il correspond (REQ-182, DEC-146).
 type SeedKey = (u8, usize, u8, usize);
 
 /// Classe d'un mot-clé : 1 ou 2 (exact / autre) pour un identifiant cité, 3 ou 4 sinon.
@@ -151,7 +153,9 @@ fn word_class(cited: bool, rank: u8) -> u8 {
 }
 
 /// Nœuds de départ : les nœuds qui correspondent à au moins un terme (noms qualifiés cités puis
-/// mots-clés, ceux qui sont des identifiants cités avant les autres), triés par leur meilleure clé, puis nom qualifié et identifiant ; les `min(max_seeds, max_nodes)` premiers.
+/// mots-clés, ceux qui sont des identifiants cités avant les autres), triés par (classe, couverture
+/// décroissante, fréquence, rang, position) de leur meilleure clé, puis nom qualifié et identifiant
+/// (REQ-182, DEC-146) ; les `min(max_seeds, max_nodes)` premiers.
 /// La recherche travaille sur des références ; seuls les nœuds retenus sont copiés.
 fn find_seeds(
     nodes: &[Node],
@@ -162,7 +166,9 @@ fn find_seeds(
 ) -> Vec<Node> {
     let prepared = search::Prepared::new(nodes);
     let mut best: Vec<Option<SeedKey>> = vec![None; nodes.len()];
+    let mut cover: Vec<usize> = vec![0; nodes.len()];
     let mut offer = |i: usize, key: SeedKey| {
+        cover[i] += 1;
         if best[i].is_none_or(|b| key < b) {
             best[i] = Some(key);
         }
@@ -194,8 +200,10 @@ fn find_seeds(
         .enumerate()
         .filter_map(|(i, k)| k.map(|k| (k, i)))
         .collect();
+    let order = |k: SeedKey, i: usize| (k.0, std::cmp::Reverse(cover[i]), k.1, k.2, k.3);
     hit.sort_by(|a, b| {
-        a.0.cmp(&b.0)
+        order(a.0, a.1)
+            .cmp(&order(b.0, b.1))
             .then_with(|| nodes[a.1].qualified.cmp(&nodes[b.1].qualified))
             .then_with(|| nodes[a.1].id.cmp(&nodes[b.1].id))
     });
@@ -853,12 +861,110 @@ mod tests {
         assert_eq!(got, ["q.Bar.baz", "p.foo"]);
     }
 
-    /// Oracle naïf d'AC-141-5, écrit depuis la définition.
+    fn seed_names(nodes: &[Node], quals: &[&str], ws: &[&str], cited: &[&str]) -> Vec<String> {
+        let q: Vec<String> = quals.iter().map(|s| s.to_string()).collect();
+        let w: Vec<String> = ws.iter().map(|s| s.to_string()).collect();
+        find_seeds(nodes, &q, &w, &set(cited), &AskLimits::default())
+            .into_iter()
+            .map(|n| n.qualified)
+            .collect()
+    }
+
+    #[test]
+    fn req182_ac1_node_covering_more_terms_leads_its_class() {
+        let t = |q: &str, s: Option<&str>| mk(NodeKind::Type, q, s);
+        let mut nodes = vec![t("p.AlphaBetaGamma", None)];
+        for i in 0..9 {
+            nodes.push(t(&format!("p.xalpha{i}"), None));
+            nodes.push(t(&format!("p.xbeta{i}"), None));
+            nodes.push(t(&format!("p.xgamma{i}"), None));
+        }
+        nodes.push(t("p.deltaX0", None));
+        nodes.push(t("p.deltaX1", None));
+        let got = seed_names(&nodes, &[], &["alpha", "beta", "gamma", "delta"], &[]);
+        assert_eq!(got[0], "p.AlphaBetaGamma", "{got:?}");
+    }
+
+    #[test]
+    fn req182_ac2_coverage_ordering() {
+        let t = |q: &str, s: Option<&str>| mk(NodeKind::Type, q, s);
+        // (a) la classe domine la couverture
+        let nodes = vec![t("p.xaaa_bbb_ccc", None), t("p.solo", None)];
+        let got = seed_names(&nodes, &[], &["aaa", "bbb", "ccc", "solo"], &[]);
+        assert_eq!(got, ["p.solo", "p.xaaa_bbb_ccc"]);
+        let nodes = vec![t("p.aaa", Some("bbb ccc")), t("p.cited1", None)];
+        let got = seed_names(&nodes, &[], &["aaa", "bbb", "ccc", "cited"], &["cited"]);
+        assert_eq!(got, ["p.cited1", "p.aaa"]);
+        let nodes = vec![
+            t("p.xaaa_bbb_ccc", None),
+            t("p.cited", None),
+            t("q.Foo.bar", None),
+        ];
+        let got = seed_names(
+            &nodes,
+            &["foo.bar"],
+            &["aaa", "bbb", "ccc", "cited"],
+            &["cited"],
+        );
+        assert_eq!(got, ["q.Foo.bar", "p.cited", "p.xaaa_bbb_ccc"]);
+        // (b) couverture 2 avant couverture 1, même si le terme de la couverture 1 est plus rare
+        let mut nodes = vec![t("p.xccc", None), t("p.xaaa_bbb", None)];
+        for i in 0..5 {
+            nodes.push(t(&format!("p.xaaa_f{i}"), None));
+            nodes.push(t(&format!("p.xbbb_f{i}"), None));
+        }
+        let got = seed_names(&nodes, &[], &["aaa", "bbb", "ccc"], &[]);
+        assert_eq!(got[..2], ["p.xaaa_bbb", "p.xccc"]);
+        // (c) à classe et couverture égales : fréquence, puis nom qualifié
+        let nodes = vec![t("p.xaaa1", None), t("p.xaaa0", None), t("p.xbbb", None)];
+        let got = seed_names(&nodes, &[], &["aaa", "bbb"], &[]);
+        assert_eq!(got, ["p.xbbb", "p.xaaa0", "p.xaaa1"]);
+        // rang avant nom qualifié (préfixe avant contenu, même classe, même fréquence)
+        let nodes = vec![t("p.Baaa", None), t("p.aaa1", None)];
+        assert_eq!(seed_names(&nodes, &[], &["aaa"], &[]), ["p.aaa1", "p.Baaa"]);
+        // position du terme avant nom qualifié
+        let nodes = vec![t("p.xbbb", None), t("p.zaaa", None)];
+        let got = seed_names(&nodes, &[], &["aaa", "bbb"], &[]);
+        assert_eq!(got, ["p.zaaa", "p.xbbb"]);
+        // identifiant en dernier ressort (même nom qualifié, genres différents)
+        let nodes = vec![
+            mk(NodeKind::Type, "p.xaaa", None),
+            mk(NodeKind::Method, "p.xaaa", None),
+        ];
+        let ids: Vec<String> = find_seeds(
+            &nodes,
+            &[],
+            &["aaa".to_string()],
+            &set(&[]),
+            &AskLimits::default(),
+        )
+        .into_iter()
+        .map(|n| n.id)
+        .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids, sorted);
+        // (d) un nom qualifié cité et les mots de ses segments sont des termes distincts
+        let nodes = vec![t("p.Foo.bar", None), t("q.Foo.bar", Some("zed"))];
+        let got = seed_names(&nodes, &["foo.bar"], &["foo", "bar", "zed"], &[]);
+        assert_eq!(got, ["q.Foo.bar", "p.Foo.bar"]);
+        // (e) le plafond s'applique après le tri
+        let mut nodes: Vec<Node> = (0..30).map(|i| t(&format!("p.xaaa{i:02}"), None)).collect();
+        nodes.push(t("p.zzz_aaa_bbb", None));
+        let got = seed_names(&nodes, &[], &["aaa", "bbb"], &[]);
+        assert_eq!(got.len(), 20);
+        assert_eq!(got[0], "p.zzz_aaa_bbb");
+    }
+
+    /// Oracle naïf d'AC-141-5 et d'AC-182-3, écrit depuis la définition. Avec `coverage`, la clé de
+    /// REQ-182 (classe, couverture décroissante, ...) ; sans, celle de REQ-141.
     fn naive_seeds(
         nodes: &[Node],
         quals: &[String],
         words: &[String],
         cited: &HashSet<String>,
+        coverage: bool,
     ) -> Vec<String> {
         let lower = |s: &str| s.to_lowercase();
         let suffix = |q: &str, t: &str| {
@@ -880,9 +986,11 @@ mod tests {
                 None
             }
         };
-        let mut keyed: Vec<(SeedKey, &Node)> = Vec::new();
+        type Key = (u8, std::cmp::Reverse<usize>, usize, u8, usize);
+        let mut keyed: Vec<(Key, &Node)> = Vec::new();
         for n in nodes {
             let mut best = None;
+            let mut cover = 0usize;
             for (pos, t) in quals.iter().chain(words.iter()).enumerate() {
                 let is_q = pos < quals.len();
                 let freq = nodes
@@ -904,11 +1012,13 @@ mod tests {
                     })
                 };
                 if let Some(k) = key {
+                    cover += 1;
                     best = Some(best.map_or(k, |b: SeedKey| b.min(k)));
                 }
             }
             if let Some(k) = best {
-                keyed.push((k, n));
+                let c = if coverage { cover } else { 0 };
+                keyed.push(((k.0, std::cmp::Reverse(c), k.1, k.2, k.3), n));
             }
         }
         keyed.sort_by(|a, b| {
@@ -929,6 +1039,7 @@ mod tests {
     fn req141_ac5_find_seeds_matches_naive_oracle() {
         let mut rng = Lcg(1141);
         let mut capped = false;
+        let mut differs = false;
         for _ in 0..200 {
             let nodes = random_nodes(&mut rng);
             let mut words = random_words(&mut rng);
@@ -948,7 +1059,8 @@ mod tests {
             }
             let cited: HashSet<String> =
                 words.iter().filter(|_| rng.next(2) == 0).cloned().collect();
-            let want = naive_seeds(&nodes, &quals, &words, &cited);
+            let want = naive_seeds(&nodes, &quals, &words, &cited, true);
+            differs |= want != naive_seeds(&nodes, &quals, &words, &cited, false);
             capped |= want.len() == DEFAULT_ASK_MAX_SEEDS;
             let got: Vec<String> =
                 find_seeds(&nodes, &quals, &words, &cited, &AskLimits::default())
@@ -958,6 +1070,10 @@ mod tests {
             assert_eq!(want, got, "noms {quals:?} mots {words:?}");
         }
         assert!(capped, "le plafond de 20 nœuds n'est jamais atteint");
+        assert!(
+            differs,
+            "la couverture ne change jamais la liste (AC-182-3)"
+        );
     }
 
     #[test]
