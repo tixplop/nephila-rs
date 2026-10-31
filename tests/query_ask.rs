@@ -174,8 +174,10 @@ const A9: &str = "avertissement: réponse non vérifiable : aucun nœud cité ne
 /// AC-161-4 : un nœud du graphe absent du contexte de la question n'est pas retenu.
 #[test]
 fn req161_ac4_cited_node_outside_the_context_is_dropped() {
-    assert!(!CONTEXTE_0_18_0.contains("Island"));
-    assert!(!CONTEXTE_0_18_0.contains("Ledger"));
+    for c in [CONTEXTE_0_18_0, CONTEXTE_COMPACT] {
+        assert!(!c.contains("Island"));
+        assert!(!c.contains("Ledger"));
+    }
     let env = Env::new();
     env.fixture(
         r#"{"found":true,"answer":"reponse","nodes":["com.acme.other.Island","com.acme.billing.Ledger","method:com.acme.billing.BillingService.charge"]}"#,
@@ -597,10 +599,24 @@ fn req016_ac5_ac6_ask_option_priority_over_config() {
 /// Contexte de la requête `ask` de la question d'AC-016-1, tel que la 0.18.0 l'écrivait.
 const CONTEXTE_0_18_0: &str = "Nœuds :\n- type:com.acme.billing.BillingService : com.acme.billing.BillingService (class, billing/BillingService.java) - Gère la facturation des commandes\n- package:com.acme.billing : com.acme.billing (package, billing/BillingService.java)\n- method:com.acme.billing.BillingService.charge : com.acme.billing.BillingService.charge (method, billing/BillingService.java)\nLiens :\n- package:com.acme.billing -contains-> type:com.acme.billing.BillingService\n- type:com.acme.billing.BillingService -contains-> method:com.acme.billing.BillingService.charge\n";
 
-/// AC-160-5 : le corps de la requête `ask` de la question d'AC-016-1 est identique octet pour
-/// octet à `tests/fixtures/ask_body_ac016_1.json`, et son contexte reste celui de la 0.18.0.
+/// Contexte compact de la même question (REQ-181, DEC-145) : mêmes nœuds et mêmes liens,
+/// lignes de nœuds sans nom qualifié ni genre répétés.
+const CONTEXTE_COMPACT: &str = "Nœuds :\n- type:com.acme.billing.BillingService (class, billing/BillingService.java) - Gère la facturation des commandes\n- package:com.acme.billing (billing/BillingService.java)\n- method:com.acme.billing.BillingService.charge (billing/BillingService.java)\nLiens :\n- package:com.acme.billing -contains-> type:com.acme.billing.BillingService\n- type:com.acme.billing.BillingService -contains-> method:com.acme.billing.BillingService.charge\n";
+
+/// Identifiants des lignes de nœuds : texte après `- ` jusqu'au séparateur donné.
+fn node_ids<'a>(ctx: &'a str, sep: &str) -> Vec<&'a str> {
+    let body = ctx.strip_prefix("Nœuds :\n").unwrap();
+    let (nodes, _) = body.split_once("Liens :\n").unwrap();
+    nodes
+        .lines()
+        .map(|l| l.strip_prefix("- ").unwrap().split(sep).next().unwrap())
+        .collect()
+}
+
+/// AC-181-5 : le corps de la requête `ask` de la question d'AC-016-1 est identique octet pour
+/// octet à `tests/fixtures/ask_body_ac016_1.json`, et son contexte est le contexte compact.
 #[test]
-fn req160_ac5_ask_request_body_context_of_0_18_0() {
+fn req181_ac5_ask_request_body_compact_context() {
     let env = Env::new();
     let reply = r#"{"found":true,"answer":"billing","nodes":["BillingService"]}"#;
     let server = FakeServer::start(vec![(
@@ -629,7 +645,15 @@ fn req160_ac5_ask_request_body_context_of_0_18_0() {
     let v: Value = serde_json::from_str(&post.body).unwrap();
     assert_eq!(
         v["messages"][0]["content"].as_str().unwrap(),
-        format!("Contexte :\n{CONTEXTE_0_18_0}\nQuestion : {Q}")
+        format!("Contexte :\n{CONTEXTE_COMPACT}\nQuestion : {Q}")
+    );
+    // Même sélection qu'en 0.18.0, forme seule changée.
+    assert_eq!(CONTEXTE_COMPACT.chars().count(), 436);
+    let links = |c: &'static str| c.split_once("Liens :\n").unwrap().1;
+    assert_eq!(links(CONTEXTE_COMPACT), links(CONTEXTE_0_18_0));
+    assert_eq!(
+        node_ids(CONTEXTE_COMPACT, " "),
+        node_ids(CONTEXTE_0_18_0, " : ")
     );
 }
 

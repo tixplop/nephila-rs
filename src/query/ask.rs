@@ -207,8 +207,20 @@ fn find_seeds(
         .collect()
 }
 
+/// Ligne de nœud du contexte : `- <identifiant> (<sous-genre>, <fichier>) - <résumé>`, parenthèse
+/// et résumé omis s'ils sont vides. Ni le genre ni le nom qualifié ne sont répétés : ils sont déjà
+/// dans l'identifiant (REQ-181, DEC-145).
 fn node_line(n: &Node) -> String {
-    let mut l = format!("- {} : {}", n.id, super::describe(n));
+    let paren: Vec<&str> = n
+        .subkind
+        .map(|k| k.as_str())
+        .into_iter()
+        .chain(n.file.as_deref())
+        .collect();
+    let mut l = format!("- {}", n.id);
+    if !paren.is_empty() {
+        l.push_str(&format!(" ({})", paren.join(", ")));
+    }
     if let Some(s) = &n.summary {
         l.push_str(" - ");
         l.push_str(s);
@@ -267,7 +279,7 @@ struct Context<'a> {
 /// jamais de contenu de fichier source. Rend aussi les nœuds montrés (lignes de nœuds écrites,
 /// dans l'ordre ; extrémités des liens comprises) : les citations de la réponse sont résolues
 /// parmi eux (REQ-161, DEC-130). Le premier nœud de départ coupé n'est montré que si sa ligne
-/// coupée contient encore `- <identifiant> :`.
+/// coupée commence encore par `- <identifiant> ` (identifiant suivi d'une espace).
 fn build_context<'a>(
     nodes: &'a [Node],
     edges: &'a [Edge],
@@ -306,7 +318,7 @@ fn build_context<'a>(
                 // Seule coupe dans une ligne : celle du premier nœud de départ, seul.
                 let room = limits.max_context_chars.saturating_sub(header_chars + 1);
                 let cut: String = node_line(s).chars().take(room).collect();
-                if cut.starts_with(&format!("- {} :", s.id)) {
+                if cut.starts_with(&format!("- {} ", s.id)) {
                     fill.shown.push(s);
                 }
                 fill.nodes_text = format!("{cut}\n");
@@ -1088,7 +1100,10 @@ mod tests {
             .collect();
         let (n, l) = sections(&ctx);
         assert_eq!(l, want.iter().map(String::as_str).collect::<Vec<_>>());
-        let mut ids: Vec<&str> = n.iter().map(|x| x.split(" : ").next().unwrap()).collect();
+        let mut ids: Vec<&str> = n
+            .iter()
+            .map(|x| x.trim_start_matches("- ").split(' ').next().unwrap())
+            .collect();
         let total = ids.len();
         ids.sort_unstable();
         ids.dedup();
@@ -1136,7 +1151,7 @@ mod tests {
         .text;
         assert_eq!(ctx.chars().count(), DEFAULT_ASK_MAX_CONTEXT_CHARS);
         assert!(
-            ctx.starts_with(&format!("Nœuds :\n- {} : ", s.id)),
+            ctx.starts_with(&format!("Nœuds :\n- {} ", s.id)),
             "{}",
             &ctx[..80]
         );
@@ -1257,9 +1272,60 @@ mod tests {
         )
         .text;
         assert_eq!(ctx.chars().count(), ASK_MIN_CONTEXT_CHARS);
-        assert!(ctx.starts_with(&format!("Nœuds :\n- {} : ", s.id)));
+        assert!(ctx.starts_with(&format!("Nœuds :\n- {} ", s.id)));
         assert!(ctx.ends_with("\nLiens :\n"));
         assert_eq!(ctx.lines().count(), 3);
+    }
+
+    #[test]
+    fn req181_ac1_node_line_forms() {
+        use crate::model::SubKind;
+        let n = |k, q: &str, f: Option<&str>, sk: Option<SubKind>, sum: Option<&str>| {
+            node_line(&Node::new(k, q, q, f, sk, sum))
+        };
+        let cases = [
+            (
+                n(
+                    NodeKind::Type,
+                    "p.A",
+                    Some("p/A.java"),
+                    Some(SubKind::Class),
+                    Some("Rôle de A."),
+                ),
+                "- type:p.A (class, p/A.java) - Rôle de A.",
+            ),
+            (
+                n(NodeKind::Method, "p.A.f", Some("p/A.java"), None, None),
+                "- method:p.A.f (p/A.java)",
+            ),
+            (n(NodeKind::Concept, "x", None, None, None), "- concept:x"),
+            (
+                n(NodeKind::Concept, "x", None, None, Some("Facturation.")),
+                "- concept:x - Facturation.",
+            ),
+            (
+                n(NodeKind::Dependency, "g:a", None, None, None),
+                "- dependency:g:a",
+            ),
+            (
+                n(NodeKind::Type, "p.A", None, Some(SubKind::Class), None),
+                "- type:p.A (class)",
+            ),
+            (
+                n(
+                    NodeKind::Document,
+                    "conf/app.yaml",
+                    Some("conf/app.yaml"),
+                    Some(SubKind::Yaml),
+                    None,
+                ),
+                "- document:conf/app.yaml (yaml, conf/app.yaml)",
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, want);
+            assert!(!got.contains(" : "), "{got}");
+        }
     }
 
     #[test]
@@ -1273,13 +1339,10 @@ mod tests {
             Some(SubKind::Class),
             Some("Rôle de A."),
         );
-        assert_eq!(
-            node_line(&a),
-            "- type:p.A : p.A (class, p/A.java) - Rôle de A."
-        );
+        assert_eq!(node_line(&a), "- type:p.A (class, p/A.java) - Rôle de A.");
         assert!(a.id.starts_with("type:"));
         let c = Node::new(NodeKind::Concept, "x", "x", None, None, None);
-        assert_eq!(node_line(&c), "- concept:x : x (concept)");
+        assert_eq!(node_line(&c), "- concept:x");
         let f = Node::new(NodeKind::Method, "p.A.f", "f", Some("p/A.java"), None, None);
         let g = Node::new(NodeKind::Method, "p.B.g", "g", Some("p/B.java"), None, None);
         let edges = vec![edge(&f, &g, Calls)];
@@ -1296,7 +1359,8 @@ mod tests {
             "{ctx}"
         );
         let prompt = crate::llm::ask::ask_system_prompt();
-        assert!(prompt.contains("- <identifiant> : <nom qualifié> (<genre>, <fichier>) - <résumé>"));
+        assert_eq!(node_line(&f), "- method:p.A.f (p/A.java)");
+        assert!(prompt.contains("- <identifiant> (<sous-genre>, <fichier>) - <résumé>"));
         assert!(prompt.contains("- <source> -<genre>-> <cible>"));
     }
 
@@ -1305,10 +1369,10 @@ mod tests {
         let (n, _) = sections(ctx);
         n.iter()
             .map(|l| {
-                l.split(" : ")
+                l.trim_start_matches("- ")
+                    .split(' ')
                     .next()
                     .unwrap()
-                    .trim_start_matches("- ")
                     .to_string()
             })
             .collect()
@@ -1388,7 +1452,7 @@ mod tests {
         );
         assert!(c.shown.is_empty());
         assert_eq!(c.text.chars().count(), DEFAULT_ASK_MAX_CONTEXT_CHARS);
-        // Identifiant entier mais sans le ` :` qui suit : aucun nœud montré.
+        // Identifiant entier mais sans l'espace qui suit : aucun nœud montré.
         let room = DEFAULT_ASK_MAX_CONTEXT_CHARS - "Nœuds :\nLiens :\n".chars().count() - 1;
         let id_len = "type:".len();
         let name_len = room - "- ".len() - id_len;
