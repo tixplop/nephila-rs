@@ -137,7 +137,7 @@ fn req003_ac1_chunk_fixture_preferred() {
     std::fs::write(d.path().join("fx/src/A.java.json"), GOOD).unwrap();
     std::fs::write(
         d.path().join("fx/src/A.java.2.json"),
-        r#"{"version":2,"summaries":[{"node":"type:Z","summary":"Z"}],"concepts":[]}"#,
+        r#"{"version":2,"summaries":[{"node":"type:Z","summary":"Rôle de Z."}],"concepts":[]}"#,
     )
     .unwrap();
     assert_eq!(ex(&m, "src/A.java", 1).unwrap().summaries.len(), 2);

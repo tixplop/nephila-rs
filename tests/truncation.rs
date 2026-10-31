@@ -13,8 +13,7 @@ use fake_server::FakeServer;
 const LABEL: &str = "réponse tronquée par la limite de jetons";
 const ADVICE: &str = "réduisez max_chunk_chars ou batch_files, ou augmentez max_output_tokens";
 const SECRET: &str = "SECRET_REPONSE_42";
-const A_GOOD: &str =
-    r#"{"version": 2, "summaries": [{"node": "type:A", "summary": "Classe A."}], "concepts": []}"#;
+const A_GOOD: &str = r#"{"version": 2, "summaries": [{"node": "type:A", "summary": "Classe A centrale."}], "concepts": []}"#;
 
 const CUT: &str = r#"{"version": 2, "summaries": [{"node": "type:A", "summ"#;
 
@@ -170,7 +169,7 @@ fn lot_reply(names: &[&str]) -> String {
         .map(|n| {
             serde_json::json!({
                 "file": format!("{n}.java"),
-                "summaries": [{"node": format!("type:{n}"), "summary": format!("Classe {n}.")}],
+                "summaries": [{"node": format!("type:{n}"), "summary": format!("Classe {n} centrale.")}],
                 "concepts": []
             })
         })
@@ -275,7 +274,7 @@ fn req046_ac3_autres_raisons_d_arret_appliquent_le_resume() {
         assert_eq!(s.to_enrich(), 0);
         assert_eq!(
             s.summary_of("type:A").as_deref(),
-            Some("Classe A."),
+            Some("Classe A centrale."),
             "{p} {reason:?}"
         );
     }
@@ -306,7 +305,7 @@ fn req046_ac5_lot_tronque_coupe_en_moities_puis_fichiers_seuls() {
     // Première réponse tronquée seulement : 4 requêtes, 4 fichiers enrichis, aucun avertissement.
     let one = |n: &str| {
         format!(
-            r#"{{"version": 2, "summaries": [{{"node": "type:{n}", "summary": "Classe {n}."}}], "concepts": []}}"#
+            r#"{{"version": 2, "summaries": [{{"node": "type:{n}", "summary": "Classe {n} centrale."}}], "concepts": []}}"#
         )
     };
     let s = Setup::new(
@@ -805,7 +804,7 @@ fn req096_ac1_lot_tronque_deux_moities_enrichies() {
         for n in ["A", "B", "C", "D"] {
             assert_eq!(
                 s.summary_of(&format!("type:{n}")),
-                Some(format!("Classe {n}.")),
+                Some(format!("Classe {n} centrale.")),
                 "{p}"
             );
         }

@@ -1,11 +1,12 @@
 //! Prompt d'enrichissement et schéma JSON version 2 (DEC-019, REQ-024).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::filter::FileType;
+use crate::llm::tidy;
 
 /// Version du schéma de réponse d'enrichissement.
 pub const ENRICH_SCHEMA_VERSION: u32 = 2;
@@ -142,7 +143,53 @@ struct RawConcept {
     sections: Vec<String>,
 }
 
-/// Filtre les éléments bruts d'un fichier selon sa liste de nœuds (règles version 2, REQ-024).
+fn node_empty_of_sense(id: &str) -> String {
+    format!("résumé pour {id} (vide de sens)")
+}
+
+fn node_duplicate(id: &str) -> String {
+    format!("résumé en double pour {id} (premier gardé)")
+}
+
+fn node_capped(id: &str, received: usize) -> String {
+    format!(
+        "résumé pour {id} : coupé à {} caractères, fin écartée ({received} caractères reçus)",
+        tidy::SUMMARY_MAX_CHARS
+    )
+}
+
+fn concept_empty_of_sense(name: &str) -> String {
+    format!("concept {name} : résumé vide de sens écarté")
+}
+
+fn concept_capped(name: &str, received: usize) -> String {
+    format!(
+        "concept {name} : résumé coupé à {} caractères, fin écartée ({received} caractères reçus)",
+        tidy::SUMMARY_MAX_CHARS
+    )
+}
+
+/// Résumé replié puis coupé : `(texte replié, longueur repliée si coupé, texte gardé)` ; `None`
+/// si vide après repli.
+fn fold_and_cap(raw: &str) -> Option<(String, Option<usize>, String)> {
+    let folded = tidy::fold(raw);
+    if folded.is_empty() {
+        return None;
+    }
+    let received = folded.chars().count();
+    match tidy::cap(&folded) {
+        Some(cut) => Some((folded, Some(received), cut)),
+        None => {
+            let same = folded.clone();
+            Some((folded, None, same))
+        }
+    }
+}
+
+/// Filtre les éléments bruts d'un fichier selon sa liste de nœuds (règles version 2, REQ-024) :
+/// résumés repliés sur une ligne, coupés à 400 caractères et écartés s'ils sont vides de sens
+/// (REQ-178), premier résumé d'un nœud gardé et concepts de même nom fusionnés (REQ-179), noms
+/// de concepts normalisés (REQ-180) ; DEC-144.
 fn filter_raw(
     summaries: Vec<RawSummary>,
     concepts: Vec<RawConcept>,
@@ -151,6 +198,7 @@ fn filter_raw(
 ) -> Enrichment {
     let known: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
     let mut out = Enrichment::default();
+    let mut kept: HashMap<String, usize> = HashMap::new();
 
     for s in summaries {
         if s.node.trim().is_empty() {
@@ -160,12 +208,30 @@ fn filter_raw(
         if !known.contains(s.node.as_str()) {
             out.rejected
                 .push(format!("résumé pour {} (nœud hors liste)", s.node));
-        } else if !s.summary.trim().is_empty() {
-            out.summaries.push((s.node, s.summary.trim().to_string()));
+            continue;
         }
+        let Some((folded, received, text)) = fold_and_cap(&s.summary) else {
+            continue;
+        };
+        if tidy::is_meaningless(&folded, tidy::node_name(&s.node)) {
+            out.rejected.push(node_empty_of_sense(&s.node));
+            continue;
+        }
+        if let Some(&i) = kept.get(&s.node) {
+            if out.summaries[i].1 != text {
+                out.rejected.push(node_duplicate(&s.node));
+            }
+            continue;
+        }
+        if let Some(n) = received {
+            out.rejected.push(node_capped(&s.node, n));
+        }
+        kept.insert(s.node.clone(), out.summaries.len());
+        out.summaries.push((s.node, text));
     }
 
     let markdown = is_markdown(file);
+    let mut by_name: HashMap<String, usize> = HashMap::new();
     for c in concepts {
         let name = normalize_concept_name(&c.name);
         if name.is_empty() {
@@ -195,11 +261,38 @@ fn filter_raw(
             out.rejected
                 .push(format!("concept {name} : sections hors liste écartées"));
         }
-        out.concepts.push(Concept {
-            name,
-            summary: c.summary.filter(|s| !s.trim().is_empty()),
-            sections,
-        });
+        let summary = match c.summary.as_deref().and_then(fold_and_cap) {
+            None => None,
+            Some((folded, received, text)) => {
+                if tidy::is_meaningless(&folded, &name) {
+                    out.rejected.push(concept_empty_of_sense(&name));
+                    None
+                } else {
+                    if let Some(n) = received {
+                        out.rejected.push(concept_capped(&name, n));
+                    }
+                    Some(text)
+                }
+            }
+        };
+        if let Some(&i) = by_name.get(&name) {
+            let existing = &mut out.concepts[i];
+            for s in sections {
+                if !existing.sections.contains(&s) {
+                    existing.sections.push(s);
+                }
+            }
+            if existing.summary.is_none() {
+                existing.summary = summary;
+            }
+        } else {
+            by_name.insert(name.clone(), out.concepts.len());
+            out.concepts.push(Concept {
+                name,
+                summary,
+                sections,
+            });
+        }
     }
     out
 }
@@ -960,15 +1053,15 @@ mod tests {
     fn req027_ac6_parse_lot_conforming() {
         let items = [item("A.java", &["type:A"]), item("B.java", &["type:B"])];
         let json = r#"{"version":3,"files":[
-            {"file":"B.java","summaries":[{"node":"type:B","summary":"b"},{"node":"type:A","summary":"x"}],"concepts":[]},
-            {"file":"A.java","summaries":[{"node":"type:A","summary":"a"}],"concepts":[]}]}"#;
+            {"file":"B.java","summaries":[{"node":"type:B","summary":"Rôle de b."},{"node":"type:A","summary":"x"}],"concepts":[]},
+            {"file":"A.java","summaries":[{"node":"type:A","summary":"Rôle de a."}],"concepts":[]}]}"#;
         let l = parse_lot(json, &items).unwrap();
         assert!(l.rejected.is_empty());
         assert_eq!(l.files[0].0, "A.java");
         let a = l.files[0].1.as_ref().unwrap();
-        assert_eq!(a.summaries, vec![("type:A".into(), "a".into())]);
+        assert_eq!(a.summaries, vec![("type:A".into(), "Rôle de a.".into())]);
         let b = l.files[1].1.as_ref().unwrap();
-        assert_eq!(b.summaries, vec![("type:B".into(), "b".into())]);
+        assert_eq!(b.summaries, vec![("type:B".into(), "Rôle de b.".into())]);
         assert_eq!(b.rejected.len(), 1, "{:?}", b.rejected);
     }
 
@@ -990,7 +1083,7 @@ mod tests {
     fn req027_ac7_parse_lot_out_of_lot_duplicate_and_missing() {
         let items = [item("A.java", &["type:A"]), item("B.java", &["type:B"])];
         let json = r#"{"version":3,"files":[
-            {"file":"A.java","summaries":[{"node":"type:A","summary":"a"}],"concepts":[]},
+            {"file":"A.java","summaries":[{"node":"type:A","summary":"Rôle de a."}],"concepts":[]},
             {"file":"autre/Inconnu.java","summaries":[],"concepts":[]},
             {"file":"A.java","summaries":[{"node":"type:A","summary":"bis"}],"concepts":[]}]}"#;
         let l = parse_lot(json, &items).unwrap();
@@ -998,7 +1091,7 @@ mod tests {
         assert!(l.rejected[0].contains("autre/Inconnu.java"));
         assert!(l.rejected[1].contains("A.java"));
         let a = l.files[0].1.as_ref().unwrap();
-        assert_eq!(a.summaries, vec![("type:A".into(), "a".into())]);
+        assert_eq!(a.summaries, vec![("type:A".into(), "Rôle de a.".into())]);
         let e = l.files[1].1.as_ref().unwrap_err().to_string();
         assert!(
             e.contains("B.java") && e.contains("absent de la réponse du lot"),
@@ -1041,5 +1134,304 @@ mod tests {
             );
             assert!(e.contains("X.java") && e.contains("Y.java"), "{e}");
         }
+    }
+
+    fn one_summary(file: &str, nodes: &[&str], node: &str, summary: &str) -> Enrichment {
+        let json = serde_json::json!({"version": 2, "concepts": [],
+            "summaries": [{"node": node, "summary": summary}]})
+        .to_string();
+        Enrichment::parse(&json, file, &ids(nodes)).unwrap()
+    }
+
+    fn words90() -> String {
+        (0..90)
+            .map(|i| format!("mot{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn req178_ac1_resume_replie_sur_une_ligne() {
+        let e = one_summary(
+            "A.java",
+            &["type:A"],
+            "type:A",
+            "  Première ligne.\n\n  Deuxième\tligne.  ",
+        );
+        assert_eq!(
+            e.summaries,
+            vec![("type:A".into(), "Première ligne. Deuxième ligne.".into())]
+        );
+        assert!(e.rejected.is_empty());
+        let e = one_summary("A.java", &["type:A"], "type:A", "\n \t");
+        assert!(e.summaries.is_empty() && e.rejected.is_empty());
+    }
+
+    #[test]
+    fn req178_ac2_resume_coupe_a_400_caracteres() {
+        let long = words90();
+        assert_eq!(long.chars().count(), 539);
+        let e = one_summary("A.java", &["type:A"], "type:A", &long);
+        let got = &e.summaries[0].1;
+        assert!(got.chars().count() <= 400 && got.ends_with('…'));
+        let body = got.trim_end_matches('…');
+        assert!(long.starts_with(body) && !body.ends_with(' '));
+        assert!(long[body.len()..].starts_with(' '));
+        let next = long[body.len() + 1..].split(' ').next().unwrap();
+        assert!(body.chars().count() + 1 + next.chars().count() + 1 > 400);
+        assert_eq!(
+            e.rejected,
+            vec!["résumé pour type:A : coupé à 400 caractères, fin écartée (539 caractères reçus)"]
+        );
+        let exact = "é".repeat(400);
+        let e = one_summary("A.java", &["type:A"], "type:A", &exact);
+        assert_eq!(e.summaries[0].1, exact);
+        assert!(e.rejected.is_empty());
+        let e = one_summary("A.java", &["type:A"], "type:A", &"x".repeat(500));
+        assert_eq!(e.summaries[0].1, format!("{}…", "x".repeat(399)));
+    }
+
+    #[test]
+    fn req178_ac3_resumes_vides_de_sens_ecartes() {
+        let nodes = ["type:A", "type:com.acme.Order", "method:Big.m1"];
+        let bad = [
+            ("type:A", "N/A"),
+            ("type:A", "n/a."),
+            ("type:A", "…"),
+            ("type:A", "-"),
+            ("type:A", "TODO"),
+            ("type:A", "Aucun résumé."),
+            ("type:A", "Classe A."),
+            ("type:A", "A"),
+            ("type:com.acme.Order", "Order."),
+            ("type:com.acme.Order", "class Order"),
+            ("method:Big.m1", "Méthode m1."),
+        ];
+        for (id, text) in bad {
+            let e = one_summary("A.java", &nodes, id, text);
+            assert!(e.summaries.is_empty(), "{text}");
+            assert_eq!(e.rejected, vec![format!("résumé pour {id} (vide de sens)")]);
+        }
+        let good = [
+            ("type:A", "Le A."),
+            ("type:A", "Fait A."),
+            ("type:A", "s"),
+            ("type:A", "Classe A centrale."),
+            ("type:com.acme.Order", "Commande client."),
+        ];
+        for (id, text) in good {
+            let e = one_summary("A.java", &nodes, id, text);
+            assert_eq!(e.summaries, vec![(id.to_string(), text.to_string())]);
+            assert!(e.rejected.is_empty(), "{text}");
+        }
+    }
+
+    fn one_concept(summary: &str) -> Enrichment {
+        let json = serde_json::json!({"version": 2, "summaries": [],
+            "concepts": [{"name": "Facturation", "summary": summary,
+                          "sections": ["section:docs/g.md#intro"]}]})
+        .to_string();
+        Enrichment::parse(&json, "docs/g.md", &ids(&["section:docs/g.md#intro"])).unwrap()
+    }
+
+    #[test]
+    fn req178_ac4_resume_de_concept() {
+        let e = one_concept("Émission\ndes factures.");
+        assert_eq!(
+            e.concepts[0].summary.as_deref(),
+            Some("Émission des factures.")
+        );
+        assert!(e.rejected.is_empty());
+        for bad in ["N/A", "Facturation."] {
+            let e = one_concept(bad);
+            assert_eq!(e.concepts.len(), 1);
+            assert_eq!(e.concepts[0].summary, None);
+            assert_eq!(
+                e.rejected,
+                vec!["concept facturation : résumé vide de sens écarté"]
+            );
+        }
+        let e = one_concept(&words90());
+        let s = e.concepts[0].summary.as_deref().unwrap();
+        assert!(s.chars().count() <= 400 && s.ends_with('…'));
+        assert_eq!(
+            e.rejected,
+            vec!["concept facturation : résumé coupé à 400 caractères, fin écartée (539 caractères reçus)"]
+        );
+    }
+
+    #[test]
+    fn req178_ac5_regles_par_fichier_d_un_lot() {
+        let items = vec![
+            LotItem {
+                file: "A.java".into(),
+                text: String::new(),
+                node_ids: ids(&["type:A"]),
+            },
+            LotItem {
+                file: "B.java".into(),
+                text: String::new(),
+                node_ids: ids(&["type:B"]),
+            },
+        ];
+        let json = r#"{"version":3,"files":[
+            {"file":"A.java","summaries":[{"node":"type:A","summary":"N/A"}],"concepts":[]},
+            {"file":"B.java","summaries":[{"node":"type:B","summary":"Rôle\nde B."}],"concepts":[]}]}"#;
+        let lot = parse_lot(json, &items).unwrap();
+        let a = lot.files[0].1.as_ref().unwrap();
+        let b = lot.files[1].1.as_ref().unwrap();
+        assert!(a.summaries.is_empty());
+        assert_eq!(a.rejected, vec!["résumé pour type:A (vide de sens)"]);
+        assert_eq!(b.summaries, vec![("type:B".into(), "Rôle de B.".into())]);
+        assert!(b.rejected.is_empty());
+    }
+
+    #[test]
+    fn req178_ac9_elements_sans_saut_de_ligne_ni_texte_recu() {
+        let e = one_summary("A.java", &["type:A"], "type:A", "\n\nN/A\n");
+        assert_eq!(e.rejected, vec!["résumé pour type:A (vide de sens)"]);
+        for text in ["é".repeat(400), "  a   b  ".to_string(), " \n ".to_string()] {
+            assert!(one_summary("A.java", &["type:A"], "type:A", &text)
+                .rejected
+                .is_empty());
+        }
+        let json = r#"{"version":2,"summaries":[],"concepts":[{"name":"« Facturation ».","sections":["type:A"]}]}"#;
+        let e = Enrichment::parse(json, "A.java", &ids(&["type:A"])).unwrap();
+        assert_eq!(
+            e.rejected,
+            vec!["concept facturation (fichier non Markdown)"]
+        );
+    }
+
+    #[test]
+    fn req179_ac1_premier_resume_garde() {
+        let two = |a: &str, b: &str| {
+            let json = serde_json::json!({"version": 2, "concepts": [], "summaries": [
+                {"node": "type:A", "summary": a}, {"node": "type:A", "summary": b}]})
+            .to_string();
+            Enrichment::parse(&json, "A.java", &ids(&["type:A"])).unwrap()
+        };
+        let e = two("Premier rôle.", "Second rôle.");
+        assert_eq!(e.summaries, vec![("type:A".into(), "Premier rôle.".into())]);
+        assert_eq!(
+            e.rejected,
+            vec!["résumé en double pour type:A (premier gardé)"]
+        );
+        let e = two("Rôle.", "Rôle.");
+        assert_eq!(e.summaries.len(), 1);
+        assert!(e.rejected.is_empty());
+        let e = two("N/A", "Rôle.");
+        assert_eq!(e.summaries, vec![("type:A".into(), "Rôle.".into())]);
+        assert_eq!(e.rejected, vec!["résumé pour type:A (vide de sens)"]);
+    }
+
+    #[test]
+    fn req179_ac2_concepts_de_meme_nom_fusionnes() {
+        let json = r#"{"version":2,"summaries":[],"concepts":[
+            {"name":"Facturation","sections":["section:docs/g.md#s1"]},
+            {"name":"« facturation »","summary":"Émission des factures.",
+             "sections":["section:docs/g.md#s2","section:docs/g.md#s1"]}]}"#;
+        let e = Enrichment::parse(
+            json,
+            "docs/g.md",
+            &ids(&["section:docs/g.md#s1", "section:docs/g.md#s2"]),
+        )
+        .unwrap();
+        assert_eq!(
+            e.concepts,
+            vec![Concept {
+                name: "facturation".into(),
+                summary: Some("Émission des factures.".into()),
+                sections: ids(&["section:docs/g.md#s1", "section:docs/g.md#s2"]),
+            }]
+        );
+        assert!(e.rejected.is_empty());
+    }
+
+    #[test]
+    fn req179_ac3_unicite_et_fusion_idempotente() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let nodes = ids(&[
+            "type:N0",
+            "type:N1",
+            "type:N2",
+            "section:g.md#a",
+            "section:g.md#b",
+        ]);
+        let names = [
+            "Facturation",
+            "« facturation »",
+            "\"Facturation\".",
+            "Client",
+            "client…",
+        ];
+        let texts = [
+            "",
+            " \n ",
+            "N/A",
+            "Rôle.",
+            "Autre rôle.",
+            "Rôle.\n",
+            "N2.",
+            "x",
+        ];
+        for _ in 0..200 {
+            let summaries: Vec<_> = (0..next(8))
+                .map(|_| {
+                    let text = if next(6) == 0 {
+                        "mot ".repeat(150)
+                    } else {
+                        texts[next(texts.len() as u64) as usize].to_string()
+                    };
+                    serde_json::json!({"node": format!("type:N{}", next(3)), "summary": text})
+                })
+                .collect();
+            let concepts: Vec<_> = (0..next(6))
+                .map(|_| {
+                    let secs: Vec<String> = (0..1 + next(2))
+                        .map(|_| format!("section:g.md#{}", ["a", "b"][next(2) as usize]))
+                        .collect();
+                    serde_json::json!({"name": names[next(names.len() as u64) as usize],
+                        "summary": texts[next(texts.len() as u64) as usize], "sections": secs})
+                })
+                .collect();
+            let json =
+                serde_json::json!({"version": 2, "summaries": summaries, "concepts": concepts})
+                    .to_string();
+            let e = Enrichment::parse(&json, "g.md", &nodes).unwrap();
+            let mut seen = HashSet::new();
+            assert!(e.summaries.iter().all(|(n, _)| seen.insert(n.clone())));
+            let mut seen = HashSet::new();
+            assert!(e.concepts.iter().all(|c| seen.insert(c.name.clone())));
+            let merged = crate::chunk::merge_enrichments(vec![e.clone()]);
+            assert_eq!(merged.summaries, e.summaries);
+            assert_eq!(merged.concepts, e.concepts);
+        }
+    }
+
+    #[test]
+    fn req180_ac2_nom_normalise_dans_les_elements_de_concept() {
+        let json = r#"{"version":2,"summaries":[],"concepts":[
+            {"name":"« Facturation ».","summary":"N/A","sections":["section:g.md#a","section:x#y"]}]}"#;
+        let e = Enrichment::parse(json, "g.md", &ids(&["section:g.md#a"])).unwrap();
+        assert_eq!(e.concepts[0].name, "facturation");
+        assert_eq!(
+            e.rejected,
+            vec![
+                "concept facturation : sections hors liste écartées",
+                "concept facturation : résumé vide de sens écarté"
+            ]
+        );
+
+        let json = r#"{"version":2,"summaries":[],"concepts":[{"name":"\"...\"","sections":["section:docs/g.md#intro"]}]}"#;
+        let e = Enrichment::parse(json, "docs/g.md", &ids(&["section:docs/g.md#intro"])).unwrap();
+        assert!(e.concepts.is_empty());
+        assert_eq!(e.rejected, vec!["concept sans nom"]);
     }
 }

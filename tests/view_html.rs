@@ -219,7 +219,8 @@ fn req025_ac3_hostile_summary_is_escaped_and_round_trips() {
         .iter()
         .find(|n| n["id"] == "type:com.acme.core.OrderService")
         .unwrap();
-    assert_eq!(svc["summary"], hostile);
+    // REQ-178 : U+2028 est un blanc, replié en espace par le filtrage.
+    assert_eq!(svc["summary"], "</script><script>alert(1)</script> & fin");
 }
 
 #[test]
