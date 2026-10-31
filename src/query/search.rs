@@ -48,23 +48,50 @@ impl<'a> Prepared<'a> {
         Prepared { items }
     }
 
-    /// Pour chaque nœud correspondant au terme (déjà en minuscules) : sa position dans le
-    /// tableau et son rang (0 exact, 1 préfixe, 2 contenu).
-    pub fn ranks(&self, term: &str) -> Vec<(usize, u8)> {
+    /// Variante de `new` pour `query ask` : formes en minuscules puis repliées (accents), une
+    /// fois par nœud ; une chaîne ASCII n'est pas copiée deux fois (REQ-183, DEC-147).
+    pub fn folded(nodes: &'a [Node]) -> Prepared<'a> {
+        let fold = |s: &str| {
+            let lower = s.to_lowercase();
+            match super::words::fold(&lower) {
+                std::borrow::Cow::Owned(o) => o,
+                std::borrow::Cow::Borrowed(_) => lower,
+            }
+        };
+        let items = nodes
+            .iter()
+            .map(|n| Folded {
+                node: n,
+                short: fold(&n.short),
+                qualified: fold(&n.qualified),
+                summary: n.summary.as_deref().map(fold),
+            })
+            .collect();
+        Prepared { items }
+    }
+
+    /// Pour chaque nœud correspondant à un mot de `query ask` (formes déjà repliées) : sa position
+    /// dans le tableau et son rang (0 exact, 1 préfixe, 2 contenu). Exact : nom court ou nom
+    /// qualifié égal à `exact` ; préfixe : commence par `root` ; contenu : contient `root`, résumé
+    /// compris si `summary`. `ranks_with(t, t, true)` est la règle de `query search` (REQ-183).
+    pub fn ranks_with(&self, exact: &str, root: &str, summary: bool) -> Vec<(usize, u8)> {
         self.items
             .iter()
             .enumerate()
             .filter_map(|(i, f)| {
-                rank(f, term).map(|r| {
-                    (
-                        i,
-                        match r {
-                            Rank::Exact => 0,
-                            Rank::Prefix => 1,
-                            Rank::Content => 2,
-                        },
-                    )
-                })
+                let r = if f.short == exact || f.qualified == exact {
+                    0
+                } else if f.short.starts_with(root) || f.qualified.starts_with(root) {
+                    1
+                } else if f.short.contains(root)
+                    || f.qualified.contains(root)
+                    || (summary && f.summary.as_deref().is_some_and(|s| s.contains(root)))
+                {
+                    2
+                } else {
+                    return None;
+                };
+                Some((i, r))
             })
             .collect()
     }
@@ -215,7 +242,7 @@ pub(crate) mod oracle {
         "x",
     ];
 
-    fn phrase(rng: &mut Lcg, max: usize) -> String {
+    pub fn phrase(rng: &mut Lcg, max: usize) -> String {
         let n = 1 + rng.next(max);
         (0..n)
             .map(|_| FRAGMENTS[rng.next(FRAGMENTS.len())])

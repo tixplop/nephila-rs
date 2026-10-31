@@ -7,6 +7,7 @@ pub mod lookup;
 pub mod neighbors;
 pub mod path;
 pub mod search;
+pub(crate) mod words;
 
 use std::path::Path;
 

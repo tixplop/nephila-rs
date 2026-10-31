@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use super::lookup::{self, Lookup};
 use super::search;
+use super::words;
 use crate::config::Config;
 use crate::error::{Error, Result, TRUNCATED};
 use crate::filter::ProjectFile;
@@ -28,7 +29,7 @@ pub use crate::config::{
 /// Longueur minimale d'un mot de la question pour être cherché.
 const MIN_WORD_CHARS: usize = 3;
 
-const STOP_WORDS: &[&str] = &[
+pub(crate) const STOP_WORDS: &[&str] = &[
     "quel", "quelle", "quels", "quelles", "que", "qui", "quoi", "les", "des", "une", "est", "sont",
     "par", "pour", "dans", "sur", "avec", "comment", "pourquoi", "the", "what", "which", "how",
     "who", "where", "and", "does", "are", "for", "with",
@@ -38,7 +39,9 @@ pub fn not_found() -> Error {
     Error::Message("pas trouvé dans le graphe".to_string())
 }
 
-/// Mots significatifs de la question, minuscules, sans doublon, dans l'ordre d'apparition.
+/// Mots significatifs de la question, minuscules, sans doublon, dans l'ordre d'apparition, sans
+/// les mots vides de base (`STOP_WORDS`) ; les mots vides des mots ordinaires, le repli et la
+/// racine sont appliqués ensuite par `question_words` (REQ-183, DEC-147).
 fn keywords(question: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     question
@@ -152,11 +155,74 @@ fn word_class(cited: bool, rank: u8) -> u8 {
     (if cited { 1 } else { 3 }) + u8::from(rank != 0)
 }
 
-/// Nœuds de départ : les nœuds qui correspondent à au moins un terme (noms qualifiés cités puis
-/// mots-clés, ceux qui sont des identifiants cités avant les autres), triés par (classe, couverture
-/// décroissante, fréquence, rang, position) de leur meilleure clé, puis nom qualifié et identifiant
-/// (REQ-182, DEC-146) ; les `min(max_seeds, max_nodes)` premiers.
-/// La recherche travaille sur des références ; seuls les nœuds retenus sont copiés.
+/// Mot de la question préparé pour la recherche : forme exacte repliée, racine (préfixe de la
+/// forme exacte), identifiant cité ou non, et recherche dans les résumés ou non (REQ-183).
+struct Word {
+    exact: String,
+    root: String,
+    cited: bool,
+    summary: bool,
+}
+
+/// Termes de la question (REQ-183, DEC-147) : mots-clés dans leur ordre ; un mot ordinaire dont la
+/// forme repliée est un mot vide de `PROSE_STOP_WORDS` est écarté ; un identifiant cité est
+/// seulement replié ; un mot ordinaire est cherché par sa racine, et dans les résumés s'il compte
+/// au moins 4 caractères. Les doublons de forme repliée sont retirés, le premier gardé.
+fn question_words(question: &str) -> Vec<Word> {
+    let cited = cited_identifiers(question);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for w in keywords(question) {
+        let exact = words::fold(&w).into_owned();
+        let is_cited = cited.contains(&w);
+        if !is_cited && words::PROSE_STOP_WORDS.contains(&exact.as_str()) {
+            continue;
+        }
+        if !seen.insert(exact.clone()) {
+            continue;
+        }
+        let (root, summary) = if is_cited {
+            (exact.clone(), true)
+        } else {
+            (words::stem(&exact).to_string(), exact.chars().count() >= 4)
+        };
+        out.push(Word {
+            exact,
+            root,
+            cited: is_cited,
+            summary,
+        });
+    }
+    out
+}
+
+/// Noms qualifiés cités par la question, repliés, sans doublon (REQ-183).
+fn folded_qualified_terms(question: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    qualified_terms(question)
+        .iter()
+        .map(|q| words::fold(q).into_owned())
+        .filter(|q| seen.insert(q.clone()))
+        .collect()
+}
+
+/// Nœuds de départ d'une question, chemin de production : graphe, noms qualifiés cités et mots
+/// repliés, mots ordinaires filtrés et racinisés, puis le classement de `rank_seeds` (REQ-183,
+/// DEC-147).
+fn question_seeds(nodes: &[Node], question: &str, limits: &AskLimits) -> Vec<Node> {
+    let prepared = search::Prepared::folded(nodes);
+    rank_seeds(
+        nodes,
+        &prepared,
+        &folded_qualified_terms(question),
+        &question_words(question),
+        limits,
+    )
+}
+
+/// Nœuds de départ à partir de termes bruts, sans repli, racine ni mot vide : la règle de
+/// REQ-141 et REQ-182, cœur du classement (REQ-183, DEC-147). Assistant des tests.
+#[cfg(test)]
 fn find_seeds(
     nodes: &[Node],
     qualified: &[String],
@@ -164,7 +230,41 @@ fn find_seeds(
     cited: &HashSet<String>,
     limits: &AskLimits,
 ) -> Vec<Node> {
-    let prepared = search::Prepared::new(nodes);
+    let words: Vec<Word> = words
+        .iter()
+        .map(|w| {
+            let w = w.trim().to_lowercase();
+            Word {
+                cited: cited.contains(&w),
+                exact: w.clone(),
+                root: w,
+                summary: true,
+            }
+        })
+        .collect();
+    rank_seeds(
+        nodes,
+        &search::Prepared::new(nodes),
+        qualified,
+        &words,
+        limits,
+    )
+}
+
+/// Nœuds de départ : les nœuds qui correspondent à au moins un terme (noms qualifiés cités puis
+/// mots-clés, ceux qui sont des identifiants cités avant les autres), triés par (classe, couverture
+/// décroissante, fréquence, rang, position) de leur meilleure clé, puis nom qualifié et identifiant
+/// (REQ-182, DEC-146) ; les `min(max_seeds, max_nodes)` premiers.
+/// La recherche travaille sur des références ; seuls les nœuds retenus sont copiés. Les noms
+/// qualifiés et les mots sont déjà préparés, `prepared` porte les formes des nœuds de `nodes`
+/// (REQ-183, DEC-147).
+fn rank_seeds(
+    nodes: &[Node],
+    prepared: &search::Prepared,
+    qualified: &[String],
+    words: &[Word],
+    limits: &AskLimits,
+) -> Vec<Node> {
     let mut best: Vec<Option<SeedKey>> = vec![None; nodes.len()];
     let mut cover: Vec<usize> = vec![0; nodes.len()];
     let mut offer = |i: usize, key: SeedKey| {
@@ -181,18 +281,10 @@ fn find_seeds(
         }
     }
     for (k, w) in words.iter().enumerate() {
-        let hits = prepared.ranks(w.trim().to_lowercase().as_str());
+        let hits = prepared.ranks_with(&w.exact, &w.root, w.summary);
         let freq = hits.len();
         for (i, r) in hits {
-            offer(
-                i,
-                (
-                    word_class(cited.contains(w), r),
-                    freq,
-                    r,
-                    qualified.len() + k,
-                ),
-            );
+            offer(i, (word_class(w.cited, r), freq, r, qualified.len() + k));
         }
     }
     let mut hit: Vec<(SeedKey, usize)> = best
@@ -394,13 +486,7 @@ pub fn answer(
     limits: &AskLimits,
 ) -> Result<(String, Vec<Node>)> {
     let nodes = store.nodes()?;
-    let seeds = find_seeds(
-        &nodes,
-        &qualified_terms(question),
-        &keywords(question),
-        &cited_identifiers(question),
-        limits,
-    );
+    let seeds = question_seeds(&nodes, question, limits);
     if seeds.is_empty() {
         return Err(not_found());
     }
@@ -594,16 +680,10 @@ mod tests {
     }
 
     fn seed_ids(nodes: &[Node], question: &str) -> Vec<String> {
-        find_seeds(
-            nodes,
-            &qualified_terms(question),
-            &keywords(question),
-            &cited_identifiers(question),
-            &AskLimits::default(),
-        )
-        .into_iter()
-        .map(|n| n.id)
-        .collect()
+        question_seeds(nodes, question, &AskLimits::default())
+            .into_iter()
+            .map(|n| n.id)
+            .collect()
     }
 
     #[test]
@@ -729,6 +809,266 @@ mod tests {
             ]
         );
         assert_eq!(ids("readme.md#usage"), vec!["docs/README.md#usage"]);
+    }
+
+    #[test]
+    fn req183_ac4_accents_and_roots_reach_dependency_nodes() {
+        let nodes = vec![
+            mk(NodeKind::Type, "p.DependencyResolver", None),
+            mk(
+                NodeKind::Type,
+                "q.Graph",
+                Some("Résout les dépendances du projet."),
+            ),
+            mk(NodeKind::Type, "r.Other", Some("Rien à voir.")),
+        ];
+        for q in [
+            "Où sont résolues les dépendances ?",
+            "Ou sont resolues les dependances ?",
+        ] {
+            assert_eq!(
+                seed_ids(&nodes, q),
+                ["type:p.DependencyResolver", "type:q.Graph"],
+                "question {q}"
+            );
+        }
+    }
+
+    fn seed_quals(nodes: &[Node], question: &str) -> Vec<String> {
+        question_seeds(nodes, question, &AskLimits::default())
+            .into_iter()
+            .map(|n| n.qualified)
+            .collect()
+    }
+
+    fn word_view(question: &str) -> Vec<(String, String, bool, bool)> {
+        question_words(question)
+            .into_iter()
+            .map(|w| (w.exact, w.root, w.cited, w.summary))
+            .collect()
+    }
+
+    #[test]
+    fn req183_ac3_question_words() {
+        let w = |e: &str, r: &str, c: bool, s: bool| (e.to_string(), r.to_string(), c, s);
+        assert_eq!(
+            word_view("Which class uses LineWrapper?"),
+            [
+                w("class", "class", false, true),
+                w("linewrapper", "linewrapper", true, true)
+            ]
+        );
+        assert_eq!(
+            word_view("Quels fichiers utilisent cette classe ?"),
+            [
+                w("fichiers", "fichier", false, true),
+                w("classe", "class", false, true)
+            ]
+        );
+        assert_eq!(
+            word_view("What does use() return?"),
+            [
+                w("use", "use", true, true),
+                w("return", "return", false, true)
+            ]
+        );
+        assert_eq!(
+            word_view("Comment les dépendances sont-elles déclarées ?"),
+            [
+                w("dependances", "depend", false, true),
+                w("declarees", "declare", false, true)
+            ]
+        );
+        assert_eq!(
+            word_view("How is the map built?"),
+            [
+                w("map", "map", false, false),
+                w("built", "built", false, true)
+            ]
+        );
+        assert_eq!(
+            word_view("Dépendances et dependances"),
+            [w("dependances", "depend", false, true)]
+        );
+        assert_eq!(
+            word_view("Que fait OrderService ?"),
+            [w("orderservice", "orderservice", true, true)]
+        );
+        for q in ["Que fait cafe.ouvrir ?", "Que fait Café.ouvrir ?"] {
+            assert_eq!(folded_qualified_terms(q), ["cafe.ouvrir"], "{q}");
+        }
+    }
+
+    #[test]
+    fn req183_ac5_matching_rules() {
+        let m = |q: &str, s: Option<&str>| mk(NodeKind::Method, q, s);
+        // (a) exact sur le mot seul, préfixe sur la racine
+        let nodes = vec![
+            m("a.lines", None),
+            m("b.line", None),
+            m("c.LineWrapper", None),
+        ];
+        assert_eq!(
+            seed_quals(&nodes, "Where are lines?"),
+            ["a.lines", "b.line", "c.LineWrapper"]
+        );
+        // (b) un mot de 3 caractères ne cherche pas dans les résumés, sauf s'il est cité
+        let nodes = vec![m("p.Foo", Some("a map of names")), m("p.HashMap", None)];
+        assert_eq!(seed_quals(&nodes, "Where is the map?"), ["p.HashMap"]);
+        assert_eq!(
+            seed_quals(&nodes, "Where is map()?"),
+            ["p.Foo", "p.HashMap"]
+        );
+        // (c) un mot vide de relation n'est pas cherché, sauf cité
+        let nodes = vec![m("p.uses", None)];
+        assert_eq!(seed_quals(&nodes, "What does uses() return?")[0], "p.uses");
+        assert!(seed_quals(&nodes, "Which class uses it?").is_empty());
+        // (d) un identifiant cité n'est pas racinisé
+        let nodes = vec![m("p.checkedItems", None), m("p.checkItem", None)];
+        assert_eq!(
+            seed_quals(&nodes, "What does checkedItems() do?"),
+            ["p.checkedItems"]
+        );
+        assert_eq!(
+            seed_quals(&nodes, "Which checked items?"),
+            ["p.checkItem", "p.checkedItems"]
+        );
+        // (e) nom qualifié cité replié, classe 0
+        let nodes = vec![m("p.Café.ouvrir", None), m("a.ouvrir", None)];
+        assert_eq!(
+            seed_quals(&nodes, "Que fait cafe.ouvrir ?"),
+            ["p.Café.ouvrir", "a.ouvrir"]
+        );
+    }
+
+    /// Oracle naïf d'AC-183-6, écrit depuis la définition de REQ-183 sur les formes repliées.
+    fn naive_folded_seeds(nodes: &[Node], quals: &[String], words: &[Word]) -> Vec<String> {
+        let f = |s: &str| words::fold(&s.to_lowercase()).into_owned();
+        let suffix = |q: &str, t: &str| {
+            q == t
+                || q.strip_suffix(t)
+                    .and_then(|h| h.chars().next_back())
+                    .is_some_and(|c| matches!(c, '.' | '#' | '/' | ':'))
+        };
+        let hit = |n: &Node, w: &Word| -> Option<u8> {
+            let (s, q) = (f(&n.short), f(&n.qualified));
+            let sum = n.summary.as_deref().map(f);
+            if s == w.exact || q == w.exact {
+                Some(0)
+            } else if s.starts_with(&w.root) || q.starts_with(&w.root) {
+                Some(1)
+            } else if s.contains(&w.root)
+                || q.contains(&w.root)
+                || (w.summary && sum.is_some_and(|x| x.contains(&w.root)))
+            {
+                Some(2)
+            } else {
+                None
+            }
+        };
+        type Key = (u8, std::cmp::Reverse<usize>, usize, u8, usize);
+        let mut keyed: Vec<(Key, &Node)> = Vec::new();
+        for n in nodes {
+            let mut best: Option<SeedKey> = None;
+            let mut cover = 0usize;
+            for (pos, t) in quals.iter().enumerate() {
+                if suffix(&f(&n.qualified), t) {
+                    let freq = nodes.iter().filter(|m| suffix(&f(&m.qualified), t)).count();
+                    cover += 1;
+                    let k = (0, freq, 0, pos);
+                    best = Some(best.map_or(k, |b| b.min(k)));
+                }
+            }
+            for (k, w) in words.iter().enumerate() {
+                if let Some(r) = hit(n, w) {
+                    let freq = nodes.iter().filter(|m| hit(m, w).is_some()).count();
+                    let base = if w.cited { 1 } else { 3 };
+                    let key = (
+                        if r == 0 { base } else { base + 1 },
+                        freq,
+                        r,
+                        quals.len() + k,
+                    );
+                    cover += 1;
+                    best = Some(best.map_or(key, |b| b.min(key)));
+                }
+            }
+            if let Some(k) = best {
+                keyed.push(((k.0, std::cmp::Reverse(cover), k.1, k.2, k.3), n));
+            }
+        }
+        keyed.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.qualified.cmp(&b.1.qualified))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        let mut seen = HashSet::new();
+        keyed
+            .into_iter()
+            .filter(|(_, n)| seen.insert(n.id.clone()))
+            .take(DEFAULT_ASK_MAX_SEEDS)
+            .map(|(_, n)| n.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn req183_ac6_folded_search_matches_naive_oracle() {
+        let mut rng = Lcg(2183);
+        let (mut capped, mut roots, mut no_summary) = (false, false, false);
+        for _ in 0..200 {
+            let nodes = random_nodes(&mut rng);
+            let total = 1 + rng.next(10);
+            let nq = rng.next(total.min(3) + 1);
+            let mut words: Vec<Word> = random_words(&mut rng)
+                .into_iter()
+                .take(total - nq)
+                .map(|w| {
+                    let exact = words::fold(&w).into_owned();
+                    let chars: Vec<char> = exact.chars().collect();
+                    let root: String = chars[..1 + rng.next(chars.len())].iter().collect();
+                    roots |= root != exact;
+                    let summary = rng.next(2) == 0;
+                    no_summary |= !summary;
+                    Word {
+                        exact,
+                        root,
+                        cited: rng.next(2) == 0,
+                        summary,
+                    }
+                })
+                .collect();
+            words.truncate(total - nq);
+            let mut quals = Vec::new();
+            for _ in 0..nq {
+                let q = nodes[rng.next(nodes.len())].qualified.to_lowercase();
+                let cut: Vec<usize> = q.match_indices(['.', '#']).map(|(i, _)| i + 1).collect();
+                let start = if cut.is_empty() {
+                    0
+                } else {
+                    cut[rng.next(cut.len())]
+                };
+                quals.push(words::fold(&q[start..]).into_owned());
+            }
+            let want = naive_folded_seeds(&nodes, &quals, &words);
+            capped |= want.len() == DEFAULT_ASK_MAX_SEEDS;
+            let got: Vec<String> = rank_seeds(
+                &nodes,
+                &search::Prepared::folded(&nodes),
+                &quals,
+                &words,
+                &AskLimits::default(),
+            )
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+            let view: Vec<_> = words
+                .iter()
+                .map(|w| (&w.exact, &w.root, w.cited, w.summary))
+                .collect();
+            assert_eq!(want, got, "noms {quals:?} mots {view:?}");
+        }
+        assert!(capped, "le plafond de 20 nœuds n'est jamais atteint");
+        assert!(roots && no_summary);
     }
 
     fn seeds_of(nodes: &[Node], words: &[&str]) -> Vec<String> {
