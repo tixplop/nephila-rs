@@ -840,3 +840,177 @@ fn req038_ac11_openai_ask_retried_after_nonconforming_reply() {
         .collect();
     assert_eq!(chats.len(), 2);
 }
+
+// ---- Notes de correction des nouveaux essais (REQ-177, T-265) ----
+
+/// Décode un corps enregistré : (contenu du message de rôle `user`, corps sans ce contenu).
+fn split_user(body: &str) -> (String, serde_json::Value) {
+    let mut v: serde_json::Value = serde_json::from_str(body).unwrap();
+    let msgs = v["messages"].as_array_mut().expect("messages");
+    let m = msgs
+        .iter_mut()
+        .find(|m| m["role"] == "user")
+        .expect("message user");
+    let content = match &m["content"] {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        other => panic!("contenu inattendu : {other}"),
+    };
+    m["content"] = serde_json::Value::Null;
+    (content, v)
+}
+
+fn anthropic_env(server: &FakeServer) -> Env {
+    Env::new(
+        1,
+        &format!(
+            "provider = \"anthropic\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\n",
+            server.base_url
+        ),
+    )
+}
+
+fn assert_summary_applied(env: &Env) {
+    assert_eq!(env.to_enrich(), 0);
+    let q = env.run(&["query", "search", "F00", "--json"], &[]);
+    assert!(q.status.success(), "{}", stderr(&q));
+    assert!(String::from_utf8_lossy(&q.stdout).contains("résumé"));
+}
+
+#[test]
+fn req177_ac7_openai_text_without_json_then_note_absent() {
+    let server = FakeServer::start(vec![
+        (200, openai_reply("désolé, pas de JSON")),
+        (200, openai_reply(GOOD)),
+    ]);
+    let env = server_env(&server, "");
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+    let reqs = posts(&server);
+    assert_eq!(reqs.len(), 2);
+    let (u1, rest1) = split_user(&reqs[0].body);
+    let (u2, rest2) = split_user(&reqs[1].body);
+    assert_eq!(u2, format!("{u1}\n\n{}", nephila::llm::retry::NOTE_ABSENT));
+    assert_eq!(rest1, rest2);
+    assert_summary_applied(&env);
+}
+
+#[test]
+fn req177_ac7_anthropic_text_without_json_then_note_absent() {
+    let good = serde_json::json!({"content":[{"type":"text","text":GOOD}]}).to_string();
+    let bad =
+        serde_json::json!({"content":[{"type":"text","text":"désolé, pas de JSON"}]}).to_string();
+    let server = FakeServer::start(vec![(200, bad), (200, good)]);
+    let env = anthropic_env(&server);
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+    let reqs = posts(&server);
+    assert_eq!(reqs.len(), 2);
+    let (u1, rest1) = split_user(&reqs[0].body);
+    let (u2, rest2) = split_user(&reqs[1].body);
+    assert_eq!(u2, format!("{u1}\n\n{}", nephila::llm::retry::NOTE_ABSENT));
+    assert_eq!(rest1, rest2);
+    assert_summary_applied(&env);
+}
+
+#[test]
+fn req177_ac7_openai_one_note_per_try_from_previous_error() {
+    let server = FakeServer::start(vec![
+        (
+            200,
+            openai_reply(r#"{"version":2,"summaries":[],"concepts":[],"extra":1}"#),
+        ),
+        (200, openai_reply(r#"{"summaries":[]}"#)),
+        (200, openai_reply(GOOD)),
+    ]);
+    let env = server_env(&server, "");
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let reqs = posts(&server);
+    assert_eq!(reqs.len(), 3);
+    let u1 = split_user(&reqs[0].body).0;
+    let u2 = split_user(&reqs[1].body).0;
+    let u3 = split_user(&reqs[2].body).0;
+    assert_eq!(
+        u2,
+        format!("{u1}\n\n{}", nephila::llm::retry::NOTE_UNKNOWN_FIELD)
+    );
+    assert_eq!(
+        u3,
+        format!("{u1}\n\n{}", nephila::llm::retry::NOTE_MISSING_FIELD)
+    );
+    assert_summary_applied(&env);
+}
+
+#[test]
+fn req177_ac8_openai_lot_version_2_then_note_version() {
+    let entry = |i: usize| {
+        format!(
+            r#"{{"file":"src/F{i:02}.java","summaries":[{{"node":"type:p.F{i:02}","summary":"résumé {i:02}"}}],"concepts":[]}}"#
+        )
+    };
+    let good = format!(r#"{{"version":3,"files":[{},{}]}}"#, entry(0), entry(1));
+    let server = FakeServer::start(vec![
+        (200, openai_reply(r#"{"version":2,"files":[]}"#)),
+        (200, openai_reply(&good)),
+    ]);
+    let env = Env::new(
+        2,
+        &format!(
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\nconcurrency = 1\nbatch_files = 2\n",
+            server.base_url
+        ),
+    );
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let reqs = posts(&server);
+    assert_eq!(reqs.len(), 2, "{}", stderr(&o));
+    let u1 = split_user(&reqs[0].body).0;
+    let u2 = split_user(&reqs[1].body).0;
+    assert_eq!(u2, format!("{u1}\n\n{}", nephila::llm::retry::NOTE_VERSION));
+    assert!(!u2.contains("extrait") && !u2.contains("morceau"), "{u2}");
+    assert_eq!(env.to_enrich(), 0);
+    let q = env.run(&["query", "search", "F01", "--json"], &[]);
+    assert!(String::from_utf8_lossy(&q.stdout).contains("résumé 01"));
+}
+
+#[test]
+fn req177_ac8_openai_ask_invalid_type_then_note_shape() {
+    let ask_ok = r#"{"found":true,"answer":"oui","nodes":["type:p.F00"]}"#;
+    let server = FakeServer::start(vec![
+        (200, openai_reply(r#"{"found": "oui"}"#)),
+        (200, openai_reply(ask_ok)),
+    ]);
+    let env = Env::new(1, MOCK_CONFIG);
+    assert!(env.run(&["build"], &[]).status.success());
+    fs::write(
+        &env.config,
+        format!(
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_RETRIES_TEST_KEY\"\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let o = env.run(
+        &["query", "ask", "F00 ?"],
+        &[("NEPHILA_RETRIES_TEST_KEY", "sk")],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("oui"));
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+    let chats: Vec<_> = posts(&server)
+        .into_iter()
+        .filter(|r| r.path.ends_with("/v1/chat/completions"))
+        .collect();
+    assert_eq!(chats.len(), 2);
+    let u1 = split_user(&chats[0].body).0;
+    let u2 = split_user(&chats[1].body).0;
+    assert_eq!(u2, format!("{u1}\n\n{}", nephila::llm::retry::NOTE_SHAPE));
+    assert!(u2.starts_with("Contexte :\n"), "{u2}");
+}
