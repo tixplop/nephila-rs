@@ -23,7 +23,7 @@ use enrich::{
     enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt, parse_lot,
 };
 pub use enrich::{Enrichment, Excerpt, LotItem};
-pub use retry::with_format_retries;
+pub use retry::{with_format_retries, with_note, FormatFault};
 
 /// Options de génération communes aux fournisseurs HTTP (REQ-058, DEC-072).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +70,9 @@ pub trait Llm: Send + Sync {
         known: &[String],
         stop: &AtomicBool,
         stats: &CallStats,
+        fault: Option<FormatFault>,
     ) -> Result<Enrichment> {
-        let _ = (label, excerpt, stop, stats);
+        let _ = (label, excerpt, stop, stats, fault);
         self.enrich(file, call, text, requested, known)
     }
     /// Enrichit un lot de 2 fichiers ou plus en un seul appel (schéma version 3, DEC-033).
@@ -84,15 +85,22 @@ pub trait Llm: Send + Sync {
         items: &[LotItem],
         stop: &AtomicBool,
         stats: &CallStats,
+        fault: Option<FormatFault>,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        let _ = (label, stop, stats);
+        let _ = (label, stop, stats, fault);
         self.enrich_lot(items)
     }
     /// Répond à une question à partir d'un contexte de graphe.
     fn ask(&self, question: &str, context: &str) -> Result<AskReply>;
     /// Comme `ask`, en relevant l'appel dans `stats`. Par défaut, le relevé est ignoré.
-    fn ask_with(&self, question: &str, context: &str, stats: &CallStats) -> Result<AskReply> {
-        let _ = stats;
+    fn ask_with(
+        &self,
+        question: &str,
+        context: &str,
+        stats: &CallStats,
+        fault: Option<FormatFault>,
+    ) -> Result<AskReply> {
+        let _ = (stats, fault);
         self.ask(question, context)
     }
 }
@@ -152,13 +160,17 @@ impl<T: Complete> Llm for T {
         known: &[String],
         stop: &AtomicBool,
         stats: &CallStats,
+        fault: Option<FormatFault>,
     ) -> Result<Enrichment> {
         let out = self.complete(
             Some(label),
             Some(stop),
             stats,
             enrichment_system_prompt(self.summary_language()),
-            enrichment_user_prompt(file, excerpt, text, requested),
+            with_note(
+                enrichment_user_prompt(file, excerpt, text, requested),
+                fault,
+            ),
         )?;
         http::parse_reply(&out, KEY_VERSION, |j| Enrichment::parse(j, file, known))
     }
@@ -180,28 +192,35 @@ impl<T: Complete> Llm for T {
         items: &[LotItem],
         stop: &AtomicBool,
         stats: &CallStats,
+        fault: Option<FormatFault>,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
         let out = self.complete(
             Some(label),
             Some(stop),
             stats,
             lot_system_prompt(self.summary_language()),
-            lot_user_prompt(items),
+            with_note(lot_user_prompt(items), fault),
         )?;
         Ok(http::parse_reply(&out, KEY_VERSION, |j| parse_lot(j, items))?.into_results())
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
-        self.ask_with(question, context, &CallStats::default())
+        self.ask_with(question, context, &CallStats::default(), None)
     }
 
-    fn ask_with(&self, question: &str, context: &str, stats: &CallStats) -> Result<AskReply> {
+    fn ask_with(
+        &self,
+        question: &str,
+        context: &str,
+        stats: &CallStats,
+        fault: Option<FormatFault>,
+    ) -> Result<AskReply> {
         let out = self.complete(
             None,
             None,
             stats,
             ask_system_prompt(),
-            ask_user_prompt(question, context),
+            with_note(ask_user_prompt(question, context), fault),
         )?;
         http::parse_reply(&out, KEY_FOUND, AskReply::parse)
     }
@@ -245,9 +264,10 @@ impl Llm for WithModel {
         known: &[String],
         stop: &AtomicBool,
         stats: &CallStats,
+        fault: Option<FormatFault>,
     ) -> Result<Enrichment> {
         self.inner.enrich_labeled(
-            label, file, call, excerpt, text, requested, known, stop, stats,
+            label, file, call, excerpt, text, requested, known, stop, stats, fault,
         )
     }
 
@@ -261,16 +281,24 @@ impl Llm for WithModel {
         items: &[LotItem],
         stop: &AtomicBool,
         stats: &CallStats,
+        fault: Option<FormatFault>,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
-        self.inner.enrich_lot_labeled(label, items, stop, stats)
+        self.inner
+            .enrich_lot_labeled(label, items, stop, stats, fault)
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {
         self.inner.ask(question, context)
     }
 
-    fn ask_with(&self, question: &str, context: &str, stats: &CallStats) -> Result<AskReply> {
-        self.inner.ask_with(question, context, stats)
+    fn ask_with(
+        &self,
+        question: &str,
+        context: &str,
+        stats: &CallStats,
+        fault: Option<FormatFault>,
+    ) -> Result<AskReply> {
+        self.inner.ask_with(question, context, stats, fault)
     }
 }
 

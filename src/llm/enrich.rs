@@ -13,10 +13,11 @@ pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 /// Version du prompt d'enrichissement (DEC-062). À incrémenter à chaque changement des consignes
 /// système, des gabarits de requête (fichier seul et lot) ou des schémas de réponse version 2 et
 /// 3 : tout enrichissement conservé avec une autre version est refait. Un test fige l'empreinte
-/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 6 depuis la 0.26.0
+/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0
 /// (consignes de forme des résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers,
-/// REQ-171 ; langue, REQ-172 ; concepts, REQ-175 ; les valeurs 2 à 5 n'ont pas été livrées).
-pub const ENRICH_PROMPT_VERSION: u32 = 6;
+/// REQ-171 ; langue, REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais,
+/// REQ-177 ; les valeurs 2 à 6 n'ont pas été livrées).
+pub const ENRICH_PROMPT_VERSION: u32 = 7;
 
 /// Consignes de forme des résumés : ligne commune aux deux prompts système (DEC-135).
 pub const SUMMARY_RULES: &str = "Résumés (de nœud ou de concept) : une phrase de 25 mots au plus, qui dit le rôle ou la responsabilité de l'élément (ce qu'il fait et à quoi il sert), pas sa syntaxe ni sa signature ; ne répète pas son nom ; n'écris que ce que le contenu montre, sans rien supposer ni inventer. Omets (aucune entrée dans \"summaries\") un accesseur ou un mutateur trivial (il lit ou écrit un champ, sans autre effet) et une section vide ou réduite à son titre.";
@@ -590,23 +591,41 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn req049_ac4_prompt_texts_are_frozen_next_to_the_prompt_version() {
-        // Changer une consigne, un gabarit ou un schéma : incrémenter `ENRICH_PROMPT_VERSION`,
-        // puis mettre à jour les deux littéraux ci-dessous.
-        assert_eq!(ENRICH_PROMPT_VERSION, 6);
-        let texts = [
+    /// Les six textes de la version 6 (inchangés par la version 7).
+    fn texts_v6() -> Vec<String> {
+        vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
             user_prompt(None),
             user_prompt(Some(EXCERPT_2_3)),
             lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
             lot_user_prompt(&lot_items()),
-        ];
+        ]
+    }
+
+    #[test]
+    fn req049_ac4_prompt_texts_are_frozen_next_to_the_prompt_version() {
+        // Changer une consigne, un gabarit, un schéma ou une note : incrémenter
+        // `ENRICH_PROMPT_VERSION`, puis mettre à jour le littéral ci-dessous.
+        assert_eq!(ENRICH_PROMPT_VERSION, 7);
+        let mut texts = texts_v6();
+        texts.push(
+            crate::llm::FormatFault::ALL
+                .map(crate::llm::FormatFault::note)
+                .join("\n"),
+        );
         assert_eq!(
             fingerprint_of(&texts),
-            "0d53830988dade24bd34df822cd23054749d4d8eb426ed86d817f306620348fb",
+            "772f5652e95481e85eea6478ea9ce8b1736b5c63ca4facdf633a76e6ac678ff4",
             "les textes du prompt ont changé : incrémentez ENRICH_PROMPT_VERSION"
+        );
+    }
+
+    #[test]
+    fn req177_ac5_the_six_texts_of_version_6_are_unchanged() {
+        assert_eq!(
+            fingerprint_of(&texts_v6()),
+            "0d53830988dade24bd34df822cd23054749d4d8eb426ed86d817f306620348fb"
         );
     }
 

@@ -386,14 +386,8 @@ pub fn answer(
     }
     let edges = store.edges()?;
     let context = build_context(&nodes, &edges, &seeds, limits);
-    let stop = AtomicBool::new(false);
     let mut totals = LlmTotals::default();
-    let result = with_format_retries(format_retries, &stop, |attempt| {
-        let stats = CallStats::default();
-        let r = llm.ask_with(question, &context.text, &stats);
-        totals.add(&stats, attempt >= 2);
-        r
-    });
+    let result = ask_with_retries(llm, question, &context.text, format_retries, &mut totals);
     if totals.calls > 0 {
         crate::trace!("{}", calls_line(&totals));
     }
@@ -413,6 +407,24 @@ pub fn answer(
             Ok((answer, retained))
         }
     }
+}
+
+/// Appels de `query ask` avec leurs nouveaux essais de format ; la catégorie de l'erreur
+/// précédente est transmise au fournisseur (REQ-177, DEC-143).
+fn ask_with_retries(
+    llm: &dyn Llm,
+    question: &str,
+    context: &str,
+    format_retries: u32,
+    totals: &mut LlmTotals,
+) -> Result<AskReply> {
+    let stop = AtomicBool::new(false);
+    with_format_retries(format_retries, &stop, |attempt, fault| {
+        let stats = CallStats::default();
+        let r = llm.ask_with(question, context, &stats, fault);
+        totals.add(&stats, attempt >= 2);
+        r
+    })
 }
 
 /// Citations résolues parmi les nœuds montrés (REQ-161), dans l'ordre des citations, sans doublon.
@@ -1423,6 +1435,65 @@ mod tests {
         assert_eq!(
             resolve_cited(&shown, &["type:p.A", "p.A", "method:p.A.save"]),
             vec!["type:p.A", "method:p.A.save"]
+        );
+    }
+
+    /// Faux `Llm` de `query ask` (REQ-177, AC-177-4) : erreur `Shape` puis `NotFound`.
+    struct AskFaults {
+        seen: std::sync::Mutex<Vec<Option<crate::llm::FormatFault>>>,
+    }
+
+    impl Llm for AskFaults {
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<crate::llm::Enrichment> {
+            unreachable!("enrich")
+        }
+        fn enrich_lot(
+            &self,
+            _: &[crate::llm::LotItem],
+        ) -> Result<Vec<(String, Result<crate::llm::Enrichment>)>> {
+            unreachable!("enrich_lot")
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<AskReply> {
+            unreachable!("ask")
+        }
+        fn ask_with(
+            &self,
+            _: &str,
+            _: &str,
+            _: &CallStats,
+            fault: Option<crate::llm::FormatFault>,
+        ) -> Result<AskReply> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(fault);
+            if seen.len() == 1 {
+                Err(Error::Format(
+                    "réponse LLM non conforme au schéma : invalid type: string \"oui\", expected a boolean"
+                        .into(),
+                ))
+            } else {
+                Ok(AskReply::NotFound)
+            }
+        }
+    }
+
+    #[test]
+    fn req177_ac4_ask_passes_previous_fault() {
+        let llm = AskFaults {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut totals = LlmTotals::default();
+        let r = ask_with_retries(&llm, "q", "ctx", 2, &mut totals);
+        assert!(matches!(r, Ok(AskReply::NotFound)));
+        assert_eq!(
+            *llm.seen.lock().unwrap(),
+            vec![None, Some(crate::llm::FormatFault::Shape)]
         );
     }
 }

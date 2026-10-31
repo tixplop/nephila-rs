@@ -12,8 +12,8 @@ use crate::chunk;
 use crate::error::{warn, Error, Result, TRUNCATED};
 use crate::index::build::{BuildReport, IndexOptions};
 use crate::llm::{
-    calls_line, tokens_segment, with_format_retries, CallStats, Enrichment, Excerpt, Llm,
-    LlmTotals, LotItem,
+    calls_line, tokens_segment, with_format_retries, CallStats, Enrichment, Excerpt, FormatFault,
+    Llm, LlmTotals, LotItem,
 };
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
 use crate::parse::markdown;
@@ -422,6 +422,7 @@ fn traced_enrich(
     requested: &[String],
     known: &[String],
     attempt: Attempt,
+    fault: Option<FormatFault>,
     stop: &AtomicBool,
     totals: &Mutex<LlmTotals>,
 ) -> Result<Enrichment> {
@@ -429,7 +430,7 @@ fn traced_enrich(
     let label = format!("{path} [{index}/{total}]");
     if !trace::enabled() {
         let result = llm.enrich_labeled(
-            &label, path, index, excerpt, text, requested, known, stop, &stats,
+            &label, path, index, excerpt, text, requested, known, stop, &stats, fault,
         );
         add_totals(totals, &stats, attempt);
         return result;
@@ -441,7 +442,7 @@ fn traced_enrich(
     );
     let started = Instant::now();
     let result = llm.enrich_labeled(
-        &label, path, index, excerpt, text, requested, known, stop, &stats,
+        &label, path, index, excerpt, text, requested, known, stop, &stats, fault,
     );
     let ms = started.elapsed().as_millis();
     add_totals(totals, &stats, attempt);
@@ -486,8 +487,8 @@ fn traced_lot(
     totals: &Mutex<LlmTotals>,
 ) -> Result<Vec<(String, Result<Enrichment>)>> {
     let total = retries.saturating_add(1);
-    with_format_retries(retries, stop, |current| {
-        traced_lot_once(llm, items, Attempt { current, total }, stop, totals)
+    with_format_retries(retries, stop, |current, fault| {
+        traced_lot_once(llm, items, Attempt { current, total }, fault, stop, totals)
     })
 }
 
@@ -495,13 +496,14 @@ fn traced_lot_once(
     llm: &dyn Llm,
     items: &[LotItem],
     attempt: Attempt,
+    fault: Option<FormatFault>,
     stop: &AtomicBool,
     totals: &Mutex<LlmTotals>,
 ) -> Result<Vec<(String, Result<Enrichment>)>> {
     let label = format!("lot {} +{}", items[0].file, items.len() - 1);
     let stats = CallStats::default();
     if !trace::enabled() {
-        let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop, &stats);
+        let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop, &stats, fault);
         add_totals(totals, &stats, attempt);
         return result;
     }
@@ -511,7 +513,7 @@ fn traced_lot_once(
         attempt.mark()
     );
     let started = Instant::now();
-    let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop, &stats);
+    let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop, &stats, fault);
     let ms = started.elapsed().as_millis();
     add_totals(totals, &stats, attempt);
     let tokens = tokens_suffix(&stats);
@@ -822,7 +824,7 @@ fn run_call(
     totals: &Mutex<LlmTotals>,
 ) -> Result<Enrichment> {
     let total = retries.saturating_add(1);
-    with_format_retries(retries, stop, |current| {
+    with_format_retries(retries, stop, |current, fault| {
         traced_enrich(
             llm,
             path,
@@ -833,6 +835,7 @@ fn run_call(
             requested,
             known,
             Attempt { current, total },
+            fault,
             stop,
             totals,
         )
@@ -2475,7 +2478,7 @@ mod tests {
         assert_eq!((p.consecutive_network, p.network_total), (2, 2));
         // Une suite d'essais terminée par une erreur réseau compte pour une seule erreur.
         let t = p.dispatch();
-        let r: Result<()> = with_format_retries(2, &AtomicBool::new(false), |n| {
+        let r: Result<()> = with_format_retries(2, &AtomicBool::new(false), |n, _| {
             if n < 3 {
                 Err(Error::Format("f".into()))
             } else {
@@ -3421,5 +3424,128 @@ mod plan_index_tests {
         let expected: usize = lists.iter().map(|n| (*n).div_ceil(150).max(1)).sum();
         assert_eq!(plan.len(), expected);
         assert!(lists.iter().sum::<usize>() >= 20_000);
+    }
+
+    /// Faux `Llm` qui relève la catégorie reçue (REQ-177, AC-177-4) : erreur de format au
+    /// premier appel, succès ensuite.
+    struct Faults {
+        seen: Mutex<Vec<Option<FormatFault>>>,
+        first_error: Error,
+    }
+
+    impl Faults {
+        fn new(first_error: Error) -> Faults {
+            Faults {
+                seen: Mutex::new(Vec::new()),
+                first_error,
+            }
+        }
+        fn next(&self, fault: Option<FormatFault>) -> Option<Error> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(fault);
+            (seen.len() == 1).then(|| self.first_error.clone())
+        }
+    }
+
+    impl Llm for Faults {
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn enrich_labeled(
+            &self,
+            _: &str,
+            _: &str,
+            _: usize,
+            _: Option<Excerpt>,
+            _: &str,
+            _: &[String],
+            _: &[String],
+            _: &AtomicBool,
+            _: &CallStats,
+            fault: Option<FormatFault>,
+        ) -> Result<Enrichment> {
+            match self.next(fault) {
+                Some(e) => Err(e),
+                None => Ok(Enrichment::default()),
+            }
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn enrich_lot_labeled(
+            &self,
+            _: &str,
+            items: &[LotItem],
+            _: &AtomicBool,
+            _: &CallStats,
+            fault: Option<FormatFault>,
+        ) -> Result<Vec<(String, Result<Enrichment>)>> {
+            match self.next(fault) {
+                Some(e) => Err(e),
+                None => Ok(items
+                    .iter()
+                    .map(|i| (i.file.clone(), Ok(Enrichment::default())))
+                    .collect()),
+            }
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req177_ac4_run_call_passes_previous_fault() {
+        let llm = Faults::new(Error::Format(
+            "réponse LLM non conforme : aucun objet JSON dans le texte".into(),
+        ));
+        let totals = Mutex::new(LlmTotals::default());
+        let r = run_call(
+            &llm,
+            "A.java",
+            1,
+            1,
+            None,
+            "t",
+            &[],
+            &[],
+            2,
+            &AtomicBool::new(false),
+            &totals,
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            *llm.seen.lock().unwrap(),
+            vec![None, Some(FormatFault::Absent)]
+        );
+    }
+
+    #[test]
+    fn req177_ac4_traced_lot_passes_previous_fault() {
+        let llm = Faults::new(Error::Format(
+            "réponse LLM non conforme au schéma : version 2 non prise en charge pour un lot (attendu : 3)"
+                .into(),
+        ));
+        let items: Vec<LotItem> = ["A.java", "B.java"]
+            .iter()
+            .map(|f| LotItem {
+                file: (*f).into(),
+                text: "t".into(),
+                node_ids: vec![],
+            })
+            .collect();
+        let totals = Mutex::new(LlmTotals::default());
+        let r = traced_lot(&llm, &items, 2, &AtomicBool::new(false), &totals);
+        assert_eq!(r.unwrap().len(), 2);
+        assert_eq!(
+            *llm.seen.lock().unwrap(),
+            vec![None, Some(FormatFault::Version)]
+        );
     }
 }

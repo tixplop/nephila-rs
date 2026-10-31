@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use super::ask::AskReply;
 use super::enrich::parse_lot;
-use super::{CallStats, Enrichment, Excerpt, Llm, LotItem};
+use super::{CallStats, Enrichment, Excerpt, FormatFault, Llm, LotItem};
 use crate::error::{Error, Result};
 use serde_json::Value;
 
@@ -333,6 +333,7 @@ impl Llm for MockLlm {
         known: &[String],
         _stop: &std::sync::atomic::AtomicBool,
         stats: &CallStats,
+        _fault: Option<FormatFault>,
     ) -> Result<Enrichment> {
         self.enrich_stats(file, call, known, stats)
     }
@@ -347,6 +348,7 @@ impl Llm for MockLlm {
         items: &[LotItem],
         _stop: &std::sync::atomic::AtomicBool,
         stats: &CallStats,
+        _fault: Option<FormatFault>,
     ) -> Result<Vec<(String, Result<Enrichment>)>> {
         self.enrich_lot_stats(items, stats)
     }
@@ -355,7 +357,13 @@ impl Llm for MockLlm {
         self.ask_stats(&CallStats::default())
     }
 
-    fn ask_with(&self, _question: &str, _context: &str, stats: &CallStats) -> Result<AskReply> {
+    fn ask_with(
+        &self,
+        _question: &str,
+        _context: &str,
+        stats: &CallStats,
+        _fault: Option<FormatFault>,
+    ) -> Result<AskReply> {
         self.ask_stats(stats)
     }
 }
@@ -386,6 +394,7 @@ mod tests {
             &[],
             &AtomicBool::new(false),
             &s,
+            None,
         )
         .unwrap();
         assert_eq!((s.sends(), s.responded(), s.usage()), (1, true, None));
@@ -396,12 +405,12 @@ mod tests {
             text: "t".into(),
             node_ids: vec![],
         }];
-        let r = m.enrich_lot_labeled("l", &items, &AtomicBool::new(false), &s);
+        let r = m.enrich_lot_labeled("l", &items, &AtomicBool::new(false), &s, None);
         assert!(r.is_ok());
         assert_eq!((s.sends(), s.responded(), s.usage()), (1, true, None));
 
         let s = CallStats::default();
-        m.ask_with("q", "c", &s).unwrap();
+        m.ask_with("q", "c", &s, None).unwrap();
         assert_eq!((s.sends(), s.responded(), s.usage()), (1, true, None));
     }
 
@@ -419,11 +428,12 @@ mod tests {
             &[],
             &AtomicBool::new(false),
             &s,
+            None,
         );
         assert!(matches!(r, Err(Error::Network(_))));
         assert_eq!((s.sends(), s.responded()), (1, false));
         let s = CallStats::default();
-        assert!(m.ask_with("q", "c", &s).is_err());
+        assert!(m.ask_with("q", "c", &s, None).is_err());
         assert_eq!((s.sends(), s.responded()), (1, false));
     }
 }
