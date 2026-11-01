@@ -9,6 +9,7 @@ pub mod escape;
 pub mod export;
 pub mod filter;
 pub mod index;
+pub(crate) mod interrupt;
 pub mod llm;
 pub mod model;
 pub mod out;
