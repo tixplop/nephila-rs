@@ -862,7 +862,7 @@ fn reenriched_once(old: i64) {
         .collect();
     assert_eq!(
         versions,
-        vec![i64::from(nephila::llm::enrich::ENRICH_PROMPT_VERSION)]
+        vec![i64::from(nephila::llm::enrich::MARKDOWN_PROMPT_VERSION)]
     );
 }
 
@@ -946,4 +946,79 @@ fn req167_ac5_omitted_trivial_accessor_is_accepted() {
     );
     assert_eq!(summary_of(&env, &get), None);
     assert!(summary_of(&env, &run).is_some());
+}
+
+fn set_prompt_version(env: &Env, path: &str, v: i64) {
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let n = conn
+        .execute(
+            "UPDATE enrichments SET prompt_version = ?1 WHERE path = ?2",
+            rusqlite::params![v, path],
+        )
+        .unwrap();
+    assert_eq!(n, 1, "{path}");
+}
+
+#[test]
+fn req193_ac5_only_the_family_with_an_older_version_is_reenriched() {
+    use nephila::llm::enrich::{
+        BUILD_PROMPT_VERSION, CODE_PROMPT_VERSION, DATA_PROMPT_VERSION, MARKDOWN_PROMPT_VERSION,
+    };
+    let env = tiny_env(&[
+        ("a.md", "# Un\n\ntexte\n"),
+        (
+            "src/A.java",
+            "package p;\npublic class A {\n  public void run() {}\n}\n",
+        ),
+        (
+            "pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId><artifactId>x</artifactId><version>1</version><dependencies><dependency><groupId>d</groupId><artifactId>e</artifactId><version>1</version></dependency></dependencies></project>\n",
+        ),
+        ("app.yml", "a: 1\nb: 2\n"),
+    ]);
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nbatch_files = 4\nconcurrency = 1\n",
+    )
+    .unwrap();
+    env.ok(&["build"]);
+    assert_eq!(to_enrich(&env), 0);
+    let versions = || -> Vec<(String, i64)> {
+        let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+        let mut st = conn
+            .prepare("SELECT path, prompt_version FROM enrichments ORDER BY path")
+            .unwrap();
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    };
+    let seven = |p: &str, v: u32| (p.to_string(), i64::from(v));
+    assert_eq!(
+        versions(),
+        vec![
+            seven("a.md", MARKDOWN_PROMPT_VERSION),
+            seven("app.yml", DATA_PROMPT_VERSION),
+            seven("pom.xml", BUILD_PROMPT_VERSION),
+            seven("src/A.java", CODE_PROMPT_VERSION),
+        ]
+    );
+    for path in ["a.md", "src/A.java"] {
+        set_prompt_version(&env, path, 6);
+        assert_eq!(to_enrich(&env), 1, "{path}");
+        env.ok(&["update"]);
+        let logged = env.logged();
+        assert_eq!(logged.len(), 1, "{path}: {logged:?}");
+        assert_eq!(
+            env.logged_paths(),
+            BTreeSet::from([path.to_string()]),
+            "{logged:?}"
+        );
+        assert_eq!(to_enrich(&env), 0);
+        let again = env.ok(&["update"]);
+        assert_eq!(text(&again.stdout), "graphe à jour\n");
+        assert!(env.logged().is_empty(), "{:?}", env.logged());
+    }
 }

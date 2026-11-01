@@ -11,14 +11,83 @@ use crate::llm::tidy;
 /// Version du schéma de réponse d'enrichissement.
 pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 
-/// Version du prompt d'enrichissement (DEC-062). À incrémenter à chaque changement des consignes
-/// système, des gabarits de requête (fichier seul et lot) ou des schémas de réponse version 2 et
-/// 3 : tout enrichissement conservé avec une autre version est refait. Un test fige l'empreinte
-/// BLAKE3 de ces textes à côté de cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0
-/// (consignes de forme des résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers,
-/// REQ-171 ; langue, REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais,
-/// REQ-177 ; les valeurs 2 à 6 n'ont pas été livrées).
-pub const ENRICH_PROMPT_VERSION: u32 = 7;
+/// Version du prompt d'enrichissement de la famille `code` (DEC-062, DEC-157). Règle d'incrément
+/// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
+/// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
+/// propre à une famille n'incrémente que la sienne. Tout enrichissement conservé avec une
+/// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0 (consignes de forme des
+/// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
+/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
+/// 2 à 6 n'ont pas été livrées).
+pub const CODE_PROMPT_VERSION: u32 = 7;
+
+/// Version du prompt d'enrichissement de la famille `build` (DEC-062, DEC-157). Règle d'incrément
+/// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
+/// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
+/// propre à une famille n'incrémente que la sienne. Tout enrichissement conservé avec une
+/// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0 (consignes de forme des
+/// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
+/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
+/// 2 à 6 n'ont pas été livrées).
+pub const BUILD_PROMPT_VERSION: u32 = 7;
+
+/// Version du prompt d'enrichissement de la famille `données` (DEC-062, DEC-157). Règle d'incrément
+/// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
+/// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
+/// propre à une famille n'incrémente que la sienne. Tout enrichissement conservé avec une
+/// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0 (consignes de forme des
+/// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
+/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
+/// 2 à 6 n'ont pas été livrées).
+pub const DATA_PROMPT_VERSION: u32 = 7;
+
+/// Version du prompt d'enrichissement de la famille `markdown` (DEC-062, DEC-157). Règle d'incrément
+/// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
+/// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
+/// propre à une famille n'incrémente que la sienne (`CONCEPT_RULES` pour celle-ci). Tout enrichissement conservé avec une
+/// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0 (consignes de forme des
+/// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
+/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
+/// 2 à 6 n'ont pas été livrées).
+pub const MARKDOWN_PROMPT_VERSION: u32 = 7;
+
+/// Versions du prompt d'enrichissement des quatre familles (REQ-193).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptVersions {
+    pub code: u32,
+    pub build: u32,
+    pub data: u32,
+    pub markdown: u32,
+}
+
+impl PromptVersions {
+    /// Versions du code.
+    pub const CURRENT: PromptVersions = PromptVersions {
+        code: CODE_PROMPT_VERSION,
+        build: BUILD_PROMPT_VERSION,
+        data: DATA_PROMPT_VERSION,
+        markdown: MARKDOWN_PROMPT_VERSION,
+    };
+
+    /// Version de la famille du type `t`.
+    pub fn of(&self, t: FileType) -> u32 {
+        match prompt_family(t) {
+            PromptFamily::Code => self.code,
+            PromptFamily::Build => self.build,
+            PromptFamily::Data => self.data,
+            PromptFamily::Markdown => self.markdown,
+        }
+    }
+
+    /// Version de la famille du chemin ; un chemin sans type prend celle de `code`.
+    pub fn of_path(&self, path: &str) -> u32 {
+        FileType::of(path).map_or(self.code, |t| self.of(t))
+    }
+}
 
 /// Consignes de forme des résumés : ligne commune aux deux prompts système (DEC-135).
 pub const SUMMARY_RULES: &str = "Résumés (de nœud ou de concept) : une phrase de 25 mots au plus, qui dit le rôle ou la responsabilité de l'élément (ce qu'il fait et à quoi il sert), pas sa syntaxe ni sa signature ; ne répète pas son nom ; n'écris que ce que le contenu montre, sans rien supposer ni inventer. Omets (aucune entrée dans \"summaries\") un accesseur ou un mutateur trivial (il lit ou écrit un champ, sans autre effet) et une section vide ou réduite à son titre.";
@@ -31,32 +100,37 @@ pub const EXCERPT_RULES: &str = "Un fichier trop long est envoyé en extraits : 
 pub const KIND_RULES: &str = "Angle du résumé selon le genre du nœud, donné par le préfixe de son identifiant : module → ce que le module produit et à quoi lui servent ses dépendances ; type → sa responsabilité ; method → son effet et ce qu'elle renvoie ; table → son rôle métier et ses colonnes clés ; document → le sujet du document, ou ce que décrit ou configure un fichier de données (SQL, XML, JSON, YAML) ; section → le sujet qu'elle traite.";
 
 /// Famille d'un type de fichier dans la phrase des types du prompt (REQ-171).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Family {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptFamily {
     Code,
     Build,
     Data,
-    Doc,
+    Markdown,
+}
+
+/// Famille de prompt d'un type de fichier (REQ-193, DEC-157).
+pub fn prompt_family(t: FileType) -> PromptFamily {
+    file_type_label(t).0
 }
 
 /// Famille et libellé d'un type de fichier dans le prompt ; `match` exhaustif (REQ-171).
-fn file_type_label(t: FileType) -> (Family, &'static str) {
+fn file_type_label(t: FileType) -> (PromptFamily, &'static str) {
     match t {
-        FileType::Java => (Family::Code, "Java"),
-        FileType::Kotlin => (Family::Code, "Kotlin"),
-        FileType::Groovy => (Family::Code, "Groovy"),
-        FileType::Scala => (Family::Code, "Scala"),
-        FileType::JavaScript => (Family::Code, "JavaScript"),
-        FileType::TypeScript => (Family::Code, "TypeScript"),
-        FileType::Maven => (Family::Build, "Maven"),
-        FileType::Ivy => (Family::Build, "Ivy"),
-        FileType::Gradle => (Family::Build, "Gradle"),
-        FileType::Npm => (Family::Build, "npm"),
-        FileType::Sql => (Family::Data, "SQL"),
-        FileType::Xml => (Family::Data, "XML"),
-        FileType::Json => (Family::Data, "JSON"),
-        FileType::Yaml => (Family::Data, "YAML"),
-        FileType::Markdown => (Family::Doc, "Markdown"),
+        FileType::Java => (PromptFamily::Code, "Java"),
+        FileType::Kotlin => (PromptFamily::Code, "Kotlin"),
+        FileType::Groovy => (PromptFamily::Code, "Groovy"),
+        FileType::Scala => (PromptFamily::Code, "Scala"),
+        FileType::JavaScript => (PromptFamily::Code, "JavaScript"),
+        FileType::TypeScript => (PromptFamily::Code, "TypeScript"),
+        FileType::Maven => (PromptFamily::Build, "Maven"),
+        FileType::Ivy => (PromptFamily::Build, "Ivy"),
+        FileType::Gradle => (PromptFamily::Build, "Gradle"),
+        FileType::Npm => (PromptFamily::Build, "npm"),
+        FileType::Sql => (PromptFamily::Data, "SQL"),
+        FileType::Xml => (PromptFamily::Data, "XML"),
+        FileType::Json => (PromptFamily::Data, "JSON"),
+        FileType::Yaml => (PromptFamily::Data, "YAML"),
+        FileType::Markdown => (PromptFamily::Markdown, "Markdown"),
     }
 }
 
@@ -65,10 +139,10 @@ fn file_type_label(t: FileType) -> (Family, &'static str) {
 /// par `, ` avec `ou ` devant la dernière.
 pub fn file_types_phrase() -> String {
     let groups: Vec<String> = [
-        (Family::Code, "code "),
-        (Family::Build, "build "),
-        (Family::Data, "données "),
-        (Family::Doc, ""),
+        (PromptFamily::Code, "code "),
+        (PromptFamily::Build, "build "),
+        (PromptFamily::Data, "données "),
+        (PromptFamily::Markdown, ""),
     ]
     .into_iter()
     .filter_map(|(family, name)| {
@@ -546,7 +620,7 @@ pub fn lot_user_prompt(items: &[LotItem]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::DEFAULT_SUMMARY_LANGUAGE;
 
@@ -584,7 +658,7 @@ mod tests {
     }
 
     /// Empreinte BLAKE3 d'une liste de textes de prompt.
-    fn fingerprint_of(texts: &[String]) -> String {
+    pub(crate) fn fingerprint_of(texts: &[String]) -> String {
         blake3::hash(texts.join("\n<<<->>>\n").as_bytes())
             .to_hex()
             .to_string()
@@ -712,21 +786,153 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn req049_ac4_prompt_texts_are_frozen_next_to_the_prompt_version() {
-        // Changer une consigne, un gabarit, un schéma ou une note : incrémenter
-        // `ENRICH_PROMPT_VERSION`, puis mettre à jour le littéral ci-dessous.
-        assert_eq!(ENRICH_PROMPT_VERSION, 7);
+    /// Textes communs aux quatre familles (REQ-193) : les sept textes figés de la version 7, la
+    /// ligne `CONCEPT_RULES` + `\n` retirée des deux prompts système.
+    fn common_texts() -> Vec<String> {
+        let strip = |p: String| p.replacen(&format!("{CONCEPT_RULES}\n"), "", 1);
         let mut texts = texts_v6();
+        texts[1] = strip(texts[1].clone());
+        texts[4] = strip(texts[4].clone());
         texts.push(
             crate::llm::FormatFault::ALL
                 .map(crate::llm::FormatFault::note)
                 .join("\n"),
         );
+        texts
+    }
+
+    /// Textes propres à une famille : `CONCEPT_RULES` pour `markdown`, aucun pour les autres.
+    fn family_texts(f: PromptFamily) -> Vec<String> {
+        match f {
+            PromptFamily::Markdown => vec![CONCEPT_RULES.to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn family_fingerprint(f: PromptFamily) -> String {
+        let mut texts = common_texts();
+        texts.extend(family_texts(f));
+        fingerprint_of(&texts)
+    }
+
+    // Règle d'incrément (REQ-193) : changer un texte commun incrémente les quatre constantes de
+    // version ; changer un texte de famille n'incrémente que la sienne ; un texte nouveau propre
+    // à une famille s'ajoute à `family_texts`. Mettre ensuite à jour le littéral du test.
+
+    #[test]
+    fn req193_ac2_code_prompt_texts_are_frozen_next_to_its_version() {
+        assert_eq!(CODE_PROMPT_VERSION, 7);
         assert_eq!(
-            fingerprint_of(&texts),
-            "772f5652e95481e85eea6478ea9ce8b1736b5c63ca4facdf633a76e6ac678ff4",
-            "les textes du prompt ont changé : incrémentez ENRICH_PROMPT_VERSION"
+            family_fingerprint(PromptFamily::Code),
+            "fb5dd371b5d691663918f707b14040fd04177acd8de51df1a47ee7c8518c8c58",
+            "les textes du prompt de la famille code ont changé : incrémentez CODE_PROMPT_VERSION"
+        );
+    }
+
+    #[test]
+    fn req193_ac2_build_prompt_texts_are_frozen_next_to_its_version() {
+        assert_eq!(BUILD_PROMPT_VERSION, 7);
+        assert_eq!(
+            family_fingerprint(PromptFamily::Build),
+            "fb5dd371b5d691663918f707b14040fd04177acd8de51df1a47ee7c8518c8c58",
+            "les textes du prompt de la famille build ont changé : incrémentez BUILD_PROMPT_VERSION"
+        );
+    }
+
+    #[test]
+    fn req193_ac2_data_prompt_texts_are_frozen_next_to_its_version() {
+        assert_eq!(DATA_PROMPT_VERSION, 7);
+        assert_eq!(
+            family_fingerprint(PromptFamily::Data),
+            "fb5dd371b5d691663918f707b14040fd04177acd8de51df1a47ee7c8518c8c58",
+            "les textes du prompt de la famille données ont changé : incrémentez DATA_PROMPT_VERSION"
+        );
+    }
+
+    #[test]
+    fn req193_ac2_markdown_prompt_texts_are_frozen_next_to_its_version() {
+        assert_eq!(MARKDOWN_PROMPT_VERSION, 7);
+        assert_eq!(
+            family_fingerprint(PromptFamily::Markdown),
+            "9d17e47d478e48eda3256131bd7c2d26aa9e99a6bba2daddf443927ce287c3e1",
+            "les textes du prompt de la famille markdown ont changé : incrémentez MARKDOWN_PROMPT_VERSION"
+        );
+        assert_ne!(
+            family_fingerprint(PromptFamily::Markdown),
+            family_fingerprint(PromptFamily::Code)
+        );
+    }
+
+    #[test]
+    fn req193_ac3_concept_rules_are_in_each_system_prompt_and_in_no_common_text() {
+        let prompts = [
+            enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
+            lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
+        ];
+        for p in &prompts {
+            assert_eq!(p.matches(CONCEPT_RULES).count(), 1);
+        }
+        let common = common_texts();
+        for t in &common {
+            assert!(!t.contains(CONCEPT_RULES));
+        }
+        let line = format!("{CONCEPT_RULES}\n");
+        for (i, p) in [(1, &prompts[0]), (4, &prompts[1])] {
+            // Position de la ligne dans le prompt envoyé, relevée avant le retrait.
+            let pos = p.find(&line).unwrap();
+            let mut back = common[i].clone();
+            back.insert_str(pos, &line);
+            assert_eq!(&back, p);
+        }
+    }
+
+    #[test]
+    fn req193_ac1_each_file_type_has_the_version_of_its_family() {
+        use FileType::*;
+        let expected = [
+            (Java, 1),
+            (Kotlin, 1),
+            (Groovy, 1),
+            (Scala, 1),
+            (JavaScript, 1),
+            (TypeScript, 1),
+            (Maven, 2),
+            (Ivy, 2),
+            (Gradle, 2),
+            (Npm, 2),
+            (Sql, 3),
+            (Xml, 3),
+            (Json, 3),
+            (Yaml, 3),
+            (Markdown, 4),
+        ];
+        assert_eq!(expected.len(), FileType::ALL.len());
+        let v = PromptVersions {
+            code: 1,
+            build: 2,
+            data: 3,
+            markdown: 4,
+        };
+        for (t, n) in expected {
+            assert_eq!(v.of(t), n, "{t:?}");
+        }
+        for t in FileType::ALL {
+            assert!(expected.iter().any(|(e, _)| *e == t), "{t:?}");
+            assert_eq!(PromptVersions::CURRENT.of(t), 7, "{t:?}");
+        }
+        assert_eq!(v.of_path("src/A.java"), 1);
+        assert_eq!(v.of_path("pom.xml"), 2);
+        assert_eq!(v.of_path("app.yml"), 3);
+        assert_eq!(v.of_path("docs/a.md"), 4);
+        assert_eq!(v.of_path("inconnu.bin"), 1);
+        assert_eq!(
+            [
+                CODE_PROMPT_VERSION,
+                BUILD_PROMPT_VERSION,
+                DATA_PROMPT_VERSION,
+                MARKDOWN_PROMPT_VERSION
+            ],
+            [7; 4]
         );
     }
 

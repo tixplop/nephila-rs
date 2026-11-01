@@ -60,6 +60,13 @@ const ASK_SYSTEM_PROMPT: &str = concat!(
     "Exemple : {\"found\": true, \"answer\": \"Le total est calculé par Panier.total, appelée par Commande.valider.\", \"nodes\": [\"method:com.exemple.Panier.total\", \"method:com.exemple.Commande.valider\"]}",
 );
 
+/// Version du prompt de `query ask` (REQ-194, DEC-158). À incrémenter à chaque changement du
+/// prompt système, du gabarit utilisateur, des notes de correction (REQ-177, communes avec
+/// l'enrichissement) ou de la forme des lignes du contexte (nœuds et liens, figées par AC-160-4
+/// et AC-181-1). Rien ne la lit à l'exécution : un test fige l'empreinte de ces textes à côté
+/// d'elle ; elle sera la clé du futur cache des réponses (OPT-55).
+pub const ASK_PROMPT_VERSION: u32 = 1;
+
 pub fn ask_system_prompt() -> String {
     ASK_SYSTEM_PROMPT.to_string()
 }
@@ -85,6 +92,23 @@ Réponds par un seul objet JSON, sans autre texte :
 - si le contexte permet de répondre : {"found": true, "answer": "<réponse>", "nodes": ["<identifiant>"]}, où « nodes » contient au moins un identifiant exact copié du contexte, les plus pertinents d'abord ;
 - sinon : {"found": false}.
 Exemple : {"found": true, "answer": "Le total est calculé par Panier.total, appelée par Commande.valider.", "nodes": ["method:com.exemple.Panier.total", "method:com.exemple.Commande.valider"]}"#;
+
+    #[test]
+    fn req194_ac1_ask_prompt_texts_are_frozen_next_to_the_ask_prompt_version() {
+        assert_eq!(ASK_PROMPT_VERSION, 1);
+        let texts = vec![
+            ask_system_prompt(),
+            ask_user_prompt("Qui calcule le total ?", "Nœuds :\n- type:p.A\nLiens :\n"),
+            crate::llm::FormatFault::ALL
+                .map(crate::llm::FormatFault::note)
+                .join("\n"),
+        ];
+        assert_eq!(
+            crate::llm::enrich::tests::fingerprint_of(&texts),
+            "06aade965c007ad952503321dd92848c986a9518682bbbfa804e224c53a2d38c",
+            "le prompt de query ask a changé : incrémentez ASK_PROMPT_VERSION"
+        );
+    }
 
     #[test]
     fn req160_ac1_system_prompt_text() {

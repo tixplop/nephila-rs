@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::enrich::ENRICH_PROMPT_VERSION;
+use crate::llm::enrich::PromptVersions;
 
 use crate::error::{Error, Result};
 
@@ -460,6 +460,8 @@ pub struct Store {
     /// Journal des changements écrits depuis la dernière passe terminée (DEC-077) : `None` quand
     /// le graphe n'est pas marqué `à jour`.
     log: Option<ChangeLog>,
+    /// Versions du prompt d'enrichissement par famille (REQ-193) ; remplaçables par les tests.
+    prompt_versions: PromptVersions,
 }
 
 /// Ce que le stockage retient des écritures faites depuis la dernière passe terminée (DEC-077,
@@ -535,7 +537,14 @@ impl Store {
             written: std::collections::HashSet::new(),
             stale: true,
             log: None,
+            prompt_versions: PromptVersions::CURRENT,
         }
+    }
+
+    /// Remplace les versions de prompt (tests de REQ-193).
+    #[cfg(test)]
+    fn set_prompt_versions(&mut self, v: PromptVersions) {
+        self.prompt_versions = v;
     }
 
     /// Lit `meta.resolution` à l'ouverture en écriture : tout autre état que `à jour` compte
@@ -1150,7 +1159,7 @@ impl Store {
     /// Applique en une transaction le résultat de l'enrichissement d'un fichier : remplace ses
     /// déclarations et références d'origine `llm` (nœuds concept compris) et les résumés de ses
     /// nœuds, puis enregistre l'enrichissement conservé du chemin (`hash` = empreinte du contenu,
-    /// `model`, `ENRICH_PROMPT_VERSION`, payload). `summaries` : couples (identifiant, texte), les
+    /// `model`, version du prompt de la famille du chemin, payload). `summaries` : couples (identifiant, texte), les
     /// identifiants devant être déclarés par le fichier. Les références `llm` doivent partir d'un
     /// nœud déclaré par le fichier.
     #[allow(clippy::too_many_arguments)]
@@ -1195,7 +1204,14 @@ impl Store {
         let track = self.log.is_some();
         let mut pending = ChangeLog::default();
         for item in items {
-            pending.merge(write_enrichment(&tx, model, language, item, track)?);
+            pending.merge(write_enrichment(
+                &tx,
+                model,
+                language,
+                item,
+                track,
+                &self.prompt_versions,
+            )?);
         }
         commit_counted(tx)?;
         self.merge_log(pending);
@@ -1205,7 +1221,7 @@ impl Store {
 
     /// Fichiers indexés à enrichir : dans la portée de l'enrichissement (documents, plus les
     /// fichiers de code si `meta.enrich_code`, REQ-050) et sans enrichissement conservé pour
-    /// (chemin, empreinte, modèle effectif, `ENRICH_PROMPT_VERSION`). Le modèle effectif est celui
+    /// (chemin, empreinte, modèle effectif, version du prompt de la famille du chemin). Le modèle effectif est celui
     /// de `meta.enrich_model` (écrit par `build`/`update` LLM actif) ; absent, le modèle n'est
     /// pas comparé.
     pub fn files_to_enrich(&self) -> Result<Vec<FileRecord>> {
@@ -1238,31 +1254,38 @@ impl Store {
     ) -> Result<Vec<FileRecord>> {
         // Un graphe lu en schéma 5 à 9 n'a pas la colonne : condition d'avant, sans la langue.
         let with_language = self.version >= SCHEMA_VERSION;
-        let up_to_date = if with_language {
-            UP_TO_DATE
-        } else {
-            UP_TO_DATE_WITHOUT_LANGUAGE
-        };
         let all = no_model_is_all && model.is_none();
+        let language_cond = if with_language {
+            " AND (?2 IS NULL OR e.language = ?2)"
+        } else {
+            ""
+        };
         let sql = if all {
-            "SELECT f.path FROM files f WHERE f.state = 'indexed' ORDER BY f.path".to_string()
+            "SELECT f.path, NULL FROM files f WHERE f.state = 'indexed' ORDER BY f.path".to_string()
         } else {
             format!(
-                "SELECT f.path FROM files f WHERE f.state = 'indexed' AND NOT EXISTS ({up_to_date}) ORDER BY f.path"
+                "SELECT f.path, e.prompt_version FROM files f LEFT JOIN enrichments e
+                 ON e.path = f.path AND e.content_hash = f.hash AND (?1 IS NULL OR e.model = ?1){language_cond}
+                 WHERE f.state = 'indexed' ORDER BY f.path"
             )
         };
         let mut st = self.conn.prepare_cached(&sql).map_err(db_err)?;
-        let first = |r: &rusqlite::Row<'_>| r.get::<_, String>(0);
-        let paths: Vec<String> = if all {
-            st.query_map([], first)
+        let row = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, Option<u32>>(1)?));
+        let rows: Vec<(String, Option<u32>)> = if all {
+            st.query_map([], row)
         } else if with_language {
-            st.query_map(params![ENRICH_PROMPT_VERSION, model, language], first)
+            st.query_map(params![model, language], row)
         } else {
-            st.query_map(params![ENRICH_PROMPT_VERSION, model], first)
+            st.query_map(params![model], row)
         }
         .map_err(db_err)?
         .collect::<std::result::Result<_, _>>()
         .map_err(db_err)?;
+        let paths: Vec<String> = rows
+            .into_iter()
+            .filter(|(p, v)| *v != Some(self.prompt_versions.of_path(p)) || all)
+            .map(|(p, _)| p)
+            .collect();
         let set: std::collections::HashSet<String> = paths
             .into_iter()
             .filter(|p| code || crate::llm::enrich::is_markdown(p))
@@ -2829,6 +2852,7 @@ fn write_enrichment(
     language: &str,
     item: &EnrichmentWrite,
     track: bool,
+    versions: &PromptVersions,
 ) -> Result<ChangeLog> {
     let EnrichmentWrite {
         path,
@@ -2874,7 +2898,7 @@ fn write_enrichment(
         path,
         hash,
         model,
-        ENRICH_PROMPT_VERSION,
+        versions.of_path(path),
         json,
         language
     ])
@@ -3230,16 +3254,6 @@ fn release_file(
     touched.extend(released);
     Ok(())
 }
-
-/// Condition « enrichissement conservé à jour » des schémas 5 à 9 (`?1` = version du prompt,
-/// `?2` = modèle ou NULL).
-const UP_TO_DATE_WITHOUT_LANGUAGE: &str = "SELECT 1 FROM enrichments e WHERE e.path = f.path
-    AND e.content_hash = f.hash AND e.prompt_version = ?1 AND (?2 IS NULL OR e.model = ?2)";
-
-/// Comme `UP_TO_DATE_WITHOUT_LANGUAGE`, avec `?3` = langue des résumés ou NULL (DEC-138).
-const UP_TO_DATE: &str = "SELECT 1 FROM enrichments e WHERE e.path = f.path
-    AND e.content_hash = f.hash AND e.prompt_version = ?1 AND (?2 IS NULL OR e.model = ?2)
-    AND (?3 IS NULL OR e.language = ?3)";
 
 /// Entrée d'enrichissement conservée (DEC-062), sans son contenu.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4609,7 +4623,7 @@ mod tests {
         let e = st.enrichment_entry("a.md").unwrap().unwrap();
         assert_eq!(
             (e.content_hash.as_str(), e.model.as_str(), e.prompt_version),
-            ("h", "m", ENRICH_PROMPT_VERSION)
+            ("h", "m", PromptVersions::CURRENT.of_path("a.md"))
         );
         st.reset().unwrap();
         assert!(st.enrichment_entry("a.md").unwrap().is_some());
@@ -4690,6 +4704,112 @@ mod tests {
             )
             .unwrap();
         assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+    }
+
+    /// Quatre fichiers (une famille chacun) enrichis avec les versions 11/12/13/14.
+    fn four_families() -> (tempfile::TempDir, Store) {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.set_prompt_versions(PromptVersions {
+            code: 11,
+            build: 12,
+            data: 13,
+            markdown: 14,
+        });
+        let paths = ["a.md", "A.java", "pom.xml", "app.yml"];
+        let files: Vec<_> = paths.iter().map(|p| file(p)).collect();
+        st.insert_pending_files(&files).unwrap();
+        for p in paths {
+            st.replace_structure(p, &[ty(&format!("p.{p}"), p)], &[])
+                .unwrap();
+            st.apply_enrichment(p, "h", "m", "français", &[], &[], &[])
+                .unwrap();
+        }
+        st.set_enrich_model("m").unwrap();
+        st.set_enrich_language("français").unwrap();
+        st.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('enrich_code', 'true')",
+                [],
+            )
+            .unwrap();
+        (dir, st)
+    }
+
+    fn to_enrich_paths(st: &Store) -> Vec<String> {
+        st.files_to_enrich()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect()
+    }
+
+    #[test]
+    fn req193_ac4_entries_carry_the_version_of_their_family_and_only_it_is_compared() {
+        let (_d, mut st) = four_families();
+        for (p, v) in [
+            ("a.md", 14),
+            ("A.java", 11),
+            ("pom.xml", 12),
+            ("app.yml", 13),
+        ] {
+            assert_eq!(
+                st.enrichment_entry(p).unwrap().unwrap().prompt_version,
+                v,
+                "{p}"
+            );
+        }
+        assert!(to_enrich_paths(&st).is_empty());
+        assert!(st
+            .files_to_enrich_for(Some("m"), Some("français"), true)
+            .unwrap()
+            .is_empty());
+        st.conn
+            .execute(
+                "UPDATE enrichments SET prompt_version = 7 WHERE path = 'pom.xml'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(to_enrich_paths(&st), ["pom.xml"]);
+        st.conn
+            .execute(
+                "UPDATE enrichments SET prompt_version = 12 WHERE path = 'pom.xml'",
+                [],
+            )
+            .unwrap();
+        let base = PromptVersions {
+            code: 11,
+            build: 12,
+            data: 13,
+            markdown: 14,
+        };
+        for (name, changed) in [
+            (
+                "a.md",
+                PromptVersions {
+                    markdown: 15,
+                    ..base
+                },
+            ),
+            ("A.java", PromptVersions { code: 15, ..base }),
+            ("pom.xml", PromptVersions { build: 15, ..base }),
+            ("app.yml", PromptVersions { data: 15, ..base }),
+        ] {
+            st.set_prompt_versions(changed);
+            assert_eq!(to_enrich_paths(&st), [name], "{name}");
+            let given = st
+                .files_to_enrich_for(Some("m"), Some("français"), true)
+                .unwrap();
+            assert_eq!(
+                given.into_iter().map(|f| f.path).collect::<Vec<_>>(),
+                [name],
+                "{name}"
+            );
+            // Graphe lu en schéma 5 à 9 : même règle, sans la langue.
+            st.version = 9;
+            assert_eq!(to_enrich_paths(&st), [name], "{name} (schéma 9)");
+            st.version = SCHEMA_VERSION;
+        }
     }
 
     /// Fichier `a.md` enrichi en `m` / `français`, `meta` alignée sur ces valeurs.
