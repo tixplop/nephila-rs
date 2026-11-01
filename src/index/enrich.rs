@@ -194,12 +194,20 @@ enum Outcome {
     Failed(String, Error),
 }
 
+/// Passage d'un lot (DEC-161) : un fichier absent d'une réponse conforme n'est renvoyé qu'une
+/// fois, par un lot de second passage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pass {
+    First,
+    Second,
+}
+
 /// Unité de travail d'un fil (DEC-063) : un lot de fichiers envoyés ensemble, un gros fichier
 /// envoyé seul (REQ-027) qui se transforme en appels dans la file commune, ou un de ces appels
 /// (morceau × groupe de nœuds, REQ-047).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Unit<'a> {
-    Lot(Vec<&'a FileRecord>),
+    Lot(Vec<&'a FileRecord>, Pass),
     Big(&'a FileRecord),
     Call {
         file: &'a FileRecord,
@@ -219,7 +227,7 @@ impl Unit<'_> {
     /// Fichiers pas encore commencés que cette unité représente.
     fn file_count(&self) -> usize {
         match self {
-            Unit::Lot(v) => v.len(),
+            Unit::Lot(v, _) => v.len(),
             Unit::Big(_) => 1,
             Unit::Call { .. } => 0,
         }
@@ -273,7 +281,7 @@ pub(crate) fn form_units_by_nodes<'a>(
         let n = nodes(f);
         if f.size > max_chunk_chars as u64 || n > MAX_NODES_PER_CALL {
             if !current.is_empty() {
-                units.push(Unit::Lot(std::mem::take(&mut current)));
+                units.push(Unit::Lot(std::mem::take(&mut current), Pass::First));
                 total = 0;
                 total_nodes = 0;
             }
@@ -285,7 +293,7 @@ pub(crate) fn form_units_by_nodes<'a>(
                 || total + f.size > max_chunk_chars as u64
                 || total_nodes + n > MAX_NODES_PER_CALL)
         {
-            units.push(Unit::Lot(std::mem::take(&mut current)));
+            units.push(Unit::Lot(std::mem::take(&mut current), Pass::First));
             total = 0;
             total_nodes = 0;
         }
@@ -294,7 +302,7 @@ pub(crate) fn form_units_by_nodes<'a>(
         current.push(f);
     }
     if !current.is_empty() {
-        units.push(Unit::Lot(current));
+        units.push(Unit::Lot(current, Pass::First));
     }
     units
 }
@@ -307,8 +315,9 @@ type Take<'t> = &'t dyn Fn(usize, usize) -> bool;
 enum Step<'a> {
     /// Résultats par fichier, et l'erreur de l'appel (pour la politique) s'il y a eu un appel.
     Finished(Vec<Outcome>, Option<Option<Error>>),
-    /// Un fichier envoyé seul : ses appels, dans l'ordre du plan, à mettre dans la file.
-    Calls(Vec<Outcome>, Vec<Unit<'a>>),
+    /// Des unités à mettre en tête de la file (appels d'un fichier envoyé seul, moitiés d'un lot
+    /// tronqué, fichiers renvoyés), et l'erreur de l'appel pour la politique s'il y a eu un appel.
+    Calls(Vec<Outcome>, Vec<Unit<'a>>, Option<Option<Error>>),
 }
 
 /// Où lire les fichiers à enrichir : racine du dépôt et chemins réels déjà connus (DEC-070).
@@ -342,8 +351,12 @@ fn run_unit<'a>(
     max_calls: Option<usize>,
     take: Take<'_>,
 ) -> Step<'a> {
+    let pass = match unit {
+        Unit::Lot(_, pass) => *pass,
+        _ => Pass::First,
+    };
     let files: Vec<&'a FileRecord> = match unit {
-        Unit::Lot(v) => v.clone(),
+        Unit::Lot(v, _) => v.clone(),
         Unit::Big(f) => vec![*f],
         Unit::Call { .. } => unreachable!("un appel ne passe pas par run_unit"),
     };
@@ -385,7 +398,7 @@ fn run_unit<'a>(
                         outcomes.push(Outcome::Failed(f.path.clone(), e.clone()));
                         Step::Finished(outcomes, Some(Some(e)))
                     } else if take(k, 1) {
-                        Step::Calls(outcomes, calls)
+                        Step::Calls(outcomes, calls, None)
                     } else {
                         // Réservation refusée : aucune issue, aucun appel mis en file.
                         Step::Finished(outcomes, None)
@@ -415,19 +428,18 @@ fn run_unit<'a>(
                 Err(Error::Truncated(_)) => {
                     let mut first: Vec<&'a FileRecord> = readable.iter().map(|(f, _)| *f).collect();
                     let second = first.split_off(first.len().div_ceil(2));
-                    let name = |half: &[&FileRecord]| match half {
-                        [only] => only.path.clone(),
-                        [head, ..] => format!("lot {} +{}", head.path, half.len() - 1),
-                        [] => String::new(),
-                    };
                     trace!(
                         "llm enrich découpe lot {} +{} [1/1] en {} et {}",
                         items[0].file,
                         items.len() - 1,
-                        name(&first),
-                        name(&second)
+                        unit_name(&first),
+                        unit_name(&second)
                     );
-                    Step::Calls(outcomes, vec![Unit::Lot(first), Unit::Lot(second)])
+                    Step::Calls(
+                        outcomes,
+                        vec![Unit::Lot(first, pass), Unit::Lot(second, pass)],
+                        None,
+                    )
                 }
                 // Essai refusé par le plafond : aucune issue pour les fichiers du lot.
                 Err(Error::Capped) => Step::Finished(outcomes, None),
@@ -441,20 +453,41 @@ fn run_unit<'a>(
                 Ok(results) => {
                     let mut by_path: HashMap<String, Result<Enrichment>> =
                         results.into_iter().collect();
+                    let mut absent: Vec<&'a FileRecord> = Vec::new();
                     for (f, _) in &readable {
-                        outcomes.push(match by_path.remove(&f.path) {
-                            Some(Ok(x)) => Outcome::Done((*f).clone(), x),
-                            Some(Err(e)) => Outcome::Failed(f.path.clone(), e),
-                            None => Outcome::Failed(
+                        match by_path.remove(&f.path) {
+                            Some(Ok(x)) => outcomes.push(Outcome::Done((*f).clone(), x)),
+                            // Sans entrée dans la réponse : renvoyé une fois au premier passage.
+                            _ if pass == Pass::First => absent.push(f),
+                            Some(Err(e)) => outcomes.push(Outcome::Failed(f.path.clone(), e)),
+                            None => outcomes.push(Outcome::Failed(
                                 f.path.clone(),
                                 Error::Message(format!("{} : absent de la réponse du lot", f.path)),
-                            ),
-                        });
+                            )),
+                        }
                     }
-                    Step::Finished(outcomes, Some(None))
+                    if absent.is_empty() {
+                        Step::Finished(outcomes, Some(None))
+                    } else {
+                        trace!(
+                            "llm enrich renvoi {} : sans entrée dans la réponse de {} [1/1]",
+                            unit_name(&absent),
+                            unit_name(&readable.iter().map(|(f, _)| *f).collect::<Vec<_>>())
+                        );
+                        Step::Calls(outcomes, vec![Unit::Lot(absent, Pass::Second)], Some(None))
+                    }
                 }
             }
         }
+    }
+}
+
+/// Nom d'une unité dans les traces : le chemin d'un fichier seul, sinon `lot <premier> +<n−1>`.
+fn unit_name(files: &[&FileRecord]) -> String {
+    match files {
+        [only] => only.path.clone(),
+        [head, ..] => format!("lot {} +{}", head.path, files.len() - 1),
+        [] => String::new(),
     }
 }
 
@@ -983,7 +1016,7 @@ pub(crate) fn estimate(
     };
     for unit in &units {
         match unit {
-            Unit::Lot(v) if v.len() >= 2 => {
+            Unit::Lot(v, _) if v.len() >= 2 => {
                 let items: Vec<LotItem> = v
                     .iter()
                     .map(|f| LotItem {
@@ -998,7 +1031,7 @@ pub(crate) fn estimate(
                     + lot_user_prompt(&items).len()
                     + v.iter().map(|f| f.size as usize).sum::<usize>();
             }
-            Unit::Lot(v) => {
+            Unit::Lot(v, _) => {
                 for f in v {
                     let requested = node_ids(f);
                     est.calls += 1;
@@ -1447,8 +1480,8 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                         Vec::new(),
                         true,
                     ),
-                    Step::Calls(outcomes, calls) => (
-                        None,
+                    Step::Calls(outcomes, calls, call) => (
+                        call,
                         (!outcomes.is_empty()).then_some(Msg::Outcomes(outcomes)),
                         calls,
                         true,
@@ -1862,7 +1895,7 @@ mod tests {
         units
             .iter()
             .map(|u| match u {
-                Unit::Lot(v) => v
+                Unit::Lot(v, _) => v
                     .iter()
                     .map(|f| f.path.as_str())
                     .collect::<Vec<_>>()
@@ -2213,7 +2246,7 @@ mod tests {
                     let mut seen: Vec<&str> = Vec::new();
                     for u in &units {
                         match u {
-                            Unit::Lot(v) => {
+                            Unit::Lot(v, _) => {
                                 assert!(!v.is_empty(), "{ctx}");
                                 assert!(v.len() <= batch, "{ctx}");
                                 assert!(
@@ -3152,6 +3185,183 @@ mod tests {
         );
     }
 
+    /// Faux `Llm` du second passage (DEC-161) : un lot qui ne contient aucun fichier déjà omis est
+    /// de premier passage et omet son rang `omit` (à partir de 0, ceux qui existent) ; un lot
+    /// qui en contient un est de second passage et omet `omit_again`. `truncate` : le lot de ce
+    /// nom est tronqué. Les appels sont notés dans l'ordre (`"abcd"`, `"b"`…).
+    struct Passes {
+        calls: Mutex<Vec<String>>,
+        omitted: Mutex<Vec<String>>,
+        omit: Vec<usize>,
+        omit_again: Vec<String>,
+        truncate: Option<&'static str>,
+    }
+
+    impl Passes {
+        fn new(omit: &[usize], omit_again: &[&str], truncate: Option<&'static str>) -> Passes {
+            Passes {
+                calls: Mutex::new(Vec::new()),
+                omitted: Mutex::new(Vec::new()),
+                omit: omit.to_vec(),
+                omit_again: omit_again.iter().map(|s| s.to_string()).collect(),
+                truncate,
+            }
+        }
+    }
+
+    impl Llm for Passes {
+        fn enrich(
+            &self,
+            file: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(file.trim_end_matches(".txt").into());
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            let names: Vec<&str> = items
+                .iter()
+                .map(|i| i.file.trim_end_matches(".txt"))
+                .collect();
+            self.calls.lock().unwrap().push(names.concat());
+            if self.truncate == Some(names.concat().as_str()) {
+                return Err(Error::Truncated("tronquée".into()));
+            }
+            let mut omitted = self.omitted.lock().unwrap();
+            let second = names.iter().any(|n| omitted.iter().any(|o| o == n));
+            let mut out = Vec::new();
+            for (rank, it) in items.iter().enumerate() {
+                let name = names[rank];
+                let drop_it = if second {
+                    self.omit_again.iter().any(|o| o == name)
+                } else {
+                    self.omit.contains(&rank)
+                };
+                if drop_it {
+                    omitted.push(name.to_string());
+                    out.push((
+                        it.file.clone(),
+                        Err(Error::Message(format!(
+                            "{} : absent de la réponse du lot",
+                            it.file
+                        ))),
+                    ));
+                } else {
+                    out.push((it.file.clone(), Ok(Enrichment::default())));
+                }
+            }
+            Ok(out)
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    type PassesRun = (Vec<String>, Vec<(String, Error)>, BuildReport, Vec<String>);
+
+    /// Fichiers `<nom>.txt` d'un dépôt temporaire, enrichis avec `llm` (`concurrency = 1`) ;
+    /// rend les appels, les échecs, le rapport et les lignes de progression.
+    fn run_passes(names: &[&str], batch_files: usize, llm: &Passes) -> PassesRun {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for n in names {
+            let name = format!("{n}.txt");
+            std::fs::write(dir.path().join(&name), "texte\n").unwrap();
+            files.push(rec(&name, 6));
+        }
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(&files).unwrap();
+        declare_one_node(&mut store, &files);
+        let mut report = BuildReport::default();
+        let opts = IndexOptions {
+            jobs: 1,
+            concurrency: 1,
+            max_chunk_chars: 1000,
+            batch_files,
+            format_retries: 0,
+            enrich_code: false,
+            max_calls: None,
+        };
+        progress::init(true);
+        progress::take_captured();
+        let failures = enrich_with_stop(
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+            },
+            &files,
+            &opts,
+            llm,
+            &mut store,
+            &mut report,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let lines = progress::take_captured();
+        progress::init(false);
+        let calls = llm.calls.lock().unwrap().clone();
+        (calls, failures, report, lines)
+    }
+
+    /// AC-199-4 : les fichiers omis d'un lot de premier passage sont renvoyés une fois, en tête
+    /// de file, et avancent une seule fois dans la progression.
+    #[test]
+    fn req199_ac4_absent_files_are_resent_once_in_order() {
+        let llm = Passes::new(&[1, 3], &[], None);
+        let (calls, failures, report, lines) = run_passes(&["a", "b", "c", "d", "e"], 4, &llm);
+        assert_eq!(calls, ["abcd", "bd", "e"]);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            lines,
+            [
+                "progression: enrichissement 0 % (0/5 fichiers)",
+                "progression: enrichissement 40 % (2/5 fichiers)",
+                "progression: enrichissement 80 % (4/5 fichiers)",
+                "progression: enrichissement 100 % (5/5 fichiers)",
+            ]
+        );
+    }
+
+    #[test]
+    fn req199_ac4_truncated_lot_halves_keep_resending_their_absent_files() {
+        let llm = Passes::new(&[1], &[], Some("abcd"));
+        let (calls, failures, report, lines) = run_passes(&["a", "b", "c", "d"], 4, &llm);
+        assert_eq!(calls, ["abcd", "ab", "b", "cd", "d"]);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            lines.last().unwrap(),
+            "progression: enrichissement 100 % (4/4 fichiers)"
+        );
+    }
+
+    /// DEC-161 (3) : un fichier encore absent de la réponse du lot renvoyé échoue, sans
+    /// troisième envoi.
+    #[test]
+    fn req199_second_pass_still_absent_file_fails_without_third_send() {
+        let llm = Passes::new(&[1, 2], &["c"], None);
+        let (calls, failures, report, _) = run_passes(&["a", "b", "c"], 3, &llm);
+        assert_eq!(calls, ["abc", "bc"]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].0, "c.txt");
+        assert!(
+            failures[0]
+                .1
+                .to_string()
+                .contains("absent de la réponse du lot"),
+            "{}",
+            failures[0].1
+        );
+        assert_eq!(report.failed, 1);
+    }
+
     /// Faux `Llm` qui identifie chaque appel par fichier et indice (`"A#2"`, ou `"lot:S0,S1"`
     /// pour un lot), mesure les appels simultanés et force les `rendezvous` premiers appels à
     /// se rencontrer (AC-051-3, AC-051-5).
@@ -3794,7 +4004,11 @@ mod tests {
     fn req186_next_unit_closes_the_queue_at_the_cap_without_touching_stop() {
         let files = unit_files(2);
         let shared = Mutex::new(Shared {
-            queue: vec![Unit::Lot(vec![&files[0]]), Unit::Lot(vec![&files[1]])].into(),
+            queue: vec![
+                Unit::Lot(vec![&files[0]], Pass::First),
+                Unit::Lot(vec![&files[1]], Pass::First),
+            ]
+            .into(),
             failed: HashSet::new(),
             expanding: 0,
         });
@@ -3824,9 +4038,9 @@ mod tests {
         let files: &'static [FileRecord] = Box::leak(files.into_boxed_slice());
         let shared = Mutex::new(Shared {
             queue: vec![
-                Unit::Lot(vec![&files[0]]),
+                Unit::Lot(vec![&files[0]], Pass::First),
                 call(&files[1]),
-                Unit::Lot(vec![&files[0]]),
+                Unit::Lot(vec![&files[0]], Pass::First),
             ]
             .into(),
             failed: HashSet::new(),

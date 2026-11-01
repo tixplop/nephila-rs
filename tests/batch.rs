@@ -523,7 +523,7 @@ fn lot_entry(i: usize) -> String {
 }
 
 #[test]
-fn req027_ac7_omitted_file_stays_pending_and_update_resends_only_it() {
+fn req199_ac6_omitted_file_is_resent_once_in_the_same_build() {
     let reply = format!(
         r#"{{"version":3,"files":[{},{},{{"file":"autre/Inconnu.java","summaries":[],"concepts":[]}}]}}"#,
         lot_entry(0),
@@ -538,15 +538,9 @@ fn req027_ac7_omitted_file_stays_pending_and_update_resends_only_it() {
     let env = server_env(&server, 3);
     let o = run_server(&env, "build");
     let err = stderr(&o);
-    assert!(!o.status.success(), "{err}");
-    assert!(err.contains("src/F01.java"), "{err}");
-    assert!(err.contains("absent de la réponse du lot"), "{err}");
+    assert!(o.status.success(), "{err}");
     assert!(err.contains("autre/Inconnu.java"), "{err}");
-    assert_eq!(pending(&env), vec!["src/F01.java"]);
-    assert_eq!(env.summaries().len(), 2);
-
-    let o = run_server(&env, "update");
-    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(!err.contains("absent de la réponse du lot"), "{err}");
     let reqs: Vec<_> = server
         .requests()
         .into_iter()
@@ -554,6 +548,7 @@ fn req027_ac7_omitted_file_stays_pending_and_update_resends_only_it() {
         .collect();
     assert_eq!(reqs.len(), 2);
     assert!(reqs[1].body.contains("F01") && !reqs[1].body.contains("F02"));
+    assert_eq!(env.summaries().len(), 3);
     assert_eq!(to_enrich(&env), 0);
 }
 

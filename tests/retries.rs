@@ -568,7 +568,14 @@ fn req038_ac6_lot_omitting_a_file_is_sent_once() {
         )
     };
     let reply = format!(r#"{{"version":3,"files":[{},{}]}}"#, entry(0), entry(2));
-    let server = FakeServer::start(vec![(200, openai_reply(&reply))]);
+    // AC-199-6 remplace AC-027-7 : le fichier omis est renvoyé seul (2e requête), sans nouvel
+    // essai de format du lot.
+    let single =
+        r#"{"version":2,"summaries":[{"node":"type:p.F01","summary":"résumé 01"}],"concepts":[]}"#;
+    let server = FakeServer::start(vec![
+        (200, openai_reply(&reply)),
+        (200, openai_reply(single)),
+    ]);
     let env = Env::new(
         3,
         &format!(
@@ -577,9 +584,11 @@ fn req038_ac6_lot_omitting_a_file_is_sent_once() {
         ),
     );
     let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
-    assert!(!o.status.success());
-    assert_eq!(posts(&server).len(), 1, "{}", stderr(&o));
-    assert_eq!(env.to_enrich(), 1);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let reqs = posts(&server);
+    assert_eq!(reqs.len(), 2, "{}", stderr(&o));
+    assert!(reqs[1].body.contains("F01") && !reqs[1].body.contains("F02"));
+    assert_eq!(env.to_enrich(), 0);
 }
 
 // ---- Option --format-retries (REQ-038, T-079) ----

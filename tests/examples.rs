@@ -2390,3 +2390,21 @@ fn REQ197_AC3_AC6_readme_model_override() {
     assert!(vers.ends_with(" Si le `.nephila.toml` d'un dépôt impose un modèle qui ferait réenrichir plus de 50 fichiers déjà enrichis, `build` et `update` refusent : ajoutez `--accept-project-model`, ou `model_override = \"allow\"` dans la configuration personnelle."));
     assert!(vers.contains("puis lancez `nephila update`. Si le"));
 }
+
+#[test]
+fn REQ199_AC10_readme_fichier_absent_d_une_reponse_de_lot() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+    let section = readme_section(&readme, "### Échecs et nouveaux essais");
+    let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+    let tronquee = bullets
+        .iter()
+        .position(|l| l.starts_with("- **Réponse tronquée**"))
+        .unwrap();
+    assert_eq!(
+        bullets[tronquee + 1],
+        "- **Fichier absent d'une réponse de lot** : renvoyé une fois, avec les autres absents du même lot ; encore absent, il échoue (`absent de la réponse du lot`)."
+    );
+    assert!(bullets[tronquee + 2].starts_with("- **Ce qui reste**"));
+    assert_eq!(bullets.len(), 5, "{bullets:?}");
+}

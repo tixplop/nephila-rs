@@ -538,6 +538,15 @@ struct RawLotEntry {
     concepts: Vec<RawConcept>,
 }
 
+/// Forme normalisée d'un chemin de réponse : espaces de bord retirés, `\` en `/`, `./` de tête retirés.
+fn norm_path(path: &str) -> String {
+    let mut p = path.trim().replace('\\', "/");
+    while let Some(rest) = p.strip_prefix("./") {
+        p = rest.to_string();
+    }
+    p
+}
+
 /// Analyse strictement la réponse version 3 d'un lot puis filtre chaque entrée selon les nœuds
 /// du fichier qu'elle nomme. Une réponse illisible ou d'une autre version rend tout le lot
 /// non conforme (`Err`) ; un fichier du lot sans entrée échoue seul.
@@ -552,7 +561,24 @@ pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
     let mut rejected = Vec::new();
     let mut found: Vec<Option<Enrichment>> = vec![None; items.len()];
     for entry in raw.files {
-        let Some(i) = items.iter().position(|it| it.file == entry.file) else {
+        let wanted = norm_path(&entry.file);
+        let by_norm = || {
+            let same: Vec<usize> = (0..items.len())
+                .filter(|&i| norm_path(&items[i].file) == wanted)
+                .collect();
+            // Plusieurs fichiers de même forme normalisée : l'entrée n'est rattachable que si
+            // tous ont déjà la leur (elle est alors « en double »), sinon elle est hors du lot.
+            match same.as_slice() {
+                [i] => Some(*i),
+                [i, ..] if same.iter().all(|&j| found[j].is_some()) => Some(*i),
+                _ => None,
+            }
+        };
+        let Some(i) = items
+            .iter()
+            .position(|it| it.file == entry.file)
+            .or_else(by_norm)
+        else {
             rejected.push(format!("entrée pour {} (fichier hors du lot)", entry.file));
             continue;
         };
@@ -563,7 +589,7 @@ pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
         found[i] = Some(filter_raw(
             entry.summaries,
             entry.concepts,
-            &entry.file,
+            &items[i].file,
             &items[i].node_ids,
         ));
     }
@@ -1306,6 +1332,42 @@ pub(crate) mod tests {
         let r = l.into_results();
         let a = r[0].1.as_ref().unwrap();
         assert_eq!(a.rejected.len(), 2);
+    }
+
+    #[test]
+    fn req198_ac1_parse_lot_normalizes_response_paths() {
+        let items = [
+            item("src/A.java", &["type:A"]),
+            item("src/B.java", &["type:B"]),
+            item("docs/c.md", &["document:docs/c.md"]),
+        ];
+        let json = r#"{"version":3,"files":[
+            {"file":"./src/A.java","summaries":[{"node":"type:Z","summary":"hors liste"}],"concepts":[]},
+            {"file":" src\\B.java ","summaries":[],"concepts":[]},
+            {"file":"docs/c.md","summaries":[],"concepts":[]}]}"#;
+        let l = parse_lot(json, &items).unwrap();
+        assert!(l.rejected.is_empty(), "{:?}", l.rejected);
+        assert!(l.files.iter().all(|(_, r)| r.is_ok()), "{:?}", l.files);
+        let a = l.files[0].1.as_ref().unwrap();
+        assert_eq!(a.rejected.len(), 1, "{:?}", a.rejected);
+    }
+
+    #[test]
+    fn req198_ac2_parse_lot_exact_path_first_and_ambiguity() {
+        let items = [item("a\\b.md", &[]), item("a/b.md", &[])];
+        let json = r#"{"version":3,"files":[
+            {"file":"a\\b.md","summaries":[],"concepts":[]},
+            {"file":"a/b.md","summaries":[],"concepts":[]},
+            {"file":"./a/b.md","summaries":[],"concepts":[]}]}"#;
+        let l = parse_lot(json, &items).unwrap();
+        assert!(l.files.iter().all(|(_, r)| r.is_ok()), "{:?}", l.files);
+        assert_eq!(l.rejected, vec!["entrée en double pour ./a/b.md"]);
+
+        let items = [item("x/a.md", &[]), item("y/a.md", &[])];
+        let json = r#"{"version":3,"files":[{"file":"a.md","summaries":[],"concepts":[]}]}"#;
+        let l = parse_lot(json, &items).unwrap();
+        assert_eq!(l.rejected, vec!["entrée pour a.md (fichier hors du lot)"]);
+        assert!(l.files.iter().all(|(_, r)| r.is_err()));
     }
 
     #[test]
