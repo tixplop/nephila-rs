@@ -82,6 +82,7 @@ fn parse_context_chars(s: &str) -> std::result::Result<usize, String> {
     }
 }
 
+const ACCEPT_PROJECT_MODEL_HELP: &str = "Accepte le modèle de .nephila.toml pour cette commande, même s'il fait réenrichir plus de 50 fichiers déjà enrichis (voir `model_override` de la configuration ; défaut : refus au-delà de 50)";
 const MAX_CALLS_HELP: &str = "Nombre maximal d'appels d'enrichissement de cette commande, nouveaux essais de format compris ; les fichiers restants attendent le prochain nephila update (remplace `max_calls` de la configuration ; défaut : aucun plafond)";
 
 const FORMAT_RETRIES_HELP: &str = "Nombre de nouveaux essais d'un appel LLM dont la réponse est non conforme (remplace `format_retries` de la configuration ; défaut 2 ; 0 = aucun nouvel essai)";
@@ -148,6 +149,8 @@ pub struct IndexOpts {
     pub format_retries: Option<u32>,
     #[arg(help = MAX_CALLS_HELP, long, value_name = "N", value_parser = parse_batch_files, allow_hyphen_values = true)]
     pub max_calls: Option<usize>,
+    #[arg(help = ACCEPT_PROJECT_MODEL_HELP, long)]
+    pub accept_project_model: bool,
     /// Exclut de l'analyse les fichiers qui correspondent au motif (syntaxe .gitignore, relatif à la racine du dépôt ; répétable ; !motif réinclut un fichier exclu par un motif précédent)
     #[arg(long, value_name = "MOTIF", action = clap::ArgAction::Append, value_parser = parse_exclude)]
     pub exclude: Vec<String>,
@@ -276,6 +279,7 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
                     batch_files: o.batch_files,
                     format_retries: o.format_retries,
                     max_calls: o.max_calls,
+                    accept_project_model: o.accept_project_model,
                     dry_run: o.dry_run,
                 },
                 o.filters(),
@@ -294,6 +298,7 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
                     batch_files: o.batch_files,
                     format_retries: o.format_retries,
                     max_calls: o.max_calls,
+                    accept_project_model: o.accept_project_model,
                     dry_run: o.dry_run,
                 },
                 o.filters(),
@@ -380,5 +385,20 @@ mod help_tests {
     fn req037_ac18_aide_cite_les_reglages_de_projet() {
         assert!(super::FILTERS_HELP.contains(&crate::config::PROJECT_SETTINGS.join(", ")));
         assert!(super::FILTERS_HELP.contains(&crate::config::ASK_SETTINGS.join(", ")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn req197_ac1_help_names_the_confirmation_threshold() {
+        assert!(super::ACCEPT_PROJECT_MODEL_HELP.contains(&format!(
+            "plus de {} fichiers",
+            crate::config::PROJECT_MODEL_CONFIRM_FILES
+        )));
+        assert!(super::ACCEPT_PROJECT_MODEL_HELP.contains(&format!(
+            "refus au-delà de {})",
+            crate::config::PROJECT_MODEL_CONFIRM_FILES
+        )));
     }
 }

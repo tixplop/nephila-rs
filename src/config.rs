@@ -18,6 +18,9 @@ pub const DEFAULT_SUMMARY_LANGUAGE: &str = "français";
 pub const SUMMARY_LANGUAGE_MAX_CHARS: usize = 40;
 pub const DEFAULT_BATCH_FILES: usize = 10;
 pub const DEFAULT_FORMAT_RETRIES: u32 = 2;
+/// Nombre de fichiers déjà enrichis au-delà duquel le modèle du dépôt est refusé sans
+/// `--accept-project-model` (REQ-196) : seule source de l'aide, de la condition et d'E-29.
+pub const PROJECT_MODEL_CONFIRM_FILES: usize = 50;
 
 /// Réglages que le fichier de projet peut porter, dans l'ordre d'affichage (REQ-042). Seule
 /// déclaration de la liste : l'aide, l'erreur de clé inconnue et la trace s'en servent.

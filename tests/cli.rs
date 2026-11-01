@@ -466,3 +466,52 @@ fn req187_ac5_rien_a_enrichir_ou_sans_llm_sans_avertissement() {
     assert_eq!(plain.stderr, capped.stderr);
     assert!(!err_of(&capped).contains("avertissement"));
 }
+
+// ---- REQ-197 : `--accept-project-model` ----
+
+const ACCEPT_PROJECT_MODEL_HELP_TEXT: &str = "--accept-project-model Accepte le modèle de .nephila.toml pour cette commande, même s'il fait réenrichir plus de 50 fichiers déjà enrichis (voir `model_override` de la configuration ; défaut : refus au-delà de 50)";
+
+#[test]
+fn req197_ac1_ac4_aide_de_accept_project_model() {
+    for cmd in ["build", "update"] {
+        let h = normalized_help(&[cmd]);
+        assert!(h.contains(ACCEPT_PROJECT_MODEL_HELP_TEXT), "{cmd} : {h}");
+        let at = h.find("--accept-project-model").unwrap();
+        assert!(h.find("--max-calls <N>").unwrap() < at, "{cmd}");
+        assert!(at < h.find("--exclude <MOTIF>").unwrap(), "{cmd}");
+        let end = at + ACCEPT_PROJECT_MODEL_HELP_TEXT.len();
+        assert!(
+            !h[at..end + 20.min(h.len() - end)].contains("[default:"),
+            "{cmd}"
+        );
+    }
+    for args in [
+        vec!["status"],
+        vec!["query", "ask"],
+        vec!["export"],
+        vec!["summary"],
+    ] {
+        assert!(
+            !normalized_help(&args).contains("--accept-project-model"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn req197_ac4_option_refusee_hors_build_et_update() {
+    for args in [
+        vec!["status", "--accept-project-model"],
+        vec!["query", "ask", "--accept-project-model", "x"],
+        vec!["export", "--accept-project-model"],
+        vec!["summary", "--accept-project-model"],
+    ] {
+        let o = nephila().args(&args).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("error: unexpected argument '--accept-project-model' found"),
+            "{args:?} : {err}"
+        );
+    }
+}

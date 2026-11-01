@@ -120,6 +120,15 @@ pub(crate) struct Setup {
     pub opts: IndexOptions,
     pub llm: Option<Box<dyn Llm>>,
     pub dry_run: Option<DryRun>,
+    /// Modèle du dépôt qui remplace le modèle personnel sous `model_override = "warn"`.
+    pub project_model: Option<ProjectModel>,
+}
+
+/// Les deux modèles d'un changement imposé par `.nephila.toml` (REQ-196).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectModel {
+    pub project: String,
+    pub personal: String,
 }
 
 /// Applique les réglages du projet et les options à la configuration, puis trace la ligne
@@ -193,6 +202,7 @@ pub(crate) fn setup(
             },
             llm: None,
             dry_run: None,
+            project_model: None,
         });
     }
     let loaded = if dry_run {
@@ -214,9 +224,19 @@ pub(crate) fn setup(
                     language: crate::config::DEFAULT_SUMMARY_LANGUAGE.to_string(),
                     no_config: crate::config::config_path().ok(),
                 }),
+                project_model: None,
             })
         }
         Some(config) => {
+            let project_model = match &project.model {
+                Some(m) if config.model_override == ModelOverride::Warn && *m != config.model => {
+                    Some(ProjectModel {
+                        project: m.clone(),
+                        personal: config.model.clone(),
+                    })
+                }
+                _ => None,
+            };
             let config = effective_config(
                 config,
                 enrich_code,
@@ -234,6 +254,7 @@ pub(crate) fn setup(
                         language: config.summary_language.clone(),
                         no_config: None,
                     }),
+                    project_model,
                 });
             }
             let llm = build_llm(&config)?;
@@ -241,6 +262,7 @@ pub(crate) fn setup(
                 opts: IndexOptions::from(&config),
                 llm: Some(llm),
                 dry_run: None,
+                project_model,
             })
         }
     }
@@ -276,6 +298,8 @@ pub struct Overrides {
     pub format_retries: Option<u32>,
     /// `--max-calls` (REQ-186) : plafond d'appels d'enrichissement de la commande.
     pub max_calls: Option<usize>,
+    /// `--accept-project-model` (REQ-197) : lève le refus E-29 pour cette commande.
+    pub accept_project_model: bool,
     /// `--dry-run` (REQ-184) : estime l'enrichissement sans client LLM ni clé.
     pub dry_run: bool,
 }
@@ -309,6 +333,7 @@ pub fn run(
     }
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
+    check_project_model(repo, &setup, over.accept_project_model, over.dry_run)?;
     let report = build_with_dry_run(
         repo,
         &setup.opts,
@@ -323,6 +348,53 @@ pub fn run(
     warn_transient(&cli_filters);
     warn_capped(&report);
     done
+}
+
+/// Modèle imposé par `.nephila.toml` sous `model_override = "warn"` (REQ-196, DEC-159) : compte
+/// les fichiers déjà enrichis avec un autre modèle ; avertit (A-13) ou, au-delà de
+/// `PROJECT_MODEL_CONFIRM_FILES` sans `accept` ni `dry_run`, refuse (E-29). N'écrit rien d'autre.
+pub(crate) fn check_project_model(
+    repo: &Path,
+    setup: &Setup,
+    accept: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let Some(pm) = &setup.project_model else {
+        return Ok(());
+    };
+    if !db_path(repo).is_file() {
+        return Ok(());
+    }
+    let n = {
+        let counted = Store::open_readonly(repo)
+            .and_then(|st| st.count_enriched_with_other_model(&pm.project, setup.opts.enrich_code));
+        counted.unwrap_or(0)
+    };
+    if n == 0 {
+        return Ok(());
+    }
+    let file = repo.join(crate::filter::PROJECT_FILE);
+    let head = |verb: &str| {
+        format!(
+            "{} : modèle `{}` au lieu de `{}`, {n} fichiers déjà enrichis {verb}",
+            file.display(),
+            crate::escape::data(&pm.project),
+            crate::escape::data(&pm.personal)
+        )
+    };
+    let remedy = format!(
+        "écrivez model_override = \"deny\" dans la configuration personnelle pour garder `{}`",
+        crate::escape::data(&pm.personal)
+    );
+    if n > crate::config::PROJECT_MODEL_CONFIRM_FILES && !accept && !dry_run {
+        return Err(Error::Message(format!(
+            "{} (au plus {} sans confirmation) ; relancez avec --accept-project-model ou {remedy}",
+            head("seraient réenrichis"),
+            crate::config::PROJECT_MODEL_CONFIRM_FILES
+        )));
+    }
+    warn(&format!("{} ; {remedy}", head("seront réenrichis")));
+    Ok(())
 }
 
 /// Filtres effectifs (DEC-045) : fichier de projet puis options de la commande.
@@ -667,6 +739,93 @@ mod tests {
             Err(Error::Message(m)) => m,
             other => panic!("attendu une erreur, obtenu {other:?}"),
         }
+    }
+
+    fn pm_setup(project: Option<&str>) -> Setup {
+        Setup {
+            opts: IndexOptions::default(),
+            llm: None,
+            dry_run: None,
+            project_model: project.map(|p| ProjectModel {
+                project: p.into(),
+                personal: "m-perso".into(),
+            }),
+        }
+    }
+
+    fn pm_repo(n: usize) -> tempfile::TempDir {
+        use crate::model::{FileRecord, FileState};
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let paths: Vec<String> = (0..n).map(|i| format!("d{i}.md")).collect();
+        let files: Vec<_> = paths
+            .iter()
+            .map(|p| FileRecord {
+                path: p.clone(),
+                hash: "h".into(),
+                size: 1,
+                mtime: 1,
+                recorded_at: 0,
+                state: FileState::Indexed,
+            })
+            .collect();
+        st.insert_pending_files(&files).unwrap();
+        for p in &paths {
+            st.replace_structure(p, &[], &[]).unwrap();
+            st.apply_enrichment(p, "h", "m-perso", "français", &[], &[], &[])
+                .unwrap();
+        }
+        drop(st);
+        dir
+    }
+
+    #[test]
+    fn req196_check_project_model_nothing_to_say() {
+        let dir = pm_repo(3);
+        // Aucun modèle de projet, ou aucun fichier à refaire : rien.
+        assert!(check_project_model(dir.path(), &pm_setup(None), false, false).is_ok());
+        assert!(check_project_model(dir.path(), &pm_setup(Some("m-perso")), false, false).is_ok());
+        // Graphe absent.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(check_project_model(empty.path(), &pm_setup(Some("m-p")), false, false).is_ok());
+        // Warn : pas d'erreur.
+        assert!(check_project_model(dir.path(), &pm_setup(Some("m-p")), false, false).is_ok());
+    }
+
+    #[test]
+    fn req196_ac3_check_project_model_refuses_above_the_limit() {
+        use crate::config::PROJECT_MODEL_CONFIRM_FILES as LIMIT;
+        let dir = pm_repo(LIMIT);
+        assert!(check_project_model(dir.path(), &pm_setup(Some("m-p")), false, false).is_ok());
+        let dir = pm_repo(LIMIT + 1);
+        let m = message(check_project_model(
+            dir.path(),
+            &pm_setup(Some("m-p")),
+            false,
+            false,
+        ));
+        assert_eq!(
+            m,
+            format!(
+                "{}/.nephila.toml : modèle `m-p` au lieu de `m-perso`, 51 fichiers déjà enrichis seraient réenrichis (au plus 50 sans confirmation) ; relancez avec --accept-project-model ou écrivez model_override = \"deny\" dans la configuration personnelle pour garder `m-perso`",
+                dir.path().display()
+            )
+        );
+        assert!(check_project_model(dir.path(), &pm_setup(Some("m-p")), true, false).is_ok());
+        assert!(check_project_model(dir.path(), &pm_setup(Some("m-p")), false, true).is_ok());
+    }
+
+    #[test]
+    fn req196_check_project_model_escapes_names() {
+        let dir = pm_repo(51);
+        let m = message(check_project_model(
+            dir.path(),
+            &pm_setup(Some("m\u{1b}]0;x\u{7}")),
+            false,
+            false,
+        ));
+        assert!(!m.contains('\u{1b}') && !m.contains('\u{7}'), "{m}");
+        assert!(m.contains("`m\\u{001B}]0;x\\u{0007}`"), "{m}");
     }
 
     #[test]

@@ -1297,6 +1297,29 @@ impl Store {
             .collect())
     }
 
+    /// Nombre de fichiers de la portée déjà enrichis (contenu inchangé) avec un autre modèle que
+    /// `model` (REQ-196, DEC-159) ; la langue et la version du prompt ne sont pas comparées.
+    pub fn count_enriched_with_other_model(&self, model: &str, code: bool) -> Result<usize> {
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT f.path FROM files f JOIN enrichments e
+                 ON e.path = f.path AND e.content_hash = f.hash
+                 WHERE f.state = 'indexed' AND e.model <> ?1",
+            )
+            .map_err(db_err)?;
+        let paths: Vec<String> = st
+            .query_map(params![model], |r| r.get::<_, String>(0))
+            .map_err(db_err)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        let set: std::collections::HashSet<String> = paths
+            .into_iter()
+            .filter(|p| code || crate::llm::enrich::is_markdown(p))
+            .collect();
+        Ok(set.len())
+    }
+
     /// Nombre de fichiers à enrichir.
     pub fn count_files_to_enrich(&self) -> Result<usize> {
         Ok(self.files_to_enrich()?.len())
@@ -4615,6 +4638,69 @@ mod tests {
         )
         .unwrap();
         (dir, st)
+    }
+
+    fn req196_ac1_store(paths: &[&str]) -> (tempfile::TempDir, Store) {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let files: Vec<_> = paths.iter().map(|p| file(p)).collect();
+        st.insert_pending_files(&files).unwrap();
+        for p in paths {
+            st.replace_structure(p, &[ty(&format!("p.{p}"), p)], &[])
+                .unwrap();
+            st.apply_enrichment(p, "h", "m-old", "français", &[], &[], &[])
+                .unwrap();
+        }
+        (dir, st)
+    }
+
+    #[test]
+    fn req196_ac1_count_enriched_with_other_model() {
+        let (_d, st) = req196_ac1_store(&["a.md", "b.md", "A.java", "pom.xml"]);
+        // Portée : documents seuls, ou avec le code.
+        assert_eq!(
+            st.count_enriched_with_other_model("m-new", false).unwrap(),
+            2
+        );
+        assert_eq!(
+            st.count_enriched_with_other_model("m-new", true).unwrap(),
+            4
+        );
+        // Le modèle déjà utilisé n'est pas compté.
+        assert_eq!(
+            st.count_enriched_with_other_model("m-old", true).unwrap(),
+            0
+        );
+        // Langue ou version de prompt différentes : la ligne est comptée comme les autres.
+        st.conn
+            .execute(
+                "UPDATE enrichments SET language = 'English', prompt_version = 99 WHERE path = 'a.md'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            st.count_enriched_with_other_model("m-new", false).unwrap(),
+            2
+        );
+        assert_eq!(
+            st.count_enriched_with_other_model("m-old", false).unwrap(),
+            0
+        );
+        // Contenu modifié : l'entrée ne vaut plus.
+        st.conn
+            .execute("UPDATE files SET hash = 'h2' WHERE path = 'b.md'", [])
+            .unwrap();
+        assert_eq!(
+            st.count_enriched_with_other_model("m-new", false).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn req196_ac1_count_enriched_with_other_model_empty_graph() {
+        let dir = tempdir().unwrap();
+        let st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(st.count_enriched_with_other_model("m", true).unwrap(), 0);
     }
 
     #[test]

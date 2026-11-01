@@ -45,6 +45,7 @@ pub fn run(
         setup.opts.jobs = j;
     }
     let lock = RepoLock::acquire(repo)?;
+    build::check_project_model(repo, &setup, over.accept_project_model, over.dry_run)?;
     // Le test d'existence se fait sous verrou : aucun build concurrent ne peut le créer entre-temps.
     if !db_path(repo).is_file() {
         eprintln!("aucun graphe : build complet");
