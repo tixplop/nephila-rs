@@ -38,6 +38,9 @@ pub enum Error {
     /// Essai refusé faute de compte par le plafond d'appels de la commande (REQ-186) : erreur
     /// interne, sans issue pour le fichier ; jamais affichée ni écrite dans un avertissement.
     Capped,
+    /// Fin d'une commande dont l'envoi a été arrêté par Ctrl-C (E-27) ; s'affiche comme `Message`,
+    /// code de sortie 130.
+    Interrupted(String),
 }
 
 /// Libellé fixe d'une réponse tronquée (avertissement d'enrichissement, erreur de `query ask`,
@@ -61,7 +64,10 @@ impl Error {
     }
 
     pub fn exit_code(&self) -> i32 {
-        EXIT_ERROR
+        match self {
+            Error::Interrupted(_) => crate::interrupt::EXIT_INTERRUPTED,
+            _ => EXIT_ERROR,
+        }
     }
 }
 
@@ -76,7 +82,8 @@ impl fmt::Display for Error {
             | Error::Timeout(m)
             | Error::Message(m)
             | Error::Format(m)
-            | Error::Truncated(m) => f.write_str(m),
+            | Error::Truncated(m)
+            | Error::Interrupted(m) => f.write_str(m),
             Error::TooManyCalls { calls, max } => write!(
                 f,
                 "trop d'appels d'enrichissement ({calls} nécessaires, au plus {max} par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml"
@@ -101,4 +108,18 @@ pub fn report_error(e: &Error) {
 /// Écrit `avertissement: <message>` sur stderr.
 pub fn warn(msg: &str) {
     eprintln!("avertissement: {}", crate::escape::data(msg));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_displays_its_message_and_exits_130() {
+        let e = Error::Interrupted("envoi interrompu : Ctrl-C reçu".into());
+        assert_eq!(e.to_string(), "envoi interrompu : Ctrl-C reçu");
+        assert_eq!(e.exit_code(), 130);
+        assert_eq!(Error::Message("x".into()).exit_code(), EXIT_ERROR);
+        assert_eq!(Error::Capped.exit_code(), 1);
+    }
 }

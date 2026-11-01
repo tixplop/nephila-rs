@@ -1,7 +1,6 @@
 //! Arrêt propre sur Ctrl-C (SIGINT) pendant une phase d'enrichissement (DEC-153, DEC-156).
 //!
-//! Unix seulement. Le module n'est pas encore branché (T-279).
-#![allow(dead_code)]
+//! Unix seulement.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -44,14 +43,21 @@ extern "C" fn on_sigint(_: libc::c_int) {
 pub(crate) struct Guard {
     old: Option<libc::sigaction>,
     _phase: MutexGuard<'static, ()>,
+    #[cfg(test)]
+    _test: TestShared,
 }
 
 impl Guard {
     pub(crate) fn install() -> Guard {
+        // Ordre des verrous : celui des tests d'abord, puis `PHASE`.
+        #[cfg(test)]
+        let test = test_shared();
         let phase = PHASE.lock().unwrap_or_else(|e| e.into_inner());
         Guard {
             old: install_handler(),
             _phase: phase,
+            #[cfg(test)]
+            _test: test,
         }
     }
 }
@@ -87,7 +93,66 @@ impl Drop for Guard {
                 libc::sigaction(libc::SIGINT, &old, std::ptr::null_mut());
             }
         }
+        // Une phase suivante sans garde ne doit pas voir le signal de celle-ci.
+        RECEIVED.store(0, Ordering::SeqCst);
     }
+}
+
+/// Verrou des tests (DEC-112) : la disposition de SIGINT et le compteur sont globaux au processus.
+/// Ordre unique : ce verrou, puis `PHASE`. Un fil qui le détient déjà (exclusif ou partagé) ne le
+/// reprend pas.
+#[cfg(test)]
+static TEST_RW: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(test)]
+thread_local! {
+    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Garde exclusive des tests qui lisent ou posent la disposition de SIGINT, ou envoient SIGINT.
+#[cfg(test)]
+pub(crate) struct TestExclusive {
+    _g: std::sync::RwLockWriteGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestExclusive {
+    fn drop(&mut self) {
+        HELD.with(|h| h.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_lock() -> TestExclusive {
+    let g = TEST_RW.write().unwrap_or_else(|e| e.into_inner());
+    HELD.with(|h| h.set(true));
+    TestExclusive { _g: g }
+}
+
+/// Garde partagée des tests d'enrichissement sans signal : exclut seulement les tests exclusifs.
+#[cfg(test)]
+pub(crate) struct TestShared {
+    _g: Option<std::sync::RwLockReadGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl Drop for TestShared {
+    fn drop(&mut self) {
+        if self._g.is_some() {
+            HELD.with(|h| h.set(false));
+        }
+    }
+}
+
+/// Sans effet sur un fil qui détient déjà l'une des gardes.
+#[cfg(test)]
+pub(crate) fn test_shared() -> TestShared {
+    if HELD.with(|h| h.get()) {
+        return TestShared { _g: None };
+    }
+    let g = TEST_RW.read().unwrap_or_else(|e| e.into_inner());
+    HELD.with(|h| h.set(true));
+    TestShared { _g: Some(g) }
 }
 
 /// Bloque SIGINT dans le fil appelant (fils de travail).
@@ -105,11 +170,8 @@ pub(crate) fn block_in_this_thread() {
 mod tests {
     use super::*;
 
-    /// Sérialise les tests du module (la disposition de SIGINT est globale).
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock() -> MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock() -> TestExclusive {
+        test_lock()
     }
 
     fn current() -> libc::sigaction {
@@ -153,7 +215,7 @@ mod tests {
         }
         let after = current();
         assert_eq!(after.sa_sigaction, before.sa_sigaction);
-        // Le noyau Linux ajoute SA_RESTORER (posé par la libc) à toute disposition réinstallée.
+        // La glibc ajoute SA_RESTORER à toute disposition réinstallée.
         let useful = libc::SA_RESTART | libc::SA_SIGINFO | libc::SA_NODEFER | libc::SA_RESETHAND;
         assert_eq!(after.sa_flags & useful, before.sa_flags & useful);
     }
@@ -161,7 +223,14 @@ mod tests {
     #[test]
     fn guard_leaves_ignored_sigint_untouched() {
         let _t = lock();
-        let before = current();
+        /// Rétablit la disposition d'origine même si une assertion échoue.
+        struct Restore(libc::sigaction);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                set(&self.0);
+            }
+        }
+        let _restore = Restore(current());
         let mut ign: libc::sigaction = unsafe { std::mem::zeroed() };
         ign.sa_sigaction = libc::SIG_IGN;
         set(&ign);
@@ -170,7 +239,6 @@ mod tests {
             assert_eq!(current().sa_sigaction, libc::SIG_IGN);
         }
         assert_eq!(current().sa_sigaction, libc::SIG_IGN);
-        set(&before);
     }
 
     #[test]
@@ -182,13 +250,17 @@ mod tests {
             on_sigint(libc::SIGINT);
             assert_eq!(received(), 1);
         }
+        assert_eq!(received(), 0);
         let _g = Guard::install();
         assert_eq!(received(), 0);
     }
 
     #[test]
     fn e28_text_and_exit_code() {
-        assert!(E28.ends_with(b"relancez nephila update pour continuer\n"));
+        assert_eq!(
+            std::str::from_utf8(E28).unwrap(),
+            "erreur: envoi interrompu : second Ctrl-C reçu : relancez nephila update pour continuer\n"
+        );
         assert_eq!(EXIT_INTERRUPTED, 130);
     }
 

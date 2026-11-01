@@ -46,6 +46,8 @@ pub struct BuildReport {
     pub capped: Option<usize>,
     /// Fichiers sans issue laissés « à enrichir » par le plafond (REQ-186).
     pub left_by_cap: usize,
+    /// Vrai si l'envoi a été arrêté par Ctrl-C (REQ-189) : la fin rend `Error::Interrupted`.
+    pub interrupted: bool,
     /// Fichiers exclus par les filtres (REQ-037) ; `None` sans filtre actif.
     pub excluded: Option<usize>,
     /// Relevé de l'estimation sous `--dry-run` (REQ-184) ; sa présence remplace le segment
@@ -387,7 +389,12 @@ pub(crate) fn finish(report: &BuildReport) -> Result<()> {
     if problems.is_empty() {
         Ok(())
     } else {
-        Err(Error::Message(problems.join(" ; ")))
+        let line = problems.join(" ; ");
+        Err(if report.interrupted {
+            Error::Interrupted(line)
+        } else {
+            Error::Message(line)
+        })
     }
 }
 
@@ -679,6 +686,49 @@ mod tests {
         let m = message(finish(&r));
         assert_eq!(m, "envoi interrompu : panne réseau répétée");
         assert!(!m.contains("plafond") && !m.contains("max_calls"));
+    }
+
+    #[test]
+    fn req191_finish_interrupted_with_files_to_enrich_exits_130() {
+        let r = BuildReport {
+            llm_active: true,
+            to_enrich: 4,
+            interrupted: true,
+            stop_cause: Some(crate::index::enrich::CAUSE_INTERRUPT.cause.into()),
+            ..BuildReport::default()
+        };
+        let e = finish(&r).unwrap_err();
+        assert!(matches!(e, Error::Interrupted(_)));
+        assert_eq!(
+            e.to_string(),
+            "envoi interrompu : Ctrl-C reçu : relancez nephila update pour continuer ; 4 fichier(s) à enrichir"
+        );
+        assert_eq!(e.exit_code(), 130);
+    }
+
+    #[test]
+    fn req191_finish_interrupted_with_only_cap_files_has_no_count() {
+        let mut r = capped_report(4, 4);
+        r.interrupted = true;
+        r.stop_cause = Some(crate::index::enrich::CAUSE_INTERRUPT.cause.into());
+        let e = finish(&r).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "envoi interrompu : Ctrl-C reçu : relancez nephila update pour continuer"
+        );
+        assert_eq!(e.exit_code(), 130);
+    }
+
+    #[test]
+    fn req191_finish_not_interrupted_stays_message_with_code_1() {
+        let r = BuildReport {
+            llm_active: true,
+            to_enrich: 2,
+            ..BuildReport::default()
+        };
+        let e = finish(&r).unwrap_err();
+        assert!(matches!(e, Error::Message(_)));
+        assert_eq!(e.exit_code(), 1);
     }
 
     #[test]

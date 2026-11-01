@@ -115,6 +115,8 @@ pub fn classify(e: &crate::error::Error) -> String {
         | Error::CallsOverCap { .. } => "erreur",
         // Un essai refusé par le plafond part avant toute trace d'appel : il n'arrive jamais ici.
         Error::Capped => unreachable!("un essai refusé par le plafond n'est jamais classé"),
+        // Erreur de fin de commande : jamais le résultat d'un appel.
+        Error::Interrupted(_) => unreachable!("une fin de commande n'est jamais classée"),
     };
     label.to_string()
 }

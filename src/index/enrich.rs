@@ -30,9 +30,9 @@ use crate::trace;
 const MAX_CONSECUTIVE_NETWORK_ERRORS: usize = 3;
 
 /// Cause d'arrêt à seuil : libellé de la trace et cause de la ligne `erreur:` (une seule table).
-struct ThresholdCause {
-    label: &'static str,
-    cause: &'static str,
+pub(crate) struct ThresholdCause {
+    pub(crate) label: &'static str,
+    pub(crate) cause: &'static str,
 }
 
 const CAUSE_NETWORK: ThresholdCause = ThresholdCause {
@@ -47,6 +47,14 @@ const CAUSE_TIMEOUT: ThresholdCause = ThresholdCause {
     label: "délais dépassés répétés",
     cause: "délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur",
 };
+/// Arrêt demandé par Ctrl-C (REQ-189, REQ-191) : seule source du libellé et de la cause.
+pub(crate) const CAUSE_INTERRUPT: ThresholdCause = ThresholdCause {
+    label: "Ctrl-C reçu",
+    cause: "Ctrl-C reçu : relancez nephila update pour continuer",
+};
+
+/// Annonce A-12 (sans le préfixe `avertissement: `) : seule source du texte.
+pub(crate) const ANNOUNCE: &str = "Ctrl-C reçu : plus aucun appel ne part, ceux en cours vont à leur terme et seront enregistrés ; appuyez de nouveau sur Ctrl-C pour quitter sans les attendre";
 
 /// Politique d'échec partagée entre les threads de travail (DEC-015).
 #[derive(Default)]
@@ -69,6 +77,8 @@ struct Policy {
     /// Vrai dès qu'une prise a été refusée faute de compte. N'écrit jamais `stop_cause`,
     /// `stop_label` ni `refused` : le plafond n'est pas une erreur (REQ-187).
     capped: bool,
+    /// Vrai si l'arrêt demandé par Ctrl-C est la cause de l'arrêt (REQ-191).
+    interrupted: bool,
 }
 
 /// Libellé du plafond atteint : seule source du texte, pour la trace `politique:` et pour A-10.
@@ -116,6 +126,17 @@ impl Policy {
             self.stop_label = Some(label.to_string());
             self.stop_cause = Some(cause.to_string());
         }
+    }
+
+    /// Arrêt demandé par Ctrl-C : pose la cause si aucune n'est posée et rend vrai ; sinon ne
+    /// change rien et rend faux. N'écrit ni `capped` ni `refused`.
+    fn request_stop(&mut self) -> bool {
+        if self.stop_cause.is_some() {
+            return false;
+        }
+        self.stop_with(CAUSE_INTERRUPT.label, CAUSE_INTERRUPT.cause);
+        self.interrupted = true;
+        true
     }
 
     /// Met à jour la politique ; renvoie vrai si l'envoi de nouveaux fichiers doit s'arrêter.
@@ -1519,6 +1540,58 @@ fn record_failure(
     failures.push((path, e));
 }
 
+/// Fil de veille : au premier SIGINT vu, demande l'arrêt à la politique, pose le drapeau d'arrêt,
+/// réveille les fils, écrit A-12 (une fois) puis, si l'arrêt demandé est la cause, la trace
+/// `politique:`. Sans garde installée le compteur reste à 0 : le fil ne fait que dormir.
+fn watch_interrupt(
+    policy: &Mutex<Policy>,
+    shared: &Mutex<Shared<'_>>,
+    wake: &Condvar,
+    stop: &AtomicBool,
+    workers_done: &AtomicBool,
+) {
+    loop {
+        let done = workers_done.load(Ordering::SeqCst);
+        if crate::interrupt::received() >= 1 {
+            on_interrupt(policy, shared, wake, stop);
+            return;
+        }
+        if done {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn on_interrupt(
+    policy: &Mutex<Policy>,
+    shared: &Mutex<Shared<'_>>,
+    wake: &Condvar,
+    stop: &AtomicBool,
+) {
+    let mut guard = policy.lock().unwrap_or_else(|p| p.into_inner());
+    let posed = guard.request_stop();
+    stop.store(true, Ordering::SeqCst);
+    let queued: usize = shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .queue
+        .iter()
+        .map(Unit::file_count)
+        .sum();
+    drop(guard);
+    // Réveille les fils qui attendent des appels.
+    drop(shared.lock().unwrap_or_else(|p| p.into_inner()));
+    wake.notify_all();
+    warn(ANNOUNCE);
+    if posed && trace::enabled() {
+        trace!(
+            "politique: arrêt de l'envoi ({}), {queued} fichiers non envoyés",
+            CAUSE_INTERRUPT.label
+        );
+    }
+}
+
 /// Pool de threads LLM ; le thread courant écrit une transaction par groupe de messages reçus.
 pub(crate) fn enrich_all(
     sources: Sources<'_>,
@@ -1528,6 +1601,7 @@ pub(crate) fn enrich_all(
     store: &mut Store,
     report: &mut BuildReport,
 ) -> Result<()> {
+    let _guard = crate::interrupt::Guard::install();
     enrich_with_stop(
         sources,
         files,
@@ -1550,6 +1624,8 @@ pub(crate) fn enrich_with_stop(
     report: &mut BuildReport,
     stop: &AtomicBool,
 ) -> Result<Vec<(String, Error)>> {
+    #[cfg(test)]
+    let _shared = crate::interrupt::test_shared();
     let IndexOptions {
         concurrency,
         max_chunk_chars,
@@ -1588,6 +1664,7 @@ pub(crate) fn enrich_with_stop(
     let wake = Condvar::new();
     let policy = Mutex::new(Policy::with_cap(max_calls));
     let capped = AtomicBool::new(false);
+    let workers_done = AtomicBool::new(false);
     let totals = Mutex::new(LlmTotals::default());
     let (tx, rx) = mpsc::channel::<Msg>();
     if !without_nodes.is_empty() {
@@ -1624,9 +1701,13 @@ pub(crate) fn enrich_with_stop(
         };
         for _ in 0..workers {
             let tx = tx.clone();
-            scope.spawn(move || worker(ctx, tx));
+            scope.spawn(move || {
+                crate::interrupt::block_in_this_thread();
+                worker(ctx, tx)
+            });
         }
         drop(tx);
+        scope.spawn(|| watch_interrupt(&policy, &shared, &wake, stop, &workers_done));
         // Un message reçu, puis tous ceux déjà arrivés (sans attente), sont écrits en une seule
         // transaction avant d'attendre le suivant : aucune transaction ouverte pendant un appel.
         let mut pending: Vec<EnrichmentWrite> = Vec::new();
@@ -1736,6 +1817,8 @@ pub(crate) fn enrich_with_stop(
                 }
             }
         }
+        // Tous les fils de travail ont rendu (leurs émetteurs sont fermés).
+        workers_done.store(true, Ordering::SeqCst);
     });
     let failed_now = report.failed - failed_before;
     trace!(
@@ -1748,6 +1831,7 @@ pub(crate) fn enrich_with_stop(
     let policy = policy.into_inner().unwrap_or_else(|p| p.into_inner());
     report.stop_cause = policy.stop_cause;
     report.refused = policy.refused;
+    report.interrupted = policy.interrupted;
     // Plafond atteint : les fichiers sans issue (ni enrichis ni en échec) restent à enrichir.
     if policy.capped {
         report.capped = policy.limit;
@@ -3404,6 +3488,233 @@ mod tests {
         assert_eq!(*llm.0.lock().unwrap(), [1, 2]);
         assert_eq!(failures.len(), 1);
         assert_eq!(report.failed, 1);
+    }
+
+    // ---- Arrêt demandé par Ctrl-C (REQ-189 à REQ-191) ----
+
+    #[test]
+    fn req189_ac7_request_stop_without_cause_sets_it() {
+        let mut p = Policy::default();
+        assert!(p.request_stop());
+        assert!(p.interrupted);
+        assert_eq!(p.stop_cause.as_deref(), Some(CAUSE_INTERRUPT.cause));
+        assert_eq!(p.stop_label.as_deref(), Some("Ctrl-C reçu"));
+        assert!(p.refused.is_none() && !p.capped);
+        // Une seconde demande ne change rien.
+        assert!(!p.request_stop());
+        assert!(p.interrupted);
+    }
+
+    #[test]
+    fn req189_ac7_request_stop_after_refused_key_changes_nothing() {
+        let mut p = Policy::default();
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&Error::InvalidKey("k".into()))));
+        assert!(!p.request_stop());
+        assert!(!p.interrupted);
+        assert_eq!(p.refused, Some(Error::InvalidKey("k".into())));
+        assert_eq!(
+            p.stop_cause.as_deref(),
+            Some("clé d'API refusée par le fournisseur")
+        );
+    }
+
+    #[test]
+    fn req189_ac7_request_stop_after_cap_sets_cause_and_keeps_cap() {
+        let mut p = Policy::with_cap(Some(0));
+        assert!(!p.take(1));
+        assert!(p.request_stop());
+        assert!(p.capped && p.interrupted);
+        assert_eq!(p.stop_cause.as_deref(), Some(CAUSE_INTERRUPT.cause));
+        assert!(p.refused.is_none());
+    }
+
+    #[test]
+    fn req189_ac7_refused_key_after_request_keeps_the_cause() {
+        let mut p = Policy::default();
+        assert!(p.request_stop());
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&Error::InvalidKey("k".into()))));
+        assert!(p.refused.is_none());
+        assert_eq!(p.stop_cause.as_deref(), Some(CAUSE_INTERRUPT.cause));
+        assert_eq!(p.stop_label.as_deref(), Some(CAUSE_INTERRUPT.label));
+    }
+
+    #[test]
+    fn req191_texts_are_the_designed_constants() {
+        assert_eq!(CAUSE_INTERRUPT.label, "Ctrl-C reçu");
+        assert_eq!(
+            CAUSE_INTERRUPT.cause,
+            "Ctrl-C reçu : relancez nephila update pour continuer"
+        );
+        assert_eq!(
+            ANNOUNCE,
+            "Ctrl-C reçu : plus aucun appel ne part, ceux en cours vont à leur terme et seront enregistrés ; appuyez de nouveau sur Ctrl-C pour quitter sans les attendre"
+        );
+    }
+
+    fn sigint_action() -> (usize, libc::c_int) {
+        // SAFETY: lecture de la disposition courante dans une structure locale.
+        unsafe {
+            let mut a: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(libc::SIGINT, std::ptr::null(), &mut a), 0);
+            (
+                a.sa_sigaction,
+                a.sa_flags & (libc::SA_RESTART | libc::SA_SIGINFO),
+            )
+        }
+    }
+
+    /// Dépôt de `n` petits fichiers, chacun avec un nœud, dans un graphe prêt à enrichir.
+    fn interrupt_store(n: usize) -> (tempfile::TempDir, Vec<FileRecord>) {
+        let (dir, files) = probe_repo(&[], n);
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(&files).unwrap();
+        for f in &files {
+            let node = Node::new(NodeKind::Method, &f.path, "x", Some(&f.path), None, None);
+            store.replace_structure(&f.path, &[node], &[]).unwrap();
+        }
+        (dir, files)
+    }
+
+    fn interrupt_opts(concurrency: usize) -> IndexOptions {
+        IndexOptions {
+            jobs: 1,
+            concurrency,
+            max_chunk_chars: 10,
+            batch_files: 1,
+            format_retries: 0,
+            enrich_code: false,
+            max_calls: None,
+        }
+    }
+
+    #[test]
+    fn req189_ac8_enrich_all_restores_sigint_disposition() {
+        let _t = crate::interrupt::test_lock();
+        let before = sigint_action();
+        let (dir, files) = interrupt_store(2);
+        let mut store = Store::open_existing(dir.path()).unwrap();
+        let llm = Probe::new(1, &[]);
+        let mut report = BuildReport::default();
+        enrich_all(
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+            },
+            &files,
+            &interrupt_opts(1),
+            &llm,
+            &mut store,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(sigint_action(), before);
+        assert!(!report.interrupted && report.stop_cause.is_none());
+    }
+
+    #[test]
+    fn req189_ac8_enrich_all_restores_sigint_disposition_after_write_error() {
+        let _t = crate::interrupt::test_lock();
+        let before = sigint_action();
+        let (dir, files) = interrupt_store(2);
+        let mut store = Store::open_readonly(dir.path()).unwrap();
+        let llm = Probe::new(1, &[]);
+        let mut report = BuildReport::default();
+        let r = enrich_all(
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+            },
+            &files,
+            &interrupt_opts(1),
+            &llm,
+            &mut store,
+            &mut report,
+        );
+        assert!(r.is_err());
+        assert_eq!(sigint_action(), before);
+    }
+
+    /// Faux LLM qui envoie SIGINT au processus lors de son premier appel, puis attend que
+    /// l'arrêt soit posé avant de répondre (aucun délai fixe).
+    struct Interrupter<'a> {
+        calls: std::sync::atomic::AtomicUsize,
+        stop: &'a AtomicBool,
+    }
+
+    impl Interrupter<'_> {
+        fn hit(&self) {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                // SAFETY: signal envoyé à ce processus, dont le gestionnaire est installé.
+                unsafe {
+                    libc::kill(libc::getpid(), libc::SIGINT);
+                }
+                let start = Instant::now();
+                while !self.stop.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(5)
+                {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    impl Llm for Interrupter<'_> {
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.hit();
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            self.hit();
+            Ok(items
+                .iter()
+                .map(|i| (i.file.clone(), Ok(Enrichment::default())))
+                .collect())
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req189_req191_signal_stops_sending_and_records_the_cause() {
+        let _t = crate::interrupt::test_lock();
+        let (dir, files) = interrupt_store(4);
+        let mut store = Store::open_existing(dir.path()).unwrap();
+        let stop = AtomicBool::new(false);
+        let llm = Interrupter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            stop: &stop,
+        };
+        let mut report = BuildReport::default();
+        let _guard = crate::interrupt::Guard::install();
+        let failures = enrich_with_stop(
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+            },
+            &files,
+            &interrupt_opts(1),
+            &llm,
+            &mut store,
+            &mut report,
+            &stop,
+        )
+        .unwrap();
+        assert!(failures.is_empty());
+        // Le seul appel en vol a été enregistré ; plus aucun n'est parti.
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+        assert!(report.interrupted);
+        assert_eq!(report.stop_cause.as_deref(), Some(CAUSE_INTERRUPT.cause));
+        assert!(report.refused.is_none());
+        assert_eq!(left_paths(store).len(), 3);
     }
 
     // ---- Plafond d'appels (REQ-186, REQ-187) ----
