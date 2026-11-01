@@ -460,7 +460,7 @@ Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, c
 
 ### Échecs et nouveaux essais
 
-- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2) ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`.
+- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2) ; encore non conforme, un lot de 4 fichiers ou plus est découpé une fois en deux, chaque moitié avec ses propres essais ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`.
 - **Surcharge passagère** (HTTP 429, 500, 502, 503, 504, 529, erreur réseau transitoire) : jusqu'à 4 nouveaux essais, avec une attente croissante ; un `retry-after` en secondes est respecté, et au-delà de 60 s le fichier échoue aussitôt.
 - **Réponse tronquée** : `réponse tronquée par la limite de jetons`, jamais renvoyée ; un lot tronqué est découpé en deux, jusqu'au fichier seul ; pour un fichier seul, réduisez `max_chunk_chars` ou augmentez `max_output_tokens`.
 - **Fichier absent d'une réponse de lot** : renvoyé une fois, avec les autres absents du même lot ; encore absent, il échoue (`absent de la réponse du lot`).

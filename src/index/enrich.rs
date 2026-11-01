@@ -423,9 +423,21 @@ fn run_unit<'a>(
                 })
                 .collect();
             match traced_lot(llm, &items, retries, stop, totals, take) {
-                // Lot tronqué (REQ-096, DEC-101) : deux moitiés remises en tête de file ; aucune
-                // issue pour le lot lui-même, ses fichiers en recevront par leurs moitiés.
-                Err(Error::Truncated(_)) => {
+                // Lot tronqué (REQ-096, DEC-101), ou de 4 fichiers ou plus encore non conforme au
+                // premier passage (REQ-200, DEC-161 (4)) : deux moitiés remises en tête de file ;
+                // aucune issue pour le lot lui-même, ses fichiers en recevront par leurs moitiés.
+                // Les moitiés d'un lot non conforme sont de second passage.
+                Err(e)
+                    if matches!(e, Error::Truncated(_))
+                        || (matches!(e, Error::Format(_))
+                            && pass == Pass::First
+                            && readable.len() >= 4) =>
+                {
+                    let next = if matches!(e, Error::Truncated(_)) {
+                        pass
+                    } else {
+                        Pass::Second
+                    };
                     let mut first: Vec<&'a FileRecord> = readable.iter().map(|(f, _)| *f).collect();
                     let second = first.split_off(first.len().div_ceil(2));
                     trace!(
@@ -437,7 +449,7 @@ fn run_unit<'a>(
                     );
                     Step::Calls(
                         outcomes,
-                        vec![Unit::Lot(first, pass), Unit::Lot(second, pass)],
+                        vec![Unit::Lot(first, next), Unit::Lot(second, next)],
                         None,
                     )
                 }
@@ -3340,6 +3352,115 @@ mod tests {
             lines.last().unwrap(),
             "progression: enrichissement 100 % (4/4 fichiers)"
         );
+    }
+
+    /// Faux `Llm` d'AC-200-4 : un lot est non conforme (`Format`), sauf si `only` nomme un autre
+    /// lot, qui est alors tronqué ; un fichier seul est conforme.
+    struct Bad {
+        only: Option<&'static str>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Llm for Bad {
+        fn enrich(
+            &self,
+            file: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(file.trim_end_matches(".txt").into());
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            let names: String = items
+                .iter()
+                .map(|i| i.file.trim_end_matches(".txt"))
+                .collect();
+            self.calls.lock().unwrap().push(names.clone());
+            match self.only {
+                Some(o) if o != names => Err(Error::Truncated("tronquée".into())),
+                _ => Err(Error::Format("réponse non conforme".into())),
+            }
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    fn run_bad(names: &[&str], batch_files: usize, llm: &Bad) -> (Vec<(String, Error)>, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for n in names {
+            let name = format!("{n}.txt");
+            std::fs::write(dir.path().join(&name), "texte\n").unwrap();
+            files.push(rec(&name, 6));
+        }
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(&files).unwrap();
+        declare_one_node(&mut store, &files);
+        let mut report = BuildReport::default();
+        let opts = IndexOptions {
+            jobs: 1,
+            concurrency: 1,
+            max_chunk_chars: 1000,
+            batch_files,
+            format_retries: 0,
+            enrich_code: false,
+            max_calls: None,
+        };
+        let failures = enrich_with_stop(
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+            },
+            &files,
+            &opts,
+            llm,
+            &mut store,
+            &mut report,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        (failures, report.failed)
+    }
+
+    /// AC-200-4 : un lot de 4 fichiers ou plus non conforme est découpé une fois ; ses moitiés,
+    /// de second passage, ne sont plus découpées ; chaque fichier échoue une seule fois.
+    #[test]
+    fn req200_ac4_non_conforming_lot_is_split_once_in_order() {
+        let llm = Bad {
+            only: None,
+            calls: Mutex::new(Vec::new()),
+        };
+        let (failures, failed) = run_bad(&["a", "b", "c", "d", "e", "f", "g"], 5, &llm);
+        assert_eq!(*llm.calls.lock().unwrap(), ["abcde", "abc", "de", "fg"]);
+        let mut paths: Vec<&str> = failures.iter().map(|f| f.0.as_str()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt", "g.txt"]
+        );
+        assert_eq!(failed, 7);
+    }
+
+    #[test]
+    fn req200_ac4_halves_of_the_split_keep_their_own_course() {
+        let llm = Bad {
+            only: Some("abcd"),
+            calls: Mutex::new(Vec::new()),
+        };
+        let (failures, failed) = run_bad(&["a", "b", "c", "d"], 4, &llm);
+        assert_eq!(
+            *llm.calls.lock().unwrap(),
+            ["abcd", "ab", "a", "b", "cd", "c", "d"]
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(failed, 0);
     }
 
     /// DEC-161 (3) : un fichier encore absent de la réponse du lot renvoyé échoue, sans

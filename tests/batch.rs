@@ -343,17 +343,23 @@ fn req027_ac5_lots_run_in_parallel() {
 }
 
 #[test]
-fn req027_ac8_non_conforming_fixture_fails_whole_lot_only() {
+fn req200_ac1_non_conforming_fixture_splits_the_lot_once() {
     let env = Env::new(8, 4, 1);
     fs::write(env.mock.join("src/F05.java.json"), "pas du json").unwrap();
     let o = env.run("build", &[]);
     assert!(!o.status.success());
     let err = stderr(&o);
-    for i in 4..8 {
+    let batches: Vec<Vec<String>> = env.log_lines().iter().map(|l| files_of(l)).collect();
+    let mut expected = vec![fnames(0..4)];
+    expected.extend(vec![fnames(4..8); 3]);
+    expected.extend(vec![fnames(4..6); 3]);
+    expected.push(fnames(6..8));
+    assert_eq!(batches, expected, "{err}");
+    for i in 4..6 {
         assert!(err.contains(&format!("F{i:02}.java")), "{err}");
     }
-    assert_eq!(to_enrich(&env), 4);
-    assert_eq!(env.summaries().len(), 4);
+    assert_eq!(pending(&env), vec!["src/F04.java", "src/F05.java"]);
+    assert_eq!(env.summaries().len(), 6);
 }
 
 fn pending(env: &Env) -> Vec<String> {

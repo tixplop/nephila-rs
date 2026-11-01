@@ -2408,3 +2408,19 @@ fn REQ199_AC10_readme_fichier_absent_d_une_reponse_de_lot() {
     assert!(bullets[tronquee + 2].starts_with("- **Ce qui reste**"));
     assert_eq!(bullets.len(), 5, "{bullets:?}");
 }
+
+/// AC-200-9 : puce « Réponse non conforme » du README.
+#[test]
+fn req200_ac9_readme_non_conforming_reply_bullet() {
+    let readme = repo_file("README.md");
+    let section = readme_section(&readme, "### Échecs et nouveaux essais");
+    let bullets: Vec<&str> = section
+        .lines()
+        .filter(|l| l.starts_with("- **Réponse non conforme**"))
+        .collect();
+    assert_eq!(
+        bullets,
+        ["- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2) ; encore non conforme, un lot de 4 fichiers ou plus est découpé une fois en deux, chaque moitié avec ses propres essais ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`."]
+    );
+    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+}
