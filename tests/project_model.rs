@@ -119,6 +119,33 @@ impl Env {
             .collect()
     }
 
+    /// `SELECT * FROM enrichments ORDER BY 1`, chaque ligne en texte.
+    fn enrichment_rows(&self) -> Vec<String> {
+        let db = rusqlite::Connection::open(self.repo.join(".nephila/graph.db")).unwrap();
+        let mut st = db.prepare("SELECT * FROM enrichments ORDER BY 1").unwrap();
+        let n = st.column_count();
+        st.query_map([], |r| {
+            Ok((0..n)
+                .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                .collect::<Vec<_>>()
+                .join("|"))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// Nombre d'entrées d'enrichissement du modèle donné.
+    fn count_model(&self, model: &str) -> i64 {
+        let db = rusqlite::Connection::open(self.repo.join(".nephila/graph.db")).unwrap();
+        db.query_row(
+            "SELECT COUNT(*) FROM enrichments WHERE model = ?1",
+            [model],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     /// `query ask` contre un faux serveur `openai` (configuration personnelle réécrite).
     fn ask(&self, extra: &str, args: &[&str]) -> (Output, Vec<serde_json::Value>) {
         let reply =
@@ -566,4 +593,251 @@ fn req196_ac6_option_refusee_par_status_et_query_ask() {
         assert_eq!(o.status.code(), Some(2), "{args:?}: {}", text(&o.stderr));
         assert!(text(&o.stderr).contains("--accept-project-model"));
     }
+}
+
+// ---- REQ-196 : A-13, E-29, seuil, --dry-run (T-287) ----
+
+const PERSO: &str = "model = \"m-perso\"\nbatch_files = 10\n";
+
+/// `n` documents enrichis avec `m-perso`, puis `model` imposé par `.nephila.toml`.
+fn imposed(n: usize, personal: &str, project_model_toml: &str) -> Env {
+    let e = Env::new(n, personal);
+    assert!(e.run(&["build"]).status.success());
+    e.project(&format!("model = {project_model_toml}\n"));
+    e.clear_log();
+    e
+}
+
+fn warn_line(head: &str, n: usize, project: &str) -> String {
+    format!(
+        "avertissement: {head} : modèle `{project}` au lieu de `m-perso`, {n} fichiers déjà enrichis seront réenrichis ; écrivez model_override = \"deny\" dans la configuration personnelle pour garder `m-perso`"
+    )
+}
+
+fn refusal_line(head: &str, n: usize, project: &str) -> String {
+    format!(
+        "erreur: {head} : modèle `{project}` au lieu de `m-perso`, {n} fichiers déjà enrichis seraient réenrichis (au plus 50 sans confirmation) ; relancez avec --accept-project-model ou écrivez model_override = \"deny\" dans la configuration personnelle pour garder `m-perso`"
+    )
+}
+
+fn head(e: &Env) -> String {
+    format!("{}/.nephila.toml", e.repo.display())
+}
+
+fn db_bytes(e: &Env) -> Vec<u8> {
+    fs::read(e.repo.join(".nephila/graph.db")).unwrap()
+}
+
+fn status_json(e: &Env) -> String {
+    text(&e.run(&["status", "--json"]).stdout)
+}
+
+fn first_with(err: &[String], needle: &str) -> usize {
+    err.iter()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("pas de `{needle}` : {err:#?}"))
+}
+
+#[test]
+fn req196_ac2_ac8_avertissement_en_premiere_ligne_puis_plus_rien() {
+    let e = imposed(3, PERSO, "\"m-projet\"");
+    let o = e.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let err = lines(&o.stderr);
+    assert_eq!(err[0], warn_line(&head(&e), 3, "m-projet"));
+    assert_eq!(err.iter().filter(|l| l.contains("au lieu de")).count(), 1);
+    // 3 fichiers, `batch_files` 10 : un seul appel ; les entrées portent le modèle du dépôt.
+    assert_eq!(e.calls(), 1);
+    assert_eq!(e.count_model("m-projet"), 3);
+    assert_eq!(e.models(), vec!["m-projet"]);
+    let second = e.run(&["update"]);
+    assert_eq!(second.status.code(), Some(0));
+    assert!(!text(&second.stderr).contains("au lieu de"));
+}
+
+#[test]
+fn req196_ac8_sans_c_la_tete_est_dot_slash() {
+    let e = imposed(3, PERSO, "\"m-projet\"");
+    let o = e
+        .command()
+        .current_dir(&e.repo)
+        .arg("update")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(
+        lines(&o.stderr)[0],
+        warn_line("./.nephila.toml", 3, "m-projet")
+    );
+}
+
+#[test]
+fn req196_ac2_ac8_place_sous_verbose() {
+    let e = imposed(3, PERSO, "\"m-projet\"");
+    let o = e.run(&["update", "--verbose"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let err = lines(&o.stderr);
+    let warn = first_with(&err, "avertissement:");
+    assert_eq!(err[warn], warn_line(&head(&e), 3, "m-projet"));
+    assert!(first_with(&err, "config:") < warn, "{err:#?}");
+    assert!(warn < first_with(&err, "parcours:"), "{err:#?}");
+}
+
+#[test]
+fn req196_ac2_ac8_place_sous_show_progress() {
+    let e = imposed(3, PERSO, "\"m-projet\"");
+    let o = e.run(&["update", "--show-progress"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let err = lines(&o.stderr);
+    let warn = first_with(&err, "avertissement:");
+    assert_eq!(warn, 0, "{err:#?}");
+    assert!(warn < first_with(&err, "progression:"), "{err:#?}");
+}
+
+#[test]
+fn req196_ac3_ac9_refus_a_51_fichiers_pour_update_et_build() {
+    let e = imposed(51, PERSO, "\"m-projet\"");
+    let db = db_bytes(&e);
+    let status = status_json(&e);
+    for args in [
+        &["update"][..],
+        &["build"][..],
+        &["update", "--show-progress"][..],
+        &["update", "--verbose"][..],
+    ] {
+        let o = e.run(args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+        assert!(o.stdout.is_empty(), "{args:?}: {}", text(&o.stdout));
+        let err = lines(&o.stderr);
+        assert_eq!(
+            err.last().unwrap(),
+            &refusal_line(&head(&e), 51, "m-projet")
+        );
+        if args.len() == 1 {
+            assert_eq!(err.len(), 1, "{err:#?}");
+        }
+        for l in &err {
+            assert!(
+                !l.starts_with("progression:")
+                    && !l.contains("parcours:")
+                    && !l.contains("structure:")
+                    && !l.contains("llm enrich"),
+                "{args:?}: {l}"
+            );
+        }
+        assert_eq!(e.calls(), 0);
+        assert_eq!(db_bytes(&e), db, "{args:?}");
+        assert_eq!(status_json(&e), status, "{args:?}");
+    }
+}
+
+#[test]
+fn req196_ac3_accept_project_model_leve_le_refus() {
+    let e = imposed(51, PERSO, "\"m-projet\"");
+    let o = e.run(&["update", "--accept-project-model"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(lines(&o.stderr)[0], warn_line(&head(&e), 51, "m-projet"));
+    assert_eq!(e.models(), vec!["m-projet"]);
+    let db = rusqlite::Connection::open(e.repo.join(".nephila/graph.db")).unwrap();
+    let n: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM enrichments WHERE model = 'm-projet'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 51);
+}
+
+#[test]
+fn req196_ac3_cinquante_fichiers_avertissent_sans_refuser() {
+    let e = imposed(50, PERSO, "\"m-projet\"");
+    let o = e.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(lines(&o.stderr)[0], warn_line(&head(&e), 50, "m-projet"));
+    assert!(!text(&o.stderr).contains("erreur:"));
+    assert_eq!(e.models(), vec!["m-projet"]);
+}
+
+#[test]
+fn req196_ac4_dry_run_avertit_estime_et_ne_modifie_rien() {
+    let e = imposed(51, PERSO, "\"m-projet\"");
+    let before = e.enrichment_rows();
+    assert_eq!(before.len(), 51);
+    let o = e.run(&["update", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let err = lines(&o.stderr);
+    assert_eq!(err[0], warn_line(&head(&e), 51, "m-projet"));
+    assert!(!text(&o.stderr).contains("erreur:"));
+    let out = lines(&o.stdout);
+    let est: Vec<&String> = out.iter().filter(|l| l.starts_with("estimation")).collect();
+    assert!(!est.is_empty(), "{out:#?}");
+    assert!(
+        est.iter().any(|l| l.contains("51 fichiers à enrichir")),
+        "{est:#?}"
+    );
+    assert_eq!(e.calls(), 0);
+    assert_eq!(e.enrichment_rows(), before);
+    assert_eq!(e.models(), vec!["m-perso"]);
+}
+
+#[test]
+fn req196_ac4_allow_ni_avertissement_ni_refus() {
+    let e = imposed(
+        51,
+        "model = \"m-perso\"\nbatch_files = 10\nmodel_override = \"allow\"\n",
+        "\"m-projet\"",
+    );
+    let o = e.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let err = text(&o.stderr);
+    assert!(
+        !err.contains("avertissement:") && !err.contains("erreur:"),
+        "{err}"
+    );
+    assert_eq!(e.models(), vec!["m-projet"]);
+}
+
+#[test]
+fn req196_ac4_deny_graphe_a_jour_sans_appel() {
+    let e = imposed(
+        51,
+        "model = \"m-perso\"\nbatch_files = 10\nmodel_override = \"deny\"\n",
+        "\"m-projet\"",
+    );
+    let o = e.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let err = text(&o.stderr);
+    assert!(
+        !err.contains("avertissement:") && !err.contains("erreur:"),
+        "{err}"
+    );
+    assert!(
+        text(&o.stdout).contains("graphe à jour"),
+        "{}",
+        text(&o.stdout)
+    );
+    assert_eq!(e.calls(), 0);
+    assert_eq!(e.models(), vec!["m-perso"]);
+}
+
+#[test]
+fn req196_ac10_echappement_de_l_avertissement_et_du_refus() {
+    let raw = "\"m\\u001b]0;x\\u0007\"";
+    let shown = "m\\u{001B}]0;x\\u{0007}";
+    let e = imposed(3, PERSO, raw);
+    let o = e.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(e.calls(), 1);
+    assert_eq!(lines(&o.stderr)[0], warn_line(&head(&e), 3, shown));
+    assert!(!o.stderr.contains(&0x1B) && !o.stderr.contains(&0x07));
+
+    let e = imposed(51, PERSO, raw);
+    let o = e.run(&["update"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        text(&o.stderr).trim_end(),
+        refusal_line(&head(&e), 51, shown)
+    );
+    assert!(!o.stderr.contains(&0x1B) && !o.stderr.contains(&0x07));
 }
