@@ -242,6 +242,7 @@ Les requêtes ne vérifient pas que le graphe est à jour : faites l'étape 1 av
 | 0 | Succès, même si seul le plafond `max_calls` laisse des fichiers à enrichir |
 | 1 | Erreur d'exécution : configuration, graphe absent, aucun résultat, arrêt de l'envoi au LLM, fichiers en attente ou à enrichir avec le LLM actif… |
 | 2 | Erreur d'usage : commande ou option inconnue, valeur invalide |
+| 130 | Interrompu par Ctrl-C (SIGINT) pendant l'enrichissement ; `nephila update` reprend les fichiers à enrichir |
 
 stdout ne contient que le résultat. Les messages vont sur stderr, préfixés `erreur:` ou `avertissement:` (et `trace:` ou `progression:` sur demande). Une erreur tient sur une ligne et dit quoi corriger. Si stdout est fermée avant la fin (`| head`), la commande s'arrête sur `erreur: écriture sur stdout impossible : <cause>` et le code 1 ; `build` et `update` ont déjà enregistré le graphe, et `nephila status` donne son état.
 
@@ -464,7 +465,7 @@ Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, c
 
 ### Arrêt de l'envoi
 
-Sept causes arrêtent l'envoi au LLM. Les six de la table sont des erreurs : chacune a sa ligne `erreur:`, la dernière de stderr, après la ligne de bilan, avec le code 1 :
+Huit causes arrêtent l'envoi au LLM. Les six de la table sont des erreurs : chacune a sa ligne `erreur:`, la dernière de stderr, après la ligne de bilan, avec le code 1 :
 
 | Cause | Quand | Que faire |
 |---|---|---|
@@ -477,7 +478,9 @@ Sept causes arrêtent l'envoi au LLM. Les six de la table sont des erreurs : cha
 
 Les appels en cours se terminent et sont enregistrés. Les fichiers non envoyés restent « à enrichir » : une fois la cause corrigée, `nephila update` ne renvoie qu'eux. Sans fichier à enrichir, aucun appel n'a lieu, et une clé fausse passe inaperçue.
 
-Le plafond `max_calls` (ou `--max-calls`) est la septième cause, la seule voulue : il borne les appels d'une commande, nouveaux essais de format compris. Quand il en faudrait un de plus, plus rien ne part, les appels en cours se terminent, et une ligne `avertissement: plafond de <n> appels atteint : …` compte les fichiers laissés à enrichir. Code 0 si rien d'autre n'échoue : chaque `nephila update` enrichit la tranche suivante.
+Le plafond `max_calls` (ou `--max-calls`) est la septième cause, et pas une erreur : il borne les appels d'une commande, nouveaux essais de format compris. Quand il en faudrait un de plus, plus rien ne part, les appels en cours se terminent, et une ligne `avertissement: plafond de <n> appels atteint : …` compte les fichiers laissés à enrichir. Code 0 si rien d'autre n'échoue : chaque `nephila update` enrichit la tranche suivante.
+
+Un Ctrl-C (SIGINT) pendant l'enrichissement de `build` ou `update` est la huitième cause : plus rien ne part, les appels en cours se terminent et sont enregistrés, et une ligne `avertissement: Ctrl-C reçu : …` l'annonce. La commande finit ensuite comme après une erreur, bilan compris, sur `erreur: envoi interrompu : Ctrl-C reçu : …` et le code 130 ; `nephila update` reprend les fichiers à enrichir. Un second Ctrl-C quitte aussitôt, code 130 : ni bilan, ni attente, les réponses en cours sont perdues, le graphe reste lisible. Hors de l'enrichissement, Ctrl-C arrête la commande sur-le-champ.
 
 ## Export et vue HTML
 

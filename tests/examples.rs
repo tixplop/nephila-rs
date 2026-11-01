@@ -1350,7 +1350,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 44_000, "README : {size} octets");
+    assert!(size <= 45_000, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1458,6 +1458,7 @@ fn REQ155_AC5_essentiel_pour_un_agent() {
         "| 0 |",
         "| 1 |",
         "| 2 |",
+        "| 130 |",
         "erreur:",
         "avertissement:",
         "stderr",
@@ -1953,7 +1954,7 @@ fn REQ165_AC16_readme_traces_sentence() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 44_000, "README : {size} octets");
+    assert!(size <= 45_000, "README : {size} octets");
 }
 
 #[test]
@@ -2003,7 +2004,7 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 44_000, "README : {size} octets");
+    assert!(size <= 45_000, "README : {size} octets");
 }
 
 // ---- REQ-174 : `summary_language` dans les exemples et le README ----
@@ -2164,7 +2165,7 @@ fn REQ174_AC5_AC10_readme_lignes_et_phrases_de_summary_language() {
         assert!(!readme.contains(old), "présent : {old}");
     }
     assert_eq!(readme.matches("config: llm=").count(), 1);
-    assert!(readme.len() <= 44_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 45_000, "README : {} octets", readme.len());
 }
 
 /// AC-185-2 : textes de V-012 pour `--dry-run`, ligne de table après `--enrich-code`.
@@ -2182,7 +2183,7 @@ fn req185_ac2_readme_dry_run() {
     let table = section.lines().filter(|l| l.starts_with("| `-")).count();
     assert_eq!(table, 11, "{section}");
     assert!(readme.find("Un seul `build` ou `update`").unwrap() < readme.find(para).unwrap());
-    assert!(readme.len() <= 44_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 45_000, "README : {} octets", readme.len());
 }
 
 // ---- REQ-188 : `max_calls` dans l'exemple et le README ----
@@ -2212,7 +2213,7 @@ fn REQ188_AC2_AC5_section_max_calls_de_l_exemple() {
 #[test]
 fn REQ188_AC3_AC6_textes_du_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 44_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 45_000, "README : {} octets", readme.len());
     let has_after = |first: &str, second: &str| {
         let a = readme
             .find(first)
@@ -2229,13 +2230,35 @@ fn REQ188_AC3_AC6_textes_du_readme() {
     );
     let sec = readme_section(&readme, "### Arrêt de l'envoi");
     assert!(sec.trim_start().starts_with(
-        "Sept causes arrêtent l'envoi au LLM. Les six de la table sont des erreurs :"
+        "Huit causes arrêtent l'envoi au LLM. Les six de la table sont des erreurs :"
     ));
     let causes = table_rows(&sec, "| Cause | Quand | Que faire |", "|---|---|---|");
     assert_eq!(causes.len(), 6, "{causes:?}");
-    assert!(sec.contains("\nLe plafond `max_calls` (ou `--max-calls`) est la septième cause, la seule voulue : il borne les appels d'une commande, nouveaux essais de format compris. Quand il en faudrait un de plus, plus rien ne part, les appels en cours se terminent, et une ligne `avertissement: plafond de <n> appels atteint : …` compte les fichiers laissés à enrichir. Code 0 si rien d'autre n'échoue : chaque `nephila update` enrichit la tranche suivante.\n"));
+    assert!(sec.contains("\nLe plafond `max_calls` (ou `--max-calls`) est la septième cause, et pas une erreur : il borne les appels d'une commande, nouveaux essais de format compris. Quand il en faudrait un de plus, plus rien ne part, les appels en cours se terminent, et une ligne `avertissement: plafond de <n> appels atteint : …` compte les fichiers laissés à enrichir. Code 0 si rien d'autre n'échoue : chaque `nephila update` enrichit la tranche suivante.\n"));
     assert!(readme.contains(
         "\n| 0 | Succès, même si seul le plafond `max_calls` laisse des fichiers à enrichir |\n"
     ));
     assert!(readme.contains("- **à enrichir** : la structure du fichier est dans le graphe, mais le LLM ne l'a pas enrichie (réponse non conforme ou tronquée, trop d'appels, plafond `max_calls`, erreur, `--no-llm`, fichier modifié depuis) ; code 1 avec le LLM actif, 0 sans lui ou s'il est laissé par le plafond ; `nephila update` le reprend.\n"));
+}
+
+#[test]
+fn REQ192_AC3_ctrl_c_dans_le_readme() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 45_000, "README : {} octets", readme.len());
+    let codes = readme_section(&readme, "## Codes de sortie");
+    let rows = table_rows(&codes, "| Code | Signification |", "|---|---|");
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert_eq!(
+        rows[3],
+        "| 130 | Interrompu par Ctrl-C (SIGINT) pendant l'enrichissement ; `nephila update` reprend les fichiers à enrichir |"
+    );
+    let sec = readme_section(&readme, "### Arrêt de l'envoi");
+    let para = "Un Ctrl-C (SIGINT) pendant l'enrichissement de `build` ou `update` est la huitième cause : plus rien ne part, les appels en cours se terminent et sont enregistrés, et une ligne `avertissement: Ctrl-C reçu : …` l'annonce. La commande finit ensuite comme après une erreur, bilan compris, sur `erreur: envoi interrompu : Ctrl-C reçu : …` et le code 130 ; `nephila update` reprend les fichiers à enrichir. Un second Ctrl-C quitte aussitôt, code 130 : ni bilan, ni attente, les réponses en cours sont perdues, le graphe reste lisible. Hors de l'enrichissement, Ctrl-C arrête la commande sur-le-champ.";
+    assert_eq!(sec.trim_end().lines().last(), Some(para));
+    let before = sec.trim_end().lines().rev().nth(1);
+    assert_eq!(before, Some(""));
+    assert!(!readme.contains("la seule voulue"));
+    for args in [&["build", "--help"][..], &["update", "--help"][..]] {
+        assert!(!help_of(args).contains("Ctrl-C"), "{args:?}");
+    }
 }
