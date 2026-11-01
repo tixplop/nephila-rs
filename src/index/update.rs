@@ -859,8 +859,9 @@ mod tests {
         }
     }
 
-    /// REQ-184 : `update --dry-run` sans changement rend l'estimation du graphe ouvert ; un
-    /// fichier modifié est le seul estimé, et son contenu entre dans le graphe.
+    /// REQ-184 : `update --dry-run` sans changement rend l'estimation du graphe ouvert ; après
+    /// modification d'un fichier, le bilan porte une estimation, sans LLM actif, et le nouveau contenu
+    /// entre dans le graphe. Que le fichier modifié soit le seul estimé n'est pas vérifié ici (AC-184-6).
     #[test]
     fn req184_update_dry_run_a_jour_puis_fichier_modifie() {
         let dir = tempfile::tempdir().unwrap();
