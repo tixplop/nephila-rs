@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 use crate::chunk;
 use crate::error::{warn, Error, Result, TRUNCATED};
 use crate::index::build::{BuildReport, IndexOptions};
+use crate::index::estimate::{AloneCase, AloneFile, Estimate};
+use crate::llm::enrich::{
+    enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt,
+};
 use crate::llm::{
     calls_line, tokens_segment, with_format_retries, CallStats, Enrichment, Excerpt, FormatFault,
     Llm, LlmTotals, LotItem,
@@ -170,7 +174,7 @@ const MAX_NODES_PER_CALL: usize = 150;
 
 /// Nombre maximal d'appels d'enrichissement pour un fichier envoyé seul (DEC-059, non
 /// configurable) : 50 appels = 7 500 nœuds d'un seul morceau. Au-delà, aucun appel n'est envoyé.
-const MAX_CALLS_PER_FILE: usize = 50;
+pub(crate) const MAX_CALLS_PER_FILE: usize = 50;
 
 /// Découpe la liste des nœuds d'un fichier en groupes d'au plus `MAX_NODES_PER_CALL` ; au moins
 /// un groupe, vide si la liste l'est.
@@ -842,6 +846,145 @@ fn run_call(
     })
 }
 
+/// Sépare les fichiers ayant des nœuds à demander de ceux qui n'en ont aucun (REQ-159).
+fn partition_by_nodes(
+    files: &[FileRecord],
+    ids: &HashMap<String, Vec<(String, String)>>,
+) -> (Vec<FileRecord>, Vec<FileRecord>) {
+    files
+        .iter()
+        .cloned()
+        .partition(|f| !ids.get(&f.path).is_none_or(Vec::is_empty))
+}
+
+/// Estimation du plan d'enrichissement de `files` sans appel ni écriture (REQ-184, DEC-148) : même
+/// partition et mêmes unités que `enrich_with_stop`. Un lot ne lit aucun fichier (ses prompts
+/// valent ceux à texte vide plus la somme des tailles) ; un fichier envoyé seul est lu en série,
+/// puis `plan_calls` donne ses appels. Un fichier illisible ou au plafond ne compte aucun appel.
+#[allow(dead_code)] // branché sur `--dry-run` par T-273
+pub(crate) fn estimate(
+    sources: Sources<'_>,
+    files: &[FileRecord],
+    ids: &HashMap<String, Vec<(String, String)>>,
+    language: &str,
+    batch_files: usize,
+    max_chunk_chars: usize,
+) -> Estimate {
+    let (with_nodes, without_nodes) = partition_by_nodes(files, ids);
+    let units = form_units_by_nodes(
+        &with_nodes,
+        |f| ids.get(&f.path).map_or(0, Vec::len),
+        batch_files,
+        max_chunk_chars,
+    );
+    let mut est = Estimate {
+        files: files.len(),
+        without_call: without_nodes.len(),
+        ..Estimate::default()
+    };
+    let node_ids = |f: &FileRecord| -> Vec<String> {
+        ids.get(&f.path)
+            .map(|v| v.iter().map(|(id, _)| id.clone()).collect())
+            .unwrap_or_default()
+    };
+    for unit in &units {
+        match unit {
+            Unit::Lot(v) if v.len() >= 2 => {
+                let items: Vec<LotItem> = v
+                    .iter()
+                    .map(|f| LotItem {
+                        file: f.path.clone(),
+                        text: String::new(),
+                        node_ids: node_ids(f),
+                    })
+                    .collect();
+                est.calls += 1;
+                est.nodes += items.iter().map(|i| i.node_ids.len()).sum::<usize>();
+                est.bytes += lot_system_prompt(language).len()
+                    + lot_user_prompt(&items).len()
+                    + v.iter().map(|f| f.size as usize).sum::<usize>();
+            }
+            Unit::Lot(v) => {
+                for f in v {
+                    let requested = node_ids(f);
+                    est.calls += 1;
+                    est.nodes += requested.len();
+                    est.bytes += enrichment_system_prompt(language).len()
+                        + enrichment_user_prompt(&f.path, None, "", &requested).len()
+                        + f.size as usize;
+                }
+            }
+            Unit::Big(f) => {
+                est.sent_alone += 1;
+                est.alone.push(estimate_alone(
+                    f,
+                    sources,
+                    ids,
+                    language,
+                    max_chunk_chars,
+                    &mut est.nodes,
+                ));
+                let last = est.alone.last().expect("fichier seul ajouté");
+                est.calls += last.calls;
+                est.bytes += last.bytes;
+                match last.case {
+                    AloneCase::Counted => {}
+                    AloneCase::OverCap(planned) => est.capped.push((last.path.clone(), planned)),
+                    AloneCase::Unreadable => est.unreadable.push(last.path.clone()),
+                }
+            }
+            Unit::Call { .. } => unreachable!("un plan de fichiers ne contient pas d'appel"),
+        }
+    }
+    est
+}
+
+/// Estimation d'un fichier envoyé seul ; ajoute ses nœuds demandés à `nodes`. Le texte lu est
+/// libéré au retour.
+#[allow(dead_code)] // branché sur `--dry-run` par T-273
+fn estimate_alone(
+    f: &FileRecord,
+    sources: Sources<'_>,
+    ids: &HashMap<String, Vec<(String, String)>>,
+    language: &str,
+    max_chunk_chars: usize,
+    nodes: &mut usize,
+) -> AloneFile {
+    let mut out = AloneFile {
+        path: f.path.clone(),
+        calls: 0,
+        bytes: 0,
+        case: AloneCase::Counted,
+    };
+    let Ok(text) = std::fs::read_to_string(sources.real_path(&f.path)) else {
+        out.case = AloneCase::Unreadable;
+        return out;
+    };
+    let file_nodes = ids.get(&f.path).cloned().unwrap_or_default();
+    match plan_calls(f, &text, max_chunk_chars, &file_nodes) {
+        Ok(calls) => {
+            let system = enrichment_system_prompt(language).len();
+            for call in calls {
+                if let Unit::Call {
+                    excerpt,
+                    part,
+                    requested,
+                    ..
+                } = call
+                {
+                    out.calls += 1;
+                    *nodes += requested.len();
+                    out.bytes +=
+                        system + enrichment_user_prompt(&f.path, excerpt, &part, &requested).len();
+                }
+            }
+        }
+        Err(Error::TooManyCalls { calls, .. }) => out.case = AloneCase::OverCap(calls),
+        Err(_) => out.case = AloneCase::Unreadable,
+    }
+    out
+}
+
 /// Nœuds déclarés par chaque fichier (identifiant, nom court), hors packages et clés de
 /// configuration (REQ-024).
 fn nodes_by_file(store: &Store) -> Result<HashMap<String, Vec<(String, String)>>> {
@@ -1272,10 +1415,7 @@ pub(crate) fn enrich_with_stop(
     let failed_before = report.failed;
     let mut succeeded = 0usize;
     // REQ-159 : un fichier sans nœud à demander est enregistré vide, sans lecture ni appel.
-    let (with_nodes, without_nodes): (Vec<FileRecord>, Vec<FileRecord>) = files
-        .iter()
-        .cloned()
-        .partition(|f| !ids.get(&f.path).is_none_or(Vec::is_empty));
+    let (with_nodes, without_nodes) = partition_by_nodes(files, &ids);
     let units = form_units_by_nodes(
         &with_nodes,
         |f| ids.get(&f.path).map_or(0, Vec::len),
@@ -3546,6 +3686,239 @@ mod plan_index_tests {
         assert_eq!(
             *llm.seen.lock().unwrap(),
             vec![None, Some(FormatFault::Version)]
+        );
+    }
+}
+
+/// REQ-184, AC-184-5 : estimation pure du plan d'enrichissement (nombres écrits en dur).
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+    use crate::index::estimate::{stdout_lines, trace_lines};
+    use crate::llm::enrich::{enrichment_system_prompt, lot_system_prompt};
+    use crate::model::FileState;
+
+    const LANG: &str = "français";
+
+    fn rec(path: &str, size: u64) -> FileRecord {
+        FileRecord {
+            path: path.into(),
+            hash: String::new(),
+            size,
+            mtime: 0,
+            recorded_at: 0,
+            state: FileState::Indexed,
+        }
+    }
+
+    fn ids_of(list: &[(&str, &[&str])]) -> HashMap<String, Vec<(String, String)>> {
+        list.iter()
+            .map(|(f, ns)| {
+                (
+                    f.to_string(),
+                    ns.iter().map(|n| (n.to_string(), n.to_string())).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn run(
+        dir: &Path,
+        files: &[FileRecord],
+        ids: &HashMap<String, Vec<(String, String)>>,
+        batch: usize,
+        max: usize,
+    ) -> Estimate {
+        let abs = HashMap::new();
+        let sources = Sources {
+            repo: dir,
+            abs: &abs,
+        };
+        estimate(sources, files, ids, LANG, batch, max)
+    }
+
+    /// Lignes de 10 octets `nNN xxxxx` : une par morceau pour `max_chunk_chars` = 10.
+    fn lines_text(n: usize) -> String {
+        (0..n).map(|i| format!("n{i:02} xxxxx\n")).collect()
+    }
+
+    fn ids_for_lines(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("n{i:02}")).collect()
+    }
+
+    #[test]
+    fn req184_ac5_lots_and_big_with_three_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("d.txt"), lines_text(3)).unwrap();
+        // max_chunk_chars = 10, batch_files = 2. a.md (3 octets) et b.md (4) forment un lot de 2
+        // (7 ≤ 10) ; c.md (2) est seul, car d.txt (30 > 10) est un `Big` qui coupe le lot ; e.md
+        // n'a aucun nœud (sans appel).
+        let files = vec![
+            rec("a.md", 3),
+            rec("b.md", 4),
+            rec("c.md", 2),
+            rec("d.txt", 30),
+            rec("e.md", 1),
+        ];
+        let ids = ids_of(&[
+            ("a.md", &["id1"]),
+            ("b.md", &["id22", "id3"]),
+            ("c.md", &["id5"]),
+            ("d.txt", &["n00", "n01", "n02"]),
+        ]);
+        let e = run(dir.path(), &files, &ids, 2, 10);
+        assert_eq!((e.files, e.sent_alone, e.without_call), (5, 1, 1));
+        assert_eq!(e.calls, 1 + 1 + 3);
+        assert_eq!(e.nodes, 3 + 1 + 3);
+        // Lot de 2 : système du lot + 14+4+1+19+1+1+9+1+1+21+4+2 = 78 d'encadrement par fichier,
+        // + 2 × chemin (4) + liste (`- id1\n` = 6 ; `- id22\n- id3\n` = 7 + 6 = 13) + tailles 3 + 4
+        // = 78+8+6 + 78+8+13 + 7 = 198.
+        // Lot de 1 (c.md) : système d'un fichier + 43 (`Fichier : ` 10, chemin 4, `\n\n` 2,
+        // `Nœuds du fichier :` 19, `\n` 1, `\n` 1, `Contenu :` 9, `\n` 1 → 47 avec le chemin) +
+        // liste 6 + taille 2 = 47 + 6 + 2 = 55.
+        let lot2 = lot_system_prompt(LANG).len() + 198;
+        let lot1 = enrichment_system_prompt(LANG).len() + 55;
+        // Big de 3 appels : par appel, système + `Fichier : d.txt (extrait k/3, lignes k–k)` (15 + 28)
+        // + 2 + 19 + 1 + 6 (`- n0k\n`) + 1 + 9 + 1 (= 39) + morceau de 10 = 92.
+        let big = 3 * (enrichment_system_prompt(LANG).len() + 92);
+        assert_eq!(e.bytes, lot2 + lot1 + big);
+        assert_eq!(e.alone.len(), 1);
+        assert_eq!(e.alone[0].path, "d.txt");
+        assert_eq!(e.alone[0].calls, 3);
+        assert_eq!(e.alone[0].bytes, big);
+        assert_eq!(e.alone[0].case, AloneCase::Counted);
+        assert!(e.capped.is_empty() && e.unreadable.is_empty());
+        // Jetons : ⌈octets / 4⌉ en entrée, 40 par nœud demandé (7 nœuds) en sortie.
+        let lines = stdout_lines(&e, 3, None);
+        assert_eq!(
+            lines[0],
+            "estimation : 5 fichiers à enrichir dont 1 envoyés seuls et 1 sans appel"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "estimation minimale : 5 appels, {} octets, {} jetons d'entrée, 280 jetons de sortie (un essai par appel)",
+                e.bytes,
+                e.bytes.div_ceil(4)
+            )
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            trace_lines(&e),
+            vec![format!("estimation d.txt : 3 appels, {big} octets")]
+        );
+    }
+
+    type BigFixture = (
+        tempfile::TempDir,
+        Vec<FileRecord>,
+        HashMap<String, Vec<(String, String)>>,
+    );
+
+    /// Fichier de `n` lignes, chacune demandant son nœud : `n` appels pour `max_chunk_chars` = 10.
+    fn big_of(n: usize) -> BigFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let text = lines_text(n);
+        std::fs::write(dir.path().join("d.txt"), &text).unwrap();
+        let names = ids_for_lines(n);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let ids = ids_of(&[("d.txt", &refs)]);
+        (dir, vec![rec("d.txt", text.len() as u64)], ids)
+    }
+
+    #[test]
+    fn req184_ac5_big_of_50_calls_is_counted() {
+        let (dir, files, ids) = big_of(50);
+        let e = run(dir.path(), &files, &ids, 5, 10);
+        // Par appel : système + 15 (`Fichier : d.txt`) + extrait (26 + 3 × chiffres de k) + 39 + 10 ;
+        // 9 appels à un chiffre (93), 41 à deux chiffres (96) : 9 × 93 + 41 × 96 = 4 773.
+        let sys = enrichment_system_prompt(LANG).len();
+        assert_eq!(e.calls, 50);
+        assert_eq!(e.nodes, 50);
+        assert_eq!(e.bytes, 50 * sys + 4_773);
+        assert_eq!((e.files, e.sent_alone, e.without_call), (1, 1, 0));
+        assert!(e.capped.is_empty());
+        assert_eq!(e.alone[0].case, AloneCase::Counted);
+    }
+
+    #[test]
+    fn req184_ac5_big_of_51_calls_is_capped_and_counts_nothing() {
+        let (dir, files, ids) = big_of(51);
+        let e = run(dir.path(), &files, &ids, 5, 10);
+        assert_eq!(e.calls, 0);
+        assert_eq!(e.bytes, 0);
+        assert_eq!(e.nodes, 0);
+        assert_eq!((e.files, e.sent_alone, e.without_call), (1, 1, 0));
+        assert_eq!(e.capped, vec![("d.txt".to_string(), 51)]);
+        assert!(e.unreadable.is_empty());
+        assert_eq!(e.alone[0].case, AloneCase::OverCap(51));
+        assert_eq!(
+            trace_lines(&e),
+            vec!["estimation d.txt : 0 appels, 0 octets (au plafond, 51 appels prévus)"]
+        );
+        let lines = stdout_lines(&e, 3, None);
+        assert_eq!(
+            lines[3],
+            "estimation au plafond : d.txt (51 appels prévus, au plus 50 par fichier, aucun compté)"
+        );
+    }
+
+    #[test]
+    fn req184_ac5_unreadable_big_counts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ids_of(&[("gone.txt", &["n00"])]);
+        let e = run(dir.path(), &[rec("gone.txt", 30)], &ids, 5, 10);
+        assert_eq!((e.calls, e.bytes, e.nodes), (0, 0, 0));
+        assert_eq!((e.files, e.sent_alone, e.without_call), (1, 1, 0));
+        assert_eq!(e.unreadable, vec!["gone.txt".to_string()]);
+        assert!(e.capped.is_empty());
+        assert_eq!(e.alone[0].case, AloneCase::Unreadable);
+        assert_eq!(
+            stdout_lines(&e, 3, None)[3],
+            "estimation illisible : gone.txt (aucun appel compté)"
+        );
+        assert_eq!(
+            trace_lines(&e),
+            vec!["estimation gone.txt : 0 appels, 0 octets (illisible)"]
+        );
+    }
+
+    #[test]
+    fn req184_ac5_files_without_nodes_make_no_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = run(
+            dir.path(),
+            &[rec("a.md", 3), rec("b.md", 9)],
+            &HashMap::new(),
+            5,
+            10,
+        );
+        assert_eq!((e.files, e.sent_alone, e.without_call), (2, 0, 2));
+        assert_eq!((e.calls, e.bytes, e.nodes), (0, 0, 0));
+    }
+
+    #[test]
+    fn req184_ac5_lot_prompt_length_is_empty_text_plus_sizes() {
+        let texts = ["Un texte é\n", "autre"];
+        let mk = |with_text: bool| -> Vec<LotItem> {
+            ["a.md", "b.md"]
+                .iter()
+                .zip(texts)
+                .map(|(f, t)| LotItem {
+                    file: f.to_string(),
+                    text: if with_text {
+                        t.to_string()
+                    } else {
+                        String::new()
+                    },
+                    node_ids: vec!["id1".into()],
+                })
+                .collect()
+        };
+        let sizes: usize = texts.iter().map(|t| t.len()).sum();
+        assert_eq!(
+            lot_user_prompt(&mk(true)).len(),
+            lot_user_prompt(&mk(false)).len() + sizes
         );
     }
 }

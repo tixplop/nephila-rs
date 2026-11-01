@@ -1212,6 +1212,30 @@ impl Store {
         let model = self.enrich_model()?;
         let language = self.enrich_language()?;
         let code = self.enrich_code()?;
+        self.files_to_enrich_with(model.as_deref(), language.as_deref(), code, false)
+    }
+
+    /// Comme `files_to_enrich`, sur des réglages donnés au lieu de ceux de `meta` (REQ-184,
+    /// DEC-148) : sans `model`, aucune entrée ne vaut et tous les fichiers de la portée sont
+    /// rendus ; `language` absente n'est pas comparée ; `code` inclut les fichiers de code.
+    pub fn files_to_enrich_for(
+        &self,
+        model: Option<&str>,
+        language: Option<&str>,
+        code: bool,
+    ) -> Result<Vec<FileRecord>> {
+        self.files_to_enrich_with(model, language, code, true)
+    }
+
+    /// Requête commune. `no_model_is_all` : un modèle absent écarte toute entrée (réglages
+    /// donnés) ; sinon il n'est pas comparé (réglages de `meta`, AC-184-10).
+    fn files_to_enrich_with(
+        &self,
+        model: Option<&str>,
+        language: Option<&str>,
+        code: bool,
+        no_model_is_all: bool,
+    ) -> Result<Vec<FileRecord>> {
         // Un graphe lu en schéma 5 à 9 n'a pas la colonne : condition d'avant, sans la langue.
         let with_language = self.version >= SCHEMA_VERSION;
         let up_to_date = if with_language {
@@ -1219,14 +1243,19 @@ impl Store {
         } else {
             UP_TO_DATE_WITHOUT_LANGUAGE
         };
-        let mut st = self
-            .conn
-            .prepare_cached(&format!(
+        let all = no_model_is_all && model.is_none();
+        let sql = if all {
+            "SELECT f.path FROM files f WHERE f.state = 'indexed' ORDER BY f.path".to_string()
+        } else {
+            format!(
                 "SELECT f.path FROM files f WHERE f.state = 'indexed' AND NOT EXISTS ({up_to_date}) ORDER BY f.path"
-            ))
-            .map_err(db_err)?;
+            )
+        };
+        let mut st = self.conn.prepare_cached(&sql).map_err(db_err)?;
         let first = |r: &rusqlite::Row<'_>| r.get::<_, String>(0);
-        let paths: Vec<String> = if with_language {
+        let paths: Vec<String> = if all {
+            st.query_map([], first)
+        } else if with_language {
             st.query_map(params![ENRICH_PROMPT_VERSION, model, language], first)
         } else {
             st.query_map(params![ENRICH_PROMPT_VERSION, model], first)
@@ -4468,6 +4497,60 @@ mod tests {
             .unwrap();
         assert!(!st.nodes().unwrap().iter().any(|n| n.id == "concept:c"));
         assert_eq!(st.nodes().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn files_to_enrich_for_given_settings() {
+        let (_d, mut st) = enriched_store();
+        let paths = |v: Vec<FileRecord>| -> Vec<String> { v.into_iter().map(|f| f.path).collect() };
+        assert!(st
+            .files_to_enrich_for(Some("m"), Some("français"), false)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            paths(
+                st.files_to_enrich_for(Some("autre"), Some("français"), false)
+                    .unwrap()
+            ),
+            vec!["a.md"]
+        );
+        assert_eq!(
+            paths(
+                st.files_to_enrich_for(Some("m"), Some("english"), false)
+                    .unwrap()
+            ),
+            vec!["a.md"]
+        );
+        // Sans modèle, aucune entrée ne vaut : tous les fichiers de la portée.
+        st.insert_pending_files(&[file("b.md"), file("C.java")])
+            .unwrap();
+        st.replace_structure("b.md", &[ty("p.B", "b.md")], &[])
+            .unwrap();
+        st.replace_structure("C.java", &[ty("p.C", "C.java")], &[])
+            .unwrap();
+        assert_eq!(
+            paths(
+                st.files_to_enrich_for(None, Some("français"), false)
+                    .unwrap()
+            ),
+            vec!["a.md", "b.md"]
+        );
+        assert_eq!(
+            paths(
+                st.files_to_enrich_for(None, Some("français"), true)
+                    .unwrap()
+            ),
+            vec!["C.java", "a.md", "b.md"]
+        );
+        // Réglages de `meta` absents : le modèle n'est pas comparé (AC-184-10).
+        assert_eq!(paths(st.files_to_enrich().unwrap()), vec!["b.md"]);
+        // Les réglages de `meta` ne changent pas le résultat des réglages donnés.
+        st.set_enrich_model("autre").unwrap();
+        assert!(st
+            .files_to_enrich_for(Some("m"), Some("français"), false)
+            .unwrap()
+            .iter()
+            .all(|f| f.path != "a.md"));
     }
 
     #[test]
