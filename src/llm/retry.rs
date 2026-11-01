@@ -212,6 +212,21 @@ mod tests {
         assert_eq!((r, c), (Ok(1), 1));
     }
 
+    #[test]
+    fn req186_capped_is_returned_as_is_without_suffix() {
+        let mut calls = 0;
+        let r: Result<()> = with_format_retries(2, &AtomicBool::new(false), |n, _| {
+            calls += 1;
+            if n == 1 {
+                Err(Error::Format("x".into()))
+            } else {
+                Err(Error::Capped)
+            }
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(r, Err(Error::Capped));
+    }
+
     fn truncated() -> Error {
         Error::Truncated("tronquée".into())
     }

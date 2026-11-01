@@ -59,6 +59,7 @@ pub fn run(
         build::write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
         let done = build::finish(&report);
         build::warn_transient(&cli_filters);
+        build::warn_capped(&report);
         return done;
     }
     let updated = update_with_dry_run(
@@ -69,6 +70,7 @@ pub fn run(
         &lock,
         &matcher,
     )?;
+    let mut capped_report = None;
     let done = match updated {
         Updated::UpToDate(estimate) => {
             writeln!(out, "graphe à jour")?;
@@ -83,10 +85,15 @@ pub fn run(
         Updated::Report(report) => {
             build::write_report(out, &report, "update")?;
             build::write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
-            build::finish(&report)
+            let done = build::finish(&report);
+            capped_report = Some(report);
+            done
         }
     };
     build::warn_transient(&cli_filters);
+    if let Some(report) = &capped_report {
+        build::warn_capped(report);
+    }
     done
 }
 

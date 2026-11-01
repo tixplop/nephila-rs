@@ -109,7 +109,12 @@ pub fn classify(e: &crate::error::Error) -> String {
         Error::Rejected { .. } => "requête refusée",
         Error::Redirected { .. } => "requête redirigée",
         Error::Truncated(_) => "tronquée",
-        Error::Message(_) | Error::Format(_) | Error::TooManyCalls { .. } => "erreur",
+        Error::Message(_)
+        | Error::Format(_)
+        | Error::TooManyCalls { .. }
+        | Error::CallsOverCap { .. } => "erreur",
+        // Un essai refusé par le plafond part avant toute trace d'appel : il n'arrive jamais ici.
+        Error::Capped => unreachable!("un essai refusé par le plafond n'est jamais classé"),
     };
     label.to_string()
 }

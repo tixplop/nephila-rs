@@ -42,6 +42,10 @@ pub struct BuildReport {
     pub stop_cause: Option<String>,
     /// Première clé refusée (REQ-054) ou requête refusée (REQ-091), quand elle a arrêté l'envoi.
     pub refused: Option<Error>,
+    /// Plafond d'appels `<m>` de la commande, quand il a été atteint (REQ-186).
+    pub capped: Option<usize>,
+    /// Fichiers sans issue laissés « à enrichir » par le plafond (REQ-186).
+    pub left_by_cap: usize,
     /// Fichiers exclus par les filtres (REQ-037) ; `None` sans filtre actif.
     pub excluded: Option<usize>,
     /// Relevé de l'estimation sous `--dry-run` (REQ-184) ; sa présence remplace le segment
@@ -63,6 +67,8 @@ pub struct IndexOptions {
     pub format_retries: u32,
     /// Enrichit aussi les fichiers de code : option ou clé `enrich_code` (REQ-050).
     pub enrich_code: bool,
+    /// Plafond d'appels d'enrichissement de la commande (REQ-186) ; `None` : aucun plafond.
+    pub max_calls: Option<usize>,
 }
 
 impl Default for IndexOptions {
@@ -74,6 +80,7 @@ impl Default for IndexOptions {
             batch_files: crate::config::DEFAULT_BATCH_FILES,
             format_retries: crate::config::DEFAULT_FORMAT_RETRIES,
             enrich_code: false,
+            max_calls: None,
         }
     }
 }
@@ -87,6 +94,7 @@ impl From<&Config> for IndexOptions {
             batch_files: c.batch_files,
             format_retries: c.format_retries,
             enrich_code: c.enrich_code,
+            max_calls: None,
         }
     }
 }
@@ -284,6 +292,7 @@ pub fn run(
     write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
     let done = finish(&report);
     warn_transient(&cli_filters);
+    warn_capped(&report);
     done
 }
 
@@ -352,13 +361,27 @@ pub(crate) fn finish(report: &BuildReport) -> Result<()> {
     if report.pending > 0 {
         problems.push(format!("{} fichier(s) en attente", report.pending));
     }
-    if report.llm_active && report.to_enrich > 0 {
-        problems.push(format!("{} fichier(s) à enrichir", report.to_enrich));
+    // Les fichiers laissés par le plafond sont dits par A-10, pas par la ligne `erreur:`.
+    let to_enrich = report.to_enrich.saturating_sub(report.left_by_cap);
+    if report.llm_active && to_enrich > 0 {
+        problems.push(format!("{to_enrich} fichier(s) à enrichir"));
     }
     if problems.is_empty() {
         Ok(())
     } else {
         Err(Error::Message(problems.join(" ; ")))
+    }
+}
+
+/// Avertissement A-10 : plafond d'appels atteint. Écrit une seule fois, après tous les autres
+/// avertissements de fin de commande et avant la ligne `erreur:` que `main` écrit.
+pub(crate) fn warn_capped(report: &BuildReport) {
+    if let Some(m) = report.capped {
+        warn(&format!(
+            "{} : {} fichiers laissés à enrichir ; relancez nephila update pour continuer ou augmentez max_calls",
+            crate::index::enrich::cap_label(m),
+            report.left_by_cap
+        ));
     }
 }
 
@@ -594,6 +617,61 @@ pub(crate) fn estimate_enrichment(
 
 #[cfg(test)]
 mod tests {
+
+    fn capped_report(left: usize, to_enrich: usize) -> BuildReport {
+        BuildReport {
+            llm_active: true,
+            to_enrich,
+            capped: Some(3),
+            left_by_cap: left,
+            ..BuildReport::default()
+        }
+    }
+
+    fn message(r: Result<()>) -> String {
+        match r {
+            Err(Error::Message(m)) => m,
+            other => panic!("attendu une erreur, obtenu {other:?}"),
+        }
+    }
+
+    #[test]
+    fn req187_finish_cap_alone_is_ok() {
+        assert!(finish(&capped_report(4, 4)).is_ok());
+    }
+
+    #[test]
+    fn req187_ac2_finish_cap_and_failed_file_counts_only_the_failure() {
+        let m = message(finish(&capped_report(4, 5)));
+        assert_eq!(m, "1 fichier(s) à enrichir");
+    }
+
+    #[test]
+    fn req187_ac3_finish_cap_and_pending_file() {
+        let mut r = capped_report(4, 4);
+        r.pending = 1;
+        let m = message(finish(&r));
+        assert_eq!(m, "1 fichier(s) en attente");
+    }
+
+    #[test]
+    fn req187_finish_cap_and_stop_cause_without_count() {
+        let mut r = capped_report(4, 4);
+        r.stop_cause = Some("panne réseau répétée".into());
+        let m = message(finish(&r));
+        assert_eq!(m, "envoi interrompu : panne réseau répétée");
+        assert!(!m.contains("plafond") && !m.contains("max_calls"));
+    }
+
+    #[test]
+    fn req187_finish_without_cap_unchanged() {
+        let r = BuildReport {
+            llm_active: true,
+            to_enrich: 2,
+            ..BuildReport::default()
+        };
+        assert_eq!(message(finish(&r)), "2 fichier(s) à enrichir");
+    }
     fn sink() -> Out {
         Out::new(Box::new(Vec::new()))
     }

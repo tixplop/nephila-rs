@@ -32,6 +32,12 @@ pub enum Error {
     /// Plan d'appels d'un fichier envoyé seul au-delà du plafond : aucun appel n'est envoyé.
     /// Ni comptée ni remise à zéro par la politique d'échec, jamais retentée (REQ-048).
     TooManyCalls { calls: usize, max: usize },
+    /// Plan d'appels d'un fichier envoyé seul au-delà du plafond d'appels de la commande
+    /// (`max_calls`, A-11) : aucun appel n'est envoyé, aucun compte n'est pris.
+    CallsOverCap { calls: usize, max: usize },
+    /// Essai refusé faute de compte par le plafond d'appels de la commande (REQ-186) : erreur
+    /// interne, sans issue pour le fichier ; jamais affichée ni écrite dans un avertissement.
+    Capped,
 }
 
 /// Libellé fixe d'une réponse tronquée (avertissement d'enrichissement, erreur de `query ask`,
@@ -75,6 +81,12 @@ impl fmt::Display for Error {
                 f,
                 "trop d'appels d'enrichissement ({calls} nécessaires, au plus {max} par fichier), aucun envoyé ; excluez ce fichier avec exclude dans .nephila.toml"
             ),
+            Error::CallsOverCap { calls, max } => write!(
+                f,
+                "trop d'appels d'enrichissement ({calls} nécessaires, au plus {max} par commande), aucun envoyé ; augmentez max_calls ou excluez ce fichier avec exclude dans .nephila.toml"
+            ),
+            // Jamais affichée : le refus n'a pas d'issue (voir `Error::Capped`).
+            Error::Capped => f.write_str("plafond d'appels atteint"),
         }
     }
 }

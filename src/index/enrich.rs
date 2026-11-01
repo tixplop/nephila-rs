@@ -62,12 +62,50 @@ struct Policy {
     /// Première erreur d'arrêt immédiat (clé refusée REQ-054, requête refusée REQ-091), si elle
     /// est la cause de l'arrêt.
     refused: Option<Error>,
+    /// Appels (essais) encore permis par le plafond de la commande (REQ-186) ; `None` sans plafond.
+    budget: Option<usize>,
+    /// Valeur du plafond, pour son libellé ; `None` sans plafond.
+    limit: Option<usize>,
+    /// Vrai dès qu'une prise a été refusée faute de compte. N'écrit jamais `stop_cause`,
+    /// `stop_label` ni `refused` : le plafond n'est pas une erreur (REQ-187).
+    capped: bool,
+}
+
+/// Libellé du plafond atteint : seule source du texte, pour la trace `politique:` et pour A-10.
+pub(crate) fn cap_label(max: usize) -> String {
+    format!("plafond de {max} appels atteint")
 }
 
 /// Totaux des erreurs réseau et des délais dépassés constatés au départ d'un appel (DEC-022).
 type Ticket = (usize, usize);
 
 impl Policy {
+    /// Politique d'une commande dont le plafond d'appels est `max_calls`.
+    fn with_cap(max_calls: Option<usize>) -> Policy {
+        Policy {
+            budget: max_calls,
+            limit: max_calls,
+            ..Policy::default()
+        }
+    }
+
+    /// Prend `n` appels sur le plafond (sous le verrou de la politique). Sans plafond : vrai.
+    /// Reste suffisant : le décompte est fait. Sinon le plafond est marqué atteint, le reste
+    /// n'est pas touché et la prise est refusée.
+    fn take(&mut self, n: usize) -> bool {
+        match self.budget {
+            None => true,
+            Some(left) if left >= n => {
+                self.budget = Some(left - n);
+                true
+            }
+            Some(_) => {
+                self.capped = true;
+                false
+            }
+        }
+    }
+
     /// Prend un ticket au départ d'un appel (sous le verrou de la politique).
     fn dispatch(&self) -> Ticket {
         (self.network_total, self.timeout_total)
@@ -240,6 +278,10 @@ pub(crate) fn form_units_by_nodes<'a>(
     units
 }
 
+/// Prise sur le plafond d'appels : `take(n, files)` réserve `n` appels ; `files` est le nombre de
+/// fichiers de l'unité en cours qui ne sont pas encore partis (compté dans la trace du refus).
+type Take<'t> = &'t dyn Fn(usize, usize) -> bool;
+
 /// Suite d'une unité qui n'est pas un appel.
 enum Step<'a> {
     /// Résultats par fichier, et l'erreur de l'appel (pour la politique) s'il y a eu un appel.
@@ -276,6 +318,8 @@ fn run_unit<'a>(
     retries: u32,
     stop: &AtomicBool,
     totals: &Mutex<LlmTotals>,
+    max_calls: Option<usize>,
+    take: Take<'_>,
 ) -> Step<'a> {
     let files: Vec<&'a FileRecord> = match unit {
         Unit::Lot(v) => v.clone(),
@@ -309,7 +353,23 @@ fn run_unit<'a>(
                     outcomes.push(Outcome::Done((*f).clone(), Enrichment::default()));
                     Step::Finished(outcomes, None)
                 }
-                Ok(calls) => Step::Calls(outcomes, calls),
+                Ok(calls) => {
+                    let k = calls.len();
+                    if max_calls.is_some_and(|m| k > m) {
+                        // A-11 : plus d'appels que le plafond de la commande, aucun compte pris.
+                        let e = Error::CallsOverCap {
+                            calls: k,
+                            max: max_calls.unwrap_or(0),
+                        };
+                        outcomes.push(Outcome::Failed(f.path.clone(), e.clone()));
+                        Step::Finished(outcomes, Some(Some(e)))
+                    } else if take(k, 1) {
+                        Step::Calls(outcomes, calls)
+                    } else {
+                        // Réservation refusée : aucune issue, aucun appel mis en file.
+                        Step::Finished(outcomes, None)
+                    }
+                }
                 Err(e) => {
                     outcomes.push(Outcome::Failed(
                         f.path.clone(),
@@ -328,7 +388,7 @@ fn run_unit<'a>(
                     node_ids: node_ids(f),
                 })
                 .collect();
-            match traced_lot(llm, &items, retries, stop, totals) {
+            match traced_lot(llm, &items, retries, stop, totals, take) {
                 // Lot tronqué (REQ-096, DEC-101) : deux moitiés remises en tête de file ; aucune
                 // issue pour le lot lui-même, ses fichiers en recevront par leurs moitiés.
                 Err(Error::Truncated(_)) => {
@@ -348,6 +408,8 @@ fn run_unit<'a>(
                     );
                     Step::Calls(outcomes, vec![Unit::Lot(first), Unit::Lot(second)])
                 }
+                // Essai refusé par le plafond : aucune issue pour les fichiers du lot.
+                Err(Error::Capped) => Step::Finished(outcomes, None),
                 Err(e) => {
                     let per_file = truncation_advice(e.clone());
                     for (f, _) in &readable {
@@ -382,6 +444,8 @@ fn trace_detail(e: &Error) -> String {
         Error::Message(m) | Error::Format(m) => m.split(" : ").next().unwrap_or("").to_string(),
         Error::Truncated(_) => TRUNCATED.to_string(),
         Error::Rejected { trace, .. } | Error::Redirected { trace, .. } => trace.clone(),
+        // Un essai refusé par le plafond part avant toute trace d'appel : jamais détaillé ici.
+        Error::Capped => unreachable!("un essai refusé par le plafond n'a pas de détail de trace"),
         other => other.to_string(),
     }
 }
@@ -489,9 +553,14 @@ fn traced_lot(
     retries: u32,
     stop: &AtomicBool,
     totals: &Mutex<LlmTotals>,
+    take: Take<'_>,
 ) -> Result<Vec<(String, Result<Enrichment>)>> {
     let total = retries.saturating_add(1);
     with_format_retries(retries, stop, |current, fault| {
+        // Chaque essai, le premier compris, est pris sur le plafond avant tout envoi.
+        if !take(1, if current == 1 { items.len() } else { 0 }) {
+            return Err(Error::Capped);
+        }
         traced_lot_once(llm, items, Attempt { current, total }, fault, stop, totals)
     })
 }
@@ -826,9 +895,14 @@ fn run_call(
     retries: u32,
     stop: &AtomicBool,
     totals: &Mutex<LlmTotals>,
+    take: Take<'_>,
 ) -> Result<Enrichment> {
     let total = retries.saturating_add(1);
     with_format_retries(retries, stop, |current, fault| {
+        // Le premier essai d'un appel d'un fichier envoyé seul est déjà réservé (`run_unit`).
+        if current >= 2 && !take(1, 0) {
+            return Err(Error::Capped);
+        }
         traced_enrich(
             llm,
             path,
@@ -1053,16 +1127,39 @@ struct Shared<'a> {
 const IDLE_WAKE: Duration = Duration::from_millis(20);
 
 /// Prend l'unité suivante ; attend quand la file est vide mais qu'une unité en cours peut encore
-/// y ajouter des appels. `None` : plus rien à faire ou arrêt demandé.
+/// y ajouter des appels. `None` : plus rien à faire ou arrêt demandé. Le plafond atteint
+/// (`capped`, jamais le drapeau `stop`) ferme la file aux lots et aux fichiers envoyés seuls ;
+/// les appels déjà réservés d'un fichier envoyé seul vont à leur terme.
 fn next_unit<'a>(
     shared: &Mutex<Shared<'a>>,
     wake: &Condvar,
     stop: &AtomicBool,
+    capped: &AtomicBool,
 ) -> Option<Unit<'a>> {
     let mut guard = shared.lock().unwrap_or_else(|p| p.into_inner());
     loop {
         if stop.load(Ordering::SeqCst) {
             return None;
+        }
+        let closed = capped.load(Ordering::SeqCst);
+        if closed {
+            // File fermée : seuls les appels réservés (hors fichier en échec) partent, où qu'ils
+            // soient dans la file ; les lots et fichiers envoyés seuls restent « laissés ».
+            let state = &*guard;
+            let pos = state.queue.iter().position(
+                |u| matches!(u, Unit::Call { file, .. } if !state.failed.contains(&file.path)),
+            );
+            if let Some(i) = pos {
+                return guard.queue.remove(i);
+            }
+            if guard.expanding == 0 {
+                return None;
+            }
+            guard = wake
+                .wait_timeout(guard, IDLE_WAKE)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+            continue;
         }
         match guard.queue.pop_front() {
             Some(Unit::Call { file, .. }) if guard.failed.contains(&file.path) => continue,
@@ -1188,10 +1285,46 @@ struct Ctx<'s, 'a> {
     format_retries: u32,
     stop: &'s AtomicBool,
     totals: &'s Mutex<LlmTotals>,
+    /// Plafond d'appels de la commande (REQ-186).
+    max_calls: Option<usize>,
+    /// Posé quand une prise sur le plafond est refusée : plus aucune unité nouvelle.
+    capped: &'s AtomicBool,
+}
+
+/// Prise de `n` appels sur le plafond, sous le verrou de la politique. Au premier refus, écrit la
+/// trace `politique: arrêt de l'envoi (plafond …), <q> fichiers non envoyés` (`q` : fichiers de la
+/// file plus les `unsent` de l'unité en cours) et réveille les fils qui attendent.
+fn take_calls(ctx: &Ctx<'_, '_>, n: usize, unsent: usize) -> bool {
+    let mut guard = ctx.policy.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.take(n) {
+        return true;
+    }
+    let first = !ctx.capped.swap(true, Ordering::SeqCst);
+    if first && trace::enabled() {
+        let queued: usize = ctx
+            .shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .queue
+            .iter()
+            .map(Unit::file_count)
+            .sum();
+        trace!(
+            "politique: arrêt de l'envoi ({}), {} fichiers non envoyés",
+            cap_label(guard.limit.unwrap_or(0)),
+            queued + unsent
+        );
+    }
+    drop(guard);
+    // Réveille les fils qui attendent des appels.
+    drop(ctx.shared.lock().unwrap_or_else(|p| p.into_inner()));
+    ctx.wake.notify_all();
+    false
 }
 
 /// Corps d'un fil d'enrichissement : prend des unités jusqu'à l'arrêt ou la fin de la file.
 fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
+    let take = |n: usize, unsent: usize| take_calls(&ctx, n, unsent);
     let Ctx {
         shared,
         wake,
@@ -1203,8 +1336,10 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
         format_retries,
         stop,
         totals,
+        max_calls,
+        capped,
     } = ctx;
-    while let Some(unit) = next_unit(shared, wake, stop) {
+    while let Some(unit) = next_unit(shared, wake, stop, capped) {
         let mut expand = ExpandGuard {
             shared,
             wake,
@@ -1234,7 +1369,20 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     format_retries,
                     stop,
                     totals,
+                    &take,
                 );
+                // Nouvel essai refusé par le plafond : ni issue, ni échec, ni compte ; les appels
+                // non partis du fichier sont sautés.
+                if matches!(result, Err(Error::Capped)) {
+                    shared
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .failed
+                        .insert(file.path.clone());
+                    expand.armed = false;
+                    finish_unit(shared, wake, Vec::new(), false);
+                    continue;
+                }
                 let err = result.as_ref().err().cloned();
                 // Toute cause d'échec fait sauter les appels non partis du fichier
                 // (AC-051-5) ; la politique enregistre quand même cet appel.
@@ -1268,6 +1416,8 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     format_retries,
                     stop,
                     totals,
+                    max_calls,
+                    &take,
                 );
                 match step {
                     Step::Finished(outcomes, call) => (
@@ -1405,6 +1555,7 @@ pub(crate) fn enrich_with_stop(
         max_chunk_chars,
         batch_files,
         format_retries,
+        max_calls,
         enrich_code: _,
         jobs: _,
     } = *opts;
@@ -1435,7 +1586,8 @@ pub(crate) fn enrich_with_stop(
         expanding: 0,
     });
     let wake = Condvar::new();
-    let policy = Mutex::new(Policy::default());
+    let policy = Mutex::new(Policy::with_cap(max_calls));
+    let capped = AtomicBool::new(false);
     let totals = Mutex::new(LlmTotals::default());
     let (tx, rx) = mpsc::channel::<Msg>();
     if !without_nodes.is_empty() {
@@ -1467,6 +1619,8 @@ pub(crate) fn enrich_with_stop(
             format_retries,
             stop,
             totals: &totals,
+            max_calls,
+            capped: &capped,
         };
         for _ in 0..workers {
             let tx = tx.clone();
@@ -1583,10 +1737,10 @@ pub(crate) fn enrich_with_stop(
             }
         }
     });
+    let failed_now = report.failed - failed_before;
     trace!(
-        "enrichissement: fin {} ms, {succeeded} enrichis, {} en échec",
-        started.elapsed().as_millis(),
-        report.failed - failed_before
+        "enrichissement: fin {} ms, {succeeded} enrichis, {failed_now} en échec",
+        started.elapsed().as_millis()
     );
     let totals = totals.into_inner().unwrap_or_else(|p| p.into_inner());
     trace!("{}", calls_line(&totals));
@@ -1594,6 +1748,11 @@ pub(crate) fn enrich_with_stop(
     let policy = policy.into_inner().unwrap_or_else(|p| p.into_inner());
     report.stop_cause = policy.stop_cause;
     report.refused = policy.refused;
+    // Plafond atteint : les fichiers sans issue (ni enrichis ni en échec) restent à enrichir.
+    if policy.capped {
+        report.capped = policy.limit;
+        report.left_by_cap = files.len().saturating_sub(succeeded + failed_now);
+    }
     match write_error {
         Some(e) => Err(e),
         None => Ok(failures),
@@ -2133,7 +2292,18 @@ mod tests {
                 unreachable!()
             };
             results.push(run_call(
-                llm, path, index, count, excerpt, &part, &requested, &known, retries, stop, &totals,
+                llm,
+                path,
+                index,
+                count,
+                excerpt,
+                &part,
+                &requested,
+                &known,
+                retries,
+                stop,
+                &totals,
+                &|_, _| true,
             )?);
         }
         match results.len() {
@@ -2704,6 +2874,7 @@ mod tests {
             batch_files: 1,
             format_retries: u32::MAX,
             enrich_code: false,
+            max_calls: None,
         };
         let stop = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel();
@@ -2785,6 +2956,7 @@ mod tests {
             batch_files: 4,
             format_retries: 0,
             enrich_code: false,
+            max_calls: None,
         };
         progress::init(true);
         progress::take_captured();
@@ -2863,6 +3035,7 @@ mod tests {
             batch_files: 5,
             format_retries: 0,
             enrich_code: false,
+            max_calls: None,
         };
         let llm = Cut(Mutex::new(Vec::new()));
         progress::init(true);
@@ -3009,6 +3182,18 @@ mod tests {
         concurrency: usize,
         batch_files: usize,
     ) -> (Store, BuildReport, Vec<(String, Error)>) {
+        probe_run_capped(dir, files, llm, concurrency, batch_files, None, 0)
+    }
+
+    fn probe_run_capped(
+        dir: &tempfile::TempDir,
+        files: &[FileRecord],
+        llm: &dyn Llm,
+        concurrency: usize,
+        batch_files: usize,
+        max_calls: Option<usize>,
+        format_retries: u32,
+    ) -> (Store, BuildReport, Vec<(String, Error)>) {
         let mut store = Store::open_or_create(dir.path()).unwrap();
         store.insert_files(files).unwrap();
         // Les sections que citent les concepts du faux `Llm` sont déclarées par `Big.txt`.
@@ -3047,8 +3232,9 @@ mod tests {
             concurrency,
             max_chunk_chars: 10,
             batch_files,
-            format_retries: 0,
+            format_retries,
             enrich_code: false,
+            max_calls,
         };
         let failures = enrich_with_stop(
             Sources {
@@ -3218,6 +3404,304 @@ mod tests {
         assert_eq!(*llm.0.lock().unwrap(), [1, 2]);
         assert_eq!(failures.len(), 1);
         assert_eq!(report.failed, 1);
+    }
+
+    // ---- Plafond d'appels (REQ-186, REQ-187) ----
+
+    #[test]
+    fn req186_ac9_take_three_of_three_then_refused() {
+        let mut p = Policy {
+            budget: Some(3),
+            ..Policy::default()
+        };
+        assert!(p.take(1) && p.take(1) && p.take(1));
+        assert!(!p.capped);
+        assert!(!p.take(1));
+        assert!(p.capped);
+    }
+
+    #[test]
+    fn req186_ac9_reservation_of_two_on_one_left_is_refused_and_keeps_the_rest() {
+        let mut p = Policy {
+            budget: Some(1),
+            ..Policy::default()
+        };
+        assert!(!p.take(2));
+        assert!(p.capped);
+        assert_eq!(p.budget, Some(1));
+        assert!(p.take(1));
+    }
+
+    #[test]
+    fn req186_ac9_no_cap_never_refuses() {
+        let mut p = Policy::default();
+        for _ in 0..1000 {
+            assert!(p.take(7));
+        }
+        assert!(!p.capped);
+        assert_eq!(p.budget, None);
+    }
+
+    #[test]
+    fn req186_ac9_cap_leaves_the_stop_cause_to_a_later_invalid_key() {
+        let mut p = Policy {
+            budget: Some(0),
+            ..Policy::default()
+        };
+        assert!(!p.take(1));
+        assert!(p.stop_cause.is_none() && p.stop_label.is_none() && p.refused.is_none());
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&Error::InvalidKey("k".into()))));
+        assert_eq!(p.refused, Some(Error::InvalidKey("k".into())));
+        assert_eq!(
+            p.stop_cause.as_deref(),
+            Some("clé d'API refusée par le fournisseur")
+        );
+    }
+
+    #[test]
+    fn req186_cap_label_is_the_single_source() {
+        assert_eq!(cap_label(3), "plafond de 3 appels atteint");
+    }
+
+    /// Chemins restés à enrichir (portée du code comprise : les fichiers du banc sont `.txt`).
+    fn left_paths(mut store: Store) -> Vec<String> {
+        store.set_enrich_code(true).unwrap();
+        store
+            .files_to_enrich()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect()
+    }
+
+    fn unit_files(n: usize) -> Vec<FileRecord> {
+        (0..n).map(|i| rec(&format!("F{i}.txt"), 1)).collect()
+    }
+
+    #[test]
+    fn req186_next_unit_closes_the_queue_at_the_cap_without_touching_stop() {
+        let files = unit_files(2);
+        let shared = Mutex::new(Shared {
+            queue: vec![Unit::Lot(vec![&files[0]]), Unit::Lot(vec![&files[1]])].into(),
+            failed: HashSet::new(),
+            expanding: 0,
+        });
+        let wake = Condvar::new();
+        let stop = AtomicBool::new(false);
+        let capped = AtomicBool::new(false);
+        let first = next_unit(&shared, &wake, &stop, &capped);
+        assert!(first.is_some());
+        finish_unit(&shared, &wake, Vec::new(), true);
+        capped.store(true, Ordering::SeqCst);
+        assert!(next_unit(&shared, &wake, &stop, &capped).is_none());
+        assert!(!stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn req186_next_unit_closed_queue_still_serves_reserved_calls_behind_a_lot() {
+        let files = unit_files(2);
+        let call = |f: &'static FileRecord| Unit::Call {
+            file: f,
+            index: 1,
+            count: 1,
+            excerpt: None,
+            part: Arc::from("t"),
+            requested: Vec::new(),
+            known: Arc::from(Vec::<String>::new()),
+        };
+        let files: &'static [FileRecord] = Box::leak(files.into_boxed_slice());
+        let shared = Mutex::new(Shared {
+            queue: vec![
+                Unit::Lot(vec![&files[0]]),
+                call(&files[1]),
+                Unit::Lot(vec![&files[0]]),
+            ]
+            .into(),
+            failed: HashSet::new(),
+            expanding: 0,
+        });
+        let wake = Condvar::new();
+        let stop = AtomicBool::new(false);
+        let capped = AtomicBool::new(true);
+        let got = next_unit(&shared, &wake, &stop, &capped);
+        assert!(matches!(got, Some(Unit::Call { .. })), "{got:?}");
+        assert!(next_unit(&shared, &wake, &stop, &capped).is_none());
+        assert_eq!(shared.lock().unwrap().queue.len(), 2);
+    }
+
+    #[test]
+    fn req186_ac2_cap_3_on_7_files_sends_3_calls_and_leaves_4() {
+        let (dir, files) = probe_repo(&[], 7);
+        let llm = Probe::new(0, &[]);
+        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 1, Some(3), 0);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(llm.calls(), ["S0.txt#1", "S1.txt#1", "S2.txt#1"]);
+        assert_eq!(report.capped, Some(3));
+        // Une prise refusée n'ajoute rien aux totaux de l'appel.
+        assert_eq!(report.llm.calls, 3);
+        assert_eq!(report.llm.format_retries, 0);
+        assert_eq!(report.left_by_cap, 4);
+        assert_eq!(report.failed, 0);
+        assert!(report.stop_cause.is_none() && report.refused.is_none());
+        let left = left_paths(store);
+        assert_eq!(left, ["S3.txt", "S4.txt", "S5.txt", "S6.txt"]);
+    }
+
+    #[test]
+    fn req186_ac4_work_that_fits_exactly_is_not_capped() {
+        let (dir, files) = probe_repo(&[], 5);
+        let llm = Probe::new(0, &[]);
+        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 1, Some(5), 0);
+        assert!(failures.is_empty());
+        assert_eq!(llm.calls().len(), 5);
+        assert_eq!(report.capped, None);
+        assert_eq!(report.left_by_cap, 0);
+        assert!(left_paths(store).is_empty());
+    }
+
+    #[test]
+    fn req186_ac10_no_cap_sends_everything() {
+        let (dir, files) = probe_repo(&[], 7);
+        let llm = Probe::new(0, &[]);
+        let (_, report, _) = probe_run_capped(&dir, &files, &llm, 1, 1, None, 0);
+        assert_eq!(llm.calls().len(), 7);
+        assert_eq!((report.capped, report.left_by_cap), (None, 0));
+    }
+
+    /// Faux `Llm` dont le premier essai de chaque fichier est non conforme.
+    struct FirstTryBad {
+        seen: Mutex<HashMap<String, usize>>,
+        sent: Mutex<Vec<String>>,
+    }
+    impl Llm for FirstTryBad {
+        fn enrich(
+            &self,
+            file: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            let n = {
+                let mut seen = self.seen.lock().unwrap();
+                let n = seen.entry(file.to_string()).or_insert(0);
+                *n += 1;
+                *n
+            };
+            self.sent.lock().unwrap().push(format!("{file}:{n}"));
+            if n == 1 {
+                Err(Error::Format("réponse non conforme".into()))
+            } else {
+                Ok(Enrichment::default())
+            }
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req186_ac5_refused_format_retry_leaves_the_file_without_outcome() {
+        let (dir, files) = probe_repo(&[], 3);
+        let llm = FirstTryBad {
+            seen: Mutex::new(HashMap::new()),
+            sent: Mutex::new(Vec::new()),
+        };
+        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 1, Some(3), 2);
+        assert_eq!(
+            *llm.sent.lock().unwrap(),
+            ["S0.txt:1", "S0.txt:2", "S1.txt:1"]
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.capped, Some(3));
+        assert_eq!(report.left_by_cap, 2);
+        let left = left_paths(store);
+        assert_eq!(left, ["S1.txt", "S2.txt"]);
+    }
+
+    fn two_small_then_big(lines: usize) -> (tempfile::TempDir, Vec<FileRecord>) {
+        let (dir, mut files) = probe_repo(&[("Big.txt", lines)], 2);
+        files.rotate_left(1);
+        (dir, files)
+    }
+
+    #[test]
+    fn req186_ac6_big_file_reservation_refused_then_accepted() {
+        // 3 appels pour Big.txt, placé après deux petits fichiers.
+        let (dir, files) = two_small_then_big(3);
+        let llm = Probe::new(0, &[]);
+        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 1, Some(4), 0);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(llm.calls(), ["S0.txt#1", "S1.txt#1"]);
+        assert_eq!(
+            (report.capped, report.left_by_cap, report.failed),
+            (Some(4), 1, 0)
+        );
+        assert_eq!(left_paths(store).len(), 1);
+
+        let (dir, files) = two_small_then_big(3);
+        let llm = Probe::new(0, &[]);
+        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 1, Some(5), 0);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(llm.calls().len(), 5);
+        assert_eq!((report.capped, report.left_by_cap), (None, 0));
+        assert!(left_paths(store).is_empty());
+    }
+
+    #[test]
+    fn req186_ac6_big_file_alone_above_the_cap_fails_with_a11() {
+        let (dir, files) = probe_repo(&[("Big.txt", 3)], 0);
+        let llm = Probe::new(0, &[]);
+        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 1, Some(2), 0);
+        assert!(llm.calls().is_empty());
+        assert_eq!(names(&failures), ["Big.txt"]);
+        assert_eq!(
+            failures[0].1.to_string(),
+            "trop d'appels d'enrichissement (3 nécessaires, au plus 2 par commande), aucun envoyé ; augmentez max_calls ou excluez ce fichier avec exclude dans .nephila.toml"
+        );
+        assert_eq!(report.failed, 1);
+        assert_eq!((report.capped, report.left_by_cap), (None, 0));
+        assert_eq!(left_paths(store).len(), 1);
+    }
+
+    #[test]
+    fn req186_ac13_a11_does_not_stop_the_following_files() {
+        let (dir, mut files) = probe_repo(&[("Big.txt", 3)], 1);
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let llm = Probe::new(0, &[]);
+        let (_, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 1, Some(2), 0);
+        assert_eq!(names(&failures), ["Big.txt"]);
+        assert_eq!(llm.calls(), ["S0.txt#1"]);
+        assert_eq!((report.capped, report.left_by_cap), (None, 0));
+    }
+
+    #[test]
+    fn req186_ac3_concurrency_4_cap_5_on_20_files_never_exceeds_5_attempts() {
+        let (dir, files) = probe_repo(&[], 20);
+        let llm = Probe::new(4, &[]);
+        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 4, 1, Some(5), 0);
+        assert!(failures.is_empty());
+        assert_eq!(llm.calls().len(), 5);
+        assert_eq!(llm.max.load(Ordering::SeqCst), 4);
+        assert_eq!(report.capped, Some(5));
+        assert_eq!(report.left_by_cap, 15);
+        assert_eq!(left_paths(store).len(), 15);
+    }
+
+    #[test]
+    fn req186_lot_attempt_is_taken_once_for_the_whole_lot() {
+        let (dir, files) = probe_repo(&[], 6);
+        let llm = Probe::new(0, &[]);
+        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 3, Some(1), 0);
+        assert!(failures.is_empty());
+        assert_eq!(llm.calls(), ["lot:S0.txt,S1.txt,S2.txt"]);
+        assert_eq!((report.capped, report.left_by_cap), (Some(1), 3));
+        assert_eq!(left_paths(store).len(), 3);
     }
 }
 
@@ -3656,6 +4140,7 @@ mod plan_index_tests {
             2,
             &AtomicBool::new(false),
             &totals,
+            &|_, _| true,
         );
         assert!(r.is_ok());
         assert_eq!(
@@ -3679,7 +4164,14 @@ mod plan_index_tests {
             })
             .collect();
         let totals = Mutex::new(LlmTotals::default());
-        let r = traced_lot(&llm, &items, 2, &AtomicBool::new(false), &totals);
+        let r = traced_lot(
+            &llm,
+            &items,
+            2,
+            &AtomicBool::new(false),
+            &totals,
+            &|_, _| true,
+        );
         assert_eq!(r.unwrap().len(), 2);
         assert_eq!(
             *llm.seen.lock().unwrap(),
