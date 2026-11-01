@@ -260,3 +260,209 @@ fn req184_dry_run_sans_cle_ecrit_bilan_puis_estimation_sur_stdout() {
     assert!(lines[3].ends_with("(3 essais par appel)"), "{text}");
     assert_eq!(lines.len(), 4, "{text}");
 }
+
+// ---- REQ-186, REQ-187, REQ-188 : `max_calls` et `--max-calls` ----
+
+const MAX_CALLS_HELP_TEXT: &str = "--max-calls <N> Nombre maximal d'appels d'enrichissement de cette commande, nouveaux essais de format compris ; les fichiers restants attendent le prochain nephila update (remplace `max_calls` de la configuration ; défaut : aucun plafond)";
+
+struct CapEnv {
+    tmp: tempfile::TempDir,
+}
+
+impl CapEnv {
+    fn new(config_extra: Option<&str>) -> CapEnv {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("mock")).unwrap();
+        if let Some(extra) = config_extra {
+            std::fs::write(
+                tmp.path().join("config.toml"),
+                format!("provider = \"mock\"\nmodel = \"mock\"\n{extra}"),
+            )
+            .unwrap();
+        }
+        CapEnv { tmp }
+    }
+
+    fn repo(&self) -> std::path::PathBuf {
+        self.tmp.path().join("repo")
+    }
+
+    fn doc(&self, name: &str) {
+        std::fs::write(self.repo().join(name), "# Titre\n\ntexte\n").unwrap();
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        let mut c = nephila();
+        c.env("NEPHILA_CONFIG", self.tmp.path().join("config.toml"))
+            .env("NEPHILA_MOCK_DIR", self.tmp.path().join("mock"))
+            .env_remove("NEPHILA_MOCK_LOG")
+            .env_remove("NO_COLOR")
+            .arg("-C")
+            .arg(self.repo())
+            .args(args);
+        c.output().unwrap()
+    }
+}
+
+fn err_of(o: &std::process::Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+#[test]
+fn req186_ac1_ac11_valeur_invalide_de_l_option() {
+    for cmd in ["build", "update"] {
+        for v in ["0", "-1", "x", "1.5", "99999999999999999999"] {
+            let env = CapEnv::new(Some(""));
+            env.doc("a.md");
+            let o = env.run(&[cmd, &format!("--max-calls={v}")]);
+            assert_eq!(o.status.code(), Some(2), "{cmd} {v}");
+            assert!(o.stdout.is_empty(), "{cmd} {v}");
+            let want = format!(
+                "error: invalid value '{v}' for '--max-calls <N>': `{v}` n'est pas un entier strictement positif"
+            );
+            let err = err_of(&o);
+            assert!(err.contains(&want), "{cmd} {v} : {err}");
+            assert!(!err.contains("unexpected argument"), "{cmd} {v} : {err}");
+            assert!(!env.repo().join(".nephila").exists(), "{cmd} {v}");
+            // forme séparée par une espace
+            let o = env.run(&[cmd, "--max-calls", v]);
+            assert_eq!(o.status.code(), Some(2), "{cmd} {v}");
+            assert!(err_of(&o).contains(&want), "{cmd} {v}");
+        }
+    }
+}
+
+#[test]
+fn req186_ac12_configuration_invalide() {
+    for shown in ["0", "-3", "\"5\"", "1.5", "true"] {
+        let env = CapEnv::new(Some(&format!("max_calls = {shown}\n")));
+        env.doc("a.md");
+        let o = env.run(&["build"]);
+        assert_eq!(o.status.code(), Some(1), "{shown}");
+        let cfg = env.tmp.path().join("config.toml");
+        assert_eq!(
+            err_of(&o),
+            format!(
+                "erreur: configuration invalide ({}) : clé « max_calls » doit être un entier strictement positif (reçu : {shown})\n",
+                cfg.display()
+            ),
+            "{shown}"
+        );
+        assert!(!env.repo().join(".nephila").exists(), "{shown}");
+        // sans LLM, la configuration n'est pas lue
+        let o = env.run(&["build", "--no-llm"]);
+        assert_eq!(o.status.code(), Some(0), "{shown}");
+        assert!(!err_of(&o).contains("erreur:"), "{shown}");
+    }
+}
+
+#[test]
+fn req186_ac1_max_calls_refuse_dans_le_fichier_de_projet() {
+    let env = CapEnv::new(Some(""));
+    env.doc("a.md");
+    std::fs::write(env.repo().join(".nephila.toml"), "max_calls = 5\n").unwrap();
+    let o = env.run(&["build"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = err_of(&o);
+    assert!(err.contains("clé inconnue `max_calls`"), "{err}");
+    assert!(!env.repo().join(".nephila").exists());
+}
+
+#[test]
+fn req188_ac1_ac4_aide_de_max_calls() {
+    for cmd in ["build", "update"] {
+        let h = normalized_help(&[cmd]);
+        assert!(h.contains(MAX_CALLS_HELP_TEXT), "{cmd} : {h}");
+        let at = h.find("--max-calls <N>").unwrap();
+        assert!(h.find("--format-retries <N>").unwrap() < at, "{cmd}");
+        assert!(at < h.find("--exclude <MOTIF>").unwrap(), "{cmd}");
+        let entry_end = at + MAX_CALLS_HELP_TEXT.len();
+        assert!(
+            !h[at..entry_end + 20.min(h.len() - entry_end)].contains("[default:"),
+            "{cmd}"
+        );
+        assert!(
+            !h[h.find("Filtres :").unwrap()..].contains("max_calls"),
+            "{cmd}"
+        );
+    }
+    for args in [
+        vec!["status"],
+        vec!["query", "ask"],
+        vec!["export"],
+        vec!["summary"],
+    ] {
+        assert!(!normalized_help(&args).contains("--max-calls"), "{args:?}");
+    }
+}
+
+#[test]
+fn req187_ac4_ligne_config_et_priorite_de_l_option() {
+    let config_line = |o: &std::process::Output| -> String {
+        err_of(o)
+            .lines()
+            .find(|l| l.contains("config: llm="))
+            .unwrap_or_else(|| panic!("{}", err_of(o)))
+            .to_string()
+    };
+    let env = CapEnv::new(Some("max_calls = 3\n"));
+    env.doc("a.md");
+    let o = env.run(&["build", "--verbose"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err_of(&o));
+    assert!(
+        config_line(&o).ends_with(" format_retries=2 max_calls=3"),
+        "{}",
+        config_line(&o)
+    );
+    let o = env.run(&["update", "--verbose", "--max-calls", "7"]);
+    assert!(
+        config_line(&o).ends_with(" format_retries=2 max_calls=7"),
+        "{}",
+        config_line(&o)
+    );
+
+    let env = CapEnv::new(Some(""));
+    env.doc("a.md");
+    let o = env.run(&["build", "--verbose"]);
+    assert!(
+        config_line(&o).ends_with(" format_retries=2"),
+        "{}",
+        config_line(&o)
+    );
+    assert!(!config_line(&o).contains("max_calls"));
+    let o = env.run(&["update", "--verbose", "--max-calls", "7"]);
+    assert!(
+        config_line(&o).ends_with(" max_calls=7"),
+        "{}",
+        config_line(&o)
+    );
+
+    // sans LLM, l'option est sans effet
+    let o = env.run(&["build", "--no-llm", "--verbose", "--max-calls", "3"]);
+    let err = err_of(&o);
+    assert!(err.contains("config: llm inactif (--no-llm)"), "{err}");
+    assert!(!err.contains("max_calls"), "{err}");
+}
+
+#[test]
+fn req187_ac5_rien_a_enrichir_ou_sans_llm_sans_avertissement() {
+    let env = CapEnv::new(Some(""));
+    env.doc("a.md");
+    assert_eq!(env.run(&["build"]).status.code(), Some(0));
+    let o = env.run(&["update", "--max-calls", "1"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(!err_of(&o).contains("avertissement"), "{}", err_of(&o));
+    assert!(!err_of(&o).contains("plafond"), "{}", err_of(&o));
+
+    let env = CapEnv::new(Some(""));
+    env.doc("a.md");
+    let plain = env.run(&["build", "--no-llm"]);
+    let env2 = CapEnv::new(Some(""));
+    env2.doc("a.md");
+    let capped = env2.run(&["build", "--no-llm", "--max-calls", "1"]);
+    assert_eq!(plain.status.code(), capped.status.code());
+    assert_eq!(plain.stdout, capped.stdout);
+    assert_eq!(plain.stderr, capped.stderr);
+    assert!(!err_of(&capped).contains("avertissement"));
+}

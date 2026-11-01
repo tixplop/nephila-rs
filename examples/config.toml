@@ -207,6 +207,27 @@ api_key_env = "ANTHROPIC_API_KEY"
 # « mock » et avec une base_url en http://.
 # tls_insecure = false
 
+# --- Plafond d'appels ---
+# Hors des « Options communes » : la ligne ci-dessous montre une valeur d'exemple, pas le
+# défaut (aucun plafond).
+
+# Nombre maximal d'appels d'enrichissement d'une commande build ou update. Entier > 0.
+# Défaut : aucun plafond. Chaque essai compte : le premier essai d'un lot ou d'un appel d'un
+# fichier envoyé seul, et chaque nouvel essai de format (voir format_retries) ; les nouveaux
+# essais après une erreur réseau ou une réponse 429 ou 5xx ne comptent pas. Un fichier envoyé
+# seul réserve tous ses appels d'un coup : s'ils ne tiennent pas dans le reste du plafond, il
+# attend la commande suivante ; s'il en demande plus que max_calls, il n'est jamais envoyé
+# (avertissement « trop d'appels d'enrichissement »).
+# Plafond atteint : rien de nouveau ne part, les appels en cours se terminent, les autres
+# fichiers restent à enrichir et un avertissement donne leur nombre ; sans autre problème, le
+# code de sortie est 0. Chaque nephila update enrichit alors la tranche suivante, par ordre de
+# chemin : de quoi étaler un gros dépôt sur plusieurs nuits (500 appels par nuit, par exemple).
+# Nombre d'appels à prévoir : nephila build --dry-run. Sans effet sur query ask.
+# Remplacé, pour une commande, par l'option --max-calls. Lue ici seulement : .nephila.toml la
+# refuse.
+# Priorité : --max-calls > ce fichier > défaut.
+# max_calls = 500
+
 # --- Réglages de query ask ---
 # Section [ask] : elle ne vaut que pour nephila query ask. L'enrichissement (build, update)
 # n'en lit rien, et la changer ne réenrichit rien. Les quatre premières clés remplacent, pour

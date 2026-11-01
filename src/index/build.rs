@@ -94,7 +94,7 @@ impl From<&Config> for IndexOptions {
             batch_files: c.batch_files,
             format_retries: c.format_retries,
             enrich_code: c.enrich_code,
-            max_calls: None,
+            max_calls: c.max_calls,
         }
     }
 }
@@ -126,15 +126,22 @@ fn effective_config(
     project: &ProjectSettings,
     batch_files: Option<usize>,
     format_retries: Option<u32>,
+    max_calls: Option<usize>,
 ) -> Config {
     let (mut config, from_project) = config.with_project(project, batch_files, format_retries);
     config.enrich_code |= enrich_code;
+    // L'option remplace la clé (REQ-186) ; le fichier de projet ne la porte pas.
+    config.max_calls = max_calls.or(config.max_calls);
+    let max_calls_trace = config
+        .max_calls
+        .map(|m| format!(" max_calls={m}"))
+        .unwrap_or_default();
     let mut tls_trace = config.tls_trace();
     if !from_project.is_empty() {
         tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
     }
     trace!(
-        "config: llm={} model={} enrich_code={} summary_language=\"{}\" thinking={} effort={} max_output_tokens={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}",
+        "config: llm={} model={} enrich_code={} summary_language=\"{}\" thinking={} effort={} max_output_tokens={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}{}",
         config.provider.as_str(),
         config.model,
         config.enrich_code,
@@ -147,6 +154,7 @@ fn effective_config(
         config.max_chunk_chars,
         config.batch_files,
         config.format_retries,
+        max_calls_trace,
         tls_trace
     );
     config
@@ -163,6 +171,7 @@ pub(crate) fn setup(
     project: &ProjectSettings,
     batch_files: Option<usize>,
     format_retries: Option<u32>,
+    max_calls: Option<usize>,
 ) -> Result<Setup> {
     if no_llm {
         trace!("config: llm inactif (--no-llm)");
@@ -197,8 +206,14 @@ pub(crate) fn setup(
             })
         }
         Some(config) => {
-            let config =
-                effective_config(config, enrich_code, project, batch_files, format_retries);
+            let config = effective_config(
+                config,
+                enrich_code,
+                project,
+                batch_files,
+                format_retries,
+                max_calls,
+            );
             if dry_run {
                 return Ok(Setup {
                     opts: IndexOptions::from(&config),
@@ -248,6 +263,8 @@ pub struct Overrides {
     pub jobs: Option<usize>,
     pub batch_files: Option<usize>,
     pub format_retries: Option<u32>,
+    /// `--max-calls` (REQ-186) : plafond d'appels d'enrichissement de la commande.
+    pub max_calls: Option<usize>,
     /// `--dry-run` (REQ-184) : estime l'enrichissement sans client LLM ni clé.
     pub dry_run: bool,
 }
@@ -274,6 +291,7 @@ pub fn run(
         &project.settings,
         over.batch_files,
         over.format_retries,
+        over.max_calls,
     )?;
     if let Some(j) = over.jobs {
         setup.opts.jobs = j;

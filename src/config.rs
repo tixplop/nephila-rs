@@ -357,6 +357,9 @@ pub struct Config {
     pub batch_files: usize,
     /// Nouveaux essais d'un appel dont la réponse est non conforme (REQ-038).
     pub format_retries: u32,
+    /// Plafond d'appels d'enrichissement par commande, configuration personnelle seulement
+    /// (REQ-186) ; `None` = aucun plafond.
+    pub max_calls: Option<usize>,
     /// Enrichit aussi les fichiers de code, pas seulement les documents (REQ-050).
     pub enrich_code: bool,
     /// Demande la réflexion au modèle (REQ-058).
@@ -391,6 +394,7 @@ struct RawConfig {
     timeout_secs: Option<i64>,
     batch_files: Option<i64>,
     format_retries: Option<toml::Value>,
+    max_calls: Option<toml::Value>,
     enrich_code: Option<toml::Value>,
     summary_language: Option<toml::Value>,
     thinking: Option<toml::Value>,
@@ -731,6 +735,18 @@ impl Config {
                 )))
             }
         };
+        let max_calls = match &raw.max_calls {
+            None => None,
+            Some(toml::Value::Integer(n)) if *n >= 1 => {
+                Some(usize::try_from(*n).unwrap_or(usize::MAX))
+            }
+            Some(v) => {
+                return Err(Error::Message(format!(
+                    "configuration invalide ({at}) : clé « max_calls » doit être un entier \
+                     strictement positif (reçu : {v})"
+                )))
+            }
+        };
         let enrich_code = match &raw.enrich_code {
             None => false,
             Some(toml::Value::Boolean(b)) => *b,
@@ -867,6 +883,7 @@ impl Config {
             )? as u64,
             batch_files: positive("batch_files", raw.batch_files, DEFAULT_BATCH_FILES)?,
             format_retries,
+            max_calls,
             enrich_code,
             thinking,
             effort,
@@ -966,6 +983,7 @@ mod project_tests {
             timeout_secs: 30,
             batch_files: 3,
             format_retries: 1,
+            max_calls: None,
             enrich_code: false,
             thinking: false,
             effort: DEFAULT_EFFORT,
@@ -1413,6 +1431,25 @@ mod ask_tests {
 
     fn project(toml: &str) -> Result<ProjectSettings> {
         ProjectSettings::from_table(&toml.parse().unwrap(), "./.nephila.toml")
+    }
+
+    #[test]
+    fn req186_ac1_max_calls_du_chargeur() {
+        assert_eq!(personal("").unwrap().max_calls, None);
+        assert_eq!(personal("max_calls = 500").unwrap().max_calls, Some(500));
+        for shown in ["0", "-3", "\"5\"", "1.5", "true"] {
+            let e = personal(&format!("max_calls = {shown}")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "configuration invalide ({P}) : clé « max_calls » doit être un entier \
+                     strictement positif (reçu : {shown})"
+                )
+            );
+        }
+        // jamais dans le fichier de projet
+        assert!(!PROJECT_SETTINGS.contains(&"max_calls"));
+        assert_eq!(project_cap("max_calls"), None);
     }
 
     fn forty() -> String {

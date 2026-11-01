@@ -82,6 +82,8 @@ fn parse_context_chars(s: &str) -> std::result::Result<usize, String> {
     }
 }
 
+const MAX_CALLS_HELP: &str = "Nombre maximal d'appels d'enrichissement de cette commande, nouveaux essais de format compris ; les fichiers restants attendent le prochain nephila update (remplace `max_calls` de la configuration ; défaut : aucun plafond)";
+
 const FORMAT_RETRIES_HELP: &str = "Nombre de nouveaux essais d'un appel LLM dont la réponse est non conforme (remplace `format_retries` de la configuration ; défaut 2 ; 0 = aucun nouvel essai)";
 
 /// Motif `--exclude` : compilé seul, pour que l'erreur d'usage le nomme (REQ-037).
@@ -144,6 +146,8 @@ pub struct IndexOpts {
     pub batch_files: Option<usize>,
     #[arg(help = FORMAT_RETRIES_HELP, long, value_name = "N", value_parser = parse_format_retries, allow_hyphen_values = true)]
     pub format_retries: Option<u32>,
+    #[arg(help = MAX_CALLS_HELP, long, value_name = "N", value_parser = parse_batch_files, allow_hyphen_values = true)]
+    pub max_calls: Option<usize>,
     /// Exclut de l'analyse les fichiers qui correspondent au motif (syntaxe .gitignore, relatif à la racine du dépôt ; répétable ; !motif réinclut un fichier exclu par un motif précédent)
     #[arg(long, value_name = "MOTIF", action = clap::ArgAction::Append, value_parser = parse_exclude)]
     pub exclude: Vec<String>,
@@ -271,6 +275,7 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
                     jobs: o.jobs,
                     batch_files: o.batch_files,
                     format_retries: o.format_retries,
+                    max_calls: o.max_calls,
                     dry_run: o.dry_run,
                 },
                 o.filters(),
@@ -288,6 +293,7 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
                     jobs: o.jobs,
                     batch_files: o.batch_files,
                     format_retries: o.format_retries,
+                    max_calls: o.max_calls,
                     dry_run: o.dry_run,
                 },
                 o.filters(),

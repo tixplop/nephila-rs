@@ -129,6 +129,7 @@ nephila update [--no-llm] [-v|--verbose | --show-progress] [--enrich-code] [--jo
 | `--jobs <N>` | Fils du parcours et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs. Sans effet sur `concurrency` (appels LLM) |
 | `--batch-files <N>` | Fichiers par appel d'enrichissement, pour cette commande |
 | `--format-retries <N>` | Nouveaux essais d'une réponse non conforme, pour cette commande |
+| `--max-calls <N>` | Plafond d'appels d'enrichissement, pour cette commande |
 | `--exclude <MOTIF>` | Exclut les fichiers qui correspondent au motif, pour cette commande ; répétable |
 | `--exclude-type <TYPES>` | Exclut des types, séparés par des virgules, pour cette commande ; répétable |
 
@@ -140,7 +141,7 @@ update terminé : 2 fichiers traités, 24 nœuds, 28 liens, 2 références non r
 Le bilan donne deux compteurs :
 
 - **en attente** : l'analyse du fichier n'a pas abouti ; code de sortie 1 ; `nephila update` le reprend.
-- **à enrichir** : la structure du fichier est dans le graphe, mais le LLM ne l'a pas enrichie (réponse non conforme ou tronquée, trop d'appels, erreur, `--no-llm`, fichier modifié depuis) ; code 1 avec le LLM actif, 0 sans lui ; `nephila update` le reprend.
+- **à enrichir** : la structure du fichier est dans le graphe, mais le LLM ne l'a pas enrichie (réponse non conforme ou tronquée, trop d'appels, plafond `max_calls`, erreur, `--no-llm`, fichier modifié depuis) ; code 1 avec le LLM actif, 0 sans lui ou s'il est laissé par le plafond ; `nephila update` le reprend.
 
 Un fichier en échec est nommé sur stderr avec sa cause, et le traitement des autres continue ; si l'envoi au LLM s'arrête, voir [Arrêt de l'envoi](#arrêt-de-lenvoi).
 Un seul `build` ou `update` à la fois par dépôt : une seconde commande échoue aussitôt (`erreur: indexation déjà en cours sur ce dépôt`).
@@ -238,7 +239,7 @@ Les requêtes ne vérifient pas que le graphe est à jour : faites l'étape 1 av
 
 | Code | Signification |
 |---|---|
-| 0 | Succès |
+| 0 | Succès, même si seul le plafond `max_calls` laisse des fichiers à enrichir |
 | 1 | Erreur d'exécution : configuration, graphe absent, aucun résultat, arrêt de l'envoi au LLM, fichiers en attente ou à enrichir avec le LLM actif… |
 | 2 | Erreur d'usage : commande ou option inconnue, valeur invalide |
 
@@ -370,6 +371,7 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 | `max_output_tokens` | Limite de jetons de la réponse, entier > 0 ; configuration personnelle seulement | 16384 |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |
 | `format_retries` | Nouveaux essais d'une réponse non conforme, entier ≥ 0 | 2 |
+| `max_calls` | Plafond d'appels d'enrichissement par commande, nouveaux essais de format compris ; configuration personnelle seulement | aucun |
 | `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 | 300 |
 | `tls_ca_cert` | Fichier PEM d'autorités ajoutées aux autorités publiques ; chemin absolu, `~/…` ou relatif | aucun |
 | `tls_insecure` | `true` désactive le contrôle du certificat du serveur, comme `curl -k` | `false` |
@@ -462,7 +464,7 @@ Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, c
 
 ### Arrêt de l'envoi
 
-Six causes arrêtent l'envoi au LLM. Chacune a sa ligne `erreur:`, la dernière de stderr, après la ligne de bilan, avec le code 1 :
+Sept causes arrêtent l'envoi au LLM. Les six de la table sont des erreurs : chacune a sa ligne `erreur:`, la dernière de stderr, après la ligne de bilan, avec le code 1 :
 
 | Cause | Quand | Que faire |
 |---|---|---|
@@ -474,6 +476,8 @@ Six causes arrêtent l'envoi au LLM. Chacune a sa ligne `erreur:`, la dernière 
 | Délais dépassés | 3 appels de suite sans réponse dans `timeout_secs` | augmenter `timeout_secs`, ou vérifier le fournisseur |
 
 Les appels en cours se terminent et sont enregistrés. Les fichiers non envoyés restent « à enrichir » : une fois la cause corrigée, `nephila update` ne renvoie qu'eux. Sans fichier à enrichir, aucun appel n'a lieu, et une clé fausse passe inaperçue.
+
+Le plafond `max_calls` (ou `--max-calls`) est la septième cause, la seule voulue : il borne les appels d'une commande, nouveaux essais de format compris. Quand il en faudrait un de plus, plus rien ne part, les appels en cours se terminent, et une ligne `avertissement: plafond de <n> appels atteint : …` compte les fichiers laissés à enrichir. Code 0 si rien d'autre n'échoue : chaque `nephila update` enrichit la tranche suivante.
 
 ## Export et vue HTML
 

@@ -39,6 +39,7 @@ pub fn run(
         &project.settings,
         over.batch_files,
         over.format_retries,
+        over.max_calls,
     )?;
     if let Some(j) = over.jobs {
         setup.opts.jobs = j;

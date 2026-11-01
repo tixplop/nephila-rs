@@ -1350,7 +1350,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 43_000, "README : {size} octets");
+    assert!(size <= 44_000, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1578,10 +1578,11 @@ fn REQ155_AC14_options_de_build_en_une_ligne() {
         "`--jobs <N>`",
         "`--batch-files <N>`",
         "`--format-retries <N>`",
+        "`--max-calls <N>`",
         "`--exclude <MOTIF>`",
         "`--exclude-type <TYPES>`",
     ];
-    assert_eq!(rows.len(), 10, "{rows:?}");
+    assert_eq!(rows.len(), 11, "{rows:?}");
     for (row, option) in rows.iter().zip(options) {
         assert_eq!(cell(row, 0), option);
         assert!(row.chars().count() <= 160, "{row}");
@@ -1952,7 +1953,7 @@ fn REQ165_AC16_readme_traces_sentence() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 43_000, "README : {size} octets");
+    assert!(size <= 44_000, "README : {size} octets");
 }
 
 #[test]
@@ -2002,7 +2003,7 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 43_000, "README : {size} octets");
+    assert!(size <= 44_000, "README : {size} octets");
 }
 
 // ---- REQ-174 : `summary_language` dans les exemples et le README ----
@@ -2163,7 +2164,7 @@ fn REQ174_AC5_AC10_readme_lignes_et_phrases_de_summary_language() {
         assert!(!readme.contains(old), "présent : {old}");
     }
     assert_eq!(readme.matches("config: llm=").count(), 1);
-    assert!(readme.len() <= 43_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 44_000, "README : {} octets", readme.len());
 }
 
 /// AC-185-2 : textes de V-012 pour `--dry-run`, ligne de table après `--enrich-code`.
@@ -2179,7 +2180,62 @@ fn req185_ac2_readme_dry_run() {
     assert!(at < readme.find("| `-v, --verbose` |").unwrap());
     let section = readme_section(&readme, "### `nephila build` et `nephila update`");
     let table = section.lines().filter(|l| l.starts_with("| `-")).count();
-    assert_eq!(table, 10, "{section}");
+    assert_eq!(table, 11, "{section}");
     assert!(readme.find("Un seul `build` ou `update`").unwrap() < readme.find(para).unwrap());
-    assert!(readme.len() <= 43_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 44_000, "README : {} octets", readme.len());
+}
+
+// ---- REQ-188 : `max_calls` dans l'exemple et le README ----
+
+#[test]
+fn REQ188_AC2_AC5_section_max_calls_de_l_exemple() {
+    let text = example("config.toml");
+    let lines: Vec<&str> = text.lines().collect();
+    let at = |wanted: &str| position_of(&lines, wanted);
+    let title = at("# --- Plafond d'appels ---");
+    assert!(at("# tls_insecure = false") < title);
+    assert!(title < at("# --- Réglages de query ask ---"));
+    let key = at("# max_calls = 500");
+    assert_eq!(
+        lines[key - 1],
+        "# Priorité : --max-calls > ce fichier > défaut."
+    );
+    assert!(title < key && key < at("# --- Réglages de query ask ---"));
+    let common = &lines[at("# --- Options communes ---")..title];
+    assert!(!common.iter().any(|l| l.contains("max_calls")));
+    assert!(!example("nephila.toml").contains("max_calls"));
+    // décommentée, la ligne est acceptée
+    let enabled = text.replace("# max_calls = 500", "max_calls = 500");
+    assert_eq!(parse(&enabled).max_calls, Some(500));
+}
+
+#[test]
+fn REQ188_AC3_AC6_textes_du_readme() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 44_000, "README : {} octets", readme.len());
+    let has_after = |first: &str, second: &str| {
+        let a = readme
+            .find(first)
+            .unwrap_or_else(|| panic!("absent : {first}"));
+        assert_eq!(readme[a..].lines().nth(1), Some(second), "{first}");
+    };
+    has_after(
+        "| `format_retries` | Nouveaux essais d'une réponse non conforme, entier ≥ 0 | 2 |",
+        "| `max_calls` | Plafond d'appels d'enrichissement par commande, nouveaux essais de format compris ; configuration personnelle seulement | aucun |",
+    );
+    has_after(
+        "| `--format-retries <N>` | Nouveaux essais d'une réponse non conforme, pour cette commande |",
+        "| `--max-calls <N>` | Plafond d'appels d'enrichissement, pour cette commande |",
+    );
+    let sec = readme_section(&readme, "### Arrêt de l'envoi");
+    assert!(sec.trim_start().starts_with(
+        "Sept causes arrêtent l'envoi au LLM. Les six de la table sont des erreurs :"
+    ));
+    let causes = table_rows(&sec, "| Cause | Quand | Que faire |", "|---|---|---|");
+    assert_eq!(causes.len(), 6, "{causes:?}");
+    assert!(sec.contains("\nLe plafond `max_calls` (ou `--max-calls`) est la septième cause, la seule voulue : il borne les appels d'une commande, nouveaux essais de format compris. Quand il en faudrait un de plus, plus rien ne part, les appels en cours se terminent, et une ligne `avertissement: plafond de <n> appels atteint : …` compte les fichiers laissés à enrichir. Code 0 si rien d'autre n'échoue : chaque `nephila update` enrichit la tranche suivante.\n"));
+    assert!(readme.contains(
+        "\n| 0 | Succès, même si seul le plafond `max_calls` laisse des fichiers à enrichir |\n"
+    ));
+    assert!(readme.contains("- **à enrichir** : la structure du fichier est dans le graphe, mais le LLM ne l'a pas enrichie (réponse non conforme ou tronquée, trop d'appels, plafond `max_calls`, erreur, `--no-llm`, fichier modifié depuis) ; code 1 avec le LLM actif, 0 sans lui ou s'il est laissé par le plafond ; `nephila update` le reprend.\n"));
 }
