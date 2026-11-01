@@ -7,6 +7,7 @@ use std::time::Instant;
 use crate::config::{Config, ProjectSettings, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS};
 use crate::error::{warn, Error, Result};
 use crate::filter::{Filters, Matcher, ProjectFile};
+use crate::index::estimate::{self, Estimate};
 use crate::index::lock::RepoLock;
 use crate::index::{enrich, structure};
 use crate::llm::{build_llm, Llm, LlmTotals};
@@ -43,6 +44,9 @@ pub struct BuildReport {
     pub refused: Option<Error>,
     /// Fichiers exclus par les filtres (REQ-037) ; `None` sans filtre actif.
     pub excluded: Option<usize>,
+    /// Relevé de l'estimation sous `--dry-run` (REQ-184) ; sa présence remplace le segment
+    /// `enrichissement : désactivé` par `enrichissement : estimé sans envoi`.
+    pub estimate: Option<Estimate>,
 }
 
 /// Réglages de l'indexation : ceux de la configuration, ou les défauts sans configuration.
@@ -87,16 +91,66 @@ impl From<&Config> for IndexOptions {
     }
 }
 
+/// Réglages de l'estimation sous `--dry-run` (REQ-184, DEC-148) ; les autres réglages
+/// (`enrich_code`, `max_chunk_chars`, `batch_files`, `format_retries`) sont ceux d'`IndexOptions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DryRun {
+    /// Modèle effectif ; `None` sans configuration (aucun enrichissement ne vaut alors).
+    pub model: Option<String>,
+    /// Langue des résumés effective.
+    pub language: String,
+    /// Chemin de la configuration personnelle, quand elle n'existe pas.
+    pub no_config: Option<PathBuf>,
+}
+
 /// Réglages et fournisseur LLM (absent : indexation sans enrichissement).
 pub(crate) struct Setup {
     pub opts: IndexOptions,
     pub llm: Option<Box<dyn Llm>>,
+    pub dry_run: Option<DryRun>,
+}
+
+/// Applique les réglages du projet et les options à la configuration, puis trace la ligne
+/// `config:` (la même avec ou sans `--dry-run`).
+fn effective_config(
+    config: Config,
+    enrich_code: bool,
+    project: &ProjectSettings,
+    batch_files: Option<usize>,
+    format_retries: Option<u32>,
+) -> Config {
+    let (mut config, from_project) = config.with_project(project, batch_files, format_retries);
+    config.enrich_code |= enrich_code;
+    let mut tls_trace = config.tls_trace();
+    if !from_project.is_empty() {
+        tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
+    }
+    trace!(
+        "config: llm={} model={} enrich_code={} summary_language=\"{}\" thinking={} effort={} max_output_tokens={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}",
+        config.provider.as_str(),
+        config.model,
+        config.enrich_code,
+        config.summary_language,
+        config.thinking,
+        config.effort.as_str(),
+        config.max_output_tokens,
+        config.concurrency,
+        config.timeout_secs,
+        config.max_chunk_chars,
+        config.batch_files,
+        config.format_retries,
+        tls_trace
+    );
+    config
 }
 
 /// Prépare une commande d'indexation : avec `--no-llm` la configuration n'est pas lue ; sans
-/// fichier de configuration le LLM est inactif ; sinon validation (la clé n'est constatée qu'au premier appel, REQ-054).
+/// fichier de configuration le LLM est inactif ; sinon validation (la clé n'est constatée qu'au
+/// premier appel, REQ-054). Sous `--dry-run`, la configuration est lue sans la clé et aucun
+/// client n'est construit (REQ-184).
 pub(crate) fn setup(
     no_llm: bool,
+    dry_run: bool,
     enrich_code: bool,
     project: &ProjectSettings,
     batch_files: Option<usize>,
@@ -110,9 +164,15 @@ pub(crate) fn setup(
                 ..IndexOptions::default()
             },
             llm: None,
+            dry_run: None,
         });
     }
-    match Config::load_optional()? {
+    let loaded = if dry_run {
+        Config::load_optional_without_key()?
+    } else {
+        Config::load_optional()?
+    };
+    match loaded {
         None => {
             trace!("config: llm inactif (aucune configuration)");
             Ok(Setup {
@@ -121,36 +181,32 @@ pub(crate) fn setup(
                     ..IndexOptions::default()
                 },
                 llm: None,
+                dry_run: dry_run.then(|| DryRun {
+                    model: None,
+                    language: crate::config::DEFAULT_SUMMARY_LANGUAGE.to_string(),
+                    no_config: crate::config::config_path().ok(),
+                }),
             })
         }
         Some(config) => {
-            let (mut config, from_project) =
-                config.with_project(project, batch_files, format_retries);
-            config.enrich_code |= enrich_code;
-            let mut tls_trace = config.tls_trace();
-            if !from_project.is_empty() {
-                tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
+            let config =
+                effective_config(config, enrich_code, project, batch_files, format_retries);
+            if dry_run {
+                return Ok(Setup {
+                    opts: IndexOptions::from(&config),
+                    llm: None,
+                    dry_run: Some(DryRun {
+                        model: Some(config.model.clone()),
+                        language: config.summary_language.clone(),
+                        no_config: None,
+                    }),
+                });
             }
-            trace!(
-                "config: llm={} model={} enrich_code={} summary_language=\"{}\" thinking={} effort={} max_output_tokens={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}",
-                config.provider.as_str(),
-                config.model,
-                config.enrich_code,
-                config.summary_language,
-                config.thinking,
-                config.effort.as_str(),
-                config.max_output_tokens,
-                config.concurrency,
-                config.timeout_secs,
-                config.max_chunk_chars,
-                config.batch_files,
-                config.format_retries,
-                tls_trace
-            );
             let llm = build_llm(&config)?;
             Ok(Setup {
                 opts: IndexOptions::from(&config),
                 llm: Some(llm),
+                dry_run: None,
             })
         }
     }
@@ -166,7 +222,9 @@ impl BuildReport {
             "{verb} terminé : {} fichiers traités, {} nœuds, {} liens, {} références non résolues, {} fichiers en attente, {} fichiers à enrichir",
             self.processed, self.nodes, self.edges, self.unresolved, self.pending, self.to_enrich
         );
-        if !self.llm_active {
+        if self.estimate.is_some() {
+            line.push_str(", enrichissement : estimé sans envoi");
+        } else if !self.llm_active {
             line.push_str(", enrichissement : désactivé");
         }
         if let Some(k) = self.excluded {
@@ -182,6 +240,8 @@ pub struct Overrides {
     pub jobs: Option<usize>,
     pub batch_files: Option<usize>,
     pub format_retries: Option<u32>,
+    /// `--dry-run` (REQ-184) : estime l'enrichissement sans client LLM ni clé.
+    pub dry_run: bool,
 }
 
 /// Point d'entrée de `nephila build` : valide le dépôt, la configuration et la clé, puis construit.
@@ -201,6 +261,7 @@ pub fn run(
     let matcher = effective_matcher(repo, &project.filters, &cli_filters)?;
     let mut setup = setup(
         no_llm,
+        over.dry_run,
         enrich_code,
         &project.settings,
         over.batch_files,
@@ -211,8 +272,16 @@ pub fn run(
     }
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
-    let report = build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
+    let report = build_with_dry_run(
+        repo,
+        &setup.opts,
+        setup.llm.as_deref(),
+        setup.dry_run.as_ref(),
+        &lock,
+        &matcher,
+    )?;
     write_report(out, &report, "build")?;
+    write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
     let done = finish(&report);
     warn_transient(&cli_filters);
     done
@@ -241,6 +310,33 @@ pub(crate) fn warn_transient(cli_filters: &Filters) {
 /// Écrit la ligne de bilan sur stdout ; en cas d'échec (E-17), la commande s'arrête là.
 pub(crate) fn write_report(out: &mut Out, report: &BuildReport, verb: &str) -> Result<()> {
     writeln!(out, "{}", report.line_for(verb))
+}
+
+/// Écrit les lignes de l'estimation sur stdout, après le bilan (V-002) ; E-17 si stdout est
+/// fermée. Sans relevé (pas de `--dry-run`), n'écrit rien.
+pub(crate) fn write_estimate(
+    out: &mut Out,
+    report: &BuildReport,
+    opts: &IndexOptions,
+    dry: Option<&DryRun>,
+) -> Result<()> {
+    write_estimate_lines(out, report.estimate.as_ref(), opts, dry)
+}
+
+/// Comme `write_estimate`, pour un relevé donné.
+pub(crate) fn write_estimate_lines(
+    out: &mut Out,
+    estimate: Option<&Estimate>,
+    opts: &IndexOptions,
+    dry: Option<&DryRun>,
+) -> Result<()> {
+    let (Some(est), Some(dry)) = (estimate, dry) else {
+        return Ok(());
+    };
+    for line in estimate::stdout_lines(est, opts.format_retries + 1, dry.no_config.as_deref()) {
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
 }
 
 /// Erreurs de fin de commande ; une clé refusée est rendue telle quelle (REQ-054) ; un fichier resté en attente, un fichier à enrichir (LLM actif) ou un arrêt
@@ -329,15 +425,39 @@ pub fn build(
     _lock: &RepoLock,
     matcher: &Matcher,
 ) -> Result<BuildReport> {
-    build_with_budget(repo, opts, llm, _lock, matcher, scan::RETAIN_BUDGET)
+    build_with_dry_run(repo, opts, llm, None, _lock, matcher)
+}
+
+/// `build` avec, sous `--dry-run`, les réglages de l'estimation (REQ-184) ; `llm` est alors absent.
+pub fn build_with_dry_run(
+    repo: &Path,
+    opts: &IndexOptions,
+    llm: Option<&dyn Llm>,
+    dry: Option<&DryRun>,
+    _lock: &RepoLock,
+    matcher: &Matcher,
+) -> Result<BuildReport> {
+    build_impl(repo, opts, llm, dry, matcher, scan::RETAIN_BUDGET)
 }
 
 /// `build` avec un budget de contenus retenus explicite (réglé par les tests seulement).
+#[cfg(test)]
 pub(crate) fn build_with_budget(
     repo: &Path,
     opts: &IndexOptions,
     llm: Option<&dyn Llm>,
     _lock: &RepoLock,
+    matcher: &Matcher,
+    budget: usize,
+) -> Result<BuildReport> {
+    build_impl(repo, opts, llm, None, matcher, budget)
+}
+
+fn build_impl(
+    repo: &Path,
+    opts: &IndexOptions,
+    llm: Option<&dyn Llm>,
+    dry: Option<&DryRun>,
     matcher: &Matcher,
     budget: usize,
 ) -> Result<BuildReport> {
@@ -390,7 +510,7 @@ pub(crate) fn build_with_budget(
         &mut store,
         &mut report,
     )?;
-    finalize(&mut store, llm, opts, repo, &abs, &mut report)?;
+    finalize(&mut store, llm, dry, opts, repo, &abs, &mut report)?;
     Ok(report)
 }
 
@@ -407,6 +527,7 @@ pub(crate) fn abs_paths(files: &[crate::scan::ScannedFile]) -> HashMap<String, P
 pub(crate) fn finalize(
     store: &mut Store,
     llm: Option<&dyn Llm>,
+    dry: Option<&DryRun>,
     opts: &IndexOptions,
     repo: &Path,
     abs: &HashMap<String, PathBuf>,
@@ -439,7 +560,36 @@ pub(crate) fn finalize(
         .filter(|f| f.state == FileState::Pending)
         .count();
     report.to_enrich = store.count_files_to_enrich()?;
+    if let Some(dry) = dry {
+        report.estimate = Some(estimate_enrichment(store, dry, opts, repo, abs)?);
+    }
     Ok(())
+}
+
+/// Estimation de l'enrichissement sur le graphe écrit (REQ-184, DEC-148) : fichiers de la portée
+/// selon les réglages effectifs, relevé, puis une trace par fichier envoyé seul. Rien n'est écrit.
+pub(crate) fn estimate_enrichment(
+    store: &Store,
+    dry: &DryRun,
+    opts: &IndexOptions,
+    repo: &Path,
+    abs: &HashMap<String, PathBuf>,
+) -> Result<Estimate> {
+    let files =
+        store.files_to_enrich_for(dry.model.as_deref(), Some(&dry.language), opts.enrich_code)?;
+    let ids = enrich::nodes_by_file(store)?;
+    let est = enrich::estimate(
+        enrich::Sources { repo, abs },
+        &files,
+        &ids,
+        &dry.language,
+        opts.batch_files,
+        opts.max_chunk_chars,
+    );
+    for line in estimate::trace_lines(&est) {
+        trace!("{line}");
+    }
+    Ok(est)
 }
 
 #[cfg(test)]
@@ -512,6 +662,72 @@ mod tests {
             &Matcher::none(),
         )
         .unwrap();
+    }
+
+    /// REQ-184 : segment de fin du bilan sous `--dry-run`, avant le segment des filtres.
+    #[test]
+    fn req184_bilan_segment_estime_sans_envoi_avec_et_sans_filtre() {
+        let mut r = BuildReport {
+            estimate: Some(Estimate::default()),
+            ..BuildReport::default()
+        };
+        assert!(
+            r.line()
+                .ends_with("0 fichiers à enrichir, enrichissement : estimé sans envoi"),
+            "{}",
+            r.line()
+        );
+        r.excluded = Some(3);
+        assert!(
+            r.line()
+                .ends_with("enrichissement : estimé sans envoi, 3 fichiers exclus par les filtres"),
+            "{}",
+            r.line()
+        );
+        r.estimate = None;
+        assert!(r
+            .line()
+            .contains("enrichissement : désactivé, 3 fichiers exclus"));
+    }
+
+    /// REQ-184 : `build` sous `--dry-run` écrit le graphe de `--no-llm`, rend l'estimation, sans
+    /// client ni écriture de `meta`.
+    #[test]
+    fn req184_build_dry_run_graphe_de_no_llm_et_estimation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(
+                d.join("guide.md"),
+                "# Guide\n\nTexte.\n\n## Suite\n\nAutre.\n",
+            )
+            .unwrap();
+            std::fs::write(d.join("C.java"), "public class C {}\n").unwrap();
+        }
+        do_build(&b, scan::RETAIN_BUDGET);
+        let lock = RepoLock::acquire(&a).unwrap();
+        let dry = DryRun {
+            model: Some("m".to_string()),
+            language: "français".to_string(),
+            no_config: None,
+        };
+        let report = build_with_dry_run(
+            &a,
+            &IndexOptions::default(),
+            None,
+            Some(&dry),
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap();
+        assert_eq!(normalized_export(&a), normalized_export(&b));
+        let est = report.estimate.as_ref().expect("estimation");
+        assert!(est.files > 0 && est.calls > 0 && est.bytes > 0, "{est:?}");
+        assert!(report.line().contains("enrichissement : estimé sans envoi"));
+        let store = Store::open_readonly(&a).unwrap();
+        assert_eq!(store.enrich_model().unwrap(), None);
+        assert!(!report.llm_active);
     }
 
     /// AC-073-1 : chaque fichier pris en charge est lu une fois ; graphe identique à celui d'un

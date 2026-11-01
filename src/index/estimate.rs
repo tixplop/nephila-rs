@@ -8,21 +8,21 @@ use crate::escape;
 use super::enrich::MAX_CALLS_PER_FILE;
 
 /// Jetons de sortie estimés par nœud demandé (DEC-058 : environ 40 jetons par résumé).
-pub(crate) const OUTPUT_TOKENS_PER_NODE: usize = 40;
+pub const OUTPUT_TOKENS_PER_NODE: usize = 40;
 
 /// Jetons d'entrée estimés : un jeton pour quatre octets, arrondi par excès.
-pub(crate) fn input_tokens(bytes: usize) -> usize {
+pub fn input_tokens(bytes: usize) -> usize {
     bytes.div_ceil(4)
 }
 
 /// Jetons de sortie estimés pour `nodes` nœuds demandés.
-pub(crate) fn output_tokens(nodes: usize) -> usize {
+pub fn output_tokens(nodes: usize) -> usize {
     OUTPUT_TOKENS_PER_NODE * nodes
 }
 
 /// Cas d'un fichier envoyé seul.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AloneCase {
+pub enum AloneCase {
     /// Appels et octets comptés.
     Counted,
     /// Plan refusé au plafond d'appels : appels prévus, aucun compté.
@@ -33,32 +33,32 @@ pub(crate) enum AloneCase {
 
 /// Un fichier envoyé seul (unité `Big`) et ce qui en est compté.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AloneFile {
-    pub(crate) path: String,
-    pub(crate) calls: usize,
-    pub(crate) bytes: usize,
-    pub(crate) case: AloneCase,
+pub struct AloneFile {
+    pub path: String,
+    pub calls: usize,
+    pub bytes: usize,
+    pub case: AloneCase,
 }
 
 /// Relevé de l'estimation, un essai par appel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Estimate {
+pub struct Estimate {
     /// Fichiers à enrichir.
-    pub(crate) files: usize,
+    pub files: usize,
     /// Fichiers envoyés seuls, au plafond et illisibles compris.
-    pub(crate) sent_alone: usize,
+    pub sent_alone: usize,
     /// Fichiers sans nœud à demander (aucun appel).
-    pub(crate) without_call: usize,
-    pub(crate) calls: usize,
-    pub(crate) bytes: usize,
+    pub without_call: usize,
+    pub calls: usize,
+    pub bytes: usize,
     /// Nœuds demandés.
-    pub(crate) nodes: usize,
+    pub nodes: usize,
     /// Fichiers au plafond d'appels : chemin et appels prévus.
-    pub(crate) capped: Vec<(String, usize)>,
+    pub capped: Vec<(String, usize)>,
     /// Fichiers envoyés seuls et illisibles.
-    pub(crate) unreadable: Vec<String>,
+    pub unreadable: Vec<String>,
     /// Tous les fichiers envoyés seuls.
-    pub(crate) alone: Vec<AloneFile>,
+    pub alone: Vec<AloneFile>,
 }
 
 /// Lignes minimale ou maximale d'un même relevé : chaque nombre du relevé multiplié par `times`.
@@ -76,7 +76,7 @@ fn totals_line(e: &Estimate, qualifier: &str, times: usize, note: &str) -> Strin
 /// au plafond ou illisibles triés par chemin, puis `sans configuration` (chemin de la
 /// configuration personnelle absente). `tries` = essais par appel de la ligne maximale
 /// (`format_retries` + 1).
-pub(crate) fn stdout_lines(e: &Estimate, tries: u32, no_config: Option<&Path>) -> Vec<String> {
+pub fn stdout_lines(e: &Estimate, tries: u32, no_config: Option<&Path>) -> Vec<String> {
     let mut lines = vec![
         format!(
             "estimation : {} fichiers à enrichir dont {} envoyés seuls et {} sans appel",
@@ -118,7 +118,7 @@ pub(crate) fn stdout_lines(e: &Estimate, tries: u32, no_config: Option<&Path>) -
 
 /// Lignes de trace `estimation <chemin> : <a> appels, <o> octets[ (<cas>)]` (V-005), une par
 /// fichier envoyé seul, triées par chemin, chemin brut, sans le préfixe `trace:`.
-pub(crate) fn trace_lines(e: &Estimate) -> Vec<String> {
+pub fn trace_lines(e: &Estimate) -> Vec<String> {
     let mut alone: Vec<&AloneFile> = e.alone.iter().collect();
     alone.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
     alone

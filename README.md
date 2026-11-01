@@ -123,6 +123,7 @@ nephila update [--no-llm] [-v|--verbose | --show-progress] [--enrich-code] [--jo
 |---|---|
 | `--no-llm` | Structure seule : la configuration n'est pas lue, aucun appel LLM |
 | `--enrich-code` | Enrichit aussi le code, pour cette commande (voir [Enrichissement](#enrichissement)) |
+| `--dry-run` | Estime l'enrichissement sans rien envoyer ; structure écrite comme avec `--no-llm`, incompatible avec lui |
 | `-v, --verbose` | Traces sur stderr (voir [Traces et progression](#traces-et-progression)) |
 | `--show-progress` | Avancement des phases sur stderr ; incompatible avec `--verbose` |
 | `--jobs <N>` | Fils du parcours et de l'extraction, de 1 à 256 ; défaut : nombre de cœurs. Sans effet sur `concurrency` (appels LLM) |
@@ -143,6 +144,8 @@ Le bilan donne deux compteurs :
 
 Un fichier en échec est nommé sur stderr avec sa cause, et le traitement des autres continue ; si l'envoi au LLM s'arrête, voir [Arrêt de l'envoi](#arrêt-de-lenvoi).
 Un seul `build` ou `update` à la fois par dépôt : une seconde commande échoue aussitôt (`erreur: indexation déjà en cours sur ce dépôt`).
+
+Avec `--dry-run`, des lignes `estimation` suivent le bilan : fichiers à enrichir selon la configuration, appels, octets et jetons au minimum (un essai par appel) et au maximum (tous les nouveaux essais de format), fichiers au plafond. Aucune clé d'API n'est lue. Jetons à ±30 % ; hors estimation : nouveaux essais HTTP, lots coupés en deux, réflexion, cache.
 
 ### `nephila status`
 

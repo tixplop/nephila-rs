@@ -6,7 +6,8 @@ use std::path::Path;
 use crate::diff::{self, Change};
 use crate::error::Result;
 use crate::filter::{Filters, Matcher, ProjectFile};
-use crate::index::build::{self, BuildReport, IndexOptions};
+use crate::index::build::{self, BuildReport, DryRun, IndexOptions};
+use crate::index::estimate::Estimate;
 use crate::index::lock::RepoLock;
 use crate::index::structure;
 use crate::llm::Llm;
@@ -33,6 +34,7 @@ pub fn run(
     let matcher = build::effective_matcher(repo, &project.filters, &cli_filters)?;
     let mut setup = build::setup(
         no_llm,
+        over.dry_run,
         enrich_code,
         &project.settings,
         over.batch_files,
@@ -45,19 +47,42 @@ pub fn run(
     // Le test d'existence se fait sous verrou : aucun build concurrent ne peut le créer entre-temps.
     if !db_path(repo).is_file() {
         eprintln!("aucun graphe : build complet");
-        let report = build::build(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)?;
+        let report = build::build_with_dry_run(
+            repo,
+            &setup.opts,
+            setup.llm.as_deref(),
+            setup.dry_run.as_ref(),
+            &lock,
+            &matcher,
+        )?;
         build::write_report(out, &report, "build")?;
+        build::write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
         let done = build::finish(&report);
         build::warn_transient(&cli_filters);
         return done;
     }
-    let done = match update(repo, &setup.opts, setup.llm.as_deref(), &lock, &matcher)? {
-        None => {
+    let updated = update_with_dry_run(
+        repo,
+        &setup.opts,
+        setup.llm.as_deref(),
+        setup.dry_run.as_ref(),
+        &lock,
+        &matcher,
+    )?;
+    let done = match updated {
+        Updated::UpToDate(estimate) => {
             writeln!(out, "graphe à jour")?;
+            build::write_estimate_lines(
+                out,
+                estimate.as_ref(),
+                &setup.opts,
+                setup.dry_run.as_ref(),
+            )?;
             Ok(())
         }
-        Some(report) => {
+        Updated::Report(report) => {
             build::write_report(out, &report, "update")?;
+            build::write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
             build::finish(&report)
         }
     };
@@ -82,6 +107,14 @@ fn is_build_script_under(path: &str, dir: &str) -> bool {
         && (dir.is_empty() || parent == dir || parent.starts_with(&format!("{dir}/")))
 }
 
+/// Résultat d'un `update` : rien n'a changé (avec, sous `--dry-run`, l'estimation du graphe
+/// ouvert), ou un bilan.
+#[derive(Debug)]
+pub enum Updated {
+    UpToDate(Option<Estimate>),
+    Report(Box<BuildReport>),
+}
+
 /// Met à jour le graphe ; `None` si rien n'a changé (aucun appel LLM, résumé conservé). Le verrou,
 /// pris par l'appelant, prouve l'exclusivité avant toute écriture.
 pub fn update(
@@ -91,6 +124,23 @@ pub fn update(
     _lock: &RepoLock,
     matcher: &Matcher,
 ) -> Result<Option<BuildReport>> {
+    Ok(
+        match update_with_dry_run(repo, opts, llm, None, _lock, matcher)? {
+            Updated::UpToDate(_) => None,
+            Updated::Report(report) => Some(*report),
+        },
+    )
+}
+
+/// `update` avec, sous `--dry-run`, les réglages de l'estimation (REQ-184) ; `llm` est alors absent.
+pub fn update_with_dry_run(
+    repo: &Path,
+    opts: &IndexOptions,
+    llm: Option<&dyn Llm>,
+    dry: Option<&DryRun>,
+    _lock: &RepoLock,
+    matcher: &Matcher,
+) -> Result<Updated> {
     build::check_repo(repo)?;
     let mut store = Store::open_existing(repo)?;
     // Lu à l'ouverture, avant toute écriture de la commande (REQ-088, DEC-097).
@@ -135,7 +185,14 @@ pub fn update(
     // « Aucun changement » : rien d'ajouté, modifié, supprimé ou en attente, graphe marqué
     // « à jour », et (LLM inactif ou aucun fichier à enrichir).
     if d.is_up_to_date() && !to_resolve && (llm.is_none() || store.count_files_to_enrich()? == 0) {
-        return Ok(None);
+        let estimate = match dry {
+            Some(dry) => {
+                let abs = build::abs_paths(&d.scanned);
+                Some(build::estimate_enrichment(&store, dry, opts, repo, &abs)?)
+            }
+            None => None,
+        };
+        return Ok(Updated::UpToDate(estimate));
     }
 
     // Tous les fichiers supprimés partent en une seule transaction (DEC-074).
@@ -184,8 +241,8 @@ pub fn update(
         &mut store,
         &mut report,
     )?;
-    build::finalize(&mut store, llm, opts, repo, &abs, &mut report)?;
-    Ok(Some(report))
+    build::finalize(&mut store, llm, dry, opts, repo, &abs, &mut report)?;
+    Ok(Updated::Report(Box::new(report)))
 }
 
 fn record(f: &ScannedFile, state: FileState) -> FileRecord {
@@ -793,5 +850,70 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
+    }
+    fn dry() -> DryRun {
+        DryRun {
+            model: Some("m".to_string()),
+            language: "français".to_string(),
+            no_config: None,
+        }
+    }
+
+    /// REQ-184 : `update --dry-run` sans changement rend l'estimation du graphe ouvert ; un
+    /// fichier modifié est le seul estimé, et son contenu entre dans le graphe.
+    #[test]
+    fn req184_update_dry_run_a_jour_puis_fichier_modifie() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.md"), "# A\n\ntexte\n").unwrap();
+        std::fs::write(repo.join("b.md"), "# B\n\ntexte\n").unwrap();
+        let lock = RepoLock::acquire(&repo).unwrap();
+        let opts = IndexOptions::default();
+        build::build(&repo, &opts, None, &lock, &Matcher::none()).unwrap();
+        // Le modèle enregistré est celui de l'estimation : tout est conservé.
+        {
+            let mut store = Store::open_existing(&repo).unwrap();
+            store.set_enrich_model("m").unwrap();
+        }
+        let d = dry();
+        let first =
+            update_with_dry_run(&repo, &opts, None, Some(&d), &lock, &Matcher::none()).unwrap();
+        let Updated::UpToDate(Some(est)) = first else {
+            panic!("graphe à jour attendu : {first:?}");
+        };
+        // Aucun enrichissement enregistré : les deux documents restent à enrichir.
+        assert_eq!(est.files, 2);
+        assert!(est.calls >= 1);
+
+        std::fs::write(repo.join("a.md"), "# A\n\nnouveau contenu\n\n## Neuf\n").unwrap();
+        let second =
+            update_with_dry_run(&repo, &opts, None, Some(&d), &lock, &Matcher::none()).unwrap();
+        let Updated::Report(report) = second else {
+            panic!("bilan attendu");
+        };
+        assert!(report.estimate.is_some());
+        assert!(!report.llm_active);
+        let store = Store::open_readonly(&repo).unwrap();
+        assert!(store.nodes().unwrap().iter().any(|n| n.id.contains("neuf")));
+        assert_eq!(store.enrich_model().unwrap().as_deref(), Some("m"));
+    }
+
+    /// Sans `--dry-run`, `update` rend la même chose qu'avant : pas d'estimation.
+    #[test]
+    fn req184_update_sans_dry_run_sans_estimation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = built_repo(dir.path(), 2);
+        let lock = RepoLock::acquire(&repo).unwrap();
+        let r = update_with_dry_run(
+            &repo,
+            &IndexOptions::default(),
+            None,
+            None,
+            &lock,
+            &Matcher::none(),
+        )
+        .unwrap();
+        assert!(matches!(r, Updated::UpToDate(None)), "{r:?}");
     }
 }

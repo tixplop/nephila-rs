@@ -594,15 +594,30 @@ impl Config {
     /// Comme `load_with`, mais `None` quand aucun fichier de configuration n'existe : le LLM est
     /// alors inactif (REQ-002). Un fichier présent mais invalide reste une erreur.
     pub fn load_optional_with(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<Config>> {
+        let cfg = Config::load_optional_without_key_with(env)?;
+        if let Some(c) = &cfg {
+            c.api_key_with(env)?;
+        }
+        Ok(cfg)
+    }
+
+    /// Comme `load_optional_with`, sans lire la clé d'API : même lecture et même validation
+    /// (`api_key_env` exigé pour `anthropic`), la variable nommée n'est pas consultée (REQ-184).
+    pub fn load_optional_without_key_with(
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Option<Config>> {
         let Ok(path) = config_path_with(env) else {
             return Ok(None);
         };
         if !path.exists() {
             return Ok(None);
         }
-        let cfg = Config::load_from_with(&path, env)?;
-        cfg.api_key_with(env)?;
-        Ok(Some(cfg))
+        Ok(Some(Config::load_from_with(&path, env)?))
+    }
+
+    /// `load_optional_without_key_with` sur l'environnement du processus.
+    pub fn load_optional_without_key() -> Result<Option<Config>> {
+        Config::load_optional_without_key_with(&|k| std::env::var(k).ok())
     }
 
     /// `load_optional_with` sur l'environnement du processus.
@@ -2003,5 +2018,56 @@ mod ask_tests {
         let (ask, _, _) = b.for_ask(&p, None, None);
         assert_eq!(ask.concurrency, 3);
         assert_eq!(ask.model, "m-ask");
+    }
+}
+
+#[cfg(test)]
+mod without_key_tests {
+    use super::*;
+
+    fn with_config(text: &str, check: impl FnOnce(&dyn Fn(&str) -> Option<String>)) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        let p = path.to_string_lossy().to_string();
+        let env = move |k: &str| (k == "NEPHILA_CONFIG").then(|| p.clone());
+        check(&env);
+    }
+
+    /// REQ-184 : la variable de `api_key_env` absente ne fait pas échouer la variante sans clé,
+    /// alors que `load_optional_with` échoue.
+    #[test]
+    fn req184_load_optional_without_key_variable_absente_succes() {
+        with_config(
+            "provider = \"openai\"\nmodel = \"m\"\napi_key_env = \"NEPHILA_ABSENTE_X\"\n",
+            |env| {
+                let c = Config::load_optional_without_key_with(env)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(c.model, "m");
+                assert!(Config::load_optional_with(env).is_err());
+            },
+        );
+    }
+
+    /// REQ-184 : `api_key_env` manquant pour `anthropic` donne la même erreur qu'avant.
+    #[test]
+    fn req184_load_optional_without_key_anthropic_sans_api_key_env() {
+        with_config("provider = \"anthropic\"\nmodel = \"m\"\n", |env| {
+            let a = Config::load_optional_without_key_with(env)
+                .unwrap_err()
+                .to_string();
+            let b = Config::load_optional_with(env).unwrap_err().to_string();
+            assert_eq!(a, b);
+            assert!(a.contains("api_key_env"), "{a}");
+        });
+    }
+
+    #[test]
+    fn req184_load_optional_without_key_sans_fichier() {
+        let env = |k: &str| (k == "NEPHILA_CONFIG").then(|| "/nulle/part/c.toml".to_string());
+        assert!(Config::load_optional_without_key_with(&env)
+            .unwrap()
+            .is_none());
     }
 }

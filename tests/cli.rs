@@ -165,3 +165,98 @@ fn req163_ac6_ac10_help_of_query_ask() {
         );
     }
 }
+
+// ---- REQ-184, REQ-185 : `--dry-run` de `build` et `update` ----
+
+#[test]
+fn req184_ac1_dry_run_with_no_llm_is_a_usage_error() {
+    for cmd in ["build", "update"] {
+        for args in [["--dry-run", "--no-llm"], ["--no-llm", "--dry-run"]] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = nephila()
+                .arg("-C")
+                .arg(dir.path())
+                .arg(cmd)
+                .args(args)
+                .assert()
+                .failure()
+                .code(2)
+                .get_output()
+                .clone();
+            assert!(out.stdout.is_empty(), "{cmd}");
+            let err = String::from_utf8(out.stderr).unwrap();
+            assert!(
+                err.contains("error: the argument '--dry-run' cannot be used with '--no-llm'")
+                    || err
+                        .contains("error: the argument '--no-llm' cannot be used with '--dry-run'"),
+                "{cmd} : {err}"
+            );
+            assert!(!dir.path().join(".nephila").exists(), "{cmd}");
+        }
+    }
+}
+
+#[test]
+fn req184_ac1_dry_run_alone_is_accepted() {
+    for cmd in ["build", "update"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "# A\n").unwrap();
+        nephila()
+            .env("NEPHILA_CONFIG", dir.path().join("absent.toml"))
+            .arg("-C")
+            .arg(dir.path())
+            .args([cmd, "--dry-run"])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn req185_ac1_dry_run_help_of_build_and_update() {
+    let want = "--dry-run Estime les appels, octets et jetons de l'enrichissement, sans rien envoyer au LLM (graphe écrit comme avec --no-llm ; incompatible avec --no-llm)";
+    for cmd in ["build", "update"] {
+        let text = normalized_help(&[cmd]);
+        assert!(text.contains(want), "{cmd} : {text}");
+        let at = |s: &str| text.find(s).unwrap();
+        assert!(at("--enrich-code") < at("--dry-run"), "{cmd}");
+        assert!(at("--dry-run") < at("-v, --verbose"), "{cmd}");
+    }
+}
+
+#[test]
+fn req184_dry_run_sans_cle_ecrit_bilan_puis_estimation_sur_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\n\ntexte\n").unwrap();
+    let conf = dir.path().join("c.toml");
+    std::fs::write(
+        &conf,
+        "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\napi_key_env = \"NEPHILA_CLE_ABSENTE_184\"\n",
+    )
+    .unwrap();
+    let out = nephila()
+        .env("NEPHILA_CONFIG", &conf)
+        .env_remove("NEPHILA_CLE_ABSENTE_184")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["build", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].ends_with("enrichissement : estimé sans envoi"),
+        "{text}"
+    );
+    assert_eq!(
+        lines[1],
+        "estimation : 1 fichiers à enrichir dont 0 envoyés seuls et 0 sans appel"
+    );
+    assert!(
+        lines[2].starts_with("estimation minimale : 1 appels, "),
+        "{text}"
+    );
+    assert!(lines[3].ends_with("(3 essais par appel)"), "{text}");
+    assert_eq!(lines.len(), 4, "{text}");
+}

@@ -2,7 +2,6 @@
 
 pub mod build;
 pub mod enrich;
-#[allow(dead_code)] // branché sur `--dry-run` par T-273
 pub mod estimate;
 pub mod lock;
 pub mod structure;

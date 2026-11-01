@@ -127,6 +127,9 @@ pub struct IndexOpts {
     /// Enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown (remplace `enrich_code` de la configuration ; défaut : documents seulement)
     #[arg(long)]
     pub enrich_code: bool,
+    /// Estime les appels, octets et jetons de l'enrichissement, sans rien envoyer au LLM (graphe écrit comme avec --no-llm ; incompatible avec --no-llm)
+    #[arg(long, conflicts_with = "no_llm")]
+    pub dry_run: bool,
     /// Traces synthétiques des étapes et des appels LLM sur stderr (préfixe `trace:` ; incompatible avec --show-progress)
     #[arg(short, long)]
     pub verbose: bool,
@@ -268,6 +271,7 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
                     jobs: o.jobs,
                     batch_files: o.batch_files,
                     format_retries: o.format_retries,
+                    dry_run: o.dry_run,
                 },
                 o.filters(),
                 out,
@@ -284,6 +288,7 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
                     jobs: o.jobs,
                     batch_files: o.batch_files,
                     format_retries: o.format_retries,
+                    dry_run: o.dry_run,
                 },
                 o.filters(),
                 out,

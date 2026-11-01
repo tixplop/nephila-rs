@@ -1350,7 +1350,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 42_500, "README : {size} octets");
+    assert!(size <= 43_000, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1572,6 +1572,7 @@ fn REQ155_AC14_options_de_build_en_une_ligne() {
     let options = [
         "`--no-llm`",
         "`--enrich-code`",
+        "`--dry-run`",
         "`-v, --verbose`",
         "`--show-progress`",
         "`--jobs <N>`",
@@ -1580,13 +1581,13 @@ fn REQ155_AC14_options_de_build_en_une_ligne() {
         "`--exclude <MOTIF>`",
         "`--exclude-type <TYPES>`",
     ];
-    assert_eq!(rows.len(), 9, "{rows:?}");
+    assert_eq!(rows.len(), 10, "{rows:?}");
     for (row, option) in rows.iter().zip(options) {
         assert_eq!(cell(row, 0), option);
         assert!(row.chars().count() <= 160, "{row}");
     }
-    assert!(rows[3].contains("incompatible avec `--verbose`"));
-    assert!(rows[4].contains("`concurrency`"));
+    assert!(rows[4].contains("incompatible avec `--verbose`"));
+    assert!(rows[5].contains("`concurrency`"));
     for needle in [
         "en attente",
         "à enrichir",
@@ -1951,7 +1952,7 @@ fn REQ165_AC16_readme_traces_sentence() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 42_500, "README : {size} octets");
+    assert!(size <= 43_000, "README : {size} octets");
 }
 
 #[test]
@@ -2001,7 +2002,7 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 42_500, "README : {size} octets");
+    assert!(size <= 43_000, "README : {size} octets");
 }
 
 // ---- REQ-174 : `summary_language` dans les exemples et le README ----
@@ -2162,5 +2163,23 @@ fn REQ174_AC5_AC10_readme_lignes_et_phrases_de_summary_language() {
         assert!(!readme.contains(old), "présent : {old}");
     }
     assert_eq!(readme.matches("config: llm=").count(), 1);
-    assert!(readme.len() <= 42_500, "README : {} octets", readme.len());
+    assert!(readme.len() <= 43_000, "README : {} octets", readme.len());
+}
+
+/// AC-185-2 : textes de V-012 pour `--dry-run`, ligne de table après `--enrich-code`.
+#[test]
+fn req185_ac2_readme_dry_run() {
+    let readme = repo_file("README.md");
+    let row = "| `--dry-run` | Estime l'enrichissement sans rien envoyer ; structure écrite comme avec `--no-llm`, incompatible avec lui |";
+    let para = "Avec `--dry-run`, des lignes `estimation` suivent le bilan : fichiers à enrichir selon la configuration, appels, octets et jetons au minimum (un essai par appel) et au maximum (tous les nouveaux essais de format), fichiers au plafond. Aucune clé d'API n'est lue. Jetons à ±30 % ; hors estimation : nouveaux essais HTTP, lots coupés en deux, réflexion, cache.";
+    assert!(readme.contains(row) && readme.contains(para));
+    let enrich = readme.find("| `--enrich-code` |").unwrap();
+    let at = readme.find(row).unwrap();
+    assert!(enrich < at);
+    assert!(at < readme.find("| `-v, --verbose` |").unwrap());
+    let section = readme_section(&readme, "### `nephila build` et `nephila update`");
+    let table = section.lines().filter(|l| l.starts_with("| `-")).count();
+    assert_eq!(table, 10, "{section}");
+    assert!(readme.find("Un seul `build` ou `update`").unwrap() < readme.find(para).unwrap());
+    assert!(readme.len() <= 43_000, "README : {} octets", readme.len());
 }

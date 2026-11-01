@@ -861,7 +861,6 @@ fn partition_by_nodes(
 /// partition et mêmes unités que `enrich_with_stop`. Un lot ne lit aucun fichier (ses prompts
 /// valent ceux à texte vide plus la somme des tailles) ; un fichier envoyé seul est lu en série,
 /// puis `plan_calls` donne ses appels. Un fichier illisible ou au plafond ne compte aucun appel.
-#[allow(dead_code)] // branché sur `--dry-run` par T-273
 pub(crate) fn estimate(
     sources: Sources<'_>,
     files: &[FileRecord],
@@ -941,7 +940,6 @@ pub(crate) fn estimate(
 
 /// Estimation d'un fichier envoyé seul ; ajoute ses nœuds demandés à `nodes`. Le texte lu est
 /// libéré au retour.
-#[allow(dead_code)] // branché sur `--dry-run` par T-273
 fn estimate_alone(
     f: &FileRecord,
     sources: Sources<'_>,
@@ -987,7 +985,7 @@ fn estimate_alone(
 
 /// Nœuds déclarés par chaque fichier (identifiant, nom court), hors packages et clés de
 /// configuration (REQ-024).
-fn nodes_by_file(store: &Store) -> Result<HashMap<String, Vec<(String, String)>>> {
+pub(crate) fn nodes_by_file(store: &Store) -> Result<HashMap<String, Vec<(String, String)>>> {
     let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for (file, node, short) in store.declared_short_names()? {
         if !node.starts_with("package:") && !node.starts_with("key:") {

@@ -379,6 +379,7 @@ mod tests {
         crate::index::build::finalize(
             store,
             None,
+            None,
             &crate::index::build::IndexOptions::default(),
             repo,
             &HashMap::new(),
@@ -565,6 +566,7 @@ mod tests {
         let opts = IndexOptions::default();
         finalize(
             &mut store,
+            None,
             None,
             &opts,
             repo,
