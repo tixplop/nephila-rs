@@ -82,7 +82,9 @@
 # Plafonds : ici seulement, chaque réglage entier a un plafond (ligne « Plafond dans ce fichier ») ; la configuration personnelle et les options n'en ont pas.
 
 # Nom du modèle utilisé pour ce dépôt. Texte non vide. Remplace le modèle de la configuration
-# personnelle.
+# personnelle, qui peut aussi l'ignorer ou demander une confirmation (clé model_override) : par
+# défaut, s'il fait réenrichir plus de 50 fichiers déjà enrichis avec un autre modèle, build et
+# update refusent sans l'option --accept-project-model.
 # Priorité : ce fichier > configuration personnelle > défaut.
 # model = "claude-sonnet-4-5"
 
@@ -133,6 +135,7 @@
 # [ask]
 
 # Modèle qui répond aux questions. Texte non vide. Absente : le modèle de l'enrichissement.
+# Ignorée, comme model ci-dessus, si la configuration personnelle dit model_override = "deny".
 # Priorité : ce fichier > [ask] de la configuration personnelle > model ci-dessus > model personnel.
 # model = "claude-opus-5-5"
 

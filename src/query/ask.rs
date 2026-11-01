@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use super::lookup::{self, Lookup};
 use super::search;
 use super::words;
-use crate::config::Config;
+use crate::config::{Config, ModelOverride};
 use crate::error::{Error, Result, TRUNCATED};
 use crate::filter::ProjectFile;
 use crate::llm::{build_llm, calls_line, with_format_retries, AskReply, CallStats, Llm, LlmTotals};
@@ -577,6 +577,7 @@ pub fn run(
     }
     let project = ProjectFile::load(repo)?;
     let config = Config::load()?;
+    let deny = config.model_override == ModelOverride::Deny;
     let (config, limits, marks) = config.for_ask(&project.settings, format_retries, context_chars);
     let llm = build_llm(&config)?;
     let store = super::open(repo, check_stale)?;
@@ -600,6 +601,20 @@ pub fn run(
         config.tls_trace(),
         mark
     );
+    if deny {
+        if let Some(m) = project
+            .settings
+            .ask
+            .model
+            .as_ref()
+            .or(project.settings.model.as_ref())
+        {
+            crate::trace!(
+                "modèle: {} de .nephila.toml ignoré (model_override = \"deny\")",
+                m
+            );
+        }
+    }
     let (answer, cited) = answer(
         &store,
         llm.as_ref(),

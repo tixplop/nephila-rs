@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::config::{Config, ProjectSettings, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS};
+use crate::config::{
+    Config, ModelOverride, ProjectSettings, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS,
+};
 use crate::error::{warn, Error, Result};
 use crate::filter::{Filters, Matcher, ProjectFile};
 use crate::index::estimate::{self, Estimate};
@@ -130,6 +132,7 @@ fn effective_config(
     format_retries: Option<u32>,
     max_calls: Option<usize>,
 ) -> Config {
+    let deny = config.model_override == ModelOverride::Deny;
     let (mut config, from_project) = config.with_project(project, batch_files, format_retries);
     config.enrich_code |= enrich_code;
     // L'option remplace la clé (REQ-186) ; le fichier de projet ne la porte pas.
@@ -159,6 +162,12 @@ fn effective_config(
         max_calls_trace,
         tls_trace
     );
+    if let (true, Some(m)) = (deny, &project.model) {
+        trace!(
+            "modèle: {} de .nephila.toml ignoré (model_override = \"deny\")",
+            m
+        );
+    }
     config
 }
 

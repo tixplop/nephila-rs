@@ -951,3 +951,46 @@ fn req163_ac4_context_chars_option_and_ask_keys_bound_the_context() {
     );
     assert!(sizes[0] <= 2000 && sizes[0] > 1000, "{sizes:?}");
 }
+
+#[test]
+fn req195_ac8_trace_du_modele_du_depot_ignore_dans_ask() {
+    let env = Env::new();
+    ask_ok_fixture(&env);
+    let proj = env.repo.join(".nephila.toml");
+    let deny = format!("{MOCK_CFG}model_override = \"deny\"\n");
+    fs::write(&env.config, &deny).unwrap();
+    // [ask].model du dépôt prime sur model ; la trace suit la ligne config, avant appels.
+    fs::write(
+        &proj,
+        "model = \"m-projet\"\n[ask]\nmodel = \"m-ask-projet\"\n",
+    )
+    .unwrap();
+    let t = traces(&env.ask(Q, &["-v"]));
+    assert_eq!(t.len(), 3, "{t:?}");
+    assert_eq!(t[0], CFG_DEFAULT);
+    assert_eq!(
+        t[1],
+        "modèle: m-ask-projet de .nephila.toml ignoré (model_override = \"deny\")"
+    );
+    assert_eq!(t[2], CALLS_UNKNOWN);
+    // Sans [ask].model : model du premier niveau.
+    fs::write(&proj, "model = \"m-projet\"\n").unwrap();
+    let t = traces(&env.ask(Q, &["-v"]));
+    assert_eq!(
+        t[1],
+        "modèle: m-projet de .nephila.toml ignoré (model_override = \"deny\")"
+    );
+    // Sans -v : stderr vide ; sans modèle du dépôt : aucune trace.
+    let o = env.ask(Q, &[]);
+    assert!(text(&o.stderr).is_empty(), "{}", text(&o.stderr));
+    fs::write(&proj, "").unwrap();
+    assert_eq!(traces(&env.ask(Q, &["-v"])), [CFG_DEFAULT, CALLS_UNKNOWN]);
+    // allow et warn : aucune trace.
+    fs::write(&proj, "model = \"m-projet\"\n").unwrap();
+    for p in ["allow", "warn"] {
+        fs::write(&env.config, format!("{MOCK_CFG}model_override = \"{p}\"\n")).unwrap();
+        let t = traces(&env.ask(Q, &["-v"]));
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(!t.iter().any(|l| l.contains("ignoré")));
+    }
+}

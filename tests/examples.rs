@@ -218,7 +218,7 @@ fn REQ041_AC4_valeurs_par_defaut_documentees_egales_aux_valeurs_reelles() {
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| key_of(l))
         .collect();
-    assert_eq!(active.len(), 11, "options communes réactivées : {active:?}");
+    assert_eq!(active.len(), 12, "options communes réactivées : {active:?}");
 }
 
 #[test]
@@ -1350,7 +1350,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 45_000, "README : {size} octets");
+    assert!(size <= 46_000, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1580,10 +1580,11 @@ fn REQ155_AC14_options_de_build_en_une_ligne() {
         "`--batch-files <N>`",
         "`--format-retries <N>`",
         "`--max-calls <N>`",
+        "`--accept-project-model`",
         "`--exclude <MOTIF>`",
         "`--exclude-type <TYPES>`",
     ];
-    assert_eq!(rows.len(), 11, "{rows:?}");
+    assert_eq!(rows.len(), 12, "{rows:?}");
     for (row, option) in rows.iter().zip(options) {
         assert_eq!(cell(row, 0), option);
         assert!(row.chars().count() <= 160, "{row}");
@@ -1954,7 +1955,7 @@ fn REQ165_AC16_readme_traces_sentence() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 45_000, "README : {size} octets");
+    assert!(size <= 46_000, "README : {size} octets");
 }
 
 #[test]
@@ -1975,7 +1976,11 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     for needle in ["output_config", "effort = \"default\"", "requête refusée"] {
         assert!(first.contains(needle), "{first} : {needle}");
     }
-    assert!(first.ends_with("puis lancez `nephila update`."), "{first}");
+    // Une phrase s'ajoute à la fin (REQ-197, item 39) ; celles qui précèdent ne bougent pas.
+    assert!(
+        first.contains("puis lancez `nephila update`. Si le `.nephila.toml`"),
+        "{first}"
+    );
     assert_eq!(
         sec.lines().filter(|l| l.starts_with("- **Vers ")).count(),
         6
@@ -2004,7 +2009,7 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 45_000, "README : {size} octets");
+    assert!(size <= 46_000, "README : {size} octets");
 }
 
 // ---- REQ-174 : `summary_language` dans les exemples et le README ----
@@ -2165,7 +2170,7 @@ fn REQ174_AC5_AC10_readme_lignes_et_phrases_de_summary_language() {
         assert!(!readme.contains(old), "présent : {old}");
     }
     assert_eq!(readme.matches("config: llm=").count(), 1);
-    assert!(readme.len() <= 45_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
 }
 
 /// AC-185-2 : textes de V-012 pour `--dry-run`, ligne de table après `--enrich-code`.
@@ -2181,9 +2186,9 @@ fn req185_ac2_readme_dry_run() {
     assert!(at < readme.find("| `-v, --verbose` |").unwrap());
     let section = readme_section(&readme, "### `nephila build` et `nephila update`");
     let table = section.lines().filter(|l| l.starts_with("| `-")).count();
-    assert_eq!(table, 11, "{section}");
+    assert_eq!(table, 12, "{section}");
     assert!(readme.find("Un seul `build` ou `update`").unwrap() < readme.find(para).unwrap());
-    assert!(readme.len() <= 45_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
 }
 
 // ---- REQ-188 : `max_calls` dans l'exemple et le README ----
@@ -2213,7 +2218,7 @@ fn REQ188_AC2_AC5_section_max_calls_de_l_exemple() {
 #[test]
 fn REQ188_AC3_AC6_textes_du_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 45_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
     let has_after = |first: &str, second: &str| {
         let a = readme
             .find(first)
@@ -2244,7 +2249,7 @@ fn REQ188_AC3_AC6_textes_du_readme() {
 #[test]
 fn REQ192_AC3_ctrl_c_dans_le_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 45_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
     let codes = readme_section(&readme, "## Codes de sortie");
     let rows = table_rows(&codes, "| Code | Signification |", "|---|---|");
     assert_eq!(rows.len(), 4, "{rows:?}");
@@ -2261,4 +2266,127 @@ fn REQ192_AC3_ctrl_c_dans_le_readme() {
     for args in [&["build", "--help"][..], &["update", "--help"][..]] {
         assert!(!help_of(args).contains("Ctrl-C"), "{args:?}");
     }
+}
+
+// ---- REQ-195, REQ-197 : `model_override` dans les exemples et le README ----
+
+const MODEL_OVERRIDE_BLOCK: &str = r#"# Ce que fait nephila quand le .nephila.toml d'un dépôt impose un modèle (model, ou model de
+# sa section [ask]). Texte : "allow", "warn" ou "deny" ; défaut : "warn".
+#   "allow" : le modèle du dépôt s'applique, sans message.
+#   "warn"  : le modèle du dépôt s'applique ; quand il fait réenrichir des fichiers déjà enrichis
+#             avec un autre modèle, build et update le disent par un avertissement qui donne leur
+#             nombre, avant tout appel. Au-delà de 50 fichiers, ils refusent, sans rien envoyer
+#             ni écrire, sauf avec l'option --accept-project-model (pour cette commande) ;
+#             --dry-run ne refuse jamais. query ask n'est pas concerné.
+#   "deny"  : le modèle du dépôt est ignoré partout (build, update, --dry-run, query ask) : le
+#             vôtre s'applique ; les autres réglages du dépôt restent.
+# Un dépôt cloné ne peut ainsi pas faire réenrichir votre graphe, avec votre clé d'API, par un
+# modèle de son choix sans que vous le sachiez. Lue ici seulement :
+# .nephila.toml la refuse.
+# model_override = "warn""#;
+
+const MODEL_BLOCK_PROJECT: &str = "\
+# Nom du modèle utilisé pour ce dépôt. Texte non vide. Remplace le modèle de la configuration
+# personnelle, qui peut aussi l'ignorer ou demander une confirmation (clé model_override) : par
+# défaut, s'il fait réenrichir plus de 50 fichiers déjà enrichis avec un autre modèle, build et
+# update refusent sans l'option --accept-project-model.
+# Priorité : ce fichier > configuration personnelle > défaut.
+# model = \"claude-sonnet-4-5\"";
+
+const MODEL_ASK_LINE: &str = "# Modèle qui répond aux questions. Texte non vide. Absente : le modèle de l'enrichissement.\n# Ignorée, comme model ci-dessus, si la configuration personnelle dit model_override = \"deny\".\n";
+
+#[test]
+fn REQ197_AC2_AC5_bloc_model_override_de_l_exemple_personnel() {
+    let config = example("config.toml");
+    assert!(
+        config.contains(&format!(
+            "# tls_insecure = false\n\n{MODEL_OVERRIDE_BLOCK}\n\n# --- Plafond d'appels ---"
+        )),
+        "bloc absent ou mal placé"
+    );
+    assert_eq!(MODEL_OVERRIDE_BLOCK.lines().count(), 14);
+    for l in MODEL_OVERRIDE_BLOCK.lines() {
+        assert!(l.chars().count() <= 100, "{l}");
+    }
+    assert_eq!(
+        config
+            .lines()
+            .filter(|l| l.starts_with("# model_override"))
+            .count(),
+        1
+    );
+    // AC-041-2 : la clé est écrite ; AC-041-4 : réactivée, elle vaut le défaut.
+    assert!(keys_written(&config).contains("model_override"));
+    let common = section(&config, COMMON);
+    assert!(common.iter().any(|l| l == "# model_override = \"warn\""));
+    let enabled = config.replace("# model_override = \"warn\"", "model_override = \"warn\"");
+    assert_eq!(
+        parse(&enabled).model_override,
+        nephila::config::ModelOverride::Warn
+    );
+    for needle in [
+        "\"allow\"",
+        "\"warn\"",
+        "\"deny\"",
+        "50",
+        "--accept-project-model",
+    ] {
+        assert!(MODEL_OVERRIDE_BLOCK.contains(needle), "{needle}");
+    }
+}
+
+#[test]
+fn REQ197_AC2_AC5_blocs_de_model_dans_l_exemple_du_depot() {
+    let project = example("nephila.toml");
+    assert!(project.contains(MODEL_BLOCK_PROJECT));
+    assert!(project.contains(MODEL_ASK_LINE));
+    assert!(!project.lines().any(|l| l.starts_with("# model_override")));
+    assert!(!keys_written(&project).contains("model_override"));
+    // Décommenté, le fichier reste accepté par le lecteur du fichier de projet.
+    let dir = tempfile::tempdir().unwrap();
+    let lines: Vec<String> = project.lines().map(String::from).collect();
+    fs::write(dir.path().join(".nephila.toml"), join(&reactivate(&lines))).unwrap();
+    ProjectFile::load(dir.path()).unwrap();
+}
+
+#[test]
+fn REQ197_AC3_AC6_readme_model_override() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+    let table = readme_section(&readme, "## Configuration du LLM");
+    let lines: Vec<&str> = table.lines().collect();
+    let lang = lines
+        .iter()
+        .position(|l| l.starts_with("| `summary_language` |"))
+        .unwrap();
+    assert_eq!(
+        lines[lang + 1],
+        "| `model_override` | Modèle imposé par `.nephila.toml` (`model`, `[ask].model`) : `\"allow\"` l'accepte, `\"warn\"` aussi mais avertit et refuse au-delà de 50 fichiers à réenrichir sans `--accept-project-model`, `\"deny\"` l'ignore ; configuration personnelle seulement | `\"warn\"` |"
+    );
+    assert!(lines[lang + 2].starts_with("| `api_key_env` |"));
+    let options = readme.lines().collect::<Vec<_>>();
+    let mc = options
+        .iter()
+        .position(|l| l.starts_with("| `--max-calls <N>` |"))
+        .unwrap();
+    assert_eq!(
+        options[mc + 1],
+        "| `--accept-project-model` | Accepte le modèle de `.nephila.toml` même s'il réenrichit plus de 50 fichiers, pour cette commande |"
+    );
+    assert!(options[mc + 2].starts_with("| `--exclude <MOTIF>` |"));
+    let bullet = "- **Changer `model` ou `summary_language` réenrichit une fois** chaque fichier de la portée ; les autres réglages ne réenrichissent rien. Un modèle imposé ici (`model`, `[ask].model`) suit `model_override` de la configuration personnelle : par défaut (`\"warn\"`), `build` et `update` l'annoncent par un avertissement qui compte les fichiers déjà enrichis à refaire, et refusent au-delà de 50 sans `--accept-project-model` ; `\"deny\"` l'ignore partout, `query ask` compris ; `\"allow\"` l'accepte sans message. Pour vérifier les valeurs effectives : `nephila build --verbose` (ligne `config`).";
+    assert_eq!(
+        readme
+            .lines()
+            .filter(|l| l
+                .starts_with("- **Changer `model` ou `summary_language` réenrichit une fois**"))
+            .collect::<Vec<_>>(),
+        vec![bullet]
+    );
+    let vers = readme
+        .lines()
+        .find(|l| l.starts_with("- **Vers 0.26**"))
+        .unwrap();
+    assert!(vers.ends_with(" Si le `.nephila.toml` d'un dépôt impose un modèle qui ferait réenrichir plus de 50 fichiers déjà enrichis, `build` et `update` refusent : ajoutez `--accept-project-model`, ou `model_override = \"allow\"` dans la configuration personnelle."));
+    assert!(vers.contains("puis lancez `nephila update`. Si le"));
 }

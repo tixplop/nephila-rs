@@ -318,6 +318,25 @@ pub enum Effort {
     ModelDefault,
 }
 
+/// Politique de la configuration personnelle envers le modèle imposé par `.nephila.toml`
+/// (REQ-195) : `allow` l'accepte, `warn` (défaut) aussi mais avertit (REQ-196), `deny` l'ignore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelOverride {
+    Allow,
+    Warn,
+    Deny,
+}
+
+impl ModelOverride {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelOverride::Allow => "allow",
+            ModelOverride::Warn => "warn",
+            ModelOverride::Deny => "deny",
+        }
+    }
+}
+
 pub const DEFAULT_EFFORT: Effort = Effort::Low;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 
@@ -378,6 +397,8 @@ pub struct Config {
     pub tls_insecure: bool,
     /// Langue retenue des résumés et des noms de concepts (REQ-172).
     pub summary_language: String,
+    /// Politique envers le modèle imposé par `.nephila.toml` (REQ-195).
+    pub model_override: ModelOverride,
     /// Section `[ask]` de la configuration personnelle (REQ-162).
     pub ask: AskOverrides,
 }
@@ -402,6 +423,7 @@ struct RawConfig {
     max_output_tokens: Option<toml::Value>,
     tls_ca_cert: Option<String>,
     tls_insecure: Option<bool>,
+    model_override: Option<toml::Value>,
     ask: Option<toml::Value>,
 }
 
@@ -457,7 +479,7 @@ impl Config {
         format_retries: Option<u32>,
     ) -> (Config, Vec<&'static str>) {
         let mut from_project = Vec::new();
-        if let Some(v) = &p.model {
+        if let (Some(v), true) = (&p.model, self.model_override != ModelOverride::Deny) {
             self.model = v.clone();
             from_project.push("model");
         }
@@ -522,13 +544,15 @@ impl Config {
         let personal = self.ask.clone();
         let (mut cfg, from_project) = self.with_project(project, None, format_retries);
         let pa = &project.ask;
+        let deny = cfg.model_override == ModelOverride::Deny;
+        let project_ask_model = if deny { None } else { pa.model.clone() };
         let mut marks: Vec<&'static str> = Vec::new();
-        if pa.model.is_some() {
+        if project_ask_model.is_some() {
             marks.push("ask.model");
         } else if from_project.contains(&"model") && personal.model.is_none() {
             marks.push("model");
         }
-        if let Some(v) = pa.model.clone().or(personal.model.clone()) {
+        if let Some(v) = project_ask_model.or(personal.model.clone()) {
             cfg.model = v;
         }
         if let Some(v) = pa.thinking.or(personal.thinking) {
@@ -795,6 +819,19 @@ impl Config {
                 ));
             }
         };
+        let model_override = match &raw.model_override {
+            None => ModelOverride::Warn,
+            Some(toml::Value::String(s)) if s == "allow" => ModelOverride::Allow,
+            Some(toml::Value::String(s)) if s == "warn" => ModelOverride::Warn,
+            Some(toml::Value::String(s)) if s == "deny" => ModelOverride::Deny,
+            Some(v) => {
+                return Err(invalid(
+                    "model_override",
+                    "\"allow\", \"warn\" ou \"deny\"",
+                    v,
+                ));
+            }
+        };
         let max_output_tokens = match &raw.max_output_tokens {
             None => DEFAULT_MAX_OUTPUT_TOKENS,
             Some(toml::Value::Integer(n)) if (1..=i64::from(u32::MAX)).contains(n) => *n as u32,
@@ -893,6 +930,7 @@ impl Config {
             tls_ca_certs,
             tls_insecure: raw.tls_insecure.unwrap_or(false),
             summary_language,
+            model_override,
             ask,
         })
     }
@@ -993,6 +1031,7 @@ mod project_tests {
             tls_ca_certs: Vec::new(),
             tls_insecure: true,
             summary_language: DEFAULT_SUMMARY_LANGUAGE.to_string(),
+            model_override: ModelOverride::Warn,
             ask: AskOverrides::default(),
         }
     }
@@ -1416,6 +1455,122 @@ mod llm_options_tests {
                 "{line}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod model_override_tests {
+    use super::*;
+
+    fn parse(extra: &str) -> Result<Config> {
+        Config::parse(
+            &format!("provider = \"mock\"\n{extra}"),
+            Path::new("/x/config.toml"),
+        )
+    }
+
+    fn proj(s: &str) -> ProjectSettings {
+        ProjectSettings::from_table(&s.parse::<toml::Table>().unwrap(), "./.nephila.toml").unwrap()
+    }
+
+    fn with_policy(p: ModelOverride, ask: AskOverrides) -> Config {
+        let mut c = parse("model = \"m-perso\"").unwrap();
+        c.model_override = p;
+        c.ask = ask;
+        c
+    }
+
+    #[test]
+    fn req195_ac1_lecture_et_valeurs() {
+        assert_eq!(parse("").unwrap().model_override, ModelOverride::Warn);
+        for (v, want) in [
+            ("allow", ModelOverride::Allow),
+            ("warn", ModelOverride::Warn),
+            ("deny", ModelOverride::Deny),
+        ] {
+            let c = parse(&format!("model_override = \"{v}\"")).unwrap();
+            assert_eq!(c.model_override, want);
+            assert_eq!(c.model_override.as_str(), v);
+        }
+        for (v, shown) in [
+            ("\"Deny\"", "\"Deny\""),
+            ("\"\"", "\"\""),
+            ("\"oui\"", "\"oui\""),
+            ("1", "1"),
+            ("true", "true"),
+        ] {
+            let msg = parse(&format!("model_override = {v}"))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                msg,
+                format!(
+                    "configuration invalide (/x/config.toml) : clé « model_override » doit être \"allow\", \"warn\" ou \"deny\" (reçu : {shown})"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn req195_ac1_refusee_dans_le_fichier_de_projet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".nephila.toml"),
+            "model_override = \"deny\"\n",
+        )
+        .unwrap();
+        let e = crate::filter::ProjectFile::load(dir.path())
+            .map(|_| ())
+            .expect_err("clé refusée")
+            .to_string();
+        assert!(e.contains("clé inconnue `model_override`"), "{e}");
+        let permitted = e.split("clés permises").nth(1).unwrap_or("");
+        assert!(!permitted.contains("model_override"), "{e}");
+        assert!(!PROJECT_SETTINGS.contains(&"model_override"));
+        assert_eq!(PROJECT_SETTINGS.len(), 7);
+    }
+
+    #[test]
+    fn req195_ac2_fusion_selon_la_politique() {
+        let p = proj("model = \"m-projet\"\nconcurrency = 2");
+        for pol in [ModelOverride::Allow, ModelOverride::Warn] {
+            let (c, from) = with_policy(pol, AskOverrides::default()).with_project(&p, None, None);
+            assert_eq!(c.model, "m-projet");
+            assert_eq!(c.concurrency, 2);
+            assert_eq!(from, vec!["model", "concurrency"]);
+        }
+        let (c, from) =
+            with_policy(ModelOverride::Deny, AskOverrides::default()).with_project(&p, None, None);
+        assert_eq!(c.model, "m-perso");
+        assert_eq!(c.concurrency, 2);
+        assert_eq!(from, vec!["concurrency"]);
+    }
+
+    #[test]
+    fn req195_ac3_for_ask_selon_la_politique() {
+        let p = proj("model = \"m-projet\"\n[ask]\nmodel = \"m-ask-projet\"");
+        let (c, _, m) =
+            with_policy(ModelOverride::Deny, AskOverrides::default()).for_ask(&p, None, None);
+        assert_eq!(c.model, "m-perso");
+        assert!(m.is_empty(), "{m:?}");
+        let perso = AskOverrides {
+            model: Some("m-ask-perso".into()),
+            ..Default::default()
+        };
+        let (c, _, m) = with_policy(ModelOverride::Deny, perso).for_ask(&p, None, None);
+        assert_eq!(c.model, "m-ask-perso");
+        assert!(m.is_empty(), "{m:?}");
+        for pol in [ModelOverride::Allow, ModelOverride::Warn] {
+            let (c, _, m) = with_policy(pol, AskOverrides::default()).for_ask(&p, None, None);
+            assert_eq!(c.model, "m-ask-projet");
+            assert_eq!(m, vec!["ask.model"]);
+        }
+        // Sous deny, les autres réglages de [ask] du dépôt s'appliquent toujours.
+        let p2 = proj("[ask]\nmodel = \"m-ask-projet\"\nthinking = true");
+        let (c, _, m) =
+            with_policy(ModelOverride::Deny, AskOverrides::default()).for_ask(&p2, None, None);
+        assert!(c.thinking);
+        assert_eq!(m, vec!["ask.thinking"]);
     }
 }
 

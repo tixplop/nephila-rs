@@ -1164,3 +1164,43 @@ fn REQ174_AC2_AC7_valeur_invalide_de_la_configuration_personnelle() {
         assert!(!stderr(&o).contains("summary_language"), "{raw}");
     }
 }
+
+// ---- REQ-195 : trace du modèle du dépôt ignoré sous `model_override = "deny"` ----
+
+#[test]
+fn req195_ac5_ac8_trace_du_modele_ignore_sous_deny() {
+    let env = Env::new(MOCK);
+    fs::write(env.repo.join(".nephila.toml"), "model = \"m-projet\"\n").unwrap();
+    let ignored = "modèle: m-projet de .nephila.toml ignoré (model_override = \"deny\")";
+    env.write_config(&format!("{MOCK}model_override = \"deny\"\n"));
+    let err = stderr(&env.run(&["build", "--verbose"]));
+    let lines: Vec<&str> = err.lines().collect();
+    let at = lines.iter().position(|l| l.contains("] config: ")).unwrap();
+    assert!(!lines[at].contains("model=m-projet"), "{err}");
+    assert!(!lines[at].contains("(.nephila.toml"), "{err}");
+    assert!(
+        lines[at + 1].starts_with("trace: [") && lines[at + 1].ends_with(&format!("] {ignored}")),
+        "{err}"
+    );
+    assert_eq!(err.matches("ignoré (model_override").count(), 1);
+    // Sans --verbose, ni la clé ni le modèle du dépôt n'apparaissent.
+    let quiet = stderr(&env.run(&["build"]));
+    assert!(
+        !quiet.contains("m-projet") && !quiet.contains("model_override"),
+        "{quiet}"
+    );
+    // allow et warn : aucune trace ; --no-llm : aucune trace.
+    for p in ["allow", "warn"] {
+        env.write_config(&format!("{MOCK}model_override = \"{p}\"\n"));
+        let l = config_line(&env.run(&["build", "--verbose"]));
+        assert!(l.contains(" model=m-projet "), "{l}");
+        assert!(!stderr(&env.run(&["build", "--verbose"])).contains("ignoré (model_override"));
+    }
+    env.write_config(&format!("{MOCK}model_override = \"deny\"\n"));
+    assert!(
+        !stderr(&env.run(&["build", "--no-llm", "--verbose"])).contains("ignoré (model_override")
+    );
+    // deny sans model dans le projet : aucune trace.
+    fs::remove_file(env.repo.join(".nephila.toml")).unwrap();
+    assert!(!stderr(&env.run(&["build", "--verbose"])).contains("ignoré (model_override"));
+}

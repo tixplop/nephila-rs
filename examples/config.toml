@@ -207,6 +207,21 @@ api_key_env = "ANTHROPIC_API_KEY"
 # « mock » et avec une base_url en http://.
 # tls_insecure = false
 
+# Ce que fait nephila quand le .nephila.toml d'un dépôt impose un modèle (model, ou model de
+# sa section [ask]). Texte : "allow", "warn" ou "deny" ; défaut : "warn".
+#   "allow" : le modèle du dépôt s'applique, sans message.
+#   "warn"  : le modèle du dépôt s'applique ; quand il fait réenrichir des fichiers déjà enrichis
+#             avec un autre modèle, build et update le disent par un avertissement qui donne leur
+#             nombre, avant tout appel. Au-delà de 50 fichiers, ils refusent, sans rien envoyer
+#             ni écrire, sauf avec l'option --accept-project-model (pour cette commande) ;
+#             --dry-run ne refuse jamais. query ask n'est pas concerné.
+#   "deny"  : le modèle du dépôt est ignoré partout (build, update, --dry-run, query ask) : le
+#             vôtre s'applique ; les autres réglages du dépôt restent.
+# Un dépôt cloné ne peut ainsi pas faire réenrichir votre graphe, avec votre clé d'API, par un
+# modèle de son choix sans que vous le sachiez. Lue ici seulement :
+# .nephila.toml la refuse.
+# model_override = "warn"
+
 # --- Plafond d'appels ---
 # Hors des « Options communes » : la ligne ci-dessous montre une valeur d'exemple, pas le
 # défaut (aucun plafond).
