@@ -1671,15 +1671,13 @@ pub(crate) fn enrich_with_stop(
 ) -> Result<Vec<(String, Error)>> {
     #[cfg(test)]
     let _shared = crate::interrupt::test_shared();
-    let IndexOptions {
-        concurrency,
-        max_chunk_chars,
-        batch_files,
-        format_retries,
-        max_calls,
-        enrich_code: _,
-        jobs: _,
-    } = *opts;
+    let (concurrency, max_chunk_chars, batch_files, format_retries, max_calls) = (
+        opts.concurrency,
+        opts.max_chunk_chars,
+        opts.batch_files,
+        opts.format_retries,
+        opts.max_calls,
+    );
     let ids = nodes_by_file(store)?;
     let started = Instant::now();
     let failed_before = report.failed;
@@ -3006,6 +3004,7 @@ mod tests {
             format_retries: u32::MAX,
             enrich_code: false,
             max_calls: None,
+            ..IndexOptions::default()
         };
         let stop = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel();
@@ -3088,6 +3087,7 @@ mod tests {
             format_retries: 0,
             enrich_code: false,
             max_calls: None,
+            ..IndexOptions::default()
         };
         progress::init(true);
         progress::take_captured();
@@ -3167,6 +3167,7 @@ mod tests {
             format_retries: 0,
             enrich_code: false,
             max_calls: None,
+            ..IndexOptions::default()
         };
         let llm = Cut(Mutex::new(Vec::new()));
         progress::init(true);
@@ -3301,6 +3302,7 @@ mod tests {
             format_retries: 0,
             enrich_code: false,
             max_calls: None,
+            ..IndexOptions::default()
         };
         progress::init(true);
         progress::take_captured();
@@ -3414,6 +3416,7 @@ mod tests {
             format_retries: 0,
             enrich_code: false,
             max_calls: None,
+            ..IndexOptions::default()
         };
         let failures = enrich_with_stop(
             Sources {
@@ -3652,6 +3655,7 @@ mod tests {
             format_retries,
             enrich_code: false,
             max_calls,
+            ..IndexOptions::default()
         };
         let failures = enrich_with_stop(
             Sources {
@@ -3919,6 +3923,7 @@ mod tests {
             format_retries: 0,
             enrich_code: false,
             max_calls: None,
+            ..IndexOptions::default()
         }
     }
 
@@ -5186,6 +5191,7 @@ mod structured_fallback_tests {
             format_retries: 0,
             enrich_code: false,
             max_calls: None,
+            ..IndexOptions::default()
         };
         let mut report = BuildReport::default();
         let sources = Sources {

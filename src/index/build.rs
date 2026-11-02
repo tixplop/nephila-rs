@@ -8,7 +8,7 @@ use crate::config::{
     Config, ModelOverride, ProjectSettings, DEFAULT_CONCURRENCY, DEFAULT_MAX_CHUNK_CHARS,
 };
 use crate::error::{warn, Error, Result};
-use crate::filter::{Filters, Matcher, ProjectFile};
+use crate::filter::{EnrichScope, Filters, Matcher, ProjectFile};
 use crate::index::estimate::{self, Estimate};
 use crate::index::lock::RepoLock;
 use crate::index::{enrich, structure};
@@ -50,6 +50,8 @@ pub struct BuildReport {
     pub left_by_cap: usize,
     /// Vrai si l'envoi a été arrêté par Ctrl-C (REQ-189) : la fin rend `Error::Interrupted`.
     pub interrupted: bool,
+    /// Fichiers indexés écartés par les motifs de la portée d'enrichissement (REQ-207).
+    pub out_of_scope: usize,
     /// Fichiers exclus par les filtres (REQ-037) ; `None` sans filtre actif.
     pub excluded: Option<usize>,
     /// Relevé de l'estimation sous `--dry-run` (REQ-184) ; sa présence remplace le segment
@@ -58,7 +60,7 @@ pub struct BuildReport {
 }
 
 /// Réglages de l'indexation : ceux de la configuration, ou les défauts sans configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexOptions {
     /// Nombre d'appels LLM simultanés.
     pub concurrency: usize,
@@ -73,6 +75,8 @@ pub struct IndexOptions {
     pub enrich_code: bool,
     /// Plafond d'appels d'enrichissement de la commande (REQ-186) ; `None` : aucun plafond.
     pub max_calls: Option<usize>,
+    /// Motifs de la portée d'enrichissement, personnels et du dépôt (REQ-207).
+    pub enrich_scope: EnrichScope,
 }
 
 impl Default for IndexOptions {
@@ -85,6 +89,7 @@ impl Default for IndexOptions {
             format_retries: crate::config::DEFAULT_FORMAT_RETRIES,
             enrich_code: false,
             max_calls: None,
+            enrich_scope: EnrichScope::default(),
         }
     }
 }
@@ -99,6 +104,7 @@ impl From<&Config> for IndexOptions {
             format_retries: c.format_retries,
             enrich_code: c.enrich_code,
             max_calls: c.max_calls,
+            enrich_scope: EnrichScope::default(),
         }
     }
 }
@@ -213,9 +219,15 @@ pub(crate) fn setup(
     match loaded {
         None => {
             trace!("config: llm inactif (aucune configuration)");
+            let defaults = EnrichScope::default();
             Ok(Setup {
                 opts: IndexOptions {
                     enrich_code,
+                    enrich_scope: EnrichScope::new(
+                        defaults.personal_include,
+                        defaults.personal_exclude,
+                        project,
+                    ),
                     ..IndexOptions::default()
                 },
                 llm: None,
@@ -245,9 +257,17 @@ pub(crate) fn setup(
                 format_retries,
                 max_calls,
             );
+            let opts = IndexOptions {
+                enrich_scope: EnrichScope::new(
+                    config.enrich_include.clone(),
+                    config.enrich_exclude.clone(),
+                    project,
+                ),
+                ..IndexOptions::from(&config)
+            };
             if dry_run {
                 return Ok(Setup {
-                    opts: IndexOptions::from(&config),
+                    opts,
                     llm: None,
                     dry_run: Some(DryRun {
                         model: Some(config.model.clone()),
@@ -259,7 +279,7 @@ pub(crate) fn setup(
             }
             let llm = build_llm(&config)?;
             Ok(Setup {
-                opts: IndexOptions::from(&config),
+                opts,
                 llm: Some(llm),
                 dry_run: None,
                 project_model,
@@ -282,6 +302,12 @@ impl BuildReport {
             line.push_str(", enrichissement : estimé sans envoi");
         } else if !self.llm_active {
             line.push_str(", enrichissement : désactivé");
+        }
+        if self.out_of_scope > 0 {
+            line.push_str(&format!(
+                ", {} fichiers hors portée d'enrichissement",
+                self.out_of_scope
+            ));
         }
         if let Some(k) = self.excluded {
             line.push_str(&format!(", {k} fichiers exclus par les filtres"));
@@ -366,8 +392,13 @@ pub(crate) fn check_project_model(
         return Ok(());
     }
     let n = {
-        let counted = Store::open_readonly(repo)
-            .and_then(|st| st.count_enriched_with_other_model(&pm.project, setup.opts.enrich_code));
+        let counted = Store::open_readonly(repo).and_then(|st| {
+            st.count_enriched_with_other_model(
+                &pm.project,
+                setup.opts.enrich_code,
+                &setup.opts.enrich_scope,
+            )
+        });
         counted.unwrap_or(0)
     };
     if n == 0 {
@@ -621,6 +652,7 @@ fn build_impl(
         store.set_enrich_model(llm.model())?;
         store.set_enrich_language(llm.summary_language())?;
         store.set_enrich_code(opts.enrich_code)?;
+        store.set_enrich_scope(&opts.enrich_scope)?;
     }
     if records.is_empty() {
         warn("aucun fichier pris en charge dans le dépôt : graphe vide");
@@ -689,6 +721,9 @@ pub(crate) fn finalize(
         .filter(|f| f.state == FileState::Pending)
         .count();
     report.to_enrich = store.count_files_to_enrich()?;
+    if llm.is_some() || dry.is_some() {
+        report.out_of_scope = store.count_out_of_scope(opts.enrich_code, &opts.enrich_scope)?;
+    }
     if let Some(dry) = dry {
         report.estimate = Some(estimate_enrichment(store, dry, opts, repo, abs)?);
     }
@@ -704,8 +739,12 @@ pub(crate) fn estimate_enrichment(
     repo: &Path,
     abs: &HashMap<String, PathBuf>,
 ) -> Result<Estimate> {
-    let files =
-        store.files_to_enrich_for(dry.model.as_deref(), Some(&dry.language), opts.enrich_code)?;
+    let files = store.files_to_enrich_for(
+        dry.model.as_deref(),
+        Some(&dry.language),
+        opts.enrich_code,
+        &opts.enrich_scope,
+    )?;
     let ids = enrich::nodes_by_file(store)?;
     let est = enrich::estimate(
         enrich::Sources { repo, abs },

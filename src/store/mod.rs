@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
+use crate::filter::EnrichScope;
 use crate::llm::enrich::PromptVersions;
 
 use crate::error::{Error, Result};
@@ -971,7 +972,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_scope');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -989,7 +990,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_scope');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -1228,7 +1229,8 @@ impl Store {
         let model = self.enrich_model()?;
         let language = self.enrich_language()?;
         let code = self.enrich_code()?;
-        self.files_to_enrich_with(model.as_deref(), language.as_deref(), code, false)
+        let scope = self.enrich_scope()?;
+        self.files_to_enrich_with(model.as_deref(), language.as_deref(), code, &scope, false)
     }
 
     /// Comme `files_to_enrich`, sur des réglages donnés au lieu de ceux de `meta` (REQ-184,
@@ -1239,8 +1241,9 @@ impl Store {
         model: Option<&str>,
         language: Option<&str>,
         code: bool,
+        scope: &EnrichScope,
     ) -> Result<Vec<FileRecord>> {
-        self.files_to_enrich_with(model, language, code, true)
+        self.files_to_enrich_with(model, language, code, scope, true)
     }
 
     /// Requête commune. `no_model_is_all` : un modèle absent écarte toute entrée (réglages
@@ -1250,8 +1253,10 @@ impl Store {
         model: Option<&str>,
         language: Option<&str>,
         code: bool,
+        scope: &EnrichScope,
         no_model_is_all: bool,
     ) -> Result<Vec<FileRecord>> {
+        let scope = scope.compile()?;
         // Un graphe lu en schéma 5 à 9 n'a pas la colonne : condition d'avant, sans la langue.
         let with_language = self.version >= SCHEMA_VERSION;
         let all = no_model_is_all && model.is_none();
@@ -1288,7 +1293,7 @@ impl Store {
             .collect();
         let set: std::collections::HashSet<String> = paths
             .into_iter()
-            .filter(|p| code || crate::llm::enrich::is_markdown(p))
+            .filter(|p| (code || crate::llm::enrich::is_markdown(p)) && scope.contains(p))
             .collect();
         Ok(self
             .files()?
@@ -1299,7 +1304,13 @@ impl Store {
 
     /// Nombre de fichiers de la portée déjà enrichis (contenu inchangé) avec un autre modèle que
     /// `model` (REQ-196, DEC-159) ; la langue et la version du prompt ne sont pas comparées.
-    pub fn count_enriched_with_other_model(&self, model: &str, code: bool) -> Result<usize> {
+    pub fn count_enriched_with_other_model(
+        &self,
+        model: &str,
+        code: bool,
+        scope: &EnrichScope,
+    ) -> Result<usize> {
+        let scope = scope.compile()?;
         let mut st = self
             .conn
             .prepare_cached(
@@ -1315,9 +1326,52 @@ impl Store {
             .map_err(db_err)?;
         let set: std::collections::HashSet<String> = paths
             .into_iter()
-            .filter(|p| code || crate::llm::enrich::is_markdown(p))
+            .filter(|p| (code || crate::llm::enrich::is_markdown(p)) && scope.contains(p))
             .collect();
         Ok(set.len())
+    }
+
+    /// Fichiers indexés de la portée Markdown/code (REQ-050) que les motifs écartent (REQ-207).
+    pub fn count_out_of_scope(&self, code: bool, scope: &EnrichScope) -> Result<usize> {
+        let scope = scope.compile()?;
+        Ok(self
+            .files()?
+            .iter()
+            .filter(|f| f.state == FileState::Indexed)
+            .filter(|f| code || crate::llm::enrich::is_markdown(&f.path))
+            .filter(|f| !scope.contains(&f.path))
+            .count())
+    }
+
+    /// Motifs de la portée enregistrés par le dernier `build`/`update` LLM actif ; clé absente
+    /// ou illisible : liste par défaut (REQ-207, DEC-166).
+    pub fn enrich_scope(&self) -> Result<EnrichScope> {
+        match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'enrich_scope'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get::<_, String>(0))
+        {
+            Ok(v) => Ok(serde_json::from_str(&v).unwrap_or_default()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(EnrichScope::default()),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Enregistre les motifs effectifs d'une commande LLM active.
+    pub fn set_enrich_scope(&mut self, scope: &EnrichScope) -> Result<()> {
+        self.ensure_writable()?;
+        let json = serde_json::to_string(scope)
+            .map_err(|e| Error::Message(format!("motifs de portée illisibles : {e}")))?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO meta(key, value) VALUES ('enrich_scope', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .map_err(db_err)?
+            .execute([json])
+            .map_err(db_err)?;
+        Ok(())
     }
 
     /// Nombre de fichiers à enrichir.
@@ -4541,19 +4595,24 @@ mod tests {
         let (_d, mut st) = enriched_store();
         let paths = |v: Vec<FileRecord>| -> Vec<String> { v.into_iter().map(|f| f.path).collect() };
         assert!(st
-            .files_to_enrich_for(Some("m"), Some("français"), false)
+            .files_to_enrich_for(Some("m"), Some("français"), false, &EnrichScope::default())
             .unwrap()
             .is_empty());
         assert_eq!(
             paths(
-                st.files_to_enrich_for(Some("autre"), Some("français"), false)
-                    .unwrap()
+                st.files_to_enrich_for(
+                    Some("autre"),
+                    Some("français"),
+                    false,
+                    &EnrichScope::default()
+                )
+                .unwrap()
             ),
             vec!["a.md"]
         );
         assert_eq!(
             paths(
-                st.files_to_enrich_for(Some("m"), Some("english"), false)
+                st.files_to_enrich_for(Some("m"), Some("english"), false, &EnrichScope::default())
                     .unwrap()
             ),
             vec!["a.md"]
@@ -4567,14 +4626,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             paths(
-                st.files_to_enrich_for(None, Some("français"), false)
+                st.files_to_enrich_for(None, Some("français"), false, &EnrichScope::default())
                     .unwrap()
             ),
             vec!["a.md", "b.md"]
         );
         assert_eq!(
             paths(
-                st.files_to_enrich_for(None, Some("français"), true)
+                st.files_to_enrich_for(None, Some("français"), true, &EnrichScope::default())
                     .unwrap()
             ),
             vec!["C.java", "a.md", "b.md"]
@@ -4584,7 +4643,7 @@ mod tests {
         // Les réglages de `meta` ne changent pas le résultat des réglages donnés.
         st.set_enrich_model("autre").unwrap();
         assert!(st
-            .files_to_enrich_for(Some("m"), Some("français"), false)
+            .files_to_enrich_for(Some("m"), Some("français"), false, &EnrichScope::default())
             .unwrap()
             .iter()
             .all(|f| f.path != "a.md"));
@@ -4659,16 +4718,19 @@ mod tests {
         let (_d, st) = req196_ac1_store(&["a.md", "b.md", "A.java", "pom.xml"]);
         // Portée : documents seuls, ou avec le code.
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", false).unwrap(),
+            st.count_enriched_with_other_model("m-new", false, &EnrichScope::default())
+                .unwrap(),
             2
         );
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", true).unwrap(),
+            st.count_enriched_with_other_model("m-new", true, &EnrichScope::default())
+                .unwrap(),
             4
         );
         // Le modèle déjà utilisé n'est pas compté.
         assert_eq!(
-            st.count_enriched_with_other_model("m-old", true).unwrap(),
+            st.count_enriched_with_other_model("m-old", true, &EnrichScope::default())
+                .unwrap(),
             0
         );
         // Langue ou version de prompt différentes : la ligne est comptée comme les autres.
@@ -4679,11 +4741,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", false).unwrap(),
+            st.count_enriched_with_other_model("m-new", false, &EnrichScope::default())
+                .unwrap(),
             2
         );
         assert_eq!(
-            st.count_enriched_with_other_model("m-old", false).unwrap(),
+            st.count_enriched_with_other_model("m-old", false, &EnrichScope::default())
+                .unwrap(),
             0
         );
         // Contenu modifié : l'entrée ne vaut plus.
@@ -4691,8 +4755,115 @@ mod tests {
             .execute("UPDATE files SET hash = 'h2' WHERE path = 'b.md'", [])
             .unwrap();
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", false).unwrap(),
+            st.count_enriched_with_other_model("m-new", false, &EnrichScope::default())
+                .unwrap(),
             1
+        );
+    }
+
+    fn scope_exclude(pattern: &str) -> EnrichScope {
+        EnrichScope {
+            personal_exclude: vec![pattern.to_string()],
+            ..EnrichScope::default()
+        }
+    }
+
+    #[test]
+    fn req207_ac7_enrich_scope_absent_is_default_and_roundtrips() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(st.enrich_scope().unwrap(), EnrichScope::default());
+        let scope = EnrichScope {
+            personal_include: vec!["src/**".into()],
+            personal_exclude: vec!["a/".into()],
+            project_include: vec!["b/".into()],
+            project_exclude: vec!["c/".into()],
+        };
+        st.set_enrich_scope(&scope).unwrap();
+        assert_eq!(st.enrich_scope().unwrap(), scope);
+        // Valeur illisible : liste par défaut.
+        st.conn
+            .execute("UPDATE meta SET value = 'x' WHERE key = 'enrich_scope'", [])
+            .unwrap();
+        assert_eq!(st.enrich_scope().unwrap(), EnrichScope::default());
+    }
+
+    #[test]
+    fn req207_ac7_enrich_scope_survives_reset_and_reset_with_pending_files() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let scope = scope_exclude("docs/");
+        st.set_enrich_scope(&scope).unwrap();
+        st.reset().unwrap();
+        assert_eq!(st.enrich_scope().unwrap(), scope);
+        st.reset_with_pending_files(&[file("a.md")]).unwrap();
+        assert_eq!(st.enrich_scope().unwrap(), scope);
+    }
+
+    #[test]
+    fn req207_ac4_files_to_enrich_follow_the_registered_scope() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let names = ["docs/a.md", "docs/migrations/b.md", "c.md"];
+        st.insert_pending_files(&names.map(file)).unwrap();
+        for p in names {
+            st.replace_structure(p, &[ty(&format!("p.{p}"), p)], &[])
+                .unwrap();
+        }
+        let paths = |st: &Store| -> Vec<String> {
+            st.files_to_enrich()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect()
+        };
+        // Sans valeur enregistrée : liste par défaut.
+        assert_eq!(paths(&st), vec!["c.md", "docs/a.md"]);
+        st.set_enrich_scope(&scope_exclude("docs/")).unwrap();
+        assert_eq!(paths(&st), vec!["c.md"]);
+        st.set_enrich_scope(&scope_exclude("nothing/")).unwrap();
+        assert_eq!(paths(&st).len(), 3);
+    }
+
+    #[test]
+    fn req207_ac8_count_enriched_with_other_model_ignores_out_of_scope_files() {
+        let (_d, st) = req196_ac1_store(&["a.md", "docs/migrations/b.md"]);
+        assert_eq!(
+            st.count_enriched_with_other_model("m-new", false, &EnrichScope::default())
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            st.count_enriched_with_other_model("m-new", false, &scope_exclude("nothing/"))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn req207_ac4_count_out_of_scope_counts_only_indexed_files_of_the_kind() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let names = [
+            "a.md",
+            "docs/migrations/b.md",
+            "src/test/MainTest.java",
+            "src/Main.java",
+            "docs/migrations/pending.md",
+        ];
+        st.insert_pending_files(&names.map(file)).unwrap();
+        for p in &names[..4] {
+            st.replace_structure(p, &[ty(&format!("p.{p}"), p)], &[])
+                .unwrap();
+        }
+        let scope = EnrichScope::default();
+        // Documents seuls : le fichier de code écarté n'est pas compté.
+        assert_eq!(st.count_out_of_scope(false, &scope).unwrap(), 1);
+        assert_eq!(st.count_out_of_scope(true, &scope).unwrap(), 2);
+        assert_eq!(
+            st.count_out_of_scope(true, &scope_exclude("nothing/"))
+                .unwrap(),
+            0
         );
     }
 
@@ -4700,7 +4871,11 @@ mod tests {
     fn req196_ac1_count_enriched_with_other_model_empty_graph() {
         let dir = tempdir().unwrap();
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(st.count_enriched_with_other_model("m", true).unwrap(), 0);
+        assert_eq!(
+            st.count_enriched_with_other_model("m", true, &EnrichScope::default())
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -4847,7 +5022,7 @@ mod tests {
         }
         assert!(to_enrich_paths(&st).is_empty());
         assert!(st
-            .files_to_enrich_for(Some("m"), Some("français"), true)
+            .files_to_enrich_for(Some("m"), Some("français"), true, &EnrichScope::default())
             .unwrap()
             .is_empty());
         st.conn
@@ -4884,7 +5059,7 @@ mod tests {
             st.set_prompt_versions(changed);
             assert_eq!(to_enrich_paths(&st), [name], "{name}");
             let given = st
-                .files_to_enrich_for(Some("m"), Some("français"), true)
+                .files_to_enrich_for(Some("m"), Some("français"), true, &EnrichScope::default())
                 .unwrap();
             assert_eq!(
                 given.into_iter().map(|f| f.path).collect::<Vec<_>>(),

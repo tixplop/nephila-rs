@@ -190,6 +190,7 @@ pub fn update_with_dry_run(
         store.set_enrich_model(llm.model())?;
         store.set_enrich_language(llm.summary_language())?;
         store.set_enrich_code(opts.enrich_code)?;
+        store.set_enrich_scope(&opts.enrich_scope)?;
     }
     // « Aucun changement » : rien d'ajouté, modifié, supprimé ou en attente, graphe marqué
     // « à jour », et (LLM inactif ou aucun fichier à enrichir).
