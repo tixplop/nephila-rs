@@ -683,7 +683,7 @@ fn REQ111_AC8_rlimit_nproc_reserve_a_linux() {
 }
 
 #[test]
-fn REQ152_AC1_pulldown_cmark_corrige_rustsec_2026_0414() {
+fn REQ209_AC1_pulldown_cmark_corrige_rustsec_2026_0433() {
     let text =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock")).unwrap();
     let mut trouves = 0;
@@ -700,8 +700,8 @@ fn REQ152_AC1_pulldown_cmark_corrige_rustsec_2026_0414() {
         let n: Vec<u64> = v.split('.').map(|x| x.parse().unwrap()).collect();
         let version = (n[0], n[1], n[2]);
         assert!(
-            version >= (0, 13, 5),
-            "pulldown-cmark {v} < 0.13.5 (RUSTSEC-2026-0414)"
+            version >= (0, 13, 6),
+            "pulldown-cmark {v} < 0.13.6 (RUSTSEC-2026-0433)"
         );
     }
     assert!(trouves >= 1, "aucun bloc pulldown-cmark dans Cargo.lock");

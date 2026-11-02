@@ -1237,17 +1237,17 @@ fn REQ134_AC2_ligne_config_d_exemple_du_readme_est_la_sortie_reelle() {
 }
 
 #[test]
-fn REQ158_AC1_version_0_26_0() {
+fn REQ210_AC1_version_0_26_1() {
     assert_eq!(cargo_minor(), "0.26");
     let toml = repo_file("Cargo.toml");
-    assert!(toml.lines().any(|l| l == "version = \"0.26.0\""));
+    assert!(toml.lines().any(|l| l == "version = \"0.26.1\""));
     let lock = repo_file("Cargo.lock");
-    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.26.0\""));
+    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.26.1\""));
     let readme = repo_file("README.md");
-    for needle in ["V=v0.26.0", "git tag v0.26.0 && git push origin v0.26.0"] {
+    for needle in ["V=v0.26.1", "git tag v0.26.1 && git push origin v0.26.1"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
-    assert!(!readme.contains("v0.25.3"));
+    assert!(!readme.contains("v0.26.0"));
 }
 
 /// Titres du README (niveau 1 et plus), hors blocs de code, tels qu'écrits.
