@@ -372,6 +372,7 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 | `thinking` | `true` demande au modèle de réfléchir ; configuration personnelle seulement ; chez anthropic, modèle Claude 4.6 ou suivant | `false` |
 | `effort` | Niveau d'effort, avec ou sans `thinking` : `"low"`, `"medium"`, `"high"`, ou `"default"` pour n'en envoyer aucun ; à `"medium"` ou `"high"`, augmentez `timeout_secs` ; configuration personnelle seulement | `"low"` |
 | `max_output_tokens` | Limite de jetons de la réponse, entier > 0 ; configuration personnelle seulement | 16384 |
+| `structured_output` | Schéma JSON imposé aux réponses d'enrichissement : `"auto"` l'envoie sans `base_url` et, s'il est refusé (HTTP 400), s'en passe pour la commande ; `"on"` l'envoie toujours, et un refus arrête l'envoi ; `"off"` jamais ; configuration personnelle seulement | `"auto"` |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |
 | `format_retries` | Nouveaux essais d'une réponse non conforme, entier ≥ 0 | 2 |
 | `max_calls` | Plafond d'appels d'enrichissement par commande, nouveaux essais de format compris ; configuration personnelle seulement | aucun |

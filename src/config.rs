@@ -133,6 +133,7 @@ pub struct AskOverrides {
     pub thinking: Option<bool>,
     pub effort: Option<Effort>,
     pub max_output_tokens: Option<u32>,
+    pub structured_output: Option<StructuredOutput>,
     pub max_context_chars: Option<usize>,
     pub max_seeds: Option<usize>,
     pub max_nodes: Option<usize>,
@@ -340,6 +341,37 @@ impl ModelOverride {
     }
 }
 
+/// Réglage `structured_output` : schéma JSON imposé à la réponse du LLM (REQ-202, DEC-163).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredOutput {
+    Auto,
+    On,
+    Off,
+}
+
+impl StructuredOutput {
+    /// Valeur écrite dans un fichier : `auto`, `on` ou `off`.
+    pub fn parse(s: &str) -> Option<StructuredOutput> {
+        match s {
+            "auto" => Some(StructuredOutput::Auto),
+            "on" => Some(StructuredOutput::On),
+            "off" => Some(StructuredOutput::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StructuredOutput::Auto => "auto",
+            StructuredOutput::On => "on",
+            StructuredOutput::Off => "off",
+        }
+    }
+}
+
+/// Attendu de l'erreur E-15 des deux clés `structured_output`.
+const STRUCTURED_EXPECTED: &str = "\"auto\", \"on\" ou \"off\"";
+
 pub const DEFAULT_EFFORT: Effort = Effort::Low;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 
@@ -392,6 +424,10 @@ pub struct Config {
     pub effort_explicit: bool,
     /// Limite de jetons de la réponse, réflexion comprise (REQ-058).
     pub max_output_tokens: u32,
+    /// Schéma JSON imposé à la réponse (REQ-202 ; `query ask` : REQ-204).
+    pub structured_output: StructuredOutput,
+    /// Nom de la clé qui a donné `structured_output`, pour les traces (REQ-203).
+    pub structured_key: &'static str,
     /// Chemin résolu du PEM d'autorités ajoutées aux autorités publiques (REQ-036).
     pub tls_ca_cert: Option<PathBuf>,
     /// Certificats d'autorité (DER) lus dans `tls_ca_cert`, déjà validés.
@@ -424,6 +460,7 @@ struct RawConfig {
     thinking: Option<toml::Value>,
     effort: Option<toml::Value>,
     max_output_tokens: Option<toml::Value>,
+    structured_output: Option<toml::Value>,
     tls_ca_cert: Option<String>,
     tls_insecure: Option<bool>,
     model_override: Option<toml::Value>,
@@ -439,6 +476,7 @@ struct RawAsk {
     thinking: Option<toml::Value>,
     effort: Option<toml::Value>,
     max_output_tokens: Option<toml::Value>,
+    structured_output: Option<toml::Value>,
     max_context_chars: Option<toml::Value>,
     max_seeds: Option<toml::Value>,
     max_nodes: Option<toml::Value>,
@@ -577,6 +615,8 @@ impl Config {
         if pa.max_output_tokens.is_some() {
             marks.push("ask.max_output_tokens");
         }
+        cfg.structured_output = personal.structured_output.unwrap_or(StructuredOutput::Off);
+        cfg.structured_key = "ask.structured_output";
         let limits = AskLimits {
             max_context_chars: context_chars
                 .or(pa.max_context_chars)
@@ -846,6 +886,13 @@ impl Config {
                 ))
             }
         };
+        let structured_output = match &raw.structured_output {
+            None => StructuredOutput::Auto,
+            Some(v) => match v.as_str().and_then(StructuredOutput::parse) {
+                Some(o) => o,
+                None => return Err(invalid("structured_output", STRUCTURED_EXPECTED, v)),
+            },
+        };
         let ask = match &raw.ask {
             None => AskOverrides::default(),
             Some(toml::Value::Table(t)) => {
@@ -892,6 +939,19 @@ impl Config {
                         }
                         Some(v) => return Err(invalid("ask.max_output_tokens", positive, v)),
                     },
+                    structured_output: match &a.structured_output {
+                        None => None,
+                        Some(v) => match v.as_str().and_then(StructuredOutput::parse) {
+                            Some(o) => Some(o),
+                            None => {
+                                return Err(invalid(
+                                    "ask.structured_output",
+                                    STRUCTURED_EXPECTED,
+                                    v,
+                                ))
+                            }
+                        },
+                    },
                     max_context_chars: int(
                         "max_context_chars",
                         &a.max_context_chars,
@@ -929,6 +989,8 @@ impl Config {
             effort,
             effort_explicit: raw.effort.is_some(),
             max_output_tokens,
+            structured_output,
+            structured_key: "structured_output",
             tls_ca_cert,
             tls_ca_certs,
             tls_insecure: raw.tls_insecure.unwrap_or(false),
@@ -1030,6 +1092,8 @@ mod project_tests {
             effort: DEFAULT_EFFORT,
             effort_explicit: false,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            structured_output: StructuredOutput::Auto,
+            structured_key: "structured_output",
             tls_ca_cert: None,
             tls_ca_certs: Vec::new(),
             tls_insecure: true,
@@ -1749,6 +1813,7 @@ mod ask_tests {
                 model: Some("m-ask".into()),
                 thinking: Some(true),
                 effort: Some(Effort::ModelDefault),
+                structured_output: None,
                 max_output_tokens: Some(2048),
                 max_context_chars: Some(30000),
                 max_seeds: Some(30),
@@ -1882,6 +1947,7 @@ mod ask_tests {
                 max_output_tokens: Some(16384),
                 max_context_chars: Some(100_000),
                 max_seeds: Some(100),
+                structured_output: None,
                 max_nodes: Some(500),
             }
         );
@@ -2264,5 +2330,93 @@ mod without_key_tests {
         assert!(Config::load_optional_without_key_with(&env)
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod structured_tests {
+    use super::*;
+
+    const P: &str = "/x/config.toml";
+
+    fn personal(extra: &str) -> Result<Config> {
+        Config::parse(&format!("provider = \"mock\"\n{extra}"), Path::new(P))
+    }
+
+    fn line(key: &str, shown: &str) -> String {
+        format!(
+            "configuration invalide ({P}) : clé « {key} » doit être \"auto\", \"on\" ou \"off\" \
+             (reçu : {shown})"
+        )
+    }
+
+    const BAD: [&str; 6] = ["\"ON\"", "\"yes\"", "\"true\"", "\"\"", "true", "1"];
+
+    #[test]
+    fn req202_ac1_structured_output_du_premier_niveau() {
+        let c = personal("").unwrap();
+        assert_eq!(c.structured_output, StructuredOutput::Auto);
+        assert_eq!(c.structured_key, "structured_output");
+        for (v, want) in [
+            ("auto", StructuredOutput::Auto),
+            ("on", StructuredOutput::On),
+            ("off", StructuredOutput::Off),
+        ] {
+            let c = personal(&format!("structured_output = \"{v}\"")).unwrap();
+            assert_eq!(c.structured_output, want);
+            assert_eq!(want.as_str(), v);
+        }
+        for shown in BAD {
+            let e = personal(&format!("structured_output = {shown}")).unwrap_err();
+            assert_eq!(e.to_string(), line("structured_output", shown));
+        }
+    }
+
+    #[test]
+    fn req204_ac1_structured_output_de_la_section_ask() {
+        let c = personal("[ask]\nstructured_output = \"on\"").unwrap();
+        assert_eq!(c.ask.structured_output, Some(StructuredOutput::On));
+        assert_eq!(personal("").unwrap().ask.structured_output, None);
+        for shown in BAD {
+            let e = personal(&format!("[ask]\nstructured_output = {shown}")).unwrap_err();
+            assert_eq!(e.to_string(), line("ask.structured_output", shown));
+        }
+        // La configuration est validée en entier : une valeur invalide de l'une arrête l'autre.
+        let e = personal("structured_output = \"ON\"\n[ask]\nmodel = \"m\"").unwrap_err();
+        assert_eq!(e.to_string(), line("structured_output", "\"ON\""));
+        let e = personal("structured_output = \"on\"\n[ask]\nstructured_output = 1").unwrap_err();
+        assert_eq!(e.to_string(), line("ask.structured_output", "1"));
+    }
+
+    #[test]
+    fn req204_ac1_for_ask_ne_reprend_pas_le_premier_niveau() {
+        let p = ProjectSettings::default();
+        let c = personal("structured_output = \"on\"").unwrap();
+        let (a, _, _) = c.clone().for_ask(&p, None, None);
+        assert_eq!(a.structured_output, StructuredOutput::Off);
+        assert_eq!(a.structured_key, "ask.structured_output");
+        // Le premier niveau, lui, garde sa valeur et sa clé.
+        let (b, _) = c.with_project(&p, None, None);
+        assert_eq!(b.structured_output, StructuredOutput::On);
+        assert_eq!(b.structured_key, "structured_output");
+        let c =
+            personal("structured_output = \"off\"\n[ask]\nstructured_output = \"auto\"").unwrap();
+        let (a, _, _) = c.for_ask(&p, None, None);
+        assert_eq!(a.structured_output, StructuredOutput::Auto);
+    }
+
+    #[test]
+    fn req202_ac1_cle_refusee_dans_le_fichier_de_projet() {
+        let t = |s: &str| ProjectSettings::from_table(&s.parse().unwrap(), "./.nephila.toml");
+        assert!(!PROJECT_SETTINGS.contains(&"structured_output"));
+        assert!(!ASK_SETTINGS.contains(&"structured_output"));
+        let e = t("[ask]\nstructured_output = \"on\"")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "./.nephila.toml : clé inconnue `ask.structured_output` (clés permises dans [ask] : \
+             model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes)"
+        );
     }
 }

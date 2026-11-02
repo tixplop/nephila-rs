@@ -158,6 +158,21 @@ api_key_env = "ANTHROPIC_API_KEY"
 # .nephila.toml la refuse.
 # max_output_tokens = 16384
 
+# Schéma JSON envoyé avec chaque appel d'enrichissement : le serveur l'impose à la réponse, ce
+# qui évite des réponses non conformes et leurs nouveaux essais. Texte : "auto", "on" ou "off" ;
+# défaut : "auto".
+#   "auto" : envoyé au serveur public du fournisseur, jamais quand base_url est écrite (serveur
+#            local ou compatible) ; refusé par le serveur (HTTP 400 qui cite format ou schema),
+#            la requête repart sans lui, et la suite de la commande s'en passe.
+#   "on"   : toujours envoyé, même avec base_url (Ollama et vLLM l'acceptent) ; un refus arrête
+#            l'envoi, comme toute requête refusée.
+#   "off"  : jamais envoyé ; seule la consigne du prompt décrit la réponse.
+# Envoyé à « anthropic » dans "output_config" et à « openai » dans "response_format". Sans
+# effet avec « mock ». Le changer ne réenrichit rien. Sans effet sur query ask, qui a sa clé
+# dans la section [ask]. Lue ici seulement :
+# .nephila.toml la refuse.
+# structured_output = "auto"
+
 # Taille maximale, en caractères, d'un morceau de fichier envoyé au LLM. Entier > 0.
 # Défaut : 60000. Un lot de fichiers (voir batch_files) ne dépasse jamais cette taille.
 # Un dépôt peut le remplacer par son .nephila.toml.
@@ -276,6 +291,12 @@ api_key_env = "ANTHROPIC_API_KEY"
 # limite de jetons » : posez une question plus ciblée, ou augmentez-la.
 # Priorité : [ask] de .nephila.toml > ce fichier > max_output_tokens du premier niveau > défaut.
 # max_output_tokens = 4096
+
+# Schéma JSON imposé à la réponse de query ask. Texte : "auto", "on" ou "off", mêmes effets
+# qu'au premier niveau. Absente : "off", même si structured_output est écrite au premier
+# niveau : à activer ici pour query ask. Lue ici seulement :
+# .nephila.toml la refuse.
+# structured_output = "off"
 
 # Nombre maximal de caractères du contexte envoyé au LLM (nœuds et liens trouvés pour la
 # question), en-têtes compris. Entier, au moins 1000 ; absente : 12000. Plus grand, la réponse

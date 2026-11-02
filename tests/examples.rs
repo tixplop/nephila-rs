@@ -218,7 +218,7 @@ fn REQ041_AC4_valeurs_par_defaut_documentees_egales_aux_valeurs_reelles() {
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| key_of(l))
         .collect();
-    assert_eq!(active.len(), 12, "options communes réactivées : {active:?}");
+    assert_eq!(active.len(), 13, "options communes réactivées : {active:?}");
 }
 
 #[test]
@@ -1350,7 +1350,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 46_000, "README : {size} octets");
+    assert!(size <= 47_000, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1891,7 +1891,12 @@ fn REQ155_AC3g_memoire_en_mio() {
 fn REQ164_AC1_section_ask_de_la_configuration_personnelle() {
     let text = example("config.toml");
     let written = ask_keys_written(&text);
-    let accepted: BTreeSet<String> = ASK_SETTINGS.iter().map(|k| k.to_string()).collect();
+    // `structured_output` : clé de la configuration personnelle seulement (REQ-204).
+    let accepted: BTreeSet<String> = ASK_SETTINGS
+        .iter()
+        .chain(["structured_output"].iter())
+        .map(|k| k.to_string())
+        .collect();
     assert_eq!(written, accepted);
     // Chaque clé a sa ligne désactivée, et la ligne `# [ask]` est la dernière de ce niveau.
     assert_eq!(text.lines().filter(|l| *l == ASK_HEADER).count(), 1);
@@ -1906,6 +1911,7 @@ fn REQ164_AC1_section_ask_de_la_configuration_personnelle() {
             thinking: Some(true),
             effort: Some(nephila::config::Effort::Medium),
             max_output_tokens: Some(4096),
+            structured_output: Some(nephila::config::StructuredOutput::Off),
             max_context_chars: Some(30000),
             max_seeds: Some(30),
             max_nodes: Some(120),
@@ -1955,7 +1961,7 @@ fn REQ165_AC16_readme_traces_sentence() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 46_000, "README : {size} octets");
+    assert!(size <= 47_000, "README : {size} octets");
 }
 
 #[test]
@@ -2009,7 +2015,7 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 46_000, "README : {size} octets");
+    assert!(size <= 47_000, "README : {size} octets");
 }
 
 // ---- REQ-174 : `summary_language` dans les exemples et le README ----
@@ -2170,7 +2176,7 @@ fn REQ174_AC5_AC10_readme_lignes_et_phrases_de_summary_language() {
         assert!(!readme.contains(old), "présent : {old}");
     }
     assert_eq!(readme.matches("config: llm=").count(), 1);
-    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
 }
 
 /// AC-185-2 : textes de V-012 pour `--dry-run`, ligne de table après `--enrich-code`.
@@ -2188,7 +2194,7 @@ fn req185_ac2_readme_dry_run() {
     let table = section.lines().filter(|l| l.starts_with("| `-")).count();
     assert_eq!(table, 12, "{section}");
     assert!(readme.find("Un seul `build` ou `update`").unwrap() < readme.find(para).unwrap());
-    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
 }
 
 // ---- REQ-188 : `max_calls` dans l'exemple et le README ----
@@ -2218,7 +2224,7 @@ fn REQ188_AC2_AC5_section_max_calls_de_l_exemple() {
 #[test]
 fn REQ188_AC3_AC6_textes_du_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
     let has_after = |first: &str, second: &str| {
         let a = readme
             .find(first)
@@ -2249,7 +2255,7 @@ fn REQ188_AC3_AC6_textes_du_readme() {
 #[test]
 fn REQ192_AC3_ctrl_c_dans_le_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
     let codes = readme_section(&readme, "## Codes de sortie");
     let rows = table_rows(&codes, "| Code | Signification |", "|---|---|");
     assert_eq!(rows.len(), 4, "{rows:?}");
@@ -2352,7 +2358,7 @@ fn REQ197_AC2_AC5_blocs_de_model_dans_l_exemple_du_depot() {
 #[test]
 fn REQ197_AC3_AC6_readme_model_override() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
     let table = readme_section(&readme, "## Configuration du LLM");
     let lines: Vec<&str> = table.lines().collect();
     let lang = lines
@@ -2394,7 +2400,7 @@ fn REQ197_AC3_AC6_readme_model_override() {
 #[test]
 fn REQ199_AC10_readme_fichier_absent_d_une_reponse_de_lot() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
     let section = readme_section(&readme, "### Échecs et nouveaux essais");
     let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
     let tronquee = bullets
@@ -2422,5 +2428,76 @@ fn req200_ac9_readme_non_conforming_reply_bullet() {
         bullets,
         ["- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2) ; encore non conforme, un lot de 4 fichiers ou plus est découpé une fois en deux, chaque moitié avec ses propres essais ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`."]
     );
-    assert!(readme.len() <= 46_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+}
+
+const STRUCTURED_BLOCK: &str = "# Schéma JSON envoyé avec chaque appel d'enrichissement : le serveur l'impose à la réponse, ce
+# qui évite des réponses non conformes et leurs nouveaux essais. Texte : \"auto\", \"on\" ou \"off\" ;
+# défaut : \"auto\".
+#   \"auto\" : envoyé au serveur public du fournisseur, jamais quand base_url est écrite (serveur
+#            local ou compatible) ; refusé par le serveur (HTTP 400 qui cite format ou schema),
+#            la requête repart sans lui, et la suite de la commande s'en passe.
+#   \"on\"   : toujours envoyé, même avec base_url (Ollama et vLLM l'acceptent) ; un refus arrête
+#            l'envoi, comme toute requête refusée.
+#   \"off\"  : jamais envoyé ; seule la consigne du prompt décrit la réponse.
+# Envoyé à « anthropic » dans \"output_config\" et à « openai » dans \"response_format\". Sans
+# effet avec « mock ». Le changer ne réenrichit rien. Sans effet sur query ask, qui a sa clé
+# dans la section [ask]. Lue ici seulement :
+# .nephila.toml la refuse.
+# structured_output = \"auto\"";
+
+const STRUCTURED_ASK_BLOCK: &str = "# Schéma JSON imposé à la réponse de query ask. Texte : \"auto\", \"on\" ou \"off\", mêmes effets
+# qu'au premier niveau. Absente : \"off\", même si structured_output est écrite au premier
+# niveau : à activer ici pour query ask. Lue ici seulement :
+# .nephila.toml la refuse.
+# structured_output = \"off\"";
+
+/// AC-205-1, AC-205-3 : blocs exacts de `structured_output` dans l'exemple personnel.
+#[test]
+fn req205_ac1_ac3_blocs_structured_output_de_l_exemple_personnel() {
+    let config = example("config.toml");
+    assert_eq!(STRUCTURED_BLOCK.lines().count(), 14);
+    assert_eq!(STRUCTURED_ASK_BLOCK.lines().count(), 5);
+    assert_eq!(config.matches(STRUCTURED_BLOCK).count(), 1);
+    assert_eq!(config.matches(STRUCTURED_ASK_BLOCK).count(), 1);
+    assert!(config.contains(&format!(
+        "# max_output_tokens = 16384\n\n{STRUCTURED_BLOCK}\n\n# Taille maximale, en caractères, d'un morceau"
+    )));
+    assert!(config.contains(&format!(
+        "# max_output_tokens = 4096\n\n{STRUCTURED_ASK_BLOCK}\n\n# Nombre maximal de caractères du contexte"
+    )));
+    assert_eq!(
+        config
+            .lines()
+            .filter(|l| l.starts_with("# structured_output ="))
+            .count(),
+        2
+    );
+    for l in STRUCTURED_BLOCK.lines().chain(STRUCTURED_ASK_BLOCK.lines()) {
+        assert!(l.chars().count() <= 100, "{l}");
+    }
+    // AC-041-2 : clés de l'exemple = clés du chargeur, au premier niveau et dans [ask].
+    assert!(keys_written(&config).contains("structured_output"));
+    assert!(ask_keys_written(&config).contains("structured_output"));
+    // AC-041-4 : réactivée avec les autres options communes, la ligne ne change rien.
+    let common = section(&config, COMMON);
+    assert!(common.iter().any(|l| l == "# structured_output = \"auto\""));
+    let enabled = config
+        .replace("\n# [ask]\n", "\n[ask]\n")
+        .replace(
+            "# structured_output = \"auto\"",
+            "structured_output = \"auto\"",
+        )
+        .replace(
+            "# structured_output = \"off\"",
+            "structured_output = \"off\"",
+        );
+    let c = parse(&enabled);
+    assert_eq!(c.structured_output, nephila::config::StructuredOutput::Auto);
+    assert_eq!(
+        c.ask.structured_output,
+        Some(nephila::config::StructuredOutput::Off)
+    );
+    // Le fichier du dépôt ne la contient pas.
+    assert!(!example("nephila.toml").contains("structured_output"));
 }

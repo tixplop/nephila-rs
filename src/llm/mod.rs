@@ -16,7 +16,7 @@ pub use usage::{
 
 use std::sync::atomic::AtomicBool;
 
-use crate::config::{Config, Effort, Provider};
+use crate::config::{Config, Effort, Provider, StructuredOutput};
 use crate::error::{Error, Result};
 pub use ask::AskReply;
 use ask::{ask_system_prompt, ask_user_prompt};
@@ -34,6 +34,26 @@ pub struct Generation {
     pub effort_explicit: bool,
     pub thinking: bool,
     pub max_output_tokens: u32,
+}
+
+/// Valeur effective de `structured_output` (REQ-202, DEC-163) : `On` et `Auto` envoient le
+/// schéma, `Off` jamais ; `Auto` rend `Off` quand `base_url` est écrite.
+// Passée aux adaptateurs par T-295.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Structured {
+    Off,
+    On,
+    Auto,
+}
+
+#[allow(dead_code)]
+pub(crate) fn structured(config: &Config) -> Structured {
+    match (config.structured_output, config.base_url.is_some()) {
+        (StructuredOutput::On, _) => Structured::On,
+        (StructuredOutput::Off, _) | (StructuredOutput::Auto, true) => Structured::Off,
+        (StructuredOutput::Auto, false) => Structured::Auto,
+    }
 }
 
 /// Fournisseur LLM. Les implémentations sont partagées entre threads.
@@ -373,6 +393,41 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                 .with_retry(retry)
                 .with_summary_language(config.summary_language.clone()),
             ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod structured_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn config(structured: &str, base_url: bool, provider: &str) -> Config {
+        let url = if base_url {
+            "base_url = \"http://x\"\n"
+        } else {
+            ""
+        };
+        Config::parse(
+            &format!(
+                "provider = \"{provider}\"\nmodel = \"m\"\napi_key_env = \"K\"\n{url}\
+                 structured_output = \"{structured}\"\n"
+            ),
+            Path::new("/x/config.toml"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn req202_ac2_valeur_effective() {
+        for provider in ["openai", "anthropic", "mock"] {
+            let eff = |s: &str, url: bool| structured(&config(s, url, provider));
+            assert_eq!(eff("auto", false), Structured::Auto, "{provider}");
+            assert_eq!(eff("auto", true), Structured::Off, "{provider}");
+            assert_eq!(eff("on", false), Structured::On, "{provider}");
+            assert_eq!(eff("on", true), Structured::On, "{provider}");
+            assert_eq!(eff("off", false), Structured::Off, "{provider}");
+            assert_eq!(eff("off", true), Structured::Off, "{provider}");
         }
     }
 }

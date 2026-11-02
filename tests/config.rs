@@ -626,3 +626,44 @@ fn req038_ac16_invalid_format_retries_single_line_on_build_and_ask() {
         }
     }
 }
+
+/// AC-202-1, AC-204-1 : `structured_output` écrite dans `.nephila.toml`, au premier niveau puis
+/// dans `[ask]`, donne l'erreur de clé inconnue (E-2), listes de clés inchangées, avant tout
+/// parcours.
+#[test]
+fn req202_ac1_req204_ac1_structured_output_refusee_dans_le_fichier_de_projet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("a.md"), "# a\n").unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(&config, "provider = \"mock\"\n").unwrap();
+    let cases = [
+        (
+            "structured_output = \"on\"\n",
+            "clé inconnue `structured_output` (clés permises : exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)",
+        ),
+        (
+            "[ask]\nstructured_output = \"on\"\n",
+            "clé inconnue `ask.structured_output` (clés permises dans [ask] : model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes)",
+        ),
+    ];
+    for (project, tail) in cases {
+        std::fs::write(repo.join(".nephila.toml"), project).unwrap();
+        let o = assert_cmd::Command::cargo_bin("nephila")
+            .unwrap()
+            .env("NEPHILA_CONFIG", &config)
+            .arg("-C")
+            .arg(&repo)
+            .arg("build")
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(1), "{project}");
+        assert_eq!(
+            String::from_utf8_lossy(&o.stderr),
+            format!("erreur: {}/.nephila.toml : {tail}\n", repo.display()),
+            "{project}"
+        );
+        assert!(!repo.join(".nephila").exists(), "{project}");
+    }
+}
