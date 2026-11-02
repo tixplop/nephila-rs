@@ -409,22 +409,26 @@ pub fn schema_refused(
     fallback: &AtomicBool,
     key: &str,
 ) -> bool {
-    let Error::Rejected {
-        code: 400,
-        detail: Some(d),
-        ..
-    } = e
-    else {
-        return false;
+    let d = match e {
+        Error::Rejected {
+            code: 400,
+            detail: Some(d),
+            ..
+        }
+        | Error::BatchItem {
+            refused: Some(d), ..
+        } => d,
+        _ => return false,
     };
     let d = d.to_ascii_lowercase();
     if structured != super::Structured::Auto || !(d.contains("format") || d.contains("schema")) {
         return false;
     }
     if !fallback.swap(true, Ordering::SeqCst) {
-        crate::trace!(
+        // Écrite même pendant une passe de collecte (traces tues), sinon le repli se perdrait.
+        crate::trace::emit_unmuted(format_args!(
             "sortie structurée: schéma JSON refusé par {provider} (HTTP 400), suite de la commande sans schéma ({key} = \"auto\")"
-        );
+        ));
     }
     true
 }

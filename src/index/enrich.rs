@@ -453,8 +453,9 @@ fn run_unit<'a>(
                         None,
                     )
                 }
-                // Essai refusé par le plafond : aucune issue pour les fichiers du lot.
-                Err(Error::Capped) => Step::Finished(outcomes, None),
+                // Essai refusé par le plafond, ou requête mise de côté par le collecteur du mode
+                // lot : aucune issue pour les fichiers du lot.
+                Err(Error::Capped | Error::Deferred) => Step::Finished(outcomes, None),
                 Err(e) => {
                     let per_file = truncation_advice(e.clone());
                     for (f, _) in &readable {
@@ -511,7 +512,10 @@ fn trace_detail(e: &Error) -> String {
         Error::Truncated(_) => TRUNCATED.to_string(),
         Error::Rejected { trace, .. } | Error::Redirected { trace, .. } => trace.clone(),
         // Un essai refusé par le plafond part avant toute trace d'appel : jamais détaillé ici.
+        // Texte fixe : la cause du fournisseur ne va pas dans la trace (design.md, A-17).
+        Error::BatchItem { .. } => "requête du lot du fournisseur en échec".to_string(),
         Error::Capped => unreachable!("un essai refusé par le plafond n'a pas de détail de trace"),
+        Error::Deferred => unreachable!("une requête mise de côté n'a pas de détail de trace"),
         other => other.to_string(),
     }
 }
@@ -587,6 +591,8 @@ fn traced_enrich(
             x.summaries.len(),
             x.concepts.len()
         ),
+        // Essai refusé par le plafond ou requête mise de côté (mode lot) : ni appel ni fin à tracer.
+        Err(Error::Capped | Error::Deferred) => {}
         Err(e) => trace!(
             "llm enrich fin {path} [{index}/{total}] {} {ms} ms : {}{tokens}",
             trace::classify(e),
@@ -666,6 +672,8 @@ fn traced_lot_once(
                 });
             trace!("llm enrich fin {label} [1/1] ok ({r} résumés, {k} concepts) {ms} ms{tokens}")
         }
+        // Essai refusé par le plafond ou requête mise de côté (mode lot) : ni appel ni fin à tracer.
+        Err(Error::Capped | Error::Deferred) => {}
         Err(e) => trace!(
             "llm enrich fin {label} [1/1] {} {ms} ms : {}{tokens}",
             trace::classify(e),
@@ -1437,6 +1445,13 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     totals,
                     &take,
                 );
+                // Requête mise de côté (mode lot) : aucune issue, mais le fichier n'est pas en
+                // échec, pour que les autres appels d'un gros fichier soient relevés (AC-214-4).
+                if matches!(result, Err(Error::Deferred)) {
+                    expand.armed = false;
+                    finish_unit(shared, wake, Vec::new(), false);
+                    continue;
+                }
                 // Nouvel essai refusé par le plafond : ni issue, ni échec, ni compte ; les appels
                 // non partis du fichier sont sautés.
                 if matches!(result, Err(Error::Capped)) {
@@ -2903,6 +2918,88 @@ mod tests {
     }
 
     #[test]
+    fn req214_trace_detail_batch_item_ne_recopie_pas_le_fournisseur() {
+        let e = Error::BatchItem {
+            cause: "api_error : secret du fournisseur".into(),
+            refused: None,
+        };
+        assert_eq!(trace_detail(&e), "requête du lot du fournisseur en échec");
+    }
+
+    struct Failing(fn() -> Error);
+    impl Llm for Failing {
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            Err((self.0)())
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err((self.0)())
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err((self.0)())
+        }
+    }
+
+    #[test]
+    fn req214_verbose_capped_et_deferred_ne_paniquent_pas_et_ne_tracent_pas_de_fin() {
+        let _t = crate::interrupt::test_lock();
+        let stop = AtomicBool::new(false);
+        let totals = Mutex::new(LlmTotals::default());
+        let attempt = Attempt {
+            current: 1,
+            total: 1,
+        };
+        let items = [LotItem {
+            file: "a.md".into(),
+            text: "t".into(),
+            node_ids: vec![],
+        }];
+        for make in [(|| Error::Capped) as fn() -> Error, || Error::Deferred] {
+            let llm = Failing(make);
+            let (results, events) = crate::trace::capture_all(true, || {
+                (
+                    traced_enrich(
+                        &llm,
+                        "a.md",
+                        1,
+                        1,
+                        None,
+                        "t",
+                        &[],
+                        &[],
+                        attempt,
+                        None,
+                        &stop,
+                        &totals,
+                    ),
+                    traced_lot_once(&llm, &items, attempt, None, &stop, &totals),
+                )
+            });
+            assert_eq!(results.0.unwrap_err(), make());
+            assert_eq!(results.1.unwrap_err(), make());
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert!(events.iter().all(|e| e.starts_with("llm enrich départ")));
+        }
+        // Une requête du lot en échec garde sa ligne de fin, au texte fixe.
+        let llm = Failing(|| Error::BatchItem {
+            cause: "api_error : secret".into(),
+            refused: None,
+        });
+        let (_, events) = crate::trace::capture_all(true, || {
+            traced_lot_once(&llm, &items, attempt, None, &stop, &totals)
+        });
+        let fin = events.last().unwrap();
+        assert!(fin.contains("erreur") && fin.contains("requête du lot du fournisseur en échec"));
+        assert!(!fin.contains("secret"), "{fin}");
+    }
+
+    #[test]
     fn req038_ac7_final_format_result_does_not_touch_network_count() {
         let mut p = Policy::default();
         for _ in 0..2 {
@@ -3825,6 +3922,40 @@ mod tests {
         assert_eq!(*llm.0.lock().unwrap(), [1, 2]);
         assert_eq!(failures.len(), 1);
         assert_eq!(report.failed, 1);
+    }
+
+    #[test]
+    fn req214_ac4_requete_mise_de_cote_ne_fait_pas_sauter_les_appels_du_fichier() {
+        struct DeferSecond(Mutex<Vec<usize>>);
+        impl Llm for DeferSecond {
+            fn enrich(
+                &self,
+                _: &str,
+                call: usize,
+                _: &str,
+                _: &[String],
+                _: &[String],
+            ) -> Result<Enrichment> {
+                self.0.lock().unwrap().push(call);
+                if call == 2 {
+                    return Err(Error::Deferred);
+                }
+                Ok(Enrichment::default())
+            }
+            fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+                Err(Error::Message("inutilisé".into()))
+            }
+            fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+                Err(Error::Message("inutilisé".into()))
+            }
+        }
+        let (dir, files) = probe_repo(&[("Big.txt", 4)], 0);
+        let llm = DeferSecond(Mutex::new(Vec::new()));
+        let (_, report, failures) = probe_run(&dir, &files, &llm, 1, 1);
+        assert_eq!(*llm.0.lock().unwrap(), [1, 2, 3, 4]);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert!(report.stop_cause.is_none());
     }
 
     // ---- Arrêt demandé par Ctrl-C (REQ-189 à REQ-191) ----

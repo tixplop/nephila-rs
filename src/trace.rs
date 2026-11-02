@@ -11,6 +11,21 @@ use std::time::{Duration, Instant};
 pub const MAX_MESSAGE_CHARS: usize = 120;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static MUTED: AtomicBool = AtomicBool::new(false);
+// Sous test, le mute est propre au fil (comme `CAPTURED`, DEC-109, DEC-112) : un test qui tait
+// les traces ne gêne pas ses voisins quand ils partagent le processus.
+#[cfg(test)]
+thread_local! {
+    static MUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn is_muted() -> bool {
+    #[cfg(not(test))]
+    return MUTED.load(Ordering::Relaxed);
+    #[cfg(test)]
+    return MUTED.with(|m| m.get());
+}
 static START: OnceLock<Instant> = OnceLock::new();
 
 /// Active ou non les traces ; la première activation fixe l'instant de départ.
@@ -22,7 +37,16 @@ pub fn init(enabled: bool) {
 }
 
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    ENABLED.load(Ordering::Relaxed) && !is_muted()
+}
+
+/// Fait taire les traces (passes de collecte du mode lot, AC-214-5) : tant que c'est posé,
+/// `emit` n'écrit rien et `enabled()` est faux. Seule `emit_unmuted` passe encore.
+pub fn mute(muted: bool) {
+    #[cfg(not(test))]
+    MUTED.store(muted, Ordering::Relaxed);
+    #[cfg(test)]
+    MUTED.with(|m| m.set(muted));
 }
 
 /// Ligne complète (sans fin de ligne) pour un temps écoulé donné.
@@ -34,13 +58,22 @@ pub fn format_line(elapsed: Duration, event: &str) -> String {
     )
 }
 
-/// Écrit une trace si elles sont actives.
+/// Écrit une trace si elles sont actives et non tues.
 pub fn emit(args: fmt::Arguments) {
+    if is_muted() {
+        return;
+    }
+    emit_unmuted(args);
+}
+
+/// Comme `emit`, même quand les traces sont tues : pour la seule trace de `schema_refused`, que
+/// le repli écrirait sinon pendant une passe de collecte pour rien (AC-214-5).
+pub fn emit_unmuted(args: fmt::Arguments) {
     #[cfg(test)]
     if capture_event(&args) {
         return;
     }
-    if !enabled() {
+    if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
     let start = *START.get_or_init(Instant::now);
@@ -68,7 +101,7 @@ fn capture_event(args: &fmt::Arguments) -> bool {
         None => false,
     });
     local
-        || (enabled()
+        || (ENABLED.load(Ordering::Relaxed)
             && match CAPTURED_ALL
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -153,9 +186,12 @@ pub fn classify(e: &crate::error::Error) -> String {
         Error::Message(_)
         | Error::Format(_)
         | Error::TooManyCalls { .. }
-        | Error::CallsOverCap { .. } => "erreur",
+        | Error::CallsOverCap { .. }
+        | Error::BatchItem { .. } => "erreur",
         // Un essai refusé par le plafond part avant toute trace d'appel : il n'arrive jamais ici.
         Error::Capped => unreachable!("un essai refusé par le plafond n'est jamais classé"),
+        // Une requête mise de côté part avant toute trace d'appel : elle n'arrive jamais ici.
+        Error::Deferred => unreachable!("une requête mise de côté n'est jamais classée"),
         // Erreur de fin de commande : jamais le résultat d'un appel.
         Error::Interrupted(_) => unreachable!("une fin de commande n'est jamais classée"),
     };
@@ -194,6 +230,34 @@ mod tests {
         assert_eq!(ev, vec!["a 1", "b"]);
         let ((), none) = capture(|| {});
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn req214_mute_tait_emit_mais_pas_emit_unmuted() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                mute(false);
+            }
+        }
+        let _reset = Reset;
+        let ((), ev) = capture(|| {
+            mute(true);
+            crate::trace!("tue");
+            emit_unmuted(format_args!("dit {}", 1));
+            mute(false);
+            crate::trace!("dite");
+        });
+        assert_eq!(ev, vec!["dit 1", "dite"]);
+    }
+
+    #[test]
+    fn req214_classify_batch_item_est_une_erreur() {
+        let e = crate::error::Error::BatchItem {
+            cause: "expirée".into(),
+            refused: None,
+        };
+        assert_eq!(classify(&e), "erreur");
     }
 
     #[test]

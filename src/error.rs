@@ -44,6 +44,16 @@ pub enum Error {
     /// Essai refusé faute de compte par le plafond d'appels de la commande (REQ-186) : erreur
     /// interne, sans issue pour le fichier ; jamais affichée ni écrite dans un avertissement.
     Capped,
+    /// Requête mise de côté par le collecteur du mode lot (DEC-168) : erreur interne, sans issue
+    /// pour le fichier ; jamais affichée ni écrite dans un avertissement.
+    Deferred,
+    /// Requête du lot du fournisseur en échec (A-17) : `cause` est le texte de l'avertissement,
+    /// `refused` le message d'un refus HTTP 400 ou `invalid_request_error`, lu par le repli de
+    /// `structured_output`.
+    BatchItem {
+        cause: String,
+        refused: Option<String>,
+    },
     /// Fin d'une commande dont l'envoi a été arrêté par Ctrl-C (E-27) ; s'affiche comme `Message`,
     /// code de sortie 130.
     Interrupted(String),
@@ -100,6 +110,12 @@ impl fmt::Display for Error {
             ),
             // Jamais affichée : le refus n'a pas d'issue (voir `Error::Capped`).
             Error::Capped => f.write_str("plafond d'appels atteint"),
+            // Jamais affichée : la requête est mise de côté (voir `Error::Deferred`).
+            Error::Deferred => f.write_str("requête mise de côté"),
+            Error::BatchItem { cause, .. } => write!(
+                f,
+                "requête du lot du fournisseur en échec ({cause}) ; relancez nephila update --batch"
+            ),
         }
     }
 }
@@ -127,5 +143,18 @@ mod tests {
         assert_eq!(e.exit_code(), 130);
         assert_eq!(Error::Message("x".into()).exit_code(), EXIT_ERROR);
         assert_eq!(Error::Capped.exit_code(), 1);
+    }
+
+    #[test]
+    fn req214_batch_item_display() {
+        let e = Error::BatchItem {
+            cause: "expirée".into(),
+            refused: None,
+        };
+        assert_eq!(
+            e.to_string(),
+            "requête du lot du fournisseur en échec (expirée) ; relancez nephila update --batch"
+        );
+        assert_eq!(e.exit_code(), 1);
     }
 }

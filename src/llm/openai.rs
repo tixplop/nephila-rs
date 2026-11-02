@@ -1,10 +1,12 @@
 //! Adaptateur compatible OpenAI Chat Completions (REQ-002) : OpenAI, Ollama, llama.cpp, vLLM.
 
+use super::batch::Collector;
 use super::schema::Reply;
 use super::{http, openai_usage, CallStats, Complete, Generation, Retry, Structured, Tls};
 use crate::config::Effort;
 use crate::error::{Error, Result, TRUNCATED};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
@@ -49,6 +51,7 @@ pub struct OpenAiLlm {
     structured_key: &'static str,
     fallback: AtomicBool,
     summary_language: String,
+    collector: Option<Arc<Collector>>,
 }
 
 impl OpenAiLlm {
@@ -73,6 +76,7 @@ impl OpenAiLlm {
             structured_key: "structured_output",
             fallback: AtomicBool::new(false),
             summary_language: crate::config::DEFAULT_SUMMARY_LANGUAGE.to_string(),
+            collector: None,
         }
     }
 
@@ -91,6 +95,12 @@ impl OpenAiLlm {
     /// Langue des résumés demandée dans les prompts système (REQ-172).
     pub fn with_summary_language(mut self, language: String) -> OpenAiLlm {
         self.summary_language = language;
+        self
+    }
+
+    /// Collecteur du mode lot : les réponses viennent de lui au lieu du réseau (DEC-168).
+    pub fn with_collector(mut self, collector: Arc<Collector>) -> OpenAiLlm {
+        self.collector = Some(collector);
         self
     }
 
@@ -129,6 +139,9 @@ impl Complete for OpenAiLlm {
             let schema = with_schema.then(|| reply.schema());
             let format = schema.as_ref().map(|s| (reply.name(), s));
             let body = request_body(&self.model, &self.gen, &system, &user, format);
+            if let Some(collector) = &self.collector {
+                return collector.exchange(&body, stats);
+            }
             http::send(
                 "openai",
                 self.request("POST", "/v1/chat/completions"),
@@ -531,5 +544,100 @@ mod tests {
                 [format!("sortie structurée: schéma JSON refusé par openai (HTTP 400), suite de la commande sans schéma ({key} = \"auto\")")]
             );
         }
+    }
+
+    fn batch_llm(c: &std::sync::Arc<crate::llm::batch::Collector>) -> OpenAiLlm {
+        llm_structured(
+            "http://127.0.0.1:1".into(),
+            Structured::Auto,
+            "structured_output",
+        )
+        .with_collector(c.clone())
+    }
+
+    #[test]
+    fn req214_ac5_refus_du_schema_en_lot_replie_et_met_de_cote_sans_schema() {
+        use crate::llm::batch::{body_id, Answer, Collector};
+        let c = std::sync::Arc::new(Collector::new());
+        let l = batch_llm(&c);
+        let with: serde_json::Value = serde_json::from_str(&expected_body(true)).unwrap();
+        let without: serde_json::Value = serde_json::from_str(&expected_body(false)).unwrap();
+        c.add_answer(
+            body_id(&with),
+            Answer::Failed {
+                cause: "invalid_request_error : response_format is not supported".into(),
+                refused: Some("response_format is not supported".into()),
+            },
+        );
+        // Un test muet les traces : celle du repli doit tout de même sortir.
+        struct Unmute;
+        impl Drop for Unmute {
+            fn drop(&mut self) {
+                crate::trace::mute(false);
+            }
+        }
+        let _unmute = Unmute;
+        crate::trace::mute(true);
+        let (r, events) = crate::trace::capture(|| call(&l, &CallStats::default()));
+        crate::trace::mute(false);
+        assert_eq!(r, Err(Error::Deferred));
+        let pend = c.take_pending();
+        assert_eq!(pend.len(), 1);
+        assert_eq!(pend[0].body, without);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events[0].starts_with("sortie structurée: schéma JSON refusé par openai"));
+        // Sa réponse connue est rendue.
+        c.add_answer(pend[0].id.clone(), Answer::Raw(OK_OPENAI.into()));
+        let stats = CallStats::default();
+        assert_eq!(call(&l, &stats).unwrap(), "x");
+        assert!(stats.responded());
+        // Le repli reste posé : les appels suivants partent sans schéma, sans nouvelle trace.
+        let (r, events) = crate::trace::capture(|| call(&l, &CallStats::default()));
+        assert_eq!(r.unwrap(), "x");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn req214_ac5_refus_sans_mention_de_schema_donne_batch_item() {
+        use crate::llm::batch::{body_id, Answer, Collector};
+        let c = std::sync::Arc::new(Collector::new());
+        let l = batch_llm(&c);
+        let with: serde_json::Value = serde_json::from_str(&expected_body(true)).unwrap();
+        c.add_answer(
+            body_id(&with),
+            Answer::Failed {
+                cause: "invalid_request_error : model unknown".into(),
+                refused: Some("model unknown".into()),
+            },
+        );
+        let e = call(&l, &CallStats::default()).unwrap_err();
+        assert_eq!(
+            e,
+            Error::BatchItem {
+                cause: "invalid_request_error : model unknown".into(),
+                refused: Some("model unknown".into())
+            }
+        );
+        assert!(c.take_pending().is_empty());
+        // Sous `On`, même un refus qui cite le schéma ne replie pas.
+        let c = std::sync::Arc::new(Collector::new());
+        let l = llm_structured(
+            "http://127.0.0.1:1".into(),
+            Structured::On,
+            "structured_output",
+        )
+        .with_collector(c.clone());
+        c.add_answer(
+            body_id(&with),
+            Answer::Failed {
+                cause: "x".into(),
+                refused: Some("bad schema".into()),
+            },
+        );
+        assert!(matches!(
+            call(&l, &CallStats::default()),
+            Err(Error::BatchItem { .. })
+        ));
+        assert!(c.take_pending().is_empty());
     }
 }

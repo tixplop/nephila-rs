@@ -2,6 +2,7 @@
 
 pub mod anthropic;
 pub mod ask;
+pub mod batch;
 pub mod enrich;
 mod http;
 pub use http::{Retry, Tls};
