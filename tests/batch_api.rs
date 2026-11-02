@@ -1,4 +1,4 @@
-//! Protocole du lot du fournisseur `anthropic` : création, état, résultats (REQ-212, REQ-214),
+//! Protocole du lot des fournisseurs `anthropic` et `openai` : création, état, résultats (REQ-212, REQ-214),
 //! par l'API publique de la bibliothèque et contre le faux serveur à routes.
 
 #[allow(dead_code)]
@@ -14,6 +14,7 @@ use nephila::config::Effort;
 use nephila::error::Error;
 use nephila::llm::anthropic::AnthropicLlm;
 use nephila::llm::batch::{Answer, BatchApi, Collector, CreateError, Pending};
+use nephila::llm::openai::OpenAiLlm;
 use nephila::llm::{Generation, Llm, Retry, Tls};
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
@@ -463,6 +464,418 @@ fn req214_batch_link_needs_a_collector_and_address_is_effective() {
         None,
         "m".into(),
         "k".into(),
+        10,
+        &Tls::default(),
+        1,
+        Generation {
+            effort: Effort::ModelDefault,
+            effort_explicit: false,
+            thinking: false,
+            max_output_tokens: 100,
+        },
+    );
+    assert!(without.batch().is_none());
+}
+
+// --- Fournisseur openai (REQ-213) ---
+
+fn oai_with(server: &BatchServer, key: Option<&str>) -> OpenAiLlm {
+    OpenAiLlm::new(
+        Some(format!("{}/", server.base_url)),
+        "m".into(),
+        key.map(String::from),
+        10,
+        &Tls::default(),
+        1,
+        Generation {
+            effort: Effort::ModelDefault,
+            effort_explicit: false,
+            thinking: false,
+            max_output_tokens: 100,
+        },
+    )
+    .with_retry(Retry::from_millis(1))
+    .with_collector(Arc::new(Collector::new()))
+}
+
+fn oai(server: &BatchServer) -> OpenAiLlm {
+    oai_with(server, Some("sk-test"))
+}
+
+fn oai_counts(total: u64, completed: u64, failed: u64) -> Value {
+    json!({"total": total, "completed": completed, "failed": failed})
+}
+
+fn oai_status(
+    llm: &OpenAiLlm,
+    server: &BatchServer,
+    body: Value,
+) -> nephila::llm::batch::LotStatus {
+    server.route("GET", "/v1/batches/b1", vec![ok(body)]);
+    llm.status("b1", &AtomicBool::new(false)).unwrap()
+}
+
+#[test]
+fn req213_create_uploads_multipart_then_creates_the_batch() {
+    let server = BatchServer::start();
+    server.route("POST", "/v1/files", vec![ok(json!({"id": "file-in1"}))]);
+    server.route("POST", "/v1/batches", vec![ok(json!({"id": "batch_9"}))]);
+    let llm = oai(&server);
+    let (p1, p2) = (pending(1), pending(2));
+    let (id, bytes) = llm
+        .create(&[p1.clone(), p2.clone()], &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(id, "batch_9");
+    let line = |p: &Pending| {
+        format!(
+            "{}\n",
+            json!({"custom_id": p.id, "method": "POST", "url": "/v1/chat/completions", "body": p.body})
+        )
+    };
+    let jsonl = format!("{}{}", line(&p1), line(&p2));
+    assert_eq!(bytes, jsonl.len());
+
+    let up = &server.hits("POST", "/v1/files")[0];
+    let ct = &up.headers["content-type"];
+    let boundary = ct.strip_prefix("multipart/form-data; boundary=").unwrap();
+    assert!(!jsonl.contains(boundary));
+    let want = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n\
+         --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"batch.jsonl\"\r\n\
+         Content-Type: application/jsonl\r\n\r\n{jsonl}\r\n--{b}--\r\n",
+        b = boundary
+    );
+    assert_eq!(up.body, want);
+    assert_eq!(up.headers["authorization"], "Bearer sk-test");
+
+    let hit = &server.hits("POST", "/v1/batches")[0];
+    assert_eq!(hit.headers["content-type"], "application/json");
+    assert_eq!(
+        serde_json::from_str::<Value>(&hit.body).unwrap(),
+        json!({"input_file_id": "file-in1", "endpoint": "/v1/chat/completions",
+               "completion_window": "24h"})
+    );
+}
+
+#[test]
+fn req213_no_key_sends_no_authorization_header() {
+    let server = BatchServer::start();
+    server.route("POST", "/v1/files", vec![ok(json!({"id": "file-in1"}))]);
+    server.route("POST", "/v1/batches", vec![ok(json!({"id": "b1"}))]);
+    server.route(
+        "GET",
+        "/v1/batches/b1",
+        vec![ok(
+            json!({"status": "in_progress", "request_counts": oai_counts(1, 0, 0)}),
+        )],
+    );
+    let llm = oai_with(&server, None);
+    let stop = AtomicBool::new(false);
+    llm.create(&[pending(1)], &stop).unwrap();
+    llm.status("b1", &stop).unwrap();
+    let all = server.requests();
+    assert_eq!(all.len(), 3);
+    for r in all {
+        assert!(!r.headers.contains_key("authorization"), "{}", r.path);
+    }
+}
+
+#[test]
+fn req213_create_without_file_id_does_not_create_the_batch() {
+    let server = BatchServer::start();
+    server.route("POST", "/v1/files", vec![ok(json!({}))]);
+    server.route("POST", "/v1/batches", vec![ok(json!({"id": "b1"}))]);
+    let e = oai(&server)
+        .create(&[pending(1)], &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(matches!(e, CreateError::Other(Error::Format(_))), "{e:?}");
+    assert!(server.hits("POST", "/v1/batches").is_empty());
+}
+
+#[test]
+fn req213_create_without_batch_id_is_an_error() {
+    let server = BatchServer::start();
+    server.route("POST", "/v1/files", vec![ok(json!({"id": "f"}))]);
+    server.route("POST", "/v1/batches", vec![ok(json!({}))]);
+    let e = oai(&server)
+        .create(&[pending(1)], &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(matches!(e, CreateError::Other(Error::Format(_))), "{e:?}");
+}
+
+#[test]
+fn req213_no_batch_mode_for_404_405_501_at_upload_or_creation() {
+    for code in [404u16, 405, 501] {
+        let server = BatchServer::start();
+        server.route("POST", "/v1/files", vec![Reply::status(code, "{}")]);
+        let e = oai(&server)
+            .create(&[pending(1)], &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(
+            e,
+            CreateError::NoBatchMode {
+                code,
+                url: format!("{}/v1/files", server.base_url)
+            }
+        );
+        assert!(server.hits("POST", "/v1/batches").is_empty(), "{code}");
+
+        let server = BatchServer::start();
+        server.route("POST", "/v1/files", vec![ok(json!({"id": "f"}))]);
+        server.route("POST", "/v1/batches", vec![Reply::status(code, "{}")]);
+        let e = oai(&server)
+            .create(&[pending(1)], &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(
+            e,
+            CreateError::NoBatchMode {
+                code,
+                url: format!("{}/v1/batches", server.base_url)
+            }
+        );
+    }
+}
+
+#[test]
+fn req213_upload_failure_does_not_create_the_batch() {
+    let server = BatchServer::start();
+    server.route("POST", "/v1/files", vec![Reply::status(500, "{}")]);
+    let e = oai(&server)
+        .create(&[pending(1)], &AtomicBool::new(false))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        CreateError::Failed {
+            cause: "HTTP 500".into()
+        }
+    );
+    assert_eq!(server.hits("POST", "/v1/files").len(), 1);
+    assert!(server.hits("POST", "/v1/batches").is_empty());
+}
+
+#[test]
+fn req213_status_unfinished_then_finished_with_counters() {
+    let server = BatchServer::start();
+    let llm = oai(&server);
+    for status in ["validating", "in_progress", "finalizing"] {
+        let s = oai_status(
+            &llm,
+            &server,
+            json!({"status": status, "request_counts": oai_counts(10, 3, 1)}),
+        );
+        assert!(!s.finished, "{status}");
+        assert_eq!((s.done, s.total), (4, 10));
+        assert_eq!(s.status, status);
+        assert_eq!(s.id, "b1");
+        assert!(s.files.is_empty());
+    }
+    for status in ["completed", "expired", "cancelled", "failed"] {
+        let s = oai_status(
+            &llm,
+            &server,
+            json!({"status": status, "request_counts": oai_counts(10, 8, 2)}),
+        );
+        assert!(s.finished, "{status}");
+        assert_eq!((s.done, s.total), (10, 10));
+    }
+}
+
+#[test]
+fn req213_status_without_counters_is_an_error() {
+    let server = BatchServer::start();
+    server.route(
+        "GET",
+        "/v1/batches/b1",
+        vec![ok(json!({"status": "completed"}))],
+    );
+    let e = oai(&server)
+        .status("b1", &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(matches!(e, Error::Format(_)), "{e:?}");
+}
+
+#[test]
+fn req213_status_reads_output_and_error_files_when_present() {
+    let server = BatchServer::start();
+    let llm = oai(&server);
+    let counts = oai_counts(2, 1, 1);
+    let s = oai_status(
+        &llm,
+        &server,
+        json!({"status": "completed", "request_counts": counts,
+               "output_file_id": "file-out", "error_file_id": "file-err"}),
+    );
+    assert_eq!(
+        s.files,
+        vec!["/v1/files/file-out/content", "/v1/files/file-err/content"]
+    );
+    let s = oai_status(
+        &llm,
+        &server,
+        json!({"status": "completed", "request_counts": counts,
+               "output_file_id": "file-out", "error_file_id": null}),
+    );
+    assert_eq!(s.files, vec!["/v1/files/file-out/content"]);
+    let s = oai_status(
+        &llm,
+        &server,
+        json!({"status": "completed", "request_counts": counts, "error_file_id": "file-err"}),
+    );
+    assert_eq!(s.files, vec!["/v1/files/file-err/content"]);
+}
+
+#[test]
+fn req213_status_failed_and_expired_give_the_failure_and_default_answer() {
+    let server = BatchServer::start();
+    let llm = oai(&server);
+    let s = oai_status(
+        &llm,
+        &server,
+        json!({"status": "failed", "request_counts": oai_counts(2, 0, 0),
+               "errors": {"data": [{"code": "x", "message": "ligne 1\ninvalide"}]}}),
+    );
+    let refused = failed("lot refusé : ligne 1 invalide", None);
+    assert_eq!(s.failure, Some(refused.clone()));
+    assert_eq!(s.default_answer, refused);
+
+    let s = oai_status(
+        &llm,
+        &server,
+        json!({"status": "failed", "request_counts": oai_counts(2, 0, 0)}),
+    );
+    assert_eq!(s.failure, Some(failed("lot refusé", None)));
+    assert_eq!(s.default_answer, failed("lot refusé", None));
+
+    let s = oai_status(
+        &llm,
+        &server,
+        json!({"status": "cancelled", "request_counts": oai_counts(2, 1, 0)}),
+    );
+    assert_eq!(s.failure, None);
+    assert_eq!(s.default_answer, failed("annulée", None));
+
+    let s = oai_status(
+        &llm,
+        &server,
+        json!({"status": "expired", "request_counts": oai_counts(2, 1, 0),
+               "output_file_id": "file-out"}),
+    );
+    assert_eq!(s.failure, None);
+    assert_eq!(s.default_answer, failed("expirée", None));
+
+    let s = oai_status(
+        &llm,
+        &server,
+        json!({"status": "completed", "request_counts": oai_counts(2, 2, 0)}),
+    );
+    assert_eq!(s.failure, None);
+    assert_eq!(s.default_answer, failed("sans réponse", None));
+}
+
+#[test]
+fn req213_results_keep_200_bodies_and_name_the_other_causes() {
+    let server = BatchServer::start();
+    let ok_body = json!({"choices": [{"message": {"content": "{}"}}]});
+    let out = [
+        json!({"custom_id": "c1", "response": {"status_code": 200, "body": ok_body}, "error": null}),
+        json!({"custom_id": "c2", "response": {"status_code": 429,
+            "body": {"error": {"message": "trop\nde  requêtes"}}}, "error": null}),
+        json!({"custom_id": "c3", "response": {"status_code": 400,
+            "body": {"error": {"message": "response_format bad"}}}, "error": null}),
+        json!({"custom_id": "c4", "response": {"status_code": 500, "body": {}}, "error": null}),
+    ];
+    let err = [json!({"custom_id": "c5", "response": null,
+               "error": {"code": "batch_expired", "message": "n'a pas fini"}})];
+    let text = |l: &[Value]| l.iter().map(|l| format!("{l}\n\n")).collect::<String>();
+    server.route(
+        "GET",
+        "/v1/files/file-out/content",
+        vec![Reply::status(200, &text(&out))],
+    );
+    server.route(
+        "GET",
+        "/v1/files/file-err/content",
+        vec![Reply::status(200, &text(&err))],
+    );
+    let llm = oai(&server);
+    let status = oai_status(
+        &llm,
+        &server,
+        json!({"status": "completed", "request_counts": oai_counts(5, 4, 1),
+               "output_file_id": "file-out", "error_file_id": "file-err"}),
+    );
+    let answers = llm.results(&status, &AtomicBool::new(false)).unwrap();
+    assert_eq!(answers.len(), 5);
+    let get = |id: &str| answers.iter().find(|(i, _)| i == id).unwrap().1.clone();
+    let Answer::Raw(raw) = get("c1") else {
+        panic!()
+    };
+    assert_eq!(serde_json::from_str::<Value>(&raw).unwrap(), ok_body);
+    assert_eq!(get("c2"), failed("HTTP 429 : trop de requêtes", None));
+    assert_eq!(
+        get("c3"),
+        failed(
+            "HTTP 400 : response_format bad",
+            Some("response_format bad")
+        )
+    );
+    assert_eq!(get("c4"), failed("HTTP 500", None));
+    assert_eq!(get("c5"), failed("n'a pas fini", None));
+    assert_eq!(server.hits("GET", "/v1/files/file-out/content").len(), 1);
+    assert_eq!(server.hits("GET", "/v1/files/file-err/content").len(), 1);
+}
+
+#[test]
+fn req213_results_without_key_send_no_authorization_header() {
+    let server = BatchServer::start();
+    server.route(
+        "GET",
+        "/v1/files/file-out/content",
+        vec![Reply::status(200, "")],
+    );
+    let llm = oai_with(&server, None);
+    let status = oai_status(
+        &llm,
+        &server,
+        json!({"status": "completed", "request_counts": oai_counts(0, 0, 0),
+               "output_file_id": "file-out"}),
+    );
+    llm.results(&status, &AtomicBool::new(false)).unwrap();
+    let hits = server.hits("GET", "/v1/files/file-out/content");
+    assert_eq!(hits.len(), 1);
+    assert!(!hits[0].headers.contains_key("authorization"));
+}
+
+#[test]
+fn req213_results_invalid_line_is_an_error() {
+    let server = BatchServer::start();
+    server.route(
+        "GET",
+        "/v1/files/file-out/content",
+        vec![Reply::status(200, "pas du json\n")],
+    );
+    let llm = oai(&server);
+    let status = oai_status(
+        &llm,
+        &server,
+        json!({"status": "completed", "request_counts": oai_counts(1, 1, 0),
+               "output_file_id": "file-out"}),
+    );
+    let e = llm.results(&status, &AtomicBool::new(false)).unwrap_err();
+    assert!(matches!(e, Error::Format(_)), "{e:?}");
+}
+
+#[test]
+fn req213_batch_link_needs_a_collector_and_address_is_effective() {
+    let server = BatchServer::start();
+    let link = oai(&server);
+    let link = link.batch().unwrap();
+    assert_eq!(link.api.provider(), "openai");
+    assert_eq!(link.api.address(), server.base_url);
+    let without = OpenAiLlm::new(
+        None,
+        "m".into(),
+        None,
         10,
         &Tls::default(),
         1,

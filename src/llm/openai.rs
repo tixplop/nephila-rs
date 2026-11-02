@@ -1,6 +1,6 @@
 //! Adaptateur compatible OpenAI Chat Completions (REQ-002) : OpenAI, Ollama, llama.cpp, vLLM.
 
-use super::batch::Collector;
+use super::batch::{Answer, BatchApi, BatchLink, Collector, CreateError, LotStatus, Pending};
 use super::schema::Reply;
 use super::{http, openai_usage, CallStats, Complete, Generation, Retry, Structured, Tls};
 use crate::config::Effort;
@@ -121,7 +121,217 @@ impl OpenAiLlm {
     }
 }
 
+/// Identifiant de fichier ou de lot sûr à placer dans un chemin d'URL.
+fn check_id(id: &str) -> Result<&str> {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        Ok(id)
+    } else {
+        Err(Error::Format("identifiant de openai illisible".into()))
+    }
+}
+
+fn failed(cause: &str) -> Answer {
+    Answer::Failed {
+        cause: cause.into(),
+        refused: None,
+    }
+}
+
+/// Compteur `name` de `request_counts`.
+fn count(v: &serde_json::Value, name: &str) -> Result<usize> {
+    v["request_counts"][name]
+        .as_u64()
+        .map(|n| n as usize)
+        .ok_or_else(|| Error::Format(format!("état de lot de openai sans {name}")))
+}
+
+/// Message d'erreur d'un objet `{code, message}`, normalisé ; vide s'il manque.
+fn error_message(e: &serde_json::Value) -> String {
+    http::provider_text(e["message"].as_str().unwrap_or(""))
+}
+
+/// Fichier d'entrée du lot : JSONL, un `custom_id` par ligne.
+fn jsonl(requests: &[Pending]) -> String {
+    let mut out = String::new();
+    for p in requests {
+        let line = serde_json::json!({
+            "custom_id": p.id, "method": "POST", "url": "/v1/chat/completions", "body": p.body,
+        });
+        out.push_str(&line.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// Corps `multipart/form-data` du dépôt du fichier : `purpose` puis `file`. Le séparateur vient de
+/// l'empreinte du contenu, donc ne s'y trouve pas.
+fn multipart(jsonl: &str) -> (String, String) {
+    let boundary = format!("nephila{}", blake3::hash(jsonl.as_bytes()).to_hex());
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"batch.jsonl\"\r\n\
+         Content-Type: application/jsonl\r\n\r\n{jsonl}\r\n--{boundary}--\r\n"
+    );
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// Réponse d'une ligne de résultat (tableau d'A-17).
+fn line_answer(v: &serde_json::Value) -> Answer {
+    let response = &v["response"];
+    let Some(code) = response["status_code"].as_u64() else {
+        let message = error_message(&v["error"]);
+        return failed(if message.is_empty() {
+            "sans réponse"
+        } else {
+            &message
+        });
+    };
+    if code == 200 {
+        return Answer::Raw(response["body"].to_string());
+    }
+    let message = error_message(&response["body"]["error"]);
+    if message.is_empty() {
+        return failed(&format!("HTTP {code}"));
+    }
+    Answer::Failed {
+        cause: format!("HTTP {code} : {message}"),
+        refused: (code == 400).then(|| message.clone()),
+    }
+}
+
+impl BatchApi for OpenAiLlm {
+    fn provider(&self) -> &str {
+        "openai"
+    }
+
+    fn address(&self) -> String {
+        self.base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_BASE_URL)
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    fn create(
+        &self,
+        requests: &[Pending],
+        stop: &AtomicBool,
+    ) -> std::result::Result<(String, usize), CreateError> {
+        let input = jsonl(requests);
+        let (content_type, upload) = multipart(&input);
+        let file = http::send_create(
+            "openai",
+            self.request("POST", "/v1/files"),
+            &upload,
+            &content_type,
+            &self.retry,
+            stop,
+        )?;
+        let file_id = http::parse_body("openai", &file)
+            .and_then(|v| match v["id"].as_str() {
+                Some(id) => check_id(id).map(String::from),
+                None => Err(Error::Format(
+                    "réponse de openai sans identifiant de fichier".into(),
+                )),
+            })
+            .map_err(CreateError::Other)?;
+        let body = serde_json::json!({
+            "input_file_id": file_id,
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+        });
+        let text = http::send_create(
+            "openai",
+            self.request("POST", "/v1/batches"),
+            &body.to_string(),
+            "application/json",
+            &self.retry,
+            stop,
+        )?;
+        let id = http::parse_body("openai", &text)
+            .and_then(|v| match v["id"].as_str() {
+                Some(id) => check_id(id).map(String::from),
+                None => Err(Error::Format(
+                    "réponse de openai sans identifiant de lot".into(),
+                )),
+            })
+            .map_err(CreateError::Other)?;
+        Ok((id, input.len()))
+    }
+
+    fn status(&self, id: &str, stop: &AtomicBool) -> Result<LotStatus> {
+        let id = check_id(id)?;
+        let text = http::send_all(
+            "openai",
+            self.request("GET", &format!("/v1/batches/{id}")),
+            &self.retry,
+            stop,
+        )?;
+        let v = http::parse_body("openai", &text)?;
+        let status = v["status"]
+            .as_str()
+            .ok_or_else(|| Error::Format("état de lot de openai sans status".into()))?;
+        let finished = matches!(status, "completed" | "expired" | "cancelled" | "failed");
+        let refused = {
+            let message = error_message(&v["errors"]["data"][0]);
+            failed(&if message.is_empty() {
+                "lot refusé".to_string()
+            } else {
+                format!("lot refusé : {message}")
+            })
+        };
+        let failure = (status == "failed").then(|| refused.clone());
+        let mut files = Vec::new();
+        for key in ["output_file_id", "error_file_id"] {
+            if let Some(file) = v[key].as_str() {
+                files.push(format!("/v1/files/{}/content", check_id(file)?));
+            }
+        }
+        Ok(LotStatus {
+            id: id.into(),
+            status: status.into(),
+            finished,
+            done: count(&v, "completed")? + count(&v, "failed")?,
+            total: count(&v, "total")?,
+            failure,
+            default_answer: match status {
+                "failed" => refused,
+                "expired" => failed("expirée"),
+                "cancelled" => failed("annulée"),
+                _ => failed("sans réponse"),
+            },
+            files,
+        })
+    }
+
+    fn results(&self, status: &LotStatus, stop: &AtomicBool) -> Result<Vec<(String, Answer)>> {
+        let mut out = Vec::new();
+        for file in &status.files {
+            let text = http::send_all("openai", self.request("GET", file), &self.retry, stop)?;
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let v = http::parse_body("openai", line)?;
+                let custom_id = v["custom_id"].as_str().ok_or_else(|| {
+                    Error::Format("ligne de résultat de openai sans custom_id".into())
+                })?;
+                out.push((custom_id.to_string(), line_answer(&v)));
+            }
+        }
+        Ok(out)
+    }
+}
+
 impl Complete for OpenAiLlm {
+    fn batch(&self) -> Option<BatchLink<'_>> {
+        self.collector.as_deref().map(|collector| BatchLink {
+            api: self,
+            collector,
+        })
+    }
+
     fn summary_language(&self) -> &str {
         &self.summary_language
     }

@@ -312,7 +312,8 @@ fn send_with(
 pub fn send_create(
     provider: &str,
     req: ureq::Request,
-    body: &serde_json::Value,
+    body: &str,
+    content_type: &str,
     retry: &Retry,
     stop: &AtomicBool,
 ) -> std::result::Result<String, CreateError> {
@@ -321,8 +322,8 @@ pub fn send_create(
     loop {
         let result = req
             .clone()
-            .set("content-type", "application/json")
-            .send_string(&body.to_string());
+            .set("content-type", content_type)
+            .send_string(body);
         let failed = |cause: &str| CreateError::Failed {
             cause: cause.into(),
         };

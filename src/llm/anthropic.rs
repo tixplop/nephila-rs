@@ -253,7 +253,8 @@ impl BatchApi for AnthropicLlm {
         let text = http::send_create(
             "anthropic",
             self.request("POST", "/v1/messages/batches"),
-            &body,
+            &body.to_string(),
+            "application/json",
             &self.retry,
             stop,
         )?;
