@@ -386,7 +386,7 @@ fn req037_ac18_aide_et_cle_proche_inconnue() {
     assert_eq!(
         text(&o.stderr),
         format!(
-            "erreur: {} : clé inconnue `modele` (clés permises : exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n",
+            "erreur: {} : clé inconnue `modele` (clés permises : exclude, exclude_types, exclude_defaults, enrich_include, enrich_exclude, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n",
             e.shown()
         )
     );
@@ -1135,7 +1135,7 @@ fn req162_ac11_cle_inconnue_du_premier_niveau_liste_ask() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         text(&o.stderr),
-        "erreur: ./.nephila.toml : clé inconnue `zz` (clés permises : exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n"
+        "erreur: ./.nephila.toml : clé inconnue `zz` (clés permises : exclude, exclude_types, exclude_defaults, enrich_include, enrich_exclude, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)\n"
     );
 }
 
@@ -1291,7 +1291,7 @@ fn req174_ac8_liste_des_cles_et_section_ask() {
     e.project("zz = 1\n");
     let o = e.run(&["build"]);
     assert!(text(&o.stderr).contains(
-        "clé inconnue `zz` (clés permises : exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)"
+        "clé inconnue `zz` (clés permises : exclude, exclude_types, exclude_defaults, enrich_include, enrich_exclude, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)"
     ));
     e.project("[ask]\nsummary_language = \"anglais\"\n");
     let o = e.run(&["status"]);

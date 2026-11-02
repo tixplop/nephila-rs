@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{self, ProjectSettings, CONNECTION_KEYS, PROJECT_SETTINGS};
 use crate::error::{Error, Result};
@@ -269,6 +270,9 @@ pub struct ProjectFile {
 /// Clés de filtre et d'exclusion du fichier de projet, dans l'ordre de la liste d'E-2.
 const FILTER_KEYS: [&str; 3] = ["exclude", "exclude_types", "exclude_defaults"];
 
+/// Clés de portée d'enrichissement du fichier de projet, après `FILTER_KEYS` dans la liste d'E-2.
+const ENRICH_SCOPE_KEYS: [&str; 2] = ["enrich_include", "enrich_exclude"];
+
 const EXAMPLES: [(&str, &str); 2] = [
     ("exclude", "exclude = [\"docs/legacy/\"]"),
     ("exclude_types", "exclude_types = [\"json\"]"),
@@ -306,9 +310,14 @@ impl ProjectFile {
                     "{shown} : clé `{key}` permise seulement dans la configuration personnelle ({at})"
                 )));
             }
-            if !FILTER_KEYS.contains(&key) && !PROJECT_SETTINGS.contains(&key) && key != "ask" {
+            if !FILTER_KEYS.contains(&key)
+                && !ENRICH_SCOPE_KEYS.contains(&key)
+                && !PROJECT_SETTINGS.contains(&key)
+                && key != "ask"
+            {
                 let allowed = FILTER_KEYS
                     .into_iter()
+                    .chain(ENRICH_SCOPE_KEYS)
                     .chain(PROJECT_SETTINGS)
                     .chain(["ask"])
                     .collect::<Vec<_>>()
@@ -358,6 +367,90 @@ impl ProjectFile {
         filters.defaults_off = !exclude_defaults;
         let settings = ProjectSettings::from_table(&table, &shown)?;
         Ok(ProjectFile { filters, settings })
+    }
+}
+
+/// Liste par défaut de `enrich_exclude` (REQ-206) ; seule déclaration.
+pub const DEFAULT_ENRICH_EXCLUDE: [&str; 8] = [
+    "**/test/**",
+    "**/__tests__/**",
+    "*.spec.*",
+    "*.test.*",
+    "**/generated/**",
+    "**/migrations/**",
+    "*.min.js",
+    "*.d.ts",
+];
+
+/// Plafond de motifs par clé de portée dans le fichier de projet (REQ-206, DEC-166).
+pub const PROJECT_SCOPE_MAX_PATTERNS: usize = 100;
+
+/// Portée d'enrichissement (REQ-206, REQ-207) : motifs de la configuration personnelle et du
+/// fichier de projet, jamais fusionnés.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrichScope {
+    pub personal_include: Vec<String>,
+    pub personal_exclude: Vec<String>,
+    pub project_include: Vec<String>,
+    pub project_exclude: Vec<String>,
+}
+
+impl Default for EnrichScope {
+    fn default() -> EnrichScope {
+        EnrichScope {
+            personal_include: Vec::new(),
+            personal_exclude: DEFAULT_ENRICH_EXCLUDE.map(String::from).to_vec(),
+            project_include: Vec::new(),
+            project_exclude: Vec::new(),
+        }
+    }
+}
+
+impl EnrichScope {
+    pub fn new(
+        personal_include: Vec<String>,
+        personal_exclude: Vec<String>,
+        project: &ProjectSettings,
+    ) -> EnrichScope {
+        EnrichScope {
+            personal_include,
+            personal_exclude,
+            project_include: project.enrich_include.clone(),
+            project_exclude: project.enrich_exclude.clone(),
+        }
+    }
+
+    /// Compile les quatre listes ; les chemins du graphe sont relatifs, la racine est constante.
+    pub fn compile(&self) -> Result<CompiledScope> {
+        let one = |patterns: &[String]| {
+            Filters {
+                patterns: patterns.to_vec(),
+                ..Filters::default()
+            }
+            .compile(Path::new("/"))
+        };
+        Ok(CompiledScope {
+            sources: [
+                (one(&self.personal_include)?, one(&self.personal_exclude)?),
+                (one(&self.project_include)?, one(&self.project_exclude)?),
+            ],
+        })
+    }
+}
+
+/// Portée compilée : décision par fichier.
+#[derive(Debug, Clone)]
+pub struct CompiledScope {
+    /// (include, exclude) de la configuration personnelle, puis du fichier de projet.
+    sources: [(Matcher, Matcher); 2],
+}
+
+impl CompiledScope {
+    /// Le fichier `rel` est-il dans la portée ? Chaque source doit le laisser passer.
+    pub fn contains(&self, rel: &str) -> bool {
+        self.sources.iter().all(|(include, exclude)| {
+            (!include.is_active() || include.excludes(rel)) && !exclude.excludes(rel)
+        })
     }
 }
 
@@ -481,5 +574,96 @@ mod tests {
         .unwrap_err();
         assert!(e.to_string().starts_with("motif invalide `a[b` ("), "{e}");
         assert!(!e.to_string().contains('\n'));
+    }
+
+    fn scope(pi: &[&str], pe: &[&str], ji: &[&str], je: &[&str]) -> CompiledScope {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        EnrichScope {
+            personal_include: v(pi),
+            personal_exclude: v(pe),
+            project_include: v(ji),
+            project_exclude: v(je),
+        }
+        .compile()
+        .unwrap()
+    }
+
+    #[test]
+    fn req206_ac2_liste_par_defaut() {
+        assert_eq!(
+            DEFAULT_ENRICH_EXCLUDE,
+            [
+                "**/test/**",
+                "**/__tests__/**",
+                "*.spec.*",
+                "*.test.*",
+                "**/generated/**",
+                "**/migrations/**",
+                "*.min.js",
+                "*.d.ts"
+            ]
+        );
+        for p in DEFAULT_ENRICH_EXCLUDE {
+            assert!(compile_pattern(Path::new("/"), p).is_ok(), "{p}");
+        }
+        assert_eq!(EnrichScope::default().personal_exclude.len(), 8);
+        assert!(EnrichScope::default().personal_include.is_empty());
+    }
+
+    #[test]
+    fn req207_ac1_liste_par_defaut() {
+        let s = EnrichScope::default().compile().unwrap();
+        for p in [
+            "src/test/java/A.java",
+            "test/a.md",
+            "web/__tests__/a.js",
+            "a.spec.ts",
+            "x/a.test.js",
+            "src/generated/G.java",
+            "db/migrations/V1.sql",
+            "docs/migrations/b.md",
+            "a.min.js",
+            "types/a.d.ts",
+        ] {
+            assert!(!s.contains(p), "{p}");
+        }
+        for p in [
+            "src/Test.java",
+            "src/latest/A.java",
+            "README.md",
+            "src/a.ts",
+            "src/tests/A.java",
+        ] {
+            assert!(s.contains(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn req207_ac2_configuration_personnelle() {
+        let s = scope(&["src/**"], &[], &[], &[]);
+        assert!(s.contains("src/a.ts"));
+        assert!(!s.contains("lib/a.ts"));
+        let s = scope(&["src/**"], &["src/gen/"], &[], &[]);
+        assert!(!s.contains("src/gen/a.ts"));
+        let s = scope(&[], &["src/", "!src/garde.ts"], &[], &[]);
+        assert!(s.contains("src/garde.ts"));
+        assert!(!s.contains("src/a.ts"));
+        assert!(scope(&[], &[], &[], &[]).contains("src/test/A.java"));
+    }
+
+    #[test]
+    fn req207_ac3_fichier_de_projet() {
+        let d: Vec<&str> = DEFAULT_ENRICH_EXCLUDE.to_vec();
+        assert!(!scope(&[], &d, &[], &[]).contains("src/test/A.java"));
+        assert!(!scope(&[], &d, &[], &["!src/test/**"]).contains("src/test/A.java"));
+        let s = scope(&[], &d, &[], &["legacy/"]);
+        assert!(!s.contains("legacy/a.ts"));
+        assert!(!s.contains("src/test/A.java"));
+        let s = scope(&[], &[], &[], &["legacy/"]);
+        assert!(s.contains("src/test/A.java"));
+        assert!(!s.contains("legacy/a.ts"));
+        let s = scope(&["src/**", "lib/**"], &[], &["src/**"], &[]);
+        assert!(s.contains("src/a.ts"));
+        assert!(!s.contains("lib/a.ts"));
     }
 }

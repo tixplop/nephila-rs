@@ -24,6 +24,8 @@
 # Un dépôt peut remplacer sept réglages par son fichier .nephila.toml (model, summary_language,
 # max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries) ; les autres clés ne
 # sont lues qu'ici.
+# Seule exception : enrich_include et enrich_exclude, qu'un dépôt peut écrire lui aussi pour
+# réduire la portée de l'enrichissement (voir « Portée d'enrichissement »).
 #
 # Enrichissements conservés : un fichier déjà enrichi n'est renvoyé au LLM que si son contenu
 # change, ou si le modèle, summary_language (ici ou dans .nephila.toml) ou le prompt de la
@@ -257,6 +259,28 @@ api_key_env = "ANTHROPIC_API_KEY"
 # refuse.
 # Priorité : --max-calls > ce fichier > défaut.
 # max_calls = 500
+
+# --- Portée d'enrichissement ---
+# Ces motifs réduisent les fichiers envoyés au LLM. Un fichier hors portée reste dans le graphe
+# avec ses nœuds et ses liens, n'est pas envoyé et ne compte pas « à enrichir » : exclude, lui,
+# retire aussi la structure. Le bilan de build et update compte ces fichiers (« fichiers hors
+# portée d'enrichissement »). Les résumés déjà faits restent tant que le fichier ne change pas.
+# Changer ces motifs ne réenrichit rien : seuls les fichiers qui entrent dans la portée deviennent
+# « à enrichir ». Un .nephila.toml peut écrire les deux clés, mais seulement pour réduire la
+# portée : pour enrichir vos tests, c'est ici qu'il faut écrire enrich_exclude. Les lignes
+# ci-dessous montrent les valeurs par défaut.
+
+# Motifs des fichiers à enrichir : un fichier qui n'y correspond pas est hors portée. Tableau de
+# textes, mêmes règles qu'exclude de .nephila.toml : syntaxe de .gitignore, relative à la racine du
+# dépôt, sensible à la casse, !motif compris. Défaut : [], aucune restriction. Un fichier de code
+# reste hors portée sans enrich_code, même s'il correspond.
+# enrich_include = []
+
+# Motifs des fichiers à ne pas enrichir ; l'emporte sur enrich_include. Mêmes règles, le dernier
+# motif qui s'applique l'emporte (!motif). Défaut : la liste ci-dessous (tests, code généré,
+# migrations, fichiers minifiés, déclarations de types), documents Markdown compris. Écrite, la
+# clé remplace cette liste ; un tableau vide retire toute exclusion.
+# enrich_exclude = ["**/test/**", "**/__tests__/**", "*.spec.*", "*.test.*", "**/generated/**", "**/migrations/**", "*.min.js", "*.d.ts"]
 
 # --- Réglages de query ask ---
 # Section [ask] : elle ne vaut que pour nephila query ask. L'enrichissement (build, update)

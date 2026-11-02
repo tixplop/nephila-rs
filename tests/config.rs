@@ -641,7 +641,7 @@ fn req202_ac1_req204_ac1_structured_output_refusee_dans_le_fichier_de_projet() {
     let cases = [
         (
             "structured_output = \"on\"\n",
-            "clé inconnue `structured_output` (clés permises : exclude, exclude_types, exclude_defaults, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)",
+            "clé inconnue `structured_output` (clés permises : exclude, exclude_types, exclude_defaults, enrich_include, enrich_exclude, model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries, ask)",
         ),
         (
             "[ask]\nstructured_output = \"on\"\n",

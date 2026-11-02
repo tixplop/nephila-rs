@@ -322,7 +322,7 @@ model = "qwen2.5-coder:14b"
 format_retries = 4
 ```
 
-Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les sept réglages `model`, `summary_language`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`, au premier niveau, avec le nom et le type de la configuration personnelle, puis la section `[ask]` en fin de fichier. Toute autre clé est une erreur. Priorité : option > fichier de projet > configuration personnelle > défaut.
+Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, et les sept réglages `model`, `summary_language`, `max_chunk_chars`, `concurrency`, `timeout_secs`, `batch_files` et `format_retries`, au premier niveau, avec le nom et le type de la configuration personnelle, puis la section `[ask]` en fin de fichier. S'y ajoutent `enrich_include` et `enrich_exclude`, qui ne peuvent que réduire [la portée de l'enrichissement](#enrichissement). Toute autre clé est une erreur. Priorité : option > fichier de projet > configuration personnelle > défaut.
 
 | Réglage | Plafond dans `.nephila.toml` |
 |---|---|
@@ -369,6 +369,8 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 | `max_chunk_chars` | Taille maximale d'un morceau envoyé au LLM | 60000 |
 | `concurrency` | Appels LLM simultanés ; l'extraction est réglée par `--jobs` | 4 |
 | `enrich_code` | `true` enrichit aussi le code ; configuration personnelle seulement | `false` |
+| `enrich_include` | Motifs des seuls fichiers à enrichir ; aussi dans `.nephila.toml` | aucune restriction |
+| `enrich_exclude` | Motifs des fichiers à ne pas enrichir, qui l'emportent sur `enrich_include` ; écrite, elle remplace la liste par défaut ; aussi dans `.nephila.toml` | `**/test/**`, `**/__tests__/**`, `*.spec.*`, `*.test.*`, `**/generated/**`, `**/migrations/**`, `*.min.js`, `*.d.ts` |
 | `thinking` | `true` demande au modèle de réfléchir ; configuration personnelle seulement ; chez anthropic, modèle Claude 4.6 ou suivant | `false` |
 | `effort` | Niveau d'effort, avec ou sans `thinking` : `"low"`, `"medium"`, `"high"`, ou `"default"` pour n'en envoyer aucun ; à `"medium"` ou `"high"`, augmentez `timeout_secs` ; configuration personnelle seulement | `"low"` |
 | `max_output_tokens` | Limite de jetons de la réponse, entier > 0 ; configuration personnelle seulement | 16384 |

@@ -158,14 +158,54 @@ pub struct ProjectSettings {
     pub timeout_secs: Option<u64>,
     pub batch_files: Option<usize>,
     pub format_retries: Option<u32>,
+    /// Motifs de portée d'enrichissement (REQ-206), lus avant les réglages.
+    pub enrich_include: Vec<String>,
+    pub enrich_exclude: Vec<String>,
     /// Section `[ask]` (REQ-162).
     pub ask: AskOverrides,
+}
+
+/// Lit une clé de portée d'enrichissement du fichier de projet : type (E-3), nombre (E-30),
+/// puis motifs (E-5).
+fn scope_patterns(table: &toml::Table, key: &str, shown: &str) -> Result<Vec<String>> {
+    let Some(value) = table.get(key) else {
+        return Ok(Vec::new());
+    };
+    let example = if key == "enrich_include" {
+        "[\"src/**\"]"
+    } else {
+        "[\"legacy/\"]"
+    };
+    let items: Option<Vec<&str>> = value
+        .as_array()
+        .and_then(|a| a.iter().map(|v| v.as_str()).collect());
+    let Some(items) = items else {
+        return Err(Error::Message(format!(
+            "{shown} : clé `{key}` : tableau de chaînes attendu, ex. {key} = {example}"
+        )));
+    };
+    if items.len() > crate::filter::PROJECT_SCOPE_MAX_PATTERNS {
+        return Err(Error::Message(format!(
+            "{shown} : clé `{key}` : trop de motifs `{}` (au plus {})",
+            items.len(),
+            crate::filter::PROJECT_SCOPE_MAX_PATTERNS
+        )));
+    }
+    for item in &items {
+        crate::filter::compile_pattern(Path::new("/"), item)
+            .map_err(|m| Error::Message(format!("{shown} : clé `{key}` : {m}")))?;
+    }
+    Ok(items.into_iter().map(String::from).collect())
 }
 
 impl ProjectSettings {
     /// Lit et valide les réglages présents dans `table` ; `shown` = chemin affiché du fichier.
     pub fn from_table(table: &toml::Table, shown: &str) -> Result<ProjectSettings> {
-        let mut out = ProjectSettings::default();
+        let mut out = ProjectSettings {
+            enrich_include: scope_patterns(table, "enrich_include", shown)?,
+            enrich_exclude: scope_patterns(table, "enrich_exclude", shown)?,
+            ..ProjectSettings::default()
+        };
         for key in PROJECT_SETTINGS {
             let Some(value) = table.get(key) else {
                 continue;
@@ -416,6 +456,10 @@ pub struct Config {
     pub max_calls: Option<usize>,
     /// Enrichit aussi les fichiers de code, pas seulement les documents (REQ-050).
     pub enrich_code: bool,
+    /// Motifs des seuls fichiers à enrichir ; vide = aucune restriction (REQ-206).
+    pub enrich_include: Vec<String>,
+    /// Motifs des fichiers à ne pas enrichir ; défaut : `DEFAULT_ENRICH_EXCLUDE` (REQ-206).
+    pub enrich_exclude: Vec<String>,
     /// Demande la réflexion au modèle (REQ-058).
     pub thinking: bool,
     /// Niveau d'effort demandé au modèle, avec ou sans `thinking` (REQ-058, REQ-157).
@@ -456,6 +500,8 @@ struct RawConfig {
     format_retries: Option<toml::Value>,
     max_calls: Option<toml::Value>,
     enrich_code: Option<toml::Value>,
+    enrich_include: Option<toml::Value>,
+    enrich_exclude: Option<toml::Value>,
     summary_language: Option<toml::Value>,
     thinking: Option<toml::Value>,
     effort: Option<toml::Value>,
@@ -843,6 +889,34 @@ impl Config {
                 "configuration invalide ({at}) : clé « {key} » doit être {expected} (reçu : {v})"
             ))
         };
+        let scope = |key: &str, v: &Option<toml::Value>, default: Vec<String>| match v {
+            None => Ok(default),
+            Some(value) => {
+                let expected = "un tableau de motifs valides";
+                let toml::Value::Array(a) = value else {
+                    return Err(invalid(key, expected, value));
+                };
+                let mut out = Vec::with_capacity(a.len());
+                for item in a {
+                    let toml::Value::String(s) = item else {
+                        return Err(invalid(key, expected, value));
+                    };
+                    if crate::filter::compile_pattern(Path::new("/"), s).is_err() {
+                        return Err(invalid(key, expected, item));
+                    }
+                    out.push(s.clone());
+                }
+                Ok(out)
+            }
+        };
+        let enrich_include = scope("enrich_include", &raw.enrich_include, Vec::new())?;
+        let enrich_exclude = scope(
+            "enrich_exclude",
+            &raw.enrich_exclude,
+            crate::filter::DEFAULT_ENRICH_EXCLUDE
+                .map(String::from)
+                .to_vec(),
+        )?;
         let thinking = match &raw.thinking {
             None => false,
             Some(toml::Value::Boolean(b)) => *b,
@@ -985,6 +1059,8 @@ impl Config {
             format_retries,
             max_calls,
             enrich_code,
+            enrich_include,
+            enrich_exclude,
             thinking,
             effort,
             effort_explicit: raw.effort.is_some(),
@@ -1088,6 +1164,8 @@ mod project_tests {
             format_retries: 1,
             max_calls: None,
             enrich_code: false,
+            enrich_include: Vec::new(),
+            enrich_exclude: Vec::new(),
             thinking: false,
             effort: DEFAULT_EFFORT,
             effort_explicit: false,
@@ -2417,6 +2495,61 @@ mod structured_tests {
             e,
             "./.nephila.toml : clé inconnue `ask.structured_output` (clés permises dans [ask] : \
              model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod enrich_scope_tests {
+    use super::*;
+
+    fn parse(extra: &str) -> Result<Config> {
+        Config::parse_with(
+            &format!("provider = \"mock\"\n{extra}"),
+            Path::new("/c.toml"),
+            &|_| None,
+        )
+    }
+
+    #[test]
+    fn req206_ac1_lecture_des_deux_cles() {
+        let c = parse("").unwrap();
+        assert_eq!(c.enrich_exclude, crate::filter::DEFAULT_ENRICH_EXCLUDE);
+        assert!(c.enrich_include.is_empty());
+        assert_eq!(
+            parse("enrich_exclude = [\"a/\"]").unwrap().enrich_exclude,
+            ["a/"]
+        );
+        assert!(parse("enrich_exclude = []")
+            .unwrap()
+            .enrich_exclude
+            .is_empty());
+        assert_eq!(
+            parse("enrich_include = [\"src/**\"]")
+                .unwrap()
+                .enrich_include,
+            ["src/**"]
+        );
+        let many = format!("enrich_exclude = [{}]", "\"a\",".repeat(150));
+        assert_eq!(parse(&many).unwrap().enrich_exclude.len(), 150);
+    }
+
+    #[test]
+    fn req206_ac6_erreurs_de_la_configuration_personnelle() {
+        let e = |extra: &str| parse(extra).unwrap_err().to_string();
+        let line = |key: &str, got: &str| {
+            format!("configuration invalide (/c.toml) : clé « {key} » doit être un tableau de motifs valides (reçu : {got})")
+        };
+        assert_eq!(e("enrich_exclude = \"a\""), line("enrich_exclude", "\"a\""));
+        assert_eq!(e("enrich_exclude = [1]"), line("enrich_exclude", "[1]"));
+        assert_eq!(
+            e("enrich_include = [\"src/**\", \"a[b\"]"),
+            line("enrich_include", "\"a[b\"")
+        );
+        // Première clé fautive : enrich_include avant enrich_exclude.
+        assert_eq!(
+            e("enrich_exclude = 1\nenrich_include = 2"),
+            line("enrich_include", "2")
         );
     }
 }
