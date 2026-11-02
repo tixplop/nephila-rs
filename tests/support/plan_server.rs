@@ -13,6 +13,8 @@ pub enum Act {
     Ok(u64),
     /// Réponse HTTP d'erreur, avec `retry-after` éventuel.
     Status(u16, Option<&'static str>),
+    /// Réponse HTTP d'erreur écrite une fois `n` requêtes reçues (attente plafonnée à 10 s).
+    StatusAfter(u16, usize),
     /// Réponse 200 qui n'est pas un JSON conforme.
     Garbage,
     /// Réponse 200 de JSON valide mais hors schéma, après `delay_ms`.
@@ -111,6 +113,19 @@ fn serve(
                 (200, String::new(), chat(r#"{"inattendu": true}"#))
             }
             Act::Garbage => (200, String::new(), chat("ceci n'est pas du JSON")),
+            Act::StatusAfter(s, n) => {
+                let start = std::time::Instant::now();
+                while count.load(Ordering::SeqCst) < n
+                    && start.elapsed() < std::time::Duration::from_secs(10)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                (
+                    s,
+                    String::new(),
+                    serde_json::json!({"error":{"message":"simulé"}}).to_string(),
+                )
+            }
             Act::Status(s, retry) => (
                 s,
                 retry

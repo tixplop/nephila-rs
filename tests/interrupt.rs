@@ -746,10 +746,48 @@ fn req191_ac3_ac9_plafond_puis_signal() {
 
 // ---- AC-191-4, AC-191-8 : une autre cause d'abord ----
 
+#[test]
+fn plan_server_status_after_attend_la_requete_n() {
+    use std::io::Write;
+    use std::net::TcpStream;
+    let server = Server::start(|i| {
+        if i == 0 {
+            Act::StatusAfter(401, 2)
+        } else {
+            Act::Ok(0)
+        }
+    });
+    let addr = server.base_url.trim_start_matches("http://").to_string();
+    let body = r#"{"messages":[{"role":"user","content":"x"}]}"#;
+    let req = format!(
+        "POST / HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut first = TcpStream::connect(&addr).unwrap();
+    first.write_all(req.as_bytes()).unwrap();
+    first
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut buf = [0u8; 64];
+    assert!(first.read(&mut buf).is_err(), "réponse reçue trop tôt");
+    let mut second = TcpStream::connect(&addr).unwrap();
+    second.write_all(req.as_bytes()).unwrap();
+    first
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let n = first.read(&mut buf).unwrap();
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 401"),
+        "{:?}",
+        &buf[..n]
+    );
+    wait_until("deux réponses servies", || server.served() >= 2);
+}
+
 fn key_refused_then_signal(verbose: bool) -> Done {
     let server = Server::start(|i| {
         if i == 0 {
-            Act::Status(401, None)
+            Act::StatusAfter(401, 2)
         } else {
             Act::Ok(2000)
         }
