@@ -335,6 +335,7 @@ Clés permises : les filtres `exclude`, `exclude_types` et `exclude_defaults`, e
 | `ask.max_context_chars` | 100000 |
 | `ask.max_seeds` | 100 |
 | `ask.max_nodes` | 500 |
+| `enrich_include`, `enrich_exclude` | 100 motifs par clé |
 
 Ces plafonds ne valent que pour .nephila.toml : la configuration personnelle et les options --batch-files et --format-retries n'en ont pas. Un dépôt cloné ne peut ainsi imposer ni plus de fils, ni des appels plus longs ou plus gros, ni plus d'essais.
 
@@ -456,11 +457,13 @@ Les autorités publiques restent reconnues. En dernier recours, `tls_insecure = 
 
 Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, concepts des documents). `enrich_code = true` dans la configuration personnelle, ou `--enrich-code` pour une commande, enrichit aussi le code et les fichiers de build et de données ; sans lui, un fichier de code n'est ni envoyé ni compté « à enrichir ». Un fichier garde ses enrichissements tant que son contenu, le modèle, la langue des résumés et le prompt de la version de nephila ne changent pas : un second `build` sans changement ne fait aucun appel, et changer `model` ou `summary_language` réenrichit une fois chaque fichier de la portée.
 
+`enrich_include` et `enrich_exclude` réduisent cette portée par motifs (syntaxe d'`exclude`), sans toucher au graphe : un fichier hors portée garde ses nœuds et ses liens, n'est pas envoyé et ne compte pas « à enrichir » ; le bilan compte ces fichiers dans `fichiers hors portée d'enrichissement`. Changer ces motifs ne réenrichit rien. Exception à la priorité : ceux de `.nephila.toml` s'ajoutent à ceux de la configuration personnelle, liste par défaut comprise, si bien qu'un dépôt ne peut que réduire la portée ; pour enrichir vos tests, écrivez `enrich_exclude = []` dans la configuration personnelle.
+
 ### Lots et gros fichiers
 
 - **Lots** : `batch_files` fichiers par appel (défaut 10), dans la limite de `max_chunk_chars` ; jusqu'à `concurrency` appels en même temps.
 - **Gros fichier** : envoyé seul, en morceaux de `max_chunk_chars`, au plus 150 nœuds demandés par appel.
-- **Plafond** : un fichier qui demanderait plus de 50 appels n'est pas envoyé et reste « à enrichir », nommé par l'avertissement `trop d'appels d'enrichissement`. Deux remèdes : `exclude` dans `.nephila.toml`, qui retire aussi sa structure du graphe, ou un `max_chunk_chars` plus grand, qui réduit le nombre de morceaux pour tous les fichiers. Au-delà de 7500 nœuds, seul `exclude` suffit.
+- **Plafond** : un fichier qui demanderait plus de 50 appels n'est pas envoyé et reste « à enrichir », nommé par l'avertissement `trop d'appels d'enrichissement`. Trois remèdes : `enrich_exclude`, qui garde sa structure dans le graphe, `exclude` dans `.nephila.toml`, qui la retire, ou un `max_chunk_chars` plus grand, qui réduit le nombre de morceaux pour tous les fichiers. Au-delà de 7500 nœuds, `max_chunk_chars` ne suffit plus.
 
 ### Échecs et nouveaux essais
 
@@ -590,7 +593,7 @@ Les références sans cible sont comptées dans « références non résolues »
 
 Les versions qui demandent une action, la plus récente d'abord. L'historique des nouveautés est dans les tags git et sur la page [Releases](https://github.com/tixplop/nephila-rs/releases).
 
-- **Vers 0.26** : le premier `nephila build` ou `nephila update` réenrichit une fois chaque fichier de la portée. Les résumés y sont écrits en `summary_language` (défaut `"français"`) : pour une autre langue, écrivez la clé avant cette commande. `effort` (défaut `"low"`) est envoyé aussi sans `thinking` : à `anthropic` dans `output_config`, sauf pour un modèle sorti avant Claude Opus 4.5, et à `openai` si la clé est écrite. Si votre serveur ou votre modèle refuse ce champ (requête refusée, HTTP 400), écrivez `effort = "default"` dans la configuration personnelle, puis lancez `nephila update`. Si le `.nephila.toml` d'un dépôt impose un modèle qui ferait réenrichir plus de 50 fichiers déjà enrichis, `build` et `update` refusent : ajoutez `--accept-project-model`, ou `model_override = "allow"` dans la configuration personnelle.
+- **Vers 0.26** : le premier `nephila build` ou `nephila update` réenrichit une fois chaque fichier de la portée. Les résumés y sont écrits en `summary_language` (défaut `"français"`) : pour une autre langue, écrivez la clé avant cette commande. `effort` (défaut `"low"`) est envoyé aussi sans `thinking` : à `anthropic` dans `output_config`, sauf pour un modèle sorti avant Claude Opus 4.5, et à `openai` si la clé est écrite. Si votre serveur ou votre modèle refuse ce champ (requête refusée, HTTP 400), écrivez `effort = "default"` dans la configuration personnelle, puis lancez `nephila update`. La liste par défaut d'`enrich_exclude` s'applique sans réglage, y compris aux documents Markdown : rien n'est réenvoyé ni retiré pour autant, et `enrich_exclude = []` dans la configuration personnelle rétablit la portée d'avant. Si le `.nephila.toml` d'un dépôt impose un modèle qui ferait réenrichir plus de 50 fichiers déjà enrichis, `build` et `update` refusent : ajoutez `--accept-project-model`, ou `model_override = "allow"` dans la configuration personnelle.
 - **Vers 0.25** : le premier `nephila update` (ou `build`) migre le graphe et calcule les communautés, sans appel LLM ; d'ici là, `query community` répond `communautés non calculées`. Pour revenir à une version antérieure, supprimez `.nephila/` : le build suivant réenrichit tous les fichiers de la portée.
 - **Vers 0.24** : `dist/`, `out/`, `coverage/`, `.next/`, `.nuxt/`, `vendor/`, `.idea/` et `*.min.js` sont exclus par défaut, et le premier `nephila update` retire leurs fichiers du graphe. Pour les garder : `exclude_defaults = false` dans `.nephila.toml`.
 - **Vers 0.23** : l'extraction utilise un fil par cœur, quelle que soit `concurrency`. Pour la limiter comme `concurrency = 1` le faisait : `--jobs 1`.

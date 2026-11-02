@@ -1351,7 +1351,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 47_000, "README : {size} octets");
+    assert!(size <= 48_000, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1962,7 +1962,7 @@ fn REQ165_AC16_readme_traces_sentence() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 47_000, "README : {size} octets");
+    assert!(size <= 48_000, "README : {size} octets");
 }
 
 #[test]
@@ -1985,7 +1985,9 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     }
     // Une phrase s'ajoute à la fin (REQ-197, item 39) ; celles qui précèdent ne bougent pas.
     assert!(
-        first.contains("puis lancez `nephila update`. Si le `.nephila.toml`"),
+        first.contains(
+            "puis lancez `nephila update`. La liste par défaut d'`enrich_exclude` s'applique"
+        ),
         "{first}"
     );
     assert_eq!(
@@ -2016,7 +2018,7 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 47_000, "README : {size} octets");
+    assert!(size <= 48_000, "README : {size} octets");
 }
 
 // ---- REQ-174 : `summary_language` dans les exemples et le README ----
@@ -2177,7 +2179,7 @@ fn REQ174_AC5_AC10_readme_lignes_et_phrases_de_summary_language() {
         assert!(!readme.contains(old), "présent : {old}");
     }
     assert_eq!(readme.matches("config: llm=").count(), 1);
-    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
 }
 
 /// AC-185-2 : textes de V-012 pour `--dry-run`, ligne de table après `--enrich-code`.
@@ -2195,7 +2197,7 @@ fn req185_ac2_readme_dry_run() {
     let table = section.lines().filter(|l| l.starts_with("| `-")).count();
     assert_eq!(table, 12, "{section}");
     assert!(readme.find("Un seul `build` ou `update`").unwrap() < readme.find(para).unwrap());
-    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
 }
 
 // ---- REQ-188 : `max_calls` dans l'exemple et le README ----
@@ -2225,7 +2227,7 @@ fn REQ188_AC2_AC5_section_max_calls_de_l_exemple() {
 #[test]
 fn REQ188_AC3_AC6_textes_du_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
     let has_after = |first: &str, second: &str| {
         let a = readme
             .find(first)
@@ -2256,7 +2258,7 @@ fn REQ188_AC3_AC6_textes_du_readme() {
 #[test]
 fn REQ192_AC3_ctrl_c_dans_le_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
     let codes = readme_section(&readme, "## Codes de sortie");
     let rows = table_rows(&codes, "| Code | Signification |", "|---|---|");
     assert_eq!(rows.len(), 4, "{rows:?}");
@@ -2359,7 +2361,7 @@ fn REQ197_AC2_AC5_blocs_de_model_dans_l_exemple_du_depot() {
 #[test]
 fn REQ197_AC3_AC6_readme_model_override() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
     let table = readme_section(&readme, "## Configuration du LLM");
     let lines: Vec<&str> = table.lines().collect();
     let lang = lines
@@ -2395,13 +2397,15 @@ fn REQ197_AC3_AC6_readme_model_override() {
         .find(|l| l.starts_with("- **Vers 0.26**"))
         .unwrap();
     assert!(vers.ends_with(" Si le `.nephila.toml` d'un dépôt impose un modèle qui ferait réenrichir plus de 50 fichiers déjà enrichis, `build` et `update` refusent : ajoutez `--accept-project-model`, ou `model_override = \"allow\"` dans la configuration personnelle."));
-    assert!(vers.contains("puis lancez `nephila update`. Si le"));
+    assert!(vers.contains(
+        "puis lancez `nephila update`. La liste par défaut d'`enrich_exclude` s'applique"
+    ));
 }
 
 #[test]
 fn REQ199_AC10_readme_fichier_absent_d_une_reponse_de_lot() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
     let section = readme_section(&readme, "### Échecs et nouveaux essais");
     let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
     let tronquee = bullets
@@ -2429,7 +2433,7 @@ fn req200_ac9_readme_non_conforming_reply_bullet() {
         bullets,
         ["- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2) ; encore non conforme, un lot de 4 fichiers ou plus est découpé une fois en deux, chaque moitié avec ses propres essais ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`."]
     );
-    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
 }
 
 const STRUCTURED_BLOCK: &str = "# Schéma JSON envoyé avec chaque appel d'enrichissement : le serveur l'impose à la réponse, ce
@@ -2507,7 +2511,7 @@ fn req205_ac1_ac3_blocs_structured_output_de_l_exemple_personnel() {
 #[test]
 fn req205_ac2_readme_lignes_structured_output() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
     let lines: Vec<&str> = readme.lines().collect();
     let count = |l: &str| lines.iter().filter(|x| **x == l).count();
     assert_eq!(count("| `structured_output` | Schéma JSON imposé aux réponses d'enrichissement : `\"auto\"` l'envoie sans `base_url` et, s'il est refusé (HTTP 400), s'en passe pour la commande ; `\"on\"` l'envoie toujours, et un refus arrête l'envoi ; `\"off\"` jamais ; configuration personnelle seulement | `\"auto\"` |"), 1);
@@ -2562,4 +2566,277 @@ fn req205_ac4_readme_place_des_lignes_structured_output() {
         "{}",
         &readme[at..at + 80]
     );
+}
+
+// ---- REQ-208 : enrich_include et enrich_exclude dans les exemples et le README (T-300) ----
+
+const SCOPE_SECTION_CONFIG: &str = r#"# --- Portée d'enrichissement ---
+# Ces motifs réduisent les fichiers envoyés au LLM. Un fichier hors portée reste dans le graphe
+# avec ses nœuds et ses liens, n'est pas envoyé et ne compte pas « à enrichir » : exclude, lui,
+# retire aussi la structure. Le bilan de build et update compte ces fichiers (« fichiers hors
+# portée d'enrichissement »). Les résumés déjà faits restent tant que le fichier ne change pas.
+# Changer ces motifs ne réenrichit rien : seuls les fichiers qui entrent dans la portée deviennent
+# « à enrichir ». Un .nephila.toml peut écrire les deux clés, mais seulement pour réduire la
+# portée : pour enrichir vos tests, c'est ici qu'il faut écrire enrich_exclude. Les lignes
+# ci-dessous montrent les valeurs par défaut.
+
+# Motifs des fichiers à enrichir : un fichier qui n'y correspond pas est hors portée. Tableau de
+# textes, mêmes règles qu'exclude de .nephila.toml : syntaxe de .gitignore, relative à la racine du
+# dépôt, sensible à la casse, !motif compris. Défaut : [], aucune restriction. Un fichier de code
+# reste hors portée sans enrich_code, même s'il correspond.
+# enrich_include = []
+
+# Motifs des fichiers à ne pas enrichir ; l'emporte sur enrich_include. Mêmes règles, le dernier
+# motif qui s'applique l'emporte (!motif). Défaut : la liste ci-dessous (tests, code généré,
+# migrations, fichiers minifiés, déclarations de types), documents Markdown compris. Écrite, la
+# clé remplace cette liste ; un tableau vide retire toute exclusion.
+# enrich_exclude = ["**/test/**", "**/__tests__/**", "*.spec.*", "*.test.*", "**/generated/**", "**/migrations/**", "*.min.js", "*.d.ts"]
+"#;
+const SCOPE_SECTION_PROJECT: &str = r#"# --- Portée d'enrichissement ---
+# Ces motifs réduisent les fichiers envoyés au LLM. Un fichier hors portée reste dans le graphe
+# avec ses nœuds et ses liens, n'est pas envoyé et ne compte pas « à enrichir » : exclude, lui,
+# retire aussi la structure.
+# Exception à « ce fichier > configuration personnelle » : ces clés s'ajoutent aux motifs de la
+# configuration personnelle et ne les remplacent pas. Un fichier doit passer les deux : un dépôt
+# ne peut que réduire la portée. Un tableau vide ou !src/test/** ne lève ni la liste par défaut,
+# ni un motif personnel. Pour enrichir vos tests, écrivez enrich_exclude dans votre configuration
+# personnelle. Sans LLM actif, ces clés n'ont aucun effet. Au plus 100 motifs par clé dans ce
+# fichier ; au-delà, c'est une erreur, signalée avant tout parcours.
+
+# Fichiers à enrichir : un fichier qui ne correspond à aucun de ces motifs est hors portée. Tableau
+# de textes, mêmes règles qu'exclude ci-dessus. Défaut : aucune restriction.
+# enrich_include = ["src/**"]
+
+# Fichiers à ne pas enrichir ; l'emporte sur enrich_include. Tableau de textes, mêmes règles
+# qu'exclude ci-dessus. Défaut : aucun motif ici ; la liste par défaut de la configuration
+# personnelle s'applique toujours.
+# enrich_exclude = ["legacy/"]
+"#;
+
+fn exact_block(text: &str, block: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let wanted: Vec<&str> = block.lines().collect();
+    let hits: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i..].starts_with(&wanted))
+        .collect();
+    assert_eq!(hits.len(), 1, "bloc exact absent ou répété");
+    let i = hits[0];
+    // ligne avant, ligne après (vides ou titres) pour contrôler la place
+    let before = if i >= 2 {
+        lines[i - 2..i].join("\n")
+    } else {
+        String::new()
+    };
+    let after = lines[i + wanted.len()..]
+        .iter()
+        .take(2)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    vec![before, after]
+}
+
+fn scope_patterns_of(line: &str) -> Vec<String> {
+    let (_, arr) = line.split_once(" = ").unwrap();
+    let v: toml::Value = toml::from_str(&format!("a = {arr}")).unwrap();
+    v["a"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn REQ208_AC1_section_de_portee_exacte_dans_les_deux_exemples() {
+    for (name, block) in [
+        ("config.toml", SCOPE_SECTION_CONFIG),
+        ("nephila.toml", SCOPE_SECTION_PROJECT),
+    ] {
+        let text = example(name);
+        exact_block(&text, block);
+        let sec = section(&text, "Portée d'enrichissement");
+        for key in ["enrich_include", "enrich_exclude"] {
+            let at = sec
+                .iter()
+                .position(|l| l.starts_with(&format!("# {key} =")))
+                .unwrap_or_else(|| panic!("{name} : {key} absente"));
+            let doc: Vec<&String> = sec[..at]
+                .iter()
+                .rev()
+                .take_while(|l| !l.is_empty())
+                .collect();
+            assert!(
+                doc.iter()
+                    .any(|l| l.contains("défaut :") || l.contains("Défaut :")),
+                "{name} : {key} sans « défaut : »"
+            );
+        }
+        // Lignes réactivées : valides.
+        if name == "nephila.toml" {
+            let (_t, r) = repo_with_project_file(&join(&reactivate(&project_example_lines())));
+            ProjectFile::load(&r).unwrap();
+        } else {
+            parse(&format!("provider = \"mock\"\n{}", join(&reactivate(&sec))));
+        }
+    }
+}
+
+#[test]
+fn REQ208_AC1_huit_motifs_de_config_toml_egaux_a_la_constante() {
+    let sec = section(&example("config.toml"), "Portée d'enrichissement");
+    let line = sec
+        .iter()
+        .find(|l| l.starts_with("# enrich_exclude ="))
+        .unwrap();
+    assert_eq!(
+        scope_patterns_of(line.strip_prefix("# ").unwrap()),
+        nephila::filter::DEFAULT_ENRICH_EXCLUDE
+    );
+}
+
+#[test]
+fn REQ208_AC3_config_toml_en_tete_section_et_valeurs_par_defaut() {
+    let text = example("config.toml");
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| *l == "# sont lues qu'ici.")
+        .unwrap();
+    assert_eq!(
+        lines[at + 1],
+        "# Seule exception : enrich_include et enrich_exclude, qu'un dépôt peut écrire lui aussi pour"
+    );
+    assert_eq!(
+        lines[at + 2],
+        "# réduire la portée de l'enrichissement (voir « Portée d'enrichissement »)."
+    );
+    let around = exact_block(&text, SCOPE_SECTION_CONFIG);
+    assert!(
+        around[0].ends_with("# max_calls = 500\n"),
+        "{:?}",
+        around[0]
+    );
+    assert_eq!(around[1], "\n# --- Réglages de query ask ---");
+    // Réactivées, les deux lignes donnent la configuration par défaut.
+    let sec = section(&text, "Portée d'enrichissement");
+    let c = parse(&format!("provider = \"mock\"\n{}", join(&reactivate(&sec))));
+    let d = parse("provider = \"mock\"\n");
+    assert_eq!(c.enrich_include, d.enrich_include);
+    assert_eq!(c.enrich_exclude, d.enrich_exclude);
+    assert!(c.enrich_include.is_empty());
+    assert_eq!(c.enrich_exclude, nephila::filter::DEFAULT_ENRICH_EXCLUDE);
+    // « Options communes » : toujours 13 lignes réactivées.
+    let common = reactivate(&section(&text, "Options communes"));
+    let active = common
+        .iter()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| key_of(l))
+        .filter(|k| *k != "tls_ca_cert")
+        .count();
+    assert_eq!(active, 13);
+    // 100 caractères au plus, sauf la ligne du tableau par défaut.
+    for l in &sec {
+        if !l.starts_with("# enrich_exclude =") {
+            assert!(l.chars().count() <= 100, "{l}");
+        }
+    }
+}
+
+#[test]
+fn REQ208_AC4_nephila_toml_section_de_portee() {
+    let text = example("nephila.toml");
+    let around = exact_block(&text, SCOPE_SECTION_PROJECT);
+    assert!(
+        around[0].ends_with("# exclude_defaults = false\n"),
+        "{:?}",
+        around[0]
+    );
+    assert_eq!(around[1], "\n# --- Réglages LLM du dépôt ---");
+    let sec = section(&text, "Portée d'enrichissement");
+    for l in &sec {
+        assert!(!l.starts_with("# Plafond dans ce fichier :"), "{l}");
+        assert!(!l.starts_with("# Priorité :"), "{l}");
+        assert!(!l.contains("enrich_code"), "{l}");
+        assert!(l.chars().count() <= 100, "{l}");
+    }
+    let joined = sec.join(" ");
+    let joined = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(joined.contains(&format!(
+        "Au plus {} motifs par clé",
+        nephila::filter::PROJECT_SCOPE_MAX_PATTERNS
+    )));
+    let (_t, r) = repo_with_project_file(&join(&reactivate(&sec)));
+    let loaded = ProjectFile::load(&r).unwrap();
+    assert_eq!(loaded.settings.enrich_include, ["src/**"]);
+    assert_eq!(loaded.settings.enrich_exclude, ["legacy/"]);
+}
+
+const README_KEY_LINES: [&str; 2] = [
+    "| `enrich_include` | Motifs des seuls fichiers à enrichir ; aussi dans `.nephila.toml` | aucune restriction |",
+    "| `enrich_exclude` | Motifs des fichiers à ne pas enrichir, qui l'emportent sur `enrich_include` ; écrite, elle remplace la liste par défaut ; aussi dans `.nephila.toml` | `**/test/**`, `**/__tests__/**`, `*.spec.*`, `*.test.*`, `**/generated/**`, `**/migrations/**`, `*.min.js`, `*.d.ts` |",
+];
+
+#[test]
+fn REQ208_AC2_AC5_readme_tables_et_phrases() {
+    let readme = repo_file("README.md");
+    let lines: Vec<&str> = readme.lines().collect();
+    // Table des clés : juste après enrich_code, une fois chacune.
+    let code = lines
+        .iter()
+        .position(|l| l.starts_with("| `enrich_code` |"))
+        .unwrap();
+    assert_eq!(lines[code + 1], README_KEY_LINES[0]);
+    assert_eq!(lines[code + 2], README_KEY_LINES[1]);
+    assert!(lines[code + 3].starts_with("| `thinking` |"));
+    for l in README_KEY_LINES {
+        assert_eq!(lines.iter().filter(|x| **x == l).count(), 1);
+    }
+    let default_col = README_KEY_LINES[1].rsplit(" | ").next().unwrap();
+    for p in nephila::filter::DEFAULT_ENRICH_EXCLUDE {
+        assert!(default_col.contains(&format!("`{p}`")));
+    }
+    let order: Vec<usize> = nephila::filter::DEFAULT_ENRICH_EXCLUDE
+        .iter()
+        .map(|p| default_col.find(&format!("`{p}`")).unwrap())
+        .collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]));
+    // Clés permises.
+    let permises = "puis la section `[ask]` en fin de fichier. S'y ajoutent `enrich_include` et `enrich_exclude`, qui ne peuvent que réduire [la portée de l'enrichissement](#enrichissement). Toute autre clé est une erreur.";
+    assert_eq!(readme.matches(permises).count(), 1);
+    // Table des plafonds : dernière ligne.
+    let cap = "| `enrich_include`, `enrich_exclude` | 100 motifs par clé |";
+    assert_eq!(readme.matches(cap).count(), 1);
+    let at = lines.iter().position(|l| *l == cap).unwrap();
+    assert_eq!(lines[at - 1], "| `ask.max_nodes` | 500 |");
+    assert!(lines[at + 1].is_empty());
+    assert!(lines[at + 2].starts_with("Ces plafonds ne valent que pour"));
+    assert!(cap.contains(&nephila::filter::PROJECT_SCOPE_MAX_PATTERNS.to_string()));
+    // Paragraphe de l'enrichissement, avant « Lots et gros fichiers ».
+    let para = "`enrich_include` et `enrich_exclude` réduisent cette portée par motifs (syntaxe d'`exclude`), sans toucher au graphe : un fichier hors portée garde ses nœuds et ses liens, n'est pas envoyé et ne compte pas « à enrichir » ; le bilan compte ces fichiers dans `fichiers hors portée d'enrichissement`. Changer ces motifs ne réenrichit rien. Exception à la priorité : ceux de `.nephila.toml` s'ajoutent à ceux de la configuration personnelle, liste par défaut comprise, si bien qu'un dépôt ne peut que réduire la portée ; pour enrichir vos tests, écrivez `enrich_exclude = []` dans la configuration personnelle.";
+    assert_eq!(readme.matches(para).count(), 1);
+    let p = lines.iter().position(|l| *l == para).unwrap();
+    assert_eq!(lines[p + 2], "### Lots et gros fichiers");
+    assert!(lines[p - 2].ends_with("réenrichit une fois chaque fichier de la portée."));
+    // Puce Plafond.
+    let plafond = lines
+        .iter()
+        .find(|l| l.starts_with("- **Plafond**"))
+        .unwrap();
+    let plafond_exact = "- **Plafond** : un fichier qui demanderait plus de 50 appels n'est pas envoyé et reste « à enrichir », nommé par l'avertissement `trop d'appels d'enrichissement`. Trois remèdes : `enrich_exclude`, qui garde sa structure dans le graphe, `exclude` dans `.nephila.toml`, qui la retire, ou un `max_chunk_chars` plus grand, qui réduit le nombre de morceaux pour tous les fichiers. Au-delà de 7500 nœuds, `max_chunk_chars` ne suffit plus.";
+    assert_eq!(readme.matches(plafond_exact).count(), 1);
+    assert_eq!(*plafond, plafond_exact);
+    assert!(!plafond.contains("seul `exclude` suffit"));
+    // Puce Vers 0.26.
+    let vers = lines
+        .iter()
+        .find(|l| l.starts_with("- **Vers 0.26**"))
+        .unwrap();
+    let phrase = "La liste par défaut d'`enrich_exclude` s'applique sans réglage, y compris aux documents Markdown : rien n'est réenvoyé ni retiré pour autant, et `enrich_exclude = []` dans la configuration personnelle rétablit la portée d'avant.";
+    assert_eq!(readme.matches(phrase).count(), 1);
+    assert!(vers.contains(&format!(
+        "puis lancez `nephila update`. {phrase} Si le `.nephila.toml`"
+    )));
+    assert!(vers.ends_with("ou `model_override = \"allow\"` dans la configuration personnelle."));
+    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
 }
