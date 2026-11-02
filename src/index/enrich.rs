@@ -1699,7 +1699,6 @@ pub(crate) fn enrich_with_stop(
 /// Passe de l'enrichissement (REQ-214, DEC-168). Le pilote du mode lot pose `Collect` et `Last` ;
 /// ni l'un ni l'autre ne veille sur Ctrl-C, c'est le pilote qui le fait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `Collect` et `Last` : posés par le pilote du mode lot (T-306).
 pub(crate) enum PassMode {
     /// Passe ordinaire du mode synchrone.
     Normal,
@@ -1712,7 +1711,7 @@ pub(crate) enum PassMode {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enrich_pass(
+pub(crate) fn enrich_pass(
     sources: Sources<'_>,
     files: &[FileRecord],
     opts: &IndexOptions,

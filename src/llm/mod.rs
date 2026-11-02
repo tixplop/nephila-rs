@@ -5,7 +5,7 @@ pub mod ask;
 pub mod batch;
 pub use batch::BatchLink;
 pub mod enrich;
-mod http;
+pub(crate) mod http;
 pub use http::{Retry, Tls};
 pub mod mock;
 pub mod openai;
