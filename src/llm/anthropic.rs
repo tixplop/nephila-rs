@@ -4,7 +4,7 @@ use super::schema::Reply;
 use super::{anthropic_usage, http, CallStats, Complete, Generation, Retry, Structured, Tls};
 use crate::config::Effort;
 use crate::error::{Error, Result, TRUNCATED};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
@@ -99,6 +99,8 @@ pub struct AnthropicLlm {
     retry: http::Retry,
     gen: Generation,
     structured: Structured,
+    structured_key: &'static str,
+    fallback: AtomicBool,
     summary_language: String,
 }
 
@@ -120,6 +122,8 @@ impl AnthropicLlm {
             retry: http::Retry::default(),
             gen,
             structured: Structured::Off,
+            structured_key: "structured_output",
+            fallback: AtomicBool::new(false),
             summary_language: crate::config::DEFAULT_SUMMARY_LANGUAGE.to_string(),
         }
     }
@@ -127,6 +131,12 @@ impl AnthropicLlm {
     /// Réglage effectif de `structured_output` (REQ-202).
     pub fn with_structured(mut self, structured: Structured) -> AnthropicLlm {
         self.structured = structured;
+        self
+    }
+
+    /// Clé qui a donné le réglage, nommée par la trace de repli (REQ-203).
+    pub fn with_structured_key(mut self, key: &'static str) -> AnthropicLlm {
+        self.structured_key = key;
         self
     }
 
@@ -165,18 +175,40 @@ impl Complete for AnthropicLlm {
         user: String,
         reply: Reply,
     ) -> Result<String> {
-        let schema = (self.structured != Structured::Off).then(|| reply.schema());
-        let format = schema.as_ref().map(|s| (reply.name(), s));
-        let body = request_body(&self.model, &self.gen, &system, &user, format);
-        let raw = http::send(
-            "anthropic",
-            self.request("POST", "/v1/messages"),
-            Some(&body),
-            &self.retry,
-            label,
-            stop,
-            stats,
-        )?;
+        let send = |with_schema: bool| {
+            let schema = with_schema.then(|| reply.schema());
+            let format = schema.as_ref().map(|s| (reply.name(), s));
+            let body = request_body(&self.model, &self.gen, &system, &user, format);
+            http::send(
+                "anthropic",
+                self.request("POST", "/v1/messages"),
+                Some(&body),
+                &self.retry,
+                label,
+                stop,
+                stats,
+            )
+        };
+        let with_schema = match self.structured {
+            Structured::Off => false,
+            Structured::On => true,
+            Structured::Auto => !self.fallback.load(Ordering::SeqCst),
+        };
+        let mut sent = send(with_schema);
+        if let Err(e) = &sent {
+            if with_schema
+                && http::schema_refused(
+                    "anthropic",
+                    e,
+                    self.structured,
+                    &self.fallback,
+                    self.structured_key,
+                )
+            {
+                sent = send(false);
+            }
+        }
+        let raw = sent?;
         let v = http::parse_body("anthropic", &raw)?;
         stats.record_response(anthropic_usage(&v));
         if v["stop_reason"] == "max_tokens" {
@@ -482,5 +514,182 @@ mod tests {
             json!({"effort": "medium", "format": fmt})
         );
         assert_eq!(b["thinking"], json!({"type": "adaptive"}));
+    }
+
+    use crate::llm::usage::recording_server;
+
+    const REFUSED_ANTHROPIC: &str =
+        r#"{"error":{"message":"output_config.format: not supported for this model"}}"#;
+    const OK_ANTHROPIC: &str =
+        r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"x"}]}"#;
+
+    fn llm_structured(base: String, structured: Structured, key: &'static str) -> AnthropicLlm {
+        AnthropicLlm::new(
+            Some(base),
+            "m".into(),
+            "k".into(),
+            10,
+            &Tls::default(),
+            2,
+            gen(false, Effort::Low, 100),
+        )
+        .with_structured(structured)
+        .with_structured_key(key)
+    }
+
+    fn expected_body(with_schema: bool) -> String {
+        let schema = Reply::File.schema();
+        let format = with_schema.then(|| (Reply::File.name(), &schema));
+        request_body("m", &gen(false, Effort::Low, 100), "s", "u", format).to_string()
+    }
+
+    fn same_json(a: &str, b: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(a).unwrap()
+            == serde_json::from_str::<serde_json::Value>(b).unwrap()
+    }
+
+    fn call(l: &AnthropicLlm, stats: &CallStats) -> Result<String> {
+        l.complete(None, None, stats, "s".into(), "u".into(), Reply::File)
+    }
+
+    fn rejected_code(e: &Error) -> u16 {
+        match e {
+            Error::Rejected { code, .. } => *code,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn req203_ac1_refus_du_schema_puis_appels_sans_schema() {
+        let (base, bodies) = recording_server(
+            vec![(400, REFUSED_ANTHROPIC.into()), (200, OK_ANTHROPIC.into())],
+            0,
+        );
+        let l = llm_structured(base, Structured::Auto, "structured_output");
+        for _ in 0..3 {
+            let stats = CallStats::default();
+            assert_eq!(call(&l, &stats).unwrap(), "x");
+        }
+        let b = bodies.lock().unwrap();
+        assert_eq!(b.len(), 4);
+        assert!(same_json(&b[0], &expected_body(true)));
+        for later in &b[1..] {
+            assert!(same_json(later, &expected_body(false)), "{later}");
+        }
+        assert_ne!(expected_body(true), expected_body(false));
+    }
+
+    #[test]
+    fn req203_ac2_refus_qui_ne_replie_pas() {
+        let cases: [(u16, &str, Structured); 4] = [
+            (400, r#"{"error":{}}"#, Structured::Auto),
+            (
+                400,
+                r#"{"error":{"message":"model unknown"}}"#,
+                Structured::Auto,
+            ),
+            (
+                422,
+                r#"{"error":{"message":"bad schema"}}"#,
+                Structured::Auto,
+            ),
+            (400, r#"{"error":{"message":"bad schema"}}"#, Structured::On),
+        ];
+        for (code, body, structured) in cases {
+            let (base, bodies) = recording_server(vec![(code, body.into())], 0);
+            let l = llm_structured(base, structured, "structured_output");
+            let stats = CallStats::default();
+            let (r, events) = crate::trace::capture(|| call(&l, &stats));
+            assert_eq!(rejected_code(&r.unwrap_err()), code, "{body}");
+            assert_eq!(bodies.lock().unwrap().len(), 1, "{code} {body}");
+            assert!(events.is_empty(), "{events:?}");
+        }
+    }
+
+    #[test]
+    fn req203_ac2_mots_cites_sans_casse() {
+        for message in ["Bad FORMAT", "invalid Schema here"] {
+            let body = format!(r#"{{"error":{{"message":"{message}"}}}}"#);
+            let (base, bodies) = recording_server(vec![(400, body), (200, OK_ANTHROPIC.into())], 0);
+            let l = llm_structured(base, Structured::Auto, "structured_output");
+            assert_eq!(call(&l, &CallStats::default()).unwrap(), "x", "{message}");
+            assert_eq!(bodies.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn req203_ac3_renvoi_refuse_a_son_tour() {
+        let (base, bodies) = recording_server(vec![(400, REFUSED_ANTHROPIC.into())], 0);
+        let l = llm_structured(base, Structured::Auto, "structured_output");
+        let e = call(&l, &CallStats::default()).unwrap_err();
+        assert_eq!(rejected_code(&e), 400);
+        assert!(e
+            .to_string()
+            .starts_with("requête refusée par anthropic (HTTP 400) sur "));
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn req203_ac4_deux_fils_refuses_une_seule_trace() {
+        let (base, bodies) = recording_server(
+            vec![
+                (400, REFUSED_ANTHROPIC.into()),
+                (400, REFUSED_ANTHROPIC.into()),
+                (200, OK_ANTHROPIC.into()),
+            ],
+            2,
+        );
+        let l = llm_structured(base, Structured::Auto, "structured_output");
+        let traces: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        let (r, events) = crate::trace::capture(|| call(&l, &CallStats::default()));
+                        assert_eq!(r.unwrap(), "x");
+                        events.len()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!(traces, 1);
+        assert_eq!(call(&l, &CallStats::default()).unwrap(), "x");
+        let b = bodies.lock().unwrap();
+        assert_eq!(b.len(), 5);
+        assert!(b[..2].iter().all(|x| same_json(x, &expected_body(true))));
+        assert!(b[2..].iter().all(|x| same_json(x, &expected_body(false))));
+    }
+
+    #[test]
+    fn req203_ac5_comptes_d_un_appel_replie() {
+        let (base, _) = recording_server(
+            vec![(400, REFUSED_ANTHROPIC.into()), (200, OK_ANTHROPIC.into())],
+            0,
+        );
+        let l = llm_structured(base, Structured::Auto, "structured_output");
+        let stats = CallStats::default();
+        assert_eq!(call(&l, &stats).unwrap(), "x");
+        assert_eq!(stats.sends(), 2);
+        assert!(stats.responded());
+    }
+
+    #[test]
+    fn req203_ac6_trace_de_repli() {
+        for key in ["structured_output", "ask.structured_output"] {
+            let (base, _) = recording_server(
+                vec![(400, REFUSED_ANTHROPIC.into()), (200, OK_ANTHROPIC.into())],
+                0,
+            );
+            let l = llm_structured(base, Structured::Auto, key);
+            let (r, events) = crate::trace::capture(|| {
+                call(&l, &CallStats::default()).unwrap();
+                call(&l, &CallStats::default()).unwrap()
+            });
+            assert_eq!(r, "x");
+            assert_eq!(
+                events,
+                [format!("sortie structurée: schéma JSON refusé par anthropic (HTTP 400), suite de la commande sans schéma ({key} = \"auto\")")]
+            );
+        }
     }
 }

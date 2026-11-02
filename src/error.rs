@@ -9,8 +9,14 @@ pub enum Error {
     InvalidKey(String),
     /// Requête refusée par le fournisseur (HTTP 400, 404, 413, 422 ; REQ-091, DEC-099) : jamais
     /// retentée, arrête l'envoi dès le premier appel. `message` est le texte E-19 complet,
-    /// `trace` le détail fixe de la trace (sans rien recopier de la réponse).
-    Rejected { message: String, trace: String },
+    /// `trace` le détail fixe de la trace (sans rien recopier de la réponse), `code` le statut HTTP
+    /// et `detail` l'`error.message` normalisé du fournisseur, s'il en a donné un (REQ-203).
+    Rejected {
+        message: String,
+        trace: String,
+        code: u16,
+        detail: Option<String>,
+    },
     /// Réponse HTTP 3xx du fournisseur (REQ-092, DEC-100) : jamais suivie ni retentée, arrête
     /// l'envoi dès le premier appel. Mêmes champs que `Rejected`.
     Redirected { message: String, trace: String },

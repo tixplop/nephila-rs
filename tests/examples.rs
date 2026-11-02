@@ -1147,7 +1147,8 @@ fn REQ157_AC10_AC14_readme_effort_sans_thinking() {
         "| Clé | `anthropic` | `openai` | `mock` |",
         "|---|---|---|---|",
     );
-    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert_eq!(cell(rows[3], 0), "`structured_output`");
     assert_eq!(cell(rows[0], 0), "`max_output_tokens`");
     assert_eq!(cell(rows[1], 0), "`thinking = true`");
     assert_eq!(cell(rows[2], 0), "`effort`");
@@ -2500,4 +2501,28 @@ fn req205_ac1_ac3_blocs_structured_output_de_l_exemple_personnel() {
     );
     // Le fichier du dépôt ne la contient pas.
     assert!(!example("nephila.toml").contains("structured_output"));
+}
+
+/// AC-205-2 : lignes exactes des items 42 à 44 du README, une fois, et taille.
+#[test]
+fn req205_ac2_readme_lignes_structured_output() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 47_000, "README : {} octets", readme.len());
+    let lines: Vec<&str> = readme.lines().collect();
+    let count = |l: &str| lines.iter().filter(|x| **x == l).count();
+    assert_eq!(count("| `structured_output` | Schéma JSON imposé aux réponses d'enrichissement : `\"auto\"` l'envoie sans `base_url` et, s'il est refusé (HTTP 400), s'en passe pour la commande ; `\"on\"` l'envoie toujours, et un refus arrête l'envoi ; `\"off\"` jamais ; configuration personnelle seulement | `\"auto\"` |"), 1);
+    let pos = lines
+        .iter()
+        .position(|l| l.starts_with("| `effort` | `output_config.effort`"))
+        .unwrap();
+    assert_eq!(
+        lines[pos + 1],
+        "| `structured_output` | `output_config.format` | `response_format` | sans effet |"
+    );
+    assert_eq!(
+        count("| `structured_output` | `output_config.format` | `response_format` | sans effet |"),
+        1
+    );
+    let phrase = "bornent le contexte envoyé. Dans la configuration personnelle seulement, `structured_output` (défaut `\"off\"`, même si la clé du premier niveau est écrite) impose aussi le schéma JSON à la réponse de `query ask`. Priorité :";
+    assert_eq!(readme.matches(phrase).count(), 1);
 }

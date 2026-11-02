@@ -2829,6 +2829,8 @@ mod tests {
         Error::Rejected {
             message: "requête refusée par openai (HTTP 400) sur u ; v".into(),
             trace: "requête refusée par openai (HTTP 400)".into(),
+            code: 400,
+            detail: None,
         }
     }
 

@@ -157,10 +157,33 @@ pub fn calls_line(t: &LlmTotals) -> String {
 /// Faux serveur HTTP des tests : une réponse par connexion, dans l'ordre ; la dernière se répète.
 #[cfg(test)]
 pub(crate) fn fake_server(replies: Vec<(u16, String)>) -> String {
+    recording_server(replies, 0).0
+}
+
+/// Comme `fake_server`, et rend aussi les corps reçus, dans l'ordre d'arrivée. Les `hold`
+/// premières requêtes sont lues toutes avant que la première réponse parte (appels simultanés).
+#[cfg(test)]
+pub(crate) fn recording_server(
+    replies: Vec<(u16, String)>,
+    hold: usize,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = bodies.clone();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
+        let reply = |i: usize, s: &mut std::net::TcpStream| {
+            let (code, body) = &replies[i.min(replies.len() - 1)];
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        };
+        let mut held = Vec::new();
         for (i, stream) in listener.incoming().enumerate() {
             let Ok(mut s) = stream else { return };
             let mut head = Vec::new();
@@ -179,17 +202,22 @@ pub(crate) fn fake_server(replies: Vec<(u16, String)>) -> String {
                 .unwrap_or(0);
             let mut rest = vec![0u8; len];
             let _ = s.read_exact(&mut rest);
-            let (code, body) = &replies[i.min(replies.len() - 1)];
-            let _ = s.write_all(
-                format!(
-                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            );
+            seen.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&rest).into_owned());
+            if i < hold {
+                held.push(s);
+                if held.len() == hold {
+                    for (j, mut h) in held.drain(..).enumerate() {
+                        reply(j, &mut h);
+                    }
+                }
+            } else {
+                reply(i, &mut s);
+            }
         }
     });
-    base
+    (base, bodies)
 }
 
 #[cfg(test)]

@@ -398,6 +398,37 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
     }
 }
 
+/// Repli de `structured_output = "auto"` (REQ-203, DEC-163) : `true` si `e` est un HTTP 400 dont
+/// le message du fournisseur cite `format` ou `schema` et que `structured` est `Auto` ; la trace
+/// n'est écrite qu'au premier refus de la commande (`fallback`). L'appelant renvoie alors le corps
+/// sans le schéma.
+pub fn schema_refused(
+    provider: &str,
+    e: &Error,
+    structured: super::Structured,
+    fallback: &AtomicBool,
+    key: &str,
+) -> bool {
+    let Error::Rejected {
+        code: 400,
+        detail: Some(d),
+        ..
+    } = e
+    else {
+        return false;
+    };
+    let d = d.to_ascii_lowercase();
+    if structured != super::Structured::Auto || !(d.contains("format") || d.contains("schema")) {
+        return false;
+    }
+    if !fallback.swap(true, Ordering::SeqCst) {
+        crate::trace!(
+            "sortie structurée: schéma JSON refusé par {provider} (HTTP 400), suite de la commande sans schéma ({key} = \"auto\")"
+        );
+    }
+    true
+}
+
 /// Indice de fin du texte d'une requête refusée (E-19) : seule source.
 const REJECTED_HINT: &str = "vérifiez model, thinking, effort et max_output_tokens";
 
@@ -440,6 +471,8 @@ fn rejected(provider: &str, code: u16, url: &str, detail: Option<&str>) -> Error
     Error::Rejected {
         message,
         trace: head,
+        code,
+        detail: detail.map(String::from),
     }
 }
 

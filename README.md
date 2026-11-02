@@ -388,10 +388,11 @@ Ce que chaque clé envoie à chaque fournisseur :
 | `max_output_tokens` | `max_tokens` | `max_completion_tokens` | sans effet |
 | `thinking = true` | `"thinking": {"type": "adaptive"}` | `reasoning_effort`, même si `effort` n'est pas écrit | sans effet |
 | `effort` | `output_config.effort` ; sans `thinking`, rien pour un modèle sorti avant Claude Opus 4.5 (`claude-sonnet-4-5`, par exemple) | `reasoning_effort` ; sans `thinking`, seulement si `effort` est écrit | sans effet |
+| `structured_output` | `output_config.format` | `response_format` | sans effet |
 
 Avec `effort = "default"`, aucun niveau n'est envoyé, à aucun fournisseur, et le modèle garde le sien. Un modèle ou un serveur qui refuse ces champs, ou une limite de 16384 jetons, refuse la requête (HTTP 400) : voir [Arrêt de l'envoi](#arrêt-de-lenvoi).
 
-**Section `[ask]`** : écrite en fin de configuration personnelle ou de `.nephila.toml`, elle ne règle que `query ask`. `model`, `thinking`, `effort` et `max_output_tokens` y remplacent les clés du premier niveau ; `max_context_chars` (caractères, au moins 1000, défaut 12000), `max_seeds` (nœuds de départ, défaut 20) et `max_nodes` (nœuds, défaut 60) bornent le contexte envoyé. Priorité : `--context-chars` > `[ask]` de `.nephila.toml` > `[ask]` personnel > premier niveau > défaut. Sans `max_nodes`, un `max_context_chars` plus grand garde 60 nœuds au plus. Un dépôt cloné peut choisir le modèle de `query ask` : `query ask --verbose` montre les valeurs effectives.
+**Section `[ask]`** : écrite en fin de configuration personnelle ou de `.nephila.toml`, elle ne règle que `query ask`. `model`, `thinking`, `effort` et `max_output_tokens` y remplacent les clés du premier niveau ; `max_context_chars` (caractères, au moins 1000, défaut 12000), `max_seeds` (nœuds de départ, défaut 20) et `max_nodes` (nœuds, défaut 60) bornent le contexte envoyé. Dans la configuration personnelle seulement, `structured_output` (défaut `"off"`, même si la clé du premier niveau est écrite) impose aussi le schéma JSON à la réponse de `query ask`. Priorité : `--context-chars` > `[ask]` de `.nephila.toml` > `[ask]` personnel > premier niveau > défaut. Sans `max_nodes`, un `max_context_chars` plus grand garde 60 nœuds au plus. Un dépôt cloné peut choisir le modèle de `query ask` : `query ask --verbose` montre les valeurs effectives.
 
 La clé d'API n'est jamais écrite dans le fichier. `nephila` ne la vérifie pas avant le traitement : une clé refusée est constatée au premier appel, après l'extraction.
 

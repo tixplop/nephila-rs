@@ -381,6 +381,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     gen,
                 )
                 .with_structured(structured)
+                .with_structured_key(config.structured_key)
                 .with_retry(retry)
                 .with_summary_language(config.summary_language.clone()),
             ))
@@ -398,6 +399,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     gen,
                 )
                 .with_structured(structured)
+                .with_structured_key(config.structured_key)
                 .with_retry(retry)
                 .with_summary_language(config.summary_language.clone()),
             ))
