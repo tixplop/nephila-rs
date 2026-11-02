@@ -41,6 +41,61 @@ pub struct Pending {
     pub body: Value,
 }
 
+/// Protocole du lot d'un fournisseur (REQ-212, REQ-213) : création, état, résultats.
+/// `stop` interrompt les attentes des nouveaux essais (REQ-095).
+pub trait BatchApi: Send + Sync {
+    /// Nom du fournisseur (`anthropic`, `openai`).
+    fn provider(&self) -> &str;
+    /// Adresse effective du serveur, sans barre finale.
+    fn address(&self) -> String;
+    /// Crée un lot de ces requêtes : identifiant du lot et octets envoyés.
+    fn create(
+        &self,
+        requests: &[Pending],
+        stop: &AtomicBool,
+    ) -> std::result::Result<(String, usize), CreateError>;
+    /// État du lot `id`.
+    fn status(&self, id: &str, stop: &AtomicBool) -> Result<LotStatus>;
+    /// Réponses d'un lot fini, par `custom_id`. Les requêtes sans ligne n'y sont pas.
+    fn results(&self, status: &LotStatus, stop: &AtomicBool) -> Result<Vec<(String, Answer)>>;
+}
+
+/// Échec de la création d'un lot.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CreateError {
+    /// HTTP 404, 405 ou 501 : le serveur n'a pas de mode lot (E-31).
+    NoBatchMode { code: u16, url: String },
+    /// Création perdue ou en échec transitoire : `cause` = `réseau`, `HTTP <code>`, ... (AC-214-11).
+    Failed { cause: String },
+    /// Tout autre arrêt (clé refusée, requête refusée, redirection, réponse illisible).
+    Other(Error),
+}
+
+/// État d'un lot du fournisseur.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LotStatus {
+    pub id: String,
+    /// Statut du fournisseur, tel quel.
+    pub status: String,
+    pub finished: bool,
+    /// Requêtes traitées (`<k>`) sur `total` (`<n>`).
+    pub done: usize,
+    pub total: usize,
+    /// Lot entier refusé : toutes ses requêtes ont cette issue.
+    pub failure: Option<Answer>,
+    /// Issue d'une requête sans ligne de résultat (tableau d'A-17).
+    pub default_answer: Answer,
+    /// Où lire les résultats (chemins sur le serveur configuré).
+    pub files: Vec<String>,
+}
+
+/// Le lot d'un fournisseur et le collecteur qui reçoit ses réponses.
+#[derive(Clone, Copy)]
+pub struct BatchLink<'a> {
+    pub api: &'a dyn BatchApi,
+    pub collector: &'a Collector,
+}
+
 #[derive(Default)]
 struct State {
     answers: HashMap<String, Answer>,

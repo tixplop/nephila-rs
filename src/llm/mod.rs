@@ -3,6 +3,7 @@
 pub mod anthropic;
 pub mod ask;
 pub mod batch;
+pub use batch::BatchLink;
 pub mod enrich;
 mod http;
 pub use http::{Retry, Tls};
@@ -30,6 +31,27 @@ use enrich::{
 pub use enrich::{Enrichment, Excerpt, LotItem};
 pub use retry::{with_format_retries, with_note, FormatFault};
 use schema::Reply;
+
+/// Variable de test qui remplace le sondage d'un lot du fournisseur, une fois par minute
+/// (millisecondes).
+pub const BATCH_POLL_ENV: &str = "NEPHILA_BATCH_POLL_MS";
+
+/// Délai entre deux sondages d'un lot du fournisseur (REQ-212) : 60 s, ou `NEPHILA_BATCH_POLL_MS`
+/// (absente ou vide : 60 s ; mal formée : erreur).
+pub fn poll_interval() -> Result<std::time::Duration> {
+    poll_value(std::env::var(BATCH_POLL_ENV).ok().as_deref())
+}
+
+fn poll_value(value: Option<&str>) -> Result<std::time::Duration> {
+    match value.filter(|v| !v.is_empty()) {
+        None => Ok(std::time::Duration::from_secs(60)),
+        Some(v) => v
+            .trim()
+            .parse()
+            .map(std::time::Duration::from_millis)
+            .map_err(|_| Error::bad_integer_env(BATCH_POLL_ENV, v)),
+    }
+}
 
 /// Options de génération communes aux fournisseurs HTTP (REQ-058, DEC-072).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +82,10 @@ pub(crate) fn structured(config: &Config) -> Structured {
 
 /// Fournisseur LLM. Les implémentations sont partagées entre threads.
 pub trait Llm: Send + Sync {
+    /// Mode lot du fournisseur (DEC-168) : `None` quand il n'en a pas ou que le collecteur manque.
+    fn batch(&self) -> Option<BatchLink<'_>> {
+        None
+    }
     /// Modèle effectif, qui entre dans l'empreinte d'enrichissement (REQ-049). Vide par défaut.
     fn model(&self) -> &str {
         ""
@@ -130,6 +156,10 @@ pub trait Llm: Send + Sync {
 
 /// Appel de complétion d'un adaptateur HTTP : le reste de `Llm` s'en déduit (REQ-127).
 pub(crate) trait Complete: Send + Sync {
+    /// Mode lot de l'adaptateur (voir `Llm::batch`).
+    fn batch(&self) -> Option<BatchLink<'_>> {
+        None
+    }
     /// Langue des résumés demandée dans les prompts système (REQ-172).
     fn summary_language(&self) -> &str;
     /// Envoie la consigne système et la requête, retourne le texte de la réponse.
@@ -152,6 +182,10 @@ const KEY_FILES: &str = "files";
 const KEY_FOUND: &str = "found";
 
 impl<T: Complete> Llm for T {
+    fn batch(&self) -> Option<BatchLink<'_>> {
+        Complete::batch(self)
+    }
+
     fn summary_language(&self) -> &str {
         Complete::summary_language(self)
     }
@@ -265,6 +299,10 @@ struct WithModel {
 }
 
 impl Llm for WithModel {
+    fn batch(&self) -> Option<BatchLink<'_>> {
+        self.inner.batch()
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -407,6 +445,25 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                 .with_summary_language(config.summary_language.clone()),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn req212_ac2_poll_interval_values() {
+        assert_eq!(poll_value(None).unwrap(), Duration::from_secs(60));
+        assert_eq!(poll_value(Some("")).unwrap(), Duration::from_secs(60));
+        assert_eq!(poll_value(Some("25")).unwrap(), Duration::from_millis(25));
+        assert_eq!(poll_value(Some(" 7 ")).unwrap(), Duration::from_millis(7));
+        let e = poll_value(Some("vite")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "NEPHILA_BATCH_POLL_MS : entier attendu, reçu « vite »"
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 //! Adaptateur Anthropic Messages (REQ-002).
 
-use super::batch::Collector;
+use super::batch::{Answer, BatchApi, BatchLink, Collector, CreateError, LotStatus, Pending};
 use super::schema::Reply;
 use super::{anthropic_usage, http, CallStats, Complete, Generation, Retry, Structured, Tls};
 use crate::config::Effort;
@@ -170,7 +170,157 @@ impl AnthropicLlm {
     }
 }
 
+/// Identifiant de lot sûr à placer dans un chemin d'URL.
+fn check_id(id: &str) -> Result<&str> {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        Ok(id)
+    } else {
+        Err(Error::Format(
+            "identifiant de lot de anthropic illisible".into(),
+        ))
+    }
+}
+
+/// Compteur `name` de `request_counts`.
+fn count(v: &serde_json::Value, name: &str) -> Result<usize> {
+    v["request_counts"][name]
+        .as_u64()
+        .map(|n| n as usize)
+        .ok_or_else(|| Error::Format(format!("état de lot de anthropic sans {name}")))
+}
+
+fn failed(cause: &str) -> Answer {
+    Answer::Failed {
+        cause: cause.into(),
+        refused: None,
+    }
+}
+
+/// Réponse d'une ligne de résultat (`result`) d'un lot (tableau d'A-17).
+fn line_answer(result: &serde_json::Value) -> Answer {
+    match result["type"].as_str() {
+        Some("succeeded") => Answer::Raw(result["message"].to_string()),
+        Some("expired") => failed("expirée"),
+        Some("canceled") => failed("annulée"),
+        Some("errored") => {
+            let e = &result["error"];
+            let e = if e["error"].is_object() {
+                &e["error"]
+            } else {
+                e
+            };
+            let kind = http::provider_text(e["type"].as_str().unwrap_or("erreur"));
+            let message = http::provider_text(e["message"].as_str().unwrap_or(""));
+            let refused = (kind == "invalid_request_error").then(|| message.clone());
+            let cause = if message.is_empty() {
+                kind
+            } else {
+                format!("{kind} : {message}")
+            };
+            Answer::Failed { cause, refused }
+        }
+        _ => failed("sans réponse"),
+    }
+}
+
+impl BatchApi for AnthropicLlm {
+    fn provider(&self) -> &str {
+        "anthropic"
+    }
+
+    fn address(&self) -> String {
+        self.base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_BASE_URL)
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    fn create(
+        &self,
+        requests: &[Pending],
+        stop: &AtomicBool,
+    ) -> std::result::Result<(String, usize), CreateError> {
+        let items: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|p| serde_json::json!({"custom_id": p.id, "params": p.body}))
+            .collect();
+        let body = serde_json::json!({ "requests": items });
+        let text = http::send_create(
+            "anthropic",
+            self.request("POST", "/v1/messages/batches"),
+            &body,
+            &self.retry,
+            stop,
+        )?;
+        let id = http::parse_body("anthropic", &text)
+            .and_then(|v| match v["id"].as_str() {
+                Some(id) => check_id(id).map(String::from),
+                None => Err(Error::Format(
+                    "réponse de anthropic sans identifiant de lot".into(),
+                )),
+            })
+            .map_err(CreateError::Other)?;
+        Ok((id, body.to_string().len()))
+    }
+
+    fn status(&self, id: &str, stop: &AtomicBool) -> Result<LotStatus> {
+        let id = check_id(id)?;
+        let text = http::send_all(
+            "anthropic",
+            self.request("GET", &format!("/v1/messages/batches/{id}")),
+            &self.retry,
+            stop,
+        )?;
+        let v = http::parse_body("anthropic", &text)?;
+        let status = v["processing_status"].as_str().ok_or_else(|| {
+            Error::Format("état de lot de anthropic sans processing_status".into())
+        })?;
+        let done = ["succeeded", "errored", "canceled", "expired"]
+            .iter()
+            .map(|n| count(&v, n))
+            .sum::<Result<usize>>()?;
+        Ok(LotStatus {
+            id: id.into(),
+            status: status.into(),
+            finished: status == "ended",
+            done,
+            total: done + count(&v, "processing")?,
+            failure: None,
+            default_answer: failed("sans réponse"),
+            // L'adresse des résultats est construite ici : `results_url` n'est jamais suivie.
+            files: vec![format!("/v1/messages/batches/{id}/results")],
+        })
+    }
+
+    fn results(&self, status: &LotStatus, stop: &AtomicBool) -> Result<Vec<(String, Answer)>> {
+        let mut out = Vec::new();
+        for file in &status.files {
+            let text = http::send_all("anthropic", self.request("GET", file), &self.retry, stop)?;
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let v = http::parse_body("anthropic", line)?;
+                let custom_id = v["custom_id"].as_str().ok_or_else(|| {
+                    Error::Format("ligne de résultat de anthropic sans custom_id".into())
+                })?;
+                out.push((custom_id.to_string(), line_answer(&v["result"])));
+            }
+        }
+        Ok(out)
+    }
+}
+
 impl Complete for AnthropicLlm {
+    fn batch(&self) -> Option<BatchLink<'_>> {
+        self.collector.as_deref().map(|collector| BatchLink {
+            api: self,
+            collector,
+        })
+    }
+
     fn summary_language(&self) -> &str {
         &self.summary_language
     }

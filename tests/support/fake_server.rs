@@ -252,9 +252,9 @@ fn handshake(stream: std::net::TcpStream, cfg: &Arc<rustls::ServerConfig>) -> Op
 }
 
 /// Requête lue : méthode, chemin, en-têtes (minuscules), corps.
-type RawRequest = (String, String, HashMap<String, String>, Vec<u8>);
+pub type RawRequest = (String, String, HashMap<String, String>, Vec<u8>);
 
-fn read_request<R: BufRead>(reader: &mut R) -> Option<RawRequest> {
+pub fn read_request<R: BufRead>(reader: &mut R) -> Option<RawRequest> {
     let mut line = String::new();
     if reader.read_line(&mut line).unwrap_or(0) == 0 {
         return None;
@@ -281,7 +281,7 @@ fn read_request<R: BufRead>(reader: &mut R) -> Option<RawRequest> {
     Some((method, path, headers, body))
 }
 
-fn record(rec: &Arc<Mutex<Vec<Recorded>>>, (method, path, headers, body): RawRequest) -> usize {
+pub fn record(rec: &Arc<Mutex<Vec<Recorded>>>, (method, path, headers, body): RawRequest) -> usize {
     let mut r = rec.lock().unwrap();
     r.push(Recorded {
         at: Instant::now(),

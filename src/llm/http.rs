@@ -11,6 +11,7 @@ use rustls::crypto::{ring, CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 
+use super::batch::CreateError;
 use super::usage::CallStats;
 use crate::error::{Error, Result};
 
@@ -232,11 +233,45 @@ pub fn send(
     stop: Option<&AtomicBool>,
     stats: &CallStats,
 ) -> Result<String> {
+    send_with(provider, req, body, retry, label, stop, stats, false)
+}
+
+/// Comme `send` pour un `GET`, mais le corps est lu en entier : les résultats d'un lot du
+/// fournisseur dépassent la limite de 10 Mo d'`into_string` (REQ-214).
+pub fn send_all(
+    provider: &str,
+    req: ureq::Request,
+    retry: &Retry,
+    stop: &AtomicBool,
+) -> Result<String> {
+    send_with(
+        provider,
+        req,
+        None,
+        retry,
+        None,
+        Some(stop),
+        &CallStats::default(),
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_with(
+    provider: &str,
+    req: ureq::Request,
+    body: Option<&serde_json::Value>,
+    retry: &Retry,
+    label: Option<&str>,
+    stop: Option<&AtomicBool>,
+    stats: &CallStats,
+    unlimited: bool,
+) -> Result<String> {
     let mut k = 0;
     let mut definitive = false;
     loop {
         stats.add_send();
-        match attempt(provider, req.clone(), body) {
+        match attempt(provider, req.clone(), body, unlimited) {
             Attempt::Done(r) => return r,
             Attempt::Retry { error, .. } if definitive => return Err(error),
             Attempt::Retry {
@@ -272,6 +307,93 @@ pub fn send(
     }
 }
 
+/// Création d'un lot du fournisseur : envoi unique, renvoyé seulement sur HTTP 429, 503 ou 529
+/// (REQ-214) ; une réponse perdue ne se rejoue pas, le lot pourrait être payé deux fois.
+pub fn send_create(
+    provider: &str,
+    req: ureq::Request,
+    body: &serde_json::Value,
+    retry: &Retry,
+    stop: &AtomicBool,
+) -> std::result::Result<String, CreateError> {
+    let url = req.url().to_string();
+    let mut k = 0;
+    loop {
+        let result = req
+            .clone()
+            .set("content-type", "application/json")
+            .send_string(&body.to_string());
+        let failed = |cause: &str| CreateError::Failed {
+            cause: cause.into(),
+        };
+        let (code, retry_after) = match result {
+            Ok(resp) if (300..400).contains(&resp.status()) => {
+                let location = resp.header("location").map(provider_text);
+                return Err(CreateError::Other(redirected(
+                    provider,
+                    resp.status(),
+                    location.as_deref(),
+                )));
+            }
+            Ok(resp) => {
+                return match read_text(resp, true) {
+                    Ok(text) => Ok(text),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        Err(failed("délai dépassé"))
+                    }
+                    Err(_) => Err(failed("réseau")),
+                }
+            }
+            Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+                return Err(CreateError::Other(invalid_key(provider, code)))
+            }
+            Err(ureq::Error::Status(code @ (404 | 405 | 501), _)) => {
+                return Err(CreateError::NoBatchMode { code, url })
+            }
+            Err(ureq::Error::Status(code @ (400 | 413 | 422), resp)) => {
+                let detail = resp
+                    .into_string()
+                    .ok()
+                    .and_then(|body| provider_error_message(&body));
+                return Err(CreateError::Other(rejected(
+                    provider,
+                    code,
+                    &url,
+                    detail.as_deref(),
+                )));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                if !matches!(code, 429 | 503 | 529) {
+                    return Err(failed(&format!("HTTP {code}")));
+                }
+                (code, resp.header("retry-after").map(String::from))
+            }
+            Err(e) if is_timeout(&e) => return Err(failed("délai dépassé")),
+            Err(e) => {
+                return Err(match certificate_error(&e) {
+                    Some(cause) => CreateError::Other(certificate_refused(provider, &url, &cause)),
+                    None => failed("réseau"),
+                })
+            }
+        };
+        k += 1;
+        let delay = if k > MAX_RETRIES || stop.load(Ordering::SeqCst) {
+            None
+        } else {
+            retry_delay(k, retry.base, retry_after.as_deref(), jitter())
+        };
+        match delay {
+            Some(d) if !wait(d, Some(stop)) => {}
+            _ => return Err(failed(&format!("HTTP {code}"))),
+        }
+    }
+}
+
 /// Durée maximale d'une tranche d'attente (REQ-095).
 const WAIT_SLICE: Duration = Duration::from_millis(100);
 
@@ -296,8 +418,38 @@ pub fn wait(d: Duration, stop: Option<&AtomicBool>) -> bool {
     }
 }
 
+/// Clé d'API refusée (E-12) : texte unique.
+fn invalid_key(provider: &str, code: u16) -> Error {
+    Error::InvalidKey(format!(
+        "clé d'API refusée par {provider} (HTTP {code}) ; vérifiez la variable désignée par api_key_env"
+    ))
+}
+
+/// Certificat du serveur refusé : texte unique.
+fn certificate_refused(provider: &str, url: &str, cause: &rustls::Error) -> Error {
+    Error::Network(format!(
+        "certificat du serveur refusé par {provider} sur {url} : {cause} ; \
+         ajoutez l'autorité avec tls_ca_cert, ou désactivez le contrôle avec tls_insecure = true"
+    ))
+}
+
+/// Corps de la réponse en texte : `into_string` s'arrête à 10 Mo, `into_reader` non.
+fn read_text(resp: ureq::Response, unlimited: bool) -> std::io::Result<String> {
+    if !unlimited {
+        return resp.into_string();
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut resp.into_reader(), &mut text)?;
+    Ok(text)
+}
+
 /// Un envoi de la requête.
-fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>) -> Attempt {
+fn attempt(
+    provider: &str,
+    req: ureq::Request,
+    body: Option<&serde_json::Value>,
+    unlimited: bool,
+) -> Attempt {
     let url = req.url().to_string();
     let result = match body {
         Some(b) => req
@@ -315,7 +467,7 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
                 location.as_deref(),
             )))
         }
-        Ok(resp) => match resp.into_string() {
+        Ok(resp) => match read_text(resp, unlimited) {
             Ok(text) => Attempt::Done(Ok(text)),
             Err(e) => match e.kind() {
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
@@ -344,9 +496,9 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
                 }
             },
         },
-        Err(ureq::Error::Status(code @ (401 | 403), _)) => Attempt::Done(Err(Error::InvalidKey(format!(
-            "clé d'API refusée par {provider} (HTTP {code}) ; vérifiez la variable désignée par api_key_env"
-        )))),
+        Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+            Attempt::Done(Err(invalid_key(provider, code)))
+        }
         Err(ureq::Error::Status(code @ (400 | 404 | 413 | 422), resp)) => {
             // Corps lu une fois ; une lecture qui échoue donne un message sans partie `error.message`.
             let detail = resp
@@ -377,12 +529,10 @@ fn attempt(provider: &str, req: ureq::Request, body: Option<&serde_json::Value>)
             "délai dépassé avec {provider} sur {url} ({e}) ; augmentez timeout_secs"
         )))),
         Err(e) => match certificate_error(&e) {
-            Some(cause) => Attempt::Done(Err(Error::Network(format!(
-                "certificat du serveur refusé par {provider} sur {url} : {cause} ; \
-                 ajoutez l'autorité avec tls_ca_cert, ou désactivez le contrôle avec tls_insecure = true"
-            )))),
+            Some(cause) => Attempt::Done(Err(certificate_refused(provider, &url, &cause))),
             None => {
-                let error = Error::Network(format!("erreur réseau avec {provider} sur {url} : {e}"));
+                let error =
+                    Error::Network(format!("erreur réseau avec {provider} sur {url} : {e}"));
                 if is_transient(&e) {
                     Attempt::Retry {
                         error,
