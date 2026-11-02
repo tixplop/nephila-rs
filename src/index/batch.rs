@@ -8,11 +8,12 @@ use crate::llm::batch::{
 };
 use crate::llm::{http, poll_interval, Llm};
 use crate::model::FileRecord;
+use crate::progress::{Meter, Phase};
 use crate::store::{address_fingerprint, EnrichBatch, Store};
 use crate::trace;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Erreur E-31 (sans le préfixe `erreur: `) : seule source du texte.
 pub(crate) const E31: &str =
@@ -32,6 +33,8 @@ const A16: &str = "Ctrl-C reçu : plus rien ne part et les lots du fournisseur d
 struct Lot {
     id: String,
     requests: Option<Vec<Pending>>,
+    /// Création du lot, ou reprise pour un lot enregistré : départ du temps de la trace `fini`.
+    started: Instant,
 }
 
 /// Suite de la commande après une étape.
@@ -68,6 +71,7 @@ pub(crate) fn enrich_batched(
     store: &mut Store,
     report: &mut BuildReport,
 ) -> Result<()> {
+    report.batch = true;
     let Some(link) = llm.batch() else {
         report.refused = Some(Error::Message(E31.to_string()));
         return Ok(());
@@ -88,6 +92,7 @@ pub(crate) fn enrich_batched(
             report,
             registered,
             failures: 0,
+            sent: 0,
         };
         let result = driver.run(sources, files, opts, llm);
         done.store(true, Ordering::SeqCst);
@@ -122,6 +127,8 @@ struct Driver<'a> {
     registered: Vec<EnrichBatch>,
     /// Échecs de suivi consécutifs, remis à zéro par une réussite.
     failures: usize,
+    /// Requêtes envoyées par cette commande (les lots repris n'y comptent pas, REQ-216).
+    sent: usize,
 }
 
 impl Driver<'_> {
@@ -153,6 +160,8 @@ impl Driver<'_> {
             return Ok(());
         }
         let stop = self.stop;
+        let mut first = true;
+        let mut capped = None;
         loop {
             if self.signalled() {
                 self.interrupt();
@@ -181,6 +190,23 @@ impl Driver<'_> {
             if pending.is_empty() {
                 break;
             }
+            if let Some(m) = opts.max_calls {
+                if first && pending.len() > m {
+                    // E-32 : rien ne part, aucune dernière passe.
+                    self.report.refused = Some(Error::Message(format!(
+                        "plafond de {m} appels dépassé : le lot du fournisseur compte {} requêtes, aucune envoyée ; relancez nephila update --batch --max-calls {} ou réduisez la portée avec enrich_exclude",
+                        pending.len(),
+                        pending.len()
+                    )));
+                    return Ok(());
+                }
+                if self.sent + pending.len() > m {
+                    // Le lot ne part pas du tout : ses fichiers restent à enrichir (A-10).
+                    capped = Some(m);
+                    break;
+                }
+            }
+            first = false;
             let mut lots: Vec<Lot> = Vec::new();
             for requests in split_lots(pending, MAX_LOT_LINES, MAX_LOT_BYTES) {
                 if self.signalled() {
@@ -188,7 +214,8 @@ impl Driver<'_> {
                     return Ok(());
                 }
                 match self.link.api.create(&requests, stop) {
-                    Ok((id, _bytes)) => {
+                    Ok((id, bytes)) => {
+                        self.sent += requests.len();
                         // Avant toute autre écriture : l'identifiant permet de reprendre.
                         self.registered.push(EnrichBatch {
                             id: id.clone(),
@@ -200,9 +227,15 @@ impl Driver<'_> {
                             "lot du fournisseur envoyé : {} requêtes, identifiant {id}, réponse en 24 h au plus ; Ctrl-C ne perd rien : relancez nephila update --batch pour reprendre",
                             requests.len()
                         ));
+                        trace!(
+                            "lot du fournisseur: créé {}, {} requêtes, {bytes} octets",
+                            crate::escape::data(&id),
+                            requests.len()
+                        );
                         lots.push(Lot {
                             id,
                             requests: Some(requests),
+                            started: Instant::now(),
                         });
                     }
                     Err(e) => {
@@ -241,7 +274,7 @@ impl Driver<'_> {
             self.store,
             self.report,
             stop,
-            PassMode::Last { capped: None },
+            PassMode::Last { capped },
         )?;
         if self.signalled() {
             // Les identifiants ne sont oubliés que si la dernière passe a tout écrit.
@@ -284,6 +317,7 @@ impl Driver<'_> {
             .map(|b| Lot {
                 id: b.id.clone(),
                 requests: None,
+                started: Instant::now(),
             })
             .collect();
         for lot in &lots {
@@ -309,7 +343,8 @@ impl Driver<'_> {
         }
         if resumed && matches!(e, Error::Rejected { code: 404, .. }) {
             warn(&format!(
-                "lot du fournisseur oublié : identifiant {id}, inconnu du fournisseur ou périmé ; ses requêtes repartent dans un nouveau lot"
+                "lot du fournisseur oublié : identifiant {}, inconnu du fournisseur ou périmé ; ses requêtes repartent dans un nouveau lot",
+                id
             ));
             self.registered.retain(|b| b.id != id);
             self.save()?;
@@ -342,9 +377,12 @@ impl Driver<'_> {
             Gone,
         }
         let mut slots: Vec<Slot> = lots.iter().map(|_| Slot::Waiting).collect();
+        // Compteurs `(faites, total)` du dernier sondage de chaque lot, et progression V-011.
+        let mut counts: Vec<(usize, usize)> = vec![(0, 0); lots.len()];
+        let mut meter: Option<Meter> = None;
         loop {
             let mut waiting = false;
-            for (lot, slot) in lots.iter().zip(slots.iter_mut()) {
+            for ((lot, slot), count) in lots.iter().zip(slots.iter_mut()).zip(counts.iter_mut()) {
                 if !matches!(slot, Slot::Waiting) {
                     continue;
                 }
@@ -355,6 +393,14 @@ impl Driver<'_> {
                 match self.link.api.status(&lot.id, self.stop) {
                     Ok(status) => {
                         self.failures = 0;
+                        *count = (status.done, status.total);
+                        trace!(
+                            "lot du fournisseur: état {} {} ({}/{} requêtes)",
+                            crate::escape::data(&lot.id),
+                            crate::escape::data(&status.status),
+                            status.done,
+                            status.total
+                        );
                         if status.finished {
                             *slot = Slot::Finished(status);
                         } else {
@@ -367,6 +413,18 @@ impl Driver<'_> {
                         Step::Retry => waiting = true,
                     },
                 }
+            }
+            let (k, n) = counts.iter().fold((0, 0), |(k, n), (a, b)| (k + a, n + b));
+            // Un lot sondé sans total encore (`total` 0) fausserait `n` : on attend qu'il en ait un.
+            let counted = counts
+                .iter()
+                .zip(slots.iter())
+                .all(|(c, s)| c.1 > 0 || !matches!(s, Slot::Waiting));
+            if meter.is_none() && n > 0 && counted {
+                meter = Meter::start(Phase::ProviderBatch, n);
+            }
+            if let Some(m) = meter.as_mut() {
+                m.advance_to(k);
             }
             if !waiting {
                 break;
@@ -385,6 +443,13 @@ impl Driver<'_> {
                 Read::Gone => continue,
                 Read::Halt => return Ok(Flow::Halt),
             };
+            trace!(
+                "lot du fournisseur: fini {} {}, {} réponses en {} ms",
+                crate::escape::data(&lot.id),
+                crate::escape::data(&status.status),
+                results.len(),
+                lot.started.elapsed().as_millis()
+            );
             let mut answered: HashSet<String> = HashSet::new();
             let ids: HashSet<&str> = lot
                 .requests

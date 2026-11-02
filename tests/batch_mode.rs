@@ -313,7 +313,7 @@ fn lot(names: &[&str]) -> String {
 /// Documents `docs/<n>.md` cités dans le corps d'une requête.
 fn names_in(body: &Value) -> Vec<&'static str> {
     let text = body.to_string();
-    NAMES
+    ["a", "b", "c", "d", "e"]
         .into_iter()
         .filter(|n| text.contains(&path(n)))
         .collect()
@@ -1821,4 +1821,426 @@ fn req217_ac5_la_reprise_annonce_chaque_lot_une_fois_avant_le_sondage() {
             err(&o)
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plafond, progression et traces (T-308, REQ-216, REQ-217).
+// ---------------------------------------------------------------------------------------------
+
+const FIVE: [&str; 5] = ["a", "b", "c", "d", "e"];
+
+fn e32(m: usize, r: usize) -> String {
+    format!("erreur: plafond de {m} appels dépassé : le lot du fournisseur compte {r} requêtes, aucune envoyée ; relancez nephila update --batch --max-calls {r} ou réduisez la portée avec enrich_exclude")
+}
+
+fn a10_batch(m: usize, left: usize) -> String {
+    format!("avertissement: plafond de {m} appels atteint : {left} fichiers laissés à enrichir ; relancez nephila update --batch pour continuer ou augmentez max_calls")
+}
+
+#[test]
+fn req216_ac1_ac5_le_premier_lot_au_dessus_du_plafond_ne_part_pas() {
+    for provider in PROVIDERS {
+        let fx = Fx::all_good(provider, &FIVE);
+        let o = fx.env.run(&["build", "--batch", "--max-calls", "3"]);
+        assert_eq!(code(&o), 1, "{provider} : {}", err(&o));
+        assert_eq!(fx.creations(), 0, "{provider}");
+        assert_eq!(fx.server.requests().len(), 0, "{provider}");
+        assert_eq!(last_line(&o), e32(3, 5), "{provider}");
+        assert!(!err(&o).contains("plafond de 3 appels atteint"));
+        assert_eq!(fx.to_enrich().len(), 5, "{provider}");
+        assert!(!fx.ids_stored(), "{provider}");
+        // Structure écrite : les documents sont dans le graphe.
+        let q = fx.env.run(&["query", "search", "Document"]);
+        assert!(out(&q).contains("docs/a.md"), "{provider} : {}", out(&q));
+    }
+}
+
+fn one_bad_format(b: &Value) -> Outcome {
+    if names_in(b) == ["c"] {
+        format_failing(b)
+    } else {
+        good(b)
+    }
+}
+
+#[test]
+fn req216_ac2_ac5_le_nouvel_essai_au_dessus_du_plafond_ne_part_pas() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "format_retries = 1\n", &FIVE, 0, one_bad_format);
+        let o = fx.env.run(&["build", "--batch", "--max-calls", "5"]);
+        assert_eq!(fx.creations(), 1, "{provider}");
+        assert_eq!(fx.server.lots().len(), 1, "{provider}");
+        assert_eq!(fx.server.lots()[0].len(), 5, "{provider}");
+        // REQ-187 : le plafond est la seule raison des fichiers restants, code 0.
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(
+            lines_with(&err(&o), "plafond"),
+            [a10_batch(5, 1).as_str()],
+            "{provider}"
+        );
+        assert_eq!(fx.to_enrich(), ["docs/c.md"], "{provider}");
+        for n in ["a", "b", "d", "e"] {
+            assert_eq!(fx.summary_of(n), Some(summary_text(n)), "{provider} {n}");
+        }
+        assert!(!err(&o).lines().any(|l| l.starts_with("erreur:")));
+    }
+}
+
+#[test]
+fn req216_ac3_le_nouvel_essai_dans_le_plafond_part_dans_un_second_lot() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "format_retries = 1\n", &FIVE, 0, one_bad_format);
+        let o = fx.env.run(&["build", "--batch", "--max-calls", "6"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let lots = fx.server.lots();
+        assert_eq!(lots.len(), 2, "{provider}");
+        assert_eq!(lots[1].len(), 1, "{provider}");
+        assert!(!err(&o).contains("plafond"), "{}", err(&o));
+        assert_eq!(fx.to_enrich().len(), 0, "{provider}");
+        for n in FIVE {
+            assert_eq!(fx.summary_of(n), Some(summary_text(n)), "{provider} {n}");
+        }
+    }
+}
+
+#[test]
+fn req216_ac4_les_requetes_d_un_lot_repris_ne_comptent_pas() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &FIVE);
+        fx.interrupted();
+        fx.server.set_in_progress(0);
+        let o = fx.env.run(&["update", "--batch", "--max-calls", "1"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(fx.creations(), 1, "{provider}");
+        assert!(!err(&o).contains("plafond"), "{provider} : {}", err(&o));
+        assert_eq!(fx.to_enrich().len(), 0, "{provider}");
+    }
+}
+
+#[test]
+fn req217_ac6_lignes_de_progression_du_lot_entre_extraction_et_enrichissement() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &NAMES, 2, good);
+        fx.server.progress(vec![0, 2]);
+        let o = fx.env.run(&["build", "--batch", "--show-progress"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let e = err(&o);
+        let lines: Vec<&str> = e
+            .lines()
+            .filter(|l| l.starts_with("progression:"))
+            .collect();
+        let batch: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains("lot du fournisseur"))
+            .collect();
+        assert_eq!(
+            batch,
+            [
+                "progression: lot du fournisseur 0 % (0/4 requêtes)",
+                "progression: lot du fournisseur 50 % (2/4 requêtes)",
+                "progression: lot du fournisseur 100 % (4/4 requêtes)",
+            ],
+            "{provider}"
+        );
+        let at = |p: &str| lines.iter().position(|l| l.contains(p)).unwrap();
+        let last = |p: &str| lines.iter().rposition(|l| l.contains(p)).unwrap();
+        assert!(last("extraction") < at("lot du fournisseur"), "{lines:?}");
+        assert!(
+            last("lot du fournisseur") < at("enrichissement"),
+            "{lines:?}"
+        );
+    }
+}
+
+#[test]
+fn req217_ac2_ac6_compteurs_inchanges_aucune_ligne_de_plus_et_paliers_croissants() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &NAMES, 3, good);
+        fx.server.progress(vec![0, 2, 2]);
+        let o = fx.env.run(&["build", "--batch", "--show-progress"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(fx.polls(1), 4, "{provider}");
+        let percents: Vec<u32> = err(&o)
+            .lines()
+            .filter(|l| l.starts_with("progression: lot du fournisseur"))
+            .map(|l| {
+                l.trim_start_matches("progression: lot du fournisseur ")
+                    .split(" %")
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(percents, [0, 50, 100], "{provider}");
+    }
+}
+
+#[test]
+fn req217_ac6_ctrl_c_pendant_l_attente_aucune_ligne_d_enrichissement() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &NAMES);
+        fx.server.progress(vec![0, 2]);
+        let d = fx.interrupt_at(1, &["build", "--batch", "--show-progress"]);
+        assert_eq!(d.status.code(), Some(130), "{provider} : {}", d.stderr);
+        assert!(
+            !d.stderr.contains("progression: enrichissement"),
+            "{provider} : {}",
+            d.stderr
+        );
+        assert!(d.stderr.contains("progression: extraction"), "{provider}");
+    }
+}
+
+#[test]
+fn req217_ac2_verbose_une_trace_par_sondage_sans_resume_ni_cle() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &NAMES, 2, good);
+        fx.server.progress(vec![0, 2]);
+        let o = fx.env.run(&["build", "--batch", "--verbose"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let e = err(&o);
+        let id = first_id(provider);
+        let states: Vec<&str> = e
+            .lines()
+            .filter_map(untrace)
+            .filter(|l| l.starts_with("lot du fournisseur: état "))
+            .collect();
+        assert_eq!(states.len(), fx.polls(1), "{provider} : {e}");
+        assert_eq!(states.len(), 3);
+        assert!(states[1].starts_with(&format!("lot du fournisseur: état {id} ")));
+        assert!(states[1].ends_with("(2/4 requêtes)"), "{}", states[1]);
+        assert!(states[2].ends_with("(4/4 requêtes)"), "{}", states[2]);
+        let calls = lines_with(&e, "appels:");
+        assert_eq!(calls.len(), 1, "{e}");
+        // `<h>` : une requête par appel, comptée par le collecteur.
+        assert!(
+            calls[0].contains("appels: 4 appels, 0 nouveaux essais de format, 4 envois HTTP,"),
+            "{}",
+            calls[0]
+        );
+        for secret in ["Résumé du document", "Texte du document", "sk-test"] {
+            assert!(!e.contains(secret), "{provider} : {secret} dans {e}");
+        }
+    }
+}
+
+#[test]
+fn req217_ac7_formes_des_traces_et_ordre_des_lignes_llm_enrich() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &NAMES, 1, good);
+        let o = fx.env.run(&["build", "--batch", "--verbose"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let e = err(&o);
+        let id = first_id(provider);
+        let own: Vec<&str> = e
+            .lines()
+            .filter_map(untrace)
+            .filter(|l| l.starts_with("lot du fournisseur: "))
+            .collect();
+        for l in &own {
+            assert!(
+                ["créé ", "état ", "fini "]
+                    .iter()
+                    .any(|p| l.starts_with(&format!("lot du fournisseur: {p}"))),
+                "{l}"
+            );
+        }
+        assert_eq!(
+            own.iter().filter(|l| l.contains(": créé ")).count(),
+            1,
+            "{own:?}"
+        );
+        assert!(own[0].starts_with(&format!("lot du fournisseur: créé {id}, 4 requêtes, ")));
+        assert!(own[0].ends_with(" octets"), "{}", own[0]);
+        let fini: Vec<&&str> = own.iter().filter(|l| l.contains(": fini ")).collect();
+        assert_eq!(fini.len(), 1);
+        assert!(fini[0].starts_with(&format!("lot du fournisseur: fini {id} ")));
+        assert!(fini[0].contains(", 4 réponses en "), "{}", fini[0]);
+        assert!(fini[0].ends_with(" ms"), "{}", fini[0]);
+        let all: Vec<&str> = e.lines().collect();
+        let begin = all
+            .iter()
+            .position(|l| l.contains("enrichissement: début"))
+            .unwrap();
+        assert!(
+            all[..begin].iter().all(|l| !l.contains("llm enrich")),
+            "{provider}"
+        );
+        let starts = all[begin..]
+            .iter()
+            .filter(|l| l.contains("llm enrich départ"))
+            .count();
+        assert_eq!(starts, 4, "{provider} : {e}");
+        assert_eq!(lines_with(&e, "enrichissement: début").len(), 1);
+    }
+}
+
+#[test]
+fn req217_ac7_identifiant_avec_un_octet_1b_aucun_octet_1b_et_annonces_d_une_ligne() {
+    for flags in [&["--verbose"][..], &[][..]] {
+        // Création : l'identifiant rendu par le serveur porte un octet 0x1B, `check_id` le refuse.
+        let fx = Fx::all_good("anthropic", &["a", "b"]);
+        fx.server.route(
+            "POST",
+            fx.create_path(),
+            vec![Reply::status(200, "{\"id\": \"msgbatch_1\\u001b[31m\"}")],
+        );
+        let args = [&["build", "--batch"][..], flags].concat();
+        let o = fx.env.run(&args);
+        assert_eq!(code(&o), 1, "{flags:?} : {}", err(&o));
+        assert_eq!(
+            last_line(&o),
+            "erreur: identifiant de lot de anthropic illisible",
+            "{flags:?}"
+        );
+        assert!(lines_with(&err(&o), "lot du fournisseur envoyé").is_empty());
+        assert!(!o.stderr.contains(&0x1B) && !o.stdout.contains(&0x1B));
+
+        // Reprise : un identifiant enregistré avec 0x1B est écrit échappé, sur une seule ligne.
+        let fx = Fx::all_good("anthropic", &["a", "b"]);
+        let o = fx.env.run(&["build", "--no-llm"]);
+        assert_eq!(code(&o), 0, "{}", err(&o));
+        let mut store = nephila::store::Store::open_or_create(&fx.env.repo).unwrap();
+        store
+            .set_enrich_batches(&[nephila::store::EnrichBatch {
+                id: "x\u{1b}[31m\nfaux".into(),
+                provider: "anthropic".into(),
+                address: nephila::store::address_fingerprint(&fx.server.base_url),
+            }])
+            .unwrap();
+        drop(store);
+        let args = [&["update", "--batch"][..], flags].concat();
+        let o = fx.env.run(&args);
+        assert!(!o.stderr.contains(&0x1B), "{flags:?} : {}", err(&o));
+        let e = err(&o);
+        assert_eq!(
+            lines_with(&e, "lot du fournisseur repris"),
+            ["avertissement: lot du fournisseur repris : identifiant x\\u{001B}[31m\\u{000A}faux ; Ctrl-C ne perd rien : relancez nephila update --batch pour reprendre"],
+            "{e}"
+        );
+        assert!(e.lines().all(|l| !l.starts_with("faux")), "{e}");
+        if !flags.is_empty() {
+            let states = lines_with(&e, "lot du fournisseur: état ");
+            assert_eq!(states.len(), 3, "{e}");
+            for l in states {
+                assert!(l.contains("état x\\u{001B}[31m\\u{000A}faux échec "), "{l}");
+            }
+        }
+    }
+}
+
+#[test]
+fn req217_ac4_lignes_de_requete_en_echec_et_creation_en_delai_depasse() {
+    // (fournisseur, statut final imposé, issue de la requête, cause attendue)
+    type Case = (
+        &'static str,
+        Option<(&'static str, &'static str)>,
+        Outcome,
+        &'static str,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "openai",
+            Some(("failed", "fichier refusé")),
+            Outcome::Missing,
+            "lot refusé : fichier refusé",
+        ),
+        (
+            "openai",
+            Some(("failed", "")),
+            Outcome::Missing,
+            "lot refusé",
+        ),
+        (
+            "openai",
+            Some(("cancelled", "")),
+            Outcome::Missing,
+            "annulée",
+        ),
+        (
+            "openai",
+            None,
+            Outcome::Http(500, "panne".into()),
+            "HTTP 500 : panne",
+        ),
+        (
+            "openai",
+            None,
+            Outcome::Http(500, String::new()),
+            "HTTP 500",
+        ),
+        (
+            "openai",
+            None,
+            Outcome::Errored("x".into(), "message seul".into()),
+            "message seul",
+        ),
+        (
+            "anthropic",
+            None,
+            Outcome::Errored("api_error".into(), String::new()),
+            "api_error",
+        ),
+    ];
+    for (provider, final_status, outcome, cause) in cases {
+        let o2 = outcome.clone();
+        let fx = Fx::new(provider, "", &["a"], 0, move |_| o2.clone());
+        if let Some((status, message)) = final_status {
+            fx.server.final_status(status, message);
+        }
+        let o = fx.env.run(&["build", "--batch"]);
+        let line = format!("avertissement: docs/a.md : requête du lot du fournisseur en échec ({cause}) ; relancez nephila update --batch");
+        assert_eq!(
+            lines_with(&err(&o), "docs/a.md"),
+            [line.as_str()],
+            "{}",
+            err(&o)
+        );
+        assert_eq!(code(&o), 1, "{cause}");
+    }
+    // E-36, délai dépassé.
+    let fx = Fx::new("anthropic", "timeout_secs = 1\n", &["a"], 0, good);
+    fx.server.route(
+        "POST",
+        fx.create_path(),
+        vec![Reply::Http {
+            status: 200,
+            body: "{}".into(),
+            headers: vec![],
+            delay_ms: 3000,
+        }],
+    );
+    let o = fx.env.run(&["build", "--batch"]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert_eq!(last_line(&o), "erreur: envoi interrompu : création du lot du fournisseur en échec (délai dépassé) : vérifiez sa console puis relancez nephila update --batch ; 1 fichier(s) à enrichir");
+}
+
+#[test]
+fn req217_verbose_sans_derniere_passe_ni_enrichissement_ni_appels() {
+    let none = |e: &str, what: &str| {
+        assert!(!e.contains("enrichissement:"), "{what} : {e}");
+        assert!(!e.contains("appels:"), "{what} : {e}");
+        assert!(!e.contains("politique:"), "{what} : {e}");
+    };
+    // E-32.
+    let fx = Fx::all_good("anthropic", &FIVE);
+    let o = fx
+        .env
+        .run(&["build", "--batch", "--verbose", "--max-calls", "3"]);
+    assert_eq!(last_line(&o), e32(3, 5));
+    none(&err(&o), "E-32");
+    // Ctrl-C.
+    let fx = fixture_forever("anthropic", &["a", "b"]);
+    let d = fx.interrupt_at(1, &["build", "--batch", "--verbose"]);
+    assert_eq!(d.status.code(), Some(130));
+    none(&d.stderr, "Ctrl-C");
+    // Panne du suivi.
+    let fx = Fx::all_good("anthropic", &["a", "b"]);
+    fx.server
+        .route("GET", &fx.status_path(1), vec![Reply::status(500, "{}")]);
+    let o = fx.env.run(&["build", "--batch", "--verbose"]);
+    assert_eq!(last_line(&o), e35(2));
+    none(&err(&o), "panne");
 }

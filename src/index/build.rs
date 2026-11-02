@@ -48,6 +48,8 @@ pub struct BuildReport {
     pub capped: Option<usize>,
     /// Fichiers sans issue laissés « à enrichir » par le plafond (REQ-186).
     pub left_by_cap: usize,
+    /// Vrai sous `--batch` : les relances conseillées nomment l'option (REQ-216).
+    pub batch: bool,
     /// Vrai si l'envoi a été arrêté par Ctrl-C (REQ-189) : la fin rend `Error::Interrupted`.
     pub interrupted: bool,
     /// Fichiers indexés écartés par les motifs de la portée d'enrichissement (REQ-207).
@@ -524,8 +526,13 @@ pub(crate) fn finish(report: &BuildReport) -> Result<()> {
 /// avertissements de fin de commande et avant la ligne `erreur:` que `main` écrit.
 pub(crate) fn warn_capped(report: &BuildReport) {
     if let Some(m) = report.capped {
+        let command = if report.batch {
+            "nephila update --batch"
+        } else {
+            "nephila update"
+        };
         warn(&format!(
-            "{} : {} fichiers laissés à enrichir ; relancez nephila update pour continuer ou augmentez max_calls",
+            "{} : {} fichiers laissés à enrichir ; relancez {command} pour continuer ou augmentez max_calls",
             crate::index::enrich::cap_label(m),
             report.left_by_cap
         ));

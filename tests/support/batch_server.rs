@@ -31,6 +31,8 @@ pub enum Outcome {
     Expired,
     /// Aucune ligne de résultat.
     Missing,
+    /// Ligne de résultat avec un `status_code` autre que 200 et un message (`openai`).
+    Http(u16, String),
 }
 
 type Answer = Box<dyn Fn(&Value) -> Outcome + Send + Sync>;
@@ -55,6 +57,9 @@ struct Sim {
     create_failures: VecDeque<Reply>,
     /// Lot (1 pour le premier) qui reste `en cours` tant qu'il est retenu.
     hold: Option<usize>,
+    /// Requêtes faites que montre chaque sondage `en cours` (le dernier chiffre se répète) ;
+    /// vide : zéro.
+    progress: Vec<usize>,
 }
 
 impl BatchServer {
@@ -99,7 +104,15 @@ impl BatchServer {
             reverse: false,
             create_failures: VecDeque::new(),
             hold: None,
+            progress: Vec::new(),
         });
+    }
+
+    /// Requêtes faites que montrent les sondages `en cours`, dans l'ordre des sondages.
+    pub fn progress(&self, done: Vec<usize>) {
+        if let Some(s) = self.sim.lock().unwrap().as_mut() {
+            s.progress = done;
+        }
     }
 
     /// Nombre de sondages rendus `en cours` avant la fin d'un lot (comptés par lot).
@@ -283,6 +296,13 @@ impl Sim {
         lines.join("\n")
     }
 
+    /// Requêtes faites montrées au sondage en cours du lot `k` (de `total` requêtes).
+    fn shown(&self, k: usize, total: usize) -> usize {
+        let i = self.polls[&k] - 1;
+        let n = self.progress.get(i).or(self.progress.last()).copied();
+        n.unwrap_or(0).min(total)
+    }
+
     fn polled(&mut self, k: usize) -> bool {
         let n = self.polls.entry(k).or_insert(0);
         *n += 1;
@@ -331,7 +351,7 @@ impl Sim {
                                    "error": {"type": "error", "error": {"type": kind, "message": message}}})
                         }
                         Outcome::Expired => json!({"type": "expired"}),
-                        Outcome::Missing => return None,
+                        Outcome::Missing | Outcome::Http(..) => return None,
                     };
                     Some(json!({"custom_id": id, "result": result}).to_string())
                 })
@@ -340,7 +360,8 @@ impl Sim {
         }
         let total = self.lots[k - 1].len();
         if !self.polled(k) {
-            let counts = json!({"processing": total, "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0});
+            let done = self.shown(k, total);
+            let counts = json!({"processing": total - done, "succeeded": done, "errored": 0, "canceled": 0, "expired": 0});
             return ok(json!({"processing_status": "in_progress", "request_counts": counts}));
         }
         let o = self.outcomes(k);
@@ -397,6 +418,15 @@ impl Sim {
                         "response": {"status_code": 200, "body": text_body("openai", &t, false)}})),
                     (Outcome::Truncated(t), false) => Some(json!({"custom_id": id,
                         "response": {"status_code": 200, "body": text_body("openai", &t, true)}})),
+                    (Outcome::Http(code, message), false) => {
+                        let error = if message.is_empty() {
+                            json!({})
+                        } else {
+                            json!({"error": {"message": message}})
+                        };
+                        Some(json!({"custom_id": id,
+                            "response": {"status_code": code, "body": error}}))
+                    }
                     (Outcome::Errored(kind, message), true) => Some(json!({"custom_id": id,
                         "response": null, "error": {"code": kind, "message": message}})),
                     _ => None,
@@ -412,7 +442,9 @@ impl Sim {
         let total = self.lots[k - 1].len();
         let counts = |done: usize, failed: usize| json!({"total": total, "completed": done, "failed": failed});
         if !self.polled(k) {
-            return ok(json!({"status": "in_progress", "request_counts": counts(0, 0)}));
+            return ok(
+                json!({"status": "in_progress", "request_counts": counts(self.shown(k, total), 0)}),
+            );
         }
         if let Some((status, message)) = self.final_status.clone().filter(|(s, _)| s == "failed") {
             return ok(json!({"status": status, "request_counts": counts(0, 0),
@@ -425,14 +457,20 @@ impl Sim {
             .count();
         let failed = o
             .iter()
-            .filter(|(_, x)| matches!(x, Outcome::Errored(..)))
+            .filter(|(_, x)| matches!(x, Outcome::Errored(..) | Outcome::Http(..)))
             .count();
         let status = self
             .final_status
             .as_ref()
             .map_or("completed", |(s, _)| s.as_str());
         let mut v = json!({"status": status, "request_counts": counts(done, failed)});
-        if done > 0 {
+        let has_output = o.iter().any(|(_, x)| {
+            matches!(
+                x,
+                Outcome::Text(_) | Outcome::Truncated(_) | Outcome::Http(..)
+            )
+        });
+        if has_output {
             v["output_file_id"] = json!(format!("file_out_{k}"));
         }
         if failed > 0 {

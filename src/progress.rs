@@ -20,6 +20,8 @@ thread_local! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Extraction,
+    /// Attente des lots du fournisseur (`--batch`, REQ-217) : compte des requêtes.
+    ProviderBatch,
     Enrichment,
 }
 
@@ -27,7 +29,15 @@ impl Phase {
     fn label(self) -> &'static str {
         match self {
             Phase::Extraction => "extraction",
+            Phase::ProviderBatch => "lot du fournisseur",
             Phase::Enrichment => "enrichissement",
+        }
+    }
+
+    fn unit(self) -> &'static str {
+        match self {
+            Phase::ProviderBatch => "requêtes",
+            _ => "fichiers",
         }
     }
 }
@@ -51,8 +61,9 @@ pub fn enabled() -> bool {
 pub fn format_line(phase: Phase, k: usize, n: usize) -> String {
     let percent = (k * 100).checked_div(n).unwrap_or(0);
     format!(
-        "progression: {} {percent} % ({k}/{n} fichiers)",
-        phase.label()
+        "progression: {} {percent} % ({k}/{n} {})",
+        phase.label(),
+        phase.unit()
     )
 }
 
@@ -105,6 +116,12 @@ impl Meter {
             k: 0,
             step: 0,
         })
+    }
+
+    /// Place le compteur à `k` (borné à `n`, jamais en arrière) ; une seule ligne si un palier
+    /// est franchi.
+    pub fn advance_to(&mut self, k: usize) {
+        self.advance(k.saturating_sub(self.k));
     }
 
     /// Ajoute `by` fichiers traités (borné à `n`) ; une seule ligne si un palier est franchi.
@@ -166,6 +183,29 @@ mod tests {
         assert_eq!(
             format_line(Phase::Enrichment, 3, 3),
             "progression: enrichissement 100 % (3/3 fichiers)"
+        );
+    }
+
+    #[test]
+    fn req217_format_line_provider_batch() {
+        assert_eq!(
+            format_line(Phase::ProviderBatch, 2, 4),
+            "progression: lot du fournisseur 50 % (2/4 requêtes)"
+        );
+        init(true);
+        take_captured();
+        let mut m = Meter::start(Phase::ProviderBatch, 4).unwrap();
+        m.advance_to(2);
+        m.advance_to(2);
+        m.advance_to(1);
+        m.advance_to(4);
+        assert_eq!(
+            take_captured(),
+            [
+                "progression: lot du fournisseur 0 % (0/4 requêtes)",
+                "progression: lot du fournisseur 50 % (2/4 requêtes)",
+                "progression: lot du fournisseur 100 % (4/4 requêtes)",
+            ]
         );
     }
 
