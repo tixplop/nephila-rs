@@ -53,6 +53,8 @@ struct Sim {
     reverse: bool,
     /// Réponses données aux premières créations, avant que l'une aboutisse.
     create_failures: VecDeque<Reply>,
+    /// Lot (1 pour le premier) qui reste `en cours` tant qu'il est retenu.
+    hold: Option<usize>,
 }
 
 impl BatchServer {
@@ -96,7 +98,30 @@ impl BatchServer {
             polls: HashMap::new(),
             reverse: false,
             create_failures: VecDeque::new(),
+            hold: None,
         });
+    }
+
+    /// Nombre de sondages rendus `en cours` avant la fin d'un lot (comptés par lot).
+    pub fn set_in_progress(&self, n: usize) {
+        if let Some(s) = self.sim.lock().unwrap().as_mut() {
+            s.in_progress = n;
+        }
+    }
+
+    /// Le lot `k` (1 pour le premier) reste `en cours` jusqu'à `hold(None)`.
+    pub fn hold(&self, k: Option<usize>) {
+        if let Some(s) = self.sim.lock().unwrap().as_mut() {
+            s.hold = k;
+        }
+    }
+
+    /// Retire le script d'une route : le faux fournisseur reprend la main.
+    pub fn clear_route(&self, method: &str, path: &str) {
+        self.routes
+            .lock()
+            .unwrap()
+            .remove(&(method.to_string(), path.to_string()));
     }
 
     /// Les résultats des lots sont rendus dans l'ordre inverse de l'envoi.
@@ -184,8 +209,9 @@ fn serve(
             status,
             body,
             headers,
-            ..
+            delay_ms,
         } => {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             let n = body.len();
             (status, body, headers, n)
         }
@@ -260,7 +286,7 @@ impl Sim {
     fn polled(&mut self, k: usize) -> bool {
         let n = self.polls.entry(k).or_insert(0);
         *n += 1;
-        *n > self.in_progress
+        *n > self.in_progress && self.hold != Some(k)
     }
 
     fn handle_anthropic(&mut self, method: &str, path: &str, body: &str) -> Option<Reply> {

@@ -15,8 +15,10 @@ use batch_server::{BatchServer, Outcome};
 use fake_server::{FakeServer, Reply};
 use serde_json::{json, Value};
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const KEY_VAR: &str = "NEPHILA_T305_KEY";
 const E31: &str =
@@ -1113,5 +1115,710 @@ fn req214_ac3_premier_fichier_non_ecrit_avant_la_derniere_passe() {
         assert_eq!(code(&o), 1, "{provider} : {}", err(&o));
         assert_eq!(fx.summary_of("a"), None, "{provider}");
         assert_eq!(fx.to_enrich(), ["docs/a.md", "docs/b.md"], "{provider}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reprise, Ctrl-C, panne du suivi, oubli des identifiants, A-19 (T-307, REQ-215).
+// ---------------------------------------------------------------------------------------------
+
+const A16: &str = "avertissement: Ctrl-C reçu : plus rien ne part et les lots du fournisseur déjà envoyés ne sont pas annulés ; appuyez de nouveau sur Ctrl-C pour quitter sans attendre";
+const E34: &str =
+    "erreur: envoi interrompu : second Ctrl-C reçu : relancez nephila update --batch pour continuer";
+const A19: &str = "avertissement: lot du fournisseur enregistré : les fichiers à enrichir seront payés de nouveau ; appuyez sur Ctrl-C et relancez nephila update --batch pour le reprendre";
+const FOREVER: usize = usize::MAX;
+
+fn e33(n: usize) -> String {
+    format!("erreur: envoi interrompu : Ctrl-C reçu : relancez nephila update --batch pour continuer ; {n} fichier(s) à enrichir")
+}
+
+fn e35(n: usize) -> String {
+    format!("erreur: envoi interrompu : suivi du lot du fournisseur impossible (3 échecs consécutifs) : relancez nephila update --batch pour continuer ; {n} fichier(s) à enrichir")
+}
+
+fn a15(id: &str) -> String {
+    format!("avertissement: lot du fournisseur repris : identifiant {id} ; Ctrl-C ne perd rien : relancez nephila update --batch pour reprendre")
+}
+
+fn a18_other(id: &str) -> String {
+    format!("avertissement: lot du fournisseur oublié : identifiant {id}, envoyé à un autre fournisseur ou une autre adresse ; ses requêtes repartent dans un nouveau lot")
+}
+
+fn a18_gone(id: &str) -> String {
+    format!("avertissement: lot du fournisseur oublié : identifiant {id}, inconnu du fournisseur ou périmé ; ses requêtes repartent dans un nouveau lot")
+}
+
+fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !cond() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "délai dépassé : {what}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn reader(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = r.read_to_end(&mut b);
+        String::from_utf8_lossy(&b).into_owned()
+    })
+}
+
+/// Enfant `nephila` dont stdout et stderr sont lus par des fils.
+struct Running {
+    child: Child,
+    out: Option<std::thread::JoinHandle<String>>,
+    err: Option<std::thread::JoinHandle<String>>,
+    signalled: Option<Instant>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+struct Done {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+    signalled: Option<Instant>,
+    after_signal: Option<Duration>,
+}
+
+impl Done {
+    fn last(&self) -> &str {
+        self.stderr.lines().last().unwrap_or("")
+    }
+}
+
+impl Running {
+    fn sigint(&mut self) {
+        // SAFETY: le pid est celui d'un enfant vivant, non encore attendu.
+        let r = unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
+        assert_eq!(r, 0);
+        self.signalled = Some(Instant::now());
+    }
+
+    fn finish(mut self) -> Done {
+        let start = Instant::now();
+        let status = loop {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                break s;
+            }
+            if start.elapsed() > Duration::from_secs(50) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("la commande ne finit pas");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let ended = Instant::now();
+        Done {
+            status,
+            stdout: self.out.take().unwrap().join().unwrap(),
+            stderr: self.err.take().unwrap().join().unwrap(),
+            signalled: self.signalled,
+            after_signal: self.signalled.map(|t| ended.duration_since(t)),
+        }
+    }
+}
+
+impl Env {
+    fn spawn(&self, args: &[&str]) -> Running {
+        let mut child = Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env(KEY_VAR, "sk-test")
+            .env("NEPHILA_BATCH_POLL_MS", "5")
+            .env("NEPHILA_RETRY_BASE_MS", "1")
+            .env_remove("NO_COLOR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Running {
+            out: Some(reader(child.stdout.take().unwrap())),
+            err: Some(reader(child.stderr.take().unwrap())),
+            child,
+            signalled: None,
+        }
+    }
+
+    /// Remplace `from` par `to` dans la configuration personnelle.
+    fn edit_config(&self, from: &str, to: &str) {
+        let c = fs::read_to_string(&self.config).unwrap();
+        assert!(c.contains(from), "{c}");
+        fs::write(&self.config, c.replace(from, to)).unwrap();
+    }
+}
+
+impl Fx {
+    fn status_path(&self, k: usize) -> String {
+        if self.provider == "anthropic" {
+            format!("/v1/messages/batches/msgbatch_{k}")
+        } else {
+            format!("/v1/batches/batch_{k}")
+        }
+    }
+
+    fn id(&self, k: usize) -> String {
+        if self.provider == "anthropic" {
+            format!("msgbatch_{k}")
+        } else {
+            format!("batch_{k}")
+        }
+    }
+
+    fn polls(&self, k: usize) -> usize {
+        self.server.hits("GET", &self.status_path(k)).len()
+    }
+
+    /// Lance `args`, envoie SIGINT dès que le lot `k` est sondé, rend la fin de la commande.
+    fn interrupt_at(&self, k: usize, args: &[&str]) -> Done {
+        let mut run = self.env.spawn(args);
+        wait_until("sondage du lot", || self.polls(k) >= 1);
+        run.sigint();
+        run.finish()
+    }
+
+    /// `build --batch` interrompu au premier sondage du premier lot.
+    fn interrupted(&self) -> Done {
+        let d = self.interrupt_at(1, &["build", "--batch"]);
+        assert_eq!(d.status.code(), Some(130), "{}", d.stderr);
+        d
+    }
+
+    /// Contenu brut de la table `meta`.
+    fn meta_dump(&self) -> String {
+        let db = rusqlite::Connection::open_with_flags(
+            self.env.repo.join(".nephila/graph.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut st = db.prepare("SELECT key, value FROM meta").unwrap();
+        let rows: Vec<String> = st
+            .query_map([], |r| {
+                Ok(format!(
+                    "{}={}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.join("\n")
+    }
+}
+
+fn fixture_forever(provider: &'static str, names: &[&str]) -> Fx {
+    Fx::new(provider, "", names, FOREVER, good)
+}
+
+#[test]
+fn req215_ac1_ctrl_c_a_l_attente_enregistre_le_lot_et_s_arrete_vite() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        let d = fx.interrupted();
+        assert!(
+            d.after_signal.unwrap() < Duration::from_secs(2),
+            "{provider}"
+        );
+        let t = d.signalled.unwrap();
+        let reqs = fx.server.requests();
+        assert!(
+            reqs.iter().all(|r| !r.path.contains("cancel")),
+            "{provider}"
+        );
+        // La veille lit le signal toutes les 20 ms : quelques sondages partent encore, pas après 1 s.
+        assert!(
+            reqs.iter().all(|r| r.at <= t + Duration::from_secs(1)),
+            "{provider} : requêtes longtemps après le signal"
+        );
+        // Bilan sur stdout, de même forme que celui de l'arrêt E-35 (AC-215-8).
+        assert!(d.stdout.contains("2 fichiers à enrichir"), "{}", d.stdout);
+        let twin = Fx::new(provider, "", &["a", "b"], 0, good);
+        twin.server
+            .route("GET", &twin.status_path(1), vec![Reply::status(500, "{}")]);
+        let o = twin.env.run(&["build", "--batch"]);
+        let shape = |s: &str| s.replace(|c: char| c.is_ascii_digit(), "#");
+        assert_eq!(shape(&d.stdout), shape(&out(&o)), "{provider}");
+        assert_eq!(fx.env.to_enrich(), 2, "{provider}");
+        assert_eq!(fx.enrich_batches(), [first_id(provider)], "{provider}");
+        let meta = fx.meta_dump();
+        let stored = nephila::store::Store::open_readonly(&fx.env.repo)
+            .unwrap()
+            .enrich_batches()
+            .unwrap();
+        assert_eq!(stored[0].provider, provider);
+        assert_eq!(
+            stored[0].address,
+            nephila::store::address_fingerprint(&fx.server.base_url)
+        );
+        assert!(!meta.contains(&fx.server.base_url), "{meta}");
+        assert!(
+            !meta.contains("sk-test") && !meta.contains(KEY_VAR),
+            "{meta}"
+        );
+        // AC-215-12 et AC-217-3 : textes exacts, rien sur des appels qui vont à leur terme.
+        assert_eq!(
+            lines_with(&d.stderr, "Ctrl-C reçu : plus"),
+            [A16],
+            "{provider}"
+        );
+        assert_eq!(d.last(), e33(2), "{provider}");
+        assert!(d.last().contains("nephila update --batch"));
+        assert!(!d.stderr.contains("à leur terme"), "{}", d.stderr);
+        assert!(!d.stderr.contains("panicked"), "{}", d.stderr);
+    }
+}
+
+#[test]
+fn req215_ac2_la_reprise_ne_cree_rien_et_lit_le_lot_enregistre() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        fx.interrupted();
+        fx.server.set_in_progress(0);
+        let polls = fx.polls(1);
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(fx.creations(), 1, "{provider}");
+        assert!(fx.polls(1) > polls, "{provider}");
+        assert_eq!(fx.creations(), 1);
+        for n in ["a", "b"] {
+            assert_eq!(fx.summary_of(n), Some(summary_text(n)), "{provider} {n}");
+        }
+        assert_eq!(fx.env.to_enrich(), 0);
+        assert!(!fx.ids_stored(), "{provider}");
+        let seen = fx.server.requests().len();
+        let again = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&again), 0, "{provider} : {}", err(&again));
+        assert!(out(&again).contains("graphe à jour"), "{}", out(&again));
+        assert_eq!(fx.server.requests().len(), seen, "{provider}");
+        assert!(!fx.ids_stored(), "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac3_build_batch_reprend_aussi_sans_creer() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        fx.interrupted();
+        fx.server.set_in_progress(0);
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(fx.creations(), 1, "{provider}");
+        assert_eq!(fx.env.to_enrich(), 0, "{provider}");
+        assert!(!fx.ids_stored(), "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac4_un_document_modifie_repart_seul_dans_un_nouveau_lot() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &["a", "b"], FOREVER, |b| {
+            if names_in(b) == ["b"] && b.to_string().contains("MODIFIÉ") {
+                Outcome::Text(
+                    json!({"version": 2,
+                           "summaries": [{"node": "document:docs/b.md", "summary": "Résumé modifié."}],
+                           "concepts": []})
+                    .to_string(),
+                )
+            } else {
+                good(b)
+            }
+        });
+        fx.interrupted();
+        fx.server.set_in_progress(0);
+        fs::write(fx.env.repo.join(path("b")), "# Document b\n\nMODIFIÉ.\n").unwrap();
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let lots = fx.server.lots();
+        assert_eq!(lots.len(), 2, "{provider}");
+        assert_eq!(lots[1].len(), 1, "{provider}");
+        assert_eq!(names_in(&lots[1][0]), ["b"], "{provider}");
+        assert_eq!(
+            fx.summary_of("b"),
+            Some("Résumé modifié.".into()),
+            "{provider}"
+        );
+        assert_eq!(fx.summary_of("a"), Some(summary_text("a")), "{provider}");
+        assert!(fx.to_enrich().is_empty(), "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac5_un_autre_modele_renvoie_toutes_les_requetes() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        fx.interrupted();
+        fx.server.set_in_progress(0);
+        fx.env.edit_config("model = \"m\"", "model = \"m2\"");
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let lots = fx.server.lots();
+        assert_eq!(lots.len(), 2, "{provider}");
+        assert_eq!(lots[1].len(), 2, "{provider}");
+        for body in &lots[1] {
+            assert_eq!(body["model"], "m2", "{provider}");
+        }
+        assert!(fx.to_enrich().is_empty(), "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac6_ac14_une_autre_adresse_oublie_le_lot_sans_requete() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        fx.interrupted();
+        let before = fx.server.requests().len();
+        let second = BatchServer::start();
+        second.simulate(provider, 0, good);
+        fx.env.edit_config(&fx.server.base_url, &second.base_url);
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let e = err(&o);
+        let id1 = first_id(provider);
+        assert_eq!(
+            lines_with(&e, "lot du fournisseur oublié"),
+            [a18_other(id1)]
+        );
+        assert!(
+            !e.contains(&fx.server.base_url) && !e.contains(&second.base_url),
+            "{e}"
+        );
+        assert_eq!(fx.server.requests().len(), before, "{provider}");
+        let reqs = second.requests();
+        assert_eq!(reqs[0].method, "POST", "{provider}");
+        assert_eq!(second.lots().len(), 1, "{provider}");
+        assert!(lines_with(&e, "lot du fournisseur repris").is_empty());
+        assert!(fx.to_enrich().is_empty(), "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac7_ac14_lot_inconnu_du_fournisseur_oublie_puis_cree() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        fx.interrupted();
+        fx.server.set_in_progress(0);
+        fx.server
+            .route("GET", &fx.status_path(1), vec![Reply::status(404, "{}")]);
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(
+            lines_with(&err(&o), "lot du fournisseur oublié"),
+            [a18_gone(first_id(provider))],
+            "{provider}"
+        );
+        assert_eq!(fx.creations(), 2, "{provider}");
+        assert!(fx.to_enrich().is_empty(), "{provider}");
+        assert!(!fx.ids_stored(), "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac7_lot_inconnu_a_la_lecture_des_resultats() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        fx.interrupted();
+        fx.server.set_in_progress(0);
+        let results = if provider == "anthropic" {
+            "/v1/messages/batches/msgbatch_1/results"
+        } else {
+            "/v1/files/file_out_1/content"
+        };
+        fx.server
+            .route("GET", results, vec![Reply::status(404, "{}")]);
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(
+            lines_with(&err(&o), "lot du fournisseur oublié"),
+            [a18_gone(first_id(provider))],
+            "{provider}"
+        );
+        assert_eq!(fx.creations(), 2, "{provider}");
+        assert!(fx.to_enrich().is_empty(), "{provider}");
+    }
+}
+
+/// Réponse `ended` / `completed` du sondage d'un lot de deux requêtes.
+fn ended_body(provider: &str) -> String {
+    if provider == "anthropic" {
+        json!({"processing_status": "ended",
+               "request_counts": {"processing": 0, "succeeded": 2, "errored": 0, "canceled": 0, "expired": 0}})
+        .to_string()
+    } else {
+        json!({"status": "completed", "output_file_id": "file_out_1",
+               "request_counts": {"total": 2, "completed": 2, "failed": 0}})
+        .to_string()
+    }
+}
+
+#[test]
+fn req215_ac8_ac13_trois_sondages_en_echec_arretent_la_commande() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &["a", "b"], 0, good);
+        fx.server
+            .route("GET", &fx.status_path(1), vec![Reply::status(500, "{}")]);
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 1, "{provider} : {}", err(&o));
+        assert_eq!(last_line(&o), e35(2), "{provider}");
+        assert!(!err(&o).contains("panne réseau"), "{}", err(&o));
+        assert!(out(&o).contains("2 fichiers à enrichir"), "{}", out(&o));
+        assert_eq!(fx.enrich_batches(), [first_id(provider)], "{provider}");
+        fx.server.clear_route("GET", &fx.status_path(1));
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(fx.creations(), 1, "{provider}");
+        assert!(fx.to_enrich().is_empty(), "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac8_trois_sondages_refuses_en_400_arretent_aussi_par_e35() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &["a", "b"], 0, good);
+        fx.server
+            .route("GET", &fx.status_path(1), vec![Reply::status(400, "{}")]);
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 1, "{provider} : {}", err(&o));
+        assert_eq!(last_line(&o), e35(2), "{provider}");
+        assert_eq!(fx.enrich_batches(), [first_id(provider)], "{provider}");
+        assert_eq!(
+            fx.server.hits("GET", &fx.status_path(1)).len(),
+            3,
+            "{provider}"
+        );
+    }
+}
+
+#[test]
+fn req215_ac8_deux_echecs_puis_une_reussite_la_commande_continue() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &["a", "b"], 0, good);
+        // Chaque sondage en échec fait 5 requêtes (1 + 4 nouveaux essais).
+        let mut script = vec![Reply::status(500, "{}"); 10];
+        script.push(Reply::status(200, &ended_body(provider)));
+        fx.server.route("GET", &fx.status_path(1), script);
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert!(fx.to_enrich().is_empty(), "{provider}");
+        assert!(!err(&o).contains("erreur:"), "{}", err(&o));
+    }
+}
+
+fn format_failing(b: &Value) -> Outcome {
+    if has_note(b) {
+        good(b)
+    } else {
+        Outcome::Text("pas de JSON ici".into())
+    }
+}
+
+#[test]
+fn req215_ac9_ctrl_c_pendant_le_second_lot_rien_n_est_ecrit_puis_reprise() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "format_retries = 1\n", &["a"], 0, format_failing);
+        fx.server.hold(Some(2));
+        let d = fx.interrupt_at(2, &["build", "--batch"]);
+        assert_eq!(d.status.code(), Some(130), "{provider} : {}", d.stderr);
+        assert_eq!(fx.summary_of("a"), None, "{provider}");
+        assert_eq!(fx.to_enrich(), ["docs/a.md"], "{provider}");
+        assert_eq!(fx.enrich_batches(), [fx.id(1), fx.id(2)], "{provider}");
+        assert_eq!(d.last(), e33(1), "{provider}");
+        fx.server.hold(None);
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(fx.creations(), 2, "{provider}");
+        assert_eq!(fx.summary_of("a"), Some(summary_text("a")), "{provider}");
+        assert!(fx.to_enrich().is_empty(), "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac10_ac14_update_sans_batch_avertit_une_fois_et_oublie_a_la_fin() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        fx.interrupted();
+        let seen = fx.server.requests().len();
+        for args in [["update", "--no-llm"], ["update", "--dry-run"]] {
+            let o = fx.env.run(&args);
+            assert_eq!(code(&o), 0, "{provider} {args:?} : {}", err(&o));
+            assert!(!err(&o).contains("lot du fournisseur"), "{}", err(&o));
+            assert_eq!(fx.server.requests().len(), seen, "{provider} {args:?}");
+            assert_eq!(fx.enrich_batches(), [first_id(provider)], "{provider}");
+        }
+        fx.server.route(
+            "POST",
+            fx.sync_path(),
+            vec![
+                Reply::status(200, &wrap(provider, &single("a"))),
+                Reply::status(200, &wrap(provider, &single("b"))),
+            ],
+        );
+        let o = fx.env.run(&["update"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        // stdout inchangé : celui du même `update` sans lot enregistré.
+        let twin_server = FakeServer::start(vec![
+            (200, wrap(provider, &single("a"))),
+            (200, wrap(provider, &single("b"))),
+        ]);
+        let twin = Env::http(provider, &twin_server.base_url, "", &["a", "b"]);
+        assert_eq!(code(&twin.run(&["build", "--no-llm"])), 0);
+        let t = twin.run(&["update"]);
+        assert_eq!(code(&t), 0, "{provider} : {}", err(&t));
+        let shape = |s: &str| s.replace(|c: char| c.is_ascii_digit(), "#");
+        assert_eq!(shape(&out(&o)), shape(&out(&t)), "{provider}");
+        assert_eq!(
+            lines_with(&err(&o), "lot du fournisseur"),
+            [A19],
+            "{provider}"
+        );
+        assert_eq!(err(&o).lines().next(), Some(A19), "{provider}");
+        assert_eq!(
+            fx.server.hits("POST", fx.sync_path()).len(),
+            2,
+            "{provider}"
+        );
+        assert_eq!(fx.creations(), 1, "{provider}");
+        assert!(fx.to_enrich().is_empty(), "{provider}");
+        assert!(!fx.ids_stored(), "{provider}");
+        assert!(!fx.meta_dump().contains(first_id(provider)), "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac11_la_structure_reste_lisible_et_le_schema_ne_change_pas() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        let search = |fx: &Fx| {
+            let o = fx.env.run(&["query", "search", "Document", "--json"]);
+            assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+            out(&o)
+        };
+        let mut run = fx.env.spawn(&["build", "--batch"]);
+        wait_until("sondage du lot", || fx.polls(1) >= 1);
+        assert!(search(&fx).contains("docs/a.md"), "{provider}");
+        run.sigint();
+        let d = run.finish();
+        assert_eq!(d.status.code(), Some(130), "{provider} : {}", d.stderr);
+        assert!(search(&fx).contains("docs/b.md"), "{provider}");
+        let db = rusqlite::Connection::open(fx.env.repo.join(".nephila/graph.db")).unwrap();
+        let version: i32 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, nephila::store::SCHEMA_VERSION, "{provider}");
+    }
+}
+
+#[test]
+fn req215_ac11_ac12_second_ctrl_c_pendant_une_creation_retardee() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b"]);
+        let slow = Reply::Http {
+            status: 200,
+            body: json!({"id": "x"}).to_string(),
+            headers: vec![],
+            delay_ms: 10_000,
+        };
+        fx.server.route("POST", fx.create_path(), vec![slow]);
+        let mut run = fx.env.spawn(&["build", "--batch"]);
+        wait_until("création reçue", || fx.creations() >= 1);
+        run.sigint();
+        std::thread::sleep(Duration::from_millis(300));
+        run.sigint();
+        let d = run.finish();
+        assert_eq!(d.status.code(), Some(130), "{provider} : {}", d.stderr);
+        assert!(
+            d.after_signal.unwrap() < Duration::from_secs(1),
+            "{provider}"
+        );
+        assert_eq!(d.stdout, "", "{provider}");
+        assert_eq!(d.last(), E34, "{provider} : {}", d.stderr);
+        assert_eq!(
+            lines_with(&d.stderr, "Ctrl-C reçu : plus"),
+            [A16],
+            "{provider}"
+        );
+        assert_eq!(
+            d.stderr
+                .lines()
+                .filter(|l| l.starts_with("erreur:"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn req215_ac14_sans_fichier_a_enrichir_l_identifiant_est_oublie_sans_ligne() {
+    for provider in PROVIDERS {
+        // Chemin « à jour » : plus rien à enrichir, rien d'autre n'a changé.
+        let fx = fixture_forever(provider, &["a", "b"]);
+        fx.interrupted();
+        let seen = fx.server.requests().len();
+        fs::write(
+            fx.env.repo.join(".nephila.toml"),
+            "enrich_exclude = [\"docs/**\", \"other/**\"]\n",
+        )
+        .unwrap();
+        let o = fx.env.run(&["update"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert!(!err(&o).contains("lot du fournisseur"), "{}", err(&o));
+        assert!(!fx.ids_stored(), "{provider}");
+        assert_eq!(fx.server.requests().len(), seen, "{provider}");
+
+        // Chemin de la fin de commande : un fichier ajouté, hors de la portée.
+        let fx = fixture_forever(provider, &["a", "b"]);
+        fx.interrupted();
+        let seen = fx.server.requests().len();
+        fs::write(
+            fx.env.repo.join(".nephila.toml"),
+            "enrich_exclude = [\"docs/**\", \"other/**\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(fx.env.repo.join("other")).unwrap();
+        fs::write(fx.env.repo.join("other/x.md"), "# X\n\nTexte.\n").unwrap();
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert!(!err(&o).contains("lot du fournisseur"), "{}", err(&o));
+        assert!(!fx.ids_stored(), "{provider}");
+        assert_eq!(fx.server.requests().len(), seen, "{provider}");
+    }
+}
+
+#[test]
+fn req217_ac5_la_reprise_annonce_chaque_lot_une_fois_avant_le_sondage() {
+    for provider in PROVIDERS {
+        let fx = fixture_forever(provider, &["a", "b", "c"]);
+        let d = fx.interrupted();
+        let id1 = first_id(provider);
+        assert_eq!(
+            lines_with(&d.stderr, "lot du fournisseur envoyé"),
+            [announce(3, id1)]
+        );
+        fx.server.set_in_progress(0);
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(
+            err(&o).lines().next(),
+            Some(a15(id1).as_str()),
+            "{provider}"
+        );
+        assert_eq!(lines_with(&err(&o), "lot du fournisseur repris").len(), 1);
+        assert!(
+            !err(&o).contains("lot du fournisseur envoyé"),
+            "{}",
+            err(&o)
+        );
     }
 }

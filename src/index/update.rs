@@ -196,6 +196,10 @@ pub fn update_with_dry_run(
     // « Aucun changement » : rien d'ajouté, modifié, supprimé ou en attente, graphe marqué
     // « à jour », et (LLM inactif ou aucun fichier à enrichir).
     if d.is_up_to_date() && !to_resolve && (llm.is_none() || store.count_files_to_enrich()? == 0) {
+        // Plus rien à enrichir : les lots du fournisseur enregistrés ne servent plus (REQ-215).
+        if llm.is_some() {
+            store.set_enrich_batches(&[])?;
+        }
         let estimate = match dry {
             Some(dry) => {
                 let abs = build::abs_paths(&d.scanned);

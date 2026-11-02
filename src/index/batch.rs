@@ -2,7 +2,7 @@
 
 use crate::error::{warn, Error, Result};
 use crate::index::build::{BuildReport, IndexOptions};
-use crate::index::enrich::{enrich_pass, PassMode, Sources};
+use crate::index::enrich::{enrich_pass, PassMode, Sources, MAX_CONSECUTIVE_NETWORK_ERRORS};
 use crate::llm::batch::{
     split_lots, Answer, BatchLink, CreateError, LotStatus, Pending, MAX_LOT_BYTES, MAX_LOT_LINES,
 };
@@ -11,21 +11,55 @@ use crate::model::FileRecord;
 use crate::store::{address_fingerprint, EnrichBatch, Store};
 use crate::trace;
 use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Erreur E-31 (sans le préfixe `erreur: `) : seule source du texte.
 pub(crate) const E31: &str =
     "ce fournisseur n'a pas de mode lot ; relancez nephila update sans --batch";
 
-/// Un lot créé chez le fournisseur et les requêtes qu'il porte.
-type Lot = (String, Vec<Pending>);
+/// Cause d'E-33 (Ctrl-C), derrière `envoi interrompu : ` : seule source du texte.
+const E33_CAUSE: &str = "Ctrl-C reçu : relancez nephila update --batch pour continuer";
 
-/// Enrichit `files` par le mode lot (DEC-168) : passes de collecte, envoi des requêtes mises de
-/// côté, attente, réponses données au collecteur, jusqu'à ce que plus rien ne soit mis de côté ;
-/// puis une dernière passe qui écrit tout. Sans mode lot (`mock`, serveur sans lot), la structure
-/// reste écrite, les fichiers restent à enrichir et la commande se termine par E-31 ; rien ne part
-/// au plein tarif. Un refus ou une panne à la création arrête l'envoi, sans dernière passe.
+/// Cause d'E-35 (panne du suivi), derrière `envoi interrompu : ` : seule source du texte.
+const E35_CAUSE: &str = "suivi du lot du fournisseur impossible (3 échecs consécutifs) : relancez nephila update --batch pour continuer";
+
+/// Annonce A-16 (sans le préfixe `avertissement: `) : seule source du texte.
+const A16: &str = "Ctrl-C reçu : plus rien ne part et les lots du fournisseur déjà envoyés ne sont pas annulés ; appuyez de nouveau sur Ctrl-C pour quitter sans attendre";
+
+/// Un lot du fournisseur : ses requêtes sont connues quand la commande l'a créé, pas quand elle
+/// le reprend d'une commande précédente.
+struct Lot {
+    id: String,
+    requests: Option<Vec<Pending>>,
+}
+
+/// Suite de la commande après une étape.
+enum Flow {
+    Go,
+    Halt,
+}
+
+/// Que faire d'un échec du suivi.
+enum Step {
+    Retry,
+    Gone,
+    Halt,
+}
+
+/// Lecture des résultats d'un lot.
+enum Read {
+    Got(Vec<(String, Answer)>),
+    Gone,
+    Halt,
+}
+
+/// Enrichit `files` par le mode lot (DEC-168) : reprise des lots enregistrés, puis passes de
+/// collecte, envoi des requêtes mises de côté, attente, réponses données au collecteur, jusqu'à ce
+/// que plus rien ne soit mis de côté ; puis une dernière passe qui écrit tout. Sans mode lot
+/// (`mock`, serveur sans lot), la structure reste écrite, les fichiers restent à enrichir et la
+/// commande se termine par E-31 ; rien ne part au plein tarif. Un refus, une panne ou Ctrl-C
+/// arrête l'envoi, sans dernière passe, identifiants gardés.
 pub(crate) fn enrich_batched(
     sources: Sources<'_>,
     files: &[FileRecord],
@@ -39,68 +73,387 @@ pub(crate) fn enrich_batched(
         return Ok(());
     };
     let poll = poll_interval()?;
+    let _guard = crate::interrupt::Guard::install();
     let stop = AtomicBool::new(false);
-    let mut registered = store.enrich_batches()?;
+    let done = AtomicBool::new(false);
+    let registered = store.enrich_batches()?;
+    crate::interrupt::set_batch_mode(true);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| watch_interrupt(&stop, &done));
+        let mut driver = Driver {
+            link,
+            poll,
+            stop: &stop,
+            store,
+            report,
+            registered,
+            failures: 0,
+        };
+        let result = driver.run(sources, files, opts, llm);
+        done.store(true, Ordering::SeqCst);
+        result
+    });
+    crate::interrupt::set_batch_mode(false);
+    result
+}
+
+/// Fil de veille : au premier Ctrl-C, pose `stop` et écrit A-16, une fois.
+fn watch_interrupt(stop: &AtomicBool, done: &AtomicBool) {
     loop {
-        // Passe de collecte : rien n'est écrit, le bilan est jetable.
-        let mut scratch = BuildReport::default();
-        crate::trace::mute(true);
-        let collected = enrich_pass(
+        if crate::interrupt::received() >= 1 {
+            stop.store(true, Ordering::SeqCst);
+            warn(A16);
+            return;
+        }
+        if done.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+struct Driver<'a> {
+    link: BatchLink<'a>,
+    poll: Duration,
+    stop: &'a AtomicBool,
+    store: &'a mut Store,
+    report: &'a mut BuildReport,
+    /// Lots enregistrés dans le graphe, dans l'ordre de leur création.
+    registered: Vec<EnrichBatch>,
+    /// Échecs de suivi consécutifs, remis à zéro par une réussite.
+    failures: usize,
+}
+
+impl Driver<'_> {
+    fn signalled(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Ctrl-C reçu : E-33, sauf si une autre cause est déjà posée.
+    fn interrupt(&mut self) {
+        if self.report.stop_cause.is_none() && self.report.refused.is_none() {
+            self.report.stop_cause = Some(E33_CAUSE.to_string());
+            self.report.interrupted = true;
+        }
+    }
+
+    /// Les identifiants de lot du graphe suivent `self.registered`.
+    fn save(&mut self) -> Result<()> {
+        self.store.set_enrich_batches(&self.registered)
+    }
+
+    fn run(
+        &mut self,
+        sources: Sources<'_>,
+        files: &[FileRecord],
+        opts: &IndexOptions,
+        llm: &dyn Llm,
+    ) -> Result<()> {
+        if let Flow::Halt = self.resume()? {
+            return Ok(());
+        }
+        let stop = self.stop;
+        loop {
+            if self.signalled() {
+                self.interrupt();
+                return Ok(());
+            }
+            // Passe de collecte : rien n'est écrit, le bilan est jetable.
+            let mut scratch = BuildReport::default();
+            crate::trace::mute(true);
+            let collected = enrich_pass(
+                sources,
+                files,
+                opts,
+                llm,
+                self.store,
+                &mut scratch,
+                stop,
+                PassMode::Collect,
+            );
+            crate::trace::mute(false);
+            collected?;
+            if self.signalled() {
+                self.interrupt();
+                return Ok(());
+            }
+            let pending = self.link.collector.take_pending();
+            if pending.is_empty() {
+                break;
+            }
+            let mut lots: Vec<Lot> = Vec::new();
+            for requests in split_lots(pending, MAX_LOT_LINES, MAX_LOT_BYTES) {
+                if self.signalled() {
+                    self.interrupt();
+                    return Ok(());
+                }
+                match self.link.api.create(&requests, stop) {
+                    Ok((id, _bytes)) => {
+                        // Avant toute autre écriture : l'identifiant permet de reprendre.
+                        self.registered.push(EnrichBatch {
+                            id: id.clone(),
+                            provider: self.link.api.provider().to_string(),
+                            address: address_fingerprint(&self.link.api.address()),
+                        });
+                        self.save()?;
+                        warn(&format!(
+                            "lot du fournisseur envoyé : {} requêtes, identifiant {id}, réponse en 24 h au plus ; Ctrl-C ne perd rien : relancez nephila update --batch pour reprendre",
+                            requests.len()
+                        ));
+                        lots.push(Lot {
+                            id,
+                            requests: Some(requests),
+                        });
+                    }
+                    Err(e) => {
+                        if self.signalled() {
+                            self.interrupt();
+                        } else {
+                            refuse_creation(self.report, e);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            if self.signalled() {
+                self.interrupt();
+                return Ok(());
+            }
+            // Un lot tout juste créé n'est pas fini : seule la reprise sonde sans attendre.
+            if http::wait(self.poll, Some(stop)) {
+                self.interrupt();
+                return Ok(());
+            }
+            if let Flow::Halt = self.await_lots(lots)? {
+                return Ok(());
+            }
+        }
+        self.link.collector.close();
+        if self.signalled() {
+            self.interrupt();
+            return Ok(());
+        }
+        enrich_pass(
             sources,
             files,
             opts,
             llm,
-            store,
-            &mut scratch,
-            &stop,
-            PassMode::Collect,
-        );
-        crate::trace::mute(false);
-        collected?;
-        let pending = link.collector.take_pending();
-        if pending.is_empty() {
-            break;
+            self.store,
+            self.report,
+            stop,
+            PassMode::Last { capped: None },
+        )?;
+        if self.signalled() {
+            // Les identifiants ne sont oubliés que si la dernière passe a tout écrit.
+            if self.store.files_to_enrich()?.is_empty() {
+                self.registered.clear();
+                self.save()?;
+            }
+            self.interrupt();
+            return Ok(());
         }
-        let mut lots: Vec<Lot> = Vec::new();
-        for requests in split_lots(pending, MAX_LOT_LINES, MAX_LOT_BYTES) {
-            match link.api.create(&requests, &stop) {
-                Ok((id, _bytes)) => {
-                    // Avant toute autre écriture : l'identifiant est ce qui permet de reprendre.
-                    registered.push(EnrichBatch {
-                        id: id.clone(),
-                        provider: link.api.provider().to_string(),
-                        address: address_fingerprint(&link.api.address()),
-                    });
-                    store.set_enrich_batches(&registered)?;
-                    warn(&format!(
-                        "lot du fournisseur envoyé : {} requêtes, identifiant {id}, réponse en 24 h au plus ; Ctrl-C ne perd rien : relancez nephila update --batch pour reprendre",
-                        requests.len()
-                    ));
-                    lots.push((id, requests));
+        self.registered.clear();
+        self.save()
+    }
+
+    /// Lots enregistrés par une commande précédente : ceux d'un autre fournisseur ou d'une autre
+    /// adresse sont oubliés sans requête (A-18), les autres repris (A-15) et attendus.
+    fn resume(&mut self) -> Result<Flow> {
+        if self.registered.is_empty() {
+            return Ok(Flow::Go);
+        }
+        let provider = self.link.api.provider().to_string();
+        let address = address_fingerprint(&self.link.api.address());
+        let (kept, foreign): (Vec<EnrichBatch>, Vec<EnrichBatch>) =
+            std::mem::take(&mut self.registered)
+                .into_iter()
+                .partition(|b| b.provider == provider && b.address == address);
+        for b in &foreign {
+            warn(&format!(
+                "lot du fournisseur oublié : identifiant {}, envoyé à un autre fournisseur ou une autre adresse ; ses requêtes repartent dans un nouveau lot",
+                b.id
+            ));
+        }
+        self.registered = kept;
+        if !foreign.is_empty() {
+            self.save()?;
+        }
+        let lots: Vec<Lot> = self
+            .registered
+            .iter()
+            .map(|b| Lot {
+                id: b.id.clone(),
+                requests: None,
+            })
+            .collect();
+        for lot in &lots {
+            warn(&format!(
+                "lot du fournisseur repris : identifiant {} ; Ctrl-C ne perd rien : relancez nephila update --batch pour reprendre",
+                lot.id
+            ));
+        }
+        if lots.is_empty() {
+            Ok(Flow::Go)
+        } else {
+            self.await_lots(lots)
+        }
+    }
+
+    /// Échec du suivi du lot `id` (état ou résultats). Ctrl-C : arrêt. Clé ou requête refusée :
+    /// arrêt avec l'erreur du fournisseur. Lot repris inconnu du fournisseur (HTTP 404) : oublié
+    /// (A-18). Autre échec : compté, E-35 au troisième de suite.
+    fn track_error(&mut self, id: &str, e: Error, resumed: bool) -> Result<Step> {
+        if self.signalled() {
+            self.interrupt();
+            return Ok(Step::Halt);
+        }
+        if resumed && matches!(e, Error::Rejected { code: 404, .. }) {
+            warn(&format!(
+                "lot du fournisseur oublié : identifiant {id}, inconnu du fournisseur ou périmé ; ses requêtes repartent dans un nouveau lot"
+            ));
+            self.registered.retain(|b| b.id != id);
+            self.save()?;
+            return Ok(Step::Gone);
+        }
+        if matches!(e, Error::InvalidKey(_)) {
+            self.report.refused = Some(e);
+            return Ok(Step::Halt);
+        }
+        self.failures += 1;
+        trace!(
+            "lot du fournisseur: état {} échec {}/{MAX_CONSECUTIVE_NETWORK_ERRORS} : {}",
+            crate::escape::data(id),
+            self.failures,
+            failure_cause(&e)
+        );
+        if self.failures >= MAX_CONSECUTIVE_NETWORK_ERRORS {
+            self.report.stop_cause = Some(E35_CAUSE.to_string());
+            return Ok(Step::Halt);
+        }
+        Ok(Step::Retry)
+    }
+
+    /// Attend la fin de tous les lots (un sondage par lot à chaque intervalle, le premier sans
+    /// attendre), lit leurs résultats et donne au collecteur une réponse à chaque requête.
+    fn await_lots(&mut self, lots: Vec<Lot>) -> Result<Flow> {
+        enum Slot {
+            Waiting,
+            Finished(LotStatus),
+            Gone,
+        }
+        let mut slots: Vec<Slot> = lots.iter().map(|_| Slot::Waiting).collect();
+        loop {
+            let mut waiting = false;
+            for (lot, slot) in lots.iter().zip(slots.iter_mut()) {
+                if !matches!(slot, Slot::Waiting) {
+                    continue;
                 }
-                Err(e) => {
-                    refuse_creation(report, e);
-                    return Ok(());
+                if self.signalled() {
+                    self.interrupt();
+                    return Ok(Flow::Halt);
+                }
+                match self.link.api.status(&lot.id, self.stop) {
+                    Ok(status) => {
+                        self.failures = 0;
+                        if status.finished {
+                            *slot = Slot::Finished(status);
+                        } else {
+                            waiting = true;
+                        }
+                    }
+                    Err(e) => match self.track_error(&lot.id, e, lot.requests.is_none())? {
+                        Step::Halt => return Ok(Flow::Halt),
+                        Step::Gone => *slot = Slot::Gone,
+                        Step::Retry => waiting = true,
+                    },
+                }
+            }
+            if !waiting {
+                break;
+            }
+            if http::wait(self.poll, Some(self.stop)) {
+                self.interrupt();
+                return Ok(Flow::Halt);
+            }
+        }
+        for (lot, slot) in lots.iter().zip(slots) {
+            let Slot::Finished(status) = slot else {
+                continue;
+            };
+            let results = match self.read_results(lot, &status)? {
+                Read::Got(results) => results,
+                Read::Gone => continue,
+                Read::Halt => return Ok(Flow::Halt),
+            };
+            let mut answered: HashSet<String> = HashSet::new();
+            let ids: HashSet<&str> = lot
+                .requests
+                .iter()
+                .flatten()
+                .map(|p| p.id.as_str())
+                .collect();
+            for (id, answer) in results {
+                // Un lot repris ne connaît pas ses requêtes : toute réponse est donnée, et seules
+                // celles dont le corps n'a pas changé servent.
+                if (lot.requests.is_none() || ids.contains(id.as_str()))
+                    && answered.insert(id.clone())
+                {
+                    self.link.collector.add_answer(id, answer);
+                }
+            }
+            let default: &Answer = status.failure.as_ref().unwrap_or(&status.default_answer);
+            for p in lot.requests.iter().flatten() {
+                if !answered.contains(&p.id) {
+                    self.link
+                        .collector
+                        .add_answer(p.id.clone(), default.clone());
                 }
             }
         }
-        if let Err(e) = await_lots(link, &lots, poll, &stop) {
-            report.refused = Some(e);
-            return Ok(());
+        Ok(Flow::Go)
+    }
+
+    /// Lit les résultats d'un lot fini, avec les nouveaux essais comptés par `track_error`.
+    fn read_results(&mut self, lot: &Lot, status: &LotStatus) -> Result<Read> {
+        // Lot refusé en entier : toutes ses requêtes ont la même issue.
+        if status.failure.is_some() {
+            return Ok(Read::Got(Vec::new()));
+        }
+        loop {
+            if self.signalled() {
+                self.interrupt();
+                return Ok(Read::Halt);
+            }
+            match self.link.api.results(status, self.stop) {
+                Ok(results) => {
+                    self.failures = 0;
+                    return Ok(Read::Got(results));
+                }
+                Err(e) => match self.track_error(&lot.id, e, lot.requests.is_none())? {
+                    Step::Halt => return Ok(Read::Halt),
+                    Step::Gone => return Ok(Read::Gone),
+                    Step::Retry => {
+                        http::wait(self.poll, Some(self.stop));
+                    }
+                },
+            }
         }
     }
-    link.collector.close();
-    enrich_pass(
-        sources,
-        files,
-        opts,
-        llm,
-        store,
-        report,
-        &stop,
-        PassMode::Last { capped: None },
-    )?;
-    store.set_enrich_batches(&[])
+}
+
+/// Cause d'un échec de suivi, pour la trace : `délai dépassé`, `HTTP <code>` ou `réseau`.
+fn failure_cause(e: &Error) -> String {
+    let text = e.to_string();
+    if let Some((_, rest)) = text.split_once("(HTTP ") {
+        let code: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !code.is_empty() {
+            return format!("HTTP {code}");
+        }
+    }
+    match e {
+        Error::Network(_) | Error::Saturated(_) | Error::Timeout(_) => trace::classify(e),
+        _ => "erreur".to_string(),
+    }
 }
 
 /// Création refusée ou en échec : E-31, E-36, ou l'erreur du fournisseur (E-12, E-19, E-20).
@@ -117,44 +470,6 @@ fn refuse_creation(report: &mut BuildReport, e: CreateError) {
         }
         CreateError::Other(e) => report.refused = Some(e),
     }
-}
-
-/// Attend la fin de tous les lots (un sondage par lot à chaque intervalle), lit leurs résultats
-/// et donne au collecteur une réponse à chaque requête envoyée.
-fn await_lots(link: BatchLink<'_>, lots: &[Lot], poll: Duration, stop: &AtomicBool) -> Result<()> {
-    let mut statuses: Vec<Option<LotStatus>> = vec![None; lots.len()];
-    while statuses.iter().any(Option::is_none) {
-        http::wait(poll, Some(stop));
-        for ((id, _), slot) in lots.iter().zip(statuses.iter_mut()) {
-            if slot.is_none() {
-                let status = link.api.status(id, stop)?;
-                if status.finished {
-                    *slot = Some(status);
-                }
-            }
-        }
-    }
-    for ((_, requests), status) in lots.iter().zip(statuses.into_iter().flatten()) {
-        let ids: HashSet<&str> = requests.iter().map(|p| p.id.as_str()).collect();
-        let mut answered: HashSet<String> = HashSet::new();
-        let results = match &status.failure {
-            // Lot refusé en entier : toutes ses requêtes ont la même issue.
-            Some(_) => Vec::new(),
-            None => link.api.results(&status, stop)?,
-        };
-        for (id, answer) in results {
-            if ids.contains(id.as_str()) && answered.insert(id.clone()) {
-                link.collector.add_answer(id, answer);
-            }
-        }
-        let default: &Answer = status.failure.as_ref().unwrap_or(&status.default_answer);
-        for p in requests {
-            if !answered.contains(&p.id) {
-                link.collector.add_answer(p.id.clone(), default.clone());
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

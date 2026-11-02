@@ -27,7 +27,7 @@ use crate::trace;
 
 /// Seuil des erreurs réseau consécutives (saturations comprises) et des délais dépassés
 /// consécutifs, chacun compté à part, qui arrête l'envoi (DEC-015, DEC-099).
-const MAX_CONSECUTIVE_NETWORK_ERRORS: usize = 3;
+pub(crate) const MAX_CONSECUTIVE_NETWORK_ERRORS: usize = 3;
 
 /// Cause d'arrêt à seuil : libellé de la trace et cause de la ligne `erreur:` (une seule table).
 pub(crate) struct ThresholdCause {

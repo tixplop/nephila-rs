@@ -715,6 +715,10 @@ pub(crate) fn finalize(
             if opts.batch {
                 crate::index::batch::enrich_batched(sources, &files, opts, llm, store, report)?;
             } else {
+                // A-19 : des fichiers vont être payés de nouveau pendant qu'un lot les attend.
+                if !store.enrich_batches()?.is_empty() {
+                    warn("lot du fournisseur enregistré : les fichiers à enrichir seront payés de nouveau ; appuyez sur Ctrl-C et relancez nephila update --batch pour le reprendre");
+                }
                 enrich::enrich_all(sources, &files, opts, llm, store, report)?;
             }
             stats = resolve_pass(store)?;
@@ -729,6 +733,10 @@ pub(crate) fn finalize(
         .filter(|f| f.state == FileState::Pending)
         .count();
     report.to_enrich = store.count_files_to_enrich()?;
+    // Plus rien à enrichir : les lots du fournisseur enregistrés ne servent plus (REQ-215).
+    if llm.is_some() && report.to_enrich == 0 {
+        store.set_enrich_batches(&[])?;
+    }
     if llm.is_some() || dry.is_some() {
         report.out_of_scope = store.count_out_of_scope(opts.enrich_code, &opts.enrich_scope)?;
     }

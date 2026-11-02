@@ -2,7 +2,7 @@
 //!
 //! Unix seulement.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// Nombre de SIGINT reçus depuis l'installation de la garde courante.
@@ -15,6 +15,19 @@ static PHASE: Mutex<()> = Mutex::new(());
 pub(crate) const E28: &[u8] =
     "erreur: envoi interrompu : second Ctrl-C reçu : relancez nephila update pour continuer\n"
         .as_bytes();
+
+/// Message du second Ctrl-C sous `--batch` (design V-006, E-34) : seule source du texte.
+pub(crate) const E34: &[u8] =
+    "erreur: envoi interrompu : second Ctrl-C reçu : relancez nephila update --batch pour continuer\n"
+        .as_bytes();
+
+/// Vrai pendant le mode lot : le gestionnaire écrit E-34 au lieu d'E-28.
+static BATCH_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Choisit le texte du second Ctrl-C (atomique : lu dans le gestionnaire de signal).
+pub(crate) fn set_batch_mode(on: bool) {
+    BATCH_MODE.store(on, Ordering::SeqCst);
+}
 
 /// Code de sortie d'une exécution interrompue.
 pub(crate) const EXIT_INTERRUPTED: i32 = 130;
@@ -30,9 +43,14 @@ pub(crate) fn received() -> usize {
 extern "C" fn on_sigint(_: libc::c_int) {
     let n = RECEIVED.fetch_add(1, Ordering::SeqCst) + 1;
     if n >= 2 {
+        let text = if BATCH_MODE.load(Ordering::SeqCst) {
+            E34
+        } else {
+            E28
+        };
         // SAFETY: `write` et `_exit` sont async-signal-safe ; le tampon est statique.
         unsafe {
-            let _ = libc::write(2, E28.as_ptr().cast(), E28.len());
+            let _ = libc::write(2, text.as_ptr().cast(), text.len());
             libc::_exit(EXIT_INTERRUPTED);
         }
     }
@@ -262,6 +280,18 @@ mod tests {
             "erreur: envoi interrompu : second Ctrl-C reçu : relancez nephila update pour continuer\n"
         );
         assert_eq!(EXIT_INTERRUPTED, 130);
+    }
+
+    #[test]
+    fn req215_e34_text_and_batch_mode_flag() {
+        assert_eq!(
+            std::str::from_utf8(E34).unwrap(),
+            "erreur: envoi interrompu : second Ctrl-C reçu : relancez nephila update --batch pour continuer\n"
+        );
+        set_batch_mode(true);
+        assert!(BATCH_MODE.load(Ordering::SeqCst));
+        set_batch_mode(false);
+        assert!(!BATCH_MODE.load(Ordering::SeqCst));
     }
 
     #[test]
