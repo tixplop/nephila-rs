@@ -365,7 +365,7 @@ fn req024_ac8_anthropic_enrich_request_carries_content_nodes_and_schema() {
     let b: serde_json::Value = serde_json::from_str(&s.requests()[0].body).unwrap();
     check_enrich_request(b["messages"][0]["content"].as_str().unwrap());
     let sys = b["system"].as_str().unwrap();
-    assert!(sys.contains("version\": 2") && sys.contains("summaries") && sys.contains("concepts"));
+    assert!(!sys.contains("version") && sys.contains("summaries") && sys.contains("concepts"));
     check_system_prompt(sys);
 }
 
@@ -379,7 +379,7 @@ fn req024_ac8_openai_enrich_request_carries_content_nodes_and_schema() {
     let b: serde_json::Value = serde_json::from_str(&s.requests()[0].body).unwrap();
     check_enrich_request(b["messages"][1]["content"].as_str().unwrap());
     let sys = b["messages"][0]["content"].as_str().unwrap();
-    assert!(sys.contains("version\": 2") && sys.contains("summaries") && sys.contains("concepts"));
+    assert!(!sys.contains("version") && sys.contains("summaries") && sys.contains("concepts"));
     check_system_prompt(sys);
 }
 
@@ -440,7 +440,7 @@ fn check_lot_request(system: &str, user: &str) {
         assert!(user.contains(needle), "{needle} : {user}");
     }
     assert!(
-        system.contains("version\": 3") && system.contains("files"),
+        !system.contains("version") && system.contains("files"),
         "{system}"
     );
     check_system_prompt(system);
@@ -750,4 +750,86 @@ fn req176_ac5_build_accepts_trailing_remark_without_resend() {
         "export class ApiClient {}\n",
         &reply,
     );
+}
+
+// ---- REQ-201 : réponse sans `version` acceptée ----
+
+/// `build` par le binaire contre le faux serveur : `docs` documents, réponse sans `version`.
+fn build_without_version(provider: &str, docs: usize) {
+    let names = ["a.md", "b.md"];
+    let summary = |i: usize| {
+        format!(
+            r#"{{"node":"document:{}","summary":"Zorglub {i}."}}"#,
+            names[i]
+        )
+    };
+    let reply = if docs == 1 {
+        format!(r#"{{"summaries":[{}],"concepts":[]}}"#, summary(0))
+    } else {
+        let entry = |i: usize| {
+            format!(
+                r#"{{"file":"{}","summaries":[{}],"concepts":[]}}"#,
+                names[i],
+                summary(i)
+            )
+        };
+        format!(r#"{{"files":[{},{}]}}"#, entry(0), entry(1))
+    };
+    let body = if provider == "openai" {
+        openai_reply(&reply)
+    } else {
+        anthropic_reply(&reply)
+    };
+    let s = FakeServer::start(vec![(200, body)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for n in &names[..docs] {
+        std::fs::write(repo.join(n), "# Titre\n\nTexte.\n").unwrap();
+    }
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "provider = \"{provider}\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T293_KEY\"\nconcurrency = 1\nbatch_files = {docs}\n",
+            s.base_url
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &config)
+            .env("NEPHILA_T293_KEY", "sk-test")
+            .output()
+            .unwrap()
+    };
+    let out = run(&["build"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(0), "{provider} {docs} : {err}");
+    assert!(!err.contains("avertissement:"), "{provider} {docs} : {err}");
+    let posts = s
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .count();
+    assert_eq!(posts, 1, "{provider} {docs}");
+    let found = String::from_utf8_lossy(&run(&["query", "search", "Zorglub"]).stdout).to_string();
+    for n in &names[..docs] {
+        assert!(found.contains(n), "{provider} {docs} : {found}");
+    }
+}
+
+#[test]
+fn req201_ac4_openai_reply_without_version_single_file_and_lot() {
+    build_without_version("openai", 1);
+    build_without_version("openai", 2);
+}
+
+#[test]
+fn req201_ac4_anthropic_reply_without_version_single_file_and_lot() {
+    build_without_version("anthropic", 1);
+    build_without_version("anthropic", 2);
 }

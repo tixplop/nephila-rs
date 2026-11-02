@@ -12,7 +12,7 @@ pub const NOTE_SEVERAL: &str = "Correction : ta réponse précédente contenait 
 /// Note de `FormatFault::Unreadable`.
 pub const NOTE_UNREADABLE: &str = "Correction : ta réponse précédente contenait un JSON illisible (syntaxe invalide ou objet incomplet). Réponds par un seul objet JSON complet et valide, au format demandé.";
 /// Note de `FormatFault::Version`.
-pub const NOTE_VERSION: &str = "Correction : dans ta réponse précédente, la valeur de \"version\" n'était pas celle du format demandé. Recopie la version donnée par le schéma.";
+pub const NOTE_VERSION: &str = "Correction : ta réponse précédente contenait un champ \"version\" d'une autre valeur que celle du format demandé. N'écris pas ce champ.";
 /// Note de `FormatFault::UnknownField`.
 pub const NOTE_UNKNOWN_FIELD: &str = "Correction : ta réponse précédente contenait un champ hors du format demandé. N'utilise que les champs du format demandé, sans en ajouter ni en renommer.";
 /// Note de `FormatFault::MissingField`.
@@ -284,7 +284,7 @@ mod tests {
         }
 
         fn enrich_err(text: &str) -> Error {
-            parse_reply(text, "version", |j| {
+            parse_reply(text, "summaries", |j| {
                 Enrichment::parse(j, "A.java", &nodes())
             })
             .map(|_| ())
@@ -356,7 +356,7 @@ mod tests {
             );
             let wrapped = format!(r#"{{"result":{EXTRACTION}}}"#);
             is(&enrich_err(&wrapped), Some(FormatFault::UnknownField));
-            let e = parse_reply(EXTRACTION, "version", |j| parse_lot(j, &[])).map(|_| ());
+            let e = parse_reply(EXTRACTION, "files", |j| parse_lot(j, &[])).map(|_| ());
             is(&e.unwrap_err(), Some(FormatFault::UnknownField));
         }
 
@@ -411,7 +411,7 @@ mod tests {
                 (NOTE_ABSENT, "Correction : ta réponse précédente ne contenait aucun objet JSON. Réponds uniquement par un objet JSON au format demandé, sans texte autour."),
                 (NOTE_SEVERAL, "Correction : ta réponse précédente contenait plusieurs objets JSON différents. Réponds par un seul objet JSON au format demandé, sans texte autour."),
                 (NOTE_UNREADABLE, "Correction : ta réponse précédente contenait un JSON illisible (syntaxe invalide ou objet incomplet). Réponds par un seul objet JSON complet et valide, au format demandé."),
-                (NOTE_VERSION, "Correction : dans ta réponse précédente, la valeur de \"version\" n'était pas celle du format demandé. Recopie la version donnée par le schéma."),
+                (NOTE_VERSION, "Correction : ta réponse précédente contenait un champ \"version\" d'une autre valeur que celle du format demandé. N'écris pas ce champ."),
                 (NOTE_UNKNOWN_FIELD, "Correction : ta réponse précédente contenait un champ hors du format demandé. N'utilise que les champs du format demandé, sans en ajouter ni en renommer."),
                 (NOTE_MISSING_FIELD, "Correction : il manquait un champ obligatoire du format demandé dans ta réponse précédente. Donne tous les champs obligatoires, avec une liste vide s'il n'y a rien à y mettre."),
                 (NOTE_SHAPE, "Correction : dans ta réponse précédente, un champ n'avait pas le type ou la valeur demandés (par exemple une chaîne à la place d'un booléen ou d'une liste). Respecte exactement le format demandé."),

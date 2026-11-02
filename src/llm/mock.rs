@@ -245,6 +245,28 @@ fn check_relative(file: &str) -> Result<()> {
     }
 }
 
+/// Une fixture doit porter `version` (README, LLM simulé) : même refus que l'ancienne lecture
+/// stricte (DEC-162 (4)).
+fn require_version(json: &str) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Probe {
+        version: u32,
+    }
+    serde_json::from_str::<Probe>(json)
+        .map(|_| ())
+        .or_else(|e| {
+            let msg = e.to_string();
+            if msg.starts_with("missing field") {
+                Err(Error::Format(format!(
+                    "réponse LLM non conforme au schéma : {msg}"
+                )))
+            } else {
+                Ok(()) // autre défaut : signalé par la lecture commune
+            }
+        })
+}
+
 impl MockLlm {
     fn enrich_stats(
         &self,
@@ -254,7 +276,10 @@ impl MockLlm {
         stats: &CallStats,
     ) -> Result<Enrichment> {
         match self.fixture_json(file, call, stats)? {
-            Some(j) => Enrichment::parse(&j, file, known),
+            Some(j) => {
+                require_version(&j)?;
+                Enrichment::parse(&j, file, known)
+            }
             None => Ok(Enrichment::default()),
         }
     }
@@ -280,6 +305,7 @@ impl MockLlm {
                 None => (Value::Array(vec![]), Value::Array(vec![])),
                 Some(j) => {
                     // Même analyse stricte que `enrich` (version 2, champs inconnus refusés).
+                    require_version(&j)?;
                     Enrichment::parse(&j, &it.file, &it.node_ids)?;
                     let v: Value = serde_json::from_str(&j).map_err(|e| {
                         Error::Format(format!("fixture mock de {} illisible : {e}", it.file))

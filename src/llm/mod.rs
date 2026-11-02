@@ -121,8 +121,10 @@ pub(crate) trait Complete: Send + Sync {
     ) -> Result<String>;
 }
 
-/// Clé de premier niveau d'une réponse d'enrichissement (fichier ou lot).
-const KEY_VERSION: &str = "version";
+/// Clé de premier niveau d'une réponse d'enrichissement d'un fichier seul.
+const KEY_SUMMARIES: &str = "summaries";
+/// Clé de premier niveau d'une réponse d'enrichissement d'un lot.
+const KEY_FILES: &str = "files";
 /// Clé de premier niveau d'une réponse de `query ask`.
 const KEY_FOUND: &str = "found";
 
@@ -146,7 +148,7 @@ impl<T: Complete> Llm for T {
             enrichment_system_prompt(self.summary_language()),
             enrichment_user_prompt(file, None, text, requested),
         )?;
-        http::parse_reply(&out, KEY_VERSION, |j| Enrichment::parse(j, file, known))
+        http::parse_reply(&out, KEY_SUMMARIES, |j| Enrichment::parse(j, file, known))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -173,7 +175,7 @@ impl<T: Complete> Llm for T {
                 fault,
             ),
         )?;
-        http::parse_reply(&out, KEY_VERSION, |j| Enrichment::parse(j, file, known))
+        http::parse_reply(&out, KEY_SUMMARIES, |j| Enrichment::parse(j, file, known))
     }
 
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
@@ -184,7 +186,7 @@ impl<T: Complete> Llm for T {
             lot_system_prompt(self.summary_language()),
             lot_user_prompt(items),
         )?;
-        Ok(http::parse_reply(&out, KEY_VERSION, |j| parse_lot(j, items))?.into_results())
+        Ok(http::parse_reply(&out, KEY_FILES, |j| parse_lot(j, items))?.into_results())
     }
 
     fn enrich_lot_labeled(
@@ -202,7 +204,7 @@ impl<T: Complete> Llm for T {
             lot_system_prompt(self.summary_language()),
             with_note(lot_user_prompt(items), fault),
         )?;
-        Ok(http::parse_reply(&out, KEY_VERSION, |j| parse_lot(j, items))?.into_results())
+        Ok(http::parse_reply(&out, KEY_FILES, |j| parse_lot(j, items))?.into_results())
     }
 
     fn ask(&self, question: &str, context: &str) -> Result<AskReply> {

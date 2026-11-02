@@ -172,3 +172,38 @@ fn req003_ac7_lot_timeout_and_counters() {
     assert!(m.enrich_lot(&lot).is_ok());
     assert!(matches!(m.enrich_lot(&lot), Err(Error::InvalidKey(_))));
 }
+
+#[test]
+fn req201_ac5_fixture_without_version_fails_with_missing_field() {
+    let d = tempfile::tempdir().unwrap();
+    let body = r#""summaries":[{"node":"type:A","summary":"ok"}],"concepts":[]"#;
+    std::fs::write(d.path().join("A.java.json"), format!("{{{body}}}")).unwrap();
+    std::fs::write(d.path().join("B.java.json"), format!("{{{body}}}")).unwrap();
+    std::fs::write(
+        d.path().join("C.java.json"),
+        format!(r#"{{"version":2,{body}}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        d.path().join("D.java.json"),
+        format!(r#"{{"version":2,{body}}}"#),
+    )
+    .unwrap();
+    let m = mock(d.path(), None);
+    let n = ids(&["type:A"]);
+    let e = m.enrich("A.java", 1, "", &n, &n).unwrap_err();
+    assert!(e.to_string().contains("missing field `version`"), "{e}");
+    assert_eq!(
+        m.enrich("C.java", 1, "", &n, &n).unwrap().summaries.len(),
+        1
+    );
+    let item = |f: &str| nephila::llm::LotItem {
+        file: f.into(),
+        text: String::new(),
+        node_ids: n.clone(),
+    };
+    let e = m.enrich_lot(&[item("A.java"), item("B.java")]).unwrap_err();
+    assert!(e.to_string().contains("missing field `version`"), "{e}");
+    let ok = m.enrich_lot(&[item("C.java"), item("D.java")]).unwrap();
+    assert!(ok.iter().all(|(_, r)| r.is_ok()));
+}

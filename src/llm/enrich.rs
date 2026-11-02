@@ -16,44 +16,44 @@ pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 /// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
 /// propre à une famille n'incrémente que la sienne. Tout enrichissement conservé avec une
 /// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
-/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0 (consignes de forme des
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 8 depuis la 0.26.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
-/// 2 à 6 n'ont pas été livrées).
-pub const CODE_PROMPT_VERSION: u32 = 7;
+/// 2 à 7 n'ont pas été livrées).
+pub const CODE_PROMPT_VERSION: u32 = 8;
 
 /// Version du prompt d'enrichissement de la famille `build` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
 /// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
 /// propre à une famille n'incrémente que la sienne. Tout enrichissement conservé avec une
 /// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
-/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0 (consignes de forme des
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 8 depuis la 0.26.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
-/// 2 à 6 n'ont pas été livrées).
-pub const BUILD_PROMPT_VERSION: u32 = 7;
+/// 2 à 7 n'ont pas été livrées).
+pub const BUILD_PROMPT_VERSION: u32 = 8;
 
 /// Version du prompt d'enrichissement de la famille `données` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
 /// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
 /// propre à une famille n'incrémente que la sienne. Tout enrichissement conservé avec une
 /// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
-/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0 (consignes de forme des
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 8 depuis la 0.26.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
-/// 2 à 6 n'ont pas été livrées).
-pub const DATA_PROMPT_VERSION: u32 = 7;
+/// 2 à 7 n'ont pas été livrées).
+pub const DATA_PROMPT_VERSION: u32 = 8;
 
 /// Version du prompt d'enrichissement de la famille `markdown` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
 /// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
 /// propre à une famille n'incrémente que la sienne (`CONCEPT_RULES` pour celle-ci). Tout enrichissement conservé avec une
 /// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
-/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 7 depuis la 0.26.0 (consignes de forme des
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 8 depuis la 0.26.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
-/// 2 à 6 n'ont pas été livrées).
-pub const MARKDOWN_PROMPT_VERSION: u32 = 7;
+/// 2 à 7 n'ont pas été livrées).
+pub const MARKDOWN_PROMPT_VERSION: u32 = 8;
 
 /// Versions du prompt d'enrichissement des quatre familles (REQ-193).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +197,8 @@ pub struct Enrichment {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawEnrichment {
-    version: u32,
+    #[serde(default)]
+    version: Option<u32>,
     summaries: Vec<RawSummary>,
     concepts: Vec<RawConcept>,
 }
@@ -410,10 +411,9 @@ impl Enrichment {
     /// Analyse strictement `json` puis filtre selon la liste de nœuds du fichier.
     pub fn parse(json: &str, file: &str, node_ids: &[String]) -> Result<Enrichment> {
         let raw: RawEnrichment = serde_json::from_str(json).map_err(invalid)?;
-        if raw.version != ENRICH_SCHEMA_VERSION {
+        if let Some(v) = raw.version.filter(|v| *v != ENRICH_SCHEMA_VERSION) {
             return Err(invalid(format!(
-                "version {} non prise en charge (attendu : {ENRICH_SCHEMA_VERSION})",
-                raw.version
+                "version {v} non prise en charge (attendu : {ENRICH_SCHEMA_VERSION})"
             )));
         }
         Ok(filter_raw(raw.summaries, raw.concepts, file, node_ids))
@@ -439,8 +439,7 @@ pub fn enrichment_system_prompt(language: &str) -> String {
     let rules = language_rules(language);
     format!(
         "Tu enrichis le graphe d'un dépôt à partir d'un fichier ({types}) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
-         Schéma (version {ENRICH_SCHEMA_VERSION}) : {{\"version\": {ENRICH_SCHEMA_VERSION}, \
-         \"summaries\": [{{\"node\": \"<identifiant de la liste>\", \"summary\": \"<25 mots au plus>\"}}], \
+         Schéma : {{\"summaries\": [{{\"node\": \"<identifiant de la liste>\", \"summary\": \"<25 mots au plus>\"}}], \
          \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \
          \"sections\": [\"<identifiant de section de la liste>\"]}}]}}.\n\
          {SUMMARY_RULES}\n\
@@ -451,7 +450,7 @@ pub fn enrichment_system_prompt(language: &str) -> String {
          Les résumés ne portent que sur les nœuds de la liste fournie. Les concepts ne concernent \
          que les fichiers Markdown et ne citent que des sections de la liste. Tu ne crées, ne \
          renomme ni ne supprimes aucun nœud et tu ne produis aucun autre lien. \
-         Sans rien à signaler, réponds {{\"version\": {ENRICH_SCHEMA_VERSION}, \"summaries\": [], \"concepts\": []}}."
+         Sans rien à signaler, réponds {{\"summaries\": [], \"concepts\": []}}."
     )
 }
 
@@ -526,7 +525,8 @@ impl LotEnrichment {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLot {
-    version: u32,
+    #[serde(default)]
+    version: Option<u32>,
     files: Vec<RawLotEntry>,
 }
 
@@ -552,10 +552,9 @@ fn norm_path(path: &str) -> String {
 /// non conforme (`Err`) ; un fichier du lot sans entrée échoue seul.
 pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
     let raw: RawLot = serde_json::from_str(json).map_err(invalid)?;
-    if raw.version != ENRICH_LOT_SCHEMA_VERSION {
+    if let Some(v) = raw.version.filter(|v| *v != ENRICH_LOT_SCHEMA_VERSION) {
         return Err(invalid(format!(
-            "version {} non prise en charge pour un lot (attendu : {ENRICH_LOT_SCHEMA_VERSION})",
-            raw.version
+            "version {v} non prise en charge pour un lot (attendu : {ENRICH_LOT_SCHEMA_VERSION})"
         )));
     }
     let mut rejected = Vec::new();
@@ -615,7 +614,7 @@ pub fn lot_system_prompt(language: &str) -> String {
         "Tu enrichis le graphe d'un dépôt à partir de plusieurs fichiers ({types}) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
          Chaque fichier est introduit par une ligne `=== FICHIER : <chemin> ===`, suivie de la liste de ses \
          nœuds puis de son contenu, jusqu'à la ligne `=== FIN DU FICHIER : <chemin> ===`.\n\
-         Schéma (version {ENRICH_LOT_SCHEMA_VERSION}) : {{\"version\": {ENRICH_LOT_SCHEMA_VERSION}, \"files\": \
+         Schéma : {{\"files\": \
          [{{\"file\": \"<chemin exact du fichier>\", \"summaries\": [{{\"node\": \"<identifiant de la liste de ce fichier>\", \
          \"summary\": \"<25 mots au plus>\"}}], \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \
          \"sections\": [\"<identifiant de section de la liste de ce fichier>\"]}}]}}]}}.\n\
@@ -713,7 +712,7 @@ pub(crate) mod tests {
 
     /// Prompt système de la version 5 : sans les règles des concepts (REQ-175).
     fn texts_v5_system(p: String) -> String {
-        p.replace(&format!("{CONCEPT_RULES}\n"), "")
+        texts_v7_system(p).replace(&format!("{CONCEPT_RULES}\n"), "")
     }
 
     /// Les six textes figés par la version 5 (AC-175-2).
@@ -800,8 +799,41 @@ pub(crate) mod tests {
         ]
     }
 
-    /// Les six textes de la version 6 (inchangés par la version 7).
+    /// Prompt système des versions 2 à 7 : « Schéma (version N) : {"version": N, » et la réponse
+    /// vide avec `version` remis (REQ-201 les a retirés en version 8).
+    fn texts_v7_system(p: String) -> String {
+        p.replacen(
+            "Schéma : {\"summaries\"",
+            &format!(
+                "Schéma (version {ENRICH_SCHEMA_VERSION}) : {{\"version\": {ENRICH_SCHEMA_VERSION}, \"summaries\""
+            ),
+            1,
+        )
+        .replacen(
+            "Schéma : {\"files\"",
+            &format!(
+                "Schéma (version {ENRICH_LOT_SCHEMA_VERSION}) : {{\"version\": {ENRICH_LOT_SCHEMA_VERSION}, \"files\""
+            ),
+            1,
+        )
+        .replacen(
+            "réponds {\"summaries\"",
+            &format!("réponds {{\"version\": {ENRICH_SCHEMA_VERSION}, \"summaries\""),
+            1,
+        )
+    }
+
+    /// Les six textes de la version 6 (inchangés par la version 7) : prompts actuels avec `version`
+    /// remis.
     fn texts_v6() -> Vec<String> {
+        let mut t = texts_v8();
+        t[1] = texts_v7_system(t[1].clone());
+        t[4] = texts_v7_system(t[4].clone());
+        t
+    }
+
+    /// Les six textes actuels (version 8 : sans `version` dans les prompts système).
+    fn texts_v8() -> Vec<String> {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
@@ -812,11 +844,47 @@ pub(crate) mod tests {
         ]
     }
 
-    /// Textes communs aux quatre familles (REQ-193) : les sept textes figés de la version 7, la
+    #[test]
+    fn req177_ac5_the_six_texts_of_version_6_are_unchanged() {
+        assert_eq!(
+            fingerprint_of(&texts_v6()),
+            "0d53830988dade24bd34df822cd23054749d4d8eb426ed86d817f306620348fb"
+        );
+    }
+
+    #[test]
+    fn req171_ac4_the_six_texts_of_version_3_are_unchanged() {
+        assert_eq!(
+            fingerprint_of(&texts_v3()),
+            "27656c4c231a8abc77a1f39bd2a7c985c33bddaf48c141a06df73557b6b7dc27"
+        );
+    }
+
+    #[test]
+    fn req169_ac3_the_five_texts_of_0_26_0_are_unchanged() {
+        assert_eq!(
+            fingerprint_of(&texts_0_26(|t| t)),
+            "a15bf9ef481fcf8b4d4b23cd4c073a7c341de03e0642b46c77c7c4cb0bd06f36"
+        );
+    }
+
+    #[test]
+    fn req167_ac2_only_the_rules_and_the_example_value_changed() {
+        let strip = |t: String| {
+            t.replace(&format!("{SUMMARY_RULES}\n"), "")
+                .replace("<25 mots au plus>", "une phrase")
+        };
+        assert_eq!(
+            fingerprint_of(&texts_0_26(strip)),
+            "9d89eb9166852d117d282e3559895d7e2e5e3caf46da37b53548f491a589f8c5"
+        );
+    }
+
+    /// Textes communs aux quatre familles (REQ-193) : les sept textes figés de la version 8, la
     /// ligne `CONCEPT_RULES` + `\n` retirée des deux prompts système.
     fn common_texts() -> Vec<String> {
         let strip = |p: String| p.replacen(&format!("{CONCEPT_RULES}\n"), "", 1);
-        let mut texts = texts_v6();
+        let mut texts = texts_v8();
         texts[1] = strip(texts[1].clone());
         texts[4] = strip(texts[4].clone());
         texts.push(
@@ -847,40 +915,40 @@ pub(crate) mod tests {
 
     #[test]
     fn req193_ac2_code_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(CODE_PROMPT_VERSION, 7);
+        assert_eq!(CODE_PROMPT_VERSION, 8);
         assert_eq!(
             family_fingerprint(PromptFamily::Code),
-            "fb5dd371b5d691663918f707b14040fd04177acd8de51df1a47ee7c8518c8c58",
+            "3fc16cb0e1a5b06b8bca768a8e4600125d81a76cf3b16e7bb37f16cde9250e4d",
             "les textes du prompt de la famille code ont changé : incrémentez CODE_PROMPT_VERSION"
         );
     }
 
     #[test]
     fn req193_ac2_build_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(BUILD_PROMPT_VERSION, 7);
+        assert_eq!(BUILD_PROMPT_VERSION, 8);
         assert_eq!(
             family_fingerprint(PromptFamily::Build),
-            "fb5dd371b5d691663918f707b14040fd04177acd8de51df1a47ee7c8518c8c58",
+            "3fc16cb0e1a5b06b8bca768a8e4600125d81a76cf3b16e7bb37f16cde9250e4d",
             "les textes du prompt de la famille build ont changé : incrémentez BUILD_PROMPT_VERSION"
         );
     }
 
     #[test]
     fn req193_ac2_data_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(DATA_PROMPT_VERSION, 7);
+        assert_eq!(DATA_PROMPT_VERSION, 8);
         assert_eq!(
             family_fingerprint(PromptFamily::Data),
-            "fb5dd371b5d691663918f707b14040fd04177acd8de51df1a47ee7c8518c8c58",
+            "3fc16cb0e1a5b06b8bca768a8e4600125d81a76cf3b16e7bb37f16cde9250e4d",
             "les textes du prompt de la famille données ont changé : incrémentez DATA_PROMPT_VERSION"
         );
     }
 
     #[test]
     fn req193_ac2_markdown_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(MARKDOWN_PROMPT_VERSION, 7);
+        assert_eq!(MARKDOWN_PROMPT_VERSION, 8);
         assert_eq!(
             family_fingerprint(PromptFamily::Markdown),
-            "9d17e47d478e48eda3256131bd7c2d26aa9e99a6bba2daddf443927ce287c3e1",
+            "c71df41bb963c9b5fec3b9f06e437db0d56ada06ebdb7042b86bd0ede1bfd8b8",
             "les textes du prompt de la famille markdown ont changé : incrémentez MARKDOWN_PROMPT_VERSION"
         );
         assert_ne!(
@@ -944,7 +1012,7 @@ pub(crate) mod tests {
         }
         for t in FileType::ALL {
             assert!(expected.iter().any(|(e, _)| *e == t), "{t:?}");
-            assert_eq!(PromptVersions::CURRENT.of(t), 7, "{t:?}");
+            assert_eq!(PromptVersions::CURRENT.of(t), 8, "{t:?}");
         }
         assert_eq!(v.of_path("src/A.java"), 1);
         assert_eq!(v.of_path("pom.xml"), 2);
@@ -958,23 +1026,7 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [7; 4]
-        );
-    }
-
-    #[test]
-    fn req177_ac5_the_six_texts_of_version_6_are_unchanged() {
-        assert_eq!(
-            fingerprint_of(&texts_v6()),
-            "0d53830988dade24bd34df822cd23054749d4d8eb426ed86d817f306620348fb"
-        );
-    }
-
-    #[test]
-    fn req171_ac4_the_six_texts_of_version_3_are_unchanged() {
-        assert_eq!(
-            fingerprint_of(&texts_v3()),
-            "27656c4c231a8abc77a1f39bd2a7c985c33bddaf48c141a06df73557b6b7dc27"
+            [8; 4]
         );
     }
 
@@ -1109,14 +1161,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn req169_ac3_the_five_texts_of_0_26_0_are_unchanged() {
-        assert_eq!(
-            fingerprint_of(&texts_0_26(|t| t)),
-            "a15bf9ef481fcf8b4d4b23cd4c073a7c341de03e0642b46c77c7c4cb0bd06f36"
-        );
-    }
-
-    #[test]
     fn req169_ac1_excerpt_rules_text_and_placement() {
         assert_eq!(EXCERPT_RULES, EXTRAIT);
         let needle = format!("\n{SUMMARY_RULES}\n{EXCERPT_RULES}\n");
@@ -1168,18 +1212,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn req167_ac2_only_the_rules_and_the_example_value_changed() {
-        let strip = |t: String| {
-            t.replace(&format!("{SUMMARY_RULES}\n"), "")
-                .replace("<25 mots au plus>", "une phrase")
-        };
-        assert_eq!(
-            fingerprint_of(&texts_0_26(strip)),
-            "9d89eb9166852d117d282e3559895d7e2e5e3caf46da37b53548f491a589f8c5"
-        );
-    }
-
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -1227,6 +1259,61 @@ pub(crate) mod tests {
         let ok =
             Enrichment::parse(r#"{"version":2,"summaries":[],"concepts":[]}"#, "a.md", &n).unwrap();
         assert_eq!(ok, Enrichment::default());
+    }
+
+    #[test]
+    fn req201_ac1_version_is_optional_but_checked_when_present() {
+        let n = ids(&[]);
+        let without = Enrichment::parse(r#"{"summaries":[],"concepts":[]}"#, "a.md", &n).unwrap();
+        let with =
+            Enrichment::parse(r#"{"version":2,"summaries":[],"concepts":[]}"#, "a.md", &n).unwrap();
+        assert_eq!(without, with);
+        let e = Enrichment::parse(r#"{"version":1,"summaries":[],"concepts":[]}"#, "a.md", &n)
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("version 1 non prise en charge (attendu : 2)"),
+            "{e}"
+        );
+        assert_eq!(
+            crate::llm::FormatFault::of(&e),
+            Some(crate::llm::FormatFault::Version)
+        );
+        let e = Enrichment::parse(r#"{"summaries":[],"concepts":[],"extra":1}"#, "a.md", &n)
+            .unwrap_err();
+        assert_eq!(
+            crate::llm::FormatFault::of(&e),
+            Some(crate::llm::FormatFault::UnknownField)
+        );
+        let items = [item("A.java", &[])];
+        let entry = r#"{"file":"A.java","summaries":[],"concepts":[]}"#;
+        let a = parse_lot(&format!(r#"{{"files":[{entry}]}}"#), &items).unwrap();
+        let b = parse_lot(&format!(r#"{{"version":3,"files":[{entry}]}}"#), &items).unwrap();
+        assert_eq!(a.into_results(), b.into_results());
+        let e = parse_lot(r#"{"version":2,"files":[]}"#, &items).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("version 2 non prise en charge pour un lot (attendu : 3)"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn req201_ac2_system_prompts_do_not_name_version() {
+        let one = enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE);
+        let lot = lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE);
+        assert!(!one.contains("version") && !lot.contains("version"));
+        assert!(one.ends_with(r#"réponds {"summaries": [], "concepts": []}."#));
+        assert_eq!(
+            [
+                CODE_PROMPT_VERSION,
+                BUILD_PROMPT_VERSION,
+                DATA_PROMPT_VERSION,
+                MARKDOWN_PROMPT_VERSION
+            ],
+            [8; 4]
+        );
+        assert_eq!(crate::llm::ask::ASK_PROMPT_VERSION, 2);
     }
 
     #[test]

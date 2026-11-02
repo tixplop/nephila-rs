@@ -1091,7 +1091,9 @@ mod tests {
         }
 
         fn enrich(text: &str) -> crate::error::Result<Enrichment> {
-            parse_reply(text, "version", |j| Enrichment::parse(j, "A.java", &ids()))
+            parse_reply(text, "summaries", |j| {
+                Enrichment::parse(j, "A.java", &ids())
+            })
         }
 
         /// Message de la 0.26.0 en cours : `extract_json` puis `Enrichment::parse`.
@@ -1171,7 +1173,7 @@ mod tests {
         #[test]
         fn req176_ac3_lot_and_ask_keys() {
             let items = lot_items();
-            let lot = |t: &str| parse_reply(t, "version", |j| parse_lot(j, &items));
+            let lot = |t: &str| parse_reply(t, "files", |j| parse_lot(j, &items));
             let v3 = r#"{"version":3,"files":[{"file":"A.java","summaries":[{"node":"type:A","summary":"Le A."}],"concepts":[]}]}"#;
             assert!(lot(&format!("{v3}\n{{x}}")).is_ok());
             let v2 = r#"{"version":2,"files":[]}"#;
@@ -1189,6 +1191,19 @@ mod tests {
                 .expect("exemple");
             let e = found_false(&format!("{ex}\n{{\"found\": false}}")).unwrap_err();
             assert!(matches!(e, Error::Format(_)));
+        }
+
+        #[test]
+        fn req201_ac3_keys_summaries_and_files() {
+            assert!(enrich(r#"Voici : {"summaries": [], "concepts": []} fin"#).is_ok());
+            let items = lot_items();
+            let lot = |t: &str| parse_reply(t, "files", |j| parse_lot(j, &items));
+            let entry = r#"{"file":"A.java","summaries":[],"concepts":[]}"#;
+            assert!(lot(&format!("{{\"files\":[{entry}]}}\n{{x}}")).is_ok());
+            assert!(matches!(
+                lot(r#"{"version": 2, "files": []}"#),
+                Err(Error::Format(_))
+            ));
         }
 
         #[test]
