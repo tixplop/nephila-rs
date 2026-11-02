@@ -5060,3 +5060,274 @@ mod estimate_tests {
         );
     }
 }
+
+/// Place de la trace de repli de la sortie structurée dans l'enrichissement (REQ-203, T-297).
+#[cfg(test)]
+mod structured_fallback_tests {
+    use super::*;
+    use crate::config::Effort;
+    use crate::llm::anthropic::AnthropicLlm;
+    use crate::llm::openai::OpenAiLlm;
+    use crate::llm::{recording_server, Generation, Structured, Tls};
+    use crate::model::FileState;
+
+    const NAMES: [&str; 3] = ["A.txt", "B.txt", "C.txt"];
+    const REFUSED: &str = r#"{"error":{"message":"Invalid parameter: format is not supported"}}"#;
+
+    fn node_id(path: &str) -> String {
+        Node::new(
+            NodeKind::Method,
+            &format!("{path}.m"),
+            "m",
+            Some(path),
+            None,
+            None,
+        )
+        .id
+    }
+
+    /// Réponse HTTP 200 d'un fournisseur qui résume le nœud du fichier.
+    fn ok(provider: &str, path: &str) -> String {
+        let content = serde_json::json!({
+            "summaries": [{"node": node_id(path), "summary": "Résumé"}],
+            "concepts": [],
+        })
+        .to_string();
+        if provider == "anthropic" {
+            serde_json::json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": content}]})
+                .to_string()
+        } else {
+            serde_json::json!({"choices": [{"message": {"content": content}, "finish_reason": "stop"}]})
+                .to_string()
+        }
+    }
+
+    fn adapter(provider: &str, base: String) -> Box<dyn Llm> {
+        let gen = Generation {
+            effort: Effort::Low,
+            effort_explicit: false,
+            thinking: false,
+            max_output_tokens: 1000,
+        };
+        if provider == "anthropic" {
+            Box::new(
+                AnthropicLlm::new(
+                    Some(base),
+                    "m".into(),
+                    "k".into(),
+                    10,
+                    &Tls::default(),
+                    1,
+                    gen,
+                )
+                .with_structured(Structured::Auto)
+                .with_structured_key("structured_output"),
+            )
+        } else {
+            Box::new(
+                OpenAiLlm::new(
+                    Some(base),
+                    "m".into(),
+                    Some("k".into()),
+                    10,
+                    &Tls::default(),
+                    1,
+                    gen,
+                )
+                .with_structured(Structured::Auto)
+                .with_structured_key("structured_output"),
+            )
+        }
+    }
+
+    struct Run {
+        events: Vec<String>,
+        report: BuildReport,
+        failures: Vec<(String, Error)>,
+        sends: usize,
+    }
+
+    /// Enrichit les trois documents avec les réponses programmées ; traces capturées si `traced`.
+    fn run(provider: &str, replies: Vec<(u16, String)>, traced: bool) -> Run {
+        let _t = crate::interrupt::test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for n in NAMES {
+            std::fs::write(dir.path().join(n), "texte\n").unwrap();
+            files.push(FileRecord {
+                path: n.into(),
+                hash: String::new(),
+                size: 6,
+                mtime: 0,
+                recorded_at: 0,
+                state: FileState::Indexed,
+            });
+        }
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(&files).unwrap();
+        for f in &files {
+            let node = Node::new(
+                NodeKind::Method,
+                &format!("{}.m", f.path),
+                "m",
+                Some(&f.path),
+                None,
+                None,
+            );
+            store.replace_structure(&f.path, &[node], &[]).unwrap();
+        }
+        let (base, bodies) = recording_server(replies, 0);
+        let llm = adapter(provider, base);
+        let opts = IndexOptions {
+            jobs: 1,
+            concurrency: 1,
+            max_chunk_chars: 1000,
+            batch_files: 1,
+            format_retries: 0,
+            enrich_code: false,
+            max_calls: None,
+        };
+        let mut report = BuildReport::default();
+        let sources = Sources {
+            repo: dir.path(),
+            abs: &HashMap::new(),
+        };
+        let stop = AtomicBool::new(false);
+        let mut go = |report: &mut BuildReport| {
+            enrich_with_stop(
+                sources,
+                &files,
+                &opts,
+                llm.as_ref(),
+                &mut store,
+                report,
+                &stop,
+            )
+            .unwrap()
+        };
+        // Les lignes `llm enrich départ` et `fin` ne s'écrivent que sous `--verbose`.
+        let (failures, mut events) = crate::trace::capture_all(traced, || go(&mut report));
+        // Seuls les événements de la passe comptent, pas ceux des tests voisins.
+        events.retain(|l| {
+            NAMES.iter().any(|n| l.contains(n))
+                || l.contains("sortie structurée")
+                || l.contains("politique:")
+        });
+        let sends = bodies.lock().unwrap().len();
+        Run {
+            events,
+            report,
+            failures,
+            sends,
+        }
+    }
+
+    fn fallback_line(provider: &str) -> String {
+        format!("sortie structurée: schéma JSON refusé par {provider} (HTTP 400), suite de la commande sans schéma (structured_output = \"auto\")")
+    }
+
+    fn count(events: &[String], needle: &str) -> usize {
+        events.iter().filter(|l| l.contains(needle)).count()
+    }
+
+    #[test]
+    fn req203_ac7_trace_de_repli_apres_le_depart_avant_la_fin() {
+        for provider in ["openai", "anthropic"] {
+            let replies = vec![
+                (400, REFUSED.to_string()),
+                (200, ok(provider, "A.txt")),
+                (200, ok(provider, "B.txt")),
+                (200, ok(provider, "C.txt")),
+            ];
+            let r = run(provider, replies.clone(), true);
+            assert!(r.failures.is_empty(), "{provider}: {:?}", r.failures);
+            let at = r
+                .events
+                .iter()
+                .position(|l| l.starts_with("llm enrich départ A.txt [1/1] "))
+                .unwrap_or_else(|| panic!("{provider}: {:?}", r.events));
+            assert_eq!(r.events[at + 1], fallback_line(provider));
+            assert!(
+                r.events[at + 2].starts_with("llm enrich fin A.txt [1/1] ok ("),
+                "{}",
+                r.events[at + 2]
+            );
+            assert_eq!(count(&r.events, "sortie structurée"), 1, "{provider}");
+            for banned in ["requête refusée", "politique:", "(essai "] {
+                assert_eq!(count(&r.events, banned), 0, "{provider} {banned}");
+            }
+            assert!(
+                calls_line(&r.report.llm)
+                    .starts_with("appels: 3 appels, 0 nouveaux essais de format, 4 envois HTTP"),
+                "{provider}: {}",
+                calls_line(&r.report.llm)
+            );
+            assert_eq!(r.sends, 4);
+
+            // Traces désactivées : rien n'est retenu par la capture et aucun échec n'est rendu.
+            let quiet = run(provider, replies, false);
+            assert!(quiet.events.is_empty(), "{:?}", quiet.events);
+            assert_eq!(quiet.sends, 4);
+            assert!(quiet.failures.is_empty() && quiet.report.refused.is_none());
+            assert_eq!(quiet.report.failed, 0);
+        }
+    }
+
+    /// E-19 telle que `finish` la rend, ligne `erreur:` sans son préfixe.
+    fn rendered(r: &Run) -> String {
+        crate::index::build::finish(&r.report)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn req203_ac8_refus_sans_les_mots_du_schema_garde_e19_sans_trace_de_repli() {
+        for provider in ["openai", "anthropic"] {
+            let body = r#"{"error":{"message":"Bad request"}}"#.to_string();
+            let r = run(provider, vec![(400, body)], true);
+            assert_eq!(count(&r.events, "sortie structurée"), 0, "{provider}");
+            assert_eq!(r.sends, 1, "{provider}");
+            let e = rendered(&r);
+            assert!(
+                e.starts_with(&format!("requête refusée par {provider} (HTTP 400) sur ")),
+                "{e}"
+            );
+            assert!(
+                e.ends_with(
+                    " : Bad request ; vérifiez model, thinking, effort et max_output_tokens"
+                ),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn req203_ac8_second_refus_une_trace_avant_la_fin_et_e19_du_second_refus() {
+        for provider in ["openai", "anthropic"] {
+            let second = r#"{"error":{"message":"second refus du modèle"}}"#.to_string();
+            let r = run(
+                provider,
+                vec![(400, REFUSED.to_string()), (400, second)],
+                true,
+            );
+            assert_eq!(r.sends, 2, "{provider}");
+            assert_eq!(count(&r.events, "sortie structurée"), 1, "{provider}");
+            let trace_at = r
+                .events
+                .iter()
+                .position(|l| l.contains("sortie structurée"))
+                .unwrap();
+            let end_at = r
+                .events
+                .iter()
+                .position(|l| l.starts_with("llm enrich fin A.txt [1/1] requête refusée "))
+                .unwrap_or_else(|| panic!("{provider}: {:?}", r.events));
+            assert!(trace_at < end_at, "{provider}");
+            let e = rendered(&r);
+            assert!(
+                e.ends_with(" : second refus du modèle ; vérifiez model, thinking, effort et max_output_tokens"),
+                "{e}"
+            );
+        }
+    }
+}

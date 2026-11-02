@@ -2032,3 +2032,140 @@ mod tests {
         );
     }
 }
+
+/// Place de la trace de repli de la sortie structurée dans `query ask` (REQ-204, T-297).
+#[cfg(test)]
+mod structured_fallback_tests {
+    use super::*;
+    use crate::config::Effort;
+    use crate::llm::anthropic::AnthropicLlm;
+    use crate::llm::openai::OpenAiLlm;
+    use crate::llm::{recording_server, Generation, Structured, Tls};
+    use crate::model::{FileRecord, FileState, NodeKind};
+
+    const REFUSED: &str =
+        r#"{"error":{"message":"Invalid parameter: 'response_format' is not supported"}}"#;
+    const ANSWER: &str = r#"{"found":true,"answer":"réponse","nodes":["Alpha"]}"#;
+
+    fn ok(provider: &str) -> String {
+        if provider == "anthropic" {
+            serde_json::json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": ANSWER}]})
+                .to_string()
+        } else {
+            serde_json::json!({"choices": [{"message": {"content": ANSWER}, "finish_reason": "stop"}]})
+                .to_string()
+        }
+    }
+
+    fn adapter(provider: &str, base: String) -> Box<dyn Llm> {
+        let gen = Generation {
+            effort: Effort::Low,
+            effort_explicit: false,
+            thinking: false,
+            max_output_tokens: 1000,
+        };
+        if provider == "anthropic" {
+            Box::new(
+                AnthropicLlm::new(
+                    Some(base),
+                    "m".into(),
+                    "k".into(),
+                    10,
+                    &Tls::default(),
+                    1,
+                    gen,
+                )
+                .with_structured(Structured::Auto)
+                .with_structured_key("ask.structured_output"),
+            )
+        } else {
+            Box::new(
+                OpenAiLlm::new(
+                    Some(base),
+                    "m".into(),
+                    Some("k".into()),
+                    10,
+                    &Tls::default(),
+                    1,
+                    gen,
+                )
+                .with_structured(Structured::Auto)
+                .with_structured_key("ask.structured_output"),
+            )
+        }
+    }
+
+    /// Réponse de `answer` et traces capturées, avec les réponses programmées du faux serveur.
+    fn ask(
+        provider: &str,
+        replies: Vec<(u16, String)>,
+        verbose: bool,
+    ) -> (String, Vec<Node>, Vec<String>, usize) {
+        let _t = crate::interrupt::test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        let file = FileRecord {
+            path: "A.java".into(),
+            hash: String::new(),
+            size: 1,
+            mtime: 0,
+            recorded_at: 0,
+            state: FileState::Indexed,
+        };
+        store.insert_files(&[file]).unwrap();
+        let node = Node::new(NodeKind::Type, "Alpha", "Alpha", Some("A.java"), None, None);
+        store.replace_structure("A.java", &[node], &[]).unwrap();
+        let (base, bodies) = recording_server(replies, 0);
+        let llm = adapter(provider, base);
+        let (r, events) = crate::trace::capture_all(verbose, || {
+            answer(&store, llm.as_ref(), "Alpha", 0, &AskLimits::default())
+        });
+        let (text, nodes) = r.unwrap();
+        let mut events = events;
+        // Seuls les événements de la passe comptent, pas ceux des tests voisins.
+        events.retain(|l| l.starts_with("sortie structurée") || l.starts_with("appels:"));
+        let sends = bodies.lock().unwrap().len();
+        (text, nodes, events, sends)
+    }
+
+    /// Le `config` est écrit par `run` avant `answer` : ici, les deux traces qui suivent.
+    #[test]
+    fn req204_ac6_trace_de_repli_puis_ligne_appels() {
+        for provider in ["openai", "anthropic"] {
+            let (text, nodes, events, sends) = ask(
+                provider,
+                vec![(400, REFUSED.to_string()), (200, ok(provider))],
+                true,
+            );
+            assert_eq!(sends, 2, "{provider}");
+            assert_eq!(events.len(), 2, "{provider}: {events:?}");
+            assert_eq!(
+                events[0],
+                format!("sortie structurée: schéma JSON refusé par {provider} (HTTP 400), suite de la commande sans schéma (ask.structured_output = \"auto\")")
+            );
+            assert!(
+                events[1]
+                    .starts_with("appels: 1 appels, 0 nouveaux essais de format, 2 envois HTTP"),
+                "{}",
+                events[1]
+            );
+            // Même réponse que sans refus.
+            let (text2, nodes2, events2, sends2) = ask(provider, vec![(200, ok(provider))], true);
+            assert_eq!(sends2, 1);
+            assert_eq!((&text, &nodes), (&text2, &nodes2), "{provider}");
+            assert_eq!(events2.len(), 1);
+            assert!(events2[0]
+                .starts_with("appels: 1 appels, 0 nouveaux essais de format, 1 envois HTTP"));
+
+            // Sans `--verbose` : même réponse, aucune trace retenue.
+            let (text3, nodes3, quiet, sends3) = ask(
+                provider,
+                vec![(400, REFUSED.to_string()), (200, ok(provider))],
+                false,
+            );
+            assert_eq!(sends3, 2, "{provider}");
+            assert!(quiet.is_empty(), "{quiet:?}");
+            assert_eq!((&text3, &nodes3), (&text2, &nodes2), "{provider}");
+        }
+    }
+}

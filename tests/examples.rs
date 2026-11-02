@@ -2526,3 +2526,40 @@ fn req205_ac2_readme_lignes_structured_output() {
     let phrase = "bornent le contexte envoyé. Dans la configuration personnelle seulement, `structured_output` (défaut `\"off\"`, même si la clé du premier niveau est écrite) impose aussi le schéma JSON à la réponse de `query ask`. Priorité :";
     assert_eq!(readme.matches(phrase).count(), 1);
 }
+
+/// AC-205-4 : place des trois ajouts du README (table des clés, table des fournisseurs, phrase
+/// de la section `[ask]`).
+#[test]
+fn req205_ac4_readme_place_des_lignes_structured_output() {
+    let readme = repo_file("README.md");
+    let lines: Vec<&str> = readme.lines().collect();
+    let key_row = lines
+        .iter()
+        .position(|l| l.starts_with("| `structured_output` | Schéma JSON imposé"))
+        .unwrap();
+    assert!(
+        lines[key_row - 1].starts_with("| `max_output_tokens` |"),
+        "{}",
+        lines[key_row - 1]
+    );
+    let provider_row = lines
+        .iter()
+        .position(|l| *l == "| `structured_output` | `output_config.format` | `response_format` | sans effet |")
+        .unwrap();
+    assert!(
+        lines
+            .get(provider_row + 1)
+            .is_none_or(|l| !l.starts_with('|')),
+        "la ligne n'est pas la dernière de sa table"
+    );
+    assert!(lines[provider_row - 1].starts_with("| `effort` |"));
+    let at =
+        readme.find("bornent le contexte envoyé.").unwrap() + "bornent le contexte envoyé.".len();
+    assert!(
+        readme[at..].starts_with(
+            " Dans la configuration personnelle seulement, `structured_output` (défaut"
+        ),
+        "{}",
+        &readme[at..at + 80]
+    );
+}

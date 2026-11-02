@@ -56,14 +56,55 @@ thread_local! {
 }
 
 #[cfg(test)]
+static CAPTURED_ALL: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
 fn capture_event(args: &fmt::Arguments) -> bool {
-    CAPTURED.with(|c| match c.borrow_mut().as_mut() {
+    let local = CAPTURED.with(|c| match c.borrow_mut().as_mut() {
         Some(v) => {
             v.push(args.to_string());
             true
         }
         None => false,
-    })
+    });
+    local
+        || (enabled()
+            && match CAPTURED_ALL
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_mut()
+            {
+                Some(v) => {
+                    v.push(args.to_string());
+                    true
+                }
+                None => false,
+            })
+}
+
+/// Comme `capture`, pour toutes les traces du processus, fils de travail compris, avec les
+/// traces activées (`verbose`) ou non : un événement n'est retenu que si `enabled()` est vrai.
+/// Le test détient `interrupt::test_lock()`, qui exclut les autres tests d'enrichissement.
+/// Une garde remet l'état initial (capture éteinte, traces inactives) même après un panic.
+#[cfg(test)]
+pub(crate) fn capture_all<R>(verbose: bool, f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *CAPTURED_ALL.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            init(false);
+        }
+    }
+    let _reset = Reset;
+    init(verbose);
+    *CAPTURED_ALL.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+    let r = f();
+    let events = CAPTURED_ALL
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+        .unwrap_or_default();
+    (r, events)
 }
 
 /// Exécute `f` en rangeant les traces émises par le fil courant (texte après `trace: [..] `),

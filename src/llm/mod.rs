@@ -11,6 +11,8 @@ pub mod retry;
 mod schema;
 mod tidy;
 mod usage;
+#[cfg(test)]
+pub(crate) use usage::recording_server;
 pub use usage::{
     anthropic_usage, calls_line, openai_usage, tokens_segment, CallStats, LlmTotals, Usage,
 };

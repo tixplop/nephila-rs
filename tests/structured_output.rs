@@ -290,3 +290,224 @@ fn REQ204_AC3_ask_on_envoie_le_schema_nephila_ask() {
         assert!(format_of(provider, b).is_none(), "{provider}: {b}");
     }
 }
+
+// ---------------------------------------------------------------- T-297 (AC UX)
+
+fn mock_repo(project: Option<&str>, personal: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("a.md"), "# a\n").unwrap();
+    if let Some(p) = project {
+        fs::write(repo.join(".nephila.toml"), p).unwrap();
+    }
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, personal).unwrap();
+    (tmp, repo, config)
+}
+
+fn nephila(repo: &PathBuf, config: &PathBuf, args: &[&str]) -> Output {
+    Command::new(cargo_bin("nephila"))
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("NEPHILA_CONFIG", config)
+        .env_remove("NEPHILA_MOCK_DIR")
+        .env_remove("NEPHILA_MOCK_LOG")
+        .output()
+        .unwrap()
+}
+
+fn lines_of(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn REQ202_AC8_valeur_invalide_une_seule_ligne_e15() {
+    for (value, shown) in [("\"ON\"", "\"ON\""), ("true", "true")] {
+        let (_t, repo, config) = mock_repo(
+            None,
+            &format!("provider = \"mock\"\nstructured_output = {value}\n"),
+        );
+        let o = nephila(&repo, &config, &["build"]);
+        assert_eq!(o.status.code(), Some(1), "{value}");
+        assert_eq!(
+            err(&o),
+            format!(
+                "erreur: configuration invalide ({}) : clé « structured_output » doit être \"auto\", \"on\" ou \"off\" (reçu : {shown})\n",
+                config.display()
+            ),
+            "{value}"
+        );
+        assert!(!repo.join(".nephila").exists(), "{value}");
+
+        let o = nephila(&repo, &config, &["build", "--no-llm"]);
+        assert_eq!(o.status.code(), Some(0), "{value}: {}", err(&o));
+        assert!(
+            !lines_of(&o.stderr).iter().any(|l| l.contains("erreur:")),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn REQ202_AC8_cle_au_premier_niveau_du_fichier_de_projet() {
+    let (_t, repo, config) = mock_repo(
+        Some("structured_output = \"on\"\n"),
+        "provider = \"mock\"\n",
+    );
+    let o = nephila(&repo, &config, &["build"]);
+    assert_eq!(o.status.code(), Some(1));
+    let lines = lines_of(&o.stderr);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let l = &lines[0];
+    assert!(l.starts_with("erreur: "), "{l}");
+    let (_, list) = l
+        .split_once("clé inconnue `structured_output` (clés permises : ")
+        .unwrap_or_else(|| panic!("{l}"));
+    assert!(!list.contains("structured_output"), "{l}");
+    assert!(!l.contains("invalid type") && !l.contains("TOML"), "{l}");
+}
+
+#[test]
+fn REQ204_AC4_ask_structured_output_booleen_refuse_par_ask_et_build() {
+    let (_t, repo, config) = mock_repo(
+        None,
+        "provider = \"mock\"\n[ask]\nstructured_output = true\n",
+    );
+    assert_eq!(
+        nephila(&repo, &config, &["build", "--no-llm"])
+            .status
+            .code(),
+        Some(0)
+    );
+    let expected = format!(
+        "erreur: configuration invalide ({}) : clé « ask.structured_output » doit être \"auto\", \"on\" ou \"off\" (reçu : true)\n",
+        config.display()
+    );
+    for args in [&["query", "ask", "x"][..], &["build"][..]] {
+        let o = nephila(&repo, &config, args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+        assert_eq!(err(&o), expected, "{args:?}");
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
+}
+
+/// Trois documents, faux serveur `openai` qui accepte tout corps : stdout, stderr.
+fn three_docs(extra: &str, args: &[&str]) -> (String, String) {
+    let names = ["docs/d.md", "docs/e.md", "docs/f.md"];
+    let replies = names
+        .iter()
+        .map(|n| reply("openai", &file_reply(&[n])))
+        .collect();
+    let h = Http::new("openai", extra, 1, replies);
+    fs::write(h.repo.join("docs/f.md"), "# F\n\nTroisième.\n").unwrap();
+    let mut a = vec!["build"];
+    a.extend_from_slice(args);
+    let o = h.run(&a);
+    assert!(o.status.success(), "{extra}: {}", err(&o));
+    assert_eq!(h.bodies().len(), 3);
+    (String::from_utf8_lossy(&o.stdout).into_owned(), err(&o))
+}
+
+/// Retire le préfixe `trace: [<s>.<mmm>s] ` et remplace les millisecondes par `<ms>`.
+fn normalized(stderr: &str) -> Vec<String> {
+    let prefix = |l: &str| -> String {
+        match l.strip_prefix("trace: [").and_then(|r| r.split_once("] ")) {
+            Some((_, rest)) => rest.to_string(),
+            None => l.to_string(),
+        }
+    };
+    stderr
+        .lines()
+        .map(|l| {
+            let l = prefix(l);
+            let words: Vec<&str> = l.split(' ').collect();
+            let mut out: Vec<&str> = Vec::new();
+            for (i, w) in words.iter().enumerate() {
+                let is_ms = words
+                    .get(i + 1)
+                    .is_some_and(|n| n.trim_end_matches(',') == "ms")
+                    && !w.is_empty()
+                    && w.chars().all(|c| c.is_ascii_digit());
+                out.push(if is_ms { "<ms>" } else { w });
+            }
+            out.join(" ")
+        })
+        .collect()
+}
+
+#[test]
+fn REQ202_AC9_on_et_off_donnent_la_meme_sortie() {
+    let (_, on) = three_docs("structured_output = \"on\"\n", &["--verbose"]);
+    let (_, off) = three_docs("structured_output = \"off\"\n", &["--verbose"]);
+    let (on, off) = (normalized(&on), normalized(&off));
+    assert!(on.len() > 3, "{on:?}");
+    assert!(on.iter().any(|l| l.contains("<ms>")), "{on:?}");
+    assert_eq!(on, off);
+    for l in on.iter().chain(&off) {
+        assert!(
+            !l.contains("sortie structurée")
+                && !l.contains("structured_output")
+                && !l.contains("response_format"),
+            "{l}"
+        );
+    }
+    let a = three_docs("structured_output = \"on\"\n", &[]);
+    let b = three_docs("structured_output = \"off\"\n", &[]);
+    assert_eq!(a, b);
+}
+
+/// `query ask` sur le faux serveur `openai` : la réponse du modèle, la clé `[ask]` éventuelle.
+fn ask_once(extra: &str, model_reply: &str, args: &[&str]) -> Output {
+    let h = Http::new("openai", extra, 1, vec![reply("openai", model_reply)]);
+    let o = h.run(&["build", "--no-llm"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let mut a = vec!["query", "ask"];
+    a.extend_from_slice(args);
+    a.push("Alpha");
+    let o = h.run(&a);
+    assert_eq!(h.bodies().len(), 1);
+    o
+}
+
+fn config_line(o: &Output) -> String {
+    normalized(&err(o))
+        .into_iter()
+        .find(|l| l.starts_with("config: "))
+        .unwrap_or_else(|| panic!("pas de ligne config : {}", err(o)))
+}
+
+#[test]
+fn REQ204_AC5_champs_null_du_schema_equivalent_aux_champs_absents() {
+    let on = "[ask]\nstructured_output = \"on\"\n";
+    let cases = [
+        (
+            r#"{"found": false, "answer": null, "nodes": null}"#,
+            r#"{"found": false}"#,
+        ),
+        (
+            r#"{"found": true, "answer": "x", "nodes": null}"#,
+            r#"{"found": true, "answer": "x"}"#,
+        ),
+    ];
+    for (with_null, without) in cases {
+        for flags in [&[][..], &["--json"][..]] {
+            let a = ask_once(on, with_null, flags);
+            let b = ask_once("", without, flags);
+            assert_eq!(a.stdout, b.stdout, "{with_null} {flags:?}");
+            assert_eq!(a.stderr, b.stderr, "{with_null} {flags:?}");
+            assert_eq!(a.status.code(), b.status.code(), "{with_null} {flags:?}");
+            assert!(
+                !a.stdout.is_empty() || !a.stderr.is_empty(),
+                "{with_null} {flags:?}"
+            );
+        }
+        let a = ask_once(on, with_null, &["--verbose"]);
+        let b = ask_once("", without, &["--verbose"]);
+        assert_eq!(config_line(&a), config_line(&b), "{with_null}");
+    }
+}
