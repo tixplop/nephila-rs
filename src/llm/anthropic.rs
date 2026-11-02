@@ -1,6 +1,7 @@
 //! Adaptateur Anthropic Messages (REQ-002).
 
-use super::{anthropic_usage, http, CallStats, Complete, Generation, Retry, Tls};
+use super::schema::Reply;
+use super::{anthropic_usage, http, CallStats, Complete, Generation, Retry, Structured, Tls};
 use crate::config::Effort;
 use crate::error::{Error, Result, TRUNCATED};
 use std::sync::atomic::AtomicBool;
@@ -62,8 +63,15 @@ pub fn is_legacy_claude(model: &str) -> bool {
 
 /// Corps de la requête `/v1/messages` (REQ-058, REQ-157, DEC-126) : jamais de `thinking`
 /// désactivé ; `thinking` adaptatif si demandé ; `output_config.effort` sauf `effort = "default"`
-/// ou ancien modèle Claude sans `thinking`.
-pub fn request_body(model: &str, gen: &Generation, system: &str, user: &str) -> serde_json::Value {
+/// ou ancien modèle Claude sans `thinking` ; `output_config.format` porte le schéma s'il est donné
+/// (REQ-202).
+pub fn request_body(
+    model: &str,
+    gen: &Generation,
+    system: &str,
+    user: &str,
+    format: Option<(&str, &serde_json::Value)>,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
         "max_tokens": gen.max_output_tokens,
@@ -76,6 +84,10 @@ pub fn request_body(model: &str, gen: &Generation, system: &str, user: &str) -> 
     if gen.effort != Effort::ModelDefault && (gen.thinking || !is_legacy_claude(model)) {
         body["output_config"] = serde_json::json!({"effort": gen.effort.as_str()});
     }
+    if let Some((_, schema)) = format {
+        body["output_config"]["format"] =
+            serde_json::json!({"type": "json_schema", "schema": schema});
+    }
     body
 }
 
@@ -86,6 +98,7 @@ pub struct AnthropicLlm {
     agent: ureq::Agent,
     retry: http::Retry,
     gen: Generation,
+    structured: Structured,
     summary_language: String,
 }
 
@@ -106,8 +119,15 @@ impl AnthropicLlm {
             agent: http::agent(timeout_secs, concurrency, tls),
             retry: http::Retry::default(),
             gen,
+            structured: Structured::Off,
             summary_language: crate::config::DEFAULT_SUMMARY_LANGUAGE.to_string(),
         }
+    }
+
+    /// Réglage effectif de `structured_output` (REQ-202).
+    pub fn with_structured(mut self, structured: Structured) -> AnthropicLlm {
+        self.structured = structured;
+        self
     }
 
     /// Langue des résumés demandée dans les prompts système (REQ-172).
@@ -143,8 +163,11 @@ impl Complete for AnthropicLlm {
         stats: &CallStats,
         system: String,
         user: String,
+        reply: Reply,
     ) -> Result<String> {
-        let body = request_body(&self.model, &self.gen, &system, &user);
+        let schema = (self.structured != Structured::Off).then(|| reply.schema());
+        let format = schema.as_ref().map(|s| (reply.name(), s));
+        let body = request_body(&self.model, &self.gen, &system, &user, format);
         let raw = http::send(
             "anthropic",
             self.request("POST", "/v1/messages"),
@@ -192,18 +215,18 @@ mod tests {
     #[test]
     fn req157_ac1_body_without_thinking_sends_effort_on_current_model() {
         let m = "claude-opus-5-5";
-        let b = request_body(m, &gen(false, Effort::Low, 1234), "s", "u");
+        let b = request_body(m, &gen(false, Effort::Low, 1234), "s", "u", None);
         let mut want = base_fields();
         want["output_config"] = serde_json::json!({"effort": "low"});
         assert_eq!(b, want);
         assert_eq!(b.as_object().unwrap().len(), 5);
         assert!(b.get("thinking").is_none());
 
-        let b = request_body(m, &gen(false, Effort::High, 1234), "s", "u");
+        let b = request_body(m, &gen(false, Effort::High, 1234), "s", "u", None);
         assert_eq!(b["output_config"], serde_json::json!({"effort": "high"}));
         assert!(b.get("thinking").is_none());
 
-        let b = request_body(m, &gen(false, Effort::ModelDefault, 1234), "s", "u");
+        let b = request_body(m, &gen(false, Effort::ModelDefault, 1234), "s", "u", None);
         assert_eq!(b, base_fields());
     }
 
@@ -214,6 +237,7 @@ mod tests {
             &gen(true, Effort::ModelDefault, 1234),
             "s",
             "u",
+            None,
         );
         assert_eq!(b["thinking"], serde_json::json!({"type": "adaptive"}));
         assert!(b.get("output_config").is_none());
@@ -223,11 +247,11 @@ mod tests {
     #[test]
     fn req157_ac1_legacy_model_gets_no_effort_without_thinking() {
         let m = "claude-sonnet-4-5";
-        let b = request_body(m, &gen(false, Effort::High, 1234), "s", "u");
+        let b = request_body(m, &gen(false, Effort::High, 1234), "s", "u", None);
         let mut want = base_fields();
         want["model"] = m.into();
         assert_eq!(b, want);
-        let b = request_body(m, &gen(true, Effort::Medium, 1234), "s", "u");
+        let b = request_body(m, &gen(true, Effort::Medium, 1234), "s", "u", None);
         assert_eq!(b["thinking"], serde_json::json!({"type": "adaptive"}));
         assert_eq!(b["output_config"], serde_json::json!({"effort": "medium"}));
         assert_eq!(b.as_object().unwrap().len(), 6);
@@ -235,7 +259,7 @@ mod tests {
 
     #[test]
     fn body_with_thinking_adds_adaptive_and_effort() {
-        let b = request_body("m", &gen(true, Effort::Medium, 16384), "s", "u");
+        let b = request_body("m", &gen(true, Effort::Medium, 16384), "s", "u", None);
         assert_eq!(b["thinking"], serde_json::json!({"type": "adaptive"}));
         assert_eq!(b["output_config"], serde_json::json!({"effort": "medium"}));
         assert_eq!(b["max_tokens"], 16384);
@@ -397,7 +421,7 @@ mod tests {
             let l = llm(fake_server(vec![(200, body)]));
             let stats = CallStats::default();
             let e = l
-                .complete(None, None, &stats, "s".into(), "u".into())
+                .complete(None, None, &stats, "s".into(), "u".into(), Reply::File)
                 .unwrap_err();
             if truncated {
                 assert!(matches!(&e, Error::Truncated(m) if m == TRUNCATED), "{e:?}");
@@ -411,5 +435,52 @@ mod tests {
             assert_eq!(stats.usage(), Some(want));
             assert_eq!(stats.sends(), 1);
         }
+    }
+
+    #[test]
+    fn req202_ac4_corps_anthropic_avec_schema() {
+        let schema = crate::llm::schema::file();
+        let fmt = json!({"type": "json_schema", "schema": schema});
+        let f = Some(("nephila_fichier", &schema));
+        let b = request_body(
+            "claude-opus-5-5",
+            &gen(false, Effort::ModelDefault, 1234),
+            "s",
+            "u",
+            f,
+        );
+        let mut want = base_fields();
+        want["output_config"] = json!({"format": fmt});
+        assert_eq!(b, want);
+        let b = request_body(
+            "claude-opus-5-5",
+            &gen(false, Effort::Low, 1234),
+            "s",
+            "u",
+            f,
+        );
+        want["output_config"] = json!({"effort": "low", "format": fmt});
+        assert_eq!(b, want);
+        let b = request_body(
+            "claude-sonnet-4-5",
+            &gen(false, Effort::High, 1234),
+            "s",
+            "u",
+            f,
+        );
+        assert_eq!(b["output_config"], json!({"format": fmt}));
+        assert!(b.get("thinking").is_none());
+        let b = request_body(
+            "claude-opus-5-5",
+            &gen(true, Effort::Medium, 1234),
+            "s",
+            "u",
+            f,
+        );
+        assert_eq!(
+            b["output_config"],
+            json!({"effort": "medium", "format": fmt})
+        );
+        assert_eq!(b["thinking"], json!({"type": "adaptive"}));
     }
 }

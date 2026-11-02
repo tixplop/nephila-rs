@@ -111,6 +111,22 @@ Exemple : {"found": true, "answer": "Le total est calculé par Panier.total, app
     }
 
     #[test]
+    fn req204_ac2_null_est_lu_comme_absent() {
+        assert_eq!(
+            AskReply::parse(r#"{"found": false, "answer": null, "nodes": null}"#).unwrap(),
+            AskReply::NotFound
+        );
+        assert_eq!(
+            AskReply::parse(r#"{"found": true, "answer": "x", "nodes": null}"#).unwrap(),
+            AskReply::Found {
+                answer: "x".into(),
+                nodes: vec![]
+            }
+        );
+        assert!(AskReply::parse(r#"{"found": false, "answer": "x", "nodes": null}"#).is_err());
+    }
+
+    #[test]
     fn req160_ac1_system_prompt_text() {
         let p = ask_system_prompt();
         assert_eq!(p, REQ160);

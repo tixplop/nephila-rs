@@ -1,6 +1,7 @@
 //! Adaptateur compatible OpenAI Chat Completions (REQ-002) : OpenAI, Ollama, llama.cpp, vLLM.
 
-use super::{http, openai_usage, CallStats, Complete, Generation, Retry, Tls};
+use super::schema::Reply;
+use super::{http, openai_usage, CallStats, Complete, Generation, Retry, Structured, Tls};
 use crate::config::Effort;
 use crate::error::{Error, Result, TRUNCATED};
 use std::sync::atomic::AtomicBool;
@@ -8,8 +9,15 @@ use std::sync::atomic::AtomicBool;
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
 /// Corps de la requête `/v1/chat/completions` (REQ-058, REQ-157, DEC-126) : `reasoning_effort`
-/// si l'effort n'est pas `"default"` et que la réflexion est demandée ou l'effort écrit.
-pub fn request_body(model: &str, gen: &Generation, system: &str, user: &str) -> serde_json::Value {
+/// si l'effort n'est pas `"default"` et que la réflexion est demandée ou l'effort écrit ;
+/// `response_format` porte le schéma s'il est donné (REQ-202).
+pub fn request_body(
+    model: &str,
+    gen: &Generation,
+    system: &str,
+    user: &str,
+    format: Option<(&str, &serde_json::Value)>,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
         "messages": [
@@ -21,6 +29,12 @@ pub fn request_body(model: &str, gen: &Generation, system: &str, user: &str) -> 
     if gen.effort != Effort::ModelDefault && (gen.thinking || gen.effort_explicit) {
         body["reasoning_effort"] = gen.effort.as_str().into();
     }
+    if let Some((name, schema)) = format {
+        body["response_format"] = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": name, "strict": true, "schema": schema},
+        });
+    }
     body
 }
 
@@ -31,6 +45,7 @@ pub struct OpenAiLlm {
     agent: ureq::Agent,
     retry: http::Retry,
     gen: Generation,
+    structured: Structured,
     summary_language: String,
 }
 
@@ -52,8 +67,15 @@ impl OpenAiLlm {
             agent: http::agent(timeout_secs, concurrency, tls),
             retry: http::Retry::default(),
             gen,
+            structured: Structured::Off,
             summary_language: crate::config::DEFAULT_SUMMARY_LANGUAGE.to_string(),
         }
+    }
+
+    /// Réglage effectif de `structured_output` (REQ-202).
+    pub fn with_structured(mut self, structured: Structured) -> OpenAiLlm {
+        self.structured = structured;
+        self
     }
 
     /// Langue des résumés demandée dans les prompts système (REQ-172).
@@ -91,8 +113,11 @@ impl Complete for OpenAiLlm {
         stats: &CallStats,
         system: String,
         user: String,
+        reply: Reply,
     ) -> Result<String> {
-        let body = request_body(&self.model, &self.gen, &system, &user);
+        let schema = (self.structured != Structured::Off).then(|| reply.schema());
+        let format = schema.as_ref().map(|s| (reply.name(), s));
+        let body = request_body(&self.model, &self.gen, &system, &user, format);
         let raw = http::send(
             "openai",
             self.request("POST", "/v1/chat/completions"),
@@ -129,7 +154,7 @@ mod tests {
     }
 
     fn effort_of(thinking: bool, effort: Effort, explicit: bool) -> Option<String> {
-        let b = request_body("m", &gen(thinking, effort, explicit, 1234), "s", "u");
+        let b = request_body("m", &gen(thinking, effort, explicit, 1234), "s", "u", None);
         let n = b.as_object().unwrap().len();
         for k in ["thinking", "output_config", "max_tokens"] {
             assert!(b.get(k).is_none(), "{k}");
@@ -143,7 +168,7 @@ mod tests {
 
     #[test]
     fn body_without_thinking_has_no_reasoning_field() {
-        let b = request_body("m", &gen(false, Effort::Low, false, 1234), "s", "u");
+        let b = request_body("m", &gen(false, Effort::Low, false, 1234), "s", "u", None);
         assert_eq!(
             b,
             serde_json::json!({
@@ -170,7 +195,7 @@ mod tests {
 
     #[test]
     fn body_with_thinking_adds_reasoning_effort() {
-        let b = request_body("m", &gen(true, Effort::Medium, true, 16384), "s", "u");
+        let b = request_body("m", &gen(true, Effort::Medium, true, 16384), "s", "u", None);
         assert_eq!(b["reasoning_effort"], "medium");
         assert_eq!(b["max_completion_tokens"], 16384);
         assert!(b.get("max_tokens").is_none());
@@ -263,7 +288,7 @@ mod tests {
             );
             let stats = CallStats::default();
             let e = l
-                .complete(None, None, &stats, "s".into(), "u".into())
+                .complete(None, None, &stats, "s".into(), "u".into(), Reply::File)
                 .unwrap_err();
             if truncated {
                 assert!(matches!(&e, Error::Truncated(m) if m == TRUNCATED), "{e:?}");
@@ -276,6 +301,28 @@ mod tests {
             assert!(stats.responded());
             assert_eq!(stats.usage(), Some(want));
             assert_eq!(stats.sends(), 1);
+        }
+    }
+
+    #[test]
+    fn req202_ac4_corps_openai_avec_schema() {
+        for (name, schema) in [
+            ("nephila_fichier", crate::llm::schema::file()),
+            ("nephila_lot", crate::llm::schema::lot()),
+        ] {
+            let f = Some((name, &schema));
+            let rf = serde_json::json!({"type": "json_schema",
+                "json_schema": {"name": name, "strict": true, "schema": schema}});
+            let b = request_body("m", &gen(false, Effort::Low, false, 1234), "s", "u", f);
+            let want = request_body("m", &gen(false, Effort::Low, false, 1234), "s", "u", None);
+            assert_eq!(b["response_format"], rf);
+            assert!(b.get("reasoning_effort").is_none());
+            let mut b2 = b.clone();
+            b2.as_object_mut().unwrap().remove("response_format");
+            assert_eq!(b2, want);
+            let b = request_body("m", &gen(true, Effort::Medium, true, 1234), "s", "u", f);
+            assert_eq!(b["response_format"], rf);
+            assert_eq!(b["reasoning_effort"], "medium");
         }
     }
 }

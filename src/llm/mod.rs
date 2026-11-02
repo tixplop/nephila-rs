@@ -8,6 +8,7 @@ pub use http::{Retry, Tls};
 pub mod mock;
 pub mod openai;
 pub mod retry;
+mod schema;
 mod tidy;
 mod usage;
 pub use usage::{
@@ -25,6 +26,7 @@ use enrich::{
 };
 pub use enrich::{Enrichment, Excerpt, LotItem};
 pub use retry::{with_format_retries, with_note, FormatFault};
+use schema::Reply;
 
 /// Options de génération communes aux fournisseurs HTTP (REQ-058, DEC-072).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,16 +40,13 @@ pub struct Generation {
 
 /// Valeur effective de `structured_output` (REQ-202, DEC-163) : `On` et `Auto` envoient le
 /// schéma, `Off` jamais ; `Auto` rend `Off` quand `base_url` est écrite.
-// Passée aux adaptateurs par T-295.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Structured {
+pub enum Structured {
     Off,
     On,
     Auto,
 }
 
-#[allow(dead_code)]
 pub(crate) fn structured(config: &Config) -> Structured {
     match (config.structured_output, config.base_url.is_some()) {
         (StructuredOutput::On, _) => Structured::On,
@@ -138,6 +137,7 @@ pub(crate) trait Complete: Send + Sync {
         stats: &CallStats,
         system: String,
         user: String,
+        reply: Reply,
     ) -> Result<String>;
 }
 
@@ -167,6 +167,7 @@ impl<T: Complete> Llm for T {
             &CallStats::default(),
             enrichment_system_prompt(self.summary_language()),
             enrichment_user_prompt(file, None, text, requested),
+            Reply::File,
         )?;
         http::parse_reply(&out, KEY_SUMMARIES, |j| Enrichment::parse(j, file, known))
     }
@@ -194,6 +195,7 @@ impl<T: Complete> Llm for T {
                 enrichment_user_prompt(file, excerpt, text, requested),
                 fault,
             ),
+            Reply::File,
         )?;
         http::parse_reply(&out, KEY_SUMMARIES, |j| Enrichment::parse(j, file, known))
     }
@@ -205,6 +207,7 @@ impl<T: Complete> Llm for T {
             &CallStats::default(),
             lot_system_prompt(self.summary_language()),
             lot_user_prompt(items),
+            Reply::Lot,
         )?;
         Ok(http::parse_reply(&out, KEY_FILES, |j| parse_lot(j, items))?.into_results())
     }
@@ -223,6 +226,7 @@ impl<T: Complete> Llm for T {
             stats,
             lot_system_prompt(self.summary_language()),
             with_note(lot_user_prompt(items), fault),
+            Reply::Lot,
         )?;
         Ok(http::parse_reply(&out, KEY_FILES, |j| parse_lot(j, items))?.into_results())
     }
@@ -244,6 +248,7 @@ impl<T: Complete> Llm for T {
             stats,
             ask_system_prompt(),
             with_note(ask_user_prompt(question, context), fault),
+            Reply::Ask,
         )?;
         http::parse_reply(&out, KEY_FOUND, AskReply::parse)
     }
@@ -357,6 +362,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
         thinking: config.thinking,
         max_output_tokens: config.max_output_tokens,
     };
+    let structured = structured(config);
     match config.provider {
         Provider::Mock => Ok(Box::new(mock::MockLlm::from_env()?)),
         Provider::Anthropic => {
@@ -374,6 +380,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     config.concurrency,
                     gen,
                 )
+                .with_structured(structured)
                 .with_retry(retry)
                 .with_summary_language(config.summary_language.clone()),
             ))
@@ -390,6 +397,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
                     config.concurrency,
                     gen,
                 )
+                .with_structured(structured)
                 .with_retry(retry)
                 .with_summary_language(config.summary_language.clone()),
             ))
