@@ -1684,14 +1684,55 @@ pub(crate) fn enrich_with_stop(
     report: &mut BuildReport,
     stop: &AtomicBool,
 ) -> Result<Vec<(String, Error)>> {
+    enrich_pass(
+        sources,
+        files,
+        opts,
+        llm,
+        store,
+        report,
+        stop,
+        PassMode::Normal,
+    )
+}
+
+/// Passe de l'enrichissement (REQ-214, DEC-168). Le pilote du mode lot pose `Collect` et `Last` ;
+/// ni l'un ni l'autre ne veille sur Ctrl-C, c'est le pilote qui le fait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `Collect` et `Last` : posés par le pilote du mode lot (T-306).
+pub(crate) enum PassMode {
+    /// Passe ordinaire du mode synchrone.
+    Normal,
+    /// Passe de collecte : les requêtes sans réponse sont mises de côté par le collecteur ; rien
+    /// n'est écrit, aucun avertissement ni compteur de progression.
+    Collect,
+    /// Dernière passe : comme `Normal`, sans plafond d'appels (les réponses sont connues) ; avec
+    /// `capped`, le plafond de la commande est constaté à la fin (A-10).
+    Last { capped: Option<usize> },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enrich_pass(
+    sources: Sources<'_>,
+    files: &[FileRecord],
+    opts: &IndexOptions,
+    llm: &dyn Llm,
+    store: &mut Store,
+    report: &mut BuildReport,
+    stop: &AtomicBool,
+    mode: PassMode,
+) -> Result<Vec<(String, Error)>> {
     #[cfg(test)]
     let _shared = crate::interrupt::test_shared();
-    let (concurrency, max_chunk_chars, batch_files, format_retries, max_calls) = (
+    let max_calls = match mode {
+        PassMode::Normal => opts.max_calls,
+        _ => None,
+    };
+    let (concurrency, max_chunk_chars, batch_files, format_retries) = (
         opts.concurrency,
         opts.max_chunk_chars,
         opts.batch_files,
         opts.format_retries,
-        opts.max_calls,
     );
     let ids = nodes_by_file(store)?;
     let started = Instant::now();
@@ -1740,7 +1781,10 @@ pub(crate) fn enrich_with_stop(
         "enrichissement: début {} fichiers, {workers} fils",
         files.len()
     );
-    let mut meter = progress::Meter::start(Phase::Enrichment, files.len());
+    let mut meter = match mode {
+        PassMode::Collect => None,
+        _ => progress::Meter::start(Phase::Enrichment, files.len()),
+    };
 
     std::thread::scope(|scope| {
         let ctx = Ctx {
@@ -1765,7 +1809,9 @@ pub(crate) fn enrich_with_stop(
             });
         }
         drop(tx);
-        scope.spawn(|| watch_interrupt(&policy, &shared, &wake, stop, &workers_done));
+        if mode == PassMode::Normal {
+            scope.spawn(|| watch_interrupt(&policy, &shared, &wake, stop, &workers_done));
+        }
         // Un message reçu, puis tous ceux déjà arrivés (sans attente), sont écrits en une seule
         // transaction avant d'attendre le suivant : aucune transaction ouverte pendant un appel.
         let mut pending: Vec<EnrichmentWrite> = Vec::new();
@@ -1857,6 +1903,10 @@ pub(crate) fn enrich_with_stop(
                 advances.push((notes, adv));
                 next = rx.try_recv().ok();
             }
+            if mode == PassMode::Collect {
+                pending.clear();
+                continue;
+            }
             flush_group(
                 store,
                 llm.model(),
@@ -1894,6 +1944,16 @@ pub(crate) fn enrich_with_stop(
     if policy.capped {
         report.capped = policy.limit;
         report.left_by_cap = files.len().saturating_sub(succeeded + failed_now);
+    }
+    // Dernière passe d'un lot : le plafond a été constaté avant l'envoi, la politique n'en a pas.
+    if let PassMode::Last { capped: Some(m) } = mode {
+        let left = files.len().saturating_sub(succeeded + failed_now);
+        report.capped = Some(m);
+        report.left_by_cap = left;
+        trace!(
+            "politique: arrêt de l'envoi ({}), {left} fichiers non envoyés",
+            cap_label(m)
+        );
     }
     match write_error {
         Some(e) => Err(e),
@@ -3711,6 +3771,29 @@ mod tests {
         max_calls: Option<usize>,
         format_retries: u32,
     ) -> (Store, BuildReport, Vec<(String, Error)>) {
+        probe_run_mode(
+            dir,
+            files,
+            llm,
+            concurrency,
+            batch_files,
+            max_calls,
+            format_retries,
+            PassMode::Normal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_run_mode(
+        dir: &tempfile::TempDir,
+        files: &[FileRecord],
+        llm: &dyn Llm,
+        concurrency: usize,
+        batch_files: usize,
+        max_calls: Option<usize>,
+        format_retries: u32,
+        mode: PassMode,
+    ) -> (Store, BuildReport, Vec<(String, Error)>) {
         let mut store = Store::open_or_create(dir.path()).unwrap();
         store.insert_files(files).unwrap();
         // Les sections que citent les concepts du faux `Llm` sont déclarées par `Big.txt`.
@@ -3754,7 +3837,7 @@ mod tests {
             max_calls,
             ..IndexOptions::default()
         };
-        let failures = enrich_with_stop(
+        let failures = enrich_pass(
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
@@ -3765,9 +3848,90 @@ mod tests {
             &mut store,
             &mut report,
             &AtomicBool::new(false),
+            mode,
         )
         .unwrap();
         (store, report, failures)
+    }
+
+    #[test]
+    fn req214_collect_pass_writes_nothing_and_keeps_files_to_enrich() {
+        let (dir, files) = probe_repo(&[], 3);
+        let llm = Probe::new(1, &[]);
+        let (store, report, failures) =
+            probe_run_mode(&dir, &files, &llm, 1, 1, None, 0, PassMode::Collect);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert!(store.enrichment_entry("S0.txt").unwrap().is_none());
+        assert_eq!(left_paths(store).len(), 3);
+        // Requêtes mises de côté : rien non plus, et aucun échec.
+        let llm = Failing(|| Error::Deferred);
+        let (store, report, failures) =
+            probe_run_mode(&dir, &files, &llm, 1, 1, None, 0, PassMode::Collect);
+        assert!(failures.is_empty() && report.failed == 0);
+        assert_eq!(left_paths(store).len(), 3);
+    }
+
+    #[test]
+    fn req214_collect_pass_ignores_the_call_cap() {
+        let (dir, files) = probe_repo(&[], 3);
+        let llm = Probe::new(1, &[]);
+        let (_, report, failures) =
+            probe_run_mode(&dir, &files, &llm, 1, 1, Some(1), 0, PassMode::Collect);
+        assert_eq!(llm.calls().len(), 3, "{:?}", llm.calls());
+        assert_eq!(report.capped, None);
+        assert!(failures.is_empty() && report.failed == 0);
+    }
+
+    #[test]
+    fn req214_last_pass_ignores_the_call_cap() {
+        let (dir, files) = probe_repo(&[], 3);
+        let llm = Probe::new(1, &[]);
+        let (store, report, _) = probe_run_mode(
+            &dir,
+            &files,
+            &llm,
+            1,
+            1,
+            Some(1),
+            0,
+            PassMode::Last { capped: None },
+        );
+        assert_eq!(left_paths(store).len(), 0);
+        assert_eq!(report.capped, None);
+        assert_eq!(report.left_by_cap, 0);
+    }
+
+    #[test]
+    fn req216_last_pass_with_cap_reports_the_files_left() {
+        let (dir, files) = probe_repo(&[], 3);
+        // Collecteur fermé : aucune requête inconnue ne part, aucun fichier n'a d'issue.
+        let llm = Failing(|| Error::Capped);
+        let (events, (store, report, failures)) = {
+            let (r, e) = crate::trace::capture_all(true, || {
+                probe_run_mode(
+                    &dir,
+                    &files,
+                    &llm,
+                    1,
+                    1,
+                    Some(1),
+                    0,
+                    PassMode::Last { capped: Some(2) },
+                )
+            });
+            (e, r)
+        };
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.capped, Some(2));
+        assert_eq!(report.left_by_cap, 3);
+        assert_eq!(left_paths(store).len(), 3);
+        assert!(
+            events
+                .iter()
+                .any(|e| e == "politique: arrêt de l'envoi (plafond de 2 appels atteint), 3 fichiers non envoyés"),
+            "{events:?}"
+        );
     }
 
     fn names(failures: &[(String, Error)]) -> Vec<&str> {

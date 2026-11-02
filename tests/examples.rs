@@ -2273,7 +2273,13 @@ fn REQ192_AC3_ctrl_c_dans_le_readme() {
     assert_eq!(before, Some(""));
     assert!(!readme.contains("la seule voulue"));
     for args in [&["build", "--help"][..], &["update", "--help"][..]] {
-        assert!(!help_of(args).contains("Ctrl-C"), "{args:?}");
+        // Le texte de `--batch` (REQ-218) est la seule mention de Ctrl-C de l'aide.
+        let help = help_of(args)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace("nephila update --batch reprend après Ctrl-C", "");
+        assert!(!help.contains("Ctrl-C"), "{args:?}");
     }
 }
 

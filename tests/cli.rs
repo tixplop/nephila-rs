@@ -515,3 +515,28 @@ fn req197_ac4_option_refusee_hors_build_et_update() {
         );
     }
 }
+
+// ---- REQ-218 : `--batch` ----
+
+const BATCH_HELP_TEXT: &str = "--batch Confie l'enrichissement au mode lot du fournisseur : moins cher, mais jusqu'à 24 h d'attente ; nephila update --batch reprend après Ctrl-C (sans rapport avec --batch-files, qui règle les fichiers par appel ; incompatible avec --no-llm)";
+
+#[test]
+fn req218_ac2_aide_de_batch() {
+    for cmd in ["build", "update"] {
+        let h = normalized_help(&[cmd]);
+        assert!(h.contains(BATCH_HELP_TEXT), "{cmd} : {h}");
+        let at = h.find(BATCH_HELP_TEXT).unwrap();
+        let after_accept = h.find("--accept-project-model").unwrap();
+        assert!(after_accept < at, "{cmd}");
+        assert!(at < h.find("--exclude <MOTIF>").unwrap(), "{cmd}");
+        // Aucune autre option entre `--accept-project-model` et `--batch`.
+        let between = &h[after_accept..at];
+        assert_eq!(between.matches(" --").count(), 0, "{cmd} : {between}");
+        let end = at + BATCH_HELP_TEXT.len();
+        assert!(
+            !h[at..end + 20.min(h.len() - end)].contains("[default:"),
+            "{cmd}"
+        );
+        assert!(h.contains("--batch-files <N> Nombre maximal de fichiers par appel d'enrichissement (remplace `batch_files` de la configuration)"), "{cmd}");
+    }
+}

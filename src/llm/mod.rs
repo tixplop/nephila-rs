@@ -20,6 +20,7 @@ pub use usage::{
 };
 
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::config::{Config, Effort, Provider, StructuredOutput};
 use crate::error::{Error, Result};
@@ -373,14 +374,20 @@ impl Llm for WithModel {
 
 /// Construit le fournisseur décrit par la configuration.
 pub fn build_llm(config: &Config) -> Result<Box<dyn Llm>> {
+    build_llm_for(config, false)
+}
+
+/// Comme `build_llm`; avec `batch` (`--batch`, REQ-211), les adaptateurs HTTP reçoivent le
+/// collecteur de requêtes du mode lot.
+pub fn build_llm_for(config: &Config, batch: bool) -> Result<Box<dyn Llm>> {
     Ok(Box::new(WithModel {
-        inner: build_provider(config)?,
+        inner: build_provider(config, batch)?,
         model: config.model.clone(),
         summary_language: config.summary_language.clone(),
     }))
 }
 
-fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
+fn build_provider(config: &Config, batch: bool) -> Result<Box<dyn Llm>> {
     let tls = Tls {
         ca_certs: config.tls_ca_certs.clone(),
         insecure: config.tls_insecure,
@@ -411,39 +418,47 @@ fn build_provider(config: &Config) -> Result<Box<dyn Llm>> {
             let key = config.api_key()?.ok_or_else(|| {
                 Error::Message("clé api_key_env manquante pour le fournisseur anthropic".into())
             })?;
-            Ok(Box::new(
-                anthropic::AnthropicLlm::new(
-                    config.base_url.clone(),
-                    config.model.clone(),
-                    key,
-                    config.timeout_secs,
-                    &tls,
-                    config.concurrency,
-                    gen,
-                )
-                .with_structured(structured)
-                .with_structured_key(config.structured_key)
-                .with_retry(retry)
-                .with_summary_language(config.summary_language.clone()),
-            ))
+            let llm = anthropic::AnthropicLlm::new(
+                config.base_url.clone(),
+                config.model.clone(),
+                key,
+                config.timeout_secs,
+                &tls,
+                config.concurrency,
+                gen,
+            )
+            .with_structured(structured)
+            .with_structured_key(config.structured_key)
+            .with_retry(retry)
+            .with_summary_language(config.summary_language.clone());
+            let llm = if batch {
+                llm.with_collector(Arc::new(batch::Collector::new()))
+            } else {
+                llm
+            };
+            Ok(Box::new(llm))
         }
         Provider::OpenAi => {
             let retry = Retry::from_env()?;
-            Ok(Box::new(
-                openai::OpenAiLlm::new(
-                    config.base_url.clone(),
-                    config.model.clone(),
-                    config.api_key()?,
-                    config.timeout_secs,
-                    &tls,
-                    config.concurrency,
-                    gen,
-                )
-                .with_structured(structured)
-                .with_structured_key(config.structured_key)
-                .with_retry(retry)
-                .with_summary_language(config.summary_language.clone()),
-            ))
+            let llm = openai::OpenAiLlm::new(
+                config.base_url.clone(),
+                config.model.clone(),
+                config.api_key()?,
+                config.timeout_secs,
+                &tls,
+                config.concurrency,
+                gen,
+            )
+            .with_structured(structured)
+            .with_structured_key(config.structured_key)
+            .with_retry(retry)
+            .with_summary_language(config.summary_language.clone());
+            let llm = if batch {
+                llm.with_collector(Arc::new(batch::Collector::new()))
+            } else {
+                llm
+            };
+            Ok(Box::new(llm))
         }
     }
 }

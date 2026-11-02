@@ -445,6 +445,20 @@ pub fn ensure_no_symlink(repo: &Path) -> Result<()> {
     }
 }
 
+/// Lot du fournisseur en cours (REQ-215) : jamais la clé, ni l'adresse en clair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrichBatch {
+    pub id: String,
+    pub provider: String,
+    /// Empreinte de l'adresse du serveur (`address_fingerprint`).
+    pub address: String,
+}
+
+/// Empreinte BLAKE3, en hexadécimal, de l'adresse d'un serveur (une `base_url` peut porter un jeton).
+pub fn address_fingerprint(address: &str) -> String {
+    blake3::hash(address.as_bytes()).to_hex().to_string()
+}
+
 pub struct Store {
     conn: Connection,
     read_only: bool,
@@ -972,7 +986,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_scope');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_scope', 'enrich_batches');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -990,7 +1004,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_scope');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_scope', 'enrich_batches');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -1366,6 +1380,37 @@ impl Store {
         self.conn
             .prepare_cached(
                 "INSERT INTO meta(key, value) VALUES ('enrich_scope', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .map_err(db_err)?
+            .execute([json])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Lots du fournisseur en cours, enregistrés par `--batch` (REQ-215, DEC-168) ; clé absente
+    /// ou illisible : aucun.
+    pub fn enrich_batches(&self) -> Result<Vec<EnrichBatch>> {
+        match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'enrich_batches'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get::<_, String>(0))
+        {
+            Ok(v) => Ok(serde_json::from_str(&v).unwrap_or_default()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(Vec::new()),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Remplace la liste des lots du fournisseur en cours ; une liste vide les oublie.
+    pub fn set_enrich_batches(&mut self, batches: &[EnrichBatch]) -> Result<()> {
+        self.ensure_writable()?;
+        let json = serde_json::to_string(batches)
+            .map_err(|e| Error::Message(format!("lots du fournisseur illisibles : {e}")))?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO meta(key, value) VALUES ('enrich_batches', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             )
             .map_err(db_err)?
@@ -4786,6 +4831,82 @@ mod tests {
             .execute("UPDATE meta SET value = 'x' WHERE key = 'enrich_scope'", [])
             .unwrap();
         assert_eq!(st.enrich_scope().unwrap(), EnrichScope::default());
+    }
+
+    fn lot(id: &str) -> EnrichBatch {
+        EnrichBatch {
+            id: id.into(),
+            provider: "anthropic".into(),
+            address: crate::store::address_fingerprint("http://127.0.0.1:1"),
+        }
+    }
+
+    #[test]
+    fn req215_enrich_batches_absent_is_empty_and_roundtrips() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        assert!(st.enrich_batches().unwrap().is_empty());
+        let version: i64 = st
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        let lots = vec![lot("msgbatch_1"), lot("msgbatch_2")];
+        st.set_enrich_batches(&lots).unwrap();
+        assert_eq!(st.enrich_batches().unwrap(), lots);
+        let raw: String = st
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'enrich_batches'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            raw.contains("msgbatch_1") && raw.contains("\"address\""),
+            "{raw}"
+        );
+        assert!(!raw.contains("127.0.0.1"), "{raw}");
+        // Oubli : liste vide.
+        st.set_enrich_batches(&[]).unwrap();
+        assert!(st.enrich_batches().unwrap().is_empty());
+        let after: i64 = st
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, after);
+        // Valeur illisible : vide.
+        st.set_enrich_batches(&lots).unwrap();
+        st.conn
+            .execute(
+                "UPDATE meta SET value = 'x' WHERE key = 'enrich_batches'",
+                [],
+            )
+            .unwrap();
+        assert!(st.enrich_batches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn req215_enrich_batches_survive_reset_and_reset_with_pending_files() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let lots = vec![lot("msgbatch_1")];
+        st.set_enrich_batches(&lots).unwrap();
+        st.reset().unwrap();
+        assert_eq!(st.enrich_batches().unwrap(), lots);
+        st.reset_with_pending_files(&[file("a.md")]).unwrap();
+        assert_eq!(st.enrich_batches().unwrap(), lots);
+    }
+
+    #[test]
+    fn req215_address_fingerprint_is_blake3_and_hides_the_address() {
+        let f = crate::store::address_fingerprint("https://h/?token=secret");
+        assert_eq!(
+            f,
+            blake3::hash(b"https://h/?token=secret")
+                .to_hex()
+                .to_string()
+        );
+        assert!(!f.contains("secret"));
     }
 
     #[test]

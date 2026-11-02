@@ -12,7 +12,7 @@ use crate::filter::{EnrichScope, Filters, Matcher, ProjectFile};
 use crate::index::estimate::{self, Estimate};
 use crate::index::lock::RepoLock;
 use crate::index::{enrich, structure};
-use crate::llm::{build_llm, Llm, LlmTotals};
+use crate::llm::{build_llm_for, Llm, LlmTotals};
 use crate::model::{FileRecord, FileState};
 use crate::out::Out;
 use crate::resolve;
@@ -77,6 +77,8 @@ pub struct IndexOptions {
     pub max_calls: Option<usize>,
     /// Motifs de la portée d'enrichissement, personnels et du dépôt (REQ-207).
     pub enrich_scope: EnrichScope,
+    /// `--batch` (REQ-211) : l'enrichissement passe par le mode lot du fournisseur.
+    pub batch: bool,
 }
 
 impl Default for IndexOptions {
@@ -90,6 +92,7 @@ impl Default for IndexOptions {
             enrich_code: false,
             max_calls: None,
             enrich_scope: EnrichScope::default(),
+            batch: false,
         }
     }
 }
@@ -105,6 +108,7 @@ impl From<&Config> for IndexOptions {
             enrich_code: c.enrich_code,
             max_calls: c.max_calls,
             enrich_scope: EnrichScope::default(),
+            batch: false,
         }
     }
 }
@@ -190,6 +194,7 @@ fn effective_config(
 /// fichier de configuration le LLM est inactif ; sinon validation (la clé n'est constatée qu'au
 /// premier appel, REQ-054). Sous `--dry-run`, la configuration est lue sans la clé et aucun
 /// client n'est construit (REQ-184).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn setup(
     no_llm: bool,
     dry_run: bool,
@@ -198,6 +203,7 @@ pub(crate) fn setup(
     batch_files: Option<usize>,
     format_retries: Option<u32>,
     max_calls: Option<usize>,
+    batch: bool,
 ) -> Result<Setup> {
     if no_llm {
         trace!("config: llm inactif (--no-llm)");
@@ -263,6 +269,7 @@ pub(crate) fn setup(
                     config.enrich_exclude.clone(),
                     project,
                 ),
+                batch,
                 ..IndexOptions::from(&config)
             };
             if dry_run {
@@ -277,7 +284,7 @@ pub(crate) fn setup(
                     project_model,
                 });
             }
-            let llm = build_llm(&config)?;
+            let llm = build_llm_for(&config, batch)?;
             Ok(Setup {
                 opts,
                 llm: Some(llm),
@@ -328,6 +335,8 @@ pub struct Overrides {
     pub accept_project_model: bool,
     /// `--dry-run` (REQ-184) : estime l'enrichissement sans client LLM ni clé.
     pub dry_run: bool,
+    /// `--batch` (REQ-211) : enrichissement par le mode lot du fournisseur.
+    pub batch: bool,
 }
 
 /// Point d'entrée de `nephila build` : valide le dépôt, la configuration et la clé, puis construit.
@@ -353,6 +362,7 @@ pub fn run(
         over.batch_files,
         over.format_retries,
         over.max_calls,
+        over.batch,
     )?;
     if let Some(j) = over.jobs {
         setup.opts.jobs = j;
@@ -701,14 +711,12 @@ pub(crate) fn finalize(
         let files = store.files_to_enrich()?;
         // Sans fichier à enrichir, le graphe n'a pas changé : pas de seconde résolution.
         if !files.is_empty() {
-            enrich::enrich_all(
-                enrich::Sources { repo, abs },
-                &files,
-                opts,
-                llm,
-                store,
-                report,
-            )?;
+            let sources = enrich::Sources { repo, abs };
+            if opts.batch {
+                crate::index::batch::enrich_batched(sources, &files, opts, llm, store, report)?;
+            } else {
+                enrich::enrich_all(sources, &files, opts, llm, store, report)?;
+            }
             stats = resolve_pass(store)?;
         }
     }
