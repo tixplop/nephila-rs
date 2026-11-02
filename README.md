@@ -70,7 +70,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.26.1                                      # version voulue
+V=v0.27.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -131,6 +131,7 @@ nephila update [--no-llm] [-v|--verbose | --show-progress] [--enrich-code] [--jo
 | `--format-retries <N>` | Nouveaux essais d'une réponse non conforme, pour cette commande |
 | `--max-calls <N>` | Plafond d'appels d'enrichissement, pour cette commande |
 | `--accept-project-model` | Accepte le modèle de `.nephila.toml` même s'il réenrichit plus de 50 fichiers, pour cette commande |
+| `--batch` | Enrichit par le mode lot du fournisseur : moins cher, mais jusqu'à 24 h d'attente ; voir [Lots et gros fichiers](#lots-et-gros-fichiers) |
 | `--exclude <MOTIF>` | Exclut les fichiers qui correspondent au motif, pour cette commande ; répétable |
 | `--exclude-type <TYPES>` | Exclut des types, séparés par des virgules, pour cette commande ; répétable |
 
@@ -465,6 +466,8 @@ Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, c
 - **Gros fichier** : envoyé seul, en morceaux de `max_chunk_chars`, au plus 150 nœuds demandés par appel.
 - **Plafond** : un fichier qui demanderait plus de 50 appels n'est pas envoyé et reste « à enrichir », nommé par l'avertissement `trop d'appels d'enrichissement`. Trois remèdes : `enrich_exclude`, qui garde sa structure dans le graphe, `exclude` dans `.nephila.toml`, qui la retire, ou un `max_chunk_chars` plus grand, qui réduit le nombre de morceaux pour tous les fichiers. Au-delà de 7500 nœuds, `max_chunk_chars` ne suffit plus.
 
+**Mode lot du fournisseur** : avec `--batch`, `build` et `update` confient leurs requêtes au mode lot d'`anthropic` ou d'`openai`. Les fournisseurs annoncent -50 %, à vérifier sur leur grille, pour un délai souvent inférieur à une heure et jusqu'à 24 h : c'est fait pour un gros `build`, pas pour un `update` interactif, et `query ask` n'est pas concerné. `batch_files` garde son rôle : les fichiers par requête. La commande attend la fin du lot ; `--show-progress` suit l'attente par paliers de 10 %. Ctrl-C l'arrête aussitôt, code 130 : le lot n'est pas annulé, il se gère dans la console du fournisseur, et `nephila update --batch` le reprend sans renvoyer ce qui n'a pas changé. Un `update` sans `--batch` paie de nouveau les fichiers à enrichir. `mock` et les serveurs sans mode lot refusent l'option : relancez sans `--batch`, rien ne part à sa place. Si le premier lot dépasse `max_calls`, rien ne part.
+
 ### Échecs et nouveaux essais
 
 - **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2) ; encore non conforme, un lot de 4 fichiers ou plus est découpé une fois en deux, chaque moitié avec ses propres essais ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`.
@@ -611,7 +614,7 @@ Les actions sont épinglées par SHA et Dependabot (`.github/dependabot.yml`) pr
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, puis pousser un tag identique ; `release.yml` publie les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.26.1 && git push origin v0.26.1
+git tag v0.27.0 && git push origin v0.27.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml`) ; `cargo test` passe aussi.

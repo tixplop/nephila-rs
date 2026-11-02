@@ -1237,17 +1237,48 @@ fn REQ134_AC2_ligne_config_d_exemple_du_readme_est_la_sortie_reelle() {
 }
 
 #[test]
-fn REQ210_AC1_version_0_26_1() {
-    assert_eq!(cargo_minor(), "0.26");
+fn REQ219_AC1_version_0_27_0() {
+    assert_eq!(cargo_minor(), "0.27");
     let toml = repo_file("Cargo.toml");
-    assert!(toml.lines().any(|l| l == "version = \"0.26.1\""));
+    assert!(toml.lines().any(|l| l == "version = \"0.27.0\""));
     let lock = repo_file("Cargo.lock");
-    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.26.1\""));
+    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.27.0\""));
     let readme = repo_file("README.md");
-    for needle in ["V=v0.26.1", "git tag v0.26.1 && git push origin v0.26.1"] {
+    for needle in ["V=v0.27.0", "git tag v0.27.0 && git push origin v0.27.0"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
-    assert!(!readme.contains("v0.26.0"));
+    assert!(!readme.contains("v0.26.1"));
+}
+
+/// AC-218-1 et AC-218-4 : ligne de table et paragraphe du mode lot (V-012, items 51 et 52).
+#[test]
+fn req218_ac1_ac4_readme_batch() {
+    let readme = repo_file("README.md");
+    let row = "| `--batch` | Enrichit par le mode lot du fournisseur : moins cher, mais jusqu'à 24 h d'attente ; voir [Lots et gros fichiers](#lots-et-gros-fichiers) |";
+    let para = "**Mode lot du fournisseur** : avec `--batch`, `build` et `update` confient leurs requêtes au mode lot d'`anthropic` ou d'`openai`. Les fournisseurs annoncent -50 %, à vérifier sur leur grille, pour un délai souvent inférieur à une heure et jusqu'à 24 h : c'est fait pour un gros `build`, pas pour un `update` interactif, et `query ask` n'est pas concerné. `batch_files` garde son rôle : les fichiers par requête. La commande attend la fin du lot ; `--show-progress` suit l'attente par paliers de 10 %. Ctrl-C l'arrête aussitôt, code 130 : le lot n'est pas annulé, il se gère dans la console du fournisseur, et `nephila update --batch` le reprend sans renvoyer ce qui n'a pas changé. Un `update` sans `--batch` paie de nouveau les fichiers à enrichir. `mock` et les serveurs sans mode lot refusent l'option : relancez sans `--batch`, rien ne part à sa place. Si le premier lot dépasse `max_calls`, rien ne part.";
+    assert_eq!(readme.matches(row).count(), 1);
+    assert_eq!(readme.matches(para).count(), 1);
+    assert!(readme.find("| `--accept-project-model` |").unwrap() < readme.find(row).unwrap());
+    assert!(readme.find(row).unwrap() < readme.find("| `--exclude <MOTIF>` |").unwrap());
+    let sec = readme_section(&readme, "### Lots et gros fichiers");
+    assert!(
+        sec.trim_end().ends_with(para),
+        "paragraphe dernier de la sous-section"
+    );
+    let plafond = sec.find("- **Plafond**").unwrap();
+    assert!(plafond < sec.find(para).unwrap());
+    assert!(sec[plafond..].contains(&format!("\n\n{para}")));
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
+}
+
+/// AC-218-3 : le mode lot n'ajoute aucune clé aux exemples livrés.
+#[test]
+fn req218_ac3_exemples_sans_batch() {
+    for f in ["examples/config.toml", "examples/nephila.toml"] {
+        let t = repo_file(f).replace("--batch-files", "");
+        assert!(!t.contains("batch ="), "{f}");
+        assert!(!t.contains("--batch"), "{f}");
+    }
 }
 
 /// Titres du README (niveau 1 et plus), hors blocs de code, tels qu'écrits.
@@ -1351,7 +1382,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 48_000, "README : {size} octets");
+    assert!(size <= 50_000, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1582,10 +1613,11 @@ fn REQ155_AC14_options_de_build_en_une_ligne() {
         "`--format-retries <N>`",
         "`--max-calls <N>`",
         "`--accept-project-model`",
+        "`--batch`",
         "`--exclude <MOTIF>`",
         "`--exclude-type <TYPES>`",
     ];
-    assert_eq!(rows.len(), 12, "{rows:?}");
+    assert_eq!(rows.len(), 13, "{rows:?}");
     for (row, option) in rows.iter().zip(options) {
         assert_eq!(cell(row, 0), option);
         assert!(row.chars().count() <= 160, "{row}");
@@ -1962,7 +1994,7 @@ fn REQ165_AC16_readme_traces_sentence() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 48_000, "README : {size} octets");
+    assert!(size <= 50_000, "README : {size} octets");
 }
 
 #[test]
@@ -2018,7 +2050,7 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 48_000, "README : {size} octets");
+    assert!(size <= 50_000, "README : {size} octets");
 }
 
 // ---- REQ-174 : `summary_language` dans les exemples et le README ----
@@ -2179,7 +2211,7 @@ fn REQ174_AC5_AC10_readme_lignes_et_phrases_de_summary_language() {
         assert!(!readme.contains(old), "présent : {old}");
     }
     assert_eq!(readme.matches("config: llm=").count(), 1);
-    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
 }
 
 /// AC-185-2 : textes de V-012 pour `--dry-run`, ligne de table après `--enrich-code`.
@@ -2195,9 +2227,9 @@ fn req185_ac2_readme_dry_run() {
     assert!(at < readme.find("| `-v, --verbose` |").unwrap());
     let section = readme_section(&readme, "### `nephila build` et `nephila update`");
     let table = section.lines().filter(|l| l.starts_with("| `-")).count();
-    assert_eq!(table, 12, "{section}");
+    assert_eq!(table, 13, "{section}");
     assert!(readme.find("Un seul `build` ou `update`").unwrap() < readme.find(para).unwrap());
-    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
 }
 
 // ---- REQ-188 : `max_calls` dans l'exemple et le README ----
@@ -2227,7 +2259,7 @@ fn REQ188_AC2_AC5_section_max_calls_de_l_exemple() {
 #[test]
 fn REQ188_AC3_AC6_textes_du_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
     let has_after = |first: &str, second: &str| {
         let a = readme
             .find(first)
@@ -2258,7 +2290,7 @@ fn REQ188_AC3_AC6_textes_du_readme() {
 #[test]
 fn REQ192_AC3_ctrl_c_dans_le_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
     let codes = readme_section(&readme, "## Codes de sortie");
     let rows = table_rows(&codes, "| Code | Signification |", "|---|---|");
     assert_eq!(rows.len(), 4, "{rows:?}");
@@ -2367,7 +2399,7 @@ fn REQ197_AC2_AC5_blocs_de_model_dans_l_exemple_du_depot() {
 #[test]
 fn REQ197_AC3_AC6_readme_model_override() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
     let table = readme_section(&readme, "## Configuration du LLM");
     let lines: Vec<&str> = table.lines().collect();
     let lang = lines
@@ -2388,7 +2420,8 @@ fn REQ197_AC3_AC6_readme_model_override() {
         options[mc + 1],
         "| `--accept-project-model` | Accepte le modèle de `.nephila.toml` même s'il réenrichit plus de 50 fichiers, pour cette commande |"
     );
-    assert!(options[mc + 2].starts_with("| `--exclude <MOTIF>` |"));
+    assert!(options[mc + 2].starts_with("| `--batch` |"));
+    assert!(options[mc + 3].starts_with("| `--exclude <MOTIF>` |"));
     let bullet = "- **Changer `model` ou `summary_language` réenrichit une fois** chaque fichier de la portée ; les autres réglages ne réenrichissent rien. Un modèle imposé ici (`model`, `[ask].model`) suit `model_override` de la configuration personnelle : par défaut (`\"warn\"`), `build` et `update` l'annoncent par un avertissement qui compte les fichiers déjà enrichis à refaire, et refusent au-delà de 50 sans `--accept-project-model` ; `\"deny\"` l'ignore partout, `query ask` compris ; `\"allow\"` l'accepte sans message. Pour vérifier les valeurs effectives : `nephila build --verbose` (ligne `config`).";
     assert_eq!(
         readme
@@ -2411,7 +2444,7 @@ fn REQ197_AC3_AC6_readme_model_override() {
 #[test]
 fn REQ199_AC10_readme_fichier_absent_d_une_reponse_de_lot() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
     let section = readme_section(&readme, "### Échecs et nouveaux essais");
     let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
     let tronquee = bullets
@@ -2439,7 +2472,7 @@ fn req200_ac9_readme_non_conforming_reply_bullet() {
         bullets,
         ["- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2) ; encore non conforme, un lot de 4 fichiers ou plus est découpé une fois en deux, chaque moitié avec ses propres essais ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`."]
     );
-    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
 }
 
 const STRUCTURED_BLOCK: &str = "# Schéma JSON envoyé avec chaque appel d'enrichissement : le serveur l'impose à la réponse, ce
@@ -2517,7 +2550,7 @@ fn req205_ac1_ac3_blocs_structured_output_de_l_exemple_personnel() {
 #[test]
 fn req205_ac2_readme_lignes_structured_output() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
     let lines: Vec<&str> = readme.lines().collect();
     let count = |l: &str| lines.iter().filter(|x| **x == l).count();
     assert_eq!(count("| `structured_output` | Schéma JSON imposé aux réponses d'enrichissement : `\"auto\"` l'envoie sans `base_url` et, s'il est refusé (HTTP 400), s'en passe pour la commande ; `\"on\"` l'envoie toujours, et un refus arrête l'envoi ; `\"off\"` jamais ; configuration personnelle seulement | `\"auto\"` |"), 1);
@@ -2844,5 +2877,5 @@ fn REQ208_AC2_AC5_readme_tables_et_phrases() {
         "puis lancez `nephila update`. {phrase} Si le `.nephila.toml`"
     )));
     assert!(vers.ends_with("ou `model_override = \"allow\"` dans la configuration personnelle."));
-    assert!(readme.len() <= 48_000, "README : {} octets", readme.len());
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
 }
