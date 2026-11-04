@@ -2244,3 +2244,172 @@ fn req217_verbose_sans_derniere_passe_ni_enrichissement_ni_appels() {
     assert_eq!(last_line(&o), e35(2));
     none(&err(&o), "panne");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Appels conservés (T-316, REQ-228).
+// ---------------------------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Fichier `docs/a.md` de trois appels. Tant que `healthy` est faux, les appels de rang `bad`
+/// échouent chez le fournisseur ; les autres réussissent.
+fn three_calls(provider: &'static str, bad: &'static [usize]) -> (Fx, Arc<AtomicBool>) {
+    let healthy = Arc::new(AtomicBool::new(false));
+    let h = healthy.clone();
+    let fx = Fx::new(
+        provider,
+        "format_retries = 0\nmax_chunk_chars = 200\n",
+        &["a"],
+        0,
+        move |b| {
+            let t = b.to_string();
+            let rank = (1..=3)
+                .find(|k| t.contains(&format!("(extrait {k}/3")))
+                .expect("rang de l'appel");
+            if !h.load(Ordering::SeqCst) && bad.contains(&rank) {
+                Outcome::Errored("api_error".into(), "boom".into())
+            } else if rank == 1 {
+                Outcome::Text(single("a"))
+            } else {
+                Outcome::Text(json!({"version": 2, "summaries": [], "concepts": []}).to_string())
+            }
+        },
+    );
+    big_doc(&fx.env);
+    (fx, healthy)
+}
+
+fn kept_rows(fx: &Fx) -> usize {
+    nephila::store::Store::open_readonly(&fx.env.repo)
+        .unwrap()
+        .call_results()
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn req228_ac2_le_lot_ne_porte_que_les_appels_manquants_et_le_plafond_les_compte() {
+    for provider in PROVIDERS {
+        let (fx, healthy) = three_calls(provider, &[2, 3]);
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 1, "{provider} : {}", err(&o));
+        assert_eq!(fx.server.lots()[0].len(), 3, "{provider}");
+        assert_eq!(kept_rows(&fx), 1, "{provider}");
+        healthy.store(true, Ordering::SeqCst);
+
+        let o = fx.env.run(&["update", "--batch", "--max-calls", "1"]);
+        assert_eq!(code(&o), 1, "{provider} : {}", err(&o));
+        assert_eq!(last_line(&o), e32(1, 2), "{provider}");
+        assert_eq!(fx.server.lots().len(), 1, "{provider}");
+
+        let o = fx.env.run(&["update", "--batch", "--max-calls", "2"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let lots = fx.server.lots();
+        assert_eq!(lots.len(), 2, "{provider}");
+        assert_eq!(lots[1].len(), 2, "{provider}");
+        assert_eq!(fx.to_enrich().len(), 0, "{provider}");
+    }
+}
+
+#[test]
+fn req228_ac3_derniere_passe_conserve_les_reponses_puis_reprise_des_appels_manquants() {
+    for provider in PROVIDERS {
+        let (fx, healthy) = three_calls(provider, &[2]);
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 1, "{provider} : {}", err(&o));
+        assert_eq!(fx.to_enrich(), ["docs/a.md"], "{provider}");
+        assert!(
+            err(&o).lines().any(|l| l.starts_with(
+                "avertissement: docs/a.md : requête du lot du fournisseur en échec ("
+            ) && l.ends_with("boom) ; relancez nephila update --batch")),
+            "{provider} : {}",
+            err(&o)
+        );
+        assert_eq!(kept_rows(&fx), 2, "{provider}");
+        healthy.store(true, Ordering::SeqCst);
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let lots = fx.server.lots();
+        assert_eq!(lots.len(), 2, "{provider}");
+        assert_eq!(lots[1].len(), 1, "{provider}");
+        assert!(lots[1][0].to_string().contains("(extrait 2/3"));
+        assert_eq!(fx.to_enrich().len(), 0, "{provider}");
+        assert_eq!(kept_rows(&fx), 0, "{provider}");
+
+        // Sans --batch : un seul appel.
+        let (fx, healthy) = three_calls(provider, &[2]);
+        fx.env.run(&["build", "--batch"]);
+        assert_eq!(kept_rows(&fx), 2, "{provider}");
+        healthy.store(true, Ordering::SeqCst);
+        let empty = json!({"version": 2, "summaries": [], "concepts": []}).to_string();
+        fx.server.route(
+            "POST",
+            fx.sync_path(),
+            vec![Reply::status(200, &wrap(provider, &empty))],
+        );
+        let o = fx.env.run(&["update"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(
+            fx.server.hits("POST", fx.sync_path()).len(),
+            1,
+            "{provider}"
+        );
+        assert_eq!(fx.to_enrich().len(), 0, "{provider}");
+    }
+}
+
+#[test]
+fn req228_ac3_passe_de_collecte_interrompue_n_ecrit_aucune_ligne() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(
+            provider,
+            "format_retries = 0\nmax_chunk_chars = 200\n",
+            &["a"],
+            FOREVER,
+            good,
+        );
+        big_doc(&fx.env);
+        fx.interrupted();
+        assert_eq!(kept_rows(&fx), 0, "{provider}");
+        assert_eq!(fx.server.lots()[0].len(), 3, "{provider}");
+    }
+}
+
+#[test]
+fn req228_ac5_tous_les_appels_conserves_aucun_lot() {
+    for provider in PROVIDERS {
+        let (fx, healthy) = three_calls(provider, &[]);
+        healthy.store(true, Ordering::SeqCst);
+        // Un déclencheur garde les lignes à la réussite ; le fichier redevient « à enrichir ».
+        let o = fx.env.run(&["build", "--no-llm"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let db = fx.env.repo.join(".nephila/graph.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER keep BEFORE DELETE ON enrich_calls BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TRIGGER keep;").unwrap();
+        conn.execute("DELETE FROM enrichments WHERE path = 'docs/a.md'", [])
+            .unwrap();
+        drop(conn);
+        assert_eq!(kept_rows(&fx), 3, "{provider}");
+        assert_eq!(fx.to_enrich(), ["docs/a.md"], "{provider}");
+        let lots = fx.server.lots().len();
+
+        let o = fx.env.run(&["update", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert_eq!(fx.server.lots().len(), lots, "{provider}");
+        assert!(!err(&o).contains("lot du fournisseur"), "{}", err(&o));
+        assert!(
+            out(&o).trim_end().ends_with("0 fichiers à enrichir"),
+            "{provider} : {}",
+            out(&o)
+        );
+    }
+}

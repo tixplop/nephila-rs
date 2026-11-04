@@ -769,6 +769,21 @@ pub(crate) fn estimate_enrichment(
         &opts.enrich_scope,
     )?;
     let ids = enrich::nodes_by_file(store)?;
+    // Sans modèle, rien n'est réutilisé (REQ-228).
+    let kept = match &dry.model {
+        Some(model) => enrich::KeptCalls {
+            results: store.call_results()?,
+            model: model.clone(),
+            language: dry.language.clone(),
+            versions: store.prompt_versions(),
+        },
+        None => enrich::KeptCalls {
+            results: HashMap::new(),
+            model: String::new(),
+            language: dry.language.clone(),
+            versions: store.prompt_versions(),
+        },
+    };
     let est = enrich::estimate(
         enrich::Sources { repo, abs },
         &files,
@@ -776,6 +791,7 @@ pub(crate) fn estimate_enrichment(
         &dry.language,
         opts.batch_files,
         opts.max_chunk_chars,
+        &kept,
     );
     for line in estimate::trace_lines(&est) {
         trace!("{line}");

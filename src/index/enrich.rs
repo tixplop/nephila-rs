@@ -1104,6 +1104,7 @@ pub(crate) fn estimate(
     language: &str,
     batch_files: usize,
     max_chunk_chars: usize,
+    kept: &KeptCalls,
 ) -> Estimate {
     let (with_nodes, without_nodes) = partition_by_nodes(files, ids);
     let units = form_units_by_nodes(
@@ -1157,6 +1158,7 @@ pub(crate) fn estimate(
                     ids,
                     language,
                     max_chunk_chars,
+                    kept,
                     &mut est.nodes,
                 ));
                 let last = est.alone.last().expect("fichier seul ajouté");
@@ -1182,6 +1184,7 @@ fn estimate_alone(
     ids: &HashMap<String, Vec<(String, String)>>,
     language: &str,
     max_chunk_chars: usize,
+    kept: &KeptCalls,
     nodes: &mut usize,
 ) -> AloneFile {
     let mut out = AloneFile {
@@ -1198,7 +1201,9 @@ fn estimate_alone(
     match plan_calls(f, &text, max_chunk_chars, &file_nodes) {
         Ok(calls) => {
             let system = enrichment_system_prompt(language).len();
-            for call in calls {
+            // Les appels dont la réponse est conservée ne partent pas (REQ-228).
+            let (send, _) = split_kept(calls, kept);
+            for call in send {
                 if let Unit::Call {
                     excerpt,
                     part,
@@ -1505,6 +1510,10 @@ struct Ctx<'s, 'a> {
     capped: &'s AtomicBool,
     /// Appels conservés au début de la passe.
     kept: &'s KeptCalls,
+    /// Dernière passe du mode lot : toutes les réponses sont déjà payées, aucun appel n'est
+    /// sauté après un échec, pour que celles des autres appels du fichier soient conservées
+    /// (REQ-228).
+    answers_known: bool,
 }
 
 /// Prise de `n` appels sur le plafond, sous le verrou de la politique. Au premier refus, écrit la
@@ -1555,6 +1564,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
         max_calls,
         capped,
         kept,
+        answers_known,
     } = ctx;
     while let Some(unit) = next_unit(shared, wake, stop, capped) {
         let mut expand = ExpandGuard {
@@ -1610,7 +1620,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 let err = result.as_ref().err().cloned();
                 // Toute cause d'échec fait sauter les appels non partis du fichier
                 // (AC-051-5) ; la politique enregistre quand même cet appel.
-                if err.is_some() {
+                if err.is_some() && !answers_known {
                     shared
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -1955,6 +1965,7 @@ pub(crate) fn enrich_pass(
             max_calls,
             capped: &capped,
             kept: &kept,
+            answers_known: matches!(mode, PassMode::Last { .. }),
         };
         for _ in 0..workers {
             let tx = tx.clone();
@@ -5421,7 +5432,13 @@ mod estimate_tests {
             repo: dir,
             abs: &abs,
         };
-        estimate(sources, files, ids, LANG, batch, max)
+        let kept = KeptCalls {
+            results: HashMap::new(),
+            model: "m".into(),
+            language: LANG.into(),
+            versions: PromptVersions::CURRENT,
+        };
+        estimate(sources, files, ids, LANG, batch, max, &kept)
     }
 
     /// Lignes de 10 octets `nNN xxxxx` : une par morceau pour `max_chunk_chars` = 10.

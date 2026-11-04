@@ -285,6 +285,8 @@ struct Seen {
     bytes: Vec<usize>,
     /// Nœuds listés dans chaque requête.
     nodes: usize,
+    /// Rang (à partir de 1) de la requête qui reçoit une réponse non conforme ; 0 = aucune.
+    fail_at: usize,
 }
 
 struct ConformantServer {
@@ -412,6 +414,9 @@ fn answer(body: &[u8], seen: &Mutex<Seen>) -> String {
         let mut s = seen.lock().unwrap();
         s.bytes.push(bytes);
         s.nodes += nodes;
+        if s.fail_at == s.bytes.len() {
+            return "pas du json".to_string();
+        }
     }
     let summaries = |ids: &[String]| -> Vec<serde_json::Value> {
         ids.iter()
@@ -945,4 +950,159 @@ fn req184_ac9_chemin_a_caractere_de_controle_echappe() {
         "{}",
         err(&o)
     );
+}
+
+// ---- AC-228 : appels conservés ----
+
+/// Dépôt d'un seul fichier envoyé seul (plusieurs appels), faux serveur conforme.
+fn kept_env(server: &ConformantServer) -> Env {
+    let env = Env::new();
+    for (rel, content) in [
+        ("docs/d.md", sections("S", 16)),
+        (
+            ".nephila.toml",
+            "max_chunk_chars = 1500\nformat_retries = 0\nconcurrency = 1\n".to_string(),
+        ),
+    ] {
+        let p = env.repo.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, content).unwrap();
+    }
+    server_config(&env, server);
+    env
+}
+
+fn real(env: &Env, args: &[&str]) -> Output {
+    let mut c = env.command(args);
+    c.env(KEY_VAR, "sk-test");
+    c.output().unwrap()
+}
+
+fn kept_rows(env: &Env) -> usize {
+    env.store().call_results().unwrap().len()
+}
+
+#[test]
+fn req228_ac1_estimation_ne_compte_que_les_appels_manquants() {
+    let server = ConformantServer::start();
+    let env = kept_env(&server);
+    let o = env.run(&["build", "--dry-run", "--enrich-code"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let full = number(&estimation_lines(&o)[1], "minimale : ", " appels");
+    assert!(full >= 3, "{full}");
+
+    server.seen.lock().unwrap().fail_at = 3;
+    let r = real(&env, &["build", "--enrich-code"]);
+    assert_eq!(code(&r), 1, "{}", err(&r));
+    assert_eq!(server.requests(), 3);
+    assert_eq!(kept_rows(&env), 2);
+
+    let before = server.requests();
+    let o = env.run(&["update", "--dry-run", "--verbose"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let lines = estimation_lines(&o);
+    let calls = number(&lines[1], "minimale : ", " appels");
+    let bytes = number(&lines[1], "appels, ", " octets");
+    assert_eq!(calls, full - 2, "{}", out(&o));
+    let trace = format!("estimation docs/d.md : {calls} appels, {bytes} octets");
+    assert!(err(&o).contains(&trace), "{}", err(&o));
+    assert_eq!(kept_rows(&env), 2);
+    assert_eq!(server.requests(), before);
+
+    // Le modèle change : plus rien n'est réutilisé.
+    env.config_text(&format!(
+        "provider = \"openai\"\nmodel = \"autre\"\nenrich_code = true\nbase_url = \"{}\"\napi_key_env = \"{KEY_VAR}\"\n",
+        server.base_url
+    ));
+    let o = env.run(&["update", "--dry-run"]);
+    assert_eq!(
+        number(&estimation_lines(&o)[1], "minimale : ", " appels"),
+        full
+    );
+    assert_eq!(kept_rows(&env), 2);
+    server_config(&env, &server);
+
+    server.seen.lock().unwrap().fail_at = 0;
+    let (b0, n0) = (server.bytes(), server.requests());
+    let r = real(&env, &["update"]);
+    assert_eq!(code(&r), 0, "{}", err(&r));
+    assert_eq!(server.requests() - n0, calls);
+    assert_eq!(server.bytes() - b0, bytes);
+}
+
+#[test]
+fn req228_ac4_tous_les_appels_conserves_zero_appel() {
+    let server = ConformantServer::start();
+    let env = kept_env(&server);
+    let r = real(&env, &["build"]);
+    assert_eq!(code(&r), 0, "{}", err(&r));
+    // Un déclencheur garde les lignes à la réussite ; le fichier redevient « à enrichir ».
+    let db = env.repo.join(".nephila/graph.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER keep BEFORE DELETE ON enrich_calls BEGIN SELECT RAISE(IGNORE); END;",
+    )
+    .unwrap();
+    drop(conn);
+    fs::write(env.repo.join("docs/d.md"), sections("S", 16) + "\n").unwrap();
+    let r = real(&env, &["update"]);
+    assert_eq!(code(&r), 0, "{}", err(&r));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("DROP TRIGGER keep;").unwrap();
+    conn.execute("DELETE FROM enrichments WHERE path = 'docs/d.md'", [])
+        .unwrap();
+    drop(conn);
+    assert!(kept_rows(&env) >= 3);
+
+    let o = env.run(&["update", "--dry-run", "--verbose"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let stdout = out(&o);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "graphe à jour", "{stdout}");
+    assert_eq!(
+        lines[1],
+        "estimation : 1 fichiers à enrichir dont 1 envoyés seuls et 0 sans appel"
+    );
+    assert_eq!(
+        lines[2],
+        "estimation minimale : 0 appels, 0 octets, 0 jetons d'entrée, 0 jetons de sortie (un essai par appel)"
+    );
+    assert!(
+        err(&o)
+            .lines()
+            .any(|l| l.ends_with("estimation docs/d.md : 0 appels, 0 octets")),
+        "{}",
+        err(&o)
+    );
+}
+
+#[test]
+fn req228_ac4_plafond_compte_le_plan_entier_malgre_trois_appels_conserves() {
+    let env = Env::new();
+    fs::write(env.repo.join("big.md"), sections("S", 52)).unwrap();
+    fs::write(env.repo.join(".nephila.toml"), "max_chunk_chars = 300\n").unwrap();
+    let o = env.run(&["build", "--no-llm"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    for k in ["k1", "k2", "k3"] {
+        conn.execute(
+            "INSERT INTO enrich_calls(path, call_key, payload) VALUES ('big.md', ?1, '{\"v\":1,\"summaries\":[],\"concepts\":[],\"rejected\":[]}')",
+            [k],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let o = env.run(&["update", "--dry-run"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let stdout = out(&o);
+    assert!(
+        stdout.lines().any(|l| l
+            == "estimation au plafond : big.md (52 appels prévus, au plus 50 par fichier, aucun compté)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("estimation minimale : 0 appels, 0 octets"),
+        "{stdout}"
+    );
+    assert_eq!(kept_rows(&env), 3);
 }

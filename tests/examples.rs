@@ -1237,17 +1237,51 @@ fn REQ134_AC2_ligne_config_d_exemple_du_readme_est_la_sortie_reelle() {
 }
 
 #[test]
-fn REQ225_AC3_version_0_27_1() {
-    assert_eq!(cargo_minor(), "0.27");
+fn REQ229_AC2_version_0_28_0() {
+    assert_eq!(cargo_minor(), "0.28");
     let toml = repo_file("Cargo.toml");
-    assert!(toml.lines().any(|l| l == "version = \"0.27.1\""));
+    assert!(toml.lines().any(|l| l == "version = \"0.28.0\""));
     let lock = repo_file("Cargo.lock");
-    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.27.1\""));
+    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.28.0\""));
     let readme = repo_file("README.md");
-    for needle in ["V=v0.27.1", "git tag v0.27.1 && git push origin v0.27.1"] {
+    for needle in ["V=v0.28.0", "git tag v0.28.0 && git push origin v0.28.0"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
-    assert!(!readme.contains("v0.27.0"));
+    assert!(!readme.contains("v0.27.1"));
+}
+
+/// AC-229-1 et AC-229-4 : puce « Ce qui reste » et fin de « Mise à niveau » (V-012, items 53, 54).
+#[test]
+fn REQ229_AC1_AC4_readme_appels_gardes() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
+    let section = readme_section(&readme, "### Échecs et nouveaux essais");
+    let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(bullets.len(), 5, "{bullets:?}");
+    let rest = bullets
+        .iter()
+        .find(|l| l.starts_with("- **Ce qui reste**"))
+        .expect("puce Ce qui reste");
+    assert_eq!(
+        *rest,
+        "- **Ce qui reste** : un fichier en échec reste « à enrichir », et `nephila update` ne renvoie que ceux-là. Un fichier envoyé seul n'est écrit qu'une fois complet, mais ses réponses valides sont gardées : seuls ses appels manquants repartent, et `max_calls` comme `--dry-run` ne comptent qu'eux. Une réponse gardée ne sert plus si son morceau change ou se déplace, si les nœuds du fichier changent, ou si `model` ou `summary_language` change. Aucune de ces causes n'arrête l'envoi tant qu'elle reste isolée."
+    );
+    let upgrade = readme_section(&readme, "## Mise à niveau");
+    let bullets: Vec<&str> = upgrade.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(bullets.len(), 6, "{bullets:?}");
+    assert!(bullets[0].starts_with("- **Vers 0.26**"));
+    assert!(bullets.iter().all(|l| !l.contains("Vers 0.28")));
+    let last = upgrade
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .expect("dernier paragraphe");
+    assert_eq!(
+        last,
+        "Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`. Un graphe 0.25 à 0.27 est aussi migré sur place. Les versions antérieures refusent ensuite le graphe : pour y revenir, supprimez `.nephila/`, et le build suivant réenrichit tous les fichiers de la portée."
+    );
+    for banned in ["repart en entier", "repris en entier", "renvoyé en entier"] {
+        assert!(!readme.contains(banned), "{banned}");
+    }
 }
 
 /// AC-218-1 et AC-218-4 : ligne de table et paragraphe du mode lot (V-012, items 51 et 52).

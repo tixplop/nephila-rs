@@ -70,7 +70,7 @@ Les modules sont désignés par leur nom qualifié (`com.acme:core`), celui qu'a
 Chaque version publiée sur la page [Releases](https://github.com/tixplop/nephila-rs/releases) fournit une archive par plateforme : Linux (x86_64, aarch64 ; binaire statique musl) et macOS (Intel, Apple Silicon). Windows n'est pas pris en charge. Chaque archive contient le binaire, le README et deux exemples de configuration : `config.example.toml` (copie de `examples/config.toml`) et `nephila.example.toml` (copie de `examples/nephila.toml`).
 
 ```sh
-V=v0.27.1                                      # version voulue
+V=v0.28.0                                      # version voulue
 T=x86_64-unknown-linux-musl                    # ou aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/nephila-$V-$T.tar.gz
 curl -LO https://github.com/tixplop/nephila-rs/releases/download/$V/SHA256SUMS
@@ -474,7 +474,7 @@ Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, c
 - **Surcharge passagère** (HTTP 429, 500, 502, 503, 504, 529, erreur réseau transitoire) : jusqu'à 4 nouveaux essais, avec une attente croissante ; un `retry-after` en secondes est respecté, et au-delà de 60 s le fichier échoue aussitôt.
 - **Réponse tronquée** : `réponse tronquée par la limite de jetons`, jamais renvoyée ; un lot tronqué est découpé en deux, jusqu'au fichier seul ; pour un fichier seul, réduisez `max_chunk_chars` ou augmentez `max_output_tokens`.
 - **Fichier absent d'une réponse de lot** : renvoyé une fois, avec les autres absents du même lot ; encore absent, il échoue (`absent de la réponse du lot`).
-- **Ce qui reste** : un fichier en échec reste « à enrichir », et `nephila update` ne renvoie que ceux-là. Aucune de ces causes n'arrête l'envoi tant qu'elle reste isolée.
+- **Ce qui reste** : un fichier en échec reste « à enrichir », et `nephila update` ne renvoie que ceux-là. Un fichier envoyé seul n'est écrit qu'une fois complet, mais ses réponses valides sont gardées : seuls ses appels manquants repartent, et `max_calls` comme `--dry-run` ne comptent qu'eux. Une réponse gardée ne sert plus si son morceau change ou se déplace, si les nœuds du fichier changent, ou si `model` ou `summary_language` change. Aucune de ces causes n'arrête l'envoi tant qu'elle reste isolée.
 
 ### Arrêt de l'envoi
 
@@ -603,7 +603,7 @@ Les versions qui demandent une action, la plus récente d'abord. L'historique de
 - **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute `--check-stale` à ses requêtes, ou lance `nephila status` avant elles.
 - **Vers 0.18** : seuls les documents Markdown sont enrichis par défaut ; pour le code, `enrich_code = true` dans la configuration personnelle. Le premier `nephila build` remplace un graphe 0.17 et enrichit une fois tous les fichiers de la portée.
 
-Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`.
+Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`. Un graphe 0.25 à 0.27 est aussi migré sur place. Les versions antérieures refusent ensuite le graphe : pour y revenir, supprimez `.nephila/`, et le build suivant réenrichit tous les fichiers de la portée.
 
 ## Développement
 
@@ -614,7 +614,7 @@ Les actions sont épinglées par SHA et Dependabot (`.github/dependabot.yml`) pr
 **Publier une version** : mettre à jour `version` dans `Cargo.toml` et le README, puis pousser un tag identique ; `release.yml` publie les archives et `SHA256SUMS`.
 
 ```sh
-git tag v0.27.1 && git push origin v0.27.1
+git tag v0.28.0 && git push origin v0.28.0
 ```
 
 Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), deux à la fois, avec une limite de temps par test (`.config/nextest.toml`) ; `cargo test` passe aussi.
