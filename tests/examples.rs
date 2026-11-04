@@ -1237,17 +1237,17 @@ fn REQ134_AC2_ligne_config_d_exemple_du_readme_est_la_sortie_reelle() {
 }
 
 #[test]
-fn REQ219_AC1_version_0_27_0() {
+fn REQ225_AC3_version_0_27_1() {
     assert_eq!(cargo_minor(), "0.27");
     let toml = repo_file("Cargo.toml");
-    assert!(toml.lines().any(|l| l == "version = \"0.27.0\""));
+    assert!(toml.lines().any(|l| l == "version = \"0.27.1\""));
     let lock = repo_file("Cargo.lock");
-    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.27.0\""));
+    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.27.1\""));
     let readme = repo_file("README.md");
-    for needle in ["V=v0.27.0", "git tag v0.27.0 && git push origin v0.27.0"] {
+    for needle in ["V=v0.27.1", "git tag v0.27.1 && git push origin v0.27.1"] {
         assert!(readme.contains(needle), "absent : {needle}");
     }
-    assert!(!readme.contains("v0.26.1"));
+    assert!(!readme.contains("v0.27.0"));
 }
 
 /// AC-218-1 et AC-218-4 : ligne de table et paragraphe du mode lot (V-012, items 51 et 52).

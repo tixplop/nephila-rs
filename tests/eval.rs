@@ -351,9 +351,12 @@ struct Params {
     out: PathBuf,
     /// Variables d'environnement ajoutées aux commandes (le simulé, la clé d'API).
     env: Vec<(String, String)>,
+    /// Configuration du juge (`NEPHILA_EVAL_JUDGE_CONFIG`), absente : pas de juge.
+    judge_config: Option<PathBuf>,
 }
 
-/// Réglages tirés de l'environnement (`NEPHILA_EVAL_CONFIG` obligatoire, `NEPHILA_EVAL_OUT`).
+/// Réglages tirés de l'environnement (`NEPHILA_EVAL_CONFIG` obligatoire, `NEPHILA_EVAL_OUT`,
+/// `NEPHILA_EVAL_JUDGE_CONFIG`).
 fn params_from_env(get: &dyn Fn(&str) -> Option<String>) -> Res<Params> {
     let config = get("NEPHILA_EVAL_CONFIG")
         .filter(|v| !v.is_empty())
@@ -370,6 +373,9 @@ fn params_from_env(get: &dyn Fn(&str) -> Option<String>) -> Res<Params> {
         questions: eval_dir().join("questions.json"),
         out,
         env: vec![],
+        judge_config: get("NEPHILA_EVAL_JUDGE_CONFIG")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
     })
 }
 
@@ -552,6 +558,169 @@ fn enrich_metrics(export: &Value, stderr: &str) -> Value {
     })
 }
 
+/// Recall et précision d'une question : attendus cités / attendus, attendus cités / cités.
+fn recall_precision(expected: &[String], cited: &[String]) -> (f64, f64) {
+    let hits = expected.iter().filter(|e| cited.contains(e)).count() as u64;
+    (
+        ratio(hits, expected.len() as u64),
+        ratio(hits, cited.len() as u64),
+    )
+}
+
+/// Résultat d'un `query ask --json --verbose`.
+struct AskRun {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: String,
+}
+
+/// Mesures de `query ask` : une exécution par question, dans l'ordre du fichier.
+fn ask_metrics(questions: &[Value], runs: &[AskRun]) -> Value {
+    let (mut ok, mut without, mut not_found, mut error) = (0u64, 0u64, 0u64, 0u64);
+    let (mut calls, mut retries, mut sends) = (0u64, 0u64, 0u64);
+    let mut tokens: Option<[u64; 3]> = None;
+    let (mut sum_recall, mut sum_precision) = (0.0, 0.0);
+    let mut details = Vec::new();
+    for (q, run) in questions.iter().zip(runs) {
+        let expected: Vec<String> = q["expected"].as_array().map_or(vec![], |a| {
+            a.iter()
+                .filter_map(|e| e.as_str())
+                .map(String::from)
+                .collect()
+        });
+        let mut cited: Vec<String> = serde_json::from_slice::<Value>(&run.stdout)
+            .ok()
+            .and_then(|v| v["nodes"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|n| n["qualified"].as_str().map(String::from))
+            .collect();
+        cited.sort();
+        let status = if run.code == 0 && !cited.is_empty() {
+            ok += 1;
+            "ok"
+        } else if run.code == 0 && serde_json::from_slice::<Value>(&run.stdout).is_ok() {
+            without += 1;
+            "without_citation"
+        } else if run.code != 0
+            && last_line(run.stderr.as_bytes()) == "erreur: pas trouvé dans le graphe"
+        {
+            not_found += 1;
+            "not_found"
+        } else {
+            error += 1;
+            "error"
+        };
+        if status != "ok" {
+            cited.clear();
+        }
+        let (recall, precision) = recall_precision(&expected, &cited);
+        sum_recall += recall;
+        sum_precision += precision;
+        if let Some(t) = trace_lines(&run.stderr)
+            .filter(|l| l.starts_with("appels:"))
+            .last()
+            .map(parse_totals)
+        {
+            calls += t.calls;
+            retries += t.format_retries;
+            sends += t.http_sends;
+            if let Some(k) = t.tokens {
+                let sum = tokens.get_or_insert([0; 3]);
+                for i in 0..3 {
+                    sum[i] += k[i];
+                }
+            }
+        }
+        details.push(serde_json::json!({
+            "id": q["id"], "status": status, "cited": cited,
+            "recall": num(recall), "precision": num(precision),
+        }));
+    }
+    let n = questions.len() as f64;
+    let mean = |x: f64| if n == 0.0 { 0.0 } else { x / n };
+    serde_json::json!({
+        "questions": questions.len(),
+        "recall": num(mean(sum_recall)),
+        "precision": num(mean(sum_precision)),
+        "ok": ok, "without_citation": without, "not_found": not_found, "error": error,
+        "calls": calls, "format_retries": retries, "http_sends": sends,
+        "tokens": tokens_json(tokens),
+        "details": details,
+    })
+}
+
+/// Nœuds demandés et couverts de l'export : `(id, résumé, fichier)`.
+fn covered_nodes(export: &Value) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for n in export["nodes"].as_array().map_or(&[][..], |a| &a[..]) {
+        let id = n["id"].as_str().unwrap_or("");
+        if id.starts_with("package:") || id.starts_with("key:") {
+            continue;
+        }
+        if let (Some(file), Some(s)) = (n["file"].as_str(), n["summary"].as_str()) {
+            if !s.is_empty() {
+                out.push((id.to_string(), s.to_string(), file.to_string()));
+            }
+        }
+    }
+    out
+}
+
+const JUDGE_QUESTION: &str = "Note de 1 à 5 ce résumé d'un élément de code : 5 = exact, utile et concis ; 1 = faux ou vide. Mets la note seule, un chiffre, dans « answer », et une liste vide dans « nodes ».";
+
+/// Contexte d'un appel du juge : identifiant, résumé, 6 000 premiers caractères du fichier.
+fn judge_context(id: &str, summary: &str, file_text: &str) -> String {
+    let head: String = file_text.chars().take(6000).collect();
+    format!("Élément : {id}\nRésumé : {summary}\nFichier :\n{head}")
+}
+
+/// Juge : note de 1 à 5 de chacun des 20 résumés de plus petit `BLAKE3(id)`.
+fn judge(
+    llm: &dyn nephila::llm::Llm,
+    summaries: &[(String, String, String)],
+    corpus: &Path,
+) -> Value {
+    let mut sample: Vec<(blake3::Hash, &(String, String, String))> = summaries
+        .iter()
+        .map(|s| (blake3::hash(s.0.as_bytes()), s))
+        .collect();
+    sample.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    sample.truncate(20);
+    let mut details = Vec::new();
+    for (_, (id, summary, file)) in &sample {
+        let text = fs::read(corpus.join(file))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        let score = match llm.ask(JUDGE_QUESTION, &judge_context(id, summary, &text)) {
+            Ok(nephila::llm::AskReply::Found { answer, .. }) => {
+                let a = answer.trim();
+                a.parse::<u8>()
+                    .ok()
+                    .filter(|n| (1..=5).contains(n) && a.bytes().all(|b| b.is_ascii_digit()))
+            }
+            _ => None,
+        };
+        details.push((id.clone(), score));
+    }
+    details.sort();
+    let scores: Vec<u64> = details.iter().filter_map(|d| d.1.map(u64::from)).collect();
+    let mean = if scores.is_empty() {
+        Value::Null
+    } else {
+        num(scores.iter().sum::<u64>() as f64 / scores.len() as f64)
+    };
+    serde_json::json!({
+        "model": llm.model(),
+        "sample": details.len(),
+        "mean": mean,
+        "unreadable": details.len() - scores.len(),
+        "details": details.iter()
+            .map(|(node, score)| serde_json::json!({"node": node, "score": score}))
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn last_line(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
@@ -561,7 +730,8 @@ fn last_line(stderr: &[u8]) -> String {
         .to_string()
 }
 
-/// Une passe : `build --enrich-code --verbose`, `export`, rapport écrit en une fois.
+/// Une passe : `build --enrich-code --verbose`, `export`, les questions, le juge, rapport écrit
+/// en une fois.
 fn run_pass(p: &Params) -> Res<Value> {
     if !p.config.is_file() {
         return Err(format!(
@@ -569,6 +739,14 @@ fn run_pass(p: &Params) -> Res<Value> {
             p.config.display()
         ));
     }
+    let judge_llm = match &p.judge_config {
+        None => None,
+        Some(path) => Some(
+            nephila::config::Config::load_from(path)
+                .and_then(|c| nephila::llm::build_llm(&c))
+                .map_err(|e| format!("NEPHILA_EVAL_JUDGE_CONFIG : {}: {e}", path.display()))?,
+        ),
+    };
     let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
     let repo = tmp.path().join("repo");
     copy_tree(&p.corpus, &repo);
@@ -622,6 +800,29 @@ fn run_pass(p: &Params) -> Res<Value> {
     let questions: Value =
         serde_json::from_slice(&fs::read(&p.questions).map_err(|e| e.to_string())?)
             .map_err(|e| format!("questions illisibles : {e}"))?;
+    let (mut ask, mut judged) = (Value::Null, Value::Null);
+    if failure.is_none() {
+        let list = questions.as_array().cloned().unwrap_or_default();
+        let mut runs = Vec::new();
+        for q in &list {
+            let o = nephila(&[
+                "query",
+                "ask",
+                "--json",
+                "--verbose",
+                q["question"].as_str().unwrap_or(""),
+            ])?;
+            runs.push(AskRun {
+                code: o.status.code().unwrap_or(-1),
+                stdout: o.stdout,
+                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            });
+        }
+        ask = ask_metrics(&list, &runs);
+        if let Some(llm) = &judge_llm {
+            judged = judge(llm.as_ref(), &covered_nodes(&export), &p.corpus);
+        }
+    }
     let report = serde_json::json!({
         "schema": 1,
         "version": version,
@@ -640,8 +841,8 @@ fn run_pass(p: &Params) -> Res<Value> {
             "questions": questions.as_array().map_or(0, Vec::len),
         },
         "enrich": enrich,
-        "ask": Value::Null,
-        "judge": Value::Null,
+        "ask": ask,
+        "judge": judged,
     });
     if let Some(dir) = p.out.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{} : {e}", dir.display()))?;
@@ -700,6 +901,7 @@ fn mock_params(env: &Env, out: &Path) -> Params {
         questions: eval_dir().join("questions.json"),
         out: out.to_path_buf(),
         env: vec![("NEPHILA_MOCK_DIR".into(), env.mock.to_str().unwrap().into())],
+        judge_config: None,
     }
 }
 
@@ -741,6 +943,7 @@ impl Mini {
             questions: self.path("questions.json"),
             out: self.path("out/report.json"),
             env: all,
+            judge_config: None,
         }
     }
 }
@@ -846,7 +1049,8 @@ fn req221_ac3_report_has_the_exact_shape() {
     let pv = &written["prompt_versions"];
     assert_eq!(pv["code"], nephila::llm::enrich::CODE_PROMPT_VERSION);
     assert_eq!(pv["ask"], nephila::llm::ask::ASK_PROMPT_VERSION);
-    assert!(written["ask"].is_null() && written["judge"].is_null());
+    assert_eq!(written["ask"]["questions"], questions().len());
+    assert!(written["judge"].is_null());
     let enrich = &written["enrich"];
     assert_eq!(enrich["exit_code"], 0);
     assert!(enrich["nodes_covered"].as_u64().unwrap() > 0);
@@ -907,25 +1111,61 @@ fn req221_ac5_failed_build_stops_before_any_question() {
 #[test]
 fn req221_ac6_report_keeps_no_answer_and_no_key() {
     let mini = Mini::new();
-    let reply = serde_json::json!({
-        "choices": [{"message": {"role": "assistant", "content":
-            r#"{"version":2,"summaries":[{"node":"document:a.md","summary":"SECRET_REPONSE_42"}],"concepts":[]}"#},
-            "finish_reason": "stop"}]
-    })
-    .to_string();
-    let server = FakeServer::start((0..3).map(|_| (200, reply.clone())).collect());
+    fs::write(
+        mini.path("questions.json"),
+        r#"[{"id":"Q01","question":"Que dit a.md ?","expected":["a.md"]}]"#,
+    )
+    .unwrap();
+    let chat = |content: &str| {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"}]
+        })
+        .to_string()
+    };
+    let enrich = chat(
+        r#"{"version":2,"summaries":[{"node":"document:a.md","summary":"SECRET_REPONSE_42"}],"concepts":[]}"#,
+    );
+    let ask = chat(r#"{"found":true,"answer":"SECRET_REPONSE_42","nodes":[]}"#);
+    let judged = chat(r#"{"found":true,"answer":"SECRET_REPONSE_42","nodes":[]}"#);
+    let mut replies: Vec<(u16, String)> = (0..3).map(|_| (200, enrich.clone())).collect();
+    replies.push((200, ask));
+    replies.push((200, judged));
+    let server = FakeServer::start(replies);
     let config = format!(
         "provider = \"openai\"\nmodel = \"m\"\napi_key_env = \"NEPHILA_EVAL_TEST_KEY\"\nbase_url = \"{}\"\nbatch_files = 1\nconcurrency = 1\n",
         server.base_url
     );
-    let p = mini.params(
+    let mut p = mini.params(
         &config,
         vec![("NEPHILA_EVAL_TEST_KEY".into(), "sk-test-SECRET".into())],
     );
+    // Le juge parle au même serveur, sans clé.
+    fs::write(
+        mini.path("judge.toml"),
+        format!(
+            "provider = \"openai\"\nmodel = \"juge\"\nbase_url = \"{}\"\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    p.judge_config = Some(mini.path("judge.toml"));
     let report = run_pass(&p).unwrap();
     assert_eq!(
         report["enrich"]["nodes_covered"], 1,
         "le résumé a bien circulé"
+    );
+    let a = &report["ask"];
+    assert_eq!(
+        a["ok"].as_u64().unwrap() + a["without_citation"].as_u64().unwrap(),
+        1,
+        "{a}"
+    );
+    assert_eq!(a["calls"], 1, "la réponse d'ask a bien circulé");
+    assert_eq!(report["judge"]["sample"], 1);
+    assert_eq!(
+        report["judge"]["unreadable"], 1,
+        "la réponse du juge a bien circulé"
     );
     let text = fs::read_to_string(&p.out).unwrap();
     assert!(!text.contains("SECRET_REPONSE_42") && !text.contains("sk-test-SECRET"));
@@ -1053,4 +1293,317 @@ fn req222_ac5_mock_without_fixture_covers_nothing() {
     assert_eq!(e["nodes_covered"], 0);
     assert!(e["nodes_requested"].as_u64().unwrap() > 0);
     assert_eq!(e["first_try_rate"], 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mesures de `query ask` (REQ-223)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn req223_ac1_recall_and_precision_on_fixed_cases() {
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        recall_precision(&v(&["A", "B"]), &v(&["A", "C"])),
+        (0.5, 0.5)
+    );
+    assert_eq!(
+        recall_precision(&v(&["A", "B"]), &v(&["A", "B"])),
+        (1.0, 1.0)
+    );
+    assert_eq!(recall_precision(&v(&["A", "B"]), &v(&[])), (0.0, 0.0));
+}
+
+fn ask_fixture(env: &Env, json: &str) {
+    fs::write(env.mock.join("_ask.json"), json).unwrap();
+}
+
+#[test]
+fn req223_ac2_cited_node_is_ok_and_hidden_node_is_without_citation() {
+    let env = Env::new();
+    ask_fixture(
+        &env,
+        r#"{"found":true,"answer":"ok","nodes":["org.exemple.mediatheque.service.EmpruntService"]}"#,
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let report = run_pass(&mock_params(&env, &tmp.path().join("r.json"))).unwrap();
+    let d = report["ask"]["details"].as_array().unwrap();
+    assert_eq!(d.len(), questions().len());
+    assert_eq!(d[0]["id"], "Q01");
+    assert_eq!(d[0]["status"], "ok");
+    assert!(d[0]["recall"].as_f64().unwrap() > 0.0);
+    assert_eq!(
+        d[0]["cited"],
+        serde_json::json!(["org.exemple.mediatheque.service.EmpruntService"])
+    );
+    let hidden = d
+        .iter()
+        .find(|q| q["status"] == "without_citation")
+        .expect("une question dont le contexte ne montre pas le nœud");
+    assert_eq!(hidden["recall"], 0);
+    assert_eq!(hidden["precision"], 0);
+    assert_eq!(hidden["cited"], serde_json::json!([]));
+    let a = &report["ask"];
+    assert_eq!(
+        a["ok"].as_u64().unwrap()
+            + a["without_citation"].as_u64().unwrap()
+            + a["not_found"].as_u64().unwrap()
+            + a["error"].as_u64().unwrap(),
+        questions().len() as u64
+    );
+    assert!(a["recall"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn req223_ac3_not_found_and_errors_do_not_stop_the_pass() {
+    let env = Env::new();
+    ask_fixture(&env, r#"{"found":false}"#);
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("r.json");
+    let report = run_pass(&mock_params(&env, &out)).unwrap();
+    let a = &report["ask"];
+    let n = questions().len();
+    assert_eq!(a["not_found"], n);
+    assert_eq!(
+        (a["recall"].clone(), a["precision"].clone()),
+        (0.into(), 0.into())
+    );
+    assert!(out.is_file());
+
+    let mut p = mock_params(&env, &out);
+    p.env
+        .push(("NEPHILA_MOCK_MALFORMED".into(), "_ask:99".into()));
+    let report = run_pass(&p).unwrap();
+    let a = &report["ask"];
+    assert_eq!(a["error"], n);
+    assert!(a["calls"].as_u64().unwrap() > n as u64, "{a}");
+    assert_eq!(a["recall"], 0);
+    assert!(out.is_file());
+}
+
+#[test]
+fn req223_ac4_ask_calls_and_tokens_are_summed() {
+    let env = Env::new();
+    env.build_and_export();
+    let reply = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content":
+            r#"{"found":true,"answer":"ok","nodes":[]}"#}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 900, "prompt_tokens_details": {"cached_tokens": 100},
+                  "completion_tokens": 40}
+    })
+    .to_string();
+    let server = FakeServer::start((0..20).map(|_| (200, reply.clone())).collect());
+    fs::write(
+        &env.config,
+        format!(
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let qs: Vec<Value> = questions().into_iter().take(20).collect();
+    assert_eq!(qs.len(), 20);
+    let runs: Vec<AskRun> = qs
+        .iter()
+        .map(|q| {
+            let o = env.run(&[
+                "query",
+                "ask",
+                "--json",
+                "--verbose",
+                q["question"].as_str().unwrap(),
+            ]);
+            AskRun {
+                code: o.status.code().unwrap(),
+                stdout: o.stdout,
+                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            }
+        })
+        .collect();
+    let a = ask_metrics(&qs, &runs);
+    assert_eq!(a["calls"], 20, "{a}");
+    assert_eq!(
+        a["tokens"],
+        serde_json::json!({"input": 18000, "cache": 2000, "output": 800})
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Juge (REQ-224)
+// ---------------------------------------------------------------------------------------------
+
+fn judge_inputs(n: usize) -> Vec<(String, String, String)> {
+    (0..n)
+        .rev()
+        .map(|i| {
+            (
+                format!("type:T{i}"),
+                format!("Résumé {i}"),
+                "absent.java".to_string(),
+            )
+        })
+        .collect()
+}
+
+fn judge_mock(dir: &Path, reply: &str) -> nephila::llm::mock::MockLlm {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("_ask.json"), reply).unwrap();
+    nephila::llm::mock::MockLlm::new(nephila::llm::mock::MockOptions {
+        dir: Some(dir.to_path_buf()),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn req224_ac1_no_judge_config_means_no_judge_call() {
+    let env = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("mock.log");
+    let mut p = mock_params(&env, &tmp.path().join("r.json"));
+    p.env
+        .push(("NEPHILA_MOCK_LOG".into(), log.to_str().unwrap().into()));
+    let report = run_pass(&p).unwrap();
+    assert!(report["judge"].is_null());
+    let asks = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("_ask\t"))
+        .count();
+    assert!(asks <= questions().len(), "{asks} appels _ask");
+}
+
+#[test]
+fn req224_ac2_sample_is_the_twenty_smallest_hashes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let llm = judge_mock(
+        &tmp.path().join("m"),
+        r#"{"found":true,"answer":"4","nodes":[]}"#,
+    );
+    let inputs = judge_inputs(25);
+    let j = judge(&llm, &inputs, tmp.path());
+    assert_eq!(
+        (
+            j["sample"].clone(),
+            j["mean"].clone(),
+            j["unreadable"].clone()
+        ),
+        (20.into(), 4.into(), 0.into())
+    );
+    let mut by_hash: Vec<_> = inputs
+        .iter()
+        .map(|i| (blake3::hash(i.0.as_bytes()), i.0.clone()))
+        .collect();
+    by_hash.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut want: Vec<String> = by_hash.into_iter().take(20).map(|x| x.1).collect();
+    want.sort();
+    let got: Vec<String> = j["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["node"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(
+        judge(&llm, &inputs, tmp.path()),
+        j,
+        "mêmes nœuds à chaque lancement"
+    );
+    assert_eq!(judge(&llm, &judge_inputs(3), tmp.path())["sample"], 3);
+}
+
+#[test]
+fn req224_ac3_unreadable_answers_have_no_score() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (i, reply) in [
+        r#"{"found":true,"answer":"très bien","nodes":[]}"#,
+        r#"{"found":true,"answer":"0","nodes":[]}"#,
+        r#"{"found":true,"answer":"6","nodes":[]}"#,
+        r#"{"found":true,"answer":"4.5","nodes":[]}"#,
+        r#"{"found":false}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let llm = judge_mock(&tmp.path().join(format!("m{i}")), reply);
+        let j = judge(&llm, &judge_inputs(2), tmp.path());
+        assert_eq!(j["unreadable"], 2, "{reply}");
+        assert!(j["mean"].is_null(), "{reply}");
+        assert!(j["details"][0]["score"].is_null());
+    }
+    let llm = nephila::llm::mock::MockLlm::new(nephila::llm::mock::MockOptions {
+        invalid_key: true,
+        ..Default::default()
+    });
+    let j = judge(&llm, &judge_inputs(2), tmp.path());
+    assert_eq!(j["unreadable"], 2);
+    assert!(j["mean"].is_null());
+
+    let llm = judge_mock(
+        &tmp.path().join("blancs"),
+        r#"{"found":true,"answer":" 3 ","nodes":[]}"#,
+    );
+    let j = judge(&llm, &judge_inputs(2), tmp.path());
+    assert_eq!(
+        (j["mean"].clone(), j["unreadable"].clone()),
+        (3.into(), 0.into())
+    );
+}
+
+#[test]
+fn req224_ac4_missing_judge_config_fails_before_any_call() {
+    let mini = Mini::new();
+    let log = mini.path("mock.log");
+    let mut p = mini.params(MINI_MOCK, vec![]);
+    p.env
+        .push(("NEPHILA_MOCK_LOG".into(), log.to_str().unwrap().into()));
+    p.judge_config = Some(mini.path("juge-absent.toml"));
+    let err = run_pass(&p).err().unwrap();
+    assert!(err.contains("NEPHILA_EVAL_JUDGE_CONFIG"), "{err}");
+    assert!(!log.exists() && !p.out.exists());
+    let got = params_from_env(&|k| match k {
+        "NEPHILA_EVAL_CONFIG" => Some("c.toml".into()),
+        "NEPHILA_EVAL_JUDGE_CONFIG" => Some("j.toml".into()),
+        _ => None,
+    })
+    .unwrap();
+    assert_eq!(got.judge_config, Some(PathBuf::from("j.toml")));
+}
+
+#[test]
+fn req224_ac5_context_holds_id_summary_and_at_most_6000_chars() {
+    let text = "é".repeat(7000);
+    let c = judge_context("type:T", "Un résumé", &text);
+    assert!(c.starts_with("Élément : type:T\nRésumé : Un résumé\nFichier :\n"));
+    let file = c.split_once("Fichier :\n").unwrap().1;
+    assert_eq!(file.chars().count(), 6000);
+    assert!(file.chars().all(|ch| ch == 'é'));
+    let short = judge_context("i", "r", "abc");
+    assert!(short.ends_with("Fichier :\nabc"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Documentation du banc (REQ-225)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn req225_ac1_bench_readme_names_variables_and_report_keys() {
+    let text = fs::read_to_string(eval_dir().join("README.md")).unwrap();
+    for w in [
+        "NEPHILA_EVAL_CONFIG",
+        "NEPHILA_EVAL_OUT",
+        "NEPHILA_EVAL_JUDGE_CONFIG",
+        "eval_passe",
+        "schema",
+        "version",
+        "provider",
+        "model",
+        "prompt_versions",
+        "corpus",
+        "enrich",
+        "ask",
+        "judge",
+    ] {
+        assert!(text.contains(&format!("`{w}`")), "{w}");
+    }
+    let lower = text.to_lowercase();
+    assert!(lower.contains("appels réels") && lower.contains("payant"));
 }
