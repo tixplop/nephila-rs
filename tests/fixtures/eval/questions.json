@@ -1,0 +1,143 @@
+[
+  {
+    "id": "Q01",
+    "question": "Quelle classe enregistre les prêts et les retours de livres ?",
+    "expected": [
+      "org.exemple.mediatheque.service.EmpruntService"
+    ]
+  },
+  {
+    "id": "Q02",
+    "question": "Quelle méthode calcule le montant d'une amende de retard ?",
+    "expected": [
+      "org.exemple.mediatheque.service.AmendeService.calculerMontant"
+    ]
+  },
+  {
+    "id": "Q03",
+    "question": "Quelle méthode est appelée par EmpruntService quand un livre est rendu en retard ?",
+    "expected": [
+      "org.exemple.mediatheque.service.AmendeService.facturerRetard"
+    ]
+  },
+  {
+    "id": "Q04",
+    "question": "Quelle classe représente le prêt d'un livre à un adhérent ?",
+    "expected": [
+      "org.exemple.mediatheque.model.Emprunt"
+    ]
+  },
+  {
+    "id": "Q05",
+    "question": "Quelle méthode indique si un adhérent a atteint son quota d'emprunts ?",
+    "expected": [
+      "org.exemple.mediatheque.model.Adherent.peutEmprunter"
+    ]
+  },
+  {
+    "id": "Q06",
+    "question": "Quelle interface donne accès aux amendes impayées d'un adhérent ?",
+    "expected": [
+      "org.exemple.mediatheque.repository.AmendeRepository"
+    ]
+  },
+  {
+    "id": "Q07",
+    "question": "Quel planificateur envoie les rappels aux adhérents dont un livre est en retard ?",
+    "expected": [
+      "org.exemple.mediatheque.notification.RappelPlanificateur"
+    ]
+  },
+  {
+    "id": "Q08",
+    "question": "Quelle méthode Kotlin cherche les livres d'un auteur ?",
+    "expected": [
+      "org.exemple.mediatheque.recherche.RechercheLivres.parAuteur"
+    ]
+  },
+  {
+    "id": "Q09",
+    "question": "Quelle méthode Scala calcule les livres les plus populaires ?",
+    "expected": [
+      "org.exemple.mediatheque.statistiques.StatistiquesPret.livresPopulaires"
+    ]
+  },
+  {
+    "id": "Q10",
+    "question": "Quelle classe Groovy importe un fichier de livres dans le catalogue ?",
+    "expected": [
+      "org.exemple.mediatheque.outils.ImportCatalogue"
+    ]
+  },
+  {
+    "id": "Q11",
+    "question": "Quelle fonction du client envoie un emprunt au serveur ?",
+    "expected": [
+      "web/client/api.envoyerEmprunt"
+    ]
+  },
+  {
+    "id": "Q12",
+    "question": "Quelle fonction valide le panier d'un adhérent et quelle fonction envoie chaque emprunt ?",
+    "expected": [
+      "web/client/panier.validerPanier",
+      "web/client/api.envoyerEmprunt"
+    ]
+  },
+  {
+    "id": "Q13",
+    "question": "Quelle fonction du client recherche les livres disponibles par titre ?",
+    "expected": [
+      "web/client/recherche.rechercherDisponibles"
+    ]
+  },
+  {
+    "id": "Q14",
+    "question": "Quelle classe TypeScript gère la file des réservations ?",
+    "expected": [
+      "web/client/reservation.GestionReservation"
+    ]
+  },
+  {
+    "id": "Q15",
+    "question": "Quel document présente l'architecture des dépôts et des services ?",
+    "expected": [
+      "docs/architecture.md"
+    ]
+  },
+  {
+    "id": "Q16",
+    "question": "Quel document explique la durée d'un prêt et l'amende par jour de retard ?",
+    "expected": [
+      "docs/guide-emprunt.md"
+    ]
+  },
+  {
+    "id": "Q17",
+    "question": "Quel document décrit l'import des livres par fichier CSV ?",
+    "expected": [
+      "docs/guide-administration.md"
+    ]
+  },
+  {
+    "id": "Q18",
+    "question": "Quelle table enregistre les prêts de livres aux adhérents ?",
+    "expected": [
+      "emprunts"
+    ]
+  },
+  {
+    "id": "Q19",
+    "question": "Quelle table contient les amendes de retard dues par les adhérents ?",
+    "expected": [
+      "amendes"
+    ]
+  },
+  {
+    "id": "Q20",
+    "question": "Quelle vue SQL liste les emprunts en cours, c'est-à-dire pas encore rendus ?",
+    "expected": [
+      "emprunts_en_cours"
+    ]
+  }
+]
