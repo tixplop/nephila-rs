@@ -2413,3 +2413,57 @@ fn req228_ac5_tous_les_appels_conserves_aucun_lot() {
         );
     }
 }
+
+/// `docs/a.md` de 7 sections et d'un titre : 9 nœuds avec le document.
+fn nine_nodes_doc(env: &Env) {
+    let mut s = String::from("# Titre\n\n");
+    for k in 1..=7 {
+        s.push_str(&format!("## Section{k}\n\nTexte de la section {k}.\n\n"));
+    }
+    fs::write(env.repo.join("docs/a.md"), s).unwrap();
+}
+
+/// Nombre de nœuds listés dans le corps d'une requête.
+fn listed_nodes(body: &Value) -> usize {
+    let text = body.to_string();
+    text.split("Contenu :")
+        .next()
+        .unwrap()
+        .matches("\\n- ")
+        .count()
+}
+
+#[test]
+fn req230_ac10_appel_tronque_en_mode_lot_deux_requetes_dans_le_lot_suivant() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &["a"], 0, |b| {
+            if listed_nodes(b) == 9 {
+                Outcome::Truncated("{".into())
+            } else if b.to_string().contains("- document:docs/a.md") {
+                Outcome::Text(single("a"))
+            } else {
+                Outcome::Text(json!({"version": 2, "summaries": [], "concepts": []}).to_string())
+            }
+        });
+        nine_nodes_doc(&fx.env);
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let lots = fx.server.lots();
+        assert_eq!(lots.len(), 2, "{provider}");
+        assert_eq!(lots[0].len(), 1, "{provider}");
+        assert_eq!(lots[1].len(), 2, "{provider}");
+        assert_eq!(listed_nodes(&lots[1][0]), 5, "{provider}");
+        assert_eq!(listed_nodes(&lots[1][1]), 4, "{provider}");
+        assert_eq!(fx.env.to_enrich(), 0, "{provider}");
+        assert_eq!(fx.summary_of("a"), Some(summary_text("a")), "{provider}");
+        assert!(!err(&o).contains("tronquée"), "{provider} : {}", err(&o));
+    }
+    let fx = Fx::new("anthropic", "", &["a"], 0, good);
+    nine_nodes_doc(&fx.env);
+    let d = fx.env.run(&["build", "--dry-run", "--batch"]);
+    assert!(
+        out(&d).contains("estimation minimale : 1 appels, "),
+        "{}",
+        out(&d)
+    );
+}

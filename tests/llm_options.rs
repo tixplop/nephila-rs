@@ -638,7 +638,8 @@ fn REQ058_AC9_openai_finish_reason_length_est_tronquee_une_seule_requete() {
     let body = serde_json::json!({"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"{\"version\": 2, \"summ"}}]}).to_string();
     let h = Http::new("openai", "max_output_tokens = 10\n", vec![body; 6]);
     let o = h.run(&["build"]);
-    assert_eq!(h.bodies().len(), 1, "{}", stderr(&o));
+    // REQ-230 : le document de 2 nœuds est découpé, puis le premier sous-appel tronqué échoue.
+    assert_eq!(h.bodies().len(), 2, "{}", stderr(&o));
     assert_eq!(h.bodies()[0]["max_completion_tokens"], 10);
     let warns: Vec<String> = stderr(&o)
         .lines()

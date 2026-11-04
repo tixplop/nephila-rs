@@ -1,7 +1,7 @@
 //! Phase enrichissement (DEC-019, REQ-024) : résumés et concepts demandés au LLM pour les
 //! fichiers « à enrichir », avec la politique d'échec de DEC-015 / DEC-022.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -221,6 +221,9 @@ pub(crate) enum Unit<'a> {
         requested: Vec<String>,
         /// Liste complète des nœuds du fichier, qui filtre la réponse.
         known: Arc<[String]>,
+        /// Rangs (à partir de 1) des coupes successives qui ont donné ce sous-appel ; vide pour
+        /// un appel du plan (REQ-230).
+        path: Vec<usize>,
     },
 }
 
@@ -239,6 +242,52 @@ impl Unit<'_> {
 /// résumé, soit environ 6 000 jetons, sous la limite par défaut
 /// (`DEFAULT_MAX_OUTPUT_TOKENS`) ; un `max_output_tokens` plus bas configuré peut tronquer la réponse.
 const MAX_NODES_PER_CALL: usize = 150;
+
+/// Profondeur maximale de la découpe d'un appel tronqué (REQ-230, non configurable) : au pire
+/// 4 appels d'affilée.
+const MAX_SPLIT_DEPTH: usize = 3;
+
+/// Découpe un appel tronqué : sa liste de nœuds en deux, les ⌈n/2⌉ premiers puis les autres, sur
+/// le même texte et le même extrait. `None` pour moins de 2 nœuds ou à la profondeur maximale.
+fn split_call<'a>(unit: &Unit<'a>) -> Option<Vec<Unit<'a>>> {
+    let Unit::Call {
+        file,
+        index,
+        count,
+        excerpt,
+        part,
+        requested,
+        known,
+        path,
+    } = unit
+    else {
+        return None;
+    };
+    if requested.len() < 2 || path.len() >= MAX_SPLIT_DEPTH {
+        return None;
+    }
+    let (first, second) = requested.split_at(requested.len().div_ceil(2));
+    Some(
+        [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(i, list)| {
+                let mut path = path.clone();
+                path.push(i + 1);
+                Unit::Call {
+                    file,
+                    index: *index,
+                    count: *count,
+                    excerpt: *excerpt,
+                    part: Arc::clone(part),
+                    requested: list.to_vec(),
+                    known: Arc::clone(known),
+                    path,
+                }
+            })
+            .collect(),
+    )
+}
 
 /// Nombre maximal d'appels d'enrichissement pour un fichier envoyé seul (DEC-059, non
 /// configurable) : 50 appels = 7 500 nœuds d'un seul morceau. Au-delà, aucun appel n'est envoyé.
@@ -1003,6 +1052,7 @@ fn plan_calls<'a>(
             part: Arc::clone(&shared[k]),
             requested,
             known: Arc::clone(&known),
+            path: Vec::new(),
         })
         .collect())
 }
@@ -1028,6 +1078,7 @@ fn split_kept<'a>(
                 part,
                 requested,
                 known,
+                ..
             } => kept
                 .results
                 .get(&kept.key(&file.path, *index, *count, *excerpt, part, requested, known))
@@ -1269,11 +1320,19 @@ enum Msg<'a> {
     Chunk {
         file: &'a FileRecord,
         index: usize,
+        /// Rangs de la découpe du sous-appel (REQ-230) ; vide pour un appel du plan.
+        path: Vec<usize>,
         count: usize,
         result: Result<Enrichment>,
         /// Clé de l'appel réussi d'un plan de 2 appels ou plus (REQ-226) ; calculée dans le fil
         /// d'appel.
         key: Option<String>,
+    },
+    /// Un appel tronqué d'un fichier envoyé seul a été remplacé par `added + 1` sous-appels.
+    Split {
+        file: &'a FileRecord,
+        count: usize,
+        added: usize,
     },
     /// Appels d'un fichier envoyé seul dont la réponse était conservée (rang à partir de 1).
     Kept {
@@ -1285,7 +1344,10 @@ enum Msg<'a> {
 
 /// Résultats rangés par indice des appels d'un fichier envoyé seul, côté fil écrivain.
 struct Partial {
-    results: Vec<Option<Enrichment>>,
+    /// Clé `[rang de l'appel, rangs de découpe…]` : l'ordre des clés est celui de la fusion.
+    results: BTreeMap<Vec<usize>, Enrichment>,
+    /// Résultats attendus : les appels du plan, plus un par sous-appel de plus qu'une coupe ajoute.
+    expected: usize,
     done: usize,
     failed: bool,
 }
@@ -1297,6 +1359,8 @@ struct Shared<'a> {
     failed: HashSet<String>,
     /// Unités qui peuvent encore ajouter des appels à la file (lecture et plan d'un fichier).
     expanding: usize,
+    /// Sous-appels réservés par fichier, pour la borne de `MAX_CALLS_PER_FILE`.
+    split_calls: HashMap<String, usize>,
 }
 
 /// Délai de réveil d'un fil qui attend des appels, pour voir l'arrêt posé hors de la file.
@@ -1459,7 +1523,8 @@ fn partial_of<'p>(
     partials
         .entry(file.path.clone())
         .or_insert_with(|| Partial {
-            results: vec![None; count],
+            results: BTreeMap::new(),
+            expected: count,
             done: 0,
             failed: false,
         })
@@ -1471,18 +1536,17 @@ fn partial_of<'p>(
 fn complete_file(
     entry: &mut Partial,
     file: &FileRecord,
-    count: usize,
     succeeded: &mut usize,
     write_error: &Option<Error>,
     pending: &mut Vec<EnrichmentWrite>,
     notes: &mut Vec<String>,
 ) -> usize {
-    if entry.done != count {
+    if entry.done != entry.expected {
         return 0;
     }
-    let parts: Vec<Enrichment> = entry.results.iter_mut().filter_map(Option::take).collect();
-    // Un seul appel : résultat tel quel, comme avant DEC-063.
-    let merged = if count == 1 {
+    let parts: Vec<Enrichment> = std::mem::take(&mut entry.results).into_values().collect();
+    // Une seule partie : résultat tel quel, comme avant DEC-063.
+    let merged = if parts.len() == 1 {
         parts.into_iter().next().unwrap_or_default()
     } else {
         chunk::merge_enrichments(parts)
@@ -1547,6 +1611,18 @@ fn take_calls(ctx: &Ctx<'_, '_>, n: usize, unsent: usize) -> bool {
     false
 }
 
+/// Réserve `k` sous-appels pour un fichier : refusée si, avec les `count` appels du plan et les
+/// sous-appels déjà réservés, le total dépasse `MAX_CALLS_PER_FILE` (sous le verrou de `Shared`).
+fn reserve_split(shared: &Mutex<Shared<'_>>, path: &str, count: usize, k: usize) -> bool {
+    let mut guard = shared.lock().unwrap_or_else(|p| p.into_inner());
+    let used = guard.split_calls.entry(path.to_string()).or_insert(0);
+    if count + *used + k > MAX_CALLS_PER_FILE {
+        return false;
+    }
+    *used += k;
+    true
+}
+
 /// Corps d'un fil d'enrichissement : prend des unités jusqu'à l'arrêt ou la fin de la file.
 fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
     let take = |n: usize, unsent: usize| take_calls(&ctx, n, unsent);
@@ -1574,7 +1650,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
         };
         let ticket = policy.lock().unwrap_or_else(|p| p.into_inner()).dispatch();
         // Résultat de l'unité : l'erreur de l'appel pour la politique s'il y en a eu un.
-        let (call, message, calls, expanded) = match unit {
+        let (call, message, calls, expanded) = match &unit {
             Unit::Call {
                 file,
                 index,
@@ -1583,21 +1659,48 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 part,
                 requested,
                 known,
+                path,
             } => {
-                let result = run_call(
+                let (file, index, count, excerpt) = (*file, *index, *count, *excerpt);
+                let mut result = run_call(
                     llm,
                     &file.path,
                     index,
                     count,
                     excerpt,
-                    &part,
-                    &requested,
-                    &known,
+                    part,
+                    requested,
+                    known,
                     format_retries,
                     stop,
                     totals,
                     &take,
                 );
+                // Appel tronqué : sa liste de nœuds est coupée et les moitiés passent en tête de
+                // file (REQ-230). Pas de coupe possible, total au-delà de la borne : l'échec
+                // ordinaire (A-5). Réservation refusée par le plafond : comme un essai refusé.
+                if matches!(result, Err(Error::Truncated(_))) {
+                    if let Some(subs) = split_call(&unit) {
+                        if reserve_split(shared, &file.path, count, subs.len()) {
+                            if take(subs.len(), 0) {
+                                let added = subs.len() - 1;
+                                let sent = tx.send(Msg::Split { file, count, added });
+                                expand.armed = false;
+                                finish_unit(shared, wake, subs, false);
+                                if sent.is_err() {
+                                    break;
+                                }
+                                if record_policy(policy, shared, ticket, &None) {
+                                    stop.store(true, Ordering::SeqCst);
+                                    drop(shared.lock().unwrap_or_else(|p| p.into_inner()));
+                                    wake.notify_all();
+                                }
+                                continue;
+                            }
+                            result = Err(Error::Capped);
+                        }
+                    }
+                }
                 // Requête mise de côté (mode lot) : aucune issue, mais le fichier n'est pas en
                 // échec, pour que les autres appels d'un gros fichier soient relevés (AC-214-4).
                 if matches!(result, Err(Error::Deferred)) {
@@ -1627,15 +1730,15 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                         .failed
                         .insert(file.path.clone());
                 }
-                let key = (result.is_ok() && count >= 2).then(|| {
-                    kept.key(&file.path, index, count, excerpt, &part, &requested, &known)
-                });
+                let key = (result.is_ok() && count >= 2 && path.is_empty())
+                    .then(|| kept.key(&file.path, index, count, excerpt, part, requested, known));
                 let result = result.map_err(truncation_advice);
                 (
                     Some(err),
                     Some(Msg::Chunk {
                         file,
                         index,
+                        path: path.clone(),
                         count,
                         result,
                         key,
@@ -1644,7 +1747,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     false,
                 )
             }
-            unit => {
+            _ => {
                 let step = run_unit(
                     &unit,
                     sources,
@@ -1923,6 +2026,7 @@ pub(crate) fn enrich_pass(
         queue: units.into(),
         failed: HashSet::new(),
         expanding: 0,
+        split_calls: HashMap::new(),
     });
     let wake = Condvar::new();
     let policy = Mutex::new(Policy::with_cap(max_calls));
@@ -2013,6 +2117,7 @@ pub(crate) fn enrich_pass(
                     Msg::Chunk {
                         file,
                         index,
+                        path,
                         count,
                         result,
                         key,
@@ -2030,12 +2135,13 @@ pub(crate) fn enrich_pass(
                                     });
                                 }
                                 if !entry.failed {
-                                    entry.results[index - 1] = Some(x);
+                                    let mut rank = vec![index];
+                                    rank.extend(path);
+                                    entry.results.insert(rank, x);
                                     entry.done += 1;
                                     adv = complete_file(
                                         entry,
                                         file,
-                                        count,
                                         &mut succeeded,
                                         &write_error,
                                         &mut pending,
@@ -2058,6 +2164,9 @@ pub(crate) fn enrich_pass(
                             Err(_) => {}
                         }
                     }
+                    Msg::Split { file, count, added } => {
+                        partial_of(&mut partials, file, count).expected += added;
+                    }
                     Msg::Kept {
                         file,
                         count,
@@ -2066,13 +2175,12 @@ pub(crate) fn enrich_pass(
                         let entry = partial_of(&mut partials, file, count);
                         if !entry.failed {
                             for (index, x) in results {
-                                entry.results[index - 1] = Some(x);
+                                entry.results.insert(vec![index], x);
                                 entry.done += 1;
                             }
                             adv = complete_file(
                                 entry,
                                 file,
-                                count,
                                 &mut succeeded,
                                 &write_error,
                                 &mut pending,
@@ -3977,6 +4085,33 @@ mod tests {
         format_retries: u32,
         mode: PassMode,
     ) -> (Store, BuildReport, Vec<(String, Error)>) {
+        probe_run_extra(
+            dir,
+            files,
+            llm,
+            concurrency,
+            batch_files,
+            max_calls,
+            format_retries,
+            mode,
+            &[],
+        )
+    }
+
+    /// Comme `probe_run_mode`, avec des nœuds en plus : `(fichier, nom court)`, déclarés comme
+    /// méthodes `<fichier>.<nom>`.
+    #[allow(clippy::too_many_arguments)]
+    fn probe_run_extra(
+        dir: &tempfile::TempDir,
+        files: &[FileRecord],
+        llm: &dyn Llm,
+        concurrency: usize,
+        batch_files: usize,
+        max_calls: Option<usize>,
+        format_retries: u32,
+        mode: PassMode,
+        extra: &[(&str, &str)],
+    ) -> (Store, BuildReport, Vec<(String, Error)>) {
         let mut store = Store::open_or_create(dir.path()).unwrap();
         store.insert_files(files).unwrap();
         // Les sections que citent les concepts du faux `Llm` sont déclarées par `Big.txt`.
@@ -4006,6 +4141,19 @@ mod tests {
                 .collect();
             if f.path == "Big.txt" {
                 nodes.extend(sections.iter().cloned());
+            }
+            for (file, name) in extra {
+                if *file == f.path {
+                    let qualified = format!("{file}.{name}");
+                    nodes.push(Node::new(
+                        NodeKind::Method,
+                        &qualified,
+                        name,
+                        Some(file),
+                        None,
+                        None,
+                    ));
+                }
             }
             store.replace_structure(&f.path, &nodes, &[]).unwrap();
         }
@@ -4694,6 +4842,7 @@ mod tests {
             .into(),
             failed: HashSet::new(),
             expanding: 0,
+            split_calls: HashMap::new(),
         });
         let wake = Condvar::new();
         let stop = AtomicBool::new(false);
@@ -4717,6 +4866,7 @@ mod tests {
             part: Arc::from("t"),
             requested: Vec::new(),
             known: Arc::from(Vec::<String>::new()),
+            path: Vec::new(),
         };
         let files: &'static [FileRecord] = Box::leak(files.into_boxed_slice());
         let shared = Mutex::new(Shared {
@@ -4728,6 +4878,7 @@ mod tests {
             .into(),
             failed: HashSet::new(),
             expanding: 0,
+            split_calls: HashMap::new(),
         });
         let wake = Condvar::new();
         let stop = AtomicBool::new(false);
@@ -4910,6 +5061,351 @@ mod tests {
         assert_eq!(llm.calls(), ["lot:S0.txt,S1.txt,S2.txt"]);
         assert_eq!((report.capped, report.left_by_cap), (Some(1), 3));
         assert_eq!(left_paths(store).len(), 3);
+    }
+
+    /// Fichier `T.txt` de `lines` morceaux d'un nœud (`method:T.txt.w<i>`), dont le morceau
+    /// `two_at` (à partir de 0) porte aussi le nœud `method:T.txt.zz`.
+    fn split_repo(lines: usize, two_at: usize) -> (tempfile::TempDir, Vec<FileRecord>) {
+        let dir = tempfile::tempdir().unwrap();
+        let text: String = (0..lines)
+            .map(|i| {
+                if i == two_at {
+                    format!("w{i} zz xxxx\n")
+                } else {
+                    format!("w{i} xxxxxxx\n")
+                }
+            })
+            .collect();
+        std::fs::write(dir.path().join("T.txt"), &text).unwrap();
+        let files = vec![rec("T.txt", text.len() as u64)];
+        (dir, files)
+    }
+
+    fn truncated() -> Error {
+        Error::Truncated("réponse tronquée par la limite de jetons".into())
+    }
+
+    /// Tronque une fois l'appel de deux nœuds du plan ; compte les envois.
+    struct TruncOnce {
+        calls: Mutex<Vec<(usize, Vec<String>)>>,
+        done: AtomicBool,
+    }
+
+    impl Llm for TruncOnce {
+        fn enrich(
+            &self,
+            _: &str,
+            call: usize,
+            _: &str,
+            requested: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls.lock().unwrap().push((call, requested.to_vec()));
+            if requested.len() == 2 && !self.done.swap(true, Ordering::SeqCst) {
+                return Err(truncated());
+            }
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req230_ac6_sous_appels_comptes_dans_les_cinquante_appels() {
+        // Plan de 48 appels dont un tronqué une fois : 48 + 2 sous-appels = 50.
+        let (dir, files) = split_repo(48, 0);
+        let llm = TruncOnce {
+            calls: Mutex::new(Vec::new()),
+            done: AtomicBool::new(false),
+        };
+        let (store, report, failures) = probe_run_extra(
+            &dir,
+            &files,
+            &llm,
+            1,
+            1,
+            None,
+            0,
+            PassMode::Normal,
+            &[("T.txt", "zz")],
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert_eq!(llm.calls.lock().unwrap().len(), 50);
+        assert!(store.enriched_hash("T.txt").unwrap().is_some());
+
+        // Plan de 49 appels, même cas : 49 + 2 > 50, aucun sous-appel, échec de troncature.
+        let (dir, files) = split_repo(49, 0);
+        let llm = TruncOnce {
+            calls: Mutex::new(Vec::new()),
+            done: AtomicBool::new(false),
+        };
+        let (store, report, failures) = probe_run_extra(
+            &dir,
+            &files,
+            &llm,
+            1,
+            1,
+            None,
+            0,
+            PassMode::Normal,
+            &[("T.txt", "zz")],
+        );
+        assert!(llm.calls.lock().unwrap().len() <= 49);
+        assert_eq!(report.failed, 1);
+        assert_eq!(names(&failures), ["T.txt"]);
+        assert!(
+            matches!(&failures[0].1, Error::Truncated(m) if m.contains("réduisez max_chunk_chars")),
+            "{failures:?}"
+        );
+        assert_eq!(store.enriched_hash("T.txt").unwrap(), None);
+    }
+
+    /// Faux `Llm` de l'ordre d'arrivée : le morceau 2 (deux nœuds) est tronqué ; en concurrence,
+    /// le second sous-appel répond après le morceau 3 et le premier après le second. Les deux
+    /// sous-appels donnent un résumé au même nœud.
+    struct Reorder {
+        ordered: bool,
+        truncated: AtomicBool,
+        done3: AtomicBool,
+        done_second: AtomicBool,
+    }
+
+    impl Llm for Reorder {
+        fn enrich(
+            &self,
+            _: &str,
+            call: usize,
+            _: &str,
+            requested: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            let spin = |flag: &AtomicBool| {
+                while !flag.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            };
+            let answer = |text: &str| Enrichment {
+                summaries: vec![("method:T.txt.w1".into(), text.into())],
+                ..Enrichment::default()
+            };
+            if call == 3 {
+                self.done3.store(true, Ordering::SeqCst);
+                return Ok(Enrichment::default());
+            }
+            if call != 2 {
+                return Ok(Enrichment::default());
+            }
+            if requested.len() == 2 && !self.truncated.swap(true, Ordering::SeqCst) {
+                return Err(truncated());
+            }
+            if requested == ["method:T.txt.w1"] {
+                if self.ordered {
+                    spin(&self.done_second);
+                }
+                Ok(answer("du premier sous-appel"))
+            } else {
+                if self.ordered {
+                    spin(&self.done3);
+                }
+                self.done_second.store(true, Ordering::SeqCst);
+                Ok(answer("du second sous-appel"))
+            }
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req230_ac9_fusion_dans_l_ordre_du_plan_quel_que_soit_l_ordre_d_arrivee() {
+        let summary = |concurrency: usize| {
+            let (dir, files) = split_repo(3, 1);
+            let llm = Reorder {
+                ordered: concurrency > 1,
+                truncated: AtomicBool::new(false),
+                done3: AtomicBool::new(false),
+                done_second: AtomicBool::new(false),
+            };
+            let (store, report, failures) = probe_run_extra(
+                &dir,
+                &files,
+                &llm,
+                concurrency,
+                1,
+                None,
+                0,
+                PassMode::Normal,
+                &[("T.txt", "zz")],
+            );
+            assert!(failures.is_empty(), "{failures:?}");
+            assert_eq!(report.failed, 0);
+            assert!(store.enriched_hash("T.txt").unwrap().is_some());
+            store
+                .node_by_id("method:T.txt.w1")
+                .unwrap()
+                .and_then(|n| n.summary)
+        };
+        let parallel = summary(3);
+        assert_eq!(parallel.as_deref(), Some("du premier sous-appel"));
+        assert_eq!(parallel, summary(1));
+    }
+
+    /// Fichiers `A`, `B`, `C`, `D` d'un morceau : `C` porte deux nœuds (`w0` et `zz`).
+    struct Scripted {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Llm for Scripted {
+        fn enrich(
+            &self,
+            file: &str,
+            _: usize,
+            _: &str,
+            requested: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{file}:{}", requested.len()));
+            match (file, requested.len()) {
+                ("C", 2) => Err(truncated()),
+                ("D", _) => Ok(Enrichment::default()),
+                _ => Err(net()),
+            }
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req230_ac12_troncature_decoupee_ni_comptee_ni_remise_a_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for f in ["A", "B", "C", "D"] {
+            let text = if f == "C" {
+                "w0 zz xxxx\n"
+            } else {
+                "w0 xxxxxxx\n"
+            };
+            std::fs::write(dir.path().join(f), text).unwrap();
+            files.push(rec(f, text.len() as u64));
+        }
+        let llm = Scripted {
+            calls: Mutex::new(Vec::new()),
+        };
+        let (_store, report, failures) = probe_run_extra(
+            &dir,
+            &files,
+            &llm,
+            1,
+            1,
+            None,
+            0,
+            PassMode::Normal,
+            &[("C", "zz")],
+        );
+        // Deux erreurs réseau, la troncature de C découpée, puis l'erreur réseau de son premier
+        // sous-appel : la troisième arrête l'envoi, D n'est pas envoyé.
+        assert_eq!(*llm.calls.lock().unwrap(), ["A:1", "B:1", "C:2", "C:1"]);
+        assert_eq!(names(&failures), ["A", "B", "C"]);
+        assert!(failures.iter().all(|(_, e)| matches!(e, Error::Network(_))));
+        assert!(report
+            .stop_cause
+            .as_deref()
+            .is_some_and(|c| c.contains("panne réseau répétée")));
+    }
+
+    #[test]
+    fn req230_ac10_passe_de_collecte_seule_n_ecrit_rien() {
+        let (dir, files) = split_repo(1, 0);
+        let llm = TruncOnce {
+            calls: Mutex::new(Vec::new()),
+            done: AtomicBool::new(false),
+        };
+        let (store, report, failures) = probe_run_extra(
+            &dir,
+            &files,
+            &llm,
+            1,
+            1,
+            None,
+            0,
+            PassMode::Collect,
+            &[("T.txt", "zz")],
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert_eq!(llm.calls.lock().unwrap().len(), 3, "appel et 2 sous-appels");
+        assert_eq!(store.enriched_hash("T.txt").unwrap(), None);
+        assert!(store.call_results().unwrap().is_empty());
+    }
+
+    fn call_of(requested: &[&str], path: &[usize]) -> Unit<'static> {
+        let file: &'static FileRecord = Box::leak(Box::new(rec("A.java", 1)));
+        Unit::Call {
+            file,
+            index: 2,
+            count: 3,
+            excerpt: Some(Excerpt {
+                rank: 2,
+                total: 3,
+                first_line: 4,
+                last_line: 9,
+            }),
+            part: Arc::from("texte"),
+            requested: requested.iter().map(|s| s.to_string()).collect(),
+            known: Arc::from(vec!["x".to_string()]),
+            path: path.to_vec(),
+        }
+    }
+
+    #[test]
+    fn req230_split_call_coupe_la_liste_en_deux_sans_perte() {
+        let ids = ["a", "b", "c", "d", "e"];
+        let subs = split_call(&call_of(&ids, &[2])).unwrap();
+        let lists: Vec<(Vec<String>, Vec<usize>)> = subs
+            .iter()
+            .map(|u| match u {
+                Unit::Call {
+                    requested,
+                    path,
+                    index,
+                    count,
+                    part,
+                    excerpt,
+                    ..
+                } => {
+                    assert_eq!((*index, *count, &**part), (2, 3, "texte"));
+                    assert_eq!(excerpt.unwrap().first_line, 4);
+                    (requested.clone(), path.clone())
+                }
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            lists,
+            [
+                (vec!["a".into(), "b".into(), "c".into()], vec![2, 1]),
+                (vec!["d".into(), "e".into()], vec![2, 2]),
+            ]
+        );
+        assert!(split_call(&call_of(&["a"], &[])).is_none());
+        assert!(split_call(&call_of(&[], &[])).is_none());
+        assert!(split_call(&call_of(&ids, &[1, 1, 1])).is_none());
+        assert!(split_call(&call_of(&ids, &[1, 1])).is_some());
     }
 }
 

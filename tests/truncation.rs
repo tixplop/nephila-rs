@@ -435,20 +435,16 @@ fn req046_ac5_gros_fichier_morceau_2_tronque() {
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(w.posts().len(), 3, "{}", err(&o));
 
-    let s = Setup::new(
-        "openai",
-        vec![
-            openai_reply(ok, Some("stop")),
-            trunc("openai"),
-            openai_reply(ok, Some("stop")),
-        ],
-        &cfg,
-    );
+    // Le serveur tronque tout à partir du morceau 2 (REQ-230) : le morceau 2 et ses 3 sous-appels
+    // en chaîne, puis l'échec.
+    let mut replies = vec![openai_reply(ok, Some("stop"))];
+    replies.extend(vec![trunc("openai"); 6]);
+    let s = Setup::new("openai", replies, &cfg);
     s.write("A.java", &text);
     let o = s.run(&["build"]);
     assert!(!o.status.success());
     let posts = s.posts();
-    assert_eq!(posts.len(), 2, "{}", err(&o));
+    assert_eq!(posts.len(), 5, "{}", err(&o));
     // Le témoin montre un appel par morceau : la requête 2 porte le morceau 2 (REQ-169).
     let n = nephila::chunk::split(&text, text.len() / 3 + 40).len();
     assert_eq!(n, 3);
@@ -688,8 +684,8 @@ fn req046_ac12_gros_fichier_traces_par_morceau() {
     let ok = r#"{"version": 2, "summaries": [], "concepts": []}"#;
     let reply = |k: usize| -> Vec<String> {
         let mut v = Vec::new();
-        for i in 1..=3 {
-            v.push(if i == k {
+        for i in 1..=8 {
+            v.push(if i >= k {
                 trunc("openai")
             } else {
                 openai_reply(ok, Some("stop"))
@@ -702,7 +698,8 @@ fn req046_ac12_gros_fichier_traces_par_morceau() {
     let o = s.run(&["build", "--verbose"]);
     let e = err(&o);
     let lines = llm_enrich_for(&e, "A.java");
-    assert_eq!(lines.len(), 4, "{e}");
+    // Les lignes des sous-appels suivent ; T-319 les fixe : ici les 4 premières seulement.
+    assert!(lines.len() >= 4, "{e}");
     assert!(lines[0].contains("départ A.java [1/3]"), "{}", lines[0]);
     assert!(lines[1].contains("fin A.java [1/3] ok ("), "{}", lines[1]);
     assert!(lines[2].contains("départ A.java [2/3]"), "{}", lines[2]);
@@ -971,4 +968,357 @@ fn req096_ac5_progression_enrichissement_complet() {
             .any(|l| l == "progression: enrichissement 100 % (4/4 fichiers)"),
         "{e}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// REQ-230 : un appel tronqué d'un fichier envoyé seul est découpé (liste de nœuds).
+
+/// Corps de la requête de l'utilisateur (texte du message), quel que soit le fournisseur.
+fn user_text(body: &str) -> String {
+    fn find(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::String(s) if s.contains("Nœuds du fichier") => Some(s.clone()),
+            serde_json::Value::Array(a) => a.iter().find_map(find),
+            serde_json::Value::Object(o) => o.values().find_map(find),
+            _ => None,
+        }
+    }
+    find(&serde_json::from_str(body).unwrap()).expect("message utilisateur")
+}
+
+/// Identifiants de la liste « Nœuds du fichier » d'une requête.
+fn listed(body: &str) -> Vec<String> {
+    user_text(body)
+        .split("Contenu :")
+        .next()
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.strip_prefix("- "))
+        .map(String::from)
+        .collect()
+}
+
+/// Partie « Contenu » d'une requête.
+fn content_of(body: &str) -> String {
+    let t = user_text(body);
+    t.split_once("Contenu :").unwrap().1.to_string()
+}
+
+fn ok_for(provider: &str, summaries: &[(&str, &str)]) -> String {
+    let list: Vec<serde_json::Value> = summaries
+        .iter()
+        .map(|(n, t)| serde_json::json!({"node": n, "summary": t}))
+        .collect();
+    let text = serde_json::json!({"version": 2, "summaries": list, "concepts": []}).to_string();
+    match provider {
+        "anthropic" => anthropic_reply(&text, Some("end_turn")),
+        _ => openai_reply(&text, Some("stop")),
+    }
+}
+
+/// `A.java` de 8 méthodes : 9 nœuds avec le type.
+fn nine_nodes() -> String {
+    let mut t = String::from("public class A {\n");
+    for i in 0..8 {
+        t.push_str(&format!("    void m{i}() {{}}\n"));
+    }
+    t.push_str("}\n");
+    t
+}
+
+const FIRST5: [&str; 5] = [
+    "method:A.m0",
+    "method:A.m1",
+    "method:A.m2",
+    "method:A.m3",
+    "method:A.m4",
+];
+const LAST4: [&str; 4] = ["method:A.m5", "method:A.m6", "method:A.m7", "type:A"];
+
+#[test]
+fn req230_ac1_liste_coupee_en_deux_sous_appels() {
+    for p in ["anthropic", "openai"] {
+        let s = Setup::new(
+            p,
+            vec![
+                trunc(p),
+                ok_for(
+                    p,
+                    &[("method:A.m0", "Premier."), ("method:A.m4", "Cinquième.")],
+                ),
+                ok_for(
+                    p,
+                    &[
+                        ("method:A.m5", "Sixième."),
+                        ("type:A", "Classe A centrale."),
+                    ],
+                ),
+            ],
+            "",
+        );
+        s.write("A.java", &nine_nodes());
+        let o = s.run(&["build"]);
+        let posts = s.posts();
+        assert_eq!(posts.len(), 3, "{p} {}", err(&o));
+        assert_eq!(listed(&posts[1]), FIRST5, "{p}");
+        assert_eq!(listed(&posts[2]), LAST4, "{p}");
+        assert_eq!(listed(&posts[0]).len(), 9, "{p}");
+        assert_eq!(content_of(&posts[1]), content_of(&posts[0]), "{p}");
+        assert_eq!(content_of(&posts[2]), content_of(&posts[0]), "{p}");
+        assert_eq!(
+            s.summary_of("method:A.m0").as_deref(),
+            Some("Premier."),
+            "{p}"
+        );
+        assert_eq!(
+            s.summary_of("method:A.m4").as_deref(),
+            Some("Cinquième."),
+            "{p}"
+        );
+        assert_eq!(
+            s.summary_of("method:A.m5").as_deref(),
+            Some("Sixième."),
+            "{p}"
+        );
+        assert_eq!(
+            s.summary_of("type:A").as_deref(),
+            Some("Classe A centrale."),
+            "{p} {}",
+            err(&o)
+        );
+        assert!(o.status.success(), "{p} {}", err(&o));
+        assert!(!err(&o).contains("avertissement:"), "{p} {}", err(&o));
+        assert!(
+            out(&o).trim_end().ends_with("0 fichiers à enrichir"),
+            "{p} {}",
+            out(&o)
+        );
+    }
+}
+
+/// Config, résumés du morceau 2 (premier et dernier nœud de sa liste triée) du gros fichier.
+fn ac2_setup() -> (String, String, [(String, String); 2]) {
+    let text = big_text();
+    let max = text.len() / 3 + 40;
+    let chunks = nephila::chunk::split(&text, max);
+    assert_eq!(chunks.len(), 3);
+    let mut ids: Vec<String> = chunks[1]
+        .split("void m")
+        .skip(1)
+        .map(|r| format!("method:A.m{}", r.split('(').next().unwrap()))
+        .collect();
+    ids.sort();
+    let first = (ids[0].clone(), "Résumé du premier nœud.".to_string());
+    let last = (
+        ids[ids.len() - 1].clone(),
+        "Résumé du dernier nœud.".to_string(),
+    );
+    (text, format!("max_chunk_chars = {max}\n"), [first, last])
+}
+
+fn ac2_replies(sub_calls: bool, sums: &[(String, String); 2]) -> Vec<String> {
+    let p = "openai";
+    let none = || ok_for(p, &[]);
+    let one = |x: &(String, String)| ok_for(p, &[(x.0.as_str(), x.1.as_str())]);
+    if sub_calls {
+        vec![none(), trunc(p), one(&sums[0]), one(&sums[1]), none()]
+    } else {
+        let both = ok_for(
+            p,
+            &[
+                (sums[0].0.as_str(), sums[0].1.as_str()),
+                (sums[1].0.as_str(), sums[1].1.as_str()),
+            ],
+        );
+        vec![none(), both, none()]
+    }
+}
+
+#[test]
+fn req230_ac2_gros_fichier_morceau_2_tronque_ses_deux_sous_appels() {
+    let (text, cfg, sums) = ac2_setup();
+    let run = |sub_calls: bool| {
+        let s = Setup::new("openai", ac2_replies(sub_calls, &sums), &cfg);
+        s.write("A.java", &text);
+        let o = s.run(&["build"]);
+        assert!(o.status.success(), "{}", err(&o));
+        assert_eq!(s.to_enrich(), 0);
+        s
+    };
+    let s = run(true);
+    let posts = s.posts();
+    assert_eq!(posts.len(), 5);
+    let tag = |b: &str| {
+        let t = user_text(b);
+        t.split("(extrait ")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        posts.iter().map(|b| tag(b)).collect::<Vec<_>>(),
+        ["1/3", "2/3", "2/3", "2/3", "3/3"]
+    );
+    let (a, b) = (listed(&posts[2]), listed(&posts[3]));
+    let parent = listed(&posts[1]);
+    assert_eq!([a.clone(), b.clone()].concat(), parent);
+    assert_eq!(a.len(), parent.len().div_ceil(2));
+    // Témoin : même fichier, le morceau 2 répond en une fois avec les mêmes résumés.
+    let w = run(false);
+    assert_eq!(w.posts().len(), 3);
+    let graph = |s: &Setup| -> Vec<(String, Option<String>)> {
+        let mut v: Vec<_> = nephila::store::Store::open_readonly(&s.repo)
+            .unwrap()
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.id, n.summary))
+            .collect();
+        v.sort();
+        v
+    };
+    for (id, text) in &sums {
+        assert_eq!(s.summary_of(id).as_deref(), Some(text.as_str()), "{id}");
+    }
+    assert_eq!(graph(&s), graph(&w));
+}
+
+#[test]
+fn req230_ac9_progression_une_seule_fois_malgre_la_decoupe() {
+    let (text, cfg, sums) = ac2_setup();
+    let s = Setup::new("openai", ac2_replies(true, &sums), &cfg);
+    s.write("A.java", &text);
+    let o = s.run(&["build", "--show-progress"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let e = err(&o);
+    let lines: Vec<&str> = e
+        .lines()
+        .filter(|l| l.starts_with("progression: enrichissement"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "progression: enrichissement 0 % (0/1 fichiers)",
+            "progression: enrichissement 100 % (1/1 fichiers)"
+        ],
+        "{e}"
+    );
+}
+
+#[test]
+fn req230_ac5_tout_tronque_quatre_requetes_une_seule_ligne_a5() {
+    let p = "openai";
+    let mut t = String::from("public class A {\n");
+    for i in 0..15 {
+        t.push_str(&format!("    void m{i}() {{}}\n"));
+    }
+    t.push_str("}\n");
+    let s = Setup::new(p, many(p, 10), "");
+    s.write("A.java", &t);
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    let posts = s.posts();
+    assert_eq!(posts.len(), 4, "{}", err(&o));
+    let sizes: Vec<usize> = posts.iter().map(|b| listed(b).len()).collect();
+    assert_eq!(sizes, [16, 8, 4, 2]);
+    assert_eq!(err(&o).matches("avertissement:").count(), 1, "{}", err(&o));
+    assert!(err(&o).contains(&a5("A.java")), "{}", err(&o));
+    assert!(out(&o).contains("1 fichiers à enrichir"), "{}", out(&o));
+    assert_eq!(s.to_enrich(), 1);
+    let o = s.run(&["update"]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 8, "{}", err(&o));
+    assert_eq!(err(&o).matches("avertissement:").count(), 1, "{}", err(&o));
+    assert!(err(&o).contains(&a5("A.java")), "{}", err(&o));
+}
+
+#[test]
+fn req230_ac5_un_noeud_sans_coupe_une_seule_requete() {
+    // Un nœud, texte sous 1 000 caractères : pas de coupe possible (T-318 ajoute le texte).
+    let s = Setup::new("openai", many("openai", 3), "");
+    s.write("A.java", A_JAVA);
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 1, "{}", err(&o));
+    assert!(err(&o).contains(&a5("A.java")), "{}", err(&o));
+}
+
+fn kept_calls(s: &Setup) -> usize {
+    nephila::store::Store::open_readonly(&s.repo)
+        .unwrap()
+        .call_results()
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn req230_ac7_max_calls_compte_les_sous_appels() {
+    let p = "openai";
+    let ok = || ok_for(p, &[("method:A.m0", "Premier résumé utile.")]);
+    // 3 appels permis : l'appel tronqué et ses 2 sous-appels.
+    let s = Setup::new(p, vec![trunc(p), ok(), ok()], "");
+    s.write("A.java", &nine_nodes());
+    let o = s.run(&["build", "--max-calls", "3"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(s.posts().len(), 3, "{}", err(&o));
+    assert_eq!(s.to_enrich(), 0);
+    assert!(!err(&o).contains("plafond"), "{}", err(&o));
+    assert!(!err(&o).contains("avertissement:"), "{}", err(&o));
+
+    // 2 appels permis : la réservation des 2 sous-appels est refusée, le fichier est laissé.
+    let s = Setup::new(p, vec![trunc(p), ok(), ok()], "");
+    s.write("A.java", &nine_nodes());
+    let o = s.run(&["build", "--max-calls", "2", "--verbose"]);
+    let e = err(&o);
+    assert!(o.status.success(), "{e}");
+    assert_eq!(s.posts().len(), 1, "{e}");
+    assert!(!e.contains(&a5("A.java")), "{e}");
+    assert!(
+        e.contains("avertissement: plafond de 2 appels atteint : 1 fichiers laissés à enrichir"),
+        "{e}"
+    );
+    assert_eq!(
+        e.matches("politique: arrêt de l'envoi (plafond").count(),
+        1,
+        "{e}"
+    );
+    assert_eq!(s.to_enrich(), 1);
+}
+
+#[test]
+fn req230_ac8_sous_appel_en_echec_ne_garde_pas_les_appels_du_sous_plan() {
+    let p = "openai";
+    let text = big_text();
+    let cfg = format!(
+        "max_chunk_chars = {}\nformat_retries = 0\n",
+        text.len() / 2 + 40
+    );
+    let good = || ok_for(p, &[]);
+    let bad = || openai_reply("pas du JSON", Some("stop"));
+    // Plan de 2 appels : appel 1 conforme, appel 2 tronqué, sous-appel 1 conforme, sous-appel 2 non conforme.
+    let s = Setup::new(p, vec![good(), trunc(p), good(), bad(), good()], &cfg);
+    s.write("A.java", &text);
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 4, "{}", err(&o));
+    assert_eq!(err(&o).matches("avertissement:").count(), 1, "{}", err(&o));
+    assert!(err(&o).contains("non conforme"), "{}", err(&o));
+    assert_eq!(kept_calls(&s), 1, "seul l'appel 1 est conservé");
+    // `update` : l'appel 2 répond en entier, l'appel 1 est relu de la table.
+    let o = s.run(&["update"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(s.posts().len(), 5, "{}", err(&o));
+    assert_eq!(s.to_enrich(), 0);
+    assert_eq!(kept_calls(&s), 0);
+
+    // Plan d'un seul appel : même échec, table vide.
+    let s = Setup::new(p, vec![trunc(p), good(), bad()], "format_retries = 0\n");
+    s.write("A.java", &nine_nodes());
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 3, "{}", err(&o));
+    assert_eq!(kept_calls(&s), 0);
 }
