@@ -113,3 +113,12 @@ CREATE TABLE node_communities (
     node      TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
     community INTEGER NOT NULL
 ) WITHOUT ROWID;
+
+-- Résultats validés des appels des fichiers envoyés seuls en plusieurs appels, gardés tant que le
+-- fichier n'est pas enrichi (DEC-173). `call_key` : empreinte de la requête (REQ-226).
+CREATE TABLE enrich_calls (
+    path     TEXT NOT NULL,
+    call_key TEXT NOT NULL,
+    payload  TEXT NOT NULL,
+    PRIMARY KEY (path, call_key)
+) WITHOUT ROWID;

@@ -528,7 +528,7 @@ fn req115_ac3_texte_exact_et_place() {
 }
 
 /// Vérifie le motif de AC-115-3 (pas de dépendance de test nouvelle) :
-/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 10 en [0-9]+ ms$`.
+/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 11 en [0-9]+ ms$`.
 fn is_migration_trace_7(line: &str) -> bool {
     {
         let Some(rest) = line.strip_prefix("trace: [") else {
@@ -619,7 +619,7 @@ fn req147_ac4_update_migrates_schema8_to_current_and_traces_it() {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 8 vers 10 en ")),
+            .any(|l| l.starts_with("schéma: migration 8 vers 11 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -633,7 +633,7 @@ fn req147_ac4_update_migrates_schema8_to_current_and_traces_it() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v, "10");
+    assert_eq!(v, "11");
 }
 
 #[test]
@@ -646,7 +646,7 @@ fn req147_ac4_schema7_reaches_the_same_result_as_schema8() {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 7 vers 10 en ")),
+            .any(|l| l.starts_with("schéma: migration 7 vers 11 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -711,7 +711,7 @@ fn assert_ac173_4_chain(env: &Env, from: i32) {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with(&format!("schéma: migration {from} vers 10 en "))),
+            .any(|l| l.starts_with(&format!("schéma: migration {from} vers 11 en "))),
         "{}",
         text(&o.stderr)
     );
@@ -745,4 +745,78 @@ fn req173_ac4_update_migrates_schema9_to_10_and_keeps_entries() {
 fn req173_ac4_update_migrates_schema8_to_10_keeping_entries() {
     let (env, _) = enriched_at(8);
     assert_ac173_4_chain(&env, 8);
+}
+
+// ---- REQ-226 : schéma 11, table des appels conservés (DEC-173) ----
+
+fn files_rows(env: &Env) -> Vec<Vec<String>> {
+    table_rows(
+        env,
+        "SELECT path, hash, size, state FROM files ORDER BY path",
+        4,
+    )
+}
+
+#[test]
+fn req226_ac7_schema10_is_read_unchanged_then_migrated_by_update() {
+    let env = Env::new();
+    env.build_enriched();
+    schema6::schema7::schema8::schema9::schema10::downgrade_to_10(&env.db());
+    assert_eq!(env.user_version(), 10);
+    for args in [
+        &["status"][..],
+        &["summary"][..],
+        &["export", "--format", "json", "--output", "-"][..],
+    ] {
+        env.ok(args);
+        assert_eq!(env.user_version(), 10, "{args:?}");
+    }
+    let enrichments = env.enrichments();
+    let files = files_rows(&env);
+    let resolution_before = resolution(&env);
+
+    let o = env.ok(&["update", "--no-llm", "--verbose"]);
+    assert_eq!(env.user_version(), SCHEMA_VERSION);
+    assert_eq!(SCHEMA_VERSION, 11);
+    let migration: Vec<_> = trace_lines(&o.stderr)
+        .into_iter()
+        .filter(|l| l.starts_with("schéma: migration"))
+        .collect();
+    assert_eq!(migration.len(), 1, "{migration:?}");
+    assert!(
+        migration[0].starts_with("schéma: migration 10 vers 11 en ")
+            && migration[0].ends_with(" ms"),
+        "{migration:?}"
+    );
+    assert_eq!(env.enrichments(), enrichments);
+    assert_eq!(files_rows(&env), files);
+    assert_eq!(resolution(&env), resolution_before);
+
+    let fresh = Env::new();
+    fresh.ok(&["build", "--no-llm"]);
+    assert_eq!(master(&env), master(&fresh));
+}
+
+#[test]
+fn req226_ac7_older_schemas_reach_schema_11() {
+    for from in [5, 6, 7, 8] {
+        let env = built_at(from);
+        let o = env.ok(&["update", "--no-llm", "--verbose"]);
+        assert_eq!(env.user_version(), 11, "schéma {from}");
+        assert!(
+            trace_lines(&o.stderr)
+                .iter()
+                .any(|l| l.starts_with(&format!("schéma: migration {from} vers 11 en "))),
+            "{}",
+            text(&o.stderr)
+        );
+        let tables = master(&env);
+        assert!(
+            tables.iter().any(|t| t.1 == "enrich_calls"),
+            "schéma {from}"
+        );
+    }
+    let (env, _) = enriched_at(9);
+    env.ok(&["update", "--no-llm"]);
+    assert_eq!(env.user_version(), 11);
 }

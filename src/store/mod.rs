@@ -1,13 +1,14 @@
 //! Stockage SQLite du graphe dans `<dépôt>/.nephila/graph.db` (DEC-009, DEC-010).
 
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::filter::EnrichScope;
-use crate::llm::enrich::PromptVersions;
+use crate::llm::enrich::{Concept, Enrichment, PromptVersions};
 
 use crate::error::{Error, Result};
 
@@ -28,7 +29,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -50,6 +51,12 @@ const SCHEMA_WITHOUT_COMMUNITIES: i32 = 8;
 
 /// Dernier schéma sans `enrichments.language`, migré sur place (DEC-138).
 const SCHEMA_WITHOUT_ENRICH_LANGUAGE: i32 = 9;
+
+/// Déclaration de `enrich_calls`, identique au caractère près à celle de `schema.sql` (DEC-173).
+const ENRICH_CALLS_DDL: &str = "CREATE TABLE enrich_calls (\n    path     TEXT NOT NULL,\n    call_key TEXT NOT NULL,\n    payload  TEXT NOT NULL,\n    PRIMARY KEY (path, call_key)\n) WITHOUT ROWID;";
+
+/// Dernier schéma sans la table `enrich_calls`, migré sur place (DEC-173).
+const SCHEMA_WITHOUT_ENRICH_CALLS: i32 = 10;
 
 /// Valeurs de `meta.resolution` (DEC-076) : le graphe est-il le résultat d'une passe terminée ?
 const RESOLUTION_DONE: &str = "à jour";
@@ -611,7 +618,8 @@ impl Store {
             | SCHEMA_WITH_REF_CONTEXT
             | SCHEMA_WITH_FILE_CONTEXTS
             | SCHEMA_WITHOUT_COMMUNITIES
-            | SCHEMA_WITHOUT_ENRICH_LANGUAGE => store.migrate_to_current()?,
+            | SCHEMA_WITHOUT_ENRICH_LANGUAGE
+            | SCHEMA_WITHOUT_ENRICH_CALLS => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -647,7 +655,8 @@ impl Store {
             | SCHEMA_WITH_REF_CONTEXT
             | SCHEMA_WITH_FILE_CONTEXTS
             | SCHEMA_WITHOUT_COMMUNITIES
-            | SCHEMA_WITHOUT_ENRICH_LANGUAGE => {
+            | SCHEMA_WITHOUT_ENRICH_LANGUAGE
+            | SCHEMA_WITHOUT_ENRICH_CALLS => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
                 Ok(store)
@@ -700,7 +709,8 @@ impl Store {
                 || v == SCHEMA_WITH_REF_CONTEXT
                 || v == SCHEMA_WITH_FILE_CONTEXTS
                 || v == SCHEMA_WITHOUT_COMMUNITIES
-                || v == SCHEMA_WITHOUT_ENRICH_LANGUAGE =>
+                || v == SCHEMA_WITHOUT_ENRICH_LANGUAGE
+                || v == SCHEMA_WITHOUT_ENRICH_CALLS =>
             {
                 store.version = v
             }
@@ -715,13 +725,13 @@ impl Store {
         self.read_only && !self.conn.is_autocommit()
     }
 
-    /// Version du schéma du graphe ouvert (5 à 9 en lecture seule seulement : DEC-066, DEC-073,
+    /// Version du schéma du graphe ouvert (5 à 10 en lecture seule seulement : DEC-066, DEC-073,
     /// DEC-076).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
-    /// Migre un schéma 5 à 9 en schéma 10 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, puis 9 -> 10,
+    /// Migre un schéma 5 à 10 en schéma 11 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, puis 10 -> 11,
     /// chacune en une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         let from = self.user_version()?;
@@ -733,6 +743,7 @@ impl Store {
         self.migrate_7_to_8()?;
         self.migrate_8_to_9()?;
         self.migrate_9_to_10()?;
+        self.migrate_10_to_11()?;
         // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
         crate::trace!(
             "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
@@ -786,6 +797,28 @@ impl Store {
         }
         tx.execute_batch(&format!(
             "ALTER TABLE enrichments ADD COLUMN language TEXT NOT NULL DEFAULT '';
+             UPDATE meta SET value = '{SCHEMA_WITHOUT_ENRICH_CALLS}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITHOUT_ENRICH_CALLS};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
+    }
+
+    /// Migre un schéma 10 en schéma 11 en une transaction `IMMEDIATE` (DEC-173) : table
+    /// `enrich_calls` (sans `IF NOT EXISTS` : un objet en conflit annule la migration), versions.
+    /// Aucun marqueur `à résoudre` : le graphe n'a pas changé.
+    fn migrate_10_to_11(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_ENRICH_CALLS {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "{ENRICH_CALLS_DDL}
              UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
@@ -1209,13 +1242,32 @@ impl Store {
         language: &str,
         items: &[EnrichmentWrite],
     ) -> Result<()> {
+        self.apply_group(model, language, &[], items)
+    }
+
+    /// Écrit en une seule transaction les résultats d'appels conservés (`calls`, avant les
+    /// fichiers) puis les fichiers complets (`items`), tout ou rien (REQ-226, DEC-173). Sans
+    /// fichier complet, le graphe n'a pas changé : le marqueur `à résoudre` n'est pas posé.
+    /// Rien n'est ouvert si les deux listes sont vides.
+    pub fn apply_group(
+        &mut self,
+        model: &str,
+        language: &str,
+        calls: &[CallWrite],
+        items: &[EnrichmentWrite],
+    ) -> Result<()> {
         self.ensure_writable()?;
         self.end_fresh();
-        if items.is_empty() {
+        if calls.is_empty() && items.is_empty() {
             return Ok(());
         }
         let tx = self.conn.transaction().map_err(db_err)?;
-        mark_stale_tx(self.stale, &tx)?;
+        if !items.is_empty() {
+            mark_stale_tx(self.stale, &tx)?;
+        }
+        for call in calls {
+            write_call(&tx, call)?;
+        }
         let track = self.log.is_some();
         let mut pending = ChangeLog::default();
         for item in items {
@@ -1230,8 +1282,37 @@ impl Store {
         }
         commit_counted(tx)?;
         self.merge_log(pending);
-        self.stale = true;
+        if !items.is_empty() {
+            self.stale = true;
+        }
         Ok(())
+    }
+
+    /// Versions des prompts utilisées pour les clés et les entrées d'enrichissement.
+    pub fn prompt_versions(&self) -> PromptVersions {
+        self.prompt_versions
+    }
+
+    /// Résultats d'appels conservés, indexés par clé. Une ligne illisible ou d'un autre format
+    /// que `v` = 1 est ignorée, sans erreur ni trace : l'appel sera simplement renvoyé.
+    pub fn call_results(&self) -> Result<HashMap<String, Enrichment>> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT call_key, payload FROM enrich_calls")
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (key, json) = row.map_err(db_err)?;
+            if let Ok(p) = serde_json::from_str::<CallPayload>(&json) {
+                if p.v == CALL_PAYLOAD_VERSION {
+                    out.insert(key, p.into_enrichment());
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Fichiers indexés à enrichir : dans la portée de l'enrichissement (documents, plus les
@@ -1272,7 +1353,7 @@ impl Store {
     ) -> Result<Vec<FileRecord>> {
         let scope = scope.compile()?;
         // Un graphe lu en schéma 5 à 9 n'a pas la colonne : condition d'avant, sans la langue.
-        let with_language = self.version >= SCHEMA_VERSION;
+        let with_language = self.version >= SCHEMA_WITHOUT_ENRICH_CALLS;
         let all = no_model_is_all && model.is_none();
         let language_cond = if with_language {
             " AND (?2 IS NULL OR e.language = ?2)"
@@ -1542,6 +1623,13 @@ impl Store {
     pub fn prune_enrichments(&mut self) -> Result<usize> {
         self.ensure_writable()?;
         self.end_fresh();
+        // Les appels conservés d'un chemin disparu sont purgés sans être comptés (REQ-226).
+        self.conn
+            .execute(
+                "DELETE FROM enrich_calls WHERE path NOT IN (SELECT path FROM files)",
+                [],
+            )
+            .map_err(db_err)?;
         self.conn
             .prepare_cached(
                 "DELETE FROM enrichments WHERE NOT EXISTS
@@ -2966,6 +3054,120 @@ pub struct EnrichmentWrite {
     pub refs: Vec<Ref>,
 }
 
+/// Résultat validé d'un appel d'un fichier envoyé seul, à conserver (REQ-226).
+#[derive(Debug, Clone)]
+pub struct CallWrite {
+    pub path: String,
+    pub key: String,
+    pub result: Enrichment,
+}
+
+/// Numéro de format de la charge utile d'un appel conservé.
+const CALL_PAYLOAD_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct CallConcept {
+    name: String,
+    summary: Option<String>,
+    sections: Vec<String>,
+}
+
+/// Charge utile d'une ligne de `enrich_calls` : `{"v":1,"summaries":…,"concepts":…,"rejected":…}`.
+#[derive(Serialize, Deserialize)]
+struct CallPayload {
+    v: u32,
+    summaries: Vec<(String, String)>,
+    concepts: Vec<CallConcept>,
+    rejected: Vec<String>,
+}
+
+impl CallPayload {
+    fn of(e: &Enrichment) -> CallPayload {
+        CallPayload {
+            v: CALL_PAYLOAD_VERSION,
+            summaries: e.summaries.clone(),
+            concepts: e
+                .concepts
+                .iter()
+                .map(|c| CallConcept {
+                    name: c.name.clone(),
+                    summary: c.summary.clone(),
+                    sections: c.sections.clone(),
+                })
+                .collect(),
+            rejected: e.rejected.clone(),
+        }
+    }
+
+    fn into_enrichment(self) -> Enrichment {
+        Enrichment {
+            summaries: self.summaries,
+            concepts: self
+                .concepts
+                .into_iter()
+                .map(|c| Concept {
+                    name: c.name,
+                    summary: c.summary,
+                    sections: c.sections,
+                })
+                .collect(),
+            rejected: self.rejected,
+        }
+    }
+}
+
+/// Ce qui fait la requête d'un appel et son filtrage : la clé d'un appel conservé en est
+/// l'empreinte (REQ-226).
+#[derive(Debug, Clone, Copy)]
+pub struct CallKeyParts<'a> {
+    pub model: &'a str,
+    pub language: &'a str,
+    /// Version du prompt de la famille du chemin.
+    pub prompt_version: u32,
+    pub path: &'a str,
+    /// Rang de l'appel (à partir de 1) sur `total`.
+    pub rank: usize,
+    pub total: usize,
+    /// Première et dernière ligne de l'extrait ; `None` sans extrait.
+    pub lines: Option<(usize, usize)>,
+    pub text: &'a str,
+    pub requested: &'a [String],
+    pub known: &'a [String],
+}
+
+/// BLAKE3 hexadécimal du tableau JSON des éléments de `CallKeyParts` (REQ-226).
+pub fn call_key(p: &CallKeyParts<'_>) -> String {
+    let json = serde_json::json!([
+        p.model,
+        p.language,
+        p.prompt_version,
+        p.path,
+        p.rank,
+        p.total,
+        p.lines.map(|l| l.0),
+        p.lines.map(|l| l.1),
+        p.text,
+        p.requested,
+        p.known,
+    ]);
+    blake3::hash(json.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Écrit (ou remplace) la ligne d'un appel conservé.
+fn write_call(tx: &rusqlite::Transaction<'_>, call: &CallWrite) -> Result<()> {
+    let json = serde_json::to_string(&CallPayload::of(&call.result))
+        .map_err(|e| Error::Message(format!("résultat d'appel non sérialisable : {e}")))?;
+    tx.prepare_cached(
+        "INSERT OR REPLACE INTO enrich_calls(path, call_key, payload) VALUES (?1, ?2, ?3)",
+    )
+    .map_err(db_err)?
+    .execute(params![call.path, call.key, json])
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// Écrit l'enrichissement d'un fichier dans la transaction `tx` : déclarations et références
 /// `llm`, résumés, puis entrée d'enrichissement conservé.
 fn write_enrichment(
@@ -2984,6 +3186,10 @@ fn write_enrichment(
         refs,
     } = item;
     require_known(tx, path)?;
+    tx.prepare_cached("DELETE FROM enrich_calls WHERE path = ?1")
+        .map_err(db_err)?
+        .execute([path])
+        .map_err(db_err)?;
     let mut touched = Touched::new(track);
     apply_enrichment_tx(tx, path, summaries, concept_nodes, refs, &mut touched)?;
     finish_file(tx, path, &mut touched)?;
@@ -4296,15 +4502,30 @@ mod tests {
         PRAGMA user_version = 7;
         COMMIT;";
 
-    /// Ramène un graphe de schéma 10 au schéma 9 (DEC-138).
+    const SCHEMA10_DOWNGRADE: &str = "BEGIN;
+        DROP TABLE enrich_calls;
+        UPDATE meta SET value = '10' WHERE key = 'schema_version';
+        PRAGMA user_version = 10;
+        COMMIT;";
+
+    /// Ramène un graphe de schéma 11 au schéma 10 (DEC-173).
+    fn downgrade_to_10(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA10_DOWNGRADE)
+            .unwrap();
+    }
+
+    /// Ramène un graphe de schéma 11 au schéma 9 (le schéma 10 d'abord, DEC-138).
     fn downgrade_to_9(repo: &Path) {
+        downgrade_to_10(repo);
         Connection::open(db_path(repo))
             .unwrap()
             .execute_batch(SCHEMA9_DOWNGRADE)
             .unwrap();
     }
 
-    /// Ramène un graphe de schéma 10 au schéma 8 de la 0.24.4 (le schéma 9 d'abord, DEC-120).
+    /// Ramène un graphe de schéma 11 au schéma 8 de la 0.24.4 (le schéma 9 d'abord, DEC-120).
     fn downgrade_to_8(repo: &Path) {
         downgrade_to_9(repo);
         Connection::open(db_path(repo))
@@ -5303,7 +5524,7 @@ mod tests {
         let st = Store::open_or_create(d.path()).unwrap();
         let e = st.enrichment_entry("a.md").unwrap().unwrap();
         assert_eq!((e.content_hash.as_str(), e.language.as_str()), ("h", ""));
-        assert_eq!(st.schema_version().unwrap(), 10);
+        assert_eq!(st.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
@@ -5770,7 +5991,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        assert_eq!(SCHEMA_VERSION, 10);
+        assert_eq!(SCHEMA_VERSION, 11);
     }
 
     #[test]
@@ -5904,11 +6125,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_to_10_without_touching_the_file() {
-        for version in [10, 9, 8, 7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_11_without_touching_the_file() {
+        for version in [11, 10, 9, 8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                10 => downgrade_to_10(dir.path()),
                 9 => downgrade_to_9(dir.path()),
                 8 => downgrade_to_8(dir.path()),
                 7 => downgrade_to_7(dir.path()),
@@ -6602,6 +6824,331 @@ mod tests {
         assert!(err.to_string().contains("test"), "{err}");
         assert_eq!(removal_dump(&st), before);
         assert_eq!(st.files().unwrap().len(), 50);
+    }
+
+    // --- REQ-226 : appels conservés (schéma 11, DEC-173) ---
+
+    fn enrich_of(tag: &str) -> Enrichment {
+        Enrichment {
+            summaries: vec![("type:p.A".into(), format!("résumé {tag}"))],
+            concepts: vec![
+                crate::llm::enrich::Concept {
+                    name: format!("idée {tag}"),
+                    summary: Some("sens".into()),
+                    sections: vec!["section:a.md#1".into(), "section:a.md#2".into()],
+                },
+                crate::llm::enrich::Concept {
+                    name: "sans résumé".into(),
+                    summary: None,
+                    sections: vec![],
+                },
+            ],
+            rejected: vec![format!("écarté {tag}")],
+        }
+    }
+
+    fn call(path: &str, key: &str, tag: &str) -> CallWrite {
+        CallWrite {
+            path: path.into(),
+            key: key.into(),
+            result: enrich_of(tag),
+        }
+    }
+
+    fn calls_store() -> (tempfile::TempDir, Store) {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md"), file("b.md")])
+            .unwrap();
+        for p in ["a.md", "b.md"] {
+            st.replace_structure(p, &[ty(&format!("p.{p}"), p)], &[])
+                .unwrap();
+        }
+        (dir, st)
+    }
+
+    fn call_rows(st: &Store) -> Vec<(String, String)> {
+        let mut q = st
+            .conn
+            .prepare("SELECT path, call_key FROM enrich_calls ORDER BY path, call_key")
+            .unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn whole_item(path: &str, nodes: &[Node]) -> EnrichmentWrite {
+        EnrichmentWrite {
+            path: path.into(),
+            hash: "h".into(),
+            summaries: vec![(nodes[0].id.clone(), "résumé".into())],
+            concepts: vec![],
+            refs: vec![],
+        }
+    }
+
+    #[test]
+    fn req226_ac1_call_results_round_trip_with_payload_v1() {
+        let (_d, mut st) = calls_store();
+        let (a, b) = (call("a.md", "k1", "un"), call("a.md", "k2", "deux"));
+        st.apply_group("m", "français", &[a.clone(), b.clone()], &[])
+            .unwrap();
+        let back = st.call_results().unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back["k1"], a.result);
+        assert_eq!(back["k2"], b.result);
+        let payload: String = st
+            .conn
+            .query_row(
+                "SELECT payload FROM enrich_calls WHERE call_key = 'k1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(payload.contains("\"v\":1"), "{payload}");
+    }
+
+    fn parts<'a>(requested: &'a [String], known: &'a [String]) -> CallKeyParts<'a> {
+        CallKeyParts {
+            model: "m",
+            language: "français",
+            prompt_version: 7,
+            path: "a.md",
+            rank: 2,
+            total: 5,
+            lines: Some((10, 20)),
+            text: "texte",
+            requested,
+            known,
+        }
+    }
+
+    #[test]
+    fn req226_ac2_key_changes_with_each_element_only() {
+        let (req, known) = (
+            vec!["x".to_string()],
+            vec!["x".to_string(), "y".to_string()],
+        );
+        let base = parts(&req, &known);
+        let key = call_key(&base);
+        assert_eq!(key, call_key(&parts(&req, &known)));
+        assert_eq!(key.len(), 64);
+        let other = vec!["z".to_string()];
+        let variants = [
+            CallKeyParts {
+                model: "m2",
+                ..base
+            },
+            CallKeyParts {
+                language: "english",
+                ..base
+            },
+            CallKeyParts {
+                prompt_version: 8,
+                ..base
+            },
+            CallKeyParts {
+                path: "b.md",
+                ..base
+            },
+            CallKeyParts { rank: 3, ..base },
+            CallKeyParts { total: 6, ..base },
+            CallKeyParts {
+                lines: Some((11, 20)),
+                ..base
+            },
+            CallKeyParts {
+                lines: Some((10, 21)),
+                ..base
+            },
+            CallKeyParts {
+                lines: None,
+                ..base
+            },
+            CallKeyParts {
+                text: "texte2",
+                ..base
+            },
+            CallKeyParts {
+                requested: &other,
+                ..base
+            },
+            CallKeyParts {
+                known: &other,
+                ..base
+            },
+        ];
+        let mut keys: Vec<String> = variants.iter().map(call_key).collect();
+        keys.push(key);
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len());
+        // Les frontières entre éléments comptent.
+        let (r1, r2) = (
+            vec!["ab".to_string(), "c".to_string()],
+            vec!["a".to_string(), "bc".to_string()],
+        );
+        assert_ne!(call_key(&parts(&r1, &known)), call_key(&parts(&r2, &known)));
+    }
+
+    #[test]
+    fn req226_ac3_unreadable_payloads_are_ignored_and_replaced() {
+        let (_d, mut st) = calls_store();
+        st.apply_group("m", "français", &[call("a.md", "ok", "bon")], &[])
+            .unwrap();
+        for (k, payload) in [
+            ("tronque", "{"),
+            (
+                "futur",
+                r#"{"v":2,"summaries":[],"concepts":[],"rejected":[]}"#,
+            ),
+            ("autre", r#"{"summaries":5}"#),
+        ] {
+            st.conn
+                .execute(
+                    "INSERT INTO enrich_calls(path, call_key, payload) VALUES ('a.md', ?1, ?2)",
+                    [k, payload],
+                )
+                .unwrap();
+        }
+        let back = st.call_results().unwrap();
+        assert_eq!(back.keys().collect::<Vec<_>>(), vec!["ok"]);
+        st.apply_group("m", "français", &[call("a.md", "tronque", "neuf")], &[])
+            .unwrap();
+        let back = st.call_results().unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back["tronque"], enrich_of("neuf"));
+    }
+
+    #[test]
+    fn req226_ac4_file_write_deletes_its_rows_only_and_rollback_restores() {
+        let (_d, mut st) = calls_store();
+        let nodes_a = [ty("p.a.md", "a.md")];
+        st.apply_group(
+            "m",
+            "français",
+            &[
+                call("a.md", "k1", "1"),
+                call("a.md", "k2", "2"),
+                call("b.md", "k3", "3"),
+            ],
+            &[],
+        )
+        .unwrap();
+        // Groupe annulé par un fichier inconnu : lignes et nouveaux résultats comme avant.
+        let unknown = EnrichmentWrite {
+            path: "inconnu.md".into(),
+            ..whole_item("a.md", &nodes_a)
+        };
+        let before = call_rows(&st);
+        assert!(st
+            .apply_group(
+                "m",
+                "français",
+                &[call("b.md", "k4", "4")],
+                &[whole_item("a.md", &nodes_a), unknown],
+            )
+            .is_err());
+        assert_eq!(call_rows(&st), before);
+        // Écriture réussie du fichier a.md : ses lignes disparaissent, celles de b.md restent.
+        st.apply_enrichments("m", "français", &[whole_item("a.md", &nodes_a)])
+            .unwrap();
+        assert_eq!(call_rows(&st), vec![("b.md".to_string(), "k3".to_string())]);
+        // apply_enrichment (un fichier) fait de même.
+        st.apply_enrichment("b.md", "h", "m", "français", &[], &[], &[])
+            .unwrap();
+        assert!(call_rows(&st).is_empty());
+    }
+
+    #[test]
+    fn req226_ac5_calls_without_file_commit_once_and_keep_the_resolution_marker() {
+        let (_d, mut st) = calls_store();
+        set_resolution_tx(&st.conn, RESOLUTION_DONE).unwrap();
+        st.stale = false;
+        reset_diagnostics();
+        st.apply_group("m", "français", &[], &[]).unwrap();
+        assert_eq!(diagnostics().commits(), 0);
+        st.apply_group("m", "français", &[call("a.md", "k1", "1")], &[])
+            .unwrap();
+        assert_eq!(diagnostics().commits(), 1);
+        assert_eq!(marker(&st).as_deref(), Some(RESOLUTION_DONE));
+        assert!(!st.stale);
+        // Avec un fichier complet, le marqueur passe à `à résoudre`.
+        let nodes_a = [ty("p.a.md", "a.md")];
+        st.apply_group(
+            "m",
+            "français",
+            &[call("b.md", "k2", "2")],
+            &[whole_item("a.md", &nodes_a)],
+        )
+        .unwrap();
+        assert_eq!(marker(&st).as_deref(), Some(RESOLUTION_PENDING));
+        assert_eq!(call_rows(&st), vec![("b.md".to_string(), "k2".to_string())]);
+    }
+
+    #[test]
+    fn req226_ac6_prune_removes_rows_of_missing_paths_without_counting_them() {
+        let (_d, mut st) = calls_store();
+        st.apply_group(
+            "m",
+            "français",
+            &[call("a.md", "k1", "1"), call("gone.md", "k2", "2")],
+            &[],
+        )
+        .unwrap();
+        // gone.md n'est pas dans `files` ; a.md y est, avec une autre empreinte que celle d'un
+        // enrichissement éventuel : ses lignes restent.
+        st.conn
+            .execute("UPDATE files SET hash = 'autre' WHERE path = 'a.md'", [])
+            .unwrap();
+        assert_eq!(st.prune_enrichments().unwrap(), 0);
+        assert_eq!(call_rows(&st), vec![("a.md".to_string(), "k1".to_string())]);
+        // La valeur rendue ne compte que `enrichments`.
+        st.apply_enrichment("b.md", "h", "m", "français", &[], &[], &[])
+            .unwrap();
+        st.apply_group("m", "français", &[call("gone.md", "k3", "3")], &[])
+            .unwrap();
+        st.conn
+            .execute("UPDATE files SET hash = 'autre' WHERE path = 'b.md'", [])
+            .unwrap();
+        assert_eq!(st.prune_enrichments().unwrap(), 1);
+        assert_eq!(call_rows(&st), vec![("a.md".to_string(), "k1".to_string())]);
+    }
+
+    #[test]
+    fn req226_schema_sql_and_constant_declare_the_same_table() {
+        assert!(SCHEMA.contains(ENRICH_CALLS_DDL));
+        let (_d, st) = calls_store();
+        let sql: String = st
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'enrich_calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(format!("{sql};"), ENRICH_CALLS_DDL);
+    }
+
+    #[test]
+    fn req226_migration_10_to_11_creates_the_table_and_a_conflict_cancels_it() {
+        let dir = tempdir().unwrap();
+        drop(Store::open_or_create(dir.path()).unwrap());
+        downgrade_to_10(dir.path());
+        let st = Store::open_readonly(dir.path()).unwrap();
+        assert_eq!(st.opened_schema_version(), 10);
+        drop(st);
+        let st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(st.schema_version().unwrap(), 11);
+        assert!(st.call_results().unwrap().is_empty());
+        drop(st);
+        downgrade_to_10(dir.path());
+        Connection::open(db_path(dir.path()))
+            .unwrap()
+            .execute_batch("CREATE TABLE enrich_calls(x)")
+            .unwrap();
+        assert!(Store::open_or_create(dir.path()).is_err());
+        assert_eq!(st_user_version(dir.path()), 10);
     }
 
     #[test]
