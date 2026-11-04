@@ -2913,3 +2913,22 @@ fn REQ208_AC2_AC5_readme_tables_et_phrases() {
     assert!(vers.ends_with("ou `model_override = \"allow\"` dans la configuration personnelle."));
     assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
 }
+
+/// AC-231-3 : puce « Réponse tronquée » du README (V-012, item 56).
+#[test]
+fn REQ231_AC3_readme_reponse_tronquee_decoupe_d_un_appel() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
+    let section = readme_section(&readme, "### Échecs et nouveaux essais");
+    let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(bullets.len(), 5, "{bullets:?}");
+    let b = bullets
+        .iter()
+        .find(|l| l.starts_with("- **Réponse tronquée**"))
+        .unwrap();
+    assert_eq!(
+        *b,
+        "- **Réponse tronquée** : `réponse tronquée par la limite de jetons`, jamais renvoyée telle quelle ; un lot tronqué est découpé en deux, jusqu'au fichier seul ; un appel tronqué d'un fichier seul est aussi découpé, trois fois de suite au plus, et ces appels comptent dans `max_calls` ; si le fichier échoue quand même, réduisez `max_chunk_chars` ou augmentez `max_output_tokens`."
+    );
+    assert!(!b.contains("sous-appel"));
+}

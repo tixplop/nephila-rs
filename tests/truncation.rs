@@ -698,8 +698,7 @@ fn req046_ac12_gros_fichier_traces_par_morceau() {
     let o = s.run(&["build", "--verbose"]);
     let e = err(&o);
     let lines = llm_enrich_for(&e, "A.java");
-    // Les lignes des sous-appels suivent ; T-319 les fixe : ici les 4 premières seulement.
-    assert!(lines.len() >= 4, "{e}");
+    assert!(lines.len() >= 7, "{e}");
     assert!(lines[0].contains("départ A.java [1/3]"), "{}", lines[0]);
     assert!(lines[1].contains("fin A.java [1/3] ok ("), "{}", lines[1]);
     assert!(lines[2].contains("départ A.java [2/3]"), "{}", lines[2]);
@@ -708,7 +707,28 @@ fn req046_ac12_gros_fichier_traces_par_morceau() {
         "{}",
         lines[3]
     );
+    // Découpe du morceau 2 puis son premier sous-appel, avec le `[2/3]` du plan.
+    assert!(
+        lines[4].contains("llm enrich découpe A.java [2/3] en ")
+            && lines[4].ends_with(" sous-appels"),
+        "{}",
+        lines[4]
+    );
+    assert!(
+        lines[5].contains("llm enrich départ A.java [2/3] "),
+        "{}",
+        lines[5]
+    );
+    assert!(lines[5].ends_with("(sous-appel 1)"), "{}", lines[5]);
+    assert!(
+        lines[6].contains("llm enrich fin A.java [2/3] "),
+        "{}",
+        lines[6]
+    );
+    assert!(lines[6].ends_with("(sous-appel 1)"), "{}", lines[6]);
+    assert!(lines[4..].iter().all(|l| l.contains("[2/3]")), "{e}");
     assert!(!e.contains("[3/3]"), "{e}");
+    assert_eq!(e.matches("avertissement:").count(), 1, "{e}");
     no_forbidden_trace(&e);
 
     for k in 1..=3 {
@@ -1482,4 +1502,289 @@ fn req230_ac5_un_noeud_sur_une_seule_ligne_une_requete() {
     assert!(!o.status.success());
     assert_eq!(s.posts().len(), 1, "{}", err(&o));
     assert!(err(&o).contains(&a5("A.java")), "{}", err(&o));
+}
+
+// ---------------------------------------------------------------------------------------------
+// REQ-231 : traces de la découpe d'un appel (design.md V-005).
+
+/// Ajoute un relevé de jetons à une réponse du faux serveur.
+fn with_tokens(provider: &str, reply: &str) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(reply).unwrap();
+    v["usage"] = if provider == "anthropic" {
+        serde_json::json!({"input_tokens": 10, "output_tokens": 5})
+    } else {
+        serde_json::json!({"prompt_tokens": 10, "completion_tokens": 5})
+    };
+    v.to_string()
+}
+
+fn ok_nine(p: &str) -> (String, String) {
+    (
+        ok_for(p, &[("method:A.m0", "Premier.")]),
+        ok_for(p, &[("type:A", "Classe A centrale.")]),
+    )
+}
+
+/// Lignes `llm enrich` ou `politique:` de la sortie d'erreur, sans leur préfixe de temps.
+fn run_lines(s: &Setup, args: &[&str]) -> (Vec<String>, String) {
+    let o = s.run(args);
+    let e = err(&o);
+    (llm_lines(&e), e)
+}
+
+fn position_of(lines: &[String], prefix: &str, e: &str) -> usize {
+    lines
+        .iter()
+        .position(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("{prefix} absent : {e}"))
+}
+
+#[test]
+fn req231_ac1_ligne_de_decoupe_puis_sous_appels_marques() {
+    for p in ["anthropic", "openai"] {
+        let (a, b) = ok_nine(p);
+        let s = Setup::new(p, vec![trunc(p), a, b], "");
+        s.write("A.java", &nine_nodes());
+        let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+        let i = position_of(&lines, "llm enrich fin A.java [1/1] tronquée ", &e);
+        assert_eq!(
+            lines[i + 1],
+            "llm enrich découpe A.java [1/1] en 2 sous-appels",
+            "{p} {e}"
+        );
+        let starts = ["départ", "fin", "départ", "fin"];
+        for (k, kind) in starts.iter().enumerate() {
+            let l = &lines[i + 2 + k];
+            assert!(
+                l.starts_with(&format!("llm enrich {kind} A.java [1/1] ")),
+                "{p} {l}"
+            );
+            assert!(
+                l.ends_with(&format!("(sous-appel {})", k / 2 + 1)),
+                "{p} {l}"
+            );
+        }
+        assert_eq!(lines.len(), i + 6, "{p} {e}");
+        assert!(
+            e.lines().any(|l| l.contains("] appels: 3 appels")),
+            "{p} {e}"
+        );
+        assert!(!e.contains("politique:"), "{p} {e}");
+        for l in &lines {
+            assert!(
+                !l.contains("groupe") && !l.contains("nœuds demandés"),
+                "{l}"
+            );
+            assert!(!l.contains("(essai"), "{l}");
+        }
+    }
+}
+
+#[test]
+fn req231_ac2_sans_verbose_rien_n_est_dit() {
+    let p = "openai";
+    let (a, b) = ok_nine(p);
+    let s = Setup::new(p, vec![trunc(p), a, b], "");
+    s.write("A.java", &nine_nodes());
+    let o = s.run(&["build"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(err(&o), "", "stderr vide");
+    assert_eq!(out(&o).trim_end().lines().count(), 1, "{}", out(&o));
+    assert!(!out(&o).contains("sous-appel") && !out(&o).contains("découpe"));
+
+    let (a, b) = ok_nine(p);
+    let s = Setup::new(p, vec![trunc(p), a, b], "");
+    s.write("A.java", &nine_nodes());
+    let o = s.run(&["build", "--show-progress"]);
+    let e = err(&o);
+    let lines: Vec<&str> = e
+        .lines()
+        .filter(|l| l.starts_with("progression: enrichissement"))
+        .collect();
+    assert_eq!(
+        lines.last().copied(),
+        Some("progression: enrichissement 100 % (1/1 fichiers)"),
+        "{e}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("100 %")).count(),
+        1,
+        "{e}"
+    );
+}
+
+/// `trace: [<s>.<mmm>s] <reste>` : renvoie le reste si le temps est de la forme attendue.
+fn after_clock(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("trace: [")?;
+    let (clock, rest) = rest.split_once("s] ")?;
+    let (s, ms) = clock.split_once('.')?;
+    (!s.is_empty()
+        && s.bytes().all(|c| c.is_ascii_digit())
+        && ms.len() == 3
+        && ms.bytes().all(|c| c.is_ascii_digit()))
+    .then_some(rest)
+}
+
+#[test]
+fn req231_ac4_forme_exacte_et_marque_apres_les_jetons() {
+    let p = "openai";
+    let (a, b) = ok_nine(p);
+    let replies = vec![
+        with_tokens(p, &trunc(p)),
+        with_tokens(p, &a),
+        with_tokens(p, &b),
+    ];
+    let s = Setup::new(p, replies, "");
+    s.write("A.java", &nine_nodes());
+    let o = s.run(&["build", "--verbose"]);
+    let e = err(&o);
+    let traces = trace_lines_of(&e);
+    let i = traces
+        .iter()
+        .position(|l| l.contains("llm enrich fin A.java [1/1] tronquée"))
+        .unwrap_or_else(|| panic!("{e}"));
+    assert!(!traces[i].contains("sous-appel"), "{}", traces[i]);
+    assert_eq!(
+        after_clock(traces[i + 1]),
+        Some("llm enrich découpe A.java [1/1] en 2 sous-appels"),
+        "{e}"
+    );
+    let ends = [
+        " car. (sous-appel 1)",
+        ") (sous-appel 1)",
+        " car. (sous-appel 2)",
+        ") (sous-appel 2)",
+    ];
+    for (k, end) in ends.iter().enumerate() {
+        assert!(traces[i + 2 + k].ends_with(end), "{}", traces[i + 2 + k]);
+    }
+    assert!(traces[i + 3].contains("(jetons : "), "{}", traces[i + 3]);
+    for l in e.lines() {
+        if l.starts_with("avertissement:") || l.starts_with("erreur:") {
+            assert!(!l.contains("sous-appel"), "{l}");
+        }
+    }
+}
+
+#[test]
+fn req231_ac5_chemins_de_rang_a_chaque_profondeur() {
+    let p = "openai";
+    let mut t = String::from("public class A {\n");
+    for i in 0..15 {
+        t.push_str(&format!("    void m{i}() {{}}\n"));
+    }
+    t.push_str("}\n");
+    let s = Setup::new(p, many(p, 10), "");
+    s.write("A.java", &t);
+    let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+    let cuts: Vec<&String> = lines.iter().filter(|l| l.contains("découpe")).collect();
+    assert_eq!(cuts.len(), 3, "{e}");
+    assert!(cuts[0].ends_with("en 2 sous-appels"), "{}", cuts[0]);
+    assert!(cuts[1].ends_with("en 2 sous-appels (sous-appel 1)"));
+    assert!(cuts[2].ends_with("en 2 sous-appels (sous-appel 1.1)"));
+    let last_start = lines.iter().rposition(|l| l.contains("départ")).unwrap();
+    assert!(lines[last_start].ends_with("(sous-appel 1.1.1)"), "{e}");
+    assert!(lines[last_start + 1].starts_with("llm enrich fin "), "{e}");
+    assert!(lines[last_start + 1].ends_with("(sous-appel 1.1.1)"), "{e}");
+    assert_eq!(
+        lines.len(),
+        last_start + 2,
+        "aucune ligne après la dernière fin : {e}"
+    );
+    let a5_at = e.find(&a5("A.java")).unwrap_or_else(|| panic!("{e}"));
+    let last_fin = e.rfind("llm enrich fin A.java").unwrap();
+    assert!(a5_at > last_fin, "A-5 après la dernière fin : {e}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("(sous-appel 2)") || l.contains("(sous-appel 1.2)")),
+        "{e}"
+    );
+    assert!(lines.iter().all(|l| l.contains("[1/1]")), "{e}");
+
+    // Un seul nœud, texte coupé : « en 1 sous-appels », puis le sous-appel 1.
+    let s = Setup::new(
+        p,
+        vec![trunc(p), ok_for(p, &[("type:A", "Classe A coupée.")])],
+        "",
+    );
+    s.write("A.java", &one_node_text(30));
+    let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+    let i = position_of(
+        &lines,
+        "llm enrich découpe A.java [1/1] en 1 sous-appels",
+        &e,
+    );
+    assert!(lines[i + 1].ends_with("(sous-appel 1)"), "{e}");
+    assert!(lines[i + 1].starts_with("llm enrich départ"), "{e}");
+}
+
+#[test]
+fn req231_ac6_essais_et_attente_gardent_la_marque_en_fin() {
+    let p = "openai";
+    let (a, b) = ok_nine(p);
+    // Premier sous-appel non conforme, puis conforme.
+    let bad = openai_reply("pas du JSON", Some("stop"));
+    let s = Setup::new(p, vec![trunc(p), bad, a.clone(), b.clone()], "");
+    s.write("A.java", &nine_nodes());
+    let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("llm enrich départ A.java [1/1] ")
+                && l.ends_with(" car. (essai 2/3) (sous-appel 1)")),
+        "{e}"
+    );
+
+    // Premier sous-appel servi en HTTP 503, puis conforme.
+    let s = Setup::with_replies(
+        p,
+        vec![(200, trunc(p)), (503, String::new()), (200, a), (200, b)],
+        "",
+    );
+    s.write("A.java", &nine_nodes());
+    let o = Command::new(cargo_bin("nephila"))
+        .arg("-C")
+        .arg(&s.repo)
+        .args(["build", "--verbose"])
+        .env("NEPHILA_CONFIG", &s.config)
+        .env("NEPHILA_T100_KEY", "sk-test")
+        .env("NEPHILA_RETRY_BASE_MS", "1")
+        .output()
+        .unwrap();
+    let e = err(&o);
+    let waits: Vec<&str> = e
+        .lines()
+        .filter(|l| l.contains("llm enrich attente"))
+        .collect();
+    assert_eq!(waits.len(), 1, "{e}");
+    assert!(
+        waits[0].ends_with(" (nouvel essai 1/4) (sous-appel 1)"),
+        "{}",
+        waits[0]
+    );
+
+    // Plafond de 2 appels : pas de découpe, donc aucune marque.
+    let (a, b) = ok_nine(p);
+    let s = Setup::new(p, vec![trunc(p), a, b], "");
+    s.write("A.java", &nine_nodes());
+    let (_, e) = run_lines(&s, &["build", "--verbose", "--max-calls", "2"]);
+    assert!(!e.contains("découpe") && !e.contains("sous-appel"), "{e}");
+
+    // Cas sans coupe (un nœud, texte court) et sans troncature : aucune marque.
+    let s = Setup::new(p, many(p, 3), "");
+    s.write("A.java", A_JAVA);
+    let (_, e) = run_lines(&s, &["build", "--verbose"]);
+    assert!(!e.contains("découpe") && !e.contains("sous-appel"), "{e}");
+    let s = Setup::new(p, many(p, 3), "");
+    s.write(
+        "A.java",
+        &format!("public class A {{ /* {} */ }}\n", "x".repeat(3000)),
+    );
+    let (_, e) = run_lines(&s, &["build", "--verbose"]);
+    assert!(!e.contains("découpe") && !e.contains("sous-appel"), "{e}");
+    let s = Setup::new(p, vec![ok_for(p, &[("type:A", "Classe A.")])], "");
+    s.write("A.java", A_JAVA);
+    let (_, e) = run_lines(&s, &["build", "--verbose"]);
+    assert!(!e.contains("sous-appel"), "{e}");
 }

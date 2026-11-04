@@ -55,9 +55,21 @@ pub struct CallStats {
     sends: Cell<u32>,
     responded: Cell<bool>,
     usage: Cell<Option<Usage>>,
+    /// Marque d'un sous-appel, ajoutée en fin de la ligne d'attente (REQ-231).
+    mark: String,
 }
 
 impl CallStats {
+    /// Relevé d'un appel dont les traces d'attente portent `mark`.
+    pub fn with_mark(mark: String) -> Self {
+        CallStats {
+            mark,
+            ..CallStats::default()
+        }
+    }
+    pub(crate) fn mark(&self) -> &str {
+        &self.mark
+    }
     /// Envois HTTP réels de l'appel, nouveaux essais compris.
     pub fn sends(&self) -> u32 {
         self.sends.get()

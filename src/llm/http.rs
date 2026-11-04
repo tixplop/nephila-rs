@@ -292,8 +292,9 @@ fn send_with(
                         }
                         if let Some(label) = label {
                             crate::trace!(
-                                "llm enrich attente {label} {} ms après {cause} (nouvel essai {k}/{MAX_RETRIES})",
-                                d.as_millis()
+                                "llm enrich attente {label} {} ms après {cause} (nouvel essai {k}/{MAX_RETRIES}){}",
+                                d.as_millis(),
+                                stats.mark()
                             );
                         }
                         if wait(d, stop) {

@@ -738,8 +738,10 @@ fn traced_enrich(
     fault: Option<FormatFault>,
     stop: &AtomicBool,
     totals: &Mutex<LlmTotals>,
+    sub: &[usize],
 ) -> Result<Enrichment> {
-    let stats = CallStats::default();
+    let mark = sub_mark(sub);
+    let stats = CallStats::with_mark(mark.clone());
     let label = format!("{path} [{index}/{total}]");
     if !trace::enabled() {
         let result = llm.enrich_labeled(
@@ -749,7 +751,7 @@ fn traced_enrich(
         return result;
     }
     trace!(
-        "llm enrich départ {path} [{index}/{total}] {} car.{}",
+        "llm enrich départ {path} [{index}/{total}] {} car.{}{mark}",
         text.chars().count(),
         attempt.mark()
     );
@@ -762,19 +764,29 @@ fn traced_enrich(
     let tokens = tokens_suffix(&stats);
     match &result {
         Ok(x) => trace!(
-            "llm enrich fin {path} [{index}/{total}] ok ({} résumés, {} concepts) {ms} ms{tokens}",
+            "llm enrich fin {path} [{index}/{total}] ok ({} résumés, {} concepts) {ms} ms{tokens}{mark}",
             x.summaries.len(),
             x.concepts.len()
         ),
         // Essai refusé par le plafond ou requête mise de côté (mode lot) : ni appel ni fin à tracer.
         Err(Error::Capped | Error::Deferred) => {}
         Err(e) => trace!(
-            "llm enrich fin {path} [{index}/{total}] {} {ms} ms : {}{tokens}",
+            "llm enrich fin {path} [{index}/{total}] {} {ms} ms : {}{tokens}{mark}",
             trace::classify(e),
             trace::short(&trace_detail(e), trace::MAX_MESSAGE_CHARS)
         ),
     }
     result
+}
+
+/// Marque d'un sous-appel (REQ-231) : ` (sous-appel <rang>)`, rangs de `path` joints par `.` ;
+/// vide pour un appel du plan.
+fn sub_mark(path: &[usize]) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let ranks: Vec<String> = path.iter().map(usize::to_string).collect();
+    format!(" (sous-appel {})", ranks.join("."))
 }
 
 /// Ajoute le relevé d'un appel aux totaux de la phase.
@@ -1176,6 +1188,7 @@ fn run_call(
     stop: &AtomicBool,
     totals: &Mutex<LlmTotals>,
     take: Take<'_>,
+    sub: &[usize],
 ) -> Result<Enrichment> {
     let total = retries.saturating_add(1);
     with_format_retries(retries, stop, |current, fault| {
@@ -1196,6 +1209,7 @@ fn run_call(
             fault,
             stop,
             totals,
+            sub,
         )
     })
 }
@@ -1742,6 +1756,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     stop,
                     totals,
                     &take,
+                    path,
                 );
                 // Appel tronqué : sa liste de nœuds ou son texte est coupé et les sous-appels
                 // passent en tête de file (REQ-230). Pas de coupe possible, total au-delà de la borne : l'échec
@@ -1762,6 +1777,12 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     if let Some(subs) = split_call(&unit, &nodes) {
                         if reserve_split(shared, &file.path, count, subs.len()) {
                             if take(subs.len(), 0) {
+                                trace!(
+                                    "llm enrich découpe {} [{index}/{count}] en {} sous-appels{}",
+                                    file.path,
+                                    subs.len(),
+                                    sub_mark(path)
+                                );
                                 let added = subs.len() - 1;
                                 let sent = tx.send(Msg::Split { file, count, added });
                                 expand.armed = false;
@@ -2876,6 +2897,7 @@ mod tests {
                 stop,
                 &totals,
                 &|_, _| true,
+                &[],
             )?);
         }
         match results.len() {
@@ -3407,6 +3429,7 @@ mod tests {
                         None,
                         &stop,
                         &totals,
+                        &[],
                     ),
                     traced_lot_once(&llm, &items, attempt, None, &stop, &totals),
                 )
@@ -6149,6 +6172,7 @@ mod plan_index_tests {
             &AtomicBool::new(false),
             &totals,
             &|_, _| true,
+            &[],
         );
         assert!(r.is_ok());
         assert_eq!(
