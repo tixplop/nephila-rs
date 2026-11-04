@@ -9,3 +9,7 @@ slow-timeout = { period = "10s", terminate-after = 1 }
 [[profile.default.overrides]]
 filter = 'test(/^perf_/)'
 slow-timeout = { period = "300s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^eval_/)'
+slow-timeout = { period = "1800s", terminate-after = 1 }

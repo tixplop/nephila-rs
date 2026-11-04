@@ -1,13 +1,19 @@
-//! Banc d'évaluation : corpus figé et questions (REQ-220, DEC-172).
+//! Banc d'évaluation : corpus figé, questions, passe et rapport (REQ-220 à REQ-222, DEC-172).
 
 use assert_cmd::cargo::cargo_bin;
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// Empreinte du banc (AC-220-6) ; à recalculer si le corpus ou les questions changent.
 const CORPUS_HASH: &str = "b0a0628e94ba50f54ae238502bb1ded346aff8e69285de00aab6f2fdc4bbaea1";
+
+#[allow(dead_code)]
+#[path = "support/fake_server.rs"]
+mod fake_server;
+use fake_server::FakeServer;
 
 fn eval_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/eval")
@@ -46,18 +52,25 @@ fn questions() -> Vec<Value> {
 }
 
 /// BLAKE3 de la suite `<chemin>\0<contenu>\0` du corpus trié, puis de `questions.json`.
-fn corpus_hash() -> String {
+fn bench_hash(corpus: &Path, questions: &Path) -> String {
     let mut h = blake3::Hasher::new();
-    for f in corpus_files() {
+    for f in files_under(corpus) {
         h.update(f.as_bytes());
         h.update(b"\0");
-        h.update(&fs::read(eval_dir().join("corpus").join(&f)).unwrap());
+        h.update(&fs::read(corpus.join(&f)).unwrap());
         h.update(b"\0");
     }
     h.update(b"questions.json\0");
-    h.update(&fs::read(eval_dir().join("questions.json")).unwrap());
+    h.update(&fs::read(questions).unwrap());
     h.update(b"\0");
     h.finalize().to_hex().to_string()
+}
+
+fn corpus_hash() -> String {
+    bench_hash(
+        &eval_dir().join("corpus"),
+        &eval_dir().join("questions.json"),
+    )
 }
 
 /// Dépôt de test : copie du corpus sous `TMPDIR`, configuration `mock`, dossier de fixtures.
@@ -318,4 +331,726 @@ fn req220_ac5_expected_nodes_are_reachable_by_ask() {
 #[test]
 fn req220_ac6_corpus_hash_is_frozen() {
     assert_eq!(corpus_hash(), CORPUS_HASH);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Passe d'évaluation (REQ-221, REQ-222)
+// ---------------------------------------------------------------------------------------------
+
+type Res<T> = Result<T, String>;
+
+/// Réglages d'une passe.
+struct Params {
+    /// Configuration nephila de la passe (`NEPHILA_EVAL_CONFIG`).
+    config: PathBuf,
+    /// Dossier du corpus, copié avant la passe.
+    corpus: PathBuf,
+    /// Fichier des questions.
+    questions: PathBuf,
+    /// Chemin du rapport.
+    out: PathBuf,
+    /// Variables d'environnement ajoutées aux commandes (le simulé, la clé d'API).
+    env: Vec<(String, String)>,
+}
+
+/// Réglages tirés de l'environnement (`NEPHILA_EVAL_CONFIG` obligatoire, `NEPHILA_EVAL_OUT`).
+fn params_from_env(get: &dyn Fn(&str) -> Option<String>) -> Res<Params> {
+    let config = get("NEPHILA_EVAL_CONFIG")
+        .filter(|v| !v.is_empty())
+        .ok_or("NEPHILA_EVAL_CONFIG manque : chemin d'une configuration nephila")?;
+    let out = match get("NEPHILA_EVAL_OUT").filter(|v| !v.is_empty()) {
+        Some(o) => PathBuf::from(o),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/eval")
+            .join(format!("{}.json", env!("CARGO_PKG_VERSION"))),
+    };
+    Ok(Params {
+        config: PathBuf::from(config),
+        corpus: eval_dir().join("corpus"),
+        questions: eval_dir().join("questions.json"),
+        out,
+        env: vec![],
+    })
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            fs::copy(e.path(), dest).unwrap();
+        }
+    }
+}
+
+/// Nombre écrit dans le rapport : entier s'il l'est, sinon arrondi à 4 décimales.
+fn num(x: f64) -> Value {
+    if x.fract() == 0.0 {
+        Value::from(x as i64)
+    } else {
+        Value::from((x * 10_000.0).round() / 10_000.0)
+    }
+}
+
+fn ratio(a: u64, b: u64) -> f64 {
+    if b == 0 {
+        0.0
+    } else {
+        a as f64 / b as f64
+    }
+}
+
+/// Texte des lignes de trace de `stderr`, horodatage `trace: [<s>.<mmm>s] ` retiré.
+fn trace_lines(stderr: &str) -> impl Iterator<Item = &str> {
+    stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("trace: ["))
+        .filter_map(|l| l.split_once("s] ").map(|(_, rest)| rest))
+}
+
+/// Libellé en tête de `rest`, jusqu'au `]` de `[i/n]` compris.
+fn label_of(rest: &str) -> &str {
+    rest.find("] ").map_or(rest, |i| &rest[..=i])
+}
+
+/// `(first_calls, first_try_ok)` : lignes `llm enrich départ` sans `(essai `, et celles dont la
+/// ligne `fin` suivante de même libellé est `ok`.
+fn parse_calls(stderr: &str) -> (u64, u64) {
+    let mut pending: HashMap<&str, VecDeque<bool>> = HashMap::new();
+    let (mut first, mut ok) = (0, 0);
+    for l in trace_lines(stderr) {
+        if let Some(rest) = l.strip_prefix("llm enrich départ ") {
+            let is_first = !rest.contains("(essai ");
+            first += is_first as u64;
+            pending
+                .entry(label_of(rest))
+                .or_default()
+                .push_back(is_first);
+        } else if let Some(rest) = l.strip_prefix("llm enrich fin ") {
+            let label = label_of(rest);
+            let was_first = pending.get_mut(label).and_then(|q| q.pop_front());
+            let result = rest[label.len()..].split_whitespace().next();
+            ok += (was_first == Some(true) && result == Some("ok")) as u64;
+        }
+    }
+    (first, ok)
+}
+
+struct Totals {
+    calls: u64,
+    format_retries: u64,
+    http_sends: u64,
+    /// Entrée (cache compris), cache, sortie ; `None` : jetons inconnus.
+    tokens: Option<[u64; 3]>,
+}
+
+fn number_before(s: &str, suffix: &str) -> u64 {
+    let i = s.find(suffix).unwrap_or(0);
+    s[..i]
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn number_after(s: &str, prefix: &str) -> u64 {
+    s.find(prefix)
+        .map(|i| {
+            s[i + prefix.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Lit une ligne `appels: …` (sans horodatage).
+fn parse_totals(line: &str) -> Totals {
+    let tokens = if line.contains("jetons : inconnus") {
+        None
+    } else {
+        Some([
+            number_after(line, "entrée "),
+            number_after(line, "dont cache "),
+            number_after(line, "sortie "),
+        ])
+    };
+    Totals {
+        calls: number_before(line, " appels,"),
+        format_retries: number_before(line, " nouveaux essais"),
+        http_sends: number_before(line, " envois HTTP"),
+        tokens,
+    }
+}
+
+fn tokens_json(t: Option<[u64; 3]>) -> Value {
+    match t {
+        Some([i, c, o]) => serde_json::json!({"input": i, "cache": c, "output": o}),
+        None => Value::Null,
+    }
+}
+
+/// Mots des résumés : nombre, moyenne, médiane, rang le plus proche à 90 %, maximum.
+fn word_stats(summaries: &[String]) -> Value {
+    let mut w: Vec<u64> = summaries
+        .iter()
+        .map(|s| s.split_whitespace().count() as u64)
+        .collect();
+    w.sort_unstable();
+    let n = w.len();
+    if n == 0 {
+        return serde_json::json!({"count": 0, "mean": 0, "median": 0, "p90": 0, "max": 0});
+    }
+    let mean = w.iter().sum::<u64>() as f64 / n as f64;
+    let median = (w[(n - 1) / 2] + w[n / 2]) as f64 / 2.0;
+    let rank = (n * 9).div_ceil(10).max(1);
+    serde_json::json!({
+        "count": n, "mean": num(mean), "median": num(median),
+        "p90": w[rank - 1], "max": w[n - 1]
+    })
+}
+
+/// Mesures de l'enrichissement (sans `exit_code`), d'après l'export et stderr de `build --verbose`.
+fn enrich_metrics(export: &Value, stderr: &str) -> Value {
+    let (mut requested, mut covered) = (0u64, 0u64);
+    let mut summaries = Vec::new();
+    for n in export["nodes"].as_array().map_or(&[][..], |a| &a[..]) {
+        let id = n["id"].as_str().unwrap_or("");
+        if n["file"].is_null() || id.starts_with("package:") || id.starts_with("key:") {
+            continue;
+        }
+        requested += 1;
+        if let Some(s) = n["summary"].as_str().filter(|s| !s.is_empty()) {
+            covered += 1;
+            summaries.push(s.to_string());
+        }
+    }
+    let (first_calls, first_ok) = parse_calls(stderr);
+    let totals = trace_lines(stderr)
+        .filter(|l| l.starts_with("appels:"))
+        .last()
+        .map(parse_totals);
+    let (calls, retries, sends, tokens) = totals.map_or((0, 0, 0, None), |t| {
+        (t.calls, t.format_retries, t.http_sends, t.tokens)
+    });
+    serde_json::json!({
+        "nodes_requested": requested,
+        "nodes_covered": covered,
+        "coverage": num(ratio(covered, requested)),
+        "first_calls": first_calls,
+        "first_try_ok": first_ok,
+        "first_try_rate": num(ratio(first_ok, first_calls)),
+        "calls": calls,
+        "format_retries": retries,
+        "http_sends": sends,
+        "tokens": tokens_json(tokens),
+        "summary_words": word_stats(&summaries),
+    })
+}
+
+fn last_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("(stderr vide)")
+        .to_string()
+}
+
+/// Une passe : `build --enrich-code --verbose`, `export`, rapport écrit en une fois.
+fn run_pass(p: &Params) -> Res<Value> {
+    if !p.config.is_file() {
+        return Err(format!(
+            "NEPHILA_EVAL_CONFIG : fichier absent : {}",
+            p.config.display()
+        ));
+    }
+    let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let repo = tmp.path().join("repo");
+    copy_tree(&p.corpus, &repo);
+    let nephila = |args: &[&str]| {
+        Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &p.config)
+            .envs(p.env.iter().cloned())
+            .output()
+            .map_err(|e| format!("nephila n'a pas pu être lancé : {e}"))
+    };
+    let v = Command::new(cargo_bin("nephila"))
+        .arg("--version")
+        .output()
+        .map_err(|e| e.to_string())?;
+    let version = String::from_utf8_lossy(&v.stdout)
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .to_string();
+
+    let build = nephila(&["build", "--enrich-code", "--verbose"])?;
+    let stderr = String::from_utf8_lossy(&build.stderr).into_owned();
+    let code = build.status.code().unwrap_or(-1);
+    let mut export = serde_json::json!({"nodes": []});
+    let mut failure = None;
+    if code == 0 {
+        let e = nephila(&["export", "--output", "-"])?;
+        if e.status.success() {
+            export = serde_json::from_slice(&e.stdout).map_err(|e| format!("export : {e}"))?;
+        } else {
+            failure = Some(format!("export a échoué : {}", last_line(&e.stderr)));
+        }
+    } else {
+        failure = Some(format!(
+            "build a échoué (code {code}) : {}",
+            last_line(&build.stderr)
+        ));
+    }
+
+    let config_line = trace_lines(&stderr).find(|l| l.starts_with("config: llm="));
+    let field = |key: &str| {
+        config_line
+            .and_then(|l| l.split_whitespace().find_map(|w| w.strip_prefix(key)))
+            .map_or(Value::Null, Value::from)
+    };
+    let mut enrich = enrich_metrics(&export, &stderr);
+    enrich["exit_code"] = code.into();
+    let questions: Value =
+        serde_json::from_slice(&fs::read(&p.questions).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("questions illisibles : {e}"))?;
+    let report = serde_json::json!({
+        "schema": 1,
+        "version": version,
+        "provider": field("llm="),
+        "model": field("model="),
+        "prompt_versions": {
+            "code": nephila::llm::enrich::CODE_PROMPT_VERSION,
+            "build": nephila::llm::enrich::BUILD_PROMPT_VERSION,
+            "data": nephila::llm::enrich::DATA_PROMPT_VERSION,
+            "markdown": nephila::llm::enrich::MARKDOWN_PROMPT_VERSION,
+            "ask": nephila::llm::ask::ASK_PROMPT_VERSION,
+        },
+        "corpus": {
+            "hash": bench_hash(&p.corpus, &p.questions),
+            "files": files_under(&p.corpus).len(),
+            "questions": questions.as_array().map_or(0, Vec::len),
+        },
+        "enrich": enrich,
+        "ask": Value::Null,
+        "judge": Value::Null,
+    });
+    if let Some(dir) = p.out.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{} : {e}", dir.display()))?;
+    }
+    let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    let tmp_out = PathBuf::from(format!("{}.tmp", p.out.display()));
+    fs::write(&tmp_out, text + "\n").map_err(|e| format!("{} : {e}", tmp_out.display()))?;
+    fs::rename(&tmp_out, &p.out).map_err(|e| format!("{} : {e}", p.out.display()))?;
+    match failure {
+        Some(f) => Err(f),
+        None => Ok(report),
+    }
+}
+
+/// Passe réelle, lancée à la main par la commande `eval` du plan : appels payants.
+#[test]
+#[ignore]
+fn eval_passe() {
+    let params = params_from_env(&|k| std::env::var(k).ok()).unwrap_or_else(|e| panic!("{e}"));
+    let report = run_pass(&params).unwrap_or_else(|e| panic!("{e}"));
+    eprintln!("rapport : {}\n{report:#}", params.out.display());
+}
+
+// ---- Tests de la passe --------------------------------------------------------------------
+
+/// Fixtures du simulé pour chaque nœud demandé du corpus, tirées d'un export `--no-llm`.
+fn write_fixtures(env: &Env, extra: &str) {
+    for n in env.build_and_export() {
+        let id = n["id"].as_str().unwrap();
+        let Some(file) = n["file"].as_str() else {
+            continue;
+        };
+        if id.starts_with("package:") || id.starts_with("key:") {
+            continue;
+        }
+        let path = env.mock.join(format!("{file}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut fixture: Value = fs::read_to_string(&path)
+            .map(|t| serde_json::from_str(&t).unwrap())
+            .unwrap_or_else(|_| serde_json::json!({"version": 2, "summaries": [], "concepts": []}));
+        let short = n["short"].as_str().unwrap();
+        fixture["summaries"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "node": id, "summary": format!("Résumé de {short} {extra}")
+            }));
+        fs::write(path, fixture.to_string()).unwrap();
+    }
+}
+
+fn mock_params(env: &Env, out: &Path) -> Params {
+    Params {
+        config: env.config.clone(),
+        corpus: eval_dir().join("corpus"),
+        questions: eval_dir().join("questions.json"),
+        out: out.to_path_buf(),
+        env: vec![("NEPHILA_MOCK_DIR".into(), env.mock.to_str().unwrap().into())],
+    }
+}
+
+/// Petit corpus de documents `a.md`, `b.md`, `c.md` et fichier de questions vide.
+struct Mini {
+    tmp: tempfile::TempDir,
+}
+
+impl Mini {
+    fn new() -> Mini {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("corpus")).unwrap();
+        for n in ["a", "b", "c"] {
+            fs::write(
+                tmp.path().join(format!("corpus/{n}.md")),
+                format!("# {n}\n\nTexte {n}.\n"),
+            )
+            .unwrap();
+        }
+        fs::write(tmp.path().join("questions.json"), "[]").unwrap();
+        Mini { tmp }
+    }
+
+    fn path(&self, p: &str) -> PathBuf {
+        self.tmp.path().join(p)
+    }
+
+    fn params(&self, config: &str, env: Vec<(String, String)>) -> Params {
+        fs::write(self.path("config.toml"), config).unwrap();
+        fs::create_dir_all(self.path("mock")).unwrap();
+        let mut all = vec![(
+            "NEPHILA_MOCK_DIR".to_string(),
+            self.path("mock").to_str().unwrap().to_string(),
+        )];
+        all.extend(env);
+        Params {
+            config: self.path("config.toml"),
+            corpus: self.path("corpus"),
+            questions: self.path("questions.json"),
+            out: self.path("out/report.json"),
+            env: all,
+        }
+    }
+}
+
+const MINI_MOCK: &str = "provider = \"mock\"\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\n";
+
+#[test]
+fn req221_ac1_eval_passe_is_ignored_and_has_a_long_timeout() {
+    let exe = std::env::current_exe().unwrap();
+    let list = Command::new(&exe)
+        .args(["--list", "--ignored"])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(listed.contains("eval_passe: test"), "{listed}");
+    // Lancé sans `--ignored`, il n'est pas exécuté.
+    let run = Command::new(&exe)
+        .args(["eval_passe", "--exact"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success(), "{out}");
+    assert!(
+        out.contains("1 ignored") && out.contains("0 passed"),
+        "{out}"
+    );
+    // Ni le filtre `perf`, ni le binaire `perf`.
+    assert!(!"eval_passe".contains("perf"));
+    assert_eq!(Path::new(file!()).file_stem().unwrap(), "eval");
+
+    let toml: toml::Value = toml::from_str(
+        &fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".config/nextest.toml"))
+            .unwrap(),
+    )
+    .unwrap();
+    let profile = &toml["profile"]["default"];
+    let timeout = |v: &toml::Value| {
+        (
+            v["slow-timeout"]["period"].as_str().unwrap().to_string(),
+            v["slow-timeout"]["terminate-after"].as_integer().unwrap(),
+        )
+    };
+    assert_eq!(timeout(profile), ("60s".to_string(), 1));
+    let by_filter: HashMap<&str, (String, i64)> = profile["overrides"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| (o["filter"].as_str().unwrap(), timeout(o)))
+        .collect();
+    assert_eq!(by_filter["test(/^eval_/)"], ("1800s".to_string(), 1));
+    assert_eq!(by_filter["kind(lib) | kind(bin)"], ("10s".to_string(), 1));
+    assert_eq!(by_filter["test(/^perf_/)"], ("300s".to_string(), 1));
+    assert_eq!(by_filter.len(), 3);
+}
+
+#[test]
+fn req221_ac2_missing_variable_or_file_fails_before_any_process() {
+    let err = params_from_env(&|_| None).err().unwrap();
+    assert!(err.contains("NEPHILA_EVAL_CONFIG"), "{err}");
+
+    let mini = Mini::new();
+    let log = mini.path("mock.log");
+    let mut p = mini.params(MINI_MOCK, vec![]);
+    p.env
+        .push(("NEPHILA_MOCK_LOG".into(), log.to_str().unwrap().into()));
+    p.config = mini.path("absent.toml");
+    let err = run_pass(&p).err().unwrap();
+    assert!(err.contains("NEPHILA_EVAL_CONFIG"), "{err}");
+    assert!(!log.exists() && !p.out.exists());
+}
+
+#[test]
+fn req221_ac3_report_has_the_exact_shape() {
+    let env = Env::new();
+    write_fixtures(&env, "");
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("nouveau/dossier/rapport.json");
+    let report = run_pass(&mock_params(&env, &out)).unwrap();
+    let written: Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+    assert_eq!(written, report);
+    let mut keys: Vec<&String> = written.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "ask",
+            "corpus",
+            "enrich",
+            "judge",
+            "model",
+            "prompt_versions",
+            "provider",
+            "schema",
+            "version"
+        ]
+    );
+    assert_eq!(written["schema"], 1);
+    assert_eq!(written["provider"], "mock");
+    assert_eq!(written["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(written["corpus"]["hash"], CORPUS_HASH);
+    assert_eq!(written["corpus"]["files"], corpus_files().len());
+    assert_eq!(written["corpus"]["questions"], questions().len());
+    let pv = &written["prompt_versions"];
+    assert_eq!(pv["code"], nephila::llm::enrich::CODE_PROMPT_VERSION);
+    assert_eq!(pv["ask"], nephila::llm::ask::ASK_PROMPT_VERSION);
+    assert!(written["ask"].is_null() && written["judge"].is_null());
+    let enrich = &written["enrich"];
+    assert_eq!(enrich["exit_code"], 0);
+    assert!(enrich["nodes_covered"].as_u64().unwrap() > 0);
+    assert_eq!(enrich["coverage"], 1);
+
+    // Chemin par défaut : `<manifeste>/target/eval/<version>.json`.
+    let p =
+        params_from_env(&|k| (k == "NEPHILA_EVAL_CONFIG").then(|| "c.toml".to_string())).unwrap();
+    assert_eq!(
+        p.out,
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/eval")
+            .join(format!("{}.json", env!("CARGO_PKG_VERSION")))
+    );
+    let p = params_from_env(&|k| match k {
+        "NEPHILA_EVAL_CONFIG" => Some("c.toml".into()),
+        "NEPHILA_EVAL_OUT" => Some("/x/r.json".into()),
+        _ => None,
+    })
+    .unwrap();
+    assert_eq!(p.out, PathBuf::from("/x/r.json"));
+}
+
+#[test]
+fn req221_ac4_two_passes_give_identical_reports() {
+    let env = Env::new();
+    write_fixtures(&env, "");
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = (tmp.path().join("a.json"), tmp.path().join("b.json"));
+    run_pass(&mock_params(&env, &a)).unwrap();
+    run_pass(&mock_params(&env, &b)).unwrap();
+    assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
+}
+
+#[test]
+fn req221_ac5_failed_build_stops_before_any_question() {
+    let env = Env::new();
+    write_fixtures(&env, "");
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("r.json");
+    let log = tmp.path().join("mock.log");
+    let mut p = mock_params(&env, &out);
+    p.env.push(("NEPHILA_MOCK_INVALID_KEY".into(), "1".into()));
+    p.env
+        .push(("NEPHILA_MOCK_LOG".into(), log.to_str().unwrap().into()));
+    let err = run_pass(&p).err().unwrap();
+    assert!(
+        err.contains("build a échoué") && err.contains("clé d'API refusée"),
+        "{err}"
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+    assert_ne!(report["enrich"]["exit_code"], 0);
+    assert!(report["ask"].is_null() && report["judge"].is_null());
+    let journal = fs::read_to_string(&log).unwrap_or_default();
+    assert!(!journal.contains("_ask"), "{journal}");
+}
+
+#[test]
+fn req221_ac6_report_keeps_no_answer_and_no_key() {
+    let mini = Mini::new();
+    let reply = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content":
+            r#"{"version":2,"summaries":[{"node":"document:a.md","summary":"SECRET_REPONSE_42"}],"concepts":[]}"#},
+            "finish_reason": "stop"}]
+    })
+    .to_string();
+    let server = FakeServer::start((0..3).map(|_| (200, reply.clone())).collect());
+    let config = format!(
+        "provider = \"openai\"\nmodel = \"m\"\napi_key_env = \"NEPHILA_EVAL_TEST_KEY\"\nbase_url = \"{}\"\nbatch_files = 1\nconcurrency = 1\n",
+        server.base_url
+    );
+    let p = mini.params(
+        &config,
+        vec![("NEPHILA_EVAL_TEST_KEY".into(), "sk-test-SECRET".into())],
+    );
+    let report = run_pass(&p).unwrap();
+    assert_eq!(
+        report["enrich"]["nodes_covered"], 1,
+        "le résumé a bien circulé"
+    );
+    let text = fs::read_to_string(&p.out).unwrap();
+    assert!(!text.contains("SECRET_REPONSE_42") && !text.contains("sk-test-SECRET"));
+}
+
+/// Stderr fixe où deux fils se croisent (AC-222-1).
+const CROSSING: &str = "\
+trace: [0.001s] llm enrich départ a [1/1] 10 car.
+trace: [0.001s] llm enrich départ b [1/1] 10 car.
+trace: [0.002s] llm enrich fin b [1/1] ok (1 résumés, 0 concepts) 3 ms
+trace: [0.003s] llm enrich fin a [1/1] erreur 3 ms : réponse LLM non conforme au schéma
+trace: [0.003s] llm enrich départ a [1/1] 10 car. (essai 2/3)
+trace: [0.004s] llm enrich fin a [1/1] ok (1 résumés, 0 concepts) 3 ms
+trace: [0.005s] llm enrich départ lot c +1 [1/1] 20 car.
+trace: [0.006s] llm enrich fin lot c +1 [1/1] tronquée 3 ms : réponse tronquée
+";
+
+#[test]
+fn req222_ac1_first_try_counts_crossing_threads() {
+    assert_eq!(parse_calls(CROSSING), (3, 1));
+    let m = enrich_metrics(&serde_json::json!({"nodes": []}), CROSSING);
+    assert_eq!(m["first_calls"], 3);
+    assert_eq!(m["first_try_ok"], 1);
+    assert_eq!(m["first_try_rate"], 0.3333);
+}
+
+#[test]
+fn req222_ac2_mock_malformed_costs_one_retry() {
+    let mini = Mini::new();
+    let p = mini.params(
+        MINI_MOCK,
+        vec![("NEPHILA_MOCK_MALFORMED".into(), "a.md:1".into())],
+    );
+    let e = &run_pass(&p).unwrap()["enrich"];
+    assert_eq!(e["first_calls"], 3);
+    assert_eq!(e["first_try_ok"], 2);
+    assert_eq!(e["calls"], 4);
+    assert_eq!(e["format_retries"], 1);
+    assert_eq!(e["http_sends"], 4);
+    assert!(e["tokens"].is_null());
+}
+
+#[test]
+fn req222_ac3_tokens_come_from_the_calls_line() {
+    let mini = Mini::new();
+    let reply = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content":
+            r#"{"version": 2, "summaries": [], "concepts": []}"#}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 200},
+                  "completion_tokens": 50}
+    })
+    .to_string();
+    let server = FakeServer::start((0..3).map(|_| (200, reply.clone())).collect());
+    let config = format!(
+        "provider = \"openai\"\nmodel = \"m\"\napi_key_env = \"NEPHILA_EVAL_TEST_KEY\"\nbase_url = \"{}\"\nbatch_files = 1\nconcurrency = 1\n",
+        server.base_url
+    );
+    let p = mini.params(
+        &config,
+        vec![("NEPHILA_EVAL_TEST_KEY".into(), "sk-test".into())],
+    );
+    let e = &run_pass(&p).unwrap()["enrich"];
+    assert_eq!(e["calls"], 3);
+    assert_eq!(
+        e["tokens"],
+        serde_json::json!({"input": 3000, "cache": 600, "output": 150})
+    );
+    // Lecture d'une ligne `appels:` sans jetons connus.
+    let t = parse_totals(
+        "appels: 2 appels, 1 nouveaux essais de format, 4 envois HTTP, jetons : inconnus",
+    );
+    assert_eq!(
+        (t.calls, t.format_retries, t.http_sends, t.tokens),
+        (2, 1, 4, None)
+    );
+}
+
+#[test]
+fn req222_ac4_coverage_and_word_statistics() {
+    let export = serde_json::json!({"nodes": [
+        {"id": "type:A", "file": "A.java", "summary": "un deux"},
+        {"id": "method:A.m", "file": "A.java", "summary": "trois"},
+        {"id": "type:B", "file": "B.java", "summary": ""},
+        {"id": "type:C", "file": "C.java", "summary": null},
+        {"id": "package:p", "file": "A.java", "summary": "ignoré"},
+        {"id": "key:k", "file": "pom.xml", "summary": "ignoré"},
+        {"id": "concept:x", "file": null, "summary": "ignoré"},
+    ]});
+    let m = enrich_metrics(&export, "");
+    assert_eq!(m["nodes_requested"], 4);
+    assert_eq!(m["nodes_covered"], 2);
+    assert_eq!(m["coverage"], 0.5);
+    assert_eq!(m["summary_words"]["count"], 2);
+    // Sans ligne `appels:` : tout à 0 et jetons nuls.
+    assert_eq!(
+        (m["calls"].clone(), m["first_calls"].clone()),
+        (0.into(), 0.into())
+    );
+    assert!(m["tokens"].is_null());
+
+    let words =
+        |n: &[usize]| -> Vec<String> { n.iter().map(|k| vec!["mot"; *k].join(" ")).collect() };
+    assert_eq!(
+        word_stats(&words(&[1, 2, 3, 4, 10])),
+        serde_json::json!({"count": 5, "mean": 4, "median": 3, "p90": 10, "max": 10})
+    );
+    assert_eq!(
+        word_stats(&[]),
+        serde_json::json!({"count": 0, "mean": 0, "median": 0, "p90": 0, "max": 0})
+    );
+    let none = enrich_metrics(&serde_json::json!({"nodes": []}), "");
+    assert_eq!(none["coverage"], 0);
+    assert_eq!(none["first_try_rate"], 0);
+    assert_eq!(none["nodes_requested"], 0);
+}
+
+#[test]
+fn req222_ac5_mock_without_fixture_covers_nothing() {
+    let env = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let report = run_pass(&mock_params(&env, &tmp.path().join("r.json"))).unwrap();
+    let e = &report["enrich"];
+    assert_eq!(e["exit_code"], 0);
+    assert_eq!(e["coverage"], 0);
+    assert_eq!(e["nodes_covered"], 0);
+    assert!(e["nodes_requested"].as_u64().unwrap() > 0);
+    assert_eq!(e["first_try_rate"], 1);
 }
