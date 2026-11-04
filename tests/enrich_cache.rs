@@ -1022,3 +1022,408 @@ fn req193_ac5_only_the_family_with_an_older_version_is_reenriched() {
         assert!(env.logged().is_empty(), "{:?}", env.logged());
     }
 }
+
+// ---- Appels conservés d'un gros fichier (REQ-226, REQ-227, DEC-173) ----
+
+const BIG: &str = "docs/big.md";
+
+fn big_doc(sections: usize) -> String {
+    (1..=sections)
+        .map(|i| format!("# Section{i}\n\n{}\n\n", "mot ".repeat(40)))
+        .collect()
+}
+
+/// Configuration personnelle `mock` sans nouvel essai, `max_chunk_chars` = 250 par défaut.
+fn write_config(env: &Env, model: &str, extra: &str) {
+    let settings = if extra.contains("max_chunk_chars") {
+        extra.to_string()
+    } else {
+        format!("max_chunk_chars = 250\n{extra}")
+    };
+    fs::write(
+        &env.config,
+        format!("provider = \"mock\"\nenrich_code = true\nmodel = \"{model}\"\nbatch_files = 1\nconcurrency = 1\nformat_retries = 0\n{settings}"),
+    )
+    .unwrap();
+}
+
+fn call_fixture(env: &Env, k: usize, rejected: bool) {
+    let extra = if rejected && k == 1 {
+        r#"{"node":"type:Absent","summary":"hors liste"},"#
+    } else {
+        ""
+    };
+    fs::create_dir_all(env.mock.join("docs")).unwrap();
+    fs::write(
+        env.mock.join(format!("{BIG}.{k}.json")),
+        format!(
+            r#"{{"version":2,"summaries":[{extra}{{"node":"document:{BIG}","summary":"resume{k}"}}],"concepts":[{{"name":"Concept{k}","summary":"c{k}","sections":["section:{BIG}#section{k}"]}}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// Dépôt d'un seul gros fichier de `sections` appels, fixtures conformes.
+fn big_env(sections: usize) -> Env {
+    let env = tiny_env(&[(BIG, &big_doc(sections))]);
+    write_config(&env, "mock", "");
+    for k in 1..=sections {
+        call_fixture(&env, k, false);
+    }
+    env
+}
+
+fn break_fixture(env: &Env, k: usize) {
+    fs::write(env.mock.join(format!("{BIG}.{k}.json")), "{pas du json").unwrap();
+}
+
+/// Gros fichier de 4 appels dont le troisième est non conforme : `build` échoue après les appels
+/// 1, 2 et 3. Le troisième est ensuite corrigé.
+fn failed_after_three() -> Env {
+    let env = big_env(4);
+    break_fixture(&env, 3);
+    let o = env.run(&["build"]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
+    assert_eq!(env.logged(), calls(&[1, 2, 3]));
+    call_fixture(&env, 3, false);
+    env
+}
+
+fn calls(ks: &[usize]) -> Vec<String> {
+    ks.iter().map(|k| format!("{BIG}\t{k}")).collect()
+}
+
+fn kept_rows(env: &Env) -> usize {
+    env.store().call_results().unwrap().len()
+}
+
+fn export_json(env: &Env) -> String {
+    text(
+        &env.ok(&["export", "--format", "json", "--output", "-"])
+            .stdout,
+    )
+}
+
+#[test]
+fn req227_ac1_reprise_n_envoie_que_les_appels_manquants() {
+    let env = big_env(4);
+    break_fixture(&env, 3);
+    let o = env.run(&["build"]);
+    let err = text(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert_eq!(env.logged(), calls(&[1, 2, 3]));
+    assert_eq!(to_enrich(&env), 1);
+    assert!(env
+        .store()
+        .nodes()
+        .unwrap()
+        .iter()
+        .all(|n| n.summary.is_none()));
+    let warns: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("avertissement:"))
+        .collect();
+    assert_eq!(warns.len(), 1, "{err}");
+    assert!(warns[0].contains(BIG), "{err}");
+    assert_eq!(kept_rows(&env), 2);
+
+    call_fixture(&env, 3, false);
+    let o = env.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(env.logged(), calls(&[3, 4]));
+    assert_eq!(kept_rows(&env), 0);
+    assert_eq!(to_enrich(&env), 0);
+
+    let clean = big_env(4);
+    clean.ok(&["build"]);
+    assert_eq!(export_json(&env), export_json(&clean));
+}
+
+#[test]
+fn req227_ac3_morceau_modifie_ou_nouveau_nom_renvoient_ce_qui_change() {
+    // Morceau 2 modifié sans déplacer de ligne ni changer de nœud : l'appel 1 ne repart pas.
+    let env = failed_after_three();
+    let doc = big_doc(4);
+    let target = format!("# Section2\n\n{}", "mot ".repeat(40));
+    let changed = doc.replace(&target, &format!("# Section2\n\n{}", "mon ".repeat(40)));
+    assert_ne!(doc, changed);
+    env.write(BIG, &changed);
+    env.ok(&["update"]);
+    assert_eq!(env.logged(), calls(&[2, 3, 4]));
+
+    // Ligne insérée en tête : tous les appels partent.
+    let env = failed_after_three();
+    env.write(BIG, &format!("intro\n\n{}", big_doc(4)));
+    env.ok(&["update"]);
+    assert_eq!(env.logged(), calls(&[1, 2, 3, 4]));
+
+    // Nœud ajouté dans le dernier morceau : la liste des nœuds connus change, tout repart.
+    let env = failed_after_three();
+    env.write(BIG, &format!("{}# Extra\n\nx\n", big_doc(4)));
+    env.ok(&["update"]);
+    assert_eq!(env.logged(), calls(&[1, 2, 3, 4]));
+}
+
+#[test]
+fn req227_ac4_modele_langue_et_taille_de_morceau() {
+    // Modèle changé : tous les appels partent.
+    let env = failed_after_three();
+    write_config(&env, "autre", "");
+    env.ok(&["update"]);
+    assert_eq!(env.logged(), calls(&[1, 2, 3, 4]));
+
+    // Langue changée : de même.
+    let env = failed_after_three();
+    write_config(&env, "mock", "summary_language = \"english\"\n");
+    env.ok(&["update"]);
+    assert_eq!(env.logged(), calls(&[1, 2, 3, 4]));
+
+    // Morceaux inchangés malgré une autre taille maximale : seuls les appels manquants partent.
+    let env = failed_after_three();
+    write_config(&env, "mock", "max_chunk_chars = 260\n");
+    env.ok(&["update"]);
+    assert_eq!(env.logged(), calls(&[3, 4]));
+
+    // Morceaux regroupés (le plan change) : les appels du nouveau plan partent.
+    let env = failed_after_three();
+    write_config(&env, "mock", "max_chunk_chars = 400\n");
+    env.ok(&["update"]);
+    assert_eq!(env.logged(), calls(&[1, 2]));
+
+    // Concurrence et nouveaux essais : seuls les appels manquants partent.
+    let env = failed_after_three();
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 3\nformat_retries = 2\nmax_chunk_chars = 250\n",
+    )
+    .unwrap();
+    env.ok(&["update"]);
+    let mut sent = env.logged();
+    sent.sort();
+    assert_eq!(sent, calls(&[3, 4]));
+}
+
+#[test]
+fn req227_ac6_journal_verbose_et_progression_de_la_reprise() {
+    let env = failed_after_three();
+    let o = env.ok(&["update", "--verbose"]);
+    let err = text(&o.stderr);
+    let enrich: Vec<&str> = err
+        .lines()
+        .filter(|l| l.contains("llm enrich") && l.contains(BIG))
+        .collect();
+    assert!(
+        enrich
+            .iter()
+            .all(|l| l.contains("[3/4]") || l.contains("[4/4]")),
+        "{err}"
+    );
+    assert_eq!(enrich.len(), 4, "départ et fin de deux appels : {err}");
+    let summary: Vec<&str> = err.lines().filter(|l| l.contains(" appels: ")).collect();
+    assert_eq!(summary.len(), 1, "{err}");
+    assert!(summary[0].contains("appels: 2 appels,"), "{err}");
+
+    let env = failed_after_three();
+    let o = env.ok(&["update", "--show-progress"]);
+    let progress: Vec<String> = text(&o.stderr)
+        .lines()
+        .filter(|l| l.starts_with("progression: enrichissement"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        progress,
+        [
+            "progression: enrichissement 0 % (0/1 fichiers)",
+            "progression: enrichissement 100 % (1/1 fichiers)"
+        ]
+    );
+}
+
+/// Fabrique l'état « tous les appels conservés » d'un gros fichier de `sections` appels
+/// (REQ-227 : un échec réel ne le produit pas) : un déclencheur empêche la purge des lignes à la
+/// réussite, puis le fichier redevient « à enrichir ».
+fn keep_all_calls(env: &Env, sections: usize) {
+    // Sans concept : un concept déclaré par le fichier changerait la liste des nœuds connus.
+    for k in 1..=sections {
+        fs::write(
+            env.mock.join(format!("{BIG}.{k}.json")),
+            format!(r#"{{"version":2,"summaries":[{{"node":"section:{BIG}#section{k}","summary":"s{k}"}}],"concepts":[]}}"#),
+        )
+        .unwrap();
+    }
+    env.ok(&["build", "--no-llm"]);
+    let db = env.repo.join(".nephila/graph.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER keep BEFORE DELETE ON enrich_calls BEGIN SELECT RAISE(IGNORE); END;",
+    )
+    .unwrap();
+    drop(conn);
+    env.ok(&["update"]);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("DROP TRIGGER keep;").unwrap();
+    conn.execute("DELETE FROM enrichments WHERE path = ?1", [BIG])
+        .unwrap();
+}
+
+#[test]
+fn req227_ac6_tous_les_appels_conserves_aucun_appel_fichier_enrichi() {
+    let env = big_env(4);
+    keep_all_calls(&env, 4);
+    assert_eq!(kept_rows(&env), 4);
+    assert_eq!(to_enrich(&env), 1);
+    let o = env.ok(&["update"]);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    assert_eq!(to_enrich(&env), 0);
+    assert_eq!(kept_rows(&env), 0);
+    assert!(text(&o.stdout)
+        .trim_end()
+        .ends_with("0 fichiers à enrichir"));
+}
+
+#[test]
+fn req227_ac8_element_ecarte_signale_une_fois_a_la_reussite() {
+    let env = big_env(4);
+    call_fixture(&env, 1, true);
+    break_fixture(&env, 3);
+    let o = env.run(&["build"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        !text(&o.stderr).contains("écarté(s)"),
+        "{}",
+        text(&o.stderr)
+    );
+    call_fixture(&env, 3, false);
+    let o = env.ok(&["update"]);
+    let err = text(&o.stderr);
+    let warns: Vec<&str> = err.lines().filter(|l| l.contains("écarté(s)")).collect();
+    assert_eq!(warns.len(), 1, "{err}");
+
+    let clean = big_env(4);
+    call_fixture(&clean, 1, true);
+    let o = clean.ok(&["build"]);
+    let expected: Vec<String> = text(&o.stderr)
+        .lines()
+        .filter(|l| l.contains("écarté(s)"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(warns, expected);
+}
+
+#[test]
+fn req227_ac9_lot_et_fichier_d_un_seul_appel_n_ecrivent_rien() {
+    // Lot en échec : deux petits documents envoyés ensemble.
+    let env = tiny_env(&[("a.md", "# Un\n\ntexte\n"), ("b.md", "# Deux\n\ntexte\n")]);
+    fs::write(
+        &env.config,
+        "provider = \"mock\"\nmodel = \"mock\"\nbatch_files = 2\nconcurrency = 1\nformat_retries = 0\n",
+    )
+    .unwrap();
+    let _ = fs::remove_file(&env.log);
+    let o = env
+        .cmd()
+        .env("NEPHILA_MOCK_FAIL_AFTER", "0")
+        .arg("build")
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(kept_rows(&env), 0);
+    let o = env.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert_eq!(env.logged(), vec!["a.md;b.md\t1".to_string()]);
+
+    // Fichier d'un seul appel en échec.
+    let env = tiny_env(&[("a.md", "# Un\n\ntexte\n")]);
+    write_config(&env, "mock", "");
+    fs::write(env.mock.join("a.md.1.json"), "{pas du json").unwrap();
+    let o = env.run(&["build"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(kept_rows(&env), 0);
+    fs::remove_file(env.mock.join("a.md.1.json")).unwrap();
+    env.ok(&["update"]);
+    assert_eq!(env.logged(), vec!["a.md\t1".to_string()]);
+}
+
+#[test]
+fn req227_ac11_reprise_silencieuse_sans_option() {
+    let env = failed_after_three();
+    let o = env.ok(&["update"]);
+    assert_eq!(text(&o.stderr), "");
+    let out = text(&o.stdout);
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(out.trim_end().ends_with("0 fichiers à enrichir"), "{out}");
+
+    let env = failed_after_three();
+    let o = env.ok(&["update", "--verbose"]);
+    for line in text(&o.stderr).lines() {
+        let without_tokens = line.split(" (jetons").next().unwrap();
+        for word in [
+            "appels conservés",
+            "appel conservé",
+            "réponse gardée",
+            "cache",
+            "[1/2]",
+            "[2/2]",
+        ] {
+            assert!(
+                !without_tokens.contains(word) || line.starts_with("appels:"),
+                "{word} : {line}"
+            );
+        }
+        assert!(
+            !line.contains("[1/4]") && !line.contains("[2/4]") || !line.contains("llm enrich"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn req226_ac6_build_garde_les_lignes_et_la_suppression_du_fichier_les_purge() {
+    let env = failed_after_three();
+    assert_eq!(kept_rows(&env), 2);
+    env.ok(&["build", "--no-llm"]);
+    assert_eq!(
+        kept_rows(&env),
+        2,
+        "build réinitialise le graphe sans toucher aux lignes"
+    );
+    fs::remove_file(env.repo.join(BIG)).unwrap();
+    env.ok(&["update"]);
+    assert_eq!(kept_rows(&env), 0);
+}
+
+#[test]
+fn req227_ac7_apres_kill_9_les_appels_des_groupes_valides_ne_repartent_pas() {
+    let env = big_env(4);
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+        .env_remove("NEPHILA_MOCK_FAIL_AFTER")
+        .env("NEPHILA_MOCK_DELAY_MS", "300")
+        .env("NEPHILA_CONFIG", &env.config)
+        .env("NEPHILA_MOCK_DIR", &env.mock)
+        .env("NEPHILA_MOCK_LOG", &env.log)
+        .arg("-C")
+        .arg(&env.repo)
+        .arg("build")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        assert!(start.elapsed().as_secs() < 30, "aucun appel conservé");
+        if Store::open_readonly(&env.repo)
+            .is_ok_and(|s| s.call_results().is_ok_and(|r| !r.is_empty()))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let kept = kept_rows(&env);
+    assert!((1..4).contains(&kept), "{kept}");
+    assert_eq!(to_enrich(&env), 1);
+    env.ok(&["update"]);
+    assert_eq!(env.logged().len(), 4 - kept, "{:?}", env.logged());
+    assert_eq!(to_enrich(&env), 0);
+}

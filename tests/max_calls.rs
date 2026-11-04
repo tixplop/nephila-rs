@@ -634,3 +634,158 @@ fn req186_ac13_plus_de_cinquante_appels_donne_a6_seul() {
         "{err}"
     );
 }
+
+// ---- AC-227-5, AC-227-12 : appels conservés et plafonds ----
+
+fn sections_doc(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("# Section {i}\n\n{}\n\n", "mot ".repeat(40)))
+        .collect()
+}
+
+fn db(env: &Env) -> rusqlite::Connection {
+    rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap()
+}
+
+fn kept_rows(env: &Env) -> i64 {
+    db(env)
+        .query_row("SELECT COUNT(*) FROM enrich_calls", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Fabrique l'état « tous les appels conservés » de `big.md` (un échec réel ne le produit pas) :
+/// un déclencheur empêche la purge des lignes à la réussite, puis le fichier redevient « à
+/// enrichir ». Les réponses du mock sont vides : aucun concept ne change la liste des nœuds.
+fn keep_all(env: &Env) {
+    let o = env.run(&["build", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    db(env)
+        .execute_batch(
+            "CREATE TRIGGER keep BEFORE DELETE ON enrich_calls BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+    let o = env.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    let conn = db(env);
+    conn.execute_batch("DROP TRIGGER keep;").unwrap();
+    conn.execute("DELETE FROM enrichments WHERE path = 'big.md'", [])
+        .unwrap();
+}
+
+fn three_kept_of_five() -> Env {
+    let mut files = vec![
+        ("a1.md".to_string(), small(1)),
+        ("a2.md".to_string(), small(2)),
+    ];
+    files.push(("big.md".to_string(), sections_doc(5)));
+    let env = Env::mock(&files, "");
+    env.project(&format!("max_chunk_chars = {MAX_CHUNK}\n"));
+    let o = env.run(&["build", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    db(&env)
+        .execute_batch(
+            "CREATE TRIGGER keep BEFORE DELETE ON enrich_calls BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+    let o = env.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    let conn = db(&env);
+    conn.execute_batch("DROP TRIGGER keep;").unwrap();
+    conn.execute("DELETE FROM enrichments", []).unwrap();
+    conn.execute(
+        "DELETE FROM enrich_calls WHERE call_key IN (SELECT call_key FROM enrich_calls LIMIT 2)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(kept_rows(&env), 3);
+    env
+}
+
+#[test]
+fn req227_ac5_reservation_et_plafond_comptent_les_appels_a_envoyer() {
+    let big = vec!["big.md".to_string()];
+    // 5 appels dont 3 conservés, --max-calls 2 : deux appels, fichier enrichi, aucun plafond.
+    let env = three_kept_of_five();
+    fs::remove_file(env.repo.join("a1.md")).unwrap();
+    fs::remove_file(env.repo.join("a2.md")).unwrap();
+    let _ = fs::remove_file(&env.log);
+    let o = env.run(&["update", "--max-calls", "2"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert_eq!(env.calls().len(), 2, "{:?}", env.calls());
+    assert_eq!(env.enriched(&big), big);
+    assert!(
+        !err.contains("plafond") && !err.contains("trop d'appels"),
+        "{err}"
+    );
+    assert_eq!(kept_rows(&env), 0);
+
+    // --max-calls 1 : aucun appel, A-11 sur les 2 appels à envoyer, lignes gardées.
+    let env = three_kept_of_five();
+    fs::remove_file(env.repo.join("a1.md")).unwrap();
+    fs::remove_file(env.repo.join("a2.md")).unwrap();
+    let _ = fs::remove_file(&env.log);
+    let o = env.run(&["update", "--max-calls", "1"]);
+    let (_, err) = text(&o);
+    assert!(env.calls().is_empty(), "{:?}", env.calls());
+    assert!(
+        err.lines().any(|l| l.starts_with("avertissement: big.md : trop d'appels d'enrichissement (2 nécessaires, au plus 1 par commande), aucun envoyé ; ")),
+        "{err}"
+    );
+    assert!(env.enriched(&big).is_empty());
+    assert_eq!(kept_rows(&env), 3);
+
+    // Après deux petits documents, le reste du plafond (1) ne suffit pas pour 2 appels : la
+    // réservation est refusée, le fichier est laissé par le plafond (A-10), lignes gardées.
+    let env = three_kept_of_five();
+    let _ = fs::remove_file(&env.log);
+    let o = env.run(&["update", "--max-calls", "3"]);
+    let (_, err) = text(&o);
+    assert_eq!(env.calls().len(), 2, "{:?}", env.calls());
+    assert_eq!(last(&err), a10(3, 1), "{err}");
+    assert!(env.enriched(&big).is_empty());
+    assert_eq!(kept_rows(&env), 3);
+}
+
+#[test]
+fn req227_ac12_plafond_par_fichier_sur_le_plan_entier_et_tout_conserve() {
+    // Plan de 52 appels dont 3 conservés (clés quelconques) : A-6 passe avant toute lecture.
+    let env = Env::mock(&[("big.md".to_string(), sections_doc(52))], "");
+    env.project(&format!("max_chunk_chars = {MAX_CHUNK}\n"));
+    let o = env.run(&["build", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    for k in ["k1", "k2", "k3"] {
+        db(&env)
+            .execute(
+                "INSERT INTO enrich_calls(path, call_key, payload) VALUES ('big.md', ?1, '{\"v\":1,\"summaries\":[],\"concepts\":[],\"rejected\":[]}')",
+                [k],
+            )
+            .unwrap();
+    }
+    let _ = fs::remove_file(&env.log);
+    let o = env.run(&["update", "--max-calls", "49"]);
+    let (_, err) = text(&o);
+    assert!(env.calls().is_empty(), "{:?}", env.calls());
+    assert!(
+        err.lines().any(|l| l.starts_with("avertissement: big.md : trop d'appels d'enrichissement (52 nécessaires, au plus 50 par fichier), aucun envoyé ; ")),
+        "{err}"
+    );
+    assert!(!err.contains("par commande"), "{err}");
+    assert_eq!(kept_rows(&env), 3);
+
+    // Plan de 5 appels tous conservés, --max-calls 1 : aucun appel, fichier enrichi.
+    let env = Env::mock(&[("big.md".to_string(), sections_doc(5))], "");
+    env.project(&format!("max_chunk_chars = {MAX_CHUNK}\n"));
+    keep_all(&env);
+    assert_eq!(kept_rows(&env), 5);
+    let _ = fs::remove_file(&env.log);
+    let o = env.run(&["update", "--max-calls", "1"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert!(env.calls().is_empty(), "{:?}", env.calls());
+    assert_eq!(env.enriched(&["big.md".to_string()]).len(), 1);
+    assert!(
+        !err.contains("trop d'appels") && !err.contains("plafond"),
+        "{err}"
+    );
+}

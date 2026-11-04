@@ -428,6 +428,37 @@ fn req189_ac4_fichier_envoye_seul() {
     assert_eq!(d.last(), e27(1), "{}", d.stderr);
 }
 
+// ---- AC-227-7 : l'appel en vol à l'arrêt est conservé, la reprise n'envoie que les autres ----
+
+#[test]
+fn req227_ac7_reprise_apres_signal_ne_renvoie_que_les_appels_manquants() {
+    let server = Server::start(|_| Act::Ok(1000));
+    let env = Env::new(
+        &[("big.md".to_string(), big_doc())],
+        &server.base_url,
+        "concurrency = 1\nbatch_files = 1\nformat_retries = 0\n",
+    );
+    env.project(&format!("max_chunk_chars = {MAX_CHUNK}\n"));
+    let mut run = env.spawn(&["build"]);
+    wait_until("1 requête reçue", || server.requests() >= 1);
+    run.sigint();
+    let d = run.finish();
+    assert_eq!(d.code(), Some(130), "{}", d.stderr);
+    assert_eq!(server.requests(), 1, "{}", d.stderr);
+    assert_eq!(env.to_enrich(), 1);
+    assert_eq!(env.summarized_nodes("big.md"), 0);
+    assert_eq!(d.lines("avertissement: "), vec![A12], "{}", d.stderr);
+    assert_eq!(d.last(), e27(1), "{}", d.stderr);
+
+    let fast = Server::start(|_| Act::Ok(0));
+    env.set_url(&fast.base_url);
+    let u = env.run(&["update"]);
+    assert_eq!(u.code(), Some(0), "{}", u.stderr);
+    assert_eq!(fast.requests(), 2, "morceaux 2 et 3 : {}", u.stderr);
+    assert_eq!(env.enriched(&["big.md".to_string()]).len(), 1);
+    assert_eq!(env.to_enrich(), 0);
+}
+
 // ---- AC-189-5 : portée, `query ask` garde l'effet par défaut du signal ----
 
 #[test]

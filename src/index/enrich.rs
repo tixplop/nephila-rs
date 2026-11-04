@@ -12,6 +12,7 @@ use crate::chunk;
 use crate::error::{warn, Error, Result, TRUNCATED};
 use crate::index::build::{BuildReport, IndexOptions};
 use crate::index::estimate::{AloneCase, AloneFile, Estimate};
+use crate::llm::enrich::PromptVersions;
 use crate::llm::enrich::{
     enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt,
 };
@@ -22,7 +23,7 @@ use crate::llm::{
 use crate::model::{EdgeKind, FileRecord, Node, NodeKind, Ref};
 use crate::parse::markdown;
 use crate::progress::{self, Phase};
-use crate::store::{EnrichmentWrite, Store};
+use crate::store::{call_key, CallKeyParts, CallWrite, EnrichmentWrite, Store};
 use crate::trace;
 
 /// Seuil des erreurs réseau consécutives (saturations comprises) et des délais dépassés
@@ -311,8 +312,48 @@ pub(crate) fn form_units_by_nodes<'a>(
 /// fichiers de l'unité en cours qui ne sont pas encore partis (compté dans la trace du refus).
 type Take<'t> = &'t dyn Fn(usize, usize) -> bool;
 
+/// Appels conservés lus au début de la passe (REQ-226) : partagés en lecture seule par les fils,
+/// qui n'ont pas accès au `Store`.
+pub(crate) struct KeptCalls {
+    pub(crate) results: HashMap<String, Enrichment>,
+    pub(crate) model: String,
+    pub(crate) language: String,
+    pub(crate) versions: PromptVersions,
+}
+
+impl KeptCalls {
+    /// Clé d'un appel du plan d'un fichier envoyé seul.
+    #[allow(clippy::too_many_arguments)]
+    fn key(
+        &self,
+        path: &str,
+        index: usize,
+        count: usize,
+        excerpt: Option<Excerpt>,
+        part: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> String {
+        call_key(&CallKeyParts {
+            model: &self.model,
+            language: &self.language,
+            prompt_version: self.versions.of_path(path),
+            path,
+            rank: index,
+            total: count,
+            lines: excerpt.map(|e| (e.first_line, e.last_line)),
+            text: part,
+            requested,
+            known,
+        })
+    }
+}
+
 /// Suite d'une unité qui n'est pas un appel.
 enum Step<'a> {
+    /// Fichier envoyé seul dont des appels sont conservés : le message des résultats conservés,
+    /// puis les appels à envoyer (peut-être aucun).
+    Resumed(Msg<'a>, Vec<Unit<'a>>),
     /// Résultats par fichier, et l'erreur de l'appel (pour la politique) s'il y a eu un appel.
     Finished(Vec<Outcome>, Option<Option<Error>>),
     /// Des unités à mettre en tête de la file (appels d'un fichier envoyé seul, moitiés d'un lot
@@ -350,6 +391,7 @@ fn run_unit<'a>(
     totals: &Mutex<LlmTotals>,
     max_calls: Option<usize>,
     take: Take<'_>,
+    kept: &KeptCalls,
 ) -> Step<'a> {
     let pass = match unit {
         Unit::Lot(_, pass) => *pass,
@@ -388,17 +430,28 @@ fn run_unit<'a>(
                     Step::Finished(outcomes, None)
                 }
                 Ok(calls) => {
+                    let (calls, held) = split_kept(calls, kept);
                     let k = calls.len();
-                    if max_calls.is_some_and(|m| k > m) {
-                        // A-11 : plus d'appels que le plafond de la commande, aucun compte pris.
+                    // Appels conservés : ils ne prennent rien sur le plafond (REQ-227).
+                    let kept_msg = (!held.is_empty()).then(|| Msg::Kept {
+                        file: f,
+                        count: k + held.len(),
+                        results: held,
+                    });
+                    if k > 0 && max_calls.is_some_and(|m| k > m) {
+                        // A-11 : plus d'appels à envoyer que le plafond de la commande, aucun
+                        // compte pris.
                         let e = Error::CallsOverCap {
                             calls: k,
                             max: max_calls.unwrap_or(0),
                         };
                         outcomes.push(Outcome::Failed(f.path.clone(), e.clone()));
                         Step::Finished(outcomes, Some(Some(e)))
-                    } else if take(k, 1) {
-                        Step::Calls(outcomes, calls, None)
+                    } else if k == 0 || take(k, 1) {
+                        match kept_msg {
+                            Some(msg) => Step::Resumed(msg, calls),
+                            None => Step::Calls(outcomes, calls, None),
+                        }
                     } else {
                         // Réservation refusée : aucune issue, aucun appel mis en file.
                         Step::Finished(outcomes, None)
@@ -954,6 +1007,41 @@ fn plan_calls<'a>(
         .collect())
 }
 
+/// Sépare les appels du plan dont la réponse est conservée (rang à partir de 1 et réponse) des
+/// appels à envoyer, dans l'ordre du plan (REQ-227).
+fn split_kept<'a>(
+    calls: Vec<Unit<'a>>,
+    kept: &KeptCalls,
+) -> (Vec<Unit<'a>>, Vec<(usize, Enrichment)>) {
+    if kept.results.is_empty() {
+        return (calls, Vec::new());
+    }
+    let mut send = Vec::new();
+    let mut held = Vec::new();
+    for call in calls {
+        let found = match &call {
+            Unit::Call {
+                file,
+                index,
+                count,
+                excerpt,
+                part,
+                requested,
+                known,
+            } => kept
+                .results
+                .get(&kept.key(&file.path, *index, *count, *excerpt, part, requested, known))
+                .map(|x| (*index, x.clone())),
+            _ => None,
+        };
+        match found {
+            Some(h) => held.push(h),
+            None => send.push(call),
+        }
+    }
+    (send, held)
+}
+
 /// Un appel d'enrichissement avec ses nouveaux essais de format (REQ-038) ; le compte d'essais
 /// repart à 1 pour chaque appel et seul l'appel fautif est renvoyé.
 #[allow(clippy::too_many_arguments)]
@@ -1178,6 +1266,15 @@ enum Msg<'a> {
         index: usize,
         count: usize,
         result: Result<Enrichment>,
+        /// Clé de l'appel réussi d'un plan de 2 appels ou plus (REQ-226) ; calculée dans le fil
+        /// d'appel.
+        key: Option<String>,
+    },
+    /// Appels d'un fichier envoyé seul dont la réponse était conservée (rang à partir de 1).
+    Kept {
+        file: &'a FileRecord,
+        count: usize,
+        results: Vec<(usize, Enrichment)>,
     },
 }
 
@@ -1332,18 +1429,61 @@ fn flush_group(
     store: &mut Store,
     model: &str,
     language: &str,
+    pending_calls: &mut Vec<CallWrite>,
     pending: &mut Vec<EnrichmentWrite>,
     stop: &AtomicBool,
     write_error: &mut Option<Error>,
 ) {
-    if pending.is_empty() {
+    if pending_calls.is_empty() && pending.is_empty() {
         return;
     }
-    if let Err(e) = store.apply_enrichments(model, language, pending) {
+    if let Err(e) = store.apply_group(model, language, pending_calls, pending) {
         stop.store(true, Ordering::SeqCst);
         *write_error = Some(e);
     }
+    pending_calls.clear();
     pending.clear();
+}
+
+/// Entrée de `partials` d'un fichier envoyé seul, créée au premier message.
+fn partial_of<'p>(
+    partials: &'p mut HashMap<String, Partial>,
+    file: &FileRecord,
+    count: usize,
+) -> &'p mut Partial {
+    partials
+        .entry(file.path.clone())
+        .or_insert_with(|| Partial {
+            results: vec![None; count],
+            done: 0,
+            failed: false,
+        })
+}
+
+/// Fin commune des messages d'un fichier envoyé seul : quand tous les appels ont rendu, fusion
+/// dans l'ordre du plan et mise en file de l'écriture. Rend l'avance de la progression (1 si le
+/// fichier est complet).
+fn complete_file(
+    entry: &mut Partial,
+    file: &FileRecord,
+    count: usize,
+    succeeded: &mut usize,
+    write_error: &Option<Error>,
+    pending: &mut Vec<EnrichmentWrite>,
+    notes: &mut Vec<String>,
+) -> usize {
+    if entry.done != count {
+        return 0;
+    }
+    let parts: Vec<Enrichment> = entry.results.iter_mut().filter_map(Option::take).collect();
+    // Un seul appel : résultat tel quel, comme avant DEC-063.
+    let merged = if count == 1 {
+        parts.into_iter().next().unwrap_or_default()
+    } else {
+        chunk::merge_enrichments(parts)
+    };
+    queue_done(file, &merged, succeeded, write_error, pending, notes);
+    1
 }
 
 /// Références partagées par les fils d'enrichissement.
@@ -1363,6 +1503,8 @@ struct Ctx<'s, 'a> {
     max_calls: Option<usize>,
     /// Posé quand une prise sur le plafond est refusée : plus aucune unité nouvelle.
     capped: &'s AtomicBool,
+    /// Appels conservés au début de la passe.
+    kept: &'s KeptCalls,
 }
 
 /// Prise de `n` appels sur le plafond, sous le verrou de la politique. Au premier refus, écrit la
@@ -1412,6 +1554,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
         totals,
         max_calls,
         capped,
+        kept,
     } = ctx;
     while let Some(unit) = next_unit(shared, wake, stop, capped) {
         let mut expand = ExpandGuard {
@@ -1474,6 +1617,9 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                         .failed
                         .insert(file.path.clone());
                 }
+                let key = (result.is_ok() && count >= 2).then(|| {
+                    kept.key(&file.path, index, count, excerpt, &part, &requested, &known)
+                });
                 let result = result.map_err(truncation_advice);
                 (
                     Some(err),
@@ -1482,6 +1628,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                         index,
                         count,
                         result,
+                        key,
                     }),
                     Vec::new(),
                     false,
@@ -1499,8 +1646,10 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     totals,
                     max_calls,
                     &take,
+                    kept,
                 );
                 match step {
+                    Step::Resumed(msg, calls) => (None, Some(msg), calls, true),
                     Step::Finished(outcomes, call) => (
                         call,
                         (!outcomes.is_empty()).then_some(Msg::Outcomes(outcomes)),
@@ -1734,6 +1883,12 @@ pub(crate) fn enrich_pass(
         opts.format_retries,
     );
     let ids = nodes_by_file(store)?;
+    let kept = KeptCalls {
+        results: store.call_results()?,
+        model: llm.model().to_string(),
+        language: llm.summary_language().to_string(),
+        versions: store.prompt_versions(),
+    };
     let started = Instant::now();
     let failed_before = report.failed;
     let mut succeeded = 0usize;
@@ -1799,6 +1954,7 @@ pub(crate) fn enrich_pass(
             totals: &totals,
             max_calls,
             capped: &capped,
+            kept: &kept,
         };
         for _ in 0..workers {
             let tx = tx.clone();
@@ -1814,6 +1970,7 @@ pub(crate) fn enrich_pass(
         // Un message reçu, puis tous ceux déjà arrivés (sans attente), sont écrits en une seule
         // transaction avant d'attendre le suivant : aucune transaction ouverte pendant un appel.
         let mut pending: Vec<EnrichmentWrite> = Vec::new();
+        let mut pending_calls: Vec<CallWrite> = Vec::new();
         while let Ok(first) = rx.recv() {
             // Avertissements et progression de chaque message, émis après la validation du groupe.
             let mut advances: Vec<(Vec<String>, usize)> = Vec::new();
@@ -1847,55 +2004,69 @@ pub(crate) fn enrich_pass(
                         index,
                         count,
                         result,
+                        key,
                     } => {
-                        let entry = partials
-                            .entry(file.path.clone())
-                            .or_insert_with(|| Partial {
-                                results: vec![None; count],
-                                done: 0,
-                                failed: false,
-                            });
-                        // Résultat d'un fichier déjà en échec : ignoré.
-                        if !entry.failed {
-                            match result {
-                                Err(e) => {
-                                    entry.failed = true;
-                                    record_failure(
-                                        report,
-                                        &mut failures,
-                                        &mut notes,
-                                        file.path.clone(),
-                                        e,
-                                    );
-                                    adv = 1;
+                        let entry = partial_of(&mut partials, file, count);
+                        match result {
+                            Ok(x) => {
+                                // Un résultat valide est conservé même si le fichier est déjà en
+                                // échec (REQ-227), sauf erreur d'écriture.
+                                if let (Some(key), None) = (key, &write_error) {
+                                    pending_calls.push(CallWrite {
+                                        path: file.path.clone(),
+                                        key,
+                                        result: x.clone(),
+                                    });
                                 }
-                                Ok(x) => {
+                                if !entry.failed {
                                     entry.results[index - 1] = Some(x);
                                     entry.done += 1;
-                                    if entry.done == count {
-                                        let parts: Vec<Enrichment> = entry
-                                            .results
-                                            .iter_mut()
-                                            .filter_map(Option::take)
-                                            .collect();
-                                        // Un seul appel : résultat tel quel, comme avant DEC-063.
-                                        let merged = if count == 1 {
-                                            parts.into_iter().next().unwrap_or_default()
-                                        } else {
-                                            chunk::merge_enrichments(parts)
-                                        };
-                                        queue_done(
-                                            file,
-                                            &merged,
-                                            &mut succeeded,
-                                            &write_error,
-                                            &mut pending,
-                                            &mut notes,
-                                        );
-                                        adv = 1;
-                                    }
+                                    adv = complete_file(
+                                        entry,
+                                        file,
+                                        count,
+                                        &mut succeeded,
+                                        &write_error,
+                                        &mut pending,
+                                        &mut notes,
+                                    );
                                 }
                             }
+                            // Résultat d'un fichier déjà en échec : ignoré.
+                            Err(e) if !entry.failed => {
+                                entry.failed = true;
+                                record_failure(
+                                    report,
+                                    &mut failures,
+                                    &mut notes,
+                                    file.path.clone(),
+                                    e,
+                                );
+                                adv = 1;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Msg::Kept {
+                        file,
+                        count,
+                        results,
+                    } => {
+                        let entry = partial_of(&mut partials, file, count);
+                        if !entry.failed {
+                            for (index, x) in results {
+                                entry.results[index - 1] = Some(x);
+                                entry.done += 1;
+                            }
+                            adv = complete_file(
+                                entry,
+                                file,
+                                count,
+                                &mut succeeded,
+                                &write_error,
+                                &mut pending,
+                                &mut notes,
+                            );
                         }
                     }
                 }
@@ -1904,12 +2075,14 @@ pub(crate) fn enrich_pass(
             }
             if mode == PassMode::Collect {
                 pending.clear();
+                pending_calls.clear();
                 continue;
             }
             flush_group(
                 store,
                 llm.model(),
                 llm.summary_language(),
+                &mut pending_calls,
                 &mut pending,
                 stop,
                 &mut write_error,
@@ -4008,6 +4181,83 @@ mod tests {
         calls.sort_unstable();
         let expected: Vec<String> = (1..=8).map(|k| format!("Big.txt#{k}")).collect();
         assert_eq!(calls, expected);
+    }
+
+    /// Faux `Llm` de 6 appels à 3 fils : l'appel 1 échoue pendant que les appels 2 et 3 sont en
+    /// vol ; ceux-ci ne répondent qu'après l'échec (AC-227-2). Une barrière les réunit, aucune
+    /// attente n'est fixée en temps.
+    struct FailFirstWhileOthersFly {
+        barrier: std::sync::Barrier,
+        failed: AtomicBool,
+        calls: Mutex<Vec<usize>>,
+    }
+
+    impl Llm for FailFirstWhileOthersFly {
+        fn enrich(
+            &self,
+            _: &str,
+            call: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls.lock().unwrap().push(call);
+            if call > 3 {
+                return Ok(Enrichment::default());
+            }
+            self.barrier.wait();
+            if call == 1 {
+                self.failed.store(true, Ordering::SeqCst);
+                return Err(Error::Format("réponse non conforme".into()));
+            }
+            while !self.failed.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            // Laisse le fil de l'appel 1 poser l'échec du fichier avant de prendre un appel.
+            for _ in 0..5000 {
+                std::thread::yield_now();
+            }
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req227_ac2_appels_en_vol_apres_l_echec_conserves_les_suivants_ne_partent_pas() {
+        let (dir, files) = probe_repo(&[("Big.txt", 6)], 0);
+        let llm = FailFirstWhileOthersFly {
+            barrier: std::sync::Barrier::new(3),
+            failed: AtomicBool::new(false),
+            calls: Mutex::new(Vec::new()),
+        };
+        let (store, report, failures) = probe_run(&dir, &files, &llm, 3, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(names(&failures), ["Big.txt"]);
+        let mut sent = llm.calls.lock().unwrap().clone();
+        sent.sort_unstable();
+        assert_eq!(sent, [1, 2, 3], "l'appel 4 et les suivants ne partent pas");
+        assert_eq!(store.enriched_hash("Big.txt").unwrap(), None);
+        assert_eq!(
+            store.call_results().unwrap().len(),
+            2,
+            "appels 2 et 3 conservés"
+        );
+        drop(store);
+
+        let next = Probe::new(0, &[]);
+        let (store, report, failures) = probe_run(&dir, &files, &next, 3, 1);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        let mut calls = next.calls();
+        calls.sort_unstable();
+        assert_eq!(calls, ["Big.txt#1", "Big.txt#4", "Big.txt#5", "Big.txt#6"]);
+        assert!(store.enriched_hash("Big.txt").unwrap().is_some());
+        assert!(store.call_results().unwrap().is_empty());
     }
 
     #[test]
