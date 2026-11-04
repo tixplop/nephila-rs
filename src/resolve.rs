@@ -3469,52 +3469,83 @@ import q.R;",
     }
 
     const AC066_1_SEQUENCES: u64 = 300;
-    const AC066_1_PARTS: u64 = 4;
+    const AC066_1_PARTS: u64 = 10;
 
-    /// AC-066-1 (DEC-087) : le quart `k` (de 1 à 4) des 300 séquences, soit 75 séquences ; les
-    /// quatre quarts couvrent 0..300 sans recouvrement ni trou.
+    /// AC-066-1 (DEC-087) : la tranche `k` (de 1 à 10) des 300 séquences, soit 30 séquences ; les
+    /// dix tranches couvrent 0..300 sans recouvrement ni trou. Dix tranches de 2 à 4 s à deux fils, pour tenir
+    /// la limite de 10 s de chaque test quand deux tests tournent à la fois.
     fn ac066_1_part(k: u64) {
         let size = AC066_1_SEQUENCES / AC066_1_PARTS;
         let c = ac066_1_run((k - 1) * size..k * size);
         assert!(
-            c.incremental > 125,
-            "quart {k} : {} passes incrémentales",
+            c.incremental > 50,
+            "tranche {k} : {} passes incrémentales",
             c.incremental
         );
-        assert!(c.full > 3, "quart {k} : {} passes complètes", c.full);
+        assert!(c.full > 1, "tranche {k} : {} passes complètes", c.full);
         assert!(
             c.lifted > 0,
-            "quart {k} : aucune passe où une dépendance qui disparaît était mentionnée"
+            "tranche {k} : aucune passe où une dépendance qui disparaît était mentionnée"
         );
         assert!(
             c.lifted_incremental > 0,
-            "quart {k} : aucune passe incrémentale de ce cas"
+            "tranche {k} : aucune passe incrémentale de ce cas"
         );
         assert!(
-            c.edges_seen > 750,
-            "quart {k} : {} liens comparés",
+            c.edges_seen > 300,
+            "tranche {k} : {} liens comparés",
             c.edges_seen
         );
     }
 
     #[test]
-    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_1_of_4() {
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_1_of_10() {
         ac066_1_part(1);
     }
 
     #[test]
-    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_2_of_4() {
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_2_of_10() {
         ac066_1_part(2);
     }
 
     #[test]
-    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_3_of_4() {
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_3_of_10() {
         ac066_1_part(3);
     }
 
     #[test]
-    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_4_of_4() {
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_4_of_10() {
         ac066_1_part(4);
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_5_of_10() {
+        ac066_1_part(5);
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_6_of_10() {
+        ac066_1_part(6);
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_7_of_10() {
+        ac066_1_part(7);
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_8_of_10() {
+        ac066_1_part(8);
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_9_of_10() {
+        ac066_1_part(9);
+    }
+
+    #[test]
+    fn req066_ac1_incremental_pass_equals_full_pass_on_a_copy_part_10_of_10() {
+        ac066_1_part(10);
     }
 
     /// Comparaison d'un graphe réel et d'une copie passée par la passe complète ; rend le bilan

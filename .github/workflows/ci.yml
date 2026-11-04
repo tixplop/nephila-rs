@@ -51,7 +51,7 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --locked --color never --test-threads 1 --no-fail-fast
+      - run: cargo nextest run --locked --color never --test-threads 2 --no-fail-fast
 
   view:
     name: tests de la vue HTML (node)
@@ -62,7 +62,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - run: node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests/view/*.test.js'
+      - run: node --test --test-timeout=10000 --test-concurrency=2 --test-reporter=dot 'tests/view/*.test.js'
 
   deny:
     name: cargo deny (avis)

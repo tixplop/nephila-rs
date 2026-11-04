@@ -617,15 +617,15 @@ Les actions sont épinglées par SHA et Dependabot (`.github/dependabot.yml`) pr
 git tag v0.27.0 && git push origin v0.27.0
 ```
 
-Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), en série, avec une limite de temps par test (`.config/nextest.toml`) ; `cargo test` passe aussi.
+Les tests s'exécutent avec [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`), deux à la fois, avec une limite de temps par test (`.config/nextest.toml`) ; `cargo test` passe aussi.
 
 ```sh
-cargo nextest run --cargo-quiet --color never --test-threads 1 --no-fail-fast --status-level fail --final-status-level fail   # suite complète
+cargo nextest run --cargo-quiet --color never --test-threads 2 --no-fail-fast --status-level fail --final-status-level fail   # suite complète
 cargo fmt --all -- --check                                      # format
 cargo clippy -q --all-targets --color never -- -D warnings      # lint
 cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf       # performances
 cargo nextest run --release --cargo-quiet --color never --test-threads 1 --run-ignored only --success-output final perf_banc  # banc
-node --test --test-timeout=10000 --test-concurrency=1 --test-reporter=dot 'tests/view/*.test.js'   # logique de la vue HTML
+node --test --test-timeout=10000 --test-concurrency=2 --test-reporter=dot 'tests/view/*.test.js'   # logique de la vue HTML
 ```
 
 Sous macOS, les tests des noms de fichiers non UTF-8 ne vérifient rien (APFS les refuse) : seule la CI Linux les exécute.
