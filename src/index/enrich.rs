@@ -247,9 +247,15 @@ const MAX_NODES_PER_CALL: usize = 150;
 /// 4 appels d'affilée.
 const MAX_SPLIT_DEPTH: usize = 3;
 
-/// Découpe un appel tronqué : sa liste de nœuds en deux, les ⌈n/2⌉ premiers puis les autres, sur
-/// le même texte et le même extrait. `None` pour moins de 2 nœuds ou à la profondeur maximale.
-fn split_call<'a>(unit: &Unit<'a>) -> Option<Vec<Unit<'a>>> {
+/// Taille minimale, en caractères, du texte d'un appel tronqué pour qu'il soit coupé (REQ-230,
+/// non configurable) : en dessous, le texte n'explique pas la troncature.
+const MIN_SPLIT_CHARS: usize = 1000;
+
+/// Découpe un appel tronqué (REQ-230). Non Markdown : la liste de nœuds en deux (les ⌈n/2⌉
+/// premiers puis les autres) sur le même texte pour 2 nœuds ou plus, sinon le texte. Markdown :
+/// le texte, sinon la liste. `nodes` : `(identifiant, nom court)` des nœuds demandés. `None` si
+/// aucune coupe n'est possible ou à la profondeur maximale.
+fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Unit<'a>>> {
     let Unit::Call {
         file,
         index,
@@ -263,30 +269,97 @@ fn split_call<'a>(unit: &Unit<'a>) -> Option<Vec<Unit<'a>>> {
     else {
         return None;
     };
-    if requested.len() < 2 || path.len() >= MAX_SPLIT_DEPTH {
+    if path.len() >= MAX_SPLIT_DEPTH {
         return None;
     }
-    let (first, second) = requested.split_at(requested.len().div_ceil(2));
-    Some(
-        [first, second]
-            .into_iter()
+    let sub = |i: usize, excerpt: Option<Excerpt>, part: Arc<str>, requested: Vec<String>| {
+        let mut path = path.clone();
+        path.push(i + 1);
+        Unit::Call {
+            file,
+            index: *index,
+            count: *count,
+            excerpt,
+            part,
+            requested,
+            known: Arc::clone(known),
+            path,
+        }
+    };
+    let by_list = || {
+        let (first, second) = requested.split_at(requested.len().div_ceil(2));
+        Some(
+            [first, second]
+                .into_iter()
+                .enumerate()
+                .map(|(i, list)| sub(i, *excerpt, Arc::clone(part), list.to_vec()))
+                .collect(),
+        )
+    };
+    let by_text = || {
+        let c = part.chars().count();
+        if c < MIN_SPLIT_CHARS {
+            return None;
+        }
+        let spans = chunk::split_spans_for(&file.path, part, c.div_ceil(2));
+        if spans.len() < 2 {
+            return None;
+        }
+        let homes = section_homes(part, &spans, nodes);
+        let excerpts = excerpts_of(part, &spans);
+        let parts: Vec<String> = spans.into_iter().map(|(p, _)| p).collect();
+        let mut plan = call_plan(&parts, nodes, &homes);
+        retain_calls(&mut plan, &file.path, known);
+        if plan.is_empty() {
+            return None;
+        }
+        // En-tête répété du parent : lignes du texte hors lignes réelles de son extrait.
+        let (base, header) = match excerpt {
+            Some(e) => (
+                e.first_line,
+                part.lines()
+                    .count()
+                    .saturating_sub(e.last_line - e.first_line + 1),
+            ),
+            None => (1, 0),
+        };
+        let real = |rel: usize| (base + rel).saturating_sub(1 + header).max(base);
+        plan.into_iter()
             .enumerate()
-            .map(|(i, list)| {
-                let mut path = path.clone();
-                path.push(i + 1);
-                Unit::Call {
-                    file,
-                    index: *index,
-                    count: *count,
-                    excerpt: *excerpt,
-                    part: Arc::clone(part),
-                    requested: list.to_vec(),
-                    known: Arc::clone(known),
-                    path,
-                }
+            .map(|(i, (k, list))| {
+                let own = excerpts[k]?;
+                let (rank, total) = excerpt.map_or((own.rank, own.total), |e| (e.rank, e.total));
+                let first_line = real(own.first_line);
+                let e = Excerpt {
+                    rank,
+                    total,
+                    first_line,
+                    last_line: real(own.last_line).max(first_line),
+                };
+                Some(sub(i, Some(e), Arc::from(parts[k].as_str()), list))
             })
-            .collect(),
-    )
+            .collect::<Option<Vec<_>>>()
+    };
+    let markdown = crate::llm::enrich::is_markdown(&file.path);
+    let list_ok = requested.len() >= 2;
+    if markdown {
+        by_text().or_else(|| if list_ok { by_list() } else { None })
+    } else if list_ok {
+        by_list()
+    } else {
+        by_text()
+    }
+}
+
+/// Retire d'un plan d'appels ceux dont la liste de nœuds est vide, sauf pour un Markdown dont le
+/// fichier a au moins une section (`known` : tous les nœuds du fichier, REQ-159) : un morceau de
+/// suite peut porter des concepts citant des sections connues.
+fn retain_calls(plan: &mut Vec<(usize, Vec<String>)>, path: &str, known: &[String]) {
+    let keep_empty =
+        crate::llm::enrich::is_markdown(path) && known.iter().any(|id| id.starts_with("section:"));
+    if !keep_empty {
+        plan.retain(|(_, list)| !list.is_empty());
+    }
 }
 
 /// Nombre maximal d'appels d'enrichissement pour un fichier envoyé seul (DEC-059, non
@@ -1026,13 +1099,7 @@ fn plan_calls<'a>(
     let excerpts = excerpts_of(text, &spans);
     let parts: Vec<String> = spans.into_iter().map(|(part, _)| part).collect();
     let mut plan = call_plan(&parts, nodes, &homes);
-    // REQ-159 : un appel à liste vide ne peut rien apporter, sauf pour un Markdown à sections
-    // (un morceau de suite peut porter des concepts citant des sections connues).
-    let keep_empty = crate::llm::enrich::is_markdown(&file.path)
-        && nodes.iter().any(|(id, _)| id.starts_with("section:"));
-    if !keep_empty {
-        plan.retain(|(_, list)| !list.is_empty());
-    }
+    retain_calls(&mut plan, &file.path, &known);
     let count = plan.len();
     if count > MAX_CALLS_PER_FILE {
         return Err(Error::TooManyCalls {
@@ -1676,11 +1743,23 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     totals,
                     &take,
                 );
-                // Appel tronqué : sa liste de nœuds est coupée et les moitiés passent en tête de
-                // file (REQ-230). Pas de coupe possible, total au-delà de la borne : l'échec
+                // Appel tronqué : sa liste de nœuds ou son texte est coupé et les sous-appels
+                // passent en tête de file (REQ-230). Pas de coupe possible, total au-delà de la borne : l'échec
                 // ordinaire (A-5). Réservation refusée par le plafond : comme un essai refusé.
                 if matches!(result, Err(Error::Truncated(_))) {
-                    if let Some(subs) = split_call(&unit) {
+                    let nodes: Vec<(String, String)> = {
+                        let all = ids.get(&file.path).map(Vec::as_slice).unwrap_or_default();
+                        requested
+                            .iter()
+                            .map(|r| {
+                                all.iter()
+                                    .find(|(id, _)| id == r)
+                                    .cloned()
+                                    .unwrap_or_else(|| (r.clone(), String::new()))
+                            })
+                            .collect()
+                    };
+                    if let Some(subs) = split_call(&unit, &nodes) {
                         if reserve_split(shared, &file.path, count, subs.len()) {
                             if take(subs.len(), 0) {
                                 let added = subs.len() - 1;
@@ -5375,7 +5454,7 @@ mod tests {
     #[test]
     fn req230_split_call_coupe_la_liste_en_deux_sans_perte() {
         let ids = ["a", "b", "c", "d", "e"];
-        let subs = split_call(&call_of(&ids, &[2])).unwrap();
+        let subs = split_call(&call_of(&ids, &[2]), &[]).unwrap();
         let lists: Vec<(Vec<String>, Vec<usize>)> = subs
             .iter()
             .map(|u| match u {
@@ -5402,10 +5481,235 @@ mod tests {
                 (vec!["d".into(), "e".into()], vec![2, 2]),
             ]
         );
-        assert!(split_call(&call_of(&["a"], &[])).is_none());
-        assert!(split_call(&call_of(&[], &[])).is_none());
-        assert!(split_call(&call_of(&ids, &[1, 1, 1])).is_none());
-        assert!(split_call(&call_of(&ids, &[1, 1])).is_some());
+        assert!(split_call(&call_of(&["a"], &[]), &[]).is_none());
+        assert!(split_call(&call_of(&[], &[]), &[]).is_none());
+        assert!(split_call(&call_of(&ids, &[1, 1, 1]), &[]).is_none());
+        assert!(split_call(&call_of(&ids, &[1, 1]), &[]).is_some());
+    }
+
+    /// Appel factice sur `part`, avec l'extrait `excerpt` s'il y en a un.
+    fn text_call(
+        path: &str,
+        part: &str,
+        excerpt: Option<Excerpt>,
+        requested: &[&str],
+    ) -> Unit<'static> {
+        let known: Vec<&str> = requested.to_vec();
+        text_call_known(path, part, excerpt, requested, &known)
+    }
+
+    fn text_call_known(
+        path: &str,
+        part: &str,
+        excerpt: Option<Excerpt>,
+        requested: &[&str],
+        known: &[&str],
+    ) -> Unit<'static> {
+        let file: &'static FileRecord = Box::leak(Box::new(rec(path, 1)));
+        Unit::Call {
+            file,
+            index: 1,
+            count: 1,
+            excerpt,
+            part: Arc::from(part),
+            requested: requested.iter().map(|s| s.to_string()).collect(),
+            known: known.iter().map(|s| s.to_string()).collect(),
+            path: vec![],
+        }
+    }
+
+    fn numbered_lines(n: usize) -> String {
+        (1..=n).map(|i| format!("// ligne {i:0>50}\n")).collect()
+    }
+
+    fn named(list: &[&str]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|s| {
+                (
+                    s.to_string(),
+                    s.rsplit([':', '.']).next().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn unit_shape(u: &Unit<'_>) -> (Vec<String>, Option<Excerpt>, usize, Vec<usize>) {
+        match u {
+            Unit::Call {
+                requested,
+                excerpt,
+                part,
+                path,
+                ..
+            } => (
+                requested.clone(),
+                *excerpt,
+                part.chars().count(),
+                path.clone(),
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn req230_split_call_texte_un_noeud_sans_perte_ni_doublon() {
+        // Le nom du nœud ne figure que dans la seconde moitié : la première part est retirée.
+        let text = format!("{}    void zed() {{}}\n", numbered_lines(30));
+        let subs = split_call(
+            &text_call("A.java", &text, None, &["method:A.zed"]),
+            &named(&["method:A.zed"]),
+        )
+        .unwrap();
+        assert_eq!(subs.len(), 1);
+        let (list, e, chars, path) = unit_shape(&subs[0]);
+        let e = e.unwrap();
+        assert_eq!(list, ["method:A.zed"]);
+        assert!(chars < text.chars().count());
+        assert_eq!(path, [1]);
+        assert_eq!((e.rank, e.total), (3, 3));
+        // Dernière ligne réelle : 31 ; la première part de la seconde moitié est plus bas.
+        assert_eq!(e.last_line, 31);
+        assert!(e.first_line > 1);
+    }
+
+    #[test]
+    fn req230_split_call_texte_repartit_les_noeuds_une_fois() {
+        let text = format!(
+            "    void aa() {{}}\n{}    void bb() {{}}\n",
+            numbered_lines(30)
+        );
+        let subs = split_call(
+            &text_call("A.java", &text, None, &["method:A.aa"]),
+            &named(&["method:A.aa"]),
+        )
+        .unwrap();
+        assert_eq!(subs.len(), 1);
+        let both = named(&["method:A.aa", "method:A.bb"]);
+        // Deux nœuds : liste coupée, non le texte.
+        let by_list = split_call(
+            &text_call("A.java", &text, None, &["method:A.aa", "method:A.bb"]),
+            &both,
+        )
+        .unwrap();
+        assert_eq!(by_list.len(), 2);
+        assert_eq!(unit_shape(&by_list[0]).2, text.chars().count());
+        // Markdown à deux nœuds : le texte d'abord, chacun dans la seule part qui le contient.
+        let md = format!("# Aa\n{}# Bb\n{}", numbered_lines(15), numbered_lines(15));
+        let nodes = vec![
+            ("section:D.md#aa".to_string(), "aa".to_string()),
+            ("section:D.md#bb".to_string(), "bb".to_string()),
+        ];
+        let subs = split_call(
+            &text_call("D.md", &md, None, &["section:D.md#aa", "section:D.md#bb"]),
+            &nodes,
+        )
+        .unwrap();
+        let lists: Vec<Vec<String>> = subs.iter().map(|u| unit_shape(u).0).collect();
+        assert_eq!(lists, [vec!["section:D.md#aa"], vec!["section:D.md#bb"]]);
+        assert!(subs.iter().all(|u| unit_shape(u).2 < md.chars().count()));
+    }
+
+    #[test]
+    fn req230_split_call_texte_trop_court_ou_une_ligne_ne_se_coupe_pas() {
+        let short = numbered_lines(10);
+        assert!(short.chars().count() < MIN_SPLIT_CHARS);
+        assert!(split_call(
+            &text_call("A.java", &short, None, &["type:A"]),
+            &named(&["type:A"])
+        )
+        .is_none());
+        let one_line = format!("class A {{ {} }}", "x".repeat(2000));
+        assert!(split_call(
+            &text_call("A.java", &one_line, None, &["type:A"]),
+            &named(&["type:A"])
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn req230_split_call_lignes_reelles_d_un_parent_avec_en_tete_repete() {
+        // Parent : morceau 2 d'un gros fichier, extrait 2/3 lignes 101-160, en-tête de 2 lignes.
+        // Le nom `zed` est à la ligne 40 du corps, `zee` à la ligne 59.
+        let mut body: Vec<String> = (1..=60).map(|i| format!("// ligne {i:0>50}\n")).collect();
+        body[39] = format!("// zed {:0>52}\n", "");
+        body[58] = format!("// zee {:0>52}\n", "");
+        let text = format!("package p;\nclass Aa {{\n{}", body.concat());
+        let parent = Excerpt {
+            rank: 2,
+            total: 3,
+            first_line: 101,
+            last_line: 160,
+        };
+        // Le corps se coupe en 3 : lignes 1-29 (corps), 30-58, 59-60, soit les lignes réelles
+        // 101-129, 130-158 et 159-160 une fois l'en-tête (2 lignes) retiré.
+        for (node, first, last) in [
+            ("type:Aa", 101, 129),
+            ("method:A.zed", 130, 158),
+            ("method:A.zee", 159, 160),
+        ] {
+            let subs = split_call(
+                &text_call("A.java", &text, Some(parent), &[node]),
+                &named(&[node]),
+            )
+            .unwrap();
+            assert_eq!(subs.len(), 1, "{node}");
+            let (list, e, _, _) = unit_shape(&subs[0]);
+            let e = e.unwrap();
+            assert_eq!(list, [node]);
+            assert_eq!((e.rank, e.total), (2, 3), "k/n du parent");
+            assert_eq!((e.first_line, e.last_line), (first, last), "{node}");
+        }
+    }
+
+    #[test]
+    fn req230_split_call_markdown_trois_morceaux_sans_perte() {
+        let sec = |t: &str| {
+            format!(
+                "# {t}\n\n{}\n",
+                "Du texte de section qui remplit les lignes.\n".repeat(8)
+            )
+        };
+        let md = format!("{}{}{}", sec("Alpha"), sec("Beta"), sec("Gamma"));
+        let ids = [
+            "section:D.md#alpha",
+            "section:D.md#beta",
+            "section:D.md#gamma",
+        ];
+        let subs = split_call(
+            &text_call("D.md", &md, None, &ids),
+            &[
+                (ids[0].to_string(), "alpha".to_string()),
+                (ids[1].to_string(), "beta".to_string()),
+                (ids[2].to_string(), "gamma".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(subs.len(), 3);
+        let shapes: Vec<_> = subs.iter().map(unit_shape).collect();
+        let paths: Vec<_> = shapes.iter().map(|s| s.3.clone()).collect();
+        assert_eq!(paths, [vec![1], vec![2], vec![3]]);
+        let mut all: Vec<String> = shapes.iter().flat_map(|s| s.0.clone()).collect();
+        all.sort();
+        assert_eq!(all, ids);
+    }
+
+    #[test]
+    fn req230_split_call_markdown_a_sections_garde_le_morceau_a_liste_vide() {
+        // Le morceau n'a plus de nœud demandé, mais le fichier a des sections (REQ-159).
+        let text = numbered_lines(30);
+        let subs = split_call(
+            &text_call_known("D.md", &text, None, &[], &["section:D.md#a"]),
+            &[],
+        )
+        .unwrap();
+        assert!(subs.len() >= 2);
+        assert!(subs.iter().all(|u| unit_shape(u).0.is_empty()));
+        // Sans section dans le fichier, les parts vides sont retirées : aucune coupe.
+        assert!(split_call(
+            &text_call_known("D.md", &text, None, &[], &["document:D.md"]),
+            &[]
+        )
+        .is_none());
     }
 }
 

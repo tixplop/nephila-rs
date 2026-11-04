@@ -1322,3 +1322,164 @@ fn req230_ac8_sous_appel_en_echec_ne_garde_pas_les_appels_du_sous_plan() {
     assert_eq!(s.posts().len(), 3, "{}", err(&o));
     assert_eq!(kept_calls(&s), 0);
 }
+
+/// Classe Java à un seul nœud (`type:A`), sur `n` lignes de commentaire.
+fn one_node_text(n: usize) -> String {
+    let mut t = String::from("public class A {\n");
+    for i in 0..n {
+        t.push_str(&format!(
+            "    // commentaire numéro {i:04} qui remplit la ligne\n"
+        ));
+    }
+    t.push_str("}\n");
+    t
+}
+
+fn extract_of(body: &str) -> String {
+    let t = user_text(body);
+    let start = t.find("(extrait").expect("extrait");
+    t[start..].split(')').next().unwrap().to_string() + ")"
+}
+
+#[test]
+fn req230_ac3_un_noeud_texte_coupe() {
+    let p = "openai";
+    let s = Setup::new(
+        p,
+        vec![trunc(p), ok_for(p, &[("type:A", "Classe A coupée.")])],
+        "",
+    );
+    let text = one_node_text(30);
+    // L'en-tête répété (déclaration du type) réduit le budget des morceaux suivants : 3 morceaux.
+    let spans = nephila::chunk::split_spans_for("A.java", &text, text.chars().count().div_ceil(2));
+    let total = spans.len();
+    assert!(text.chars().count() >= 1000);
+    assert_eq!(total, 3);
+    s.write("A.java", &text);
+    let o = s.run(&["build"]);
+    let posts = s.posts();
+    assert_eq!(posts.len(), 2, "{}", err(&o));
+    assert_eq!(listed(&posts[1]), ["type:A"]);
+    let (first, second) = (content_of(&posts[0]), content_of(&posts[1]));
+    assert!(second.len() < first.len(), "texte plus court");
+    let lines = second.trim_matches('\n').lines().count();
+    assert_eq!(
+        extract_of(&posts[1]),
+        format!("(extrait 1/{total}, lignes 1–{lines})")
+    );
+    assert_eq!(s.summary_of("type:A").as_deref(), Some("Classe A coupée."));
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(s.to_enrich(), 0);
+}
+
+#[test]
+fn req230_ac4_markdown_texte_coupe_et_liste_coupee_sous_mille() {
+    let p = "openai";
+    let md_reply = |sec: &str, concept: &str| {
+        let text =
+            serde_json::json!({"version": 2, "summaries": [{"node": sec, "summary": "Résumé."}],
+            "concepts": [{"name": concept, "summary": "Un concept.", "sections": [sec]}]})
+            .to_string();
+        openai_reply(&text, Some("stop"))
+    };
+    let body = |t: &str, n: usize| {
+        format!(
+            "# {t}\n\n{}\n",
+            "Du texte de section qui remplit les lignes.\n".repeat(n)
+        )
+    };
+    // Alpha + Beta et Gamma font exactement la moitié du texte chacun : 2 morceaux.
+    let doc = format!(
+        "{}{}{}{}",
+        body("Alpha", 6),
+        body("Beta", 6),
+        body("Gamma", 12),
+        "x".repeat(9)
+    );
+    let half = doc.chars().count().div_ceil(2);
+    assert!(doc.chars().count() >= 1000);
+    assert_eq!(nephila::chunk::split_spans_for("D.md", &doc, half).len(), 2);
+    let s = Setup::new(
+        p,
+        vec![
+            trunc(p),
+            md_reply("section:D.md#alpha", "Concept commun"),
+            md_reply("section:D.md#gamma", "Concept commun"),
+        ],
+        "",
+    );
+    s.write("D.md", &doc);
+    let o = s.run(&["build"]);
+    let posts = s.posts();
+    assert_eq!(posts.len(), 3, "{}", err(&o));
+    let all = listed(&posts[0]);
+    assert_eq!(all.len(), 4, "{all:?}");
+    let mut seen: Vec<String> = posts[1..].iter().flat_map(|b| listed(b)).collect();
+    seen.sort();
+    let mut want = all.clone();
+    want.sort();
+    assert_eq!(seen, want, "chaque section une seule fois");
+    for b in &posts[1..] {
+        let c = content_of(b);
+        assert!(c.len() < content_of(&posts[0]).len());
+        for id in listed(b).into_iter().filter(|i| i.starts_with("section:")) {
+            let title = ["Alpha", "Beta", "Gamma"]
+                .iter()
+                .find(|t| id.to_lowercase().ends_with(&t.to_lowercase()))
+                .unwrap();
+            assert!(c.contains(&format!("# {title}")), "{id} dans sa part");
+        }
+    }
+    assert!(o.status.success(), "{}", err(&o));
+    // Concepts fusionnés par nom : un seul nœud, cité depuis les sections des deux parts.
+    let store = nephila::store::Store::open_readonly(&s.repo).unwrap();
+    let names: Vec<String> = store
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.id.starts_with("concept:"))
+        .map(|n| n.id)
+        .collect();
+    assert_eq!(names, ["concept:concept commun"]);
+    let edges = store.edges().unwrap();
+    for sec in ["section:D.md#alpha", "section:D.md#gamma"] {
+        assert!(
+            edges.iter().any(|e| e.source == sec
+                && e.target == "concept:concept commun"
+                && e.kind == nephila::model::EdgeKind::Mentions),
+            "{sec} cite le concept"
+        );
+    }
+
+    // Sous 1 000 caractères : la liste est coupée, même texte dans les deux sous-appels.
+    let small = "# Alpha\n\nun\n\n# Beta\n\ndeux\n\n# Gamma\n\ntrois\n";
+    let s = Setup::new(
+        p,
+        vec![
+            trunc(p),
+            md_reply("section:D.md#alpha", "c1"),
+            md_reply("section:D.md#gamma", "c2"),
+        ],
+        "",
+    );
+    s.write("D.md", small);
+    let o = s.run(&["build"]);
+    let posts = s.posts();
+    assert_eq!(posts.len(), 3, "{}", err(&o));
+    assert_eq!(content_of(&posts[1]), content_of(&posts[0]));
+    assert_eq!(content_of(&posts[2]), content_of(&posts[0]));
+    assert_eq!(listed(&posts[1]).len() + listed(&posts[2]).len(), 4);
+}
+
+#[test]
+fn req230_ac5_un_noeud_sur_une_seule_ligne_une_requete() {
+    let s = Setup::new("openai", many("openai", 3), "");
+    s.write(
+        "A.java",
+        &format!("public class A {{ /* {} */ }}\n", "x".repeat(3000)),
+    );
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 1, "{}", err(&o));
+    assert!(err(&o).contains(&a5("A.java")), "{}", err(&o));
+}
