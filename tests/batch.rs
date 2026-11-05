@@ -468,7 +468,9 @@ fn req027_ac10_lot_traces_are_paired_and_contain_no_content() {
         assert!(start < end);
         let n = extra + 1;
         assert!(
-            lines[end].contains(&format!("ok ({n} résumés, 0 concepts)")),
+            lines[end].contains(&format!(
+                "ok ({n} résumés, 0 concepts, {n}/{n} nœuds résumés)"
+            )),
             "{}",
             lines[end]
         );

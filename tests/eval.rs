@@ -1192,6 +1192,18 @@ fn req222_ac1_first_try_counts_crossing_threads() {
     assert_eq!(m["first_try_rate"], 0.3333);
 }
 
+/// Même trace que `CROSSING`, avec le segment de couverture dans les fins `ok` (REQ-235).
+#[test]
+fn req235_ac12_parse_calls_keeps_result_with_coverage_segment() {
+    let with_segment = CROSSING.replace(
+        "(1 résumés, 0 concepts)",
+        "(1 résumés, 0 concepts, 1/2 nœuds résumés)",
+    );
+    assert_ne!(with_segment, CROSSING);
+    assert_eq!(parse_calls(&with_segment), parse_calls(CROSSING));
+    assert_eq!(parse_calls(&with_segment), (3, 1));
+}
+
 #[test]
 fn req222_ac2_mock_malformed_costs_one_retry() {
     let mini = Mini::new();

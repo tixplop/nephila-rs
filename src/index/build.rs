@@ -460,6 +460,11 @@ pub(crate) fn warn_transient(cli_filters: &Filters) {
     }
 }
 
+/// Segment de couverture (REQ-235) : `<n>/<m> nœuds résumés`, seul endroit qui l'écrit.
+pub(crate) fn coverage_segment(n: usize, m: usize) -> String {
+    format!("{n}/{m} nœuds résumés")
+}
+
 /// Écrit la ligne de bilan sur stdout ; en cas d'échec (E-17), la commande s'arrête là.
 pub(crate) fn write_report(out: &mut Out, report: &BuildReport, verb: &str) -> Result<()> {
     writeln!(out, "{}", report.line_for(verb))

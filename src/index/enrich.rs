@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::chunk;
 use crate::error::{warn, Error, Result, TRUNCATED};
-use crate::index::build::{BuildReport, IndexOptions};
+use crate::index::build::{coverage_segment, BuildReport, IndexOptions};
 use crate::index::estimate::{AloneCase, AloneFile, Estimate};
 use crate::llm::enrich::PromptVersions;
 use crate::llm::enrich::{
@@ -858,11 +858,19 @@ fn traced_enrich(
     add_totals(totals, &stats, attempt);
     let tokens = tokens_suffix(&stats);
     match &result {
-        Ok(x) => trace!(
-            "llm enrich fin {path} [{index}/{total}] ok ({} résumés, {} concepts) {ms} ms{tokens}{mark}",
-            x.summaries.len(),
-            x.concepts.len()
-        ),
+        Ok(x) => {
+            let n = x
+                .summaries
+                .iter()
+                .filter(|(id, _)| requested.contains(id))
+                .count();
+            trace!(
+                "llm enrich fin {path} [{index}/{total}] ok ({} résumés, {} concepts, {}) {ms} ms{tokens}{mark}",
+                x.summaries.len(),
+                x.concepts.len(),
+                coverage_segment(n, requested.len())
+            )
+        }
         // Essai refusé par le plafond ou requête mise de côté (mode lot) : ni appel ni fin à tracer.
         Err(Error::Capped | Error::Deferred) => {}
         Err(e) => trace!(
@@ -952,7 +960,11 @@ fn traced_lot_once(
                 .fold((0, 0), |(r, k), x| {
                     (r + x.summaries.len(), k + x.concepts.len())
                 });
-            trace!("llm enrich fin {label} [1/1] ok ({r} résumés, {k} concepts) {ms} ms{tokens}")
+            let m: usize = items.iter().map(|i| i.node_ids.len()).sum();
+            trace!(
+                "llm enrich fin {label} [1/1] ok ({r} résumés, {k} concepts, {}) {ms} ms{tokens}",
+                coverage_segment(r, m)
+            )
         }
         // Essai refusé par le plafond ou requête mise de côté (mode lot) : ni appel ni fin à tracer.
         Err(Error::Capped | Error::Deferred) => {}
