@@ -13,6 +13,10 @@ use std::process::{Command, Output};
 mod plan_server;
 use plan_server::{Act, Server};
 
+#[allow(dead_code)]
+#[path = "support/fake_server.rs"]
+mod fake_server;
+
 const KEY_VAR: &str = "NEPHILA_T277_KEY";
 
 fn a10(m: usize, f: usize) -> String {
@@ -788,4 +792,40 @@ fn req227_ac12_plafond_par_fichier_sur_le_plan_entier_et_tout_conserve() {
         !err.contains("trop d'appels") && !err.contains("plafond"),
         "{err}"
     );
+}
+
+// ---- AC-232-12 : lot tronqué récupéré et plafond ----
+
+#[test]
+fn req232_ac12_lot_tronque_recupere_puis_plafond_laisse_le_reste() {
+    let entry = |i: usize| {
+        serde_json::json!({
+            "file": format!("d{i}.md"),
+            "summaries": [{"node": format!("document:d{i}.md"), "summary": format!("Résumé {i}.")}],
+            "concepts": []
+        })
+        .to_string()
+    };
+    let partial = format!(
+        r#"{{"version": 3, "files": [{},{},{{"file": "d3.md", "summ"#,
+        entry(1),
+        entry(2)
+    );
+    let reply = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": partial}, "finish_reason": "length"}]
+    })
+    .to_string();
+    let server = fake_server::FakeServer::start(vec![(200, reply)]);
+    let env = Env::server(&docs(4), &server.base_url, "batch_files = 4\n");
+    let o = env.run(&["build", "--max-calls", "1"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let posts = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .count();
+    assert_eq!(posts, 1, "{err}");
+    assert_eq!(env.enriched(&names(4)), names(2), "{err}");
+    assert_eq!(lines_of(&err, "avertissement:"), vec![a10(1, 2)], "{err}");
 }

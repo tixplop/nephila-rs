@@ -15,6 +15,7 @@ use crate::index::estimate::{AloneCase, AloneFile, Estimate};
 use crate::llm::enrich::PromptVersions;
 use crate::llm::enrich::{
     enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt,
+    parse_lot_partial,
 };
 use crate::llm::{
     calls_line, tokens_segment, with_format_retries, CallStats, Enrichment, Excerpt, FormatFault,
@@ -597,7 +598,28 @@ fn run_unit<'a>(
                     node_ids: node_ids(f),
                 })
                 .collect();
-            match traced_lot(llm, &items, retries, stop, totals, take) {
+            let result = traced_lot(llm, &items, retries, stop, totals, take);
+            // Lot tronqué avec au moins une entrée complète : ces fichiers sont gardés et seul le
+            // reste repart en un lot réduit, de même passage (REQ-232, DEC-175). Sans entrée
+            // complète, la réponse est oubliée et les moitiés ci-dessous s'appliquent.
+            if let Err(Error::Truncated { partial, .. }) = &result {
+                let results = parse_lot_partial(partial, &items).into_results();
+                if results.iter().any(|(_, r)| r.is_ok()) {
+                    let mut rest: Vec<&'a FileRecord> = Vec::new();
+                    for ((f, _), (_, r)) in readable.iter().zip(results) {
+                        match r {
+                            Ok(x) => outcomes.push(Outcome::Done((*f).clone(), x)),
+                            Err(_) => rest.push(f),
+                        }
+                    }
+                    return if rest.is_empty() {
+                        Step::Finished(outcomes, None)
+                    } else {
+                        Step::Calls(outcomes, vec![Unit::Lot(rest, pass)], None)
+                    };
+                }
+            }
+            match result {
                 // Lot tronqué (REQ-096, DEC-101), ou de 4 fichiers ou plus encore non conforme au
                 // premier passage (REQ-200, DEC-161 (4)) : deux moitiés remises en tête de file ;
                 // aucune issue pour le lot lui-même, ses fichiers en recevront par leurs moitiés.
@@ -5424,6 +5446,101 @@ mod tests {
         assert_eq!(*llm.calls.lock().unwrap(), ["A:1", "B:1", "C:2", "C:1"]);
         assert_eq!(names(&failures), ["A", "B", "C"]);
         assert!(failures.iter().all(|(_, e)| matches!(e, Error::Network(_))));
+        assert!(report
+            .stop_cause
+            .as_deref()
+            .is_some_and(|c| c.contains("panne réseau répétée")));
+    }
+
+    /// Lots de deux fichiers : les deux premiers et le deuxième échouent sur le réseau, le
+    /// troisième est tronqué avec l'entrée de `E` complète.
+    struct LotPartial {
+        calls: Mutex<Vec<String>>,
+        /// L'entrée de `F` est aussi complète : rien ne repart.
+        all: bool,
+    }
+
+    impl Llm for LotPartial {
+        fn enrich(
+            &self,
+            file: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls.lock().unwrap().push(file.to_string());
+            Err(net())
+        }
+        fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            let name: Vec<&str> = items.iter().map(|i| i.file.as_str()).collect();
+            self.calls.lock().unwrap().push(name.join("+"));
+            if name[0] == "E" {
+                let cut = if self.all {
+                    r#"{"file": "F", "summaries": [{"node": "F.w0", "summary": "Résumé F."}], "concepts": []}, {"file": "G"#
+                } else {
+                    r#"{"file": "F", "summ"#
+                };
+                let partial = format!(
+                    r#"{{"version": 3, "files": [{{"file": "E", "summaries": [{{"node": "E.w0", "summary": "Résumé E."}}], "concepts": []}}, {cut}"#
+                );
+                return Err(Error::Truncated {
+                    message: "réponse tronquée par la limite de jetons".into(),
+                    partial,
+                });
+            }
+            Err(net())
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req232_ac16_lot_tronque_recupere_ne_remet_pas_les_erreurs_reseau_a_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for f in ["A", "B", "C", "D", "E", "F", "G", "H"] {
+            std::fs::write(dir.path().join(f), "w0 x\n").unwrap();
+            files.push(rec(f, 5));
+        }
+        let llm = LotPartial {
+            calls: Mutex::new(Vec::new()),
+            all: false,
+        };
+        let (store, report, failures) =
+            probe_run_extra(&dir, &files, &llm, 1, 2, None, 0, PassMode::Normal, &[]);
+        // Deux lots en erreur réseau, le lot tronqué récupéré (E gardé, F repart seul), puis
+        // l'erreur réseau de F : la troisième arrête l'envoi, G et H ne partent pas.
+        assert_eq!(*llm.calls.lock().unwrap(), ["A+B", "C+D", "E+F", "F"]);
+        assert_eq!(names(&failures), ["A", "B", "C", "D", "F"]);
+        assert!(store.enriched_hash("E").unwrap().is_some());
+        assert!(report
+            .stop_cause
+            .as_deref()
+            .is_some_and(|c| c.contains("panne réseau répétée")));
+    }
+
+    #[test]
+    fn req232_ac16_lot_tronque_tout_recu_ne_remet_pas_les_erreurs_reseau_a_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for f in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] {
+            std::fs::write(dir.path().join(f), "w0 x\n").unwrap();
+            files.push(rec(f, 5));
+        }
+        let llm = LotPartial {
+            calls: Mutex::new(Vec::new()),
+            all: true,
+        };
+        let (store, report, failures) =
+            probe_run_extra(&dir, &files, &llm, 1, 2, None, 0, PassMode::Normal, &[]);
+        // Deux lots en erreur réseau, le lot tronqué dont tout est reçu (rien ne repart), puis
+        // l'erreur réseau de G+H : la troisième arrête l'envoi, I et J ne partent pas.
+        assert_eq!(*llm.calls.lock().unwrap(), ["A+B", "C+D", "E+F", "G+H"]);
+        assert_eq!(names(&failures), ["A", "B", "C", "D", "G", "H"]);
+        assert!(store.enriched_hash("E").unwrap().is_some());
+        assert!(store.enriched_hash("F").unwrap().is_some());
         assert!(report
             .stop_cause
             .as_deref()

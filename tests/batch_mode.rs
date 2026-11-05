@@ -2467,3 +2467,34 @@ fn req230_ac10_appel_tronque_en_mode_lot_deux_requetes_dans_le_lot_suivant() {
         out(&d)
     );
 }
+
+#[test]
+fn req232_ac15_lot_tronque_avec_entrees_completes_second_lot_du_reste() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "batch_files = 4\n", &NAMES, 0, |b| {
+            if names_in(b).len() == 4 {
+                let mut text = lot(&["a", "b"]);
+                text.truncate(text.len() - 2);
+                text.push_str(r#",{"file": "docs/c.md", "summaries": [{"node": "doc"#);
+                Outcome::Truncated(text)
+            } else {
+                good(b)
+            }
+        });
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let lots = fx.server.lots();
+        assert_eq!(lots.len(), 2, "{provider}");
+        assert_eq!(lots[1].len(), 1, "{provider}");
+        assert_eq!(names_in(&lots[1][0]), ["c", "d"], "{provider}");
+        assert_eq!(fx.env.to_enrich(), 0, "{provider}");
+        for n in NAMES {
+            assert_eq!(fx.summary_of(n), Some(summary_text(n)), "{provider}");
+        }
+        assert!(
+            !err(&o).contains("avertissement: docs"),
+            "{provider} : {}",
+            err(&o)
+        );
+    }
+}

@@ -1808,3 +1808,279 @@ fn req232_ac17_ask_tronquee_au_texte_conforme_reste_refusee() {
         assert_eq!(err(&o), format!("{E11}\n"), "{p}");
     }
 }
+
+// ---- REQ-232 : lot tronqué, entrées complètes gardées, seul le reste repart ----
+
+/// Réponse de lot tronquée : les entrées complètes de `complete`, puis `cut` (début d'entrée).
+fn lot_partial_text(complete: &[&str], cut: &str) -> String {
+    let entries: Vec<String> = complete
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "file": format!("{n}.java"),
+                "summaries": [{"node": format!("type:{n}"), "summary": format!("Classe {n} centrale.")}],
+                "concepts": []
+            })
+            .to_string()
+        })
+        .collect();
+    let sep = if entries.is_empty() { "" } else { "," };
+    format!(
+        r#"{{"version": 3, "files": [{}{sep}{cut}"#,
+        entries.join(",")
+    )
+}
+
+fn trunc_text(p: &str, text: &str) -> String {
+    match p {
+        "anthropic" => anthropic_reply(text, Some("max_tokens")),
+        _ => openai_reply(text, Some("length")),
+    }
+}
+
+fn ok_text(p: &str, text: &str) -> String {
+    match p {
+        "anthropic" => anthropic_reply(text, Some("end_turn")),
+        _ => openai_reply(text, Some("stop")),
+    }
+}
+
+const CUT_C: &str = r#"{"file": "C.java", "summaries": [{"node": "type:C", "summ"#;
+
+fn assert_all_summaries(s: &Setup, p: &str) {
+    for n in ["A", "B", "C", "D"] {
+        assert_eq!(
+            s.summary_of(&format!("type:{n}")),
+            Some(format!("Classe {n} centrale.")),
+            "{p} {n}"
+        );
+    }
+}
+
+#[test]
+fn req232_ac3_entrees_a_et_b_gardees_seul_le_reste_repart() {
+    for p in ["anthropic", "openai"] {
+        let replies = vec![
+            trunc_text(p, &lot_partial_text(&["A", "B"], CUT_C)),
+            ok_text(p, &lot_reply(&["C", "D"])),
+        ];
+        let s = Setup::new(p, replies, "batch_files = 4\n");
+        four_docs(&s);
+        let o = s.run(&["build"]);
+        assert!(o.status.success(), "{p} {}", err(&o));
+        let posts = s.posts();
+        assert_eq!(posts.len(), 2, "{p} {}", err(&o));
+        assert_eq!(files_in(&posts[0]), ["A", "B", "C", "D"], "{p}");
+        assert_eq!(files_in(&posts[1]), ["C", "D"], "{p}");
+        assert!(!posts[1].contains("class A"), "{p}");
+        assert_all_summaries(&s, p);
+        assert!(!err(&o).contains("avertissement:"), "{p} {}", err(&o));
+        assert!(
+            out(&o).trim_end().ends_with("0 fichiers à enrichir"),
+            "{p} {}",
+            out(&o)
+        );
+    }
+}
+
+#[test]
+fn req232_ac4_trois_entrees_puis_d_seul_et_quatre_entrees_une_requete() {
+    for p in ["anthropic", "openai"] {
+        let replies = vec![
+            trunc_text(
+                p,
+                &lot_partial_text(&["A", "B", "C"], r#"{"file": "D.java", "su"#),
+            ),
+            ok_for(p, &[("type:D", "Classe D centrale.")]),
+        ];
+        let s = Setup::new(p, replies, "batch_files = 4\n");
+        four_docs(&s);
+        let o = s.run(&["build"]);
+        assert!(o.status.success(), "{p} {}", err(&o));
+        let posts = s.posts();
+        assert_eq!(posts.len(), 2, "{p} {}", err(&o));
+        assert_eq!(files_in(&posts[1]), ["D"], "{p}");
+        assert_all_summaries(&s, p);
+
+        let replies = vec![trunc_text(
+            p,
+            &lot_partial_text(&["A", "B", "C", "D"], r#",{"file": "E"#),
+        )];
+        let s = Setup::new(p, replies, "batch_files = 4\n");
+        four_docs(&s);
+        let o = s.run(&["build"]);
+        assert!(o.status.success(), "{p} {}", err(&o));
+        assert_eq!(s.posts().len(), 1, "{p} {}", err(&o));
+        assert_all_summaries(&s, p);
+        assert_eq!(s.to_enrich(), 0, "{p}");
+    }
+}
+
+#[test]
+fn req232_ac5_sans_entree_utile_les_moities_comme_avant() {
+    for p in ["anthropic", "openai"] {
+        for first in [
+            lot_partial_text(&[], r#"{"file": "A.java", "summaries": [{"node": "ty"#),
+            lot_partial_text(&["E"], r#"{"file": "A.java", "su"#),
+        ] {
+            let replies = vec![
+                trunc_text(p, &first),
+                ok_text(p, &lot_reply(&["A", "B"])),
+                ok_text(p, &lot_reply(&["C", "D"])),
+            ];
+            let s = Setup::new(p, replies, "batch_files = 4\n");
+            four_docs(&s);
+            let o = s.run(&["build"]);
+            assert!(o.status.success(), "{p} {}", err(&o));
+            let posts = s.posts();
+            assert_eq!(posts.len(), 3, "{p} {}", err(&o));
+            assert_eq!(files_in(&posts[1]), ["A", "B"], "{p}");
+            assert_eq!(files_in(&posts[2]), ["C", "D"], "{p}");
+            assert!(!err(&o).contains("écarté"), "{p} {}", err(&o));
+            assert_all_summaries(&s, p);
+        }
+    }
+}
+
+#[test]
+fn req232_ac6_toujours_tronque_lots_de_4_3_2_puis_d_seul() {
+    for p in ["anthropic", "openai"] {
+        let replies = vec![
+            trunc_text(p, &lot_partial_text(&["A"], r#"{"file": "B.java", "su"#)),
+            trunc_text(p, &lot_partial_text(&["B"], r#"{"file": "C.java", "su"#)),
+            trunc_text(p, &lot_partial_text(&["C"], r#"{"file": "D.java", "su"#)),
+            ok_for(p, &[("type:D", "Classe D centrale.")]),
+        ];
+        let s = Setup::new(p, replies, "batch_files = 4\n");
+        four_docs(&s);
+        let o = s.run(&["build"]);
+        assert!(o.status.success(), "{p} {}", err(&o));
+        let posts = s.posts();
+        let seen: Vec<Vec<&str>> = posts.iter().map(|b| files_in(b)).collect();
+        assert_eq!(
+            seen,
+            [
+                vec!["A", "B", "C", "D"],
+                vec!["B", "C", "D"],
+                vec!["C", "D"],
+                vec!["D"]
+            ],
+            "{p}"
+        );
+        assert_all_summaries(&s, p);
+        assert!(!err(&o).contains("avertissement:"), "{p} {}", err(&o));
+    }
+}
+
+#[test]
+fn req232_ac6_lot_de_second_passage_tronque_reste_de_second_passage() {
+    let p = "anthropic";
+    let replies = vec![
+        // Passage 1 : seul A répond ; B, C, D repartent en second passage.
+        ok_text(p, &lot_reply(&["A"])),
+        // Second passage tronqué avec B complet : C, D repartent, toujours en second passage.
+        trunc_text(p, &lot_partial_text(&["B"], r#"{"file": "C.java", "su"#)),
+        // Réponse conforme sans D : D échoue sans autre renvoi.
+        ok_text(p, &lot_reply(&["C"])),
+    ];
+    let s = Setup::new(p, replies, "batch_files = 4\n");
+    four_docs(&s);
+    let o = s.run(&["build"]);
+    let posts = s.posts();
+    assert_eq!(posts.len(), 3, "{}", err(&o));
+    assert_eq!(files_in(&posts[2]), ["C", "D"]);
+    assert_eq!(s.to_enrich_paths(), ["D.java"], "{}", err(&o));
+}
+
+#[test]
+fn req232_ac18_marqueur_de_l_element_coupe_nulle_part() {
+    for p in ["anthropic", "openai"] {
+        let cut = format!(
+            r#"{{"file": "B.java", "summaries": [{{"node": "type:B", "summary": "{SECRET}"#
+        );
+        let replies = vec![
+            trunc_text(p, &lot_partial_text(&["A"], &cut)),
+            ok_text(p, &lot_reply(&["B", "C", "D"])),
+        ];
+        let s = Setup::new(p, replies, "batch_files = 4\n");
+        four_docs(&s);
+        let o = s.run(&["build", "--verbose"]);
+        assert!(o.status.success(), "{p} {}", err(&o));
+        assert!(
+            !out(&o).contains(SECRET) && !err(&o).contains(SECRET),
+            "{p}"
+        );
+        for n in ["A", "B", "C", "D"] {
+            let sum = s.summary_of(&format!("type:{n}")).unwrap_or_default();
+            assert!(!sum.contains(SECRET), "{p} {n}");
+        }
+        assert_all_summaries(&s, p);
+        let g = s.run(&["export", "--output", "-"]);
+        assert!(g.status.success(), "{p} {}", err(&g));
+        assert!(!out(&g).contains(SECRET), "{p}");
+    }
+}
+
+#[test]
+fn req232_ac16_lot_recupere_pas_de_ligne_politique_et_compteur_non_remis_a_zero() {
+    let p = "anthropic";
+    let mut replies: Vec<fake_server::Reply> = Vec::new();
+    // Deux lots en erreur réseau (connexion fermée, tous les essais).
+    for _ in 0..10 {
+        replies.push(fake_server::Reply::Close);
+    }
+    // Lot tronqué avec l'entrée de E complète : F repart seul.
+    let partial = lot_partial_text(&["E"], r#"{"file": "F.java", "su"#);
+    replies.push(fake_server::Reply::status(200, &trunc_text(p, &partial)));
+    // F seul : erreur réseau, la troisième de la suite.
+    for _ in 0..5 {
+        replies.push(fake_server::Reply::Close);
+    }
+    let server = FakeServer::start_replies(replies);
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "provider = \"anthropic\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T100_KEY\"\nconcurrency = 1\nbatch_files = 2\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    for n in ["A", "B", "C", "D", "E", "F", "G", "H"] {
+        fs::write(
+            repo.join(format!("{n}.java")),
+            format!("public class {n} {{}}\n"),
+        )
+        .unwrap();
+    }
+    let o = Command::new(cargo_bin("nephila"))
+        .arg("-C")
+        .arg(&repo)
+        .args(["build", "--verbose"])
+        .env("NEPHILA_CONFIG", &config)
+        .env("NEPHILA_T100_KEY", "sk-test")
+        .env("NEPHILA_RETRY_BASE_MS", "1")
+        .output()
+        .unwrap();
+    let e = err(&o);
+    let politique: Vec<&str> = e
+        .lines()
+        .filter(|l| l.contains("politique:"))
+        .map(|l| l.split_once("] ").map_or(l, |x| x.1))
+        .collect();
+    assert_eq!(politique.len(), 4, "{e}");
+    for (l, k) in politique.iter().zip(1..=3) {
+        assert_eq!(
+            *l,
+            format!("politique: erreurs réseau consécutives {k}/3"),
+            "{e}"
+        );
+    }
+    assert!(
+        politique[3].starts_with("politique: arrêt de l'envoi"),
+        "{e}"
+    );
+}
