@@ -2498,3 +2498,56 @@ fn req232_ac15_lot_tronque_avec_entrees_completes_second_lot_du_reste() {
         );
     }
 }
+
+/// Identifiants de la liste « Nœuds du fichier » d'une requête.
+fn listed_ids(body: &Value) -> Vec<String> {
+    let text = body.to_string();
+    text.split("Contenu :")
+        .next()
+        .unwrap()
+        .split("\\n- ")
+        .skip(1)
+        .map(|x| x.split("\\n").next().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn req232_ac15_appel_tronque_avec_resumes_second_lot_d_une_requete_du_reste() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &["a"], 0, |b| {
+            let ids = listed_ids(b);
+            let item = |n: &String| json!({"node": n, "summary": format!("Résumé de {n}.")});
+            if ids.len() == 9 {
+                let first: Vec<String> = ids[..4].iter().map(|n| item(n).to_string()).collect();
+                Outcome::Truncated(format!(
+                    r#"{{"version": 2, "summaries": [{},{{"node": "{}", "summ"#,
+                    first.join(","),
+                    ids[4]
+                ))
+            } else {
+                let all: Vec<Value> = ids.iter().map(item).collect();
+                Outcome::Text(json!({"version": 2, "summaries": all, "concepts": []}).to_string())
+            }
+        });
+        nine_nodes_doc(&fx.env);
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let lots = fx.server.lots();
+        assert_eq!(lots.len(), 2, "{provider}");
+        assert_eq!(lots[1].len(), 1, "{provider}");
+        let (first, second) = (listed_ids(&lots[0][0]), listed_ids(&lots[1][0]));
+        assert_eq!(first.len(), 9, "{provider}");
+        assert_eq!(second, first[4..], "{provider}");
+        assert_eq!(fx.env.to_enrich(), 0, "{provider}");
+        assert_eq!(
+            fx.summary_of("a"),
+            Some("Résumé de document:docs/a.md.".to_string()),
+            "{provider}"
+        );
+        assert!(
+            !err(&o).contains("avertissement: docs"),
+            "{provider} : {}",
+            err(&o)
+        );
+    }
+}

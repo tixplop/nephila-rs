@@ -829,3 +829,74 @@ fn req232_ac12_lot_tronque_recupere_puis_plafond_laisse_le_reste() {
     assert_eq!(env.enriched(&names(4)), names(2), "{err}");
     assert_eq!(lines_of(&err, "avertissement:"), vec![a10(1, 2)], "{err}");
 }
+
+// ---- AC-232-12 : appel tronqué récupéré et plafond ----
+
+/// `A.java` de 9 nœuds : réponse tronquée aux 4 premiers résumés, puis réponse conforme au reste.
+fn nine_nodes_server() -> (fake_server::FakeServer, Vec<(String, String)>) {
+    let ids = [
+        "method:A.m0",
+        "method:A.m1",
+        "method:A.m2",
+        "method:A.m3",
+        "method:A.m4",
+        "method:A.m5",
+        "method:A.m6",
+        "method:A.m7",
+        "type:A",
+    ];
+    let item = |n: &str| serde_json::json!({"node": n, "summary": format!("Résumé de {n}.")});
+    let wrap = |text: String, finish: &str| {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": finish}]
+        })
+        .to_string()
+    };
+    let first: Vec<String> = ids[..4].iter().map(|n| item(n).to_string()).collect();
+    let partial = format!(
+        r#"{{"version": 2, "summaries": [{},{{"node": "method:A.m4", "summ"#,
+        first.join(",")
+    );
+    let rest: Vec<_> = ids[4..].iter().map(|n| item(n)).collect();
+    let full = serde_json::json!({"version": 2, "summaries": rest, "concepts": []}).to_string();
+    let server = fake_server::FakeServer::start(vec![
+        (200, wrap(partial, "length")),
+        (200, wrap(full, "stop")),
+    ]);
+    let mut class = String::from("public class A {\n");
+    for i in 0..8 {
+        class.push_str(&format!("    void m{i}() {{}}\n"));
+    }
+    class.push_str("}\n");
+    (server, vec![("A.java".to_string(), class)])
+}
+
+#[test]
+fn req232_ac12_appel_tronque_recupere_puis_plafond() {
+    let posts = |s: &fake_server::FakeServer| {
+        s.requests()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .count()
+    };
+    // Deux appels permis : l'appel tronqué et son sous-appel.
+    let (server, files) = nine_nodes_server();
+    let env = Env::server(&files, &server.base_url, "enrich_code = true\n");
+    let o = env.run(&["build", "--max-calls", "2"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert_eq!(posts(&server), 2, "{err}");
+    assert_eq!(env.enriched(&["A.java".to_string()]), ["A.java"], "{err}");
+    assert!(!err.contains("plafond"), "{err}");
+    assert!(!err.contains("avertissement:"), "{err}");
+
+    // Un seul appel permis : le sous-appel est refusé, rien n'est écrit, pas d'A-5.
+    let (server, files) = nine_nodes_server();
+    let env = Env::server(&files, &server.base_url, "enrich_code = true\n");
+    let o = env.run(&["build", "--max-calls", "1"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert_eq!(posts(&server), 1, "{err}");
+    assert_eq!(lines_of(&err, "avertissement:"), vec![a10(1, 1)], "{err}");
+    assert!(env.enriched(&["A.java".to_string()]).is_empty(), "{err}");
+}

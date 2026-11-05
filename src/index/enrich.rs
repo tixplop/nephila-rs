@@ -252,6 +252,68 @@ const MAX_SPLIT_DEPTH: usize = 3;
 /// non configurable) : en dessous, le texte n'explique pas la troncature.
 const MIN_SPLIT_CHARS: usize = 1000;
 
+/// Issue d'un appel tronqué dont on a lu les éléments complets (REQ-232).
+#[derive(Debug)]
+enum Recovery<'a> {
+    /// Tout ce qui était demandé est reçu : le résultat de l'appel.
+    All(Enrichment),
+    /// Résumés reçus, et sous-appel pour les nœuds restants.
+    Rest(Enrichment, Unit<'a>),
+    /// Rien d'utile : la découpe de REQ-230 s'applique.
+    Nothing,
+}
+
+/// Garde les éléments complets `kept` d'un appel tronqué et réduit l'appel au reste (REQ-232,
+/// DEC-175). Liste demandée vide : `All` avec au moins un concept, sinon `Nothing`. Aucun nœud
+/// demandé reçu : `Nothing`.
+fn recover_call<'a>(unit: &Unit<'a>, kept: Enrichment) -> Recovery<'a> {
+    let Unit::Call {
+        file,
+        index,
+        count,
+        excerpt,
+        part,
+        requested,
+        known,
+        path,
+    } = unit
+    else {
+        return Recovery::Nothing;
+    };
+    if requested.is_empty() {
+        return if kept.concepts.is_empty() {
+            Recovery::Nothing
+        } else {
+            Recovery::All(kept)
+        };
+    }
+    let got: HashSet<&str> = kept.summaries.iter().map(|(n, _)| n.as_str()).collect();
+    let rest: Vec<String> = requested
+        .iter()
+        .filter(|r| !got.contains(r.as_str()))
+        .cloned()
+        .collect();
+    if rest.len() == requested.len() {
+        return Recovery::Nothing;
+    }
+    if rest.is_empty() {
+        return Recovery::All(kept);
+    }
+    let mut path = path.clone();
+    path.push(1);
+    let sub = Unit::Call {
+        file,
+        index: *index,
+        count: *count,
+        excerpt: *excerpt,
+        part: Arc::clone(part),
+        requested: rest,
+        known: Arc::clone(known),
+        path,
+    };
+    Recovery::Rest(kept, sub)
+}
+
 /// Découpe un appel tronqué (REQ-230). Non Markdown : la liste de nœuds en deux (les ⌈n/2⌉
 /// premiers puis les autres) sur le même texte pour 2 nœuds ou plus, sinon le texte. Markdown :
 /// le texte, sinon la liste. `nodes` : `(identifiant, nom court)` des nœuds demandés. `None` si
@@ -1783,7 +1845,61 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 // Appel tronqué : sa liste de nœuds ou son texte est coupé et les sous-appels
                 // passent en tête de file (REQ-230). Pas de coupe possible, total au-delà de la borne : l'échec
                 // ordinaire (A-5). Réservation refusée par le plafond : comme un essai refusé.
-                if matches!(result, Err(Error::Truncated { .. })) {
+                let recovery = match &result {
+                    Err(Error::Truncated { partial, .. }) => {
+                        recover_call(&unit, Enrichment::parse_partial(partial, &file.path, known))
+                    }
+                    _ => Recovery::Nothing,
+                };
+                // Appel tronqué avec des éléments complets (REQ-232) : tout reçu, le résultat est
+                // celui de l'appel, sans effet sur la politique ; sinon les résumés reçus sont
+                // écrits et seul le reste repart, en un sous-appel.
+                let mut recovered = false;
+                let mut split_allowed = true;
+                match recovery {
+                    Recovery::All(e) => {
+                        result = Ok(e);
+                        recovered = true;
+                    }
+                    Recovery::Rest(kept_part, sub) => {
+                        split_allowed = false;
+                        if path.len() < MAX_SPLIT_DEPTH
+                            && reserve_split(shared, &file.path, count, 1)
+                        {
+                            if take(1, 0) {
+                                let mut first = path.clone();
+                                first.push(0);
+                                let split = tx.send(Msg::Split {
+                                    file,
+                                    count,
+                                    added: 1,
+                                });
+                                let chunk = tx.send(Msg::Chunk {
+                                    file,
+                                    index,
+                                    path: first,
+                                    count,
+                                    result: Ok(kept_part),
+                                    key: None,
+                                });
+                                expand.armed = false;
+                                finish_unit(shared, wake, vec![sub], false);
+                                if split.is_err() || chunk.is_err() {
+                                    break;
+                                }
+                                if record_policy(policy, shared, ticket, &None) {
+                                    stop.store(true, Ordering::SeqCst);
+                                    drop(shared.lock().unwrap_or_else(|p| p.into_inner()));
+                                    wake.notify_all();
+                                }
+                                continue;
+                            }
+                            result = Err(Error::Capped);
+                        }
+                    }
+                    Recovery::Nothing => {}
+                }
+                if split_allowed && matches!(result, Err(Error::Truncated { .. })) {
                     let nodes: Vec<(String, String)> = {
                         let all = ids.get(&file.path).map(Vec::as_slice).unwrap_or_default();
                         requested
@@ -1856,7 +1972,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     .then(|| kept.key(&file.path, index, count, excerpt, part, requested, known));
                 let result = result.map_err(truncation_advice);
                 (
-                    Some(err),
+                    (!recovered).then_some(err),
                     Some(Msg::Chunk {
                         file,
                         index,
@@ -5289,14 +5405,37 @@ mod tests {
         assert_eq!(store.enriched_hash("T.txt").unwrap(), None);
     }
 
+    /// Porte à ouverture unique : `wait` bloque jusqu'à `open` (condition, pas d'attente active).
+    struct Gate(Mutex<bool>, Condvar);
+
+    impl Gate {
+        fn new() -> Gate {
+            Gate(Mutex::new(false), Condvar::new())
+        }
+        fn open(&self) {
+            *self.0.lock().unwrap() = true;
+            self.1.notify_all();
+        }
+        fn wait(&self) {
+            let mut open = self.0.lock().unwrap();
+            while !*open {
+                open = self.1.wait(open).unwrap();
+            }
+        }
+    }
+
     /// Faux `Llm` de l'ordre d'arrivée : le morceau 2 (deux nœuds) est tronqué ; en concurrence,
     /// le second sous-appel répond après le morceau 3 et le premier après le second. Les deux
-    /// sous-appels donnent un résumé au même nœud.
+    /// sous-appels donnent un résumé au même nœud. L'appel 1 reste en cours jusqu'au premier
+    /// sous-appel : son fil est vivant quand la découpe met les sous-appels en file (un fil qui
+    /// trouve la file vide s'arrête) et prend le second sous-appel. L'appel 3 ouvre `done3` et
+    /// rend aussitôt.
     struct Reorder {
         ordered: bool,
         truncated: AtomicBool,
-        done3: AtomicBool,
-        done_second: AtomicBool,
+        done3: Gate,
+        done_second: Gate,
+        subs_started: Gate,
     }
 
     impl Llm for Reorder {
@@ -5308,35 +5447,33 @@ mod tests {
             requested: &[String],
             _: &[String],
         ) -> Result<Enrichment> {
-            let spin = |flag: &AtomicBool| {
-                while !flag.load(Ordering::SeqCst) {
-                    std::thread::yield_now();
-                }
-            };
             let answer = |text: &str| Enrichment {
                 summaries: vec![("method:T.txt.w1".into(), text.into())],
                 ..Enrichment::default()
             };
-            if call == 3 {
-                self.done3.store(true, Ordering::SeqCst);
-                return Ok(Enrichment::default());
-            }
             if call != 2 {
+                if call == 3 {
+                    self.done3.open();
+                }
+                if call == 1 && self.ordered {
+                    self.subs_started.wait();
+                }
                 return Ok(Enrichment::default());
             }
             if requested.len() == 2 && !self.truncated.swap(true, Ordering::SeqCst) {
                 return Err(truncated());
             }
+            self.subs_started.open();
             if requested == ["method:T.txt.w1"] {
                 if self.ordered {
-                    spin(&self.done_second);
+                    self.done_second.wait();
                 }
                 Ok(answer("du premier sous-appel"))
             } else {
                 if self.ordered {
-                    spin(&self.done3);
+                    self.done3.wait();
                 }
-                self.done_second.store(true, Ordering::SeqCst);
+                self.done_second.open();
                 Ok(answer("du second sous-appel"))
             }
         }
@@ -5355,8 +5492,9 @@ mod tests {
             let llm = Reorder {
                 ordered: concurrency > 1,
                 truncated: AtomicBool::new(false),
-                done3: AtomicBool::new(false),
-                done_second: AtomicBool::new(false),
+                done3: Gate::new(),
+                done_second: Gate::new(),
+                subs_started: Gate::new(),
             };
             let (store, report, failures) = probe_run_extra(
                 &dir,
@@ -5588,6 +5726,339 @@ mod tests {
             requested: requested.iter().map(|s| s.to_string()).collect(),
             known: Arc::from(vec!["x".to_string()]),
             path: path.to_vec(),
+        }
+    }
+
+    fn kept_of(nodes: &[&str], concepts: usize) -> Enrichment {
+        Enrichment {
+            summaries: nodes
+                .iter()
+                .map(|n| (n.to_string(), format!("Résumé de {n}.")))
+                .collect(),
+            concepts: (0..concepts)
+                .map(|i| crate::llm::enrich::Concept {
+                    name: format!("c{i}"),
+                    summary: None,
+                    sections: Vec::new(),
+                })
+                .collect(),
+            rejected: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn req232_recover_call_garde_les_resumes_et_reduit_la_liste_au_reste() {
+        let unit = call_of(&["a", "b", "c", "d", "e"], &[2]);
+        let Recovery::Rest(kept, sub) = recover_call(&unit, kept_of(&["a", "c"], 1)) else {
+            panic!("reste attendu");
+        };
+        assert_eq!(kept.summaries.len(), 2);
+        assert_eq!(kept.concepts.len(), 1);
+        let Unit::Call {
+            requested,
+            path,
+            index,
+            count,
+            part,
+            excerpt,
+            ..
+        } = sub
+        else {
+            panic!("appel attendu");
+        };
+        assert_eq!(requested, ["b", "d", "e"]);
+        assert_eq!(path, [2, 1]);
+        assert_eq!((index, count, &*part), (2, 3, "texte"));
+        assert_eq!(excerpt.unwrap().first_line, 4);
+        // Les résumés hors liste ne comptent pas.
+        assert!(matches!(
+            recover_call(&unit, kept_of(&["x"], 0)),
+            Recovery::Nothing
+        ));
+        // Rien de reçu, même avec un concept : la découpe s'applique.
+        assert!(matches!(
+            recover_call(&unit, kept_of(&[], 2)),
+            Recovery::Nothing
+        ));
+    }
+
+    #[test]
+    fn req232_recover_call_tout_recu_et_liste_vide() {
+        let unit = call_of(&["a", "b"], &[]);
+        let Recovery::All(x) = recover_call(&unit, kept_of(&["b", "a"], 0)) else {
+            panic!("tout attendu");
+        };
+        assert_eq!(x.summaries.len(), 2);
+        let empty = call_of(&[], &[]);
+        assert!(matches!(
+            recover_call(&empty, kept_of(&[], 1)),
+            Recovery::All(_)
+        ));
+        assert!(matches!(
+            recover_call(&empty, kept_of(&[], 0)),
+            Recovery::Nothing
+        ));
+    }
+
+    /// Réponse tronquée dont les résumés complets sont ceux de `nodes`, puis un début d'élément.
+    fn partial_of(nodes: &[(&str, &str)]) -> Error {
+        let items: Vec<String> = nodes
+            .iter()
+            .map(|(n, t)| format!(r#"{{"node": "{n}", "summary": "{t}"}}"#))
+            .collect();
+        Error::Truncated {
+            message: "réponse tronquée par la limite de jetons".into(),
+            partial: format!(
+                r#"{{"version": 2, "summaries": [{}, {{"nod"#,
+                items.join(", ")
+            ),
+        }
+    }
+
+    /// Tronque une fois l'appel de deux nœuds du plan en gardant le résumé du premier.
+    struct PartialOnce {
+        calls: Mutex<Vec<Vec<String>>>,
+        done: AtomicBool,
+    }
+
+    impl Llm for PartialOnce {
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            requested: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls.lock().unwrap().push(requested.to_vec());
+            if requested.len() == 2 && !self.done.swap(true, Ordering::SeqCst) {
+                return Err(partial_of(&[(&requested[0], "Reçu.")]));
+            }
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req232_ac11_sous_appel_unique_dans_les_cinquante_appels() {
+        let run = |lines: usize| {
+            let (dir, files) = split_repo(lines, 0);
+            let llm = PartialOnce {
+                calls: Mutex::new(Vec::new()),
+                done: AtomicBool::new(false),
+            };
+            let (store, report, failures) = probe_run_extra(
+                &dir,
+                &files,
+                &llm,
+                1,
+                1,
+                None,
+                0,
+                PassMode::Normal,
+                &[("T.txt", "zz")],
+            );
+            let n = llm.calls.lock().unwrap().len();
+            (n, store, report, failures)
+        };
+        // Plan de 49 appels dont un tronqué : 49 + 1 = 50 appels, fichier enrichi.
+        let (n, store, report, failures) = run(49);
+        assert_eq!(n, 50);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(report.failed, 0);
+        assert!(store.enriched_hash("T.txt").unwrap().is_some());
+        assert_eq!(
+            store
+                .node_by_id("method:T.txt.w0")
+                .unwrap()
+                .and_then(|x| x.summary)
+                .as_deref(),
+            Some("Reçu.")
+        );
+        // Plan de 50 appels, même cas : aucun sous-appel, échec de troncature (A-5).
+        let (n, store, report, failures) = run(50);
+        assert!(n <= 50, "{n}");
+        assert_eq!(report.failed, 1);
+        assert!(
+            matches!(&failures[0].1, Error::Truncated { message: m, .. } if m.contains("réduisez max_chunk_chars")),
+            "{failures:?}"
+        );
+        assert_eq!(store.enriched_hash("T.txt").unwrap(), None);
+    }
+
+    /// Faux `Llm` de l'ordre d'arrivée : le morceau 2 (deux nœuds) est tronqué avec le résumé de
+    /// `w1` ; en concurrence, le sous-appel de `zz` répond après le morceau 3 et donne aussi un
+    /// autre résumé pour `w1`.
+    struct RecoverReorder {
+        ordered: bool,
+        truncated: AtomicBool,
+        done3: Gate,
+    }
+
+    impl Llm for RecoverReorder {
+        fn enrich(
+            &self,
+            _: &str,
+            call: usize,
+            _: &str,
+            requested: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            if call == 3 {
+                self.done3.open();
+                return Ok(Enrichment::default());
+            }
+            if call != 2 {
+                return Ok(Enrichment::default());
+            }
+            if requested.len() == 2 && !self.truncated.swap(true, Ordering::SeqCst) {
+                return Err(partial_of(&[("method:T.txt.w1", "de la réponse tronquée")]));
+            }
+            if self.ordered {
+                self.done3.wait();
+            }
+            Ok(kept_of_texts(&[
+                ("method:T.txt.w1", "du sous-appel"),
+                ("method:T.txt.zz", "de zz"),
+            ]))
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    fn kept_of_texts(items: &[(&str, &str)]) -> Enrichment {
+        Enrichment {
+            summaries: items
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect(),
+            ..Enrichment::default()
+        }
+    }
+
+    #[test]
+    fn req232_ac14_sous_appel_apres_le_dernier_appel_meme_resultat_qu_en_serie() {
+        let summaries = |concurrency: usize| {
+            let (dir, files) = split_repo(3, 1);
+            let llm = RecoverReorder {
+                ordered: concurrency > 1,
+                truncated: AtomicBool::new(false),
+                done3: Gate::new(),
+            };
+            let (store, report, failures) = probe_run_extra(
+                &dir,
+                &files,
+                &llm,
+                concurrency,
+                1,
+                None,
+                0,
+                PassMode::Normal,
+                &[("T.txt", "zz")],
+            );
+            assert!(failures.is_empty(), "{failures:?}");
+            assert_eq!(report.failed, 0);
+            assert!(store.enriched_hash("T.txt").unwrap().is_some());
+            ["method:T.txt.w1", "method:T.txt.zz"]
+                .map(|id| store.node_by_id(id).unwrap().and_then(|n| n.summary))
+        };
+        let parallel = summaries(3);
+        assert_eq!(
+            parallel[0].as_deref(),
+            Some("de la réponse tronquée"),
+            "{parallel:?}"
+        );
+        assert_eq!(parallel[1].as_deref(), Some("de zz"));
+        assert_eq!(parallel, summaries(1));
+    }
+
+    /// `A` et `B` en erreur réseau ; `C` (deux nœuds) tronqué avec des résumés complets ; le
+    /// reste de `C`, `D` et `E` en erreur réseau.
+    struct RecoverScripted {
+        calls: Mutex<Vec<String>>,
+        all: bool,
+    }
+
+    impl Llm for RecoverScripted {
+        fn enrich(
+            &self,
+            file: &str,
+            _: usize,
+            _: &str,
+            requested: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{file}:{}", requested.len()));
+            if file == "C" && requested.len() == 2 {
+                let mut got = vec![("method:C.w0", "R0.")];
+                if self.all {
+                    got.push(("method:C.zz", "R1."));
+                }
+                return Err(partial_of(&got));
+            }
+            Err(net())
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req232_ac16_appel_recupere_ne_remet_pas_les_erreurs_reseau_a_zero() {
+        for all in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut files = Vec::new();
+            for f in ["A", "B", "C", "D", "E"] {
+                let text = if f == "C" {
+                    "w0 zz xxxx\n"
+                } else {
+                    "w0 xxxxxxx\n"
+                };
+                std::fs::write(dir.path().join(f), text).unwrap();
+                files.push(rec(f, text.len() as u64));
+            }
+            let llm = RecoverScripted {
+                calls: Mutex::new(Vec::new()),
+                all,
+            };
+            let (_store, report, _failures) = probe_run_extra(
+                &dir,
+                &files,
+                &llm,
+                1,
+                1,
+                None,
+                0,
+                PassMode::Normal,
+                &[("C", "zz")],
+            );
+            // Deux erreurs réseau, l'appel de C récupéré (au cas 1 : rien ne repart ; sinon son
+            // sous-appel est la troisième erreur), puis la troisième erreur arrête l'envoi.
+            let want: &[&str] = if all {
+                &["A:1", "B:1", "C:2", "D:1"]
+            } else {
+                &["A:1", "B:1", "C:2", "C:1"]
+            };
+            assert_eq!(*llm.calls.lock().unwrap(), want, "all = {all}");
+            assert!(report
+                .stop_cause
+                .as_deref()
+                .is_some_and(|c| c.contains("panne réseau répétée")));
         }
     }
 

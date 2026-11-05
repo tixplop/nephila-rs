@@ -9,6 +9,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+#[allow(dead_code)]
+#[path = "support/fake_server.rs"]
+mod fake_server;
+
 const SVC: &str = "core/src/main/java/com/acme/core/OrderService.java";
 const ORDER: &str = "core/src/main/java/com/acme/domain/Order.java";
 
@@ -1426,4 +1430,175 @@ fn req227_ac7_apres_kill_9_les_appels_des_groupes_valides_ne_repartent_pas() {
     env.ok(&["update"]);
     assert_eq!(env.logged().len(), 4 - kept, "{:?}", env.logged());
     assert_eq!(to_enrich(&env), 0);
+}
+
+// ---- AC-232-13 : appel tronqué récupéré et appels conservés ----
+
+fn openai_body(text: &str, finish: &str) -> String {
+    serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": finish}]
+    })
+    .to_string()
+}
+
+struct Served {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    config: PathBuf,
+    server: fake_server::FakeServer,
+}
+
+impl Served {
+    /// `A.java` de 60 méthodes en 2 appels ; les réponses successives du faux serveur.
+    fn new(text: &str, max_chunk_chars: usize, replies: Vec<String>) -> Served {
+        let server =
+            fake_server::FakeServer::start(replies.into_iter().map(|b| (200, b)).collect());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("A.java"), text).unwrap();
+        let config = tmp.path().join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T322_KEY\"\nconcurrency = 1\nformat_retries = 0\nmax_chunk_chars = {max_chunk_chars}\n",
+                server.base_url
+            ),
+        )
+        .unwrap();
+        Served {
+            _tmp: tmp,
+            repo,
+            config,
+            server,
+        }
+    }
+
+    fn run(&self, cmd: &str) -> Output {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.repo)
+            .arg(cmd)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_T322_KEY", "sk-test")
+            .output()
+            .unwrap()
+    }
+
+    fn posts(&self) -> usize {
+        self.server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == "/v1/chat/completions")
+            .count()
+    }
+
+    fn kept(&self) -> usize {
+        Store::open_readonly(&self.repo)
+            .unwrap()
+            .call_results()
+            .unwrap()
+            .len()
+    }
+}
+
+/// Texte de `A.java` (60 méthodes), borne de morceau donnant 2 morceaux, identifiants demandés
+/// à chaque appel (lus dans les requêtes d'un premier essai).
+fn two_calls() -> (String, usize, [Vec<String>; 2]) {
+    let mut text = String::from("public class A {\n");
+    for i in 0..60 {
+        text.push_str(&format!("    void m{i}() {{}}\n"));
+    }
+    text.push_str("}\n");
+    let max = text.len() / 2 + 40;
+    assert_eq!(nephila::chunk::split(&text, max).len(), 2);
+    let empty = openai_body(r#"{"version": 2, "summaries": [], "concepts": []}"#, "stop");
+    let probe = Served::new(&text, max, vec![empty.clone(), empty]);
+    probe.run("build");
+    let bodies: Vec<String> = probe
+        .server
+        .requests()
+        .into_iter()
+        .map(|r| r.body)
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    let ids = |b: &str| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(b).unwrap();
+        let user = v["messages"][1]["content"].as_str().unwrap().to_string();
+        user.split("Contenu :")
+            .next()
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("- "))
+            .map(String::from)
+            .collect()
+    };
+    let lists = [ids(&bodies[0]), ids(&bodies[1])];
+    (text, max, lists)
+}
+
+fn summaries_text(ids: &[String], cut: Option<&str>) -> String {
+    let items: Vec<String> = ids
+        .iter()
+        .map(|n| serde_json::json!({"node": n, "summary": format!("Résumé de {n}.")}).to_string())
+        .collect();
+    match cut {
+        Some(c) => format!(
+            r#"{{"version": 2, "summaries": [{}{}{c}"#,
+            items.join(","),
+            if items.is_empty() { "" } else { "," }
+        ),
+        None => serde_json::json!({
+            "version": 2,
+            "summaries": items.iter().map(|i| serde_json::from_str::<serde_json::Value>(i).unwrap()).collect::<Vec<_>>(),
+            "concepts": []
+        })
+        .to_string(),
+    }
+}
+
+#[test]
+fn req232_ac13_sous_appel_non_conforme_ne_garde_que_l_appel_un() {
+    let (java, max, lists) = two_calls();
+    let good = openai_body(&summaries_text(&lists[0], None), "stop");
+    let partial = openai_body(
+        &summaries_text(&lists[1][..1], Some(r#"{"node": "x", "summ"#)),
+        "length",
+    );
+    let bad = openai_body("pas du JSON", "stop");
+    let full2 = openai_body(&summaries_text(&lists[1], None), "stop");
+    let s = Served::new(&java, max, vec![good, partial, bad, full2]);
+    let o = s.run("build");
+    let err = text(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert_eq!(s.posts(), 3, "{err}");
+    assert_eq!(err.matches("avertissement:").count(), 1, "{err}");
+    assert!(err.contains("non conforme"), "{err}");
+    assert_eq!(s.kept(), 1, "seul l'appel 1 est conservé");
+    // `update` : l'appel 2 répond en entier, l'appel 1 est relu de la table.
+    let o = s.run("update");
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(s.posts(), 4);
+    assert_eq!(s.kept(), 0);
+}
+
+#[test]
+fn req232_ac13_appel_un_recupere_en_entier_est_conserve_quand_l_appel_deux_echoue() {
+    let (java, max, lists) = two_calls();
+    // Appel 1 tronqué après tous ses résumés : cas (1), sa clé est écrite.
+    let cut = format!(
+        "{}, \"concepts\": [{{\"name\": \"x\", \"su",
+        summaries_text(&lists[0], Some(""))
+            .trim_end_matches([',', ' '])
+            .to_string()
+            + "]"
+    );
+    let all_cut = openai_body(&cut, "length");
+    let bad = openai_body("pas du JSON", "stop");
+    let s = Served::new(&java, max, vec![all_cut, bad]);
+    let o = s.run("build");
+    let err = text(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert_eq!(s.posts(), 2, "{err}");
+    assert_eq!(s.kept(), 1, "{err}");
 }

@@ -237,7 +237,7 @@ fn req046_ac2_openai_tronquee_un_seul_envoi() {
 }
 
 #[test]
-fn req046_ac3_texte_conforme_mais_tronque_est_refuse() {
+fn req046_ac3_texte_conforme_mais_tronque_garde_le_resume() {
     for p in ["anthropic", "openai"] {
         let body = match p {
             "anthropic" => anthropic_reply(A_GOOD, Some("max_tokens")),
@@ -246,10 +246,15 @@ fn req046_ac3_texte_conforme_mais_tronque_est_refuse() {
         let s = Setup::new(p, vec![body; 10], "");
         s.write("A.java", A_JAVA);
         let o = s.run(&["build"]);
-        assert!(!o.status.success(), "{p}");
+        assert!(o.status.success(), "{p} {}", err(&o));
         assert_eq!(s.posts().len(), 1, "{p}");
-        assert_eq!(s.to_enrich(), 1, "{p}");
-        assert_eq!(s.summary_of("type:A"), None, "{p}");
+        assert_eq!(s.to_enrich(), 0, "{p}");
+        assert_eq!(
+            s.summary_of("type:A").as_deref(),
+            Some("Classe A centrale."),
+            "{p}"
+        );
+        assert!(!err(&o).contains("avertissement:"), "{p} {}", err(&o));
     }
 }
 
@@ -2081,6 +2086,365 @@ fn req232_ac16_lot_recupere_pas_de_ligne_politique_et_compteur_non_remis_a_zero(
     }
     assert!(
         politique[3].starts_with("politique: arrêt de l'envoi"),
+        "{e}"
+    );
+}
+
+// ---- REQ-232 : appel tronqué, résumés reçus gardés, seul le reste repart ----
+
+/// Réponse d'appel tronquée : les résumés complets de `complete`, puis `cut` (début d'élément).
+fn call_partial(p: &str, complete: &[&str], cut: &str) -> String {
+    let items: Vec<String> = complete
+        .iter()
+        .map(|n| serde_json::json!({"node": n, "summary": format!("Résumé de {n}.")}).to_string())
+        .collect();
+    let sep = if items.is_empty() { "" } else { "," };
+    trunc_text(
+        p,
+        &format!(
+            r#"{{"version": 2, "summaries": [{}{sep}{cut}"#,
+            items.join(",")
+        ),
+    )
+}
+
+const NINE: [&str; 9] = [
+    "method:A.m0",
+    "method:A.m1",
+    "method:A.m2",
+    "method:A.m3",
+    "method:A.m4",
+    "method:A.m5",
+    "method:A.m6",
+    "method:A.m7",
+    "type:A",
+];
+
+/// Réponse conforme avec le résumé `Résumé de <nœud>.` de chacun des nœuds.
+fn ok_nodes(p: &str, nodes: &[&str]) -> String {
+    let owned: Vec<(String, String)> = nodes
+        .iter()
+        .map(|n| (n.to_string(), format!("Résumé de {n}.")))
+        .collect();
+    let refs: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    ok_for(p, &refs)
+}
+
+const CUT_M4: &str = r#"{"node": "method:A.m4", "summ"#;
+
+fn graph_of(s: &Setup) -> Vec<(String, Option<String>)> {
+    let mut v: Vec<_> = nephila::store::Store::open_readonly(&s.repo)
+        .unwrap()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .map(|n| (n.id, n.summary))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn req232_ac7_quatre_resumes_gardes_le_reste_repart() {
+    for p in ["anthropic", "openai"] {
+        let s = Setup::new(
+            p,
+            vec![call_partial(p, &NINE[..4], CUT_M4), ok_nodes(p, &NINE[4..])],
+            "",
+        );
+        s.write("A.java", &nine_nodes());
+        let o = s.run(&["build"]);
+        assert!(o.status.success(), "{p} {}", err(&o));
+        let posts = s.posts();
+        assert_eq!(posts.len(), 2, "{p} {}", err(&o));
+        assert_eq!(listed(&posts[0]).len(), 9, "{p}");
+        assert_eq!(listed(&posts[1]), NINE[4..], "{p}");
+        assert_eq!(content_of(&posts[1]), content_of(&posts[0]), "{p}");
+        for n in NINE {
+            assert_eq!(
+                s.summary_of(n),
+                Some(format!("Résumé de {n}.")),
+                "{p} {n} {}",
+                err(&o)
+            );
+        }
+        assert!(!err(&o).contains("avertissement:"), "{p} {}", err(&o));
+        // Témoin : l'appel répond en une fois avec les mêmes résumés.
+        let w = Setup::new(p, vec![ok_nodes(p, &NINE)], "");
+        w.write("A.java", &nine_nodes());
+        let wo = w.run(&["build"]);
+        assert!(wo.status.success(), "{p} {}", err(&wo));
+        assert_eq!(graph_of(&s), graph_of(&w), "{p}");
+        let (ge, gw) = (
+            s.run(&["export", "--output", "-"]),
+            w.run(&["export", "--output", "-"]),
+        );
+        assert_eq!(out(&ge), out(&gw), "{p}");
+    }
+}
+
+#[test]
+fn req232_ac8_tout_recu_puis_coupe_dans_les_concepts_une_requete() {
+    let p = "openai";
+    let all = |tail: &str| {
+        let items: Vec<String> = NINE
+            .iter()
+            .map(|n| {
+                serde_json::json!({"node": n, "summary": format!("Résumé de {n}.")}).to_string()
+            })
+            .collect();
+        trunc_text(
+            p,
+            &format!(
+                r#"{{"version": 2, "summaries": [{}]{tail}"#,
+                items.join(",")
+            ),
+        )
+    };
+    for tail in [
+        r#", "concepts": [{"name": "alpha", "su"#,
+        r#", "concepts": ["#,
+        "",
+    ] {
+        let s = Setup::new(p, vec![all(tail); 5], "");
+        s.write("A.java", &nine_nodes());
+        let o = s.run(&["build"]);
+        assert!(o.status.success(), "{tail} {}", err(&o));
+        assert_eq!(s.posts().len(), 1, "{tail} {}", err(&o));
+        assert_eq!(s.to_enrich(), 0, "{tail}");
+        assert_eq!(
+            s.summary_of("type:A").as_deref(),
+            Some("Résumé de type:A."),
+            "{tail}"
+        );
+    }
+}
+
+#[test]
+fn req232_ac8_markdown_concept_complet_garde_et_liste_vide() {
+    let p = "openai";
+    // Trois sections : trois résumés et un concept complet, le second concept coupé.
+    let doc = "# Alpha\n\ntexte a\n\n# Beta\n\ntexte b\n\n# Gamma\n\ntexte c\n";
+    let text = r#"{"version": 2, "summaries": [{"node": "document:D.md", "summary": "R0."}, {"node": "section:D.md#alpha", "summary": "R1."}, {"node": "section:D.md#beta", "summary": "R2."}, {"node": "section:D.md#gamma", "summary": "R3."}], "concepts": [{"name": "Idée un", "summary": "C1.", "sections": ["section:D.md#alpha"]}, {"name": "Idée deux", "su"#;
+    let s = Setup::new(p, vec![trunc_text(p, text); 5], "");
+    s.write("D.md", doc);
+    let o = s.run(&["build"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let after_first = s.posts().len();
+    let concepts: Vec<String> = nephila::store::Store::open_readonly(&s.repo)
+        .unwrap()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.id.starts_with("concept:"))
+        .map(|n| n.id)
+        .collect();
+    assert_eq!(concepts, ["concept:idée un"], "{}", err(&o));
+    assert_eq!(after_first, 1, "{}", err(&o));
+
+    // Morceau à liste vide : un concept complet puis la coupe, aucune requête de plus.
+    let doc = "# t0\nxxxxxxx\n# t2\n";
+    let ok = ok_for(p, &[]);
+    let cut_concept = trunc_text(
+        p,
+        r#"{"version": 2, "summaries": [], "concepts": [{"name": "Idée vide", "summary": "C.", "sections": ["section:E.md#t0"]}, {"name": "Autre", "su"#,
+    );
+    let s = Setup::new(
+        p,
+        vec![ok.clone(), cut_concept, ok.clone(), ok.clone(), ok],
+        "max_chunk_chars = 8\nformat_retries = 0\n",
+    );
+    s.write("E.md", doc);
+    let o = s.run(&["build"]);
+    assert_eq!(s.posts().len(), 3, "{}", err(&o));
+    let has = nephila::store::Store::open_readonly(&s.repo)
+        .unwrap()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .any(|n| n.id == "concept:idée vide");
+    assert!(has, "{}", err(&o));
+}
+
+#[test]
+fn req232_ac9_sans_resume_utile_la_decoupe_reste_la_regle() {
+    let p = "openai";
+    let partial = |cut: &str| trunc_text(p, &format!(r#"{{"version": 2, "summaries": [{cut}"#));
+    let firsts = [
+        // Résumé hors liste.
+        partial(
+            r#"{"node": "method:A.hors", "summary": "Hors liste."}, {"node": "method:A.m0", "su"#,
+        ),
+        // Résumé vide de sens.
+        partial(r#"{"node": "method:A.m0", "summary": ""}, {"node": "method:A.m1", "su"#),
+        // Un concept seul, sans résumé : rien d'utile pour un fichier Java.
+        trunc_text(
+            p,
+            r#"{"version": 2, "summaries": [], "concepts": [{"name": "x", "summary": "y", "sections": []}, {"na"#,
+        ),
+    ];
+    for (i, first) in firsts.into_iter().enumerate() {
+        let s = Setup::new(
+            p,
+            vec![first, ok_nodes(p, &NINE[..5]), ok_nodes(p, &NINE[5..])],
+            "",
+        );
+        s.write("A.java", &nine_nodes());
+        let o = s.run(&["build"]);
+        let posts = s.posts();
+        assert_eq!(posts.len(), 3, "{i} {}", err(&o));
+        assert_eq!(listed(&posts[1]), NINE[..5], "{i}");
+        assert_eq!(listed(&posts[2]), NINE[5..], "{i}");
+        assert!(
+            !err(&o).contains("élément(s) d'enrichissement écarté(s)"),
+            "{i} {}",
+            err(&o)
+        );
+    }
+}
+
+#[test]
+fn req232_ac9_morceau_2_un_resume_sur_deux_meme_extrait() {
+    let (text, cfg, sums) = ac2_setup();
+    let p = "openai";
+    let none = || ok_for(p, &[]);
+    let partial = trunc_text(
+        p,
+        &format!(
+            r#"{{"version": 2, "summaries": [{{"node": "{}", "summary": "{}"}}, {{"node": "{}", "su"#,
+            sums[0].0, sums[0].1, sums[1].0
+        ),
+    );
+    let s = Setup::new(
+        p,
+        vec![
+            none(),
+            partial,
+            ok_for(p, &[(sums[1].0.as_str(), sums[1].1.as_str())]),
+            none(),
+        ],
+        &cfg,
+    );
+    s.write("A.java", &text);
+    let o = s.run(&["build"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let posts = s.posts();
+    assert_eq!(posts.len(), 4, "{}", err(&o));
+    assert_eq!(extract_of(&posts[2]), extract_of(&posts[1]));
+    assert_eq!(content_of(&posts[2]), content_of(&posts[1]));
+    let parent = listed(&posts[1]);
+    let rest: Vec<String> = parent
+        .iter()
+        .filter(|n| **n != sums[0].0)
+        .cloned()
+        .collect();
+    assert_eq!(listed(&posts[2]), rest);
+    assert_eq!(s.to_enrich(), 0);
+    for (id, t) in &sums {
+        assert_eq!(s.summary_of(id).as_deref(), Some(t.as_str()), "{id}");
+    }
+}
+
+#[test]
+fn req232_ac10_toujours_tronque_avec_un_resume_quatre_requetes_une_ligne_a5() {
+    let p = "openai";
+    let mut t = String::from("public class A {\n");
+    for i in 0..15 {
+        t.push_str(&format!("    void m{i}() {{}}\n"));
+    }
+    t.push_str("}\n");
+    // Ordre des nœuds demandés : tri des identifiants.
+    let mut ids: Vec<String> = (0..15).map(|i| format!("method:A.m{i}")).collect();
+    ids.push("type:A".into());
+    ids.sort();
+    let replies: Vec<String> = (0..8)
+        .map(|k| {
+            let id = ids[k % 4].as_str();
+            call_partial(p, &[id], r#"{"node": "x", "summ"#)
+        })
+        .collect();
+    // Les réponses tronquées 1 à 4 portent m0, m1, m10, m11 : le premier nœud de chaque liste.
+    let replies = [
+        replies[0].clone(),
+        replies[1].clone(),
+        replies[2].clone(),
+        replies[3].clone(),
+    ]
+    .into_iter()
+    .cycle()
+    .take(8)
+    .collect();
+    let s = Setup::new(p, replies, "");
+    s.write("A.java", &t);
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    let posts = s.posts();
+    let sizes: Vec<usize> = posts.iter().map(|b| listed(b).len()).collect();
+    assert_eq!(sizes, [16, 15, 14, 13], "{}", err(&o));
+    assert_eq!(err(&o).matches("avertissement:").count(), 1, "{}", err(&o));
+    assert!(err(&o).contains(&a5("A.java")), "{}", err(&o));
+    assert_eq!(s.to_enrich(), 1);
+    assert_eq!(s.summary_of("method:A.m0"), None);
+    let o = s.run(&["update"]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 8, "{}", err(&o));
+    assert_eq!(err(&o).matches("avertissement:").count(), 1, "{}", err(&o));
+    assert!(err(&o).contains(&a5("A.java")), "{}", err(&o));
+}
+
+#[test]
+fn req232_ac18_appel_marqueur_de_l_element_coupe_nulle_part() {
+    for p in ["anthropic", "openai"] {
+        let cut = format!(r#"{{"node": "method:A.m4", "summary": "{SECRET}"#);
+        let s = Setup::new(
+            p,
+            vec![call_partial(p, &NINE[..4], &cut), ok_nodes(p, &NINE[4..])],
+            "",
+        );
+        s.write("A.java", &nine_nodes());
+        let o = s.run(&["build", "--verbose"]);
+        assert!(o.status.success(), "{p} {}", err(&o));
+        assert_eq!(s.posts().len(), 2, "{p}");
+        assert!(
+            !out(&o).contains(SECRET) && !err(&o).contains(SECRET),
+            "{p}"
+        );
+        for n in NINE {
+            let sum = s.summary_of(n).unwrap_or_default();
+            assert!(!sum.contains(SECRET), "{p} {n}");
+        }
+        let g = s.run(&["export", "--output", "-"]);
+        assert!(g.status.success(), "{p} {}", err(&g));
+        assert!(!out(&g).contains(SECRET), "{p}");
+    }
+}
+
+#[test]
+fn req232_ac14_progression_une_seule_fois() {
+    let p = "openai";
+    let s = Setup::new(
+        p,
+        vec![call_partial(p, &NINE[..4], CUT_M4), ok_nodes(p, &NINE[4..])],
+        "",
+    );
+    s.write("A.java", &nine_nodes());
+    let o = s.run(&["build", "--show-progress"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(s.posts().len(), 2);
+    let e = err(&o);
+    let lines: Vec<&str> = e
+        .lines()
+        .filter(|l| l.starts_with("progression: enrichissement"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "progression: enrichissement 0 % (0/1 fichiers)",
+            "progression: enrichissement 100 % (1/1 fichiers)"
+        ],
         "{e}"
     );
 }
