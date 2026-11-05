@@ -2429,7 +2429,7 @@ fn listed_nodes(body: &Value) -> usize {
     text.split("Contenu :")
         .next()
         .unwrap()
-        .matches("\\n- ")
+        .matches("\\n[")
         .count()
 }
 
@@ -2439,7 +2439,7 @@ fn req230_ac10_appel_tronque_en_mode_lot_deux_requetes_dans_le_lot_suivant() {
         let fx = Fx::new(provider, "", &["a"], 0, |b| {
             if listed_nodes(b) == 9 {
                 Outcome::Truncated("{".into())
-            } else if b.to_string().contains("- document:docs/a.md") {
+            } else if b.to_string().contains("— document:docs/a.md") {
                 Outcome::Text(single("a"))
             } else {
                 Outcome::Text(json!({"version": 2, "summaries": [], "concepts": []}).to_string())
@@ -2505,9 +2505,12 @@ fn listed_ids(body: &Value) -> Vec<String> {
     text.split("Contenu :")
         .next()
         .unwrap()
-        .split("\\n- ")
+        .split("\\n[")
         .skip(1)
-        .map(|x| x.split("\\n").next().unwrap().to_string())
+        .map(|x| {
+            let line = x.split("\\n").next().unwrap();
+            line.split_once(" — ").unwrap().1.to_string()
+        })
         .collect()
 }
 

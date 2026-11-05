@@ -6947,16 +6947,18 @@ mod estimate_tests {
         assert_eq!(e.calls, 1 + 1 + 3);
         assert_eq!(e.nodes, 3 + 1 + 3);
         // Lot de 2 : système du lot + 14+4+1+19+1+1+9+1+1+21+4+2 = 78 d'encadrement par fichier,
-        // + 2 × chemin (4) + liste (`- id1\n` = 6 ; `- id22\n- id3\n` = 7 + 6 = 13) + tailles 3 + 4
-        // = 78+8+6 + 78+8+13 + 7 = 198.
+        // + 4 par fichier pour ` [k]` de `=== FICHIER [k] : `, + 2 × chemin (4) par fichier, + liste numérotée
+        // en continu (`[1] id1 — id1\n` = 4 + 3 + 5 + 3 + 1 = 16 ; `[2] id22 — id22\n` = 18 ;
+        // `[3] id3 — id3\n` = 16 ; le tiret long « — » et ses deux espaces font 5 octets) + tailles
+        // 3 + 4 = (78+8+4) + 16 + (78+8+4) + 34 + 7 = 90+16 + 90+34 + 7 = 237.
         // Lot de 1 (c.md) : système d'un fichier + 43 (`Fichier : ` 10, chemin 4, `\n\n` 2,
         // `Nœuds du fichier :` 19, `\n` 1, `\n` 1, `Contenu :` 9, `\n` 1 → 47 avec le chemin) +
-        // liste 6 + taille 2 = 47 + 6 + 2 = 55.
-        let lot2 = lot_system_prompt(LANG).len() + 198;
-        let lot1 = enrichment_system_prompt(LANG).len() + 55;
+        // liste `[1] id5 — id5\n` 16 + taille 2 = 47 + 16 + 2 = 65.
+        let lot2 = lot_system_prompt(LANG).len() + 237;
+        let lot1 = enrichment_system_prompt(LANG).len() + 65;
         // Big de 3 appels : par appel, système + `Fichier : d.txt (extrait k/3, lignes k–k)` (15 + 28)
-        // + 2 + 19 + 1 + 6 (`- n0k\n`) + 1 + 9 + 1 (= 39) + morceau de 10 = 92.
-        let big = 3 * (enrichment_system_prompt(LANG).len() + 92);
+        // + 2 + 19 + 1 + 16 (`[1] n0k — n0k\n`) + 1 + 9 + 1 (= 49) + morceau de 10 = 102.
+        let big = 3 * (enrichment_system_prompt(LANG).len() + 102);
         assert_eq!(e.bytes, lot2 + lot1 + big);
         assert_eq!(e.alone.len(), 1);
         assert_eq!(e.alone[0].path, "d.txt");
@@ -7006,12 +7008,13 @@ mod estimate_tests {
     fn req184_ac5_big_of_50_calls_is_counted() {
         let (dir, files, ids) = big_of(50);
         let e = run(dir.path(), &files, &ids, 5, 10);
-        // Par appel : système + 15 (`Fichier : d.txt`) + extrait (26 + 3 × chiffres de k) + 39 + 10 ;
-        // 9 appels à un chiffre (93), 41 à deux chiffres (96) : 9 × 93 + 41 × 96 = 4 773.
+        // Par appel : système + 15 (`Fichier : d.txt`) + extrait (26 + 3 × chiffres de k) + 49
+        // (ligne `[1] n0k — n0k\n` de 16 octets) + 10 ; 9 appels à un chiffre (103), 41 à deux
+        // chiffres (106) : 9 × 103 + 41 × 106 = 5 273.
         let sys = enrichment_system_prompt(LANG).len();
         assert_eq!(e.calls, 50);
         assert_eq!(e.nodes, 50);
-        assert_eq!(e.bytes, 50 * sys + 4_773);
+        assert_eq!(e.bytes, 50 * sys + 5_273);
         assert_eq!((e.files, e.sent_alone, e.without_call), (1, 1, 0));
         assert!(e.capped.is_empty());
         assert_eq!(e.alone[0].case, AloneCase::Counted);

@@ -16,44 +16,44 @@ pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 /// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
 /// propre à une famille n'incrémente que la sienne. Tout enrichissement conservé avec une
 /// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
-/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 8 depuis la 0.26.0 (consignes de forme des
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 9 depuis la 0.28.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
-/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
-/// 2 à 7 n'ont pas été livrées).
-pub const CODE_PROMPT_VERSION: u32 = 8;
+/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
+/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées).
+pub const CODE_PROMPT_VERSION: u32 = 9;
 
 /// Version du prompt d'enrichissement de la famille `build` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
 /// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
 /// propre à une famille n'incrémente que la sienne. Tout enrichissement conservé avec une
 /// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
-/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 8 depuis la 0.26.0 (consignes de forme des
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 9 depuis la 0.28.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
-/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
-/// 2 à 7 n'ont pas été livrées).
-pub const BUILD_PROMPT_VERSION: u32 = 8;
+/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
+/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées).
+pub const BUILD_PROMPT_VERSION: u32 = 9;
 
 /// Version du prompt d'enrichissement de la famille `données` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
 /// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
 /// propre à une famille n'incrémente que la sienne. Tout enrichissement conservé avec une
 /// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
-/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 8 depuis la 0.26.0 (consignes de forme des
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 9 depuis la 0.28.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
-/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
-/// 2 à 7 n'ont pas été livrées).
-pub const DATA_PROMPT_VERSION: u32 = 8;
+/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
+/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées).
+pub const DATA_PROMPT_VERSION: u32 = 9;
 
 /// Version du prompt d'enrichissement de la famille `markdown` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
 /// de réponse, notes de correction) incrémente les quatre versions de famille ; changer un texte
 /// propre à une famille n'incrémente que la sienne (`CONCEPT_RULES` pour celle-ci). Tout enrichissement conservé avec une
 /// autre version est refait. Un test fige l'empreinte BLAKE3 des textes de la famille à côté de
-/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 8 depuis la 0.26.0 (consignes de forme des
+/// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 9 depuis la 0.28.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
-/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; les valeurs
-/// 2 à 7 n'ont pas été livrées).
-pub const MARKDOWN_PROMPT_VERSION: u32 = 8;
+/// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
+/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées).
+pub const MARKDOWN_PROMPT_VERSION: u32 = 9;
 
 /// Versions du prompt d'enrichissement des quatre familles (REQ-193).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,6 +507,27 @@ pub fn language_rules(language: &str) -> String {
     )
 }
 
+/// Consigne des numéros : ligne commune aux deux prompts système, juste après la ligne `Schéma`
+/// (REQ-236, DEC-177).
+pub const NUMBER_RULES: &str = "Chaque nœud de la liste s'écrit [numéro] nom — identifiant. Dans \"n\", donne le numéro écrit à côté du nom du nœud résumé, sans recopier son identifiant.";
+
+/// Lignes `[k] nom — id` de la liste, numérotées à partir de `first` (REQ-236).
+fn list_lines(ids: &[String], first: usize) -> String {
+    ids.iter()
+        .enumerate()
+        .map(|(i, id)| format!("[{}] {} — {id}\n", first + i, list_name(id)))
+        .collect()
+}
+
+/// Nom court d'une ligne de liste : dernier segment du chemin pour un document, sinon
+/// `tidy::node_name`.
+fn list_name(id: &str) -> &str {
+    match id.strip_prefix("document:") {
+        Some(path) => path.rsplit('/').next().unwrap_or(path),
+        None => tidy::node_name(id),
+    }
+}
+
 /// Prompt système d'enrichissement (identique pour tous les fournisseurs), langue demandée
 /// `language`.
 pub fn enrichment_system_prompt(language: &str) -> String {
@@ -514,9 +535,10 @@ pub fn enrichment_system_prompt(language: &str) -> String {
     let rules = language_rules(language);
     format!(
         "Tu enrichis le graphe d'un dépôt à partir d'un fichier ({types}) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
-         Schéma : {{\"summaries\": [{{\"node\": \"<identifiant de la liste>\", \"summary\": \"<25 mots au plus>\"}}], \
+         Schéma : {{\"summaries\": [{{\"n\": <numéro de la liste>, \"summary\": \"<25 mots au plus>\"}}], \
          \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \
          \"sections\": [\"<identifiant de section de la liste>\"]}}]}}.\n\
+         {NUMBER_RULES}\n\
          {SUMMARY_RULES}\n\
          {EXCERPT_RULES}\n\
          {KIND_RULES}\n\
@@ -536,7 +558,7 @@ pub fn enrichment_user_prompt(
     text: &str,
     requested: &[String],
 ) -> String {
-    let list: String = requested.iter().map(|n| format!("- {n}\n")).collect();
+    let list = list_lines(requested, 1);
     let head = match excerpt {
         None => format!("Fichier : {file}"),
         Some(Excerpt {
@@ -873,12 +895,14 @@ pub fn lot_system_prompt(language: &str) -> String {
     let rules = language_rules(language);
     format!(
         "Tu enrichis le graphe d'un dépôt à partir de plusieurs fichiers ({types}) et tu réponds uniquement par un objet JSON, sans texte autour.\n\
-         Chaque fichier est introduit par une ligne `=== FICHIER : <chemin> ===`, suivie de la liste de ses \
-         nœuds puis de son contenu, jusqu'à la ligne `=== FIN DU FICHIER : <chemin> ===`.\n\
+         Chaque fichier est introduit par une ligne `=== FICHIER [<f>] : <chemin> ===`, suivie de la liste de ses \
+         nœuds puis de son contenu, jusqu'à la ligne `=== FIN DU FICHIER : <chemin> ===`. \
+         Les numéros de nœuds continuent d'un fichier au suivant.\n\
          Schéma : {{\"files\": \
-         [{{\"file\": \"<chemin exact du fichier>\", \"summaries\": [{{\"node\": \"<identifiant de la liste de ce fichier>\", \
+         [{{\"f\": <numéro du fichier>, \"summaries\": [{{\"n\": <numéro de la liste de ce fichier>, \
          \"summary\": \"<25 mots au plus>\"}}], \"concepts\": [{{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \
          \"sections\": [\"<identifiant de section de la liste de ce fichier>\"]}}]}}]}}.\n\
+         {NUMBER_RULES}\n\
          {SUMMARY_RULES}\n\
          {KIND_RULES}\n\
          {rules}\n\
@@ -894,10 +918,13 @@ pub fn lot_system_prompt(language: &str) -> String {
 /// Message utilisateur d'un lot : pour chaque fichier, chemin, nœuds et contenu, avec séparateurs.
 pub fn lot_user_prompt(items: &[LotItem]) -> String {
     let mut out = String::new();
-    for it in items {
-        let list: String = it.node_ids.iter().map(|n| format!("- {n}\n")).collect();
+    let mut next = 1;
+    for (k, it) in items.iter().enumerate() {
+        let list = list_lines(&it.node_ids, next);
+        next += it.node_ids.len();
         out.push_str(&format!(
-            "=== FICHIER : {f} ===\nNœuds du fichier :\n{list}\nContenu :\n{t}\n=== FIN DU FICHIER : {f} ===\n\n",
+            "=== FICHIER [{k}] : {f} ===\nNœuds du fichier :\n{list}\nContenu :\n{t}\n=== FIN DU FICHIER : {f} ===\n\n",
+            k = k + 1,
             f = it.file,
             t = it.text
         ));
@@ -955,8 +982,11 @@ pub(crate) mod tests {
     /// `EXCERPT_RULES`, requête `None` réécrite en `(morceau 2)`. `f` transforme les prompts
     /// système.
     fn texts_0_26(f: impl Fn(String) -> String) -> Vec<String> {
-        let user =
-            user_prompt(None).replacen("Fichier : a.md\n", "Fichier : a.md (morceau 2)\n", 1);
+        let user = texts_v8_user(user_prompt(None)).replacen(
+            "Fichier : a.md\n",
+            "Fichier : a.md (morceau 2)\n",
+            1,
+        );
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             f(
@@ -965,7 +995,7 @@ pub(crate) mod tests {
             ),
             user,
             f(texts_v3_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE))),
-            lot_user_prompt(&lot_items()),
+            texts_v8_user(lot_user_prompt(&lot_items())),
         ]
     }
 
@@ -982,10 +1012,10 @@ pub(crate) mod tests {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             texts_v5_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
-            user_prompt(None),
-            user_prompt(Some(EXCERPT_2_3)),
+            texts_v8_user(user_prompt(None)),
+            texts_v8_user(user_prompt(Some(EXCERPT_2_3))),
             texts_v5_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
-            lot_user_prompt(&lot_items()),
+            texts_v8_user(lot_user_prompt(&lot_items())),
         ]
     }
 
@@ -1010,10 +1040,10 @@ pub(crate) mod tests {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             texts_v4_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
-            user_prompt(None),
-            user_prompt(Some(EXCERPT_2_3)),
+            texts_v8_user(user_prompt(None)),
+            texts_v8_user(user_prompt(Some(EXCERPT_2_3))),
             texts_v4_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
-            lot_user_prompt(&lot_items()),
+            texts_v8_user(lot_user_prompt(&lot_items())),
         ]
     }
 
@@ -1054,17 +1084,58 @@ pub(crate) mod tests {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             texts_v3_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
-            user_prompt(None),
-            user_prompt(Some(EXCERPT_2_3)),
+            texts_v8_user(user_prompt(None)),
+            texts_v8_user(user_prompt(Some(EXCERPT_2_3))),
             texts_v3_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
-            lot_user_prompt(&lot_items()),
+            texts_v8_user(lot_user_prompt(&lot_items())),
         ]
+    }
+
+    /// Prompt système de la version 8 : sans `NUMBER_RULES` ni la phrase sur les numéros, avec
+    /// les fragments `"node"`, `"file"` et `=== FICHIER : <chemin> ===` (REQ-236).
+    fn texts_v8_system(p: String) -> String {
+        p.replace(&format!("{NUMBER_RULES}\n"), "")
+            .replace(
+                "{\"n\": <numéro de la liste>, ",
+                "{\"node\": \"<identifiant de la liste>\", ",
+            )
+            .replace(
+                "{\"f\": <numéro du fichier>, ",
+                "{\"file\": \"<chemin exact du fichier>\", ",
+            )
+            .replace(
+                "{\"n\": <numéro de la liste de ce fichier>, ",
+                "{\"node\": \"<identifiant de la liste de ce fichier>\", ",
+            )
+            .replace(
+                "=== FICHIER [<f>] : <chemin> ===",
+                "=== FICHIER : <chemin> ===",
+            )
+            .replace(
+                " Les numéros de nœuds continuent d'un fichier au suivant.",
+                "",
+            )
+    }
+
+    /// Texte utilisateur de la version 8 : lignes `- <id>` et `=== FICHIER : <chemin> ===`.
+    fn texts_v8_user(u: String) -> String {
+        let mut out = String::new();
+        for line in u.split_inclusive('\n') {
+            if let (true, Some((_, id))) = (line.starts_with('['), line.split_once(" — ")) {
+                out.push_str(&format!("- {id}"));
+            } else if let Some(rest) = line.strip_prefix("=== FICHIER [") {
+                out.push_str(&format!("=== FICHIER {}", rest.split_once("] ").unwrap().1));
+            } else {
+                out.push_str(line);
+            }
+        }
+        out
     }
 
     /// Prompt système des versions 2 à 7 : « Schéma (version N) : {"version": N, » et la réponse
     /// vide avec `version` remis (REQ-201 les a retirés en version 8).
     fn texts_v7_system(p: String) -> String {
-        p.replacen(
+        texts_v8_system(p).replacen(
             "Schéma : {\"summaries\"",
             &format!(
                 "Schéma (version {ENRICH_SCHEMA_VERSION}) : {{\"version\": {ENRICH_SCHEMA_VERSION}, \"summaries\""
@@ -1088,14 +1159,17 @@ pub(crate) mod tests {
     /// Les six textes de la version 6 (inchangés par la version 7) : prompts actuels avec `version`
     /// remis.
     fn texts_v6() -> Vec<String> {
-        let mut t = texts_v8();
+        let mut t = texts_v9();
         t[1] = texts_v7_system(t[1].clone());
         t[4] = texts_v7_system(t[4].clone());
+        for i in [2, 3, 5] {
+            t[i] = texts_v8_user(t[i].clone());
+        }
         t
     }
 
-    /// Les six textes actuels (version 8 : sans `version` dans les prompts système).
-    fn texts_v8() -> Vec<String> {
+    /// Les six textes actuels (version 9 : liste numérotée, réponses à numéros).
+    fn texts_v9() -> Vec<String> {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
@@ -1142,11 +1216,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// Textes communs aux quatre familles (REQ-193) : les sept textes figés de la version 8, la
+    /// Textes communs aux quatre familles (REQ-193) : les sept textes actuels (version 9), la
     /// ligne `CONCEPT_RULES` + `\n` retirée des deux prompts système.
     fn common_texts() -> Vec<String> {
         let strip = |p: String| p.replacen(&format!("{CONCEPT_RULES}\n"), "", 1);
-        let mut texts = texts_v8();
+        let mut texts = texts_v9();
         texts[1] = strip(texts[1].clone());
         texts[4] = strip(texts[4].clone());
         texts.push(
@@ -1177,40 +1251,40 @@ pub(crate) mod tests {
 
     #[test]
     fn req193_ac2_code_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(CODE_PROMPT_VERSION, 8);
+        assert_eq!(CODE_PROMPT_VERSION, 9);
         assert_eq!(
             family_fingerprint(PromptFamily::Code),
-            "3fc16cb0e1a5b06b8bca768a8e4600125d81a76cf3b16e7bb37f16cde9250e4d",
+            "20e843f61d06a7a8d84fd5badd4c8fd1793c750044084e948203ddeb494253f4",
             "les textes du prompt de la famille code ont changé : incrémentez CODE_PROMPT_VERSION"
         );
     }
 
     #[test]
     fn req193_ac2_build_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(BUILD_PROMPT_VERSION, 8);
+        assert_eq!(BUILD_PROMPT_VERSION, 9);
         assert_eq!(
             family_fingerprint(PromptFamily::Build),
-            "3fc16cb0e1a5b06b8bca768a8e4600125d81a76cf3b16e7bb37f16cde9250e4d",
+            "20e843f61d06a7a8d84fd5badd4c8fd1793c750044084e948203ddeb494253f4",
             "les textes du prompt de la famille build ont changé : incrémentez BUILD_PROMPT_VERSION"
         );
     }
 
     #[test]
     fn req193_ac2_data_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(DATA_PROMPT_VERSION, 8);
+        assert_eq!(DATA_PROMPT_VERSION, 9);
         assert_eq!(
             family_fingerprint(PromptFamily::Data),
-            "3fc16cb0e1a5b06b8bca768a8e4600125d81a76cf3b16e7bb37f16cde9250e4d",
+            "20e843f61d06a7a8d84fd5badd4c8fd1793c750044084e948203ddeb494253f4",
             "les textes du prompt de la famille données ont changé : incrémentez DATA_PROMPT_VERSION"
         );
     }
 
     #[test]
     fn req193_ac2_markdown_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(MARKDOWN_PROMPT_VERSION, 8);
+        assert_eq!(MARKDOWN_PROMPT_VERSION, 9);
         assert_eq!(
             family_fingerprint(PromptFamily::Markdown),
-            "c71df41bb963c9b5fec3b9f06e437db0d56ada06ebdb7042b86bd0ede1bfd8b8",
+            "8cffd935c920b47f3e28a758582ddf2d8ef03bf9a1715e679fdb42ca49592d8d",
             "les textes du prompt de la famille markdown ont changé : incrémentez MARKDOWN_PROMPT_VERSION"
         );
         assert_ne!(
@@ -1274,7 +1348,7 @@ pub(crate) mod tests {
         }
         for t in FileType::ALL {
             assert!(expected.iter().any(|(e, _)| *e == t), "{t:?}");
-            assert_eq!(PromptVersions::CURRENT.of(t), 8, "{t:?}");
+            assert_eq!(PromptVersions::CURRENT.of(t), 9, "{t:?}");
         }
         assert_eq!(v.of_path("src/A.java"), 1);
         assert_eq!(v.of_path("pom.xml"), 2);
@@ -1288,7 +1362,7 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [8; 4]
+            [9; 4]
         );
     }
 
@@ -1442,17 +1516,78 @@ pub(crate) mod tests {
         let none = user_prompt(None);
         assert_eq!(
             none,
-            "Fichier : a.md\n\nNœuds du fichier :\n- document:a.md\n- section:a.md#x\n\nContenu :\ntexte a"
+            "Fichier : a.md\n\nNœuds du fichier :\n[1] a.md — document:a.md\n[2] x — section:a.md#x\n\nContenu :\ntexte a"
         );
         assert_eq!(
             enrichment_user_prompt("a.md", None, "t", &ids(&["document:a.md"])),
-            "Fichier : a.md\n\nNœuds du fichier :\n- document:a.md\n\nContenu :\nt"
+            "Fichier : a.md\n\nNœuds du fichier :\n[1] a.md — document:a.md\n\nContenu :\nt"
         );
         let some = user_prompt(Some(EXCERPT_2_3));
         let (first, rest) = some.split_once('\n').unwrap();
         assert_eq!(first, "Fichier : a.md (extrait 2/3, lignes 10–20)");
         assert_eq!(rest, none.split_once('\n').unwrap().1);
         assert!(!none.contains("morceau") && !some.contains("morceau"));
+    }
+
+    #[test]
+    fn req236_ac1_numbered_list_in_user_prompt() {
+        assert_eq!(
+            user_prompt(None),
+            "Fichier : a.md\n\nNœuds du fichier :\n[1] a.md — document:a.md\n[2] x — section:a.md#x\n\nContenu :\ntexte a"
+        );
+        let line = |id: &str, rank: usize| {
+            let mut v = vec!["document:z".to_string(); rank - 1];
+            v.push(id.to_string());
+            let p = enrichment_user_prompt("f", None, "t", &v);
+            p.lines()
+                .find(|l| l.starts_with(&format!("[{rank}]")))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            line("method:shop.Order.place(int)", 3),
+            "[3] place — method:shop.Order.place(int)"
+        );
+        assert_eq!(line("type:p.B", 1), "[1] B — type:p.B");
+        assert_eq!(
+            line("document:docs/guide.md", 1),
+            "[1] guide.md — document:docs/guide.md"
+        );
+    }
+
+    #[test]
+    fn req236_ac2_lot_user_prompt_numbers_files_and_nodes() {
+        assert_eq!(
+            lot_user_prompt(&lot_items()),
+            "=== FICHIER [1] : a.md ===\nNœuds du fichier :\n[1] a.md — document:a.md\n[2] x — section:a.md#x\n\nContenu :\ntexte a\n=== FIN DU FICHIER : a.md ===\n\n=== FICHIER [2] : B.java ===\nNœuds du fichier :\n[3] B — type:p.B\n\nContenu :\ntexte b\n=== FIN DU FICHIER : B.java ===\n\n"
+        );
+    }
+
+    #[test]
+    fn req236_ac3_schema_lines_in_system_prompts() {
+        let one = enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE);
+        assert!(one.contains("Schéma : {\"summaries\": [{\"n\": <numéro de la liste>, \"summary\": \"<25 mots au plus>\"}], \"concepts\": [{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \"sections\": [\"<identifiant de section de la liste>\"]}]}.\n"));
+        let lot = lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE);
+        assert!(lot.contains("Schéma : {\"files\": [{\"f\": <numéro du fichier>, \"summaries\": [{\"n\": <numéro de la liste de ce fichier>, \"summary\": \"<25 mots au plus>\"}], \"concepts\": [{\"name\": \"nom du concept\", \"summary\": \"<25 mots au plus> (optionnel)\", \"sections\": [\"<identifiant de section de la liste de ce fichier>\"]}]}]}.\n"));
+    }
+
+    #[test]
+    fn req236_ac4_number_rules_after_schema_and_no_node_or_file_key() {
+        assert_eq!(
+            NUMBER_RULES,
+            "Chaque nœud de la liste s'écrit [numéro] nom — identifiant. Dans \"n\", donne le numéro écrit à côté du nom du nœud résumé, sans recopier son identifiant."
+        );
+        for p in [
+            enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
+            lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
+        ] {
+            let schema = p.lines().position(|l| l.starts_with("Schéma")).unwrap();
+            assert_eq!(p.lines().nth(schema + 1).unwrap(), NUMBER_RULES);
+            assert!(!p.contains("\"node\"") && !p.contains("\"file\""));
+        }
+        assert!(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE).contains(
+            "Chaque fichier est introduit par une ligne `=== FICHIER [<f>] : <chemin> ===`, suivie de la liste de ses nœuds puis de son contenu, jusqu'à la ligne `=== FIN DU FICHIER : <chemin> ===`. Les numéros de nœuds continuent d'un fichier au suivant."
+        ));
     }
 
     #[test]
@@ -1573,7 +1708,7 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [8; 4]
+            [9; 4]
         );
         assert_eq!(crate::llm::ask::ASK_PROMPT_VERSION, 2);
     }

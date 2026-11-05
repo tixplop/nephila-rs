@@ -213,7 +213,11 @@ fn listed_ids(prompt: &str) -> Vec<String> {
         if line.starts_with("Nœuds du fichier :") {
             in_list = true;
         } else if in_list {
-            match line.strip_prefix("- ") {
+            match line
+                .strip_prefix('[')
+                .and_then(|r| r.split_once(" — "))
+                .map(|(_, id)| id)
+            {
                 Some(id) => out.push(id.to_string()),
                 None => in_list = false,
             }

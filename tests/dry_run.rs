@@ -393,8 +393,9 @@ fn answer(body: &[u8], seen: &Mutex<Seen>) -> String {
     let mut in_list = false;
     for line in user.lines() {
         if let Some(f) = line
-            .strip_prefix("=== FICHIER : ")
-            .and_then(|l| l.strip_suffix(" ==="))
+            .strip_prefix("=== FICHIER [")
+            .and_then(|l| l.split_once("] : "))
+            .and_then(|(_, l)| l.strip_suffix(" ==="))
         {
             files.push((f.to_string(), vec![]));
         } else if line == "Nœuds du fichier :" {
@@ -403,7 +404,11 @@ fn answer(body: &[u8], seen: &Mutex<Seen>) -> String {
             }
             in_list = true;
         } else if in_list {
-            match line.strip_prefix("- ") {
+            match line
+                .strip_prefix('[')
+                .and_then(|r| r.split_once(" — "))
+                .map(|(_, id)| id)
+            {
                 Some(id) => files.last_mut().unwrap().1.push(id.to_string()),
                 None => in_list = false,
             }
@@ -423,7 +428,7 @@ fn answer(body: &[u8], seen: &Mutex<Seen>) -> String {
             .map(|id| serde_json::json!({"node": id, "summary": "résumé"}))
             .collect()
     };
-    if user.starts_with("=== FICHIER : ") {
+    if user.starts_with("=== FICHIER [") {
         let list: Vec<_> = files
             .iter()
             .map(|(f, ids)| serde_json::json!({"file": f, "summaries": summaries(ids), "concepts": []}))

@@ -910,6 +910,11 @@ fn req177_ac6_prompt_version_6_graph_is_reenriched_once() {
 }
 
 #[test]
+fn req236_ac8_prompt_version_8_graph_is_reenriched_once() {
+    reenriched_once(8);
+}
+
+#[test]
 fn req167_ac5_omitted_trivial_accessor_is_accepted() {
     let env = tiny_env(&[(
         "src/A.java",
@@ -1540,7 +1545,11 @@ fn two_calls() -> (String, usize, [Vec<String>; 2]) {
             .next()
             .unwrap()
             .lines()
-            .filter_map(|l| l.strip_prefix("- "))
+            .filter_map(|l| {
+                l.strip_prefix('[')
+                    .and_then(|r| r.split_once(" — "))
+                    .map(|(_, id)| id)
+            })
             .map(String::from)
             .collect()
     };

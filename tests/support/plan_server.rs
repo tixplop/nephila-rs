@@ -167,7 +167,11 @@ fn conformant(body: &[u8]) -> String {
         if line == "Nœuds du fichier :" {
             in_list = true;
         } else if in_list {
-            match line.strip_prefix("- ") {
+            match line
+                .strip_prefix('[')
+                .and_then(|r| r.split_once(" — "))
+                .map(|(_, id)| id)
+            {
                 Some(id) => ids.push(id.to_string()),
                 None => in_list = false,
             }

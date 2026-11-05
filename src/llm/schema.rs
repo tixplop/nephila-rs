@@ -34,8 +34,8 @@ fn summaries() -> Value {
         "type": "array",
         "items": {
             "type": "object",
-            "properties": {"node": {"type": "string"}, "summary": {"type": "string"}},
-            "required": ["node", "summary"],
+            "properties": {"n": {"type": "integer"}, "summary": {"type": "string"}},
+            "required": ["n", "summary"],
             "additionalProperties": false
         }
     })
@@ -77,11 +77,11 @@ pub(crate) fn lot() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "file": {"type": "string"},
+                        "f": {"type": "integer"},
                         "summaries": summaries(),
                         "concepts": concepts()
                     },
-                    "required": ["file", "summaries", "concepts"],
+                    "required": ["f", "summaries", "concepts"],
                     "additionalProperties": false
                 }
             }
@@ -116,8 +116,8 @@ mod tests {
     #[test]
     fn req202_ac3_schemas_egaux_aux_litteraux() {
         let sums = json!({"type": "array", "items": {"type": "object",
-            "properties": {"node": s("string"), "summary": s("string")},
-            "required": ["node", "summary"], "additionalProperties": false}});
+            "properties": {"n": s("integer"), "summary": s("string")},
+            "required": ["n", "summary"], "additionalProperties": false}});
         let cons = json!({"type": "array", "items": {"type": "object",
             "properties": {"name": s("string"), "summary": {"type": ["string", "null"]},
                 "sections": {"type": "array", "items": s("string")}},
@@ -132,8 +132,8 @@ mod tests {
             lot(),
             json!({"type": "object", "properties": {"files": {"type": "array",
                 "items": {"type": "object",
-                    "properties": {"file": s("string"), "summaries": sums, "concepts": cons},
-                    "required": ["file", "summaries", "concepts"],
+                    "properties": {"f": s("integer"), "summaries": sums, "concepts": cons},
+                    "required": ["f", "summaries", "concepts"],
                     "additionalProperties": false}}},
                 "required": ["files"], "additionalProperties": false})
         );

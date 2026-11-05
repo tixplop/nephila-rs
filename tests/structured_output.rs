@@ -193,14 +193,63 @@ fn REQ202_AC5_on_envoie_le_schema_fichier_seul_et_lot() {
 
 fn fileschema() -> Value {
     let sums = json!({"type": "array", "items": {"type": "object",
-        "properties": {"node": {"type": "string"}, "summary": {"type": "string"}},
-        "required": ["node", "summary"], "additionalProperties": false}});
+        "properties": {"n": {"type": "integer"}, "summary": {"type": "string"}},
+        "required": ["n", "summary"], "additionalProperties": false}});
     let cons = json!({"type": "array", "items": {"type": "object",
         "properties": {"name": {"type": "string"}, "summary": {"type": ["string", "null"]},
             "sections": {"type": "array", "items": {"type": "string"}}},
         "required": ["name", "summary", "sections"], "additionalProperties": false}});
     json!({"type": "object", "properties": {"summaries": sums, "concepts": cons},
         "required": ["summaries", "concepts"], "additionalProperties": false})
+}
+
+#[test]
+fn REQ236_AC7_requete_avec_liste_numerotee_et_schema_a_numeros() {
+    for provider in ["openai", "anthropic"] {
+        for mode in ["on", "off"] {
+            let extra = format!("structured_output = \"{mode}\"\n");
+            let one = build_bodies(provider, &extra, 1);
+            assert_eq!(one.len(), 2, "{provider} {mode}");
+            for (b, f) in one.iter().zip(["d", "e"]) {
+                let text = b.to_string();
+                assert!(
+                    text.contains(&format!("[1] {f}.md — document:docs/{f}.md")),
+                    "{provider} {mode}: {text}"
+                );
+                let up = f.to_uppercase();
+                assert!(
+                    text.contains(&format!("[2] {f} — section:docs/{f}.md#{f}")),
+                    "{provider} {mode}: {up} {text}"
+                );
+                if mode == "on" {
+                    let fmt = format_of(provider, b).unwrap();
+                    assert_eq!(fmt, expected(provider, "nephila_fichier", fileschema()));
+                }
+            }
+            let lot = build_bodies(provider, &extra, 2);
+            let text = lot[0].to_string();
+            for want in [
+                "=== FICHIER [1] : docs/d.md ===",
+                "=== FICHIER [2] : docs/e.md ===",
+                "[1] d.md — document:docs/d.md",
+                "[2] d — section:docs/d.md#d",
+                "[3] e.md — document:docs/e.md",
+                "[4] e — section:docs/e.md#e",
+            ] {
+                assert!(text.contains(want), "{provider} {mode}: {want}");
+            }
+            if mode == "on" {
+                let schema = schema_of(provider, &format_of(provider, &lot[0]).unwrap());
+                let item = &schema["properties"]["files"]["items"];
+                assert_eq!(
+                    item["properties"]["summaries"],
+                    fileschema()["properties"]["summaries"]
+                );
+                assert_eq!(item["properties"]["f"], json!({"type": "integer"}));
+                assert_eq!(item["required"], json!(["f", "summaries", "concepts"]));
+            }
+        }
+    }
 }
 
 #[test]

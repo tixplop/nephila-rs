@@ -1018,7 +1018,11 @@ fn listed(body: &str) -> Vec<String> {
         .next()
         .unwrap()
         .lines()
-        .filter_map(|l| l.strip_prefix("- "))
+        .filter_map(|l| {
+            l.strip_prefix('[')
+                .and_then(|r| r.split_once(" — "))
+                .map(|(_, id)| id)
+        })
         .map(String::from)
         .collect()
 }

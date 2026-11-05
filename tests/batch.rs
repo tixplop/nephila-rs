@@ -584,7 +584,7 @@ fn req169_ac7_lot_request_carries_no_excerpt_wording() {
         .collect();
     assert_eq!(reqs.len(), 1);
     let body = &reqs[0].body;
-    assert!(body.contains("=== FICHIER : src/F00.java ===") && body.contains("F01.java"));
+    assert!(body.contains("=== FICHIER [1] : src/F00.java ===") && body.contains("F01.java"));
     assert!(
         !body.contains("extrait") && !body.contains("morceau"),
         "{body}"
