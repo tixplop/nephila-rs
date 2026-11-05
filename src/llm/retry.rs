@@ -228,7 +228,7 @@ mod tests {
     }
 
     fn truncated() -> Error {
-        Error::Truncated("tronquée".into())
+        Error::truncated("tronquée")
     }
 
     #[test]
@@ -402,7 +402,7 @@ mod tests {
             is(&parse_body("openai", "pas du json").unwrap_err(), None);
             is(&Error::Message("x".into()), None);
             is(&Error::Network("x".into()), None);
-            is(&Error::Truncated("x".into()), None);
+            is(&Error::truncated("x"), None);
         }
 
         #[test]

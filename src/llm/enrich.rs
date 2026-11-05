@@ -557,9 +557,15 @@ pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
             "version {v} non prise en charge pour un lot (attendu : {ENRICH_LOT_SCHEMA_VERSION})"
         )));
     }
+    Ok(attach_entries(raw.files, items))
+}
+
+/// Rattache les entrées brutes d'une réponse de lot aux fichiers du lot et filtre chacune selon
+/// les nœuds de son fichier : entrée hors lot ou en double écartée, fichier sans entrée en échec.
+fn attach_entries(entries: Vec<RawLotEntry>, items: &[LotItem]) -> LotEnrichment {
     let mut rejected = Vec::new();
     let mut found: Vec<Option<Enrichment>> = vec![None; items.len()];
-    for entry in raw.files {
+    for entry in entries {
         let wanted = norm_path(&entry.file);
         let by_norm = || {
             let same: Vec<usize> = (0..items.len())
@@ -602,7 +608,123 @@ pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
             (it.file.clone(), r)
         })
         .collect();
-    Ok(LotEnrichment { files, rejected })
+    LotEnrichment { files, rejected }
+}
+
+/// Éléments complets lus dans le début d'une réponse (REQ-232).
+#[derive(Default)]
+struct Partial {
+    version: Option<u32>,
+    summaries: Vec<RawSummary>,
+    concepts: Vec<RawConcept>,
+    files: Vec<RawLotEntry>,
+}
+
+/// Liste dont chaque élément est poussé dans `out` dès qu'il est complet ; une erreur plus loin
+/// laisse les éléments déjà poussés.
+struct PushSeq<'a, T>(&'a mut Vec<T>);
+
+impl<'de, T: Deserialize<'de>> serde::de::DeserializeSeed<'de> for PushSeq<'_, T> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<(), D::Error> {
+        d.deserialize_seq(self)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for PushSeq<'_, T> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("une liste")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<(), A::Error> {
+        while let Some(x) = seq.next_element::<T>()? {
+            self.0.push(x);
+        }
+        Ok(())
+    }
+}
+
+/// Objet de la réponse, lu clé par clé dans `Partial`.
+struct PartialObject<'a> {
+    out: &'a mut Partial,
+    lot: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for PartialObject<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<(), D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for PartialObject<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("un objet")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<(), A::Error> {
+        use serde::de::Error as _;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "version" => self.out.version = Some(map.next_value()?),
+                "summaries" if !self.lot => {
+                    map.next_value_seed(PushSeq(&mut self.out.summaries))?
+                }
+                "concepts" if !self.lot => map.next_value_seed(PushSeq(&mut self.out.concepts))?,
+                "files" if self.lot => map.next_value_seed(PushSeq(&mut self.out.files))?,
+                other => {
+                    let expected: &[&str] = if self.lot {
+                        &["version", "files"]
+                    } else {
+                        &["version", "summaries", "concepts"]
+                    };
+                    return Err(A::Error::unknown_field(other, expected));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Lit `text` à partir du premier `{` et rend les éléments complets lus avant la première
+/// erreur (coupe, champ inconnu, élément mal formé) ; une version autre que `version` vide tout.
+fn read_partial(text: &str, version: u32, lot: bool) -> Partial {
+    let mut partial = Partial::default();
+    if let Some(start) = text.find('{') {
+        let mut de = serde_json::Deserializer::from_str(&text[start..]);
+        let _ = serde::de::DeserializeSeed::deserialize(
+            PartialObject {
+                out: &mut partial,
+                lot,
+            },
+            &mut de,
+        );
+    }
+    if partial.version.is_some_and(|v| v != version) {
+        return Partial::default();
+    }
+    partial
+}
+
+impl Enrichment {
+    /// Éléments complets du début d'une réponse d'appel tronquée, filtrés comme `parse` ; ne
+    /// rend jamais d'erreur : ce qui n'a pas été lu est le reste (REQ-232).
+    pub fn parse_partial(text: &str, file: &str, known: &[String]) -> Enrichment {
+        let p = read_partial(text, ENRICH_SCHEMA_VERSION, false);
+        filter_raw(p.summaries, p.concepts, file, known)
+    }
+}
+
+/// Entrées complètes du début d'une réponse de lot tronquée, rattachées comme `parse_lot`.
+pub fn parse_lot_partial(text: &str, items: &[LotItem]) -> LotEnrichment {
+    let p = read_partial(text, ENRICH_LOT_SCHEMA_VERSION, true);
+    attach_entries(p.files, items)
 }
 
 /// Prompt système d'un lot de fichiers (identique pour tous les fournisseurs), langue demandée
@@ -1358,6 +1480,153 @@ pub(crate) mod tests {
         let e = Enrichment::parse(json, "a.md", &n).unwrap();
         assert!(e.concepts.is_empty());
         assert_eq!(e.rejected.len(), 1);
+    }
+
+    /// Positions (en octets) de la fin de chaque `}` hors chaîne de `text`, à la profondeur donnée.
+    fn closings_at(text: &str, depth: usize) -> Vec<usize> {
+        let (mut d, mut in_str, mut esc) = (0usize, false, false);
+        let mut out = Vec::new();
+        for (i, c) in text.char_indices() {
+            if in_str {
+                match (esc, c) {
+                    (true, _) => esc = false,
+                    (false, '\\') => esc = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' | '[' => d += 1,
+                '}' | ']' => {
+                    d -= 1;
+                    if c == '}' && d == depth {
+                        out.push(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    const TRICKY: &str = "Rôle « é » avec \\\"guillemets\\\", } et ] dedans.";
+
+    #[test]
+    fn req232_ac1_lot_cut_at_every_char_boundary() {
+        let items = [
+            item("A.java", &["type:A"]),
+            item("B.java", &["type:B"]),
+            item("C.java", &["type:C"]),
+        ];
+        let entry = |f: &str, n: &str| {
+            format!(
+                r#"{{"file":"{f}","summaries":[{{"node":"{n}","summary":"{TRICKY}"}}],"concepts":[]}}"#
+            )
+        };
+        let full = format!(
+            r#"{{"version":3,"files":[{},{},{}]}}"#,
+            entry("A.java", "type:A"),
+            entry("B.java", "type:B"),
+            entry("C.java", "type:C")
+        );
+        assert!(parse_lot(&full, &items).is_ok());
+        let closes = closings_at(&full, 2);
+        assert_eq!(closes.len(), 3);
+        for (cut, _) in full.char_indices().chain([(full.len(), ' ')]) {
+            let l = parse_lot_partial(&full[..cut], &items);
+            let want = closes.iter().filter(|&&c| c <= cut).count();
+            let got = l.files.iter().filter(|(_, r)| r.is_ok()).count();
+            assert_eq!(got, want, "coupe à {cut}");
+            assert_eq!(l.files.len(), 3);
+        }
+    }
+
+    #[test]
+    fn req232_ac1_call_cut_at_every_char_boundary() {
+        let s = |n: &str| format!(r#"{{"node":"type:{n}","summary":"{TRICKY}"}}"#);
+        let c = |n: &str| format!(r#"{{"name":"{n}","summary":null,"sections":["section:s"]}}"#);
+        let full = format!(
+            r#"{{"version":2,"summaries":[{},{},{}],"concepts":[{},{}]}}"#,
+            s("A"),
+            s("B"),
+            s("C"),
+            c("un"),
+            c("deux")
+        );
+        let known = ids(&["type:A", "type:B", "type:C", "section:s"]);
+        let closes = closings_at(&full, 2);
+        assert_eq!(closes.len(), 5);
+        for (cut, _) in full.char_indices().chain([(full.len(), ' ')]) {
+            let e = Enrichment::parse_partial(&full[..cut], "d.md", &known);
+            let n = closes.iter().filter(|&&x| x <= cut).count();
+            assert_eq!(e.summaries.len(), n.min(3), "coupe à {cut}");
+            assert_eq!(e.concepts.len(), n.saturating_sub(3), "coupe à {cut}");
+        }
+    }
+
+    #[test]
+    fn req232_ac2_partial_reader_edge_cases() {
+        let known = ids(&["type:A", "type:B"]);
+        let nothing = |t: &str| {
+            let e = Enrichment::parse_partial(t, "A.java", &known);
+            assert!(e.summaries.is_empty() && e.concepts.is_empty(), "{t:?}");
+        };
+        nothing("");
+        nothing("pas de json");
+        nothing("x");
+        let one = r#"{"version":2,"summaries":[{"node":"type:A","summary":"Rôle de a."},{"node":"type:B","summary":"Rôle de b."}],"concepts":[]}"#;
+        let plain = Enrichment::parse_partial(one, "A.java", &known);
+        assert_eq!(plain.summaries.len(), 2);
+        let fenced = Enrichment::parse_partial(&format!("```json\n{one}"), "A.java", &known);
+        assert_eq!(fenced, plain);
+        nothing(&one.replace(r#""version":2"#, r#""version":99"#));
+        nothing(&one.replace(r#""concepts":[]"#, r#""version":99"#));
+        // champ inconnu dans l'élément 2
+        let unk = r#"{"summaries":[{"node":"type:A","summary":"Rôle de a."},{"node":"type:B","summary":"Rôle de b.","x":1}],"concepts":[]}"#;
+        let e = Enrichment::parse_partial(unk, "A.java", &known);
+        assert_eq!(e.summaries.len(), 1);
+        // concepts avant summaries
+        let md = ids(&["section:s", "type:A"]);
+        let rev = r#"{"concepts":[{"name":"notion","summary":null,"sections":["section:s"]}],"summaries":[{"node":"section:s","summary":"Rôle de s."}]}"#;
+        let e = Enrichment::parse_partial(rev, "d.md", &md);
+        assert_eq!((e.summaries.len(), e.concepts.len()), (1, 1));
+        // clés hors schéma : les éléments complets avant elles restent gardés
+        let e = Enrichment::parse_partial(
+            r#"{"summaries":[{"node":"type:A","summary":"Rôle de a."}],"files":[],"concepts":[]}"#,
+            "A.java",
+            &known,
+        );
+        assert_eq!(e.summaries.len(), 1);
+        let e = Enrichment::parse_partial(
+            r#"{"files":[],"summaries":[{"node":"type:A","summary":"Rôle de a."}]}"#,
+            "A.java",
+            &known,
+        );
+        assert!(e.summaries.is_empty());
+        let items = [item("A.java", &["type:A"])];
+        let entry = r#"{"file":"A.java","summaries":[{"node":"type:A","summary":"Rôle de a."}],"concepts":[]}"#;
+        let l = parse_lot_partial(
+            &format!(r#"{{"version":3,"concepts":[],"files":[{entry}]}}"#),
+            &items,
+        );
+        assert!(l.files[0].1.is_err());
+        let l = parse_lot_partial(
+            &format!(r#"{{"files":[{entry}],"summaries":[],"concepts":[]}}"#),
+            &items,
+        );
+        assert!(l.files[0].1.is_ok());
+        // lot : entrée sans concepts
+        let items = [item("A.java", &["type:A"]), item("B.java", &["type:B"])];
+        let lot = r#"{"files":[{"file":"A.java","summaries":[{"node":"type:A","summary":"Rôle de a."}],"concepts":[]},{"file":"B.java","summaries":[{"node":"type:B","summary":"Rôle de b."}]}]}"#;
+        let l = parse_lot_partial(lot, &items);
+        assert!(l.files[0].1.is_ok() && l.files[1].1.is_err());
+        let l = parse_lot_partial(
+            &lot.replace(r#"{"files""#, r#"{"version":9,"files""#),
+            &items,
+        );
+        assert!(l.files.iter().all(|(_, r)| r.is_err()));
     }
 
     fn item(file: &str, nodes: &[&str]) -> LotItem {

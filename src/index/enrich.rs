@@ -603,12 +603,12 @@ fn run_unit<'a>(
                 // aucune issue pour le lot lui-même, ses fichiers en recevront par leurs moitiés.
                 // Les moitiés d'un lot non conforme sont de second passage.
                 Err(e)
-                    if matches!(e, Error::Truncated(_))
+                    if matches!(e, Error::Truncated { .. })
                         || (matches!(e, Error::Format(_))
                             && pass == Pass::First
                             && readable.len() >= 4) =>
                 {
-                    let next = if matches!(e, Error::Truncated(_)) {
+                    let next = if matches!(e, Error::Truncated { .. }) {
                         pass
                     } else {
                         Pass::Second
@@ -684,7 +684,7 @@ fn unit_name(files: &[&FileRecord]) -> String {
 fn trace_detail(e: &Error) -> String {
     match e {
         Error::Message(m) | Error::Format(m) => m.split(" : ").next().unwrap_or("").to_string(),
-        Error::Truncated(_) => TRUNCATED.to_string(),
+        Error::Truncated { .. } => TRUNCATED.to_string(),
         Error::Rejected { trace, .. } | Error::Redirected { trace, .. } => trace.clone(),
         // Un essai refusé par le plafond part avant toute trace d'appel : jamais détaillé ici.
         // Texte fixe : la cause du fournisseur ne va pas dans la trace (design.md, A-17).
@@ -698,7 +698,7 @@ fn trace_detail(e: &Error) -> String {
 /// Erreur de chaque fichier dont l'appel a été tronqué : le libellé fixe et l'action (A-5).
 fn truncation_advice(e: Error) -> Error {
     match e {
-        Error::Truncated(_) => Error::Truncated(format!(
+        Error::Truncated { .. } => Error::truncated(format!(
             "{TRUNCATED} ; réduisez max_chunk_chars ou batch_files, ou augmentez max_output_tokens"
         )),
         other => other,
@@ -1761,7 +1761,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 // Appel tronqué : sa liste de nœuds ou son texte est coupé et les sous-appels
                 // passent en tête de file (REQ-230). Pas de coupe possible, total au-delà de la borne : l'échec
                 // ordinaire (A-5). Réservation refusée par le plafond : comme un essai refusé.
-                if matches!(result, Err(Error::Truncated(_))) {
+                if matches!(result, Err(Error::Truncated { .. })) {
                     let nodes: Vec<(String, String)> = {
                         let all = ids.get(&file.path).map(Vec::as_slice).unwrap_or_default();
                         requested
@@ -2802,7 +2802,7 @@ mod tests {
 
     #[test]
     fn req046_ac6_truncated_neither_counts_nor_resets() {
-        let trunc = Error::Truncated("tronquée".into());
+        let trunc = Error::truncated("tronquée");
         let mut p = Policy::default();
         for r in [Some(&net()), Some(&net()), Some(&trunc)] {
             let t = p.dispatch();
@@ -3692,7 +3692,7 @@ mod tests {
                     .map(|i| i.file.trim_end_matches(".txt"))
                     .collect();
                 self.0.lock().unwrap().push(names);
-                Err(Error::Truncated("tronquée".into()))
+                Err(Error::truncated("tronquée"))
             }
             fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
                 Err(Error::Message("inutilisé".into()))
@@ -3796,7 +3796,7 @@ mod tests {
                 .collect();
             self.calls.lock().unwrap().push(names.concat());
             if self.truncate == Some(names.concat().as_str()) {
-                return Err(Error::Truncated("tronquée".into()));
+                return Err(Error::truncated("tronquée"));
             }
             let mut omitted = self.omitted.lock().unwrap();
             let second = names.iter().any(|n| omitted.iter().any(|o| o == n));
@@ -3937,7 +3937,7 @@ mod tests {
                 .collect();
             self.calls.lock().unwrap().push(names.clone());
             match self.only {
-                Some(o) if o != names => Err(Error::Truncated("tronquée".into())),
+                Some(o) if o != names => Err(Error::truncated("tronquée")),
                 _ => Err(Error::Format("réponse non conforme".into())),
             }
         }
@@ -5184,7 +5184,7 @@ mod tests {
     }
 
     fn truncated() -> Error {
-        Error::Truncated("réponse tronquée par la limite de jetons".into())
+        Error::truncated("réponse tronquée par la limite de jetons")
     }
 
     /// Tronque une fois l'appel de deux nœuds du plan ; compte les envois.
@@ -5261,7 +5261,7 @@ mod tests {
         assert_eq!(report.failed, 1);
         assert_eq!(names(&failures), ["T.txt"]);
         assert!(
-            matches!(&failures[0].1, Error::Truncated(m) if m.contains("réduisez max_chunk_chars")),
+            matches!(&failures[0].1, Error::Truncated { message: m, .. } if m.contains("réduisez max_chunk_chars")),
             "{failures:?}"
         );
         assert_eq!(store.enriched_hash("T.txt").unwrap(), None);

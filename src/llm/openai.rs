@@ -384,13 +384,16 @@ impl Complete for OpenAiLlm {
         let raw = sent?;
         let v = http::parse_body("openai", &raw)?;
         stats.record_response(openai_usage(&v));
-        if v["choices"][0]["finish_reason"] == "length" {
-            return Err(Error::Truncated(TRUNCATED.into()));
-        }
-        v["choices"][0]["message"]["content"]
+        let text = v["choices"][0]["message"]["content"]
             .as_str()
-            .map(String::from)
-            .ok_or_else(|| Error::Format("réponse de openai sans message".into()))
+            .map(String::from);
+        if v["choices"][0]["finish_reason"] == "length" {
+            return Err(Error::Truncated {
+                message: TRUNCATED.into(),
+                partial: text.unwrap_or_default(),
+            });
+        }
+        text.ok_or_else(|| Error::Format("réponse de openai sans message".into()))
     }
 }
 
@@ -546,7 +549,10 @@ mod tests {
                 .complete(None, None, &stats, "s".into(), "u".into(), Reply::File)
                 .unwrap_err();
             if truncated {
-                assert!(matches!(&e, Error::Truncated(m) if m == TRUNCATED), "{e:?}");
+                assert!(
+                    matches!(&e, Error::Truncated { message: m, .. } if m == TRUNCATED),
+                    "{e:?}"
+                );
             } else {
                 assert!(
                     matches!(&e, Error::Format(m) if m == "réponse de openai sans message"),

@@ -34,7 +34,8 @@ pub enum Error {
     Format(String),
     /// Réponse que le fournisseur marque tronquée par sa limite de jetons ; jamais retentée, ni
     /// comptée ni remise à zéro par la politique d'échec (REQ-046). S'affiche comme `Message`.
-    Truncated(String),
+    /// `partial` est le texte reçu avant la coupe (vide s'il manque), jamais affiché (REQ-232).
+    Truncated { message: String, partial: String },
     /// Plan d'appels d'un fichier envoyé seul au-delà du plafond : aucun appel n'est envoyé.
     /// Ni comptée ni remise à zéro par la politique d'échec, jamais retentée (REQ-048).
     TooManyCalls { calls: usize, max: usize },
@@ -74,6 +75,14 @@ pub fn stdout_write(e: &std::io::Error) -> Error {
 }
 
 impl Error {
+    /// Troncature sans texte récupéré (`partial` vide).
+    pub fn truncated(message: impl AsRef<str>) -> Error {
+        Error::Truncated {
+            message: message.as_ref().to_string(),
+            partial: String::new(),
+        }
+    }
+
     /// Variable d'environnement numérique mal formée (E-14) : seule source du texte.
     pub fn bad_integer_env(name: &str, value: &str) -> Error {
         Error::Message(format!("{name} : entier attendu, reçu « {value} »"))
@@ -98,7 +107,7 @@ impl fmt::Display for Error {
             | Error::Timeout(m)
             | Error::Message(m)
             | Error::Format(m)
-            | Error::Truncated(m)
+            | Error::Truncated { message: m, .. }
             | Error::Interrupted(m) => f.write_str(m),
             Error::TooManyCalls { calls, max } => write!(
                 f,

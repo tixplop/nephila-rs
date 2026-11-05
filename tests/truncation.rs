@@ -1788,3 +1788,23 @@ fn req231_ac6_essais_et_attente_gardent_la_marque_en_fin() {
     let (_, e) = run_lines(&s, &["build", "--verbose"]);
     assert!(!e.contains("sous-appel"), "{e}");
 }
+
+#[test]
+fn req232_ac17_ask_tronquee_au_texte_conforme_reste_refusee() {
+    const ASK_OK: &str = r#"{"found":true,"answer":"réponse complète","nodes":["Alpha"]}"#;
+    for p in ["anthropic", "openai"] {
+        let reply = match p {
+            "anthropic" => anthropic_reply(ASK_OK, Some("max_tokens")),
+            _ => openai_reply(ASK_OK, Some("length")),
+        };
+        let s = Setup::new(p, vec![reply; 10], "");
+        s.write("A.java", "public class Alpha {}\n");
+        let o = s.run(&["build", "--no-llm"]);
+        assert!(o.status.success(), "{}", err(&o));
+        let o = s.ask(&[]);
+        assert!(!o.status.success(), "{p}");
+        assert_eq!(s.posts().len(), 1, "{p}");
+        assert!(out(&o).is_empty(), "{p} {}", out(&o));
+        assert_eq!(err(&o), format!("{E11}\n"), "{p}");
+    }
+}

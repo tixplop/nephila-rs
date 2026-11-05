@@ -375,15 +375,18 @@ impl Complete for AnthropicLlm {
         let raw = sent?;
         let v = http::parse_body("anthropic", &raw)?;
         stats.record_response(anthropic_usage(&v));
-        if v["stop_reason"] == "max_tokens" {
-            return Err(Error::Truncated(TRUNCATED.into()));
-        }
-        v["content"]
+        let text = v["content"]
             .as_array()
             .and_then(|blocks| blocks.iter().find(|b| b["type"] == "text"))
             .and_then(|b| b["text"].as_str())
-            .map(String::from)
-            .ok_or_else(|| Error::Format("réponse de anthropic sans bloc texte".into()))
+            .map(String::from);
+        if v["stop_reason"] == "max_tokens" {
+            return Err(Error::Truncated {
+                message: TRUNCATED.into(),
+                partial: text.unwrap_or_default(),
+            });
+        }
+        text.ok_or_else(|| Error::Format("réponse de anthropic sans bloc texte".into()))
     }
 }
 
@@ -620,7 +623,10 @@ mod tests {
                 .complete(None, None, &stats, "s".into(), "u".into(), Reply::File)
                 .unwrap_err();
             if truncated {
-                assert!(matches!(&e, Error::Truncated(m) if m == TRUNCATED), "{e:?}");
+                assert!(
+                    matches!(&e, Error::Truncated { message: m, .. } if m == TRUNCATED),
+                    "{e:?}"
+                );
             } else {
                 assert!(
                     matches!(&e, Error::Format(m) if m == "réponse de anthropic sans bloc texte"),
