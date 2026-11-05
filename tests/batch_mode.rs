@@ -2561,3 +2561,31 @@ fn without_coverage(out: &str) -> String {
     assert!(tail.ends_with(" nœuds résumés"), "{out}");
     head.to_string()
 }
+
+/// Réponse à numéros pour la requête : le document est le nœud 1 de son fichier seul.
+fn numbered_single(body: &Value) -> Outcome {
+    let n = names_in(body)[0];
+    Outcome::Text(
+        json!({"summaries": [{"n": 1, "summary": summary_text(n)}], "concepts": []}).to_string(),
+    )
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ237_AC8_reponses_a_numeros_reliees_par_empreinte_du_corps() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &["a", "b", "c"], 0, numbered_single);
+        fx.server.reverse_results();
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        assert!(
+            !err(&o).contains("avertissement: docs/"),
+            "{provider} {}",
+            err(&o)
+        );
+        for n in ["a", "b", "c"] {
+            assert_eq!(fx.summary_of(n), Some(summary_text(n)), "{provider} {n}");
+        }
+        assert_eq!(fx.env.to_enrich(), 0);
+    }
+}

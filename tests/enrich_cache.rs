@@ -1629,3 +1629,42 @@ fn without_coverage(out: &str) -> String {
     assert!(tail.ends_with(" nœuds résumés"), "{out}");
     head.to_string()
 }
+
+/// Réponse à numéros : le nœud `k` de la liste reçoit `Résumé de <id>.`
+fn numbered_text(ids: &[String]) -> String {
+    let items: Vec<serde_json::Value> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, n)| serde_json::json!({"n": i + 1, "summary": format!("Résumé de {n}.")}))
+        .collect();
+    serde_json::json!({"summaries": items, "concepts": []}).to_string()
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ237_AC8_resumes_retraduits_d_un_appel_conserve_restent_sur_leurs_noeuds() {
+    let (java, max, lists) = two_calls();
+    let first = openai_body(&numbered_text(&lists[0]), "stop");
+    let bad = openai_body("pas du JSON", "stop");
+    let second = openai_body(&numbered_text(&lists[1]), "stop");
+    let s = Served::new(&java, max, vec![first, bad, second]);
+    let o = s.run("build");
+    let err = text(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert_eq!(s.posts(), 2, "{err}");
+    assert_eq!(s.kept(), 1, "{err}");
+    let o = s.run("update");
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    // L'appel 1 n'est pas renvoyé : une seule requête de plus, pour l'appel 2.
+    assert_eq!(s.posts(), 3);
+    assert_eq!(s.kept(), 0);
+    let nodes = Store::open_readonly(&s.repo).unwrap().nodes().unwrap();
+    for id in lists[0].iter().chain(&lists[1]) {
+        let n = nodes.iter().find(|n| &n.id == id).expect(id);
+        assert_eq!(
+            n.summary.as_deref(),
+            Some(format!("Résumé de {id}.").as_str()),
+            "{id}"
+        );
+    }
+}

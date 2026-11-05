@@ -1277,7 +1277,7 @@ fn REQ229_AC1_AC4_readme_appels_gardes() {
         .expect("dernier paragraphe");
     assert_eq!(
         last,
-        "Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`. Un graphe 0.25 à 0.27 est aussi migré sur place. Les versions antérieures refusent ensuite le graphe : pour y revenir, supprimez `.nephila/`, et le build suivant réenrichit tous les fichiers de la portée."
+        "Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`. Un graphe 0.25 à 0.27 est aussi migré sur place. La 0.28 réenrichit une fois la portée. Les versions antérieures refusent ensuite le graphe : pour y revenir, supprimez `.nephila/`, et le build suivant réenrichit tous les fichiers de la portée."
     );
     for banned in ["repart en entier", "repris en entier", "renvoyé en entier"] {
         assert!(!readme.contains(banned), "{banned}");
@@ -3019,4 +3019,35 @@ fn REQ235_AC17_readme_exemple_de_trace_avec_couverture() {
         &"trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts, 1/1 nœuds résumés) 19 ms"
     ));
     assert!(!section.contains("ok (1 résumés, 0 concepts) 19 ms"));
+}
+
+/// AC-238-3 et AC-238-7 : phrase de mise à niveau de la 0.28 (V-012, items 54 et 60).
+#[test]
+fn req238_ac3_ac7_readme_mise_a_niveau_028() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
+    let upgrade = readme_section(&readme, "## Mise à niveau");
+    assert_eq!(
+        upgrade
+            .matches("Un graphe 0.25 à 0.27 est aussi migré sur place. La 0.28 réenrichit une fois la portée. Les versions antérieures")
+            .count(),
+        1
+    );
+    let bullets: Vec<&str> = upgrade.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(bullets.len(), 6, "{bullets:?}");
+    assert!(bullets.iter().all(|l| !l.contains("Vers 0.28")));
+    let last = upgrade
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .expect("dernier paragraphe");
+    assert_eq!(
+        last,
+        "Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`. Un graphe 0.25 à 0.27 est aussi migré sur place. La 0.28 réenrichit une fois la portée. Les versions antérieures refusent ensuite le graphe : pour y revenir, supprimez `.nephila/`, et le build suivant réenrichit tous les fichiers de la portée."
+    );
+    let mock = readme_section(&readme, "### LLM simulé (`provider = \"mock\"`)");
+    assert_eq!(
+        blake3::hash(mock.as_bytes()).to_hex().as_str(),
+        "dcee63668a429f30f88a6ecba6b6b95720c7937903c951345c3342bb3769aad4",
+        "la section LLM simulé ne change pas"
+    );
 }

@@ -604,7 +604,7 @@ Les versions qui demandent une action, la plus récente d'abord. L'historique de
 - **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute `--check-stale` à ses requêtes, ou lance `nephila status` avant elles.
 - **Vers 0.18** : seuls les documents Markdown sont enrichis par défaut ; pour le code, `enrich_code = true` dans la configuration personnelle. Le premier `nephila build` remplace un graphe 0.17 et enrichit une fois tous les fichiers de la portée.
 
-Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`. Un graphe 0.25 à 0.27 est aussi migré sur place. Les versions antérieures refusent ensuite le graphe : pour y revenir, supprimez `.nephila/`, et le build suivant réenrichit tous les fichiers de la portée.
+Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`. Un graphe 0.25 à 0.27 est aussi migré sur place. La 0.28 réenrichit une fois la portée. Les versions antérieures refusent ensuite le graphe : pour y revenir, supprimez `.nephila/`, et le build suivant réenrichit tous les fichiers de la portée.
 
 ## Développement
 
