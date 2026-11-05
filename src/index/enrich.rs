@@ -674,6 +674,17 @@ fn run_unit<'a>(
                             Err(_) => rest.push(f),
                         }
                     }
+                    let suite = if rest.is_empty() {
+                        "rien ne repart".to_string()
+                    } else {
+                        format!("repart {}", unit_name(&rest))
+                    };
+                    trace!(
+                        "llm enrich récupération lot {} +{} [1/1] : {} fichiers gardés, {suite}",
+                        items[0].file,
+                        items.len() - 1,
+                        readable.len() - rest.len()
+                    );
                     return if rest.is_empty() {
                         Step::Finished(outcomes, None)
                     } else {
@@ -1858,6 +1869,13 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 let mut split_allowed = true;
                 match recovery {
                     Recovery::All(e) => {
+                        trace!(
+                            "llm enrich récupération {} [{index}/{count}] : {} résumés, {} concepts gardés, rien ne repart{}",
+                            file.path,
+                            e.summaries.len(),
+                            e.concepts.len(),
+                            sub_mark(path)
+                        );
                         result = Ok(e);
                         recovered = true;
                     }
@@ -1867,6 +1885,19 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                             && reserve_split(shared, &file.path, count, 1)
                         {
                             if take(1, 0) {
+                                if let Unit::Call {
+                                    requested: rest, ..
+                                } = &sub
+                                {
+                                    trace!(
+                                        "llm enrich récupération {} [{index}/{count}] : {} résumés, {} concepts gardés, repart {} nœuds{}",
+                                        file.path,
+                                        kept_part.summaries.len(),
+                                        kept_part.concepts.len(),
+                                        rest.len(),
+                                        sub_mark(path)
+                                    );
+                                }
                                 let mut first = path.clone();
                                 first.push(0);
                                 let split = tx.send(Msg::Split {

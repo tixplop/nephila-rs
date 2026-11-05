@@ -2448,3 +2448,518 @@ fn req232_ac14_progression_une_seule_fois() {
         "{e}"
     );
 }
+
+// ---- REQ-233 : traces de la récupération (design.md V-005) ----
+
+/// Lignes `llm enrich récupération` de la sortie d'erreur, sans leur horodatage.
+fn recovery_lines(e: &str) -> Vec<String> {
+    llm_lines(e)
+        .into_iter()
+        .filter(|l| l.starts_with("llm enrich récupération"))
+        .collect()
+}
+
+/// Lignes `trace:` complètes de récupération : forme `trace: [<s>.<ms>s] llm enrich récupération …`.
+fn assert_recovery_shape(e: &str) {
+    let re_ok = |l: &str| {
+        let Some(rest) = l.strip_prefix("trace: [") else {
+            return false;
+        };
+        let Some((clock, tail)) = rest.split_once("s] ") else {
+            return false;
+        };
+        let Some((sec, ms)) = clock.split_once('.') else {
+            return false;
+        };
+        sec.chars().all(|c| c.is_ascii_digit())
+            && !sec.is_empty()
+            && ms.len() == 3
+            && ms.chars().all(|c| c.is_ascii_digit())
+            && tail.starts_with("llm enrich récupération ")
+    };
+    for l in e.lines().filter(|l| l.contains("récupération")) {
+        assert!(re_ok(l), "{l}");
+    }
+}
+
+fn appels_line(e: &str) -> String {
+    e.lines()
+        .find(|l| l.contains("appels: "))
+        .unwrap_or_else(|| panic!("ligne appels: absente : {e}"))
+        .to_string()
+}
+
+#[test]
+fn req233_ac1_appel_ligne_de_recuperation_puis_sous_appel() {
+    for p in ["anthropic", "openai"] {
+        let s = Setup::new(
+            p,
+            vec![
+                with_tokens(p, &call_partial(p, &NINE[..4], CUT_M4)),
+                with_tokens(p, &ok_nodes(p, &NINE[4..])),
+            ],
+            "",
+        );
+        s.write("A.java", &nine_nodes());
+        let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+        let pos = position_of(&lines, "llm enrich fin A.java [1/1] tronquée ", &e);
+        assert_eq!(
+            lines[pos + 1],
+            "llm enrich récupération A.java [1/1] : 4 résumés, 0 concepts gardés, repart 5 nœuds",
+            "{p} {e}"
+        );
+        assert!(
+            lines[pos + 2].starts_with("llm enrich départ A.java [1/1] ")
+                && lines[pos + 2].ends_with(" (sous-appel 1)"),
+            "{p} {e}"
+        );
+        assert!(
+            lines[pos + 3].starts_with("llm enrich fin A.java [1/1] ok ")
+                && lines[pos + 3].ends_with(" (sous-appel 1)"),
+            "{p} {e}"
+        );
+        assert!(!e.contains("découpe"), "{p} {e}");
+        assert!(!e.contains("politique:"), "{p} {e}");
+        assert!(appels_line(&e).contains("appels: 2 appels"), "{p} {e}");
+        assert_recovery_shape(&e);
+    }
+}
+
+#[test]
+fn req233_ac2_ac6_lot_ligne_de_recuperation_puis_lot_reduit() {
+    for p in ["anthropic", "openai"] {
+        // AC-232-3 : A et B gardés, C et D repartent.
+        let s = Setup::new(
+            p,
+            vec![
+                trunc_text(p, &lot_partial_text(&["A", "B"], CUT_C)),
+                ok_text(p, &lot_reply(&["C", "D"])),
+            ],
+            "batch_files = 4\n",
+        );
+        four_docs(&s);
+        let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+        let pos = position_of(&lines, "llm enrich fin lot A.java +3 [1/1] tronquée ", &e);
+        assert_eq!(
+            lines[pos + 1],
+            "llm enrich récupération lot A.java +3 [1/1] : 2 fichiers gardés, repart lot C.java +1",
+            "{p} {e}"
+        );
+        assert!(
+            lines[pos + 2].starts_with("llm enrich départ lot C.java +1 [1/1] "),
+            "{p} {e}"
+        );
+        assert!(!e.contains("découpe") && !e.contains("renvoi"), "{p} {e}");
+        assert_recovery_shape(&e);
+
+        // AC-232-4 : trois gardés, D seul repart.
+        let s = Setup::new(
+            p,
+            vec![
+                trunc_text(
+                    p,
+                    &lot_partial_text(&["A", "B", "C"], r#"{"file": "D.java", "su"#),
+                ),
+                ok_for(p, &[("type:D", "Classe D centrale.")]),
+            ],
+            "batch_files = 4\n",
+        );
+        four_docs(&s);
+        let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+        let pos = position_of(&lines, "llm enrich fin lot A.java +3 [1/1] tronquée ", &e);
+        assert_eq!(
+            lines[pos + 1],
+            "llm enrich récupération lot A.java +3 [1/1] : 3 fichiers gardés, repart D.java",
+            "{p} {e}"
+        );
+        assert!(
+            lines[pos + 2].starts_with("llm enrich départ D.java [1/1] "),
+            "{p} {e}"
+        );
+
+        // AC-232-4, tous présents : aucun autre départ.
+        let s = Setup::new(
+            p,
+            vec![trunc_text(
+                p,
+                &lot_partial_text(&["A", "B", "C", "D"], r#",{"file": "E"#),
+            )],
+            "batch_files = 4\n",
+        );
+        four_docs(&s);
+        let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+        let pos = position_of(&lines, "llm enrich fin lot A.java +3 [1/1] tronquée ", &e);
+        assert_eq!(
+            lines[pos + 1],
+            "llm enrich récupération lot A.java +3 [1/1] : 4 fichiers gardés, rien ne repart",
+            "{p} {e}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("llm enrich départ"))
+                .count(),
+            1,
+            "{p} {e}"
+        );
+
+        // AC-232-6 : toujours tronqué, trois lignes dans l'ordre.
+        let s = Setup::new(
+            p,
+            vec![
+                trunc_text(p, &lot_partial_text(&["A"], r#"{"file": "B.java", "su"#)),
+                trunc_text(p, &lot_partial_text(&["B"], r#"{"file": "C.java", "su"#)),
+                trunc_text(p, &lot_partial_text(&["C"], r#"{"file": "D.java", "su"#)),
+                ok_for(p, &[("type:D", "Classe D centrale.")]),
+            ],
+            "batch_files = 4\n",
+        );
+        four_docs(&s);
+        let (_, e) = run_lines(&s, &["build", "--verbose"]);
+        assert_eq!(
+            recovery_lines(&e),
+            [
+                "llm enrich récupération lot A.java +3 [1/1] : 1 fichiers gardés, repart lot B.java +2",
+                "llm enrich récupération lot B.java +2 [1/1] : 1 fichiers gardés, repart lot C.java +1",
+                "llm enrich récupération lot C.java +1 [1/1] : 1 fichiers gardés, repart D.java",
+            ],
+            "{p} {e}"
+        );
+    }
+}
+
+#[test]
+fn req233_ac3_sans_verbose_rien_n_est_dit() {
+    let p = "openai";
+    let s = Setup::new(
+        p,
+        vec![call_partial(p, &NINE[..4], CUT_M4), ok_nodes(p, &NINE[4..])],
+        "",
+    );
+    s.write("A.java", &nine_nodes());
+    let o = s.run(&["build"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(err(&o), "", "stderr non vide");
+    assert_eq!(out(&o).trim_end().lines().count(), 1, "{}", out(&o));
+    assert!(out(&o).trim_end().ends_with("0 fichiers à enrichir"));
+    let s = Setup::new(
+        p,
+        vec![
+            trunc_text(p, &lot_partial_text(&["A", "B"], CUT_C)),
+            ok_text(p, &lot_reply(&["C", "D"])),
+        ],
+        "batch_files = 4\n",
+    );
+    four_docs(&s);
+    let o = s.run(&["build"]);
+    assert_eq!(err(&o), "");
+    assert_eq!(out(&o).trim_end().lines().count(), 1, "{}", out(&o));
+}
+
+#[test]
+fn req233_ac4_sans_element_utile_aucune_ligne_de_recuperation() {
+    let p = "openai";
+    // AC-232-5 : lot sans entrée utile, moitiés.
+    let s = Setup::new(
+        p,
+        vec![
+            trunc_text(
+                p,
+                &lot_partial_text(&[], r#"{"file": "A.java", "summaries": [{"node": "ty"#),
+            ),
+            ok_text(p, &lot_reply(&["A", "B"])),
+            ok_text(p, &lot_reply(&["C", "D"])),
+        ],
+        "batch_files = 4\n",
+    );
+    four_docs(&s);
+    let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+    assert!(recovery_lines(&e).is_empty(), "{e}");
+    let pos = position_of(&lines, "llm enrich fin lot A.java +3 [1/1] tronquée ", &e);
+    assert_eq!(
+        lines[pos + 1],
+        "llm enrich découpe lot A.java +3 [1/1] en lot A.java +1 et lot C.java +1",
+        "{e}"
+    );
+    // AC-232-9 : résumé hors liste, appel découpé.
+    let partial = trunc_text(
+        p,
+        r#"{"version": 2, "summaries": [{"node": "method:A.hors", "summary": "Hors."}, {"node": "method:A.m0", "su"#,
+    );
+    let s = Setup::new(
+        p,
+        vec![partial, ok_nodes(p, &NINE[..5]), ok_nodes(p, &NINE[5..])],
+        "",
+    );
+    s.write("A.java", &nine_nodes());
+    let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+    assert!(recovery_lines(&e).is_empty(), "{e}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("llm enrich découpe A.java [1/1] en 2 sous-appels")),
+        "{e}"
+    );
+    // Pas de réponse tronquée : aucune ligne.
+    let s = Setup::new(p, vec![ok_nodes(p, &NINE)], "");
+    s.write("A.java", &nine_nodes());
+    let (_, e) = run_lines(&s, &["build", "--verbose"]);
+    assert!(!e.contains("récupération"), "{e}");
+}
+
+#[test]
+fn req233_ac4_ac7_quatre_reponses_tronquees_trois_lignes_puis_a5() {
+    let p = "openai";
+    let mut t = String::from("public class A {\n");
+    for i in 0..15 {
+        t.push_str(&format!("    void m{i}() {{}}\n"));
+    }
+    t.push_str("}\n");
+    let mut ids: Vec<String> = (0..15).map(|i| format!("method:A.m{i}")).collect();
+    ids.push("type:A".into());
+    ids.sort();
+    // Le premier nœud demandé de chaque appel : m0, m1, m10, m11.
+    let replies: Vec<String> = (0..4)
+        .map(|k| call_partial(p, &[ids[k].as_str()], r#"{"node": "x", "summ"#))
+        .collect();
+    let s = Setup::new(p, replies, "");
+    s.write("A.java", &t);
+    let (lines, e) = run_lines(&s, &["build", "--verbose"]);
+    let rec = recovery_lines(&e);
+    assert_eq!(rec.len(), 3, "{e}");
+    for (l, end) in rec.iter().zip([
+        "1 résumés, 0 concepts gardés, repart 15 nœuds",
+        "1 résumés, 0 concepts gardés, repart 14 nœuds (sous-appel 1)",
+        "1 résumés, 0 concepts gardés, repart 13 nœuds (sous-appel 1.1)",
+    ]) {
+        assert!(l.ends_with(end) && l.contains(" [1/1] : "), "{l}");
+    }
+    let departs: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("llm enrich départ "))
+        .collect();
+    assert_eq!(departs.len(), 4, "{e}");
+    for (l, end) in
+        departs
+            .iter()
+            .skip(1)
+            .zip(["(sous-appel 1)", "(sous-appel 1.1)", "(sous-appel 1.1.1)"])
+    {
+        assert!(l.ends_with(end), "{l}");
+    }
+    for l in &lines {
+        assert!(
+            !l.contains("découpe")
+                && !l.contains("(sous-appel 0)")
+                && !l.contains("(sous-appel 2)"),
+            "{l}"
+        );
+    }
+    assert!(appels_line(&e).contains("appels: 4 appels"), "{e}");
+    // Aucune ligne de récupération après la quatrième fin tronquée, puis A-5.
+    let last_fin = lines
+        .iter()
+        .rposition(|l| l.starts_with("llm enrich fin A.java [1/1] tronquée "))
+        .unwrap();
+    assert!(
+        lines[last_fin + 1..]
+            .iter()
+            .all(|l| !l.contains("récupération")),
+        "{e}"
+    );
+    assert!(e.contains(&a5("A.java")), "{e}");
+    // Aucun contenu de la réponse.
+    for l in &rec {
+        assert!(!l.contains("method:") && !l.contains("Résumé"), "{l}");
+    }
+
+    // Quatrième réponse tronquée avec ses 13 résumés complets : fichier enrichi.
+    let mut replies: Vec<String> = (0..3)
+        .map(|k| call_partial(p, &[ids[k].as_str()], r#"{"node": "x", "summ"#))
+        .collect();
+    // La liste du quatrième appel : les 16 nœuds moins les trois premiers reçus (m0, m1, m10).
+    let wanted: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !ids[..3].iter().any(|g| g == n))
+        .collect();
+    replies.push(call_partial(p, &wanted, r#"{"node": "x", "summ"#));
+    let s = Setup::new(p, replies, "");
+    s.write("A.java", &t);
+    let o = s.run(&["build", "--verbose"]);
+    let e = err(&o);
+    assert!(o.status.success(), "{e}");
+    let rec = recovery_lines(&e);
+    assert_eq!(rec.len(), 4, "{e}");
+    assert!(
+        rec[3].ends_with("13 résumés, 0 concepts gardés, rien ne repart (sous-appel 1.1.1)"),
+        "{}",
+        rec[3]
+    );
+    assert!(!e.contains("avertissement:"), "{e}");
+    assert_eq!(s.to_enrich(), 0);
+}
+
+#[test]
+fn req233_ac6_appel_tous_recus_liste_vide_et_markdown() {
+    let p = "openai";
+    // AC-232-8 : tous les résumés reçus, puis coupe dans les concepts.
+    let items: Vec<String> = NINE
+        .iter()
+        .map(|n| serde_json::json!({"node": n, "summary": format!("Résumé de {n}.")}).to_string())
+        .collect();
+    let text = format!(
+        r#"{{"version": 2, "summaries": [{}], "concepts": [{{"name": "alpha", "su"#,
+        items.join(",")
+    );
+    let s = Setup::new(p, vec![trunc_text(p, &text); 3], "");
+    s.write("A.java", &nine_nodes());
+    let (_, e) = run_lines(&s, &["build", "--verbose"]);
+    assert_eq!(
+        recovery_lines(&e),
+        ["llm enrich récupération A.java [1/1] : 9 résumés, 0 concepts gardés, rien ne repart"],
+        "{e}"
+    );
+
+    // Document Markdown : résumés et un concept complet, le second concept coupé.
+    let doc = "# Alpha\n\ntexte a\n\n# Beta\n\ntexte b\n\n# Gamma\n\ntexte c\n";
+    let text = r#"{"version": 2, "summaries": [{"node": "document:D.md", "summary": "R0."}, {"node": "section:D.md#alpha", "summary": "R1."}, {"node": "section:D.md#beta", "summary": "R2."}, {"node": "section:D.md#gamma", "summary": "R3."}], "concepts": [{"name": "Idée un", "summary": "C1.", "sections": ["section:D.md#alpha"]}, {"name": "Idée deux", "su"#;
+    let s = Setup::new(p, vec![trunc_text(p, text); 3], "");
+    s.write("D.md", doc);
+    let (_, e) = run_lines(&s, &["build", "--verbose"]);
+    assert_eq!(
+        recovery_lines(&e),
+        ["llm enrich récupération D.md [1/1] : 4 résumés, 1 concepts gardés, rien ne repart"],
+        "{e}"
+    );
+
+    // Morceau à liste vide : un concept complet puis la coupe.
+    let ok = ok_for(p, &[]);
+    let cut_concept = trunc_text(
+        p,
+        r#"{"version": 2, "summaries": [], "concepts": [{"name": "Idée vide", "summary": "C.", "sections": ["section:E.md#t0"]}, {"name": "Autre", "su"#,
+    );
+    let s = Setup::new(
+        p,
+        vec![ok.clone(), cut_concept, ok.clone(), ok.clone(), ok],
+        "max_chunk_chars = 8\nformat_retries = 0\n",
+    );
+    s.write("E.md", "# t0\nxxxxxxx\n# t2\n");
+    let (_, e) = run_lines(&s, &["build", "--verbose"]);
+    let rec = recovery_lines(&e);
+    assert_eq!(rec.len(), 1, "{e}");
+    assert!(
+        rec[0].starts_with("llm enrich récupération E.md [")
+            && rec[0].ends_with("] : 0 résumés, 1 concepts gardés, rien ne repart"),
+        "{e}"
+    );
+}
+
+#[test]
+fn req233_ac9_resume_ecarte_repart_un_seul_avertissement_sans_marqueur() {
+    let p = "openai";
+    for verbose in [false, true] {
+        let cut = format!(r#"{{"node": "method:A.m3", "summary": "{SECRET}"#);
+        let first = trunc_text(
+            p,
+            &format!(
+                r#"{{"version": 2, "summaries": [{{"node": "method:A.m0", "summary": "Premier."}}, {{"node": "method:A.m1", "summary": "N/A"}}, {{"node": "method:A.m2", "summary": "Troisième."}}, {cut}"#
+            ),
+        );
+        let s = Setup::new(
+            p,
+            vec![
+                first,
+                ok_nodes(
+                    p,
+                    &["method:A.m1"]
+                        .iter()
+                        .chain(&NINE[3..])
+                        .copied()
+                        .collect::<Vec<_>>(),
+                ),
+            ],
+            "",
+        );
+        s.write("A.java", &nine_nodes());
+        let args: &[&str] = if verbose {
+            &["build", "--verbose"]
+        } else {
+            &["build"]
+        };
+        let o = s.run(args);
+        let e = err(&o);
+        assert!(o.status.success(), "{verbose} {e}");
+        assert!(
+            !e.contains(SECRET) && !out(&o).contains(SECRET),
+            "{verbose} {e}"
+        );
+        let posts = s.posts();
+        assert_eq!(posts.len(), 2, "{verbose} {e}");
+        assert!(
+            listed(&posts[1]).contains(&"method:A.m1".to_string()),
+            "{verbose}"
+        );
+        assert_eq!(listed(&posts[1]).len(), 7, "{verbose}");
+        let warns: Vec<&str> = e
+            .lines()
+            .filter(|l| l.starts_with("avertissement:"))
+            .collect();
+        assert_eq!(
+            warns,
+            ["avertissement: A.java : 1 élément(s) d'enrichissement écarté(s) : résumé pour method:A.m1 (vide de sens)"],
+            "{verbose} {e}"
+        );
+        if verbose {
+            let rec = recovery_lines(&e);
+            assert_eq!(rec.len(), 1, "{e}");
+            assert!(
+                rec[0].ends_with("2 résumés, 0 concepts gardés, repart 7 nœuds"),
+                "{e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn req233_ac3_lot_recupere_progression_et_bilan() {
+    let p = "openai";
+    let s = Setup::new(
+        p,
+        vec![
+            trunc_text(p, &lot_partial_text(&["A", "B"], CUT_C)),
+            ok_text(p, &lot_reply(&["C", "D"])),
+        ],
+        "batch_files = 4\n",
+    );
+    four_docs(&s);
+    let o = s.run(&["build", "--show-progress"]);
+    let e = err(&o);
+    assert!(o.status.success(), "{e}");
+    assert_eq!(s.posts().len(), 2, "{e}");
+    let lines: Vec<&str> = e
+        .lines()
+        .filter(|l| l.starts_with("progression: enrichissement"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "progression: enrichissement 0 % (0/4 fichiers)",
+            "progression: enrichissement 50 % (2/4 fichiers)",
+            "progression: enrichissement 100 % (4/4 fichiers)"
+        ],
+        "{e}"
+    );
+    assert_eq!(
+        e.matches("enrichissement 100 % (4/4 fichiers)").count(),
+        1,
+        "{e}"
+    );
+    assert!(!e.contains("récupération"), "{e}");
+    assert_eq!(out(&o).trim_end().lines().count(), 1, "{}", out(&o));
+    assert!(
+        out(&o).trim_end().ends_with("0 fichiers à enrichir"),
+        "{}",
+        out(&o)
+    );
+}

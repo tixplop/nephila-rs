@@ -1,0 +1,31 @@
+Reconstruit entièrement le graphe
+
+Usage: nephila build [OPTIONS]
+
+Options:
+  -C, --repo <REPO>           Racine du dépôt à analyser [default: .]
+      --no-llm                N'appelle pas le LLM (la configuration n'est pas lue) : structure seule, sans enrichissement
+      --enrich-code           Enrichit aussi le code source et les fichiers de build et de données, pas seulement les documents Markdown (remplace `enrich_code` de la configuration ; défaut : documents seulement)
+      --dry-run               Estime les appels, octets et jetons de l'enrichissement, sans rien envoyer au LLM (graphe écrit comme avec --no-llm ; incompatible avec --no-llm)
+  -v, --verbose               Traces synthétiques des étapes et des appels LLM sur stderr (préfixe `trace:` ; incompatible avec --show-progress)
+      --show-progress         Avancement des phases extraction et enrichissement sur stderr, par paliers de 10 % (préfixe `progression:` ; incompatible avec --verbose)
+      --jobs <N>              Nombre de fils du parcours du dépôt et de l'extraction, de 1 à 256 (défaut : nombre de cœurs disponibles ; indépendant de `concurrency`, qui ne règle que les appels LLM)
+      --batch-files <N>       Nombre maximal de fichiers par appel d'enrichissement (remplace `batch_files` de la configuration)
+      --format-retries <N>    Nombre de nouveaux essais d'un appel LLM dont la réponse est non conforme (remplace `format_retries` de la configuration ; défaut 2 ; 0 = aucun nouvel essai)
+      --max-calls <N>         Nombre maximal d'appels d'enrichissement de cette commande, nouveaux essais de format compris ; les fichiers restants attendent le prochain nephila update (remplace `max_calls` de la configuration ; défaut : aucun plafond)
+      --accept-project-model  Accepte le modèle de .nephila.toml pour cette commande, même s'il fait réenrichir plus de 50 fichiers déjà enrichis (voir `model_override` de la configuration ; défaut : refus au-delà de 50)
+      --batch                 Confie l'enrichissement au mode lot du fournisseur : moins cher, mais jusqu'à 24 h d'attente ; nephila update --batch reprend après Ctrl-C (sans rapport avec --batch-files, qui règle les fichiers par appel ; incompatible avec --no-llm)
+      --exclude <MOTIF>       Exclut de l'analyse les fichiers qui correspondent au motif (syntaxe .gitignore, relatif à la racine du dépôt ; répétable ; !motif réinclut un fichier exclu par un motif précédent)
+      --exclude-type <TYPES>  Exclut de l'analyse un ou plusieurs types de fichiers, séparés par des virgules (répétable). Types : markdown, java, kotlin, groovy, scala, javascript, typescript, sql, xml, json, yaml, maven, ivy, gradle, npm
+  -h, --help                  Print help
+
+Filtres : --exclude et --exclude-type valent pour cette commande seulement.
+Filtres durables (lus aussi par status et query) : fichier .nephila.toml à la racine du dépôt
+  exclude = ["docs/legacy/", "*.min.js"]
+  exclude_types = ["json"]
+Exclus par défaut, à tout niveau : dist/, out/, coverage/, .next/, .nuxt/, vendor/, .idea/ et *.min.js ; pour les analyser : exclude_defaults = false dans le même fichier
+Réglages LLM du dépôt, dans le même fichier (prioritaires sur la configuration personnelle) :
+  model, summary_language, max_chunk_chars, concurrency, timeout_secs, batch_files, format_retries
+Réglages de query ask seulement, dans une section [ask] à la fin du même fichier :
+  model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes
+Exemple : nephila build --exclude '*.min.js' --exclude-type json,yaml

@@ -2914,7 +2914,10 @@ fn REQ208_AC2_AC5_readme_tables_et_phrases() {
     assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
 }
 
-/// AC-231-3 : puce « Réponse tronquée » du README (V-012, item 56).
+/// Puce « Réponse tronquée » de V-012 (item 57).
+const TRUNCATED_BULLET: &str = "- **Réponse tronquée** : `réponse tronquée par la limite de jetons`, jamais renvoyée telle quelle ; la partie déjà reçue est gardée et seul le reste repart ; sans partie utile, un lot tronqué est découpé en deux, jusqu'au fichier seul, et un appel tronqué d'un fichier seul est aussi découpé ; un appel repart ainsi trois fois de suite au plus, et ces appels comptent dans `max_calls` ; si le fichier échoue quand même, réduisez `max_chunk_chars` ou augmentez `max_output_tokens`.";
+
+/// AC-231-3 (attendu remplacé par celui d'AC-233-10) : puce « Réponse tronquée » du README.
 #[test]
 fn REQ231_AC3_readme_reponse_tronquee_decoupe_d_un_appel() {
     let readme = repo_file("README.md");
@@ -2926,9 +2929,46 @@ fn REQ231_AC3_readme_reponse_tronquee_decoupe_d_un_appel() {
         .iter()
         .find(|l| l.starts_with("- **Réponse tronquée**"))
         .unwrap();
-    assert_eq!(
-        *b,
-        "- **Réponse tronquée** : `réponse tronquée par la limite de jetons`, jamais renvoyée telle quelle ; un lot tronqué est découpé en deux, jusqu'au fichier seul ; un appel tronqué d'un fichier seul est aussi découpé, trois fois de suite au plus, et ces appels comptent dans `max_calls` ; si le fichier échoue quand même, réduisez `max_chunk_chars` ou augmentez `max_output_tokens`."
-    );
+    assert_eq!(*b, TRUNCATED_BULLET);
     assert!(!b.contains("sous-appel"));
+    assert!(b.contains("un lot tronqué est découpé en deux"));
+    assert!(b.contains("un appel tronqué d'un fichier seul est aussi découpé"));
+    assert!(b.contains("comptent dans `max_calls`"));
+}
+
+/// AC-233-5 : puce du README, taille, aides inchangées.
+#[test]
+fn REQ233_AC5_readme_puce_taille_et_aides() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
+    let section = readme_section(&readme, "### Échecs et nouveaux essais");
+    let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(bullets.len(), 5, "{bullets:?}");
+    let b = bullets
+        .iter()
+        .find(|l| l.starts_with("- **Réponse tronquée**"))
+        .unwrap();
+    assert_eq!(*b, TRUNCATED_BULLET);
+    // Références : sorties de `--help` du binaire compilé à f629db2 (avant REQ-232 et REQ-233).
+    for (cmd, reference) in [
+        ("build", include_str!("fixtures/help/build-f629db2.txt")),
+        ("update", include_str!("fixtures/help/update-f629db2.txt")),
+    ] {
+        assert_eq!(help_of(&[cmd, "--help"]), reference, "{cmd} --help");
+    }
+}
+
+/// AC-233-10 : la puce dit la partie gardée, sans mots de `--verbose`.
+#[test]
+fn REQ233_AC10_puce_reponse_tronquee_texte_de_v012() {
+    let readme = repo_file("README.md");
+    let section = readme_section(&readme, "### Échecs et nouveaux essais");
+    let b = section
+        .lines()
+        .find(|l| l.starts_with("- **Réponse tronquée**"))
+        .unwrap();
+    assert_eq!(b, TRUNCATED_BULLET);
+    assert!(!b.contains("récupération") && !b.contains("sous-appel"));
+    assert!(b.contains("la partie déjà reçue est gardée et seul le reste repart"));
+    assert_eq!(readme.matches("la partie déjà reçue").count(), 1);
 }

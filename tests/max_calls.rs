@@ -900,3 +900,74 @@ fn req232_ac12_appel_tronque_recupere_puis_plafond() {
     assert_eq!(lines_of(&err, "avertissement:"), vec![a10(1, 1)], "{err}");
     assert!(env.enriched(&["A.java".to_string()]).is_empty(), "{err}");
 }
+
+// ---- AC-233-8 : traces de la récupération et plafond ----
+
+#[test]
+fn req233_ac8_lot_recupere_puis_plafond_ligne_sans_depart() {
+    let entry = |i: usize| {
+        serde_json::json!({
+            "file": format!("d{i}.md"),
+            "summaries": [{"node": format!("document:d{i}.md"), "summary": format!("Résumé {i}.")}],
+            "concepts": []
+        })
+        .to_string()
+    };
+    let partial = format!(
+        r#"{{"version": 3, "files": [{},{},{{"file": "d3.md", "summ"#,
+        entry(1),
+        entry(2)
+    );
+    let reply = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": partial}, "finish_reason": "length"}]
+    })
+    .to_string();
+    let server = fake_server::FakeServer::start(vec![(200, reply)]);
+    let env = Env::server(&docs(4), &server.base_url, "batch_files = 4\n");
+    let o = env.run(&["build", "--max-calls", "1", "--verbose"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let rec: Vec<&str> = err.lines().filter(|l| l.contains("récupération")).collect();
+    assert_eq!(rec.len(), 1, "{err}");
+    assert!(
+        rec[0].ends_with(
+            "llm enrich récupération lot d1.md +3 [1/1] : 2 fichiers gardés, repart lot d3.md +1"
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        err.lines()
+            .filter(|l| l.contains("llm enrich départ"))
+            .count(),
+        1,
+        "{err}"
+    );
+    assert_eq!(lines_of(&err, "avertissement:"), vec![a10(1, 2)], "{err}");
+}
+
+#[test]
+fn req233_ac8_appel_recupere_plafond_deux_ligne_et_un_aucune() {
+    let (server, files) = nine_nodes_server();
+    let env = Env::server(&files, &server.base_url, "enrich_code = true\n");
+    let o = env.run(&["build", "--max-calls", "2", "--verbose"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert_eq!(
+        err.lines()
+            .filter(|l| l.contains("llm enrich récupération"))
+            .count(),
+        1,
+        "{err}"
+    );
+    assert!(err.contains("(sous-appel 1)"), "{err}");
+
+    let (server, files) = nine_nodes_server();
+    let env = Env::server(&files, &server.base_url, "enrich_code = true\n");
+    let o = env.run(&["build", "--max-calls", "1", "--verbose"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert!(
+        !err.contains("récupération") && !err.contains("sous-appel"),
+        "{err}"
+    );
+}
