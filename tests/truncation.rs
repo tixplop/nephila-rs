@@ -2963,3 +2963,38 @@ fn req233_ac3_lot_recupere_progression_et_bilan() {
         out(&o)
     );
 }
+
+#[test]
+fn req234_ac4_resume_vide_d_une_reponse_tronquee_redemande_et_signale() {
+    let p = "openai";
+    let cut = format!(r#"{{"node": "method:A.m3", "summary": "{SECRET}"#);
+    let first = trunc_text(
+        p,
+        &format!(
+            r#"{{"version": 2, "summaries": [{{"node": "method:A.m0", "summary": "Premier."}}, {{"node": "method:A.m1", "summary": ""}}, {{"node": "method:A.m2", "summary": "Troisième."}}, {cut}"#
+        ),
+    );
+    let rest: Vec<&str> = ["method:A.m1"].iter().chain(&NINE[3..]).copied().collect();
+    let s = Setup::new(p, vec![first, ok_nodes(p, &rest)], "");
+    s.write("A.java", &nine_nodes());
+    let o = s.run(&["build"]);
+    let e = err(&o);
+    assert!(o.status.success(), "{e}");
+    let posts = s.posts();
+    assert_eq!(posts.len(), 2, "{e}");
+    assert!(
+        listed(&posts[1]).contains(&"method:A.m1".to_string()),
+        "{e}"
+    );
+    assert_eq!(listed(&posts[1]).len(), 7, "{e}");
+    let warns: Vec<&str> = e
+        .lines()
+        .filter(|l| l.starts_with("avertissement:"))
+        .collect();
+    assert_eq!(
+        warns,
+        ["avertissement: A.java : 1 élément(s) d'enrichissement écarté(s) : résumé pour method:A.m1 (vide)"],
+        "{e}"
+    );
+    assert!(!e.contains(SECRET), "{e}");
+}

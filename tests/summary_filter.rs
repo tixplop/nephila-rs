@@ -443,3 +443,94 @@ fn req180_ac4_nameless_concept_gives_the_exact_warning() {
     );
     assert!(warnings_for(&err, "docs/b.md").is_empty(), "{err}");
 }
+
+#[test]
+fn req234_ac3_empty_node_summary_gives_one_warning_absent_node_none() {
+    for verbose in [false, true] {
+        let env = Env::new(1, None);
+        env.fixture(
+            &format!("{SVC}.json"),
+            &[(TYPE_ID, ""), (METHOD_ID, "Place la commande.")],
+            json!([]),
+        );
+        let mut cmd = env.cmd();
+        cmd.arg("build");
+        if verbose {
+            cmd.arg("--verbose");
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        let err = stderr(&out);
+        let w = warnings_for(&err, "OrderService.java");
+        assert_eq!(w.len(), 1, "{err}");
+        assert_eq!(
+            w[0],
+            format!(
+                "avertissement: {SVC} : 1 élément(s) d'enrichissement écarté(s) : résumé pour {TYPE_ID} (vide)"
+            )
+        );
+        assert_eq!(env.export_node(METHOD_ID)["summary"], "Place la commande.");
+        assert!(env
+            .export_node(TYPE_ID)
+            .get("summary")
+            .is_none_or(Value::is_null));
+    }
+    // Nœud absent de la réponse : aucun élément.
+    let env = Env::new(1, None);
+    env.fixture(
+        &format!("{SVC}.json"),
+        &[(METHOD_ID, "Place la commande.")],
+        json!([]),
+    );
+    let err = env.build_ok();
+    assert!(warnings_for(&err, "OrderService.java").is_empty(), "{err}");
+}
+
+#[test]
+fn req234_ac5_two_elements_in_one_line_and_no_duplicate_across_calls() {
+    let env = Env::new(1, None);
+    env.fixture(
+        &format!("{SVC}.json"),
+        &[(TYPE_ID, ""), (METHOD_ID, "N/A")],
+        json!([]),
+    );
+    let err = env.build_ok();
+    let w = warnings_for(&err, "OrderService.java");
+    assert_eq!(w.len(), 1, "{err}");
+    assert_eq!(
+        w[0],
+        format!(
+            "avertissement: {SVC} : 2 élément(s) d'enrichissement écarté(s) : résumé pour {TYPE_ID} (vide) ; résumé pour {METHOD_ID} (vide de sens)"
+        )
+    );
+
+    let env = Env::new(1, Some(120));
+    env.fixture(&format!("{SVC}.1.json"), &[(TYPE_ID, "")], json!([]));
+    env.fixture(&format!("{SVC}.2.json"), &[(TYPE_ID, "")], json!([]));
+    let err = env.build_ok();
+    let calls: Vec<String> = env
+        .log_lines()
+        .into_iter()
+        .filter(|l| l.starts_with(SVC))
+        .collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    let w = warnings_for(&err, "OrderService.java");
+    assert_eq!(w.len(), 1, "{err}");
+    assert_eq!(
+        w[0],
+        format!(
+            "avertissement: {SVC} : 1 élément(s) d'enrichissement écarté(s) : résumé pour {TYPE_ID} (vide)"
+        )
+    );
+
+    // Résumé vide de concept : aucune ligne.
+    let env = Env::new(1, None);
+    let sec = "section:docs/guide.md#guide";
+    env.fixture(
+        "docs/guide.md.json",
+        &[],
+        json!([{"name": "Facturation", "summary": "", "sections": [sec]}]),
+    );
+    let err = env.build_ok();
+    assert!(warnings_for(&err, "docs/guide.md").is_empty(), "{err}");
+}

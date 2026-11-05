@@ -222,6 +222,10 @@ fn node_empty_of_sense(id: &str) -> String {
     format!("résumé pour {id} (vide de sens)")
 }
 
+fn node_empty(id: &str) -> String {
+    format!("résumé pour {id} (vide)")
+}
+
 fn node_duplicate(id: &str) -> String {
     format!("résumé en double pour {id} (premier gardé)")
 }
@@ -263,7 +267,8 @@ fn fold_and_cap(raw: &str) -> Option<(String, Option<usize>, String)> {
 
 /// Filtre les éléments bruts d'un fichier selon sa liste de nœuds (règles version 2, REQ-024) :
 /// résumés repliés sur une ligne, coupés à 400 caractères et écartés s'ils sont vides de sens
-/// (REQ-178), premier résumé d'un nœud gardé et concepts de même nom fusionnés (REQ-179), noms
+/// (REQ-178) ; un résumé vide d'un nœud de la liste est signalé (REQ-234), celui d'un concept ne
+/// l'est pas ; premier résumé d'un nœud gardé et concepts de même nom fusionnés (REQ-179), noms
 /// de concepts normalisés (REQ-180) ; DEC-144.
 fn filter_raw(
     summaries: Vec<RawSummary>,
@@ -286,6 +291,7 @@ fn filter_raw(
             continue;
         }
         let Some((folded, received, text)) = fold_and_cap(&s.summary) else {
+            out.rejected.push(node_empty(&s.node));
             continue;
         };
         if tidy::is_meaningless(&folded, tidy::node_name(&s.node)) {
@@ -1787,8 +1793,52 @@ pub(crate) mod tests {
             vec![("type:A".into(), "Première ligne. Deuxième ligne.".into())]
         );
         assert!(e.rejected.is_empty());
-        let e = one_summary("A.java", &["type:A"], "type:A", "\n \t");
-        assert!(e.summaries.is_empty() && e.rejected.is_empty());
+    }
+
+    #[test]
+    fn req234_ac1_resume_vide_signale() {
+        for text in ["", "\n \t"] {
+            let e = one_summary("A.java", &["type:A"], "type:A", text);
+            assert!(e.summaries.is_empty(), "{text:?}");
+            assert_eq!(e.rejected, vec!["résumé pour type:A (vide)"], "{text:?}");
+        }
+    }
+
+    #[test]
+    fn req234_ac2_resume_vide_cas_limites() {
+        let parse =
+            |json: &str, nodes: &[&str]| Enrichment::parse(json, "A.java", &ids(nodes)).unwrap();
+        let e = parse(
+            r#"{"version":2,"concepts":[],"summaries":[
+                {"node":"type:A","summary":""},{"node":"type:A","summary":"Rôle."}]}"#,
+            &["type:A"],
+        );
+        assert_eq!(e.summaries, vec![("type:A".into(), "Rôle.".into())]);
+        assert_eq!(e.rejected, vec!["résumé pour type:A (vide)"]);
+        let e = parse(
+            r#"{"version":2,"concepts":[],"summaries":[{"node":"type:Hors","summary":""}]}"#,
+            &["type:A"],
+        );
+        assert_eq!(e.rejected, vec!["résumé pour type:Hors (nœud hors liste)"]);
+        let e = parse(
+            r#"{"version":2,"concepts":[],"summaries":[{"node":"type:A","summary":"Rôle."}]}"#,
+            &["type:A", "type:B"],
+        );
+        assert!(e.rejected.is_empty());
+        let json = r#"{"version":2,"summaries":[],"concepts":[{"name":"Facturation","summary":"","sections":["section:docs/g.md#s1"]}]}"#;
+        let e = Enrichment::parse(json, "docs/g.md", &ids(&["section:docs/g.md#s1"])).unwrap();
+        assert_eq!(e.concepts.len(), 1);
+        assert_eq!(e.concepts[0].summary, None);
+        assert!(e.rejected.is_empty());
+        let items = [item("A.java", &["type:A"]), item("B.java", &["type:B"])];
+        let json = r#"{"version":3,"files":[
+            {"file":"A.java","summaries":[{"node":"type:A","summary":""}],"concepts":[]},
+            {"file":"B.java","summaries":[{"node":"type:B","summary":"Rôle."}],"concepts":[]}]}"#;
+        let lot = parse_lot(json, &items).unwrap();
+        let a = lot.files[0].1.as_ref().unwrap();
+        let b = lot.files[1].1.as_ref().unwrap();
+        assert_eq!(a.rejected, vec!["résumé pour type:A (vide)"]);
+        assert!(b.rejected.is_empty());
     }
 
     #[test]
@@ -1914,7 +1964,7 @@ pub(crate) mod tests {
     fn req178_ac9_elements_sans_saut_de_ligne_ni_texte_recu() {
         let e = one_summary("A.java", &["type:A"], "type:A", "\n\nN/A\n");
         assert_eq!(e.rejected, vec!["résumé pour type:A (vide de sens)"]);
-        for text in ["é".repeat(400), "  a   b  ".to_string(), " \n ".to_string()] {
+        for text in ["é".repeat(400), "  a   b  ".to_string()] {
             assert!(one_summary("A.java", &["type:A"], "type:A", &text)
                 .rejected
                 .is_empty());
