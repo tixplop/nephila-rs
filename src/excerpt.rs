@@ -1,5 +1,6 @@
 //! Texte envoyé au modèle pour un fichier JSON, YAML ou XML de données : le début du fichier et
-//! le squelette de ses clés au-delà de L caractères, jamais découpé (REQ-239, DEC-178).
+//! le squelette de ses clés au-delà de L caractères, jamais découpé (REQ-239, DEC-178). Un fichier
+//! SQL part sans ses INSERT et COPY massifs, puis reste découpé (REQ-240).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -38,14 +39,23 @@ pub fn mark_head_only(kib: usize) -> String {
     format!("[extrait tronqué de {kib} Ko : début du fichier]")
 }
 
+/// Marque d'un SQL dont `k` instructions INSERT ou COPY sont retirées ; `kib` = octets / 1024,
+/// arrondi au supérieur. Termine par un saut de ligne.
+pub fn mark_sql(kib: usize, k: usize) -> String {
+    format!("-- extrait tronqué de {kib} Ko : {k} instructions INSERT ou COPY retirées\n")
+}
+
 /// Titre de la section du squelette.
 pub fn skeleton_title() -> &'static str {
     "[squelette des clés]"
 }
 
-/// Texte envoyé au modèle pour `path` ; tout autre type que JSON, YAML et XML de données reste
-/// tel quel.
+/// Texte envoyé au modèle pour `path` : JSON, YAML et XML de données réduits au-delà de L, SQL
+/// sans ses INSERT et COPY massifs ; tout autre type reste tel quel.
 pub fn for_llm<'a>(path: &str, text: &'a str, max_chunk_chars: usize) -> Cow<'a, str> {
+    if FileType::of(path) == Some(FileType::Sql) {
+        return sql_for_llm(text);
+    }
     if !never_split(path) {
         return Cow::Borrowed(text);
     }
@@ -74,6 +84,36 @@ pub fn for_llm<'a>(path: &str, text: &'a str, max_chunk_chars: usize) -> Cow<'a,
         mark_with_skeleton(kib),
         skeleton_title()
     ))
+}
+
+/// Plafond, en caractères, des instructions INSERT et COPY gardées d'un fichier SQL.
+const SQL_BULK_LIMIT: usize = 2_000;
+
+/// SQL sans ses INSERT et COPY massifs (REQ-240) : on garde les premiers tant que leur total
+/// reste dans le plafond, la première qui dépasse et les suivantes sont retirées.
+fn sql_for_llm(text: &str) -> Cow<'_, str> {
+    let ranges = crate::parse::sql::bulk_ranges(text);
+    let mut total = 0;
+    let mut cut = ranges.len();
+    for (n, r) in ranges.iter().enumerate() {
+        total += text[r.clone()].chars().count();
+        if total > SQL_BULK_LIMIT {
+            cut = n;
+            break;
+        }
+    }
+    let removed = &ranges[cut..];
+    if removed.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = mark_sql(text.len().div_ceil(1024), removed.len());
+    let mut pos = 0;
+    for r in removed {
+        out.push_str(&text[pos..r.start]);
+        pos = r.end;
+    }
+    out.push_str(&text[pos..]);
+    Cow::Owned(out)
 }
 
 /// Clés de niveau 1 dans l'ordre de lecture, chacune avec ses clés de niveau 2, sans doublon.
@@ -425,5 +465,143 @@ mod tests {
             );
             assert!(never_split(p));
         }
+    }
+
+    fn ins(n: usize) -> String {
+        // INSERT de `n` caractères exactement, saut de ligne final compris.
+        let head = "INSERT INTO t VALUES ('";
+        format!("{head}{}');\n", "v".repeat(n - head.len() - 4))
+    }
+
+    /// Marque SQL pour `k` instructions retirées d'un texte `t`.
+    fn mark(t: &str, k: usize) -> String {
+        mark_sql(t.len().div_ceil(1024), k)
+    }
+
+    /// AC-240-1
+    #[test]
+    fn req240_ac1_exemple_exact() {
+        let big = format!("INSERT INTO big VALUES ('{}');", "v".repeat(2970));
+        let text = format!(
+            "CREATE TABLE a (id INT);\nINSERT INTO a VALUES (1);\n{big}\nCREATE TABLE b (id INT);\ninsert into b values (2);\n"
+        );
+        assert_eq!(
+            for_llm("db/a.sql", &text, 60_000),
+            "-- extrait tronqué de 4 Ko : 2 instructions INSERT ou COPY retirées\nCREATE TABLE a (id INT);\nINSERT INTO a VALUES (1);\nCREATE TABLE b (id INT);\n"
+        );
+    }
+
+    /// AC-240-2
+    #[test]
+    fn req240_ac2_seuil() {
+        let t = format!("CREATE TABLE a (id INT);\n{}", ins(2000));
+        assert!(matches!(for_llm("a.sql", &t, 60_000), Cow::Borrowed(s) if s == t));
+        let t = format!("CREATE TABLE a (id INT);\n{}{}", ins(1000), ins(1001));
+        let out = for_llm("a.sql", &t, 60_000);
+        assert_eq!(
+            out,
+            format!("{}CREATE TABLE a (id INT);\n{}", mark(&t, 1), ins(1000))
+        );
+        let ddl = "CREATE TABLE a (id INT);\n".repeat(5000);
+        assert!(matches!(for_llm("a.sql", &ddl, 60_000), Cow::Borrowed(_)));
+    }
+
+    /// AC-240-3
+    #[test]
+    fn req240_ac3_copy_stdin() {
+        let copy = "COPY a (id, nom) FROM stdin;\n1\tO'Brien\n2\t;INSERT\n\\.\n";
+        let t = format!("{}{copy}CREATE TABLE b (id INT);\n", ins(2000));
+        assert_eq!(
+            for_llm("a.sql", &t, 60_000),
+            format!("{}{}CREATE TABLE b (id INT);\n", mark(&t, 1), ins(2000))
+        );
+        let t = format!("{}{}", ins(2000), copy.replace("\\.\n", ""));
+        assert_eq!(
+            for_llm("a.sql", &t, 60_000),
+            format!("{}{}", mark(&t, 1), ins(2000))
+        );
+    }
+
+    /// AC-240-4
+    #[test]
+    fn req240_ac4_jamais_retire() {
+        let cases = [
+            "CREATE FUNCTION f() RETURNS void AS $$ BEGIN INSERT INTO a VALUES (1); END; $$ LANGUAGE plpgsql;\n",
+            "SELECT 'x; INSERT INTO a VALUES (1);';\n",
+            "-- INSERT INTO a VALUES (1);\nSELECT 1;\n",
+            "/* ; INSERT INTO a VALUES (1); */ SELECT 1;\n",
+            "INSERTS INTO a VALUES (1);\n",
+        ];
+        for case in cases {
+            let t = format!("{}{case}", ins(2000));
+            assert!(
+                matches!(for_llm("a.sql", &t, 60_000), Cow::Borrowed(_)),
+                "{case}"
+            );
+            let t = format!("{}{case}{}", ins(2000), ins(100));
+            let out = for_llm("a.sql", &t, 60_000);
+            assert!(out.contains(case), "{case}");
+            assert!(out.starts_with(&mark(&t, 1)), "{case}");
+        }
+        let t = format!(
+            "{}INSERT INTO a VALUES (1)\nGO\nCREATE TABLE z (id INT);\n",
+            ins(2000)
+        );
+        assert_eq!(
+            for_llm("a.sql", &t, 60_000),
+            format!("{}{}CREATE TABLE z (id INT);\n", mark(&t, 1), ins(2000))
+        );
+    }
+
+    /// AC-240-5
+    #[test]
+    fn req240_ac5_chaine_non_fermee() {
+        let t = format!(
+            "{}{}INSERT INTO a VALUES ('non fermé\nCREATE TABLE b (id INT);\n",
+            ins(2000),
+            ins(50)
+        );
+        assert_eq!(
+            for_llm("a.sql", &t, 60_000),
+            format!(
+                "{}{}INSERT INTO a VALUES ('non fermé\nCREATE TABLE b (id INT);\n",
+                mark(&t, 1),
+                ins(2000)
+            )
+        );
+    }
+
+    /// AC-240-3 : `stdin` hors d'un COPY n'étend rien.
+    #[test]
+    fn req240_ac3_stdin_hors_copy() {
+        let t = format!(
+            "{}INSERT INTO t (stdin) VALUES (1);\nCREATE TABLE b (id INT);\n",
+            ins(2000)
+        );
+        assert_eq!(
+            for_llm("a.sql", &t, 60_000),
+            format!("{}{}CREATE TABLE b (id INT);\n", mark(&t, 1), ins(2000))
+        );
+    }
+
+    /// AC-240-1 : saut de ligne CRLF retiré avec l'instruction.
+    #[test]
+    fn req240_ac1_crlf() {
+        let big = ins(1999).replace('\n', "\r\n");
+        let t = format!("{big}INSERT INTO a VALUES (1);\r\nCREATE TABLE b (id INT);\r\n");
+        assert_eq!(
+            for_llm("a.sql", &t, 60_000),
+            format!("{}{big}CREATE TABLE b (id INT);\r\n", mark(&t, 1))
+        );
+    }
+
+    /// AC-240-5 : instruction massive sans terminateur, le reste est gardé.
+    #[test]
+    fn req240_ac5_sans_terminateur() {
+        let t = format!(
+            "{}INSERT INTO a VALUES (1)\nCREATE TABLE b (id INT)\n",
+            ins(2000)
+        );
+        assert!(matches!(for_llm("a.sql", &t, 60_000), Cow::Borrowed(_)));
     }
 }

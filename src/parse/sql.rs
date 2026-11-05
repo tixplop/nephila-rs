@@ -3,6 +3,7 @@
 //! exécution de SQL.
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::Path;
 
 use super::data::{self, Format};
@@ -170,6 +171,154 @@ fn lex(src: &str) -> Lexed {
             }
         }
     }
+    out
+}
+
+/// Plages (en octets de `text`) des instructions `INSERT` et `COPY`, de leur premier mot au
+/// terminateur inclus, plus le saut de ligne qui suit ; un `COPY … FROM stdin` va jusqu'à sa
+/// ligne `\.` comprise (REQ-240). Mêmes règles de lecture que `lex` ; une chaîne, un identifiant,
+/// un commentaire ou un bloc non fermé arrête le balayage, l'instruction en cours est gardée.
+pub(crate) fn bulk_ranges(text: &str) -> Vec<Range<usize>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+    offsets.push(text.len());
+    let at = |i: usize| chars.get(i).copied();
+    let mut out = Vec::new();
+    let mut first = true;
+    // Début (en caractères) de l'instruction massive en cours, et présence de `stdin`.
+    let mut bulk: Option<usize> = None;
+    let mut stdin = false;
+    let mut copy = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let mut terminator = false;
+        match c {
+            c if c.is_whitespace() => {
+                i += 1;
+                continue;
+            }
+            '-' if at(i + 1) == Some('-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '/' if at(i + 1) == Some('*') => {
+                i += 2;
+                loop {
+                    match at(i) {
+                        None => return out,
+                        Some('*') if at(i + 1) == Some('/') => {
+                            i += 2;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+                continue;
+            }
+            '\'' | '"' | '`' => {
+                i += 1;
+                loop {
+                    match at(i) {
+                        None => return out,
+                        Some(q) if q == c && at(i + 1) == Some(c) => i += 2,
+                        Some(q) if q == c => {
+                            i += 1;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+            }
+            '[' => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != ']' && chars[j] != '\n' {
+                    j += 1;
+                }
+                i = if at(j) == Some(']') && j > i + 1 {
+                    j + 1
+                } else {
+                    i + 1
+                };
+            }
+            '$' if dollar_tag(&chars, i).is_some() => {
+                let tag = dollar_tag(&chars, i).unwrap_or_default();
+                let delim: Vec<char> = format!("${tag}$").chars().collect();
+                let mut j = i + delim.len();
+                loop {
+                    if j + delim.len() > chars.len() {
+                        return out;
+                    }
+                    if chars[j..j + delim.len()] == delim[..] {
+                        i = j + delim.len();
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            ';' => {
+                i += 1;
+                terminator = true;
+            }
+            c if is_word_start(c) => {
+                let start = i;
+                while at(i).is_some_and(is_word_char) {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect::<String>().to_lowercase();
+                if word == "go" && alone_on_line(&chars, start, i) {
+                    terminator = true;
+                } else if first {
+                    if word == "insert" || word == "copy" {
+                        bulk = Some(start);
+                        copy = word == "copy";
+                        stdin = false;
+                    }
+                } else if copy && word == "stdin" {
+                    stdin = true;
+                }
+            }
+            _ => i += 1,
+        }
+        if !terminator {
+            first = false;
+            continue;
+        }
+        first = true;
+        let Some(start) = bulk.take() else { continue };
+        let mut end = i;
+        if stdin {
+            // Lignes de données jusqu'à `\.` comprise, ou la fin.
+            while end < chars.len() && chars[end] != '\n' {
+                end += 1;
+            }
+            end = (end + 1).min(chars.len());
+            while end < chars.len() {
+                let line_start = end;
+                while end < chars.len() && chars[end] != '\n' {
+                    end += 1;
+                }
+                let line: String = chars[line_start..end].iter().collect();
+                end = (end + 1).min(chars.len());
+                if line.trim_end_matches('\r') == "\\." {
+                    break;
+                }
+            }
+            i = end;
+        } else {
+            if at(end) == Some('\r') && at(end + 1) == Some('\n') {
+                end += 1;
+            }
+            if at(end) == Some('\n') {
+                end += 1;
+            }
+            i = end;
+        }
+        out.push(offsets[start]..offsets[end]);
+    }
+    // Une instruction massive sans terminateur n'est pas retirée : le reste est gardé.
     out
 }
 
