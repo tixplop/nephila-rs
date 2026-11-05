@@ -145,6 +145,7 @@ Le bilan donne deux compteurs :
 - **en attente** : l'analyse du fichier n'a pas abouti ; code de sortie 1 ; `nephila update` le reprend.
 - **à enrichir** : la structure du fichier est dans le graphe, mais le LLM ne l'a pas enrichie (réponse non conforme ou tronquée, trop d'appels, plafond `max_calls`, erreur, `--no-llm`, fichier modifié depuis) ; code 1 avec le LLM actif, 0 sans lui ou s'il est laissé par le plafond ; `nephila update` le reprend.
 
+Si la commande enrichit des fichiers, le bilan ajoute `<n>/<m> nœuds résumés` : le modèle peut omettre un nœud sans laisser le fichier « à enrichir » ; `--verbose` donne ce compte par appel.
 Un fichier en échec est nommé sur stderr avec sa cause, et le traitement des autres continue ; si l'envoi au LLM s'arrête, voir [Arrêt de l'envoi](#arrêt-de-lenvoi).
 Un seul `build` ou `update` à la fois par dépôt : une seconde commande échoue aussitôt (`erreur: indexation déjà en cours sur ce dépôt`).
 
@@ -220,7 +221,7 @@ Avec `-v`, `build` et `update` écrivent sur stderr une ligne `trace:` par évé
 trace: [0.000s] config: llm=mock model=m-projet enrich_code=false summary_language="français" thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
 trace: [0.009s] structure: fin 7 ms, 0 en attente, 3 enrichissements conservés
 trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
-trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts) 19 ms
+trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts, 1/1 nœuds résumés) 19 ms
 ```
 
 Les traces ne contiennent jamais de contenu de fichier, de prompt, de réponse du LLM ni de clé d'API.

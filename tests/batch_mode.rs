@@ -2407,7 +2407,7 @@ fn req228_ac5_tous_les_appels_conserves_aucun_lot() {
         assert_eq!(fx.server.lots().len(), lots, "{provider}");
         assert!(!err(&o).contains("lot du fournisseur"), "{}", err(&o));
         assert!(
-            out(&o).trim_end().ends_with("0 fichiers à enrichir"),
+            without_coverage(&out(&o)).ends_with(", 0 fichiers à enrichir"),
             "{provider} : {}",
             out(&o)
         );
@@ -2550,4 +2550,11 @@ fn req232_ac15_appel_tronque_avec_resumes_second_lot_d_une_requete_du_reste() {
             err(&o)
         );
     }
+}
+
+/// Bilan sans son segment de couverture (REQ-235), qui doit être présent.
+fn without_coverage(out: &str) -> String {
+    let (head, tail) = out.trim_end().rsplit_once(", ").unwrap();
+    assert!(tail.ends_with(" nœuds résumés"), "{out}");
+    head.to_string()
 }

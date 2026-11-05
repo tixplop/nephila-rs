@@ -2972,3 +2972,51 @@ fn REQ233_AC10_puce_reponse_tronquee_texte_de_v012() {
     assert!(b.contains("la partie déjà reçue est gardée et seul le reste repart"));
     assert_eq!(readme.matches("la partie déjà reçue").count(), 1);
 }
+
+/// AC-235-11 et AC-235-15 : la ligne du bilan juste avant « Un fichier en échec est nommé ».
+#[test]
+fn REQ235_AC11_AC15_readme_ligne_du_bilan_taille_et_aides() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
+    let section = readme_section(&readme, "### `nephila build` et `nephila update`");
+    let lines: Vec<&str> = section.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.starts_with("Un fichier en échec est nommé"))
+        .unwrap();
+    assert_eq!(
+        lines[at - 1],
+        "Si la commande enrichit des fichiers, le bilan ajoute `<n>/<m> nœuds résumés` : le modèle peut omettre un nœud sans laisser le fichier « à enrichir » ; `--verbose` donne ce compte par appel."
+    );
+    assert_eq!(
+        section.matches("nœuds résumés").count(),
+        1,
+        "une seule ligne en parle"
+    );
+    assert!(section.contains("Le bilan donne deux compteurs :"));
+    assert!(lines.contains(
+        &"- **en attente** : l'analyse du fichier n'a pas abouti ; code de sortie 1 ; `nephila update` le reprend."
+    ));
+    assert!(lines.contains(
+        &"- **à enrichir** : la structure du fichier est dans le graphe, mais le LLM ne l'a pas enrichie (réponse non conforme ou tronquée, trop d'appels, plafond `max_calls`, erreur, `--no-llm`, fichier modifié depuis) ; code 1 avec le LLM actif, 0 sans lui ou s'il est laissé par le plafond ; `nephila update` le reprend."
+    ));
+    for (cmd, reference) in [
+        ("build", include_str!("fixtures/help/build-f629db2.txt")),
+        ("update", include_str!("fixtures/help/update-f629db2.txt")),
+    ] {
+        assert_eq!(help_of(&[cmd, "--help"]), reference, "{cmd} --help");
+    }
+}
+
+/// AC-235-17 : ligne d'exemple de `### Traces et progression`.
+#[test]
+fn REQ235_AC17_readme_exemple_de_trace_avec_couverture() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 50_000, "README : {} octets", readme.len());
+    let section = readme_section(&readme, "### Traces et progression");
+    let lines: Vec<&str> = section.lines().collect();
+    assert!(lines.contains(
+        &"trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts, 1/1 nœuds résumés) 19 ms"
+    ));
+    assert!(!section.contains("ok (1 résumés, 0 concepts) 19 ms"));
+}

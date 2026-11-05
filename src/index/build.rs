@@ -59,6 +59,10 @@ pub struct BuildReport {
     /// Relevé de l'estimation sous `--dry-run` (REQ-184) ; sa présence remplace le segment
     /// `enrichissement : désactivé` par `enrichissement : estimé sans envoi`.
     pub estimate: Option<Estimate>,
+    /// Nœuds résumés après fusion, des fichiers écrits par cette commande (REQ-235).
+    pub summarized: usize,
+    /// Nœuds demandés des fichiers écrits par cette commande (REQ-235).
+    pub requested: usize,
 }
 
 /// Réglages de l'indexation : ceux de la configuration, ou les défauts sans configuration.
@@ -311,6 +315,10 @@ impl BuildReport {
             line.push_str(", enrichissement : estimé sans envoi");
         } else if !self.llm_active {
             line.push_str(", enrichissement : désactivé");
+        }
+        if self.requested > 0 {
+            line.push_str(", ");
+            line.push_str(&coverage_segment(self.summarized, self.requested));
         }
         if self.out_of_scope > 0 {
             line.push_str(&format!(

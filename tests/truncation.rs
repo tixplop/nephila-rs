@@ -1114,7 +1114,7 @@ fn req230_ac1_liste_coupee_en_deux_sous_appels() {
         assert!(o.status.success(), "{p} {}", err(&o));
         assert!(!err(&o).contains("avertissement:"), "{p} {}", err(&o));
         assert!(
-            out(&o).trim_end().ends_with("0 fichiers à enrichir"),
+            without_coverage(&out(&o)).ends_with(", 0 fichiers à enrichir"),
             "{p} {}",
             out(&o)
         );
@@ -1881,7 +1881,7 @@ fn req232_ac3_entrees_a_et_b_gardees_seul_le_reste_repart() {
         assert_all_summaries(&s, p);
         assert!(!err(&o).contains("avertissement:"), "{p} {}", err(&o));
         assert!(
-            out(&o).trim_end().ends_with("0 fichiers à enrichir"),
+            without_coverage(&out(&o)).ends_with(", 0 fichiers à enrichir"),
             "{p} {}",
             out(&o)
         );
@@ -2641,7 +2641,7 @@ fn req233_ac3_sans_verbose_rien_n_est_dit() {
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(err(&o), "", "stderr non vide");
     assert_eq!(out(&o).trim_end().lines().count(), 1, "{}", out(&o));
-    assert!(out(&o).trim_end().ends_with("0 fichiers à enrichir"));
+    assert!(without_coverage(&out(&o)).ends_with(", 0 fichiers à enrichir"));
     let s = Setup::new(
         p,
         vec![
@@ -2958,7 +2958,7 @@ fn req233_ac3_lot_recupere_progression_et_bilan() {
     assert!(!e.contains("récupération"), "{e}");
     assert_eq!(out(&o).trim_end().lines().count(), 1, "{}", out(&o));
     assert!(
-        out(&o).trim_end().ends_with("0 fichiers à enrichir"),
+        without_coverage(&out(&o)).ends_with(", 0 fichiers à enrichir"),
         "{}",
         out(&o)
     );
@@ -2997,4 +2997,11 @@ fn req234_ac4_resume_vide_d_une_reponse_tronquee_redemande_et_signale() {
         "{e}"
     );
     assert!(!e.contains(SECRET), "{e}");
+}
+
+/// Bilan sans son segment de couverture (REQ-235), qui doit être présent.
+fn without_coverage(out: &str) -> String {
+    let (head, tail) = out.trim_end().rsplit_once(", ").unwrap();
+    assert!(tail.ends_with(" nœuds résumés"), "{out}");
+    head.to_string()
 }

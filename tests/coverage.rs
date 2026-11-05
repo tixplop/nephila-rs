@@ -98,6 +98,10 @@ impl Setup {
     }
 }
 
+fn out(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
 fn err(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
@@ -178,6 +182,15 @@ fn req235_ac1_ac13_trace_quatre_sur_neuf() {
     );
     assert!(!err(&o).contains("avertissement:"), "{}", err(&o));
     assert!(!err(&o).contains("couverture") && !err(&o).contains("nœuds demandés"));
+    let line = out(&o);
+    assert!(
+        line.starts_with("build terminé : ")
+            && line
+                .trim_end()
+                .ends_with(", 0 fichiers à enrichir, 4/9 nœuds résumés"),
+        "{line}"
+    );
+    assert_eq!(line.matches("nœuds résumés").count(), 1, "{line}");
     // Sans --verbose, aucune trace.
     let s = Setup::new(vec![ok_for(&all[..4])], "");
     s.write("A.java", &java("A", 8));
@@ -230,6 +243,13 @@ fn req235_ac2_resumes_hors_liste_ou_vides_ne_comptent_pas() {
     assert_eq!(f.len(), 1, "{}", err(&o));
     assert!(f[0].contains("nœuds résumés)"), "{}", f[0]);
     assert!(f[0].contains(", 3/9 nœuds résumés)"), "{}", f[0]);
+    assert!(
+        out(&o)
+            .trim_end()
+            .ends_with(", 0 fichiers à enrichir, 3/9 nœuds résumés"),
+        "{}",
+        out(&o)
+    );
 }
 
 #[test]
@@ -268,6 +288,13 @@ fn req235_ac3_deux_appels_de_150_et_50() {
         "{}",
         f[1]
     );
+    assert!(
+        out(&o)
+            .trim_end()
+            .ends_with(", 0 fichiers à enrichir, 135/200 nœuds résumés"),
+        "{}",
+        out(&o)
+    );
 }
 
 #[test]
@@ -302,6 +329,13 @@ fn req235_ac4_lot_trois_sur_quatre_puis_renvoi() {
         ),
         "{}",
         f[1]
+    );
+    assert!(
+        out(&o)
+            .trim_end()
+            .ends_with(", 0 fichiers à enrichir, 4/4 nœuds résumés"),
+        "{}",
+        out(&o)
     );
 }
 
@@ -338,6 +372,13 @@ fn req235_ac8_appel_conserve_une_seule_ligne_fin() {
     let f = fins(&o);
     assert_eq!(f.len(), 1, "{}", err(&o));
     assert!(f[0].contains(", 50/50 nœuds résumés) "), "{}", f[0]);
+    assert!(
+        out(&o)
+            .trim_end()
+            .ends_with(", 0 fichiers à enrichir, 200/200 nœuds résumés"),
+        "{}",
+        out(&o)
+    );
 }
 
 #[test]
@@ -369,8 +410,177 @@ fn req235_ac8_sous_appel_cinq_sur_cinq_marque_en_dernier() {
             && sub.ends_with(" ms (sous-appel 1)"),
         "{sub}"
     );
+    assert!(
+        out(&o)
+            .trim_end()
+            .ends_with(", 0 fichiers à enrichir, 9/9 nœuds résumés"),
+        "{}",
+        out(&o)
+    );
     // Seules les fins `ok` portent le segment.
     for l in err(&o).lines().filter(|l| l.contains("nœuds résumés")) {
         assert!(l.contains("llm enrich fin ") && l.contains(" ok ("), "{l}");
     }
+}
+
+/// Aucune ligne de stdout ne porte le segment de couverture.
+fn no_coverage(o: &Output) {
+    assert!(o.status.success(), "{}", err(o));
+    assert!(!out(o).contains("nœuds résumés"), "{}", out(o));
+}
+
+#[test]
+fn req235_ac5_reponse_vide_zero_sur_neuf() {
+    let s = Setup::new(vec![ok_for(&[])], "");
+    s.write("A.java", &java("A", 8));
+    let o = s.run(&["build", "--verbose"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(s.posts(), 1);
+    let f = fins(&o);
+    assert_eq!(f.len(), 1, "{}", err(&o));
+    assert!(f[0].contains(", 0/9 nœuds résumés) "), "{}", f[0]);
+    assert!(
+        out(&o)
+            .trim_end()
+            .ends_with(", 0 fichiers à enrichir, 0/9 nœuds résumés"),
+        "{}",
+        out(&o)
+    );
+    assert!(!err(&o).contains("avertissement:"), "{}", err(&o));
+    let u = s.run(&["update"]);
+    assert!(u.status.success(), "{}", err(&u));
+    assert!(out(&u).contains("graphe à jour"), "{}", out(&u));
+    assert_eq!(s.posts(), 1);
+}
+
+#[test]
+fn req235_ac6_sans_ecriture_d_enrichissement_aucun_segment() {
+    let all = ids("A", 8);
+    // --no-llm
+    let s = Setup::new(vec![], "");
+    s.write("A.java", &java("A", 8));
+    no_coverage(&s.run(&["build", "--no-llm"]));
+    // --dry-run
+    let s = Setup::new(vec![], "");
+    s.write("A.java", &java("A", 8));
+    no_coverage(&s.run(&["build", "--dry-run"]));
+    // update à jour, puis second build où tout est réappliqué
+    let s = Setup::new(vec![ok_for(&all)], "");
+    s.write("A.java", &java("A", 8));
+    let first = s.run(&["build"]);
+    assert!(out(&first).contains("9/9 nœuds résumés"), "{}", out(&first));
+    let up = s.run(&["update"]);
+    no_coverage(&up);
+    let second = s.run(&["build"]);
+    no_coverage(&second);
+    assert_eq!(s.posts(), 1);
+    // seuls des fichiers sans nœud écrits
+    let s = Setup::new(vec![], "");
+    s.write("E.java", "package p;\n");
+    let o = s.run(&["build"]);
+    no_coverage(&o);
+    assert_eq!(s.posts(), 0);
+}
+
+#[test]
+fn req235_ac7_segments_de_portee_et_de_filtres_restent_derniers() {
+    let all = ids("A", 8);
+    let s = Setup::new(vec![ok_for(&all[..4])], "enrich_exclude = [\"B.java\"]\n");
+    s.write("A.java", &java("A", 8));
+    s.write("B.java", &java("B", 2));
+    s.write("Z.java", &java("Z", 2));
+    let o = s.run(&["build", "--exclude", "Z.java"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).trim_end().ends_with(
+            ", 0 fichiers à enrichir, 4/9 nœuds résumés, 1 fichiers hors portée d'enrichissement, 1 fichiers exclus par les filtres"
+        ),
+        "{}",
+        out(&o)
+    );
+}
+
+#[test]
+fn req235_ac9_fichier_en_echec_ou_laisse_ne_compte_pas() {
+    let all = ids("A", 8);
+    let s = Setup::new(
+        vec![ok_for(&all[..4]), reply("pas de JSON ici")],
+        "format_retries = 0\nbatch_files = 1\n",
+    );
+    s.write("A.java", &java("A", 8));
+    s.write("B.java", &java("B", 2));
+    let o = s.run(&["build"]);
+    assert_eq!(s.posts(), 2, "{}", err(&o));
+    assert!(
+        out(&o).contains(", 4/9 nœuds résumés") && !out(&o).contains("/12 "),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(out(&o).matches("nœuds résumés").count(), 1);
+    // Plafond : le fichier est laissé, aucun segment.
+    let items: Vec<String> = all[..4]
+        .iter()
+        .map(|n| serde_json::json!({"node": n, "summary": format!("Résumé de {n}.")}).to_string())
+        .collect();
+    let cut = format!(
+        r#"{{"version": 2, "summaries": [{}, {{"node": "{}", "summ"#,
+        items.join(","),
+        all[4]
+    );
+    let truncated =
+        serde_json::json!({"choices":[{"message":{"role":"assistant","content":cut},"finish_reason":"length"}]})
+            .to_string();
+    let s = Setup::new(vec![truncated, ok_for(&all[4..])], "");
+    s.write("A.java", &java("A", 8));
+    let o = s.run(&["build", "--max-calls", "1"]);
+    assert_eq!(s.posts(), 1, "{}", err(&o));
+    assert!(!out(&o).contains("nœuds résumés"), "{}", out(&o));
+}
+
+#[test]
+fn req235_ac10_mode_lot_couverture_ecrite_une_fois_et_collecte_ne_compte_pas() {
+    #[allow(dead_code)]
+    #[path = "support/batch_server.rs"]
+    mod batch_server;
+    use batch_server::{BatchServer, Outcome};
+    let all = ids("A", 8);
+    let text = serde_json::json!({
+        "version": 2,
+        "summaries": all[..4].iter().map(|n| serde_json::json!({"node": n, "summary": format!("Résumé de {n}.")})).collect::<Vec<_>>(),
+        "concepts": []
+    })
+    .to_string();
+    let server = BatchServer::start();
+    server.simulate("openai", 0, move |_| Outcome::Text(text.clone()));
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("A.java"), java("A", 8)).unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T325_KEY\"\nconcurrency = 1\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let o = Command::new(cargo_bin("nephila"))
+        .arg("-C")
+        .arg(&repo)
+        .args(["build", "--batch"])
+        .env("NEPHILA_CONFIG", &config)
+        .env("NEPHILA_T325_KEY", "sk-test")
+        .env("NEPHILA_BATCH_POLL_MS", "5")
+        .env("NEPHILA_RETRY_BASE_MS", "1")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o)
+            .trim_end()
+            .ends_with(", 0 fichiers à enrichir, 4/9 nœuds résumés"),
+        "{}",
+        out(&o)
+    );
 }

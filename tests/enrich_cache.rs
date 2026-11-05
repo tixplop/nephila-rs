@@ -158,7 +158,7 @@ fn summary_of(env: &Env, id: &str) -> Option<String> {
 }
 
 #[test]
-fn req049_ac1_second_build_without_change_sends_nothing_and_graph_is_identical() {
+fn req049_ac1_req235_ac16_second_build_without_change_sends_nothing_and_graph_is_identical() {
     let env = Env::new();
     let first = env.ok(&["build"]);
     let sent = env.logged();
@@ -172,7 +172,12 @@ fn req049_ac1_second_build_without_change_sends_nothing_and_graph_is_identical()
     assert!(env.logged().is_empty(), "{:?}", env.logged());
     let out = text(&second.stdout);
     assert!(out.contains("0 fichiers à enrichir"), "{out}");
-    assert_eq!(out, text(&first.stdout));
+    // REQ-235 (AC-235-16) : le second build n'écrit aucun enrichissement, donc pas de segment.
+    let first_out = text(&first.stdout);
+    let (head, segment) = first_out.trim_end().rsplit_once(", ").unwrap();
+    assert!(segment.ends_with(" nœuds résumés"), "{first_out}");
+    assert!(!out.contains("nœuds résumés"), "{out}");
+    assert_eq!(out.trim_end(), head);
     assert_eq!(snapshot(&env.store()), before);
 
     let status = env.ok(&["status"]);
@@ -650,7 +655,11 @@ fn req049_ac10_retained_count_in_structure_end_line() {
         structure_end(&second)
     );
     assert!(!text(&second.stderr).contains("llm enrich"));
-    assert_eq!(text(&second.stdout), text(&first.stdout));
+    // REQ-235 (AC-235-16) : égal au premier, moins le segment de couverture.
+    let first_out = text(&first.stdout);
+    let (head, segment) = first_out.trim_end().rsplit_once(", ").unwrap();
+    assert!(segment.ends_with(" nœuds résumés"), "{first_out}");
+    assert_eq!(text(&second.stdout).trim_end(), head);
 
     let third = env.ok(&["build", "--no-llm", "--verbose"]);
     assert!(
@@ -1280,9 +1289,8 @@ fn req227_ac6_tous_les_appels_conserves_aucun_appel_fichier_enrichi() {
     assert!(env.logged().is_empty(), "{:?}", env.logged());
     assert_eq!(to_enrich(&env), 0);
     assert_eq!(kept_rows(&env), 0);
-    assert!(text(&o.stdout)
-        .trim_end()
-        .ends_with("0 fichiers à enrichir"));
+    // Les appels conservés sont écrits par cette commande : le segment suit (REQ-235).
+    assert!(without_coverage(&text(&o.stdout)).ends_with(", 0 fichiers à enrichir"));
 }
 
 #[test]
@@ -1355,7 +1363,10 @@ fn req227_ac11_reprise_silencieuse_sans_option() {
     assert_eq!(text(&o.stderr), "");
     let out = text(&o.stdout);
     assert_eq!(out.lines().count(), 1, "{out}");
-    assert!(out.trim_end().ends_with("0 fichiers à enrichir"), "{out}");
+    assert!(
+        without_coverage(&out).ends_with(", 0 fichiers à enrichir"),
+        "{out}"
+    );
 
     let env = failed_after_three();
     let o = env.ok(&["update", "--verbose"]);
@@ -1601,4 +1612,11 @@ fn req232_ac13_appel_un_recupere_en_entier_est_conserve_quand_l_appel_deux_echou
     assert!(!o.status.success(), "{err}");
     assert_eq!(s.posts(), 2, "{err}");
     assert_eq!(s.kept(), 1, "{err}");
+}
+
+/// Bilan sans son segment de couverture (REQ-235), qui doit être présent.
+fn without_coverage(out: &str) -> String {
+    let (head, tail) = out.trim_end().rsplit_once(", ").unwrap();
+    assert!(tail.ends_with(" nœuds résumés"), "{out}");
+    head.to_string()
 }

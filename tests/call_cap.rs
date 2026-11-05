@@ -347,8 +347,7 @@ fn req048_ac9_progression_bilan_et_status() {
         "{out}"
     );
     assert!(
-        out.trim_end()
-            .ends_with(", 0 fichiers en attente, 1 fichiers à enrichir"),
+        without_coverage(&out).ends_with(", 0 fichiers en attente, 1 fichiers à enrichir"),
         "{out}"
     );
     assert!(!out.contains('\x1b') && !err.contains('\x1b') && !err.contains('\r'));
@@ -482,4 +481,11 @@ fn req048_second_remede_max_chunk_chars() {
     let log = env.log_lines();
     assert_eq!(log.len(), 1, "{log:?}");
     assert!(log[0].contains(BIG), "{log:?}");
+}
+
+/// Bilan sans son segment de couverture (REQ-235), qui doit être présent.
+fn without_coverage(out: &str) -> String {
+    let (head, tail) = out.trim_end().rsplit_once(", ").unwrap();
+    assert!(tail.ends_with(" nœuds résumés"), "{out}");
+    head.to_string()
 }

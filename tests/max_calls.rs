@@ -178,7 +178,13 @@ fn lines_of<'a>(s: &'a str, prefix: &str) -> Vec<&'a str> {
 
 /// Bilan sans son dernier compte (« …, N fichiers à enrichir »).
 fn without_count(out: &str) -> String {
-    let (head, tail) = out.trim_end().rsplit_once(", ").unwrap();
+    // Le segment de couverture (REQ-235) suit le compte et dépend des fichiers écrits : écarté.
+    let line = out.trim_end();
+    let line = match line.rsplit_once(", ") {
+        Some((head, tail)) if tail.ends_with("nœuds résumés") => head,
+        _ => line,
+    };
+    let (head, tail) = line.rsplit_once(", ").unwrap();
     assert!(tail.ends_with("fichiers à enrichir"), "{out}");
     head.to_string()
 }

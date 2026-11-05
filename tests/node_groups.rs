@@ -539,8 +539,7 @@ fn req047_ac8_aucune_mention_des_groupes() {
     assert_eq!(err, "", "stderr vide");
     assert_eq!(out.lines().count(), 1, "{out}");
     assert!(
-        out.trim_end()
-            .ends_with(", 0 fichiers en attente, 0 fichiers à enrichir"),
+        without_coverage(&out).ends_with(", 0 fichiers en attente, 0 fichiers à enrichir"),
         "{out}"
     );
     // Graphe neuf : un build sans changement n'enrichit plus rien (REQ-049).
@@ -890,4 +889,11 @@ fn req047_ac15_sections_markdown_au_morceau_de_leur_titre() {
     assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
     let log: Vec<String> = (1..=3).map(|i| format!("{GUIDE}\t{i}")).collect();
     assert_eq!(mock.log_lines(), log);
+}
+
+/// Bilan sans son segment de couverture (REQ-235), qui doit être présent.
+fn without_coverage(out: &str) -> String {
+    let (head, tail) = out.trim_end().rsplit_once(", ").unwrap();
+    assert!(tail.ends_with(" nœuds résumés"), "{out}");
+    head.to_string()
 }

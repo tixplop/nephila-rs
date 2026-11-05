@@ -425,7 +425,7 @@ fn REQ207_AC9_sans_fichier_hors_portee_la_ligne_est_inchangee() {
     ok(&o);
     assert_eq!(
         bilan(&o),
-        "build terminé : 2 fichiers traités, 3 nœuds, 1 liens, 0 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir"
+        "build terminé : 2 fichiers traités, 3 nœuds, 1 liens, 0 références non résolues, 0 fichiers en attente, 0 fichiers à enrichir, 0/3 nœuds résumés"
     );
     assert!(!so(&o).contains("hors portée"));
     let o = r.run(&["update"]);

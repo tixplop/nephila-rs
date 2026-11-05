@@ -2478,6 +2478,10 @@ pub(crate) fn enrich_pass(
                 pending_calls.clear();
                 continue;
             }
+            for w in &pending {
+                report.summarized += w.summaries.len();
+                report.requested += ids.get(&w.path).map_or(0, Vec::len);
+            }
             flush_group(
                 store,
                 llm.model(),
@@ -4484,6 +4488,18 @@ mod tests {
             probe_run_mode(&dir, &files, &llm, 1, 1, None, 0, PassMode::Collect);
         assert!(failures.is_empty() && report.failed == 0);
         assert_eq!(left_paths(store).len(), 3);
+    }
+
+    #[test]
+    fn req235_collect_pass_counts_no_coverage() {
+        let (dir, files) = probe_repo(&[], 3);
+        let llm = Probe::new(1, &[]);
+        let (_, report, _) = probe_run_mode(&dir, &files, &llm, 1, 1, None, 0, PassMode::Collect);
+        assert_eq!((report.summarized, report.requested), (0, 0));
+        // Témoin : une passe normale compte les nœuds demandés.
+        let (dir, files) = probe_repo(&[], 3);
+        let (_, report, _) = probe_run_mode(&dir, &files, &llm, 1, 1, None, 0, PassMode::Normal);
+        assert!(report.requested > 0, "{report:?}");
     }
 
     #[test]

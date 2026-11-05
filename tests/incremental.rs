@@ -636,7 +636,15 @@ fn hash_line(
     out: &std::process::Output,
 ) {
     let code = out.status.code().map_or(-1, i64::from);
-    let hash = blake3::hash(&out.stdout).to_hex();
+    // Le segment de couverture du bilan (REQ-235) n'existait pas en 0.21.0 : écarté avant l'empreinte.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let stdout = match text.trim_end().rsplit_once(", ") {
+        Some((head, tail)) if tail.ends_with(" nœuds résumés") => {
+            format!("{head}\n").into_bytes()
+        }
+        _ => out.stdout.clone(),
+    };
+    let hash = blake3::hash(&stdout).to_hex();
     lines.push(format!("{name}\t{step}\t{label}\t{code}\t{hash}"));
 }
 
