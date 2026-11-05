@@ -207,7 +207,9 @@ impl<T: Complete> Llm for T {
             enrichment_user_prompt(file, None, text, requested),
             Reply::File,
         )?;
-        http::parse_reply(&out, KEY_SUMMARIES, |j| Enrichment::parse(j, file, known))
+        http::parse_reply(&out, KEY_SUMMARIES, |j| {
+            Enrichment::parse_numbered(j, file, requested, known)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -235,7 +237,9 @@ impl<T: Complete> Llm for T {
             ),
             Reply::File,
         )?;
-        http::parse_reply(&out, KEY_SUMMARIES, |j| Enrichment::parse(j, file, known))
+        http::parse_reply(&out, KEY_SUMMARIES, |j| {
+            Enrichment::parse_numbered(j, file, requested, known)
+        })
     }
 
     fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {

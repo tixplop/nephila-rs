@@ -203,11 +203,41 @@ struct RawEnrichment {
     concepts: Vec<RawConcept>,
 }
 
+/// Cible d'un résumé : numéro de la liste demandée ou identifiant de nœud (REQ-237).
+enum Target {
+    Number(i64),
+    Id(String),
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawSummary {
-    node: String,
+struct SummaryFields {
+    n: Option<i64>,
+    node: Option<String>,
     summary: String,
+}
+
+#[derive(Deserialize)]
+#[serde(try_from = "SummaryFields")]
+struct RawSummary {
+    target: Target,
+    summary: String,
+}
+
+impl TryFrom<SummaryFields> for RawSummary {
+    type Error = String;
+    fn try_from(f: SummaryFields) -> std::result::Result<Self, String> {
+        let target = match (f.n, f.node) {
+            (Some(n), None) => Target::Number(n),
+            (None, Some(id)) => Target::Id(id),
+            (None, None) => return Err("missing field `n`".into()),
+            (Some(_), Some(_)) => return Err("duplicate field `n`".into()),
+        };
+        Ok(RawSummary {
+            target,
+            summary: f.summary,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -274,6 +304,8 @@ fn filter_raw(
     summaries: Vec<RawSummary>,
     concepts: Vec<RawConcept>,
     file: &str,
+    numbered: &[String],
+    first: usize,
     node_ids: &[String],
 ) -> Enrichment {
     let known: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
@@ -281,34 +313,54 @@ fn filter_raw(
     let mut kept: HashMap<String, usize> = HashMap::new();
 
     for s in summaries {
-        if s.node.trim().is_empty() {
+        let node = match s.target {
+            Target::Number(k) => {
+                let line = k
+                    .checked_sub(first as i64)
+                    .and_then(|i| usize::try_from(i).ok())
+                    .and_then(|i| numbered.get(i));
+                match line {
+                    Some(id) => id.clone(),
+                    None => {
+                        let m = format!("résumé pour le numéro {k} (hors liste)");
+                        if !out.rejected.contains(&m) {
+                            out.rejected.push(m);
+                        }
+                        continue;
+                    }
+                }
+            }
+            Target::Id(id) => id,
+        };
+        let summary = s.summary;
+        if node.trim().is_empty() {
             out.rejected.push("résumé sans identifiant de nœud".into());
             continue;
         }
-        if !known.contains(s.node.as_str()) {
+        if !known.contains(node.as_str()) {
             out.rejected
-                .push(format!("résumé pour {} (nœud hors liste)", s.node));
+                .push(format!("résumé pour {} (nœud hors liste)", node));
             continue;
         }
-        let Some((folded, received, text)) = fold_and_cap(&s.summary) else {
-            out.rejected.push(node_empty(&s.node));
+        let Some((folded, received, text)) = fold_and_cap(&summary) else {
+            out.rejected.push(node_empty(&node));
             continue;
         };
-        if tidy::is_meaningless(&folded, tidy::node_name(&s.node)) {
-            out.rejected.push(node_empty_of_sense(&s.node));
+        if tidy::is_meaningless(&folded, tidy::node_name(&node)) {
+            out.rejected.push(node_empty_of_sense(&node));
             continue;
         }
-        if let Some(&i) = kept.get(&s.node) {
+        if let Some(&i) = kept.get(&node) {
             if out.summaries[i].1 != text {
-                out.rejected.push(node_duplicate(&s.node));
+                out.rejected.push(node_duplicate(&node));
             }
             continue;
         }
         if let Some(n) = received {
-            out.rejected.push(node_capped(&s.node, n));
+            out.rejected.push(node_capped(&node, n));
         }
-        kept.insert(s.node.clone(), out.summaries.len());
-        out.summaries.push((s.node, text));
+        kept.insert(node.clone(), out.summaries.len());
+        out.summaries.push((node, text));
     }
 
     let markdown = is_markdown(file);
@@ -416,13 +468,30 @@ pub fn is_markdown(file: &str) -> bool {
 impl Enrichment {
     /// Analyse strictement `json` puis filtre selon la liste de nœuds du fichier.
     pub fn parse(json: &str, file: &str, node_ids: &[String]) -> Result<Enrichment> {
+        Self::parse_numbered(json, file, &[], node_ids)
+    }
+
+    /// Comme `parse`, avec la liste numérotée `requested` (numéros dès 1) pour retraduire `n`.
+    pub fn parse_numbered(
+        json: &str,
+        file: &str,
+        requested: &[String],
+        node_ids: &[String],
+    ) -> Result<Enrichment> {
         let raw: RawEnrichment = serde_json::from_str(json).map_err(invalid)?;
         if let Some(v) = raw.version.filter(|v| *v != ENRICH_SCHEMA_VERSION) {
             return Err(invalid(format!(
                 "version {v} non prise en charge (attendu : {ENRICH_SCHEMA_VERSION})"
             )));
         }
-        Ok(filter_raw(raw.summaries, raw.concepts, file, node_ids))
+        Ok(filter_raw(
+            raw.summaries,
+            raw.concepts,
+            file,
+            requested,
+            1,
+            node_ids,
+        ))
     }
 }
 
@@ -536,12 +605,44 @@ struct RawLot {
     files: Vec<RawLotEntry>,
 }
 
+/// Cible d'une entrée de lot : numéro du fichier ou chemin (REQ-237).
+enum EntryTarget {
+    Number(i64),
+    Path(String),
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawLotEntry {
-    file: String,
+struct EntryFields {
+    f: Option<i64>,
+    file: Option<String>,
     summaries: Vec<RawSummary>,
     concepts: Vec<RawConcept>,
+}
+
+#[derive(Deserialize)]
+#[serde(try_from = "EntryFields")]
+struct RawLotEntry {
+    target: EntryTarget,
+    summaries: Vec<RawSummary>,
+    concepts: Vec<RawConcept>,
+}
+
+impl TryFrom<EntryFields> for RawLotEntry {
+    type Error = String;
+    fn try_from(e: EntryFields) -> std::result::Result<Self, String> {
+        let target = match (e.f, e.file) {
+            (Some(n), None) => EntryTarget::Number(n),
+            (None, Some(p)) => EntryTarget::Path(p),
+            (None, None) => return Err("missing field `f`".into()),
+            (Some(_), Some(_)) => return Err("duplicate field `f`".into()),
+        };
+        Ok(RawLotEntry {
+            target,
+            summaries: e.summaries,
+            concepts: e.concepts,
+        })
+    }
 }
 
 /// Forme normalisée d'un chemin de réponse : espaces de bord retirés, `\` en `/`, `./` de tête retirés.
@@ -571,36 +672,63 @@ pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
 fn attach_entries(entries: Vec<RawLotEntry>, items: &[LotItem]) -> LotEnrichment {
     let mut rejected = Vec::new();
     let mut found: Vec<Option<Enrichment>> = vec![None; items.len()];
+    let firsts: Vec<usize> = items
+        .iter()
+        .scan(1, |next, it| {
+            let first = *next;
+            *next += it.node_ids.len();
+            Some(first)
+        })
+        .collect();
     for entry in entries {
-        let wanted = norm_path(&entry.file);
-        let by_norm = || {
-            let same: Vec<usize> = (0..items.len())
-                .filter(|&i| norm_path(&items[i].file) == wanted)
-                .collect();
-            // Plusieurs fichiers de même forme normalisée : l'entrée n'est rattachable que si
-            // tous ont déjà la leur (elle est alors « en double »), sinon elle est hors du lot.
-            match same.as_slice() {
-                [i] => Some(*i),
-                [i, ..] if same.iter().all(|&j| found[j].is_some()) => Some(*i),
-                _ => None,
+        let (i, name) = match &entry.target {
+            EntryTarget::Number(f) => {
+                let Some(i) = usize::try_from(*f)
+                    .ok()
+                    .filter(|f| (1..=items.len()).contains(f))
+                    .map(|f| f - 1)
+                else {
+                    rejected.push(format!("entrée pour le fichier numéro {f} (hors du lot)"));
+                    continue;
+                };
+                (i, items[i].file.clone())
+            }
+            EntryTarget::Path(path) => {
+                let wanted = norm_path(path);
+                let by_norm = || {
+                    let same: Vec<usize> = (0..items.len())
+                        .filter(|&i| norm_path(&items[i].file) == wanted)
+                        .collect();
+                    // Plusieurs fichiers de même forme normalisée : l'entrée n'est rattachable que
+                    // si tous ont déjà la leur (elle est alors « en double »), sinon elle est hors
+                    // du lot.
+                    match same.as_slice() {
+                        [i] => Some(*i),
+                        [i, ..] if same.iter().all(|&j| found[j].is_some()) => Some(*i),
+                        _ => None,
+                    }
+                };
+                let Some(i) = items
+                    .iter()
+                    .position(|it| &it.file == path)
+                    .or_else(by_norm)
+                else {
+                    rejected.push(format!("entrée pour {path} (fichier hors du lot)"));
+                    continue;
+                };
+                (i, path.clone())
             }
         };
-        let Some(i) = items
-            .iter()
-            .position(|it| it.file == entry.file)
-            .or_else(by_norm)
-        else {
-            rejected.push(format!("entrée pour {} (fichier hors du lot)", entry.file));
-            continue;
-        };
         if found[i].is_some() {
-            rejected.push(format!("entrée en double pour {}", entry.file));
+            rejected.push(format!("entrée en double pour {name}"));
             continue;
         }
         found[i] = Some(filter_raw(
             entry.summaries,
             entry.concepts,
             &items[i].file,
+            &items[i].node_ids,
+            firsts[i],
             &items[i].node_ids,
         ));
     }
@@ -721,9 +849,14 @@ fn read_partial(text: &str, version: u32, lot: bool) -> Partial {
 impl Enrichment {
     /// Éléments complets du début d'une réponse d'appel tronquée, filtrés comme `parse` ; ne
     /// rend jamais d'erreur : ce qui n'a pas été lu est le reste (REQ-232).
-    pub fn parse_partial(text: &str, file: &str, known: &[String]) -> Enrichment {
+    pub fn parse_partial(
+        text: &str,
+        file: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> Enrichment {
         let p = read_partial(text, ENRICH_SCHEMA_VERSION, false);
-        filter_raw(p.summaries, p.concepts, file, known)
+        filter_raw(p.summaries, p.concepts, file, requested, 1, known)
     }
 }
 
@@ -776,6 +909,7 @@ pub fn lot_user_prompt(items: &[LotItem]) -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::config::DEFAULT_SUMMARY_LANGUAGE;
+    use crate::llm::FormatFault;
 
     const EXTRAIT: &str = "Un fichier trop long est envoyé en extraits : sa ligne \"Fichier :\" porte alors \"(extrait k/n, lignes a–b)\" et tu ne vois que ces lignes. À partir du deuxième extrait, le contenu commence par une copie partielle du début du fichier (package, imports, déclaration du type englobant, ou titres des sections englobantes), donnée pour contexte : n'en tire aucun résumé. Un nœud de la liste seulement cité dans un extrait se résume d'après ce que l'extrait en montre ; omets-le si l'extrait n'en montre pas le rôle.";
 
@@ -1565,7 +1699,7 @@ pub(crate) mod tests {
         let closes = closings_at(&full, 2);
         assert_eq!(closes.len(), 5);
         for (cut, _) in full.char_indices().chain([(full.len(), ' ')]) {
-            let e = Enrichment::parse_partial(&full[..cut], "d.md", &known);
+            let e = Enrichment::parse_partial(&full[..cut], "d.md", &known, &known);
             let n = closes.iter().filter(|&&x| x <= cut).count();
             assert_eq!(e.summaries.len(), n.min(3), "coupe à {cut}");
             assert_eq!(e.concepts.len(), n.saturating_sub(3), "coupe à {cut}");
@@ -1576,38 +1710,41 @@ pub(crate) mod tests {
     fn req232_ac2_partial_reader_edge_cases() {
         let known = ids(&["type:A", "type:B"]);
         let nothing = |t: &str| {
-            let e = Enrichment::parse_partial(t, "A.java", &known);
+            let e = Enrichment::parse_partial(t, "A.java", &known, &known);
             assert!(e.summaries.is_empty() && e.concepts.is_empty(), "{t:?}");
         };
         nothing("");
         nothing("pas de json");
         nothing("x");
         let one = r#"{"version":2,"summaries":[{"node":"type:A","summary":"Rôle de a."},{"node":"type:B","summary":"Rôle de b."}],"concepts":[]}"#;
-        let plain = Enrichment::parse_partial(one, "A.java", &known);
+        let plain = Enrichment::parse_partial(one, "A.java", &known, &known);
         assert_eq!(plain.summaries.len(), 2);
-        let fenced = Enrichment::parse_partial(&format!("```json\n{one}"), "A.java", &known);
+        let fenced =
+            Enrichment::parse_partial(&format!("```json\n{one}"), "A.java", &known, &known);
         assert_eq!(fenced, plain);
         nothing(&one.replace(r#""version":2"#, r#""version":99"#));
         nothing(&one.replace(r#""concepts":[]"#, r#""version":99"#));
         // champ inconnu dans l'élément 2
         let unk = r#"{"summaries":[{"node":"type:A","summary":"Rôle de a."},{"node":"type:B","summary":"Rôle de b.","x":1}],"concepts":[]}"#;
-        let e = Enrichment::parse_partial(unk, "A.java", &known);
+        let e = Enrichment::parse_partial(unk, "A.java", &known, &known);
         assert_eq!(e.summaries.len(), 1);
         // concepts avant summaries
         let md = ids(&["section:s", "type:A"]);
         let rev = r#"{"concepts":[{"name":"notion","summary":null,"sections":["section:s"]}],"summaries":[{"node":"section:s","summary":"Rôle de s."}]}"#;
-        let e = Enrichment::parse_partial(rev, "d.md", &md);
+        let e = Enrichment::parse_partial(rev, "d.md", &md, &md);
         assert_eq!((e.summaries.len(), e.concepts.len()), (1, 1));
         // clés hors schéma : les éléments complets avant elles restent gardés
         let e = Enrichment::parse_partial(
             r#"{"summaries":[{"node":"type:A","summary":"Rôle de a."}],"files":[],"concepts":[]}"#,
             "A.java",
             &known,
+            &known,
         );
         assert_eq!(e.summaries.len(), 1);
         let e = Enrichment::parse_partial(
             r#"{"files":[],"summaries":[{"node":"type:A","summary":"Rôle de a."}]}"#,
             "A.java",
+            &known,
             &known,
         );
         assert!(e.summaries.is_empty());
@@ -2107,5 +2244,192 @@ pub(crate) mod tests {
         let e = Enrichment::parse(json, "docs/g.md", &ids(&["section:docs/g.md#intro"])).unwrap();
         assert!(e.concepts.is_empty());
         assert_eq!(e.rejected, vec!["concept sans nom"]);
+    }
+
+    // --- T-327 : réponses à numéros (REQ-237, REQ-238) ---
+
+    fn list_a() -> Vec<String> {
+        ids(&["type:A", "method:A.m"])
+    }
+
+    fn known_a() -> Vec<String> {
+        ids(&["type:A", "method:A.m", "method:A.x"])
+    }
+
+    fn numbered(json: &str) -> Result<Enrichment> {
+        Enrichment::parse_numbered(json, "A.java", &list_a(), &known_a())
+    }
+
+    fn body(summaries: &str) -> String {
+        format!(r#"{{"summaries":[{summaries}],"concepts":[]}}"#)
+    }
+
+    fn fault_of(r: Result<impl std::fmt::Debug>) -> (Option<FormatFault>, String) {
+        let e = r.unwrap_err();
+        (FormatFault::of(&e), e.to_string())
+    }
+
+    #[test]
+    fn req237_ac1_number_is_translated_and_out_of_bounds_dropped() {
+        let e = numbered(&body(r#"{"n":2,"summary":"Rôle."}"#)).unwrap();
+        assert_eq!(e.summaries, vec![("method:A.m".into(), "Rôle.".into())]);
+        assert!(e.rejected.is_empty());
+        for n in [0, -1, 3] {
+            let e = numbered(&body(&format!(
+                r#"{{"n":{n},"summary":"x"}},{{"n":1,"summary":"Garde."}}"#
+            )))
+            .unwrap();
+            assert_eq!(e.summaries, vec![("type:A".into(), "Garde.".into())], "{n}");
+        }
+        let e = numbered(&body(r#"{"node":"method:A.x","summary":"Rôle."}"#)).unwrap();
+        assert_eq!(e.summaries, vec![("method:A.x".into(), "Rôle.".into())]);
+        let e = numbered(&body(r#"{"node":"type:Hors","summary":"x"}"#)).unwrap();
+        assert_eq!(e.rejected, vec!["résumé pour type:Hors (nœud hors liste)"]);
+    }
+
+    #[test]
+    fn req237_ac2_rules_apply_after_translation() {
+        let e = numbered(&body(r#"{"n":1,"summary":""}"#)).unwrap();
+        assert_eq!(e.rejected, vec!["résumé pour type:A (vide)"]);
+        let e = numbered(&body(r#"{"n":1,"summary":"N/A"}"#)).unwrap();
+        assert_eq!(e.rejected, vec!["résumé pour type:A (vide de sens)"]);
+        for second in [
+            r#"{"n":1,"summary":"Autre."}"#,
+            r#"{"node":"type:A","summary":"Autre."}"#,
+        ] {
+            let e = numbered(&body(&format!(
+                r#"{{"n":1,"summary":"Premier."}},{second}"#
+            )))
+            .unwrap();
+            assert_eq!(e.summaries, vec![("type:A".into(), "Premier.".into())]);
+            assert_eq!(
+                e.rejected,
+                vec!["résumé en double pour type:A (premier gardé)"]
+            );
+        }
+    }
+
+    #[test]
+    fn req237_ac3_shape_errors() {
+        let (f, m) = fault_of(numbered(&body(r#"{"summary":"x"}"#)));
+        assert_eq!(f, Some(FormatFault::MissingField));
+        assert!(m.contains("missing field `n`"), "{m}");
+        let (f, m) = fault_of(numbered(&body(r#"{"n":1,"node":"type:A","summary":"x"}"#)));
+        assert_eq!(f, Some(FormatFault::Shape));
+        assert!(m.contains("duplicate field `n`"), "{m}");
+        for bad in [r#"{"n":"1","summary":"x"}"#, r#"{"n":1.5,"summary":"x"}"#] {
+            assert_eq!(
+                fault_of(numbered(&body(bad))).0,
+                Some(FormatFault::Shape),
+                "{bad}"
+            );
+        }
+        let (f, _) = fault_of(numbered(&body(r#"{"n":1,"summary":"x","y":1}"#)));
+        assert_eq!(f, Some(FormatFault::UnknownField));
+        let (f, _) = fault_of(numbered(
+            r#"{"summaries":[],"concepts":[{"name":"c","summary":null,"sections":[1]}]}"#,
+        ));
+        assert_eq!(f, Some(FormatFault::Shape));
+    }
+
+    fn two_files() -> [LotItem; 2] {
+        lot_items()
+    }
+
+    fn lot(json: &str) -> LotEnrichment {
+        parse_lot(json, &two_files()).unwrap()
+    }
+
+    #[test]
+    fn req237_ac4_lot_numbers() {
+        let l = lot(
+            r#"{"files":[{"f":2,"summaries":[{"n":3,"summary":"Rôle."}],"concepts":[]},{"f":1,"summaries":[{"n":2,"summary":"Sujet."}],"concepts":[]}]}"#,
+        );
+        assert_eq!(
+            l.files[0].1.as_ref().unwrap().summaries,
+            vec![("section:a.md#x".into(), "Sujet.".into())]
+        );
+        assert_eq!(
+            l.files[1].1.as_ref().unwrap().summaries,
+            vec![("type:p.B".into(), "Rôle.".into())]
+        );
+        let l = lot(r#"{"files":[{"f":2,"summaries":[{"n":1,"summary":"x"}],"concepts":[]}]}"#);
+        let b = l.files[1].1.as_ref().unwrap();
+        assert!(b.summaries.is_empty());
+        assert_eq!(b.rejected, vec!["résumé pour le numéro 1 (hors liste)"]);
+        for f in [0, 3] {
+            let l = lot(&format!(
+                r#"{{"files":[{{"f":{f},"summaries":[],"concepts":[]}},{{"f":2,"summaries":[{{"n":3,"summary":"Rôle."}}],"concepts":[]}}]}}"#
+            ));
+            assert_eq!(
+                l.rejected,
+                vec![format!("entrée pour le fichier numéro {f} (hors du lot)")]
+            );
+            assert!(l.files[0]
+                .1
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("absent de la réponse du lot"));
+            assert_eq!(
+                l.files[1].1.as_ref().unwrap().summaries,
+                vec![("type:p.B".into(), "Rôle.".into())]
+            );
+        }
+        let l = lot(
+            r#"{"files":[{"f":1,"summaries":[],"concepts":[]},{"f":1,"summaries":[],"concepts":[]}]}"#,
+        );
+        assert_eq!(l.rejected, vec!["entrée en double pour a.md"]);
+        let l = lot(
+            r#"{"files":[{"file":"./a.md","summaries":[{"n":1,"summary":"Doc."}],"concepts":[]}]}"#,
+        );
+        assert_eq!(
+            l.files[0].1.as_ref().unwrap().summaries,
+            vec![("document:a.md".into(), "Doc.".into())]
+        );
+        let (f, m) = fault_of(parse_lot(
+            r#"{"files":[{"summaries":[],"concepts":[]}]}"#,
+            &two_files(),
+        ));
+        assert_eq!(f, Some(FormatFault::MissingField));
+        assert!(m.contains("missing field `f`"), "{m}");
+        let (f, m) = fault_of(parse_lot(
+            r#"{"files":[{"f":1,"file":"a.md","summaries":[],"concepts":[]}]}"#,
+            &two_files(),
+        ));
+        assert_eq!(f, Some(FormatFault::Shape));
+        assert!(m.contains("duplicate field `f`"), "{m}");
+    }
+
+    #[test]
+    fn req237_ac5_partial_translates_numbers() {
+        let text = r#"{"summaries":[{"n":2,"summary":"Rôle."},{"n":9,"summary":"x"},{"summary":"sans cible"},{"n":1,"summary":"Perdu."}]}"#;
+        let e = Enrichment::parse_partial(text, "A.java", &list_a(), &known_a());
+        assert_eq!(e.summaries, vec![("method:A.m".into(), "Rôle.".into())]);
+        assert_eq!(e.rejected, vec!["résumé pour le numéro 9 (hors liste)"]);
+        let t = r#"{"files":[{"f":2,"summaries":[{"n":3,"summary":"Rôle."}],"concepts":[]},{"f":1,"summaries":[{"n":1,"summary":"x"}"#;
+        let l = parse_lot_partial(t, &two_files());
+        assert_eq!(
+            l.files[1].1.as_ref().unwrap().summaries,
+            vec![("type:p.B".into(), "Rôle.".into())]
+        );
+        let t = r#"{"files":[{"f":1,"summaries":[{"n":1,"summary":"Doc."}],"concepts":[]},{"summaries":[{"summary":"x"}],"concepts":[]}]}"#;
+        let l = parse_lot_partial(t, &two_files());
+        assert_eq!(
+            l.files[0].1.as_ref().unwrap().summaries,
+            vec![("document:a.md".into(), "Doc.".into())]
+        );
+        assert!(l.files[1].1.is_err());
+    }
+
+    #[test]
+    fn req238_ac4_out_of_list_number_reported_once() {
+        let r = |n: i64| format!("résumé pour le numéro {n} (hors liste)");
+        let e = numbered(&body(r#"{"n":0,"summary":"x"}"#)).unwrap();
+        assert_eq!(e.rejected, vec![r(0)]);
+        let e = numbered(&body(r#"{"n":-1,"summary":"x"}"#)).unwrap();
+        assert_eq!(e.rejected, vec![r(-1)]);
+        let e = numbered(&body(r#"{"n":3,"summary":"x"},{"n":3,"summary":"y"}"#)).unwrap();
+        assert_eq!(e.rejected, vec![r(3)]);
     }
 }

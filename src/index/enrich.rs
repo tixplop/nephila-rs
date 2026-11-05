@@ -1869,9 +1869,10 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 // passent en tête de file (REQ-230). Pas de coupe possible, total au-delà de la borne : l'échec
                 // ordinaire (A-5). Réservation refusée par le plafond : comme un essai refusé.
                 let recovery = match &result {
-                    Err(Error::Truncated { partial, .. }) => {
-                        recover_call(&unit, Enrichment::parse_partial(partial, &file.path, known))
-                    }
+                    Err(Error::Truncated { partial, .. }) => recover_call(
+                        &unit,
+                        Enrichment::parse_partial(partial, &file.path, requested, known),
+                    ),
                     _ => Recovery::Nothing,
                 };
                 // Appel tronqué avec des éléments complets (REQ-232) : tout reçu, le résultat est
