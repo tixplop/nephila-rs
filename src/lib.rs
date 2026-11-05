@@ -6,6 +6,7 @@ pub(crate) mod diag;
 pub mod diff;
 pub mod error;
 pub mod escape;
+pub mod excerpt;
 pub mod export;
 pub mod filter;
 pub mod index;

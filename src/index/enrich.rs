@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::chunk;
 use crate::error::{warn, Error, Result, TRUNCATED};
+use crate::excerpt;
 use crate::index::build::{coverage_segment, BuildReport, IndexOptions};
 use crate::index::estimate::{AloneCase, AloneFile, Estimate};
 use crate::llm::enrich::PromptVersions;
@@ -656,7 +657,7 @@ fn run_unit<'a>(
                 .iter()
                 .map(|(f, t)| LotItem {
                     file: f.path.clone(),
-                    text: t.clone(),
+                    text: excerpt::for_llm(&f.path, t, max_chunk_chars).into_owned(),
                     node_ids: node_ids(f),
                 })
                 .collect();
@@ -1213,7 +1214,13 @@ fn plan_calls<'a>(
     nodes: &[(String, String)],
 ) -> Result<Vec<Unit<'a>>> {
     let known: Arc<[String]> = nodes.iter().map(|(id, _)| id.clone()).collect();
-    let spans = chunk::split_spans_for(&file.path, text, max_chunk_chars);
+    let text = excerpt::for_llm(&file.path, text, max_chunk_chars);
+    let text: &str = &text;
+    let spans = if excerpt::never_split(&file.path) {
+        vec![(text.to_string(), 0)]
+    } else {
+        chunk::split_spans_for(&file.path, text, max_chunk_chars)
+    };
     let homes = section_homes(text, &spans, nodes);
     let excerpts = excerpts_of(text, &spans);
     let parts: Vec<String> = spans.into_iter().map(|(part, _)| part).collect();
@@ -3130,13 +3137,12 @@ mod tests {
         // JSON : un seul nœud, au morceau 1 ; les morceaux 2 et 3 n'ont rien à demander.
         let text = "aaaaaaaaa\n".repeat(3);
         assert_eq!(chunk::split_spans(&text, 10).len(), 3);
-        let spans = chunk::split_spans(&text, 10);
         let nodes = [node("document:data/big.json", "")];
         let calls = planned("data/big.json", &text, 10, &nodes);
         assert_eq!(calls.len(), 1);
         let (index, count, part, requested, known) = &calls[0];
         assert_eq!((*index, *count), (1, 1));
-        assert_eq!(part, &spans[0].0);
+        assert_eq!(part, &*excerpt::for_llm("data/big.json", &text, 10));
         assert_eq!(requested, &vec!["document:data/big.json".to_string()]);
         assert_eq!(known, &vec!["document:data/big.json".to_string()]);
 
@@ -3160,6 +3166,45 @@ mod tests {
             assert_eq!(requested, &plan[k].1);
             assert_eq!(kn, &known);
         }
+    }
+
+    /// AC-239-6
+    #[test]
+    fn req239_ac6_donnees_un_seul_appel() {
+        let nodes_of = |p: &str| [node(&format!("document:{p}"), "")];
+        for path in ["data/big.json", "d.yaml", "d.xml"] {
+            let text = match path {
+                "d.xml" => format!("<r>{}</r>", "<a>x</a>".repeat(71_000)),
+                "d.yaml" => "k: v\n".repeat(100_000),
+                _ => format!("[{}0]", "1,".repeat(250_000)),
+            };
+            assert!(text.chars().count() >= 500_000, "{path}");
+            for max in [60_000, 10] {
+                let file = rec(path, text.len() as u64);
+                let units = plan_calls(&file, &text, max, &nodes_of(path)).unwrap();
+                assert_eq!(units.len(), 1, "{path} {max}");
+                match &units[0] {
+                    Unit::Call {
+                        index,
+                        count,
+                        excerpt,
+                        part,
+                        ..
+                    } => {
+                        assert_eq!((*index, *count), (1, 1));
+                        assert!(excerpt.is_none());
+                        assert_eq!(&**part, &*excerpt::for_llm(path, &text, max));
+                        assert!(part.starts_with("[extrait tronqué"), "{path} {max}");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        // Fichier de build : même plan qu'avant.
+        let text = "x\n".repeat(250_000);
+        let calls = planned("pom.xml", &text, 60_000, &nodes_of("pom.xml"));
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].2.len() <= 60_000 && !calls[0].2.starts_with("[extrait"));
     }
 
     #[test]
