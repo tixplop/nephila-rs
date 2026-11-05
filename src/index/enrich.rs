@@ -1339,6 +1339,17 @@ fn partition_by_nodes(
         .partition(|f| !ids.get(&f.path).is_none_or(Vec::is_empty))
 }
 
+/// Taille comptée d'un fichier d'un lot, sans lecture (REQ-241) : un JSON, YAML ou XML est réduit
+/// à L caractères au plus ; tout autre fichier, SQL compris (majorant), compte sa taille.
+fn sent_size(f: &FileRecord, max_chunk_chars: usize) -> usize {
+    let size = f.size as usize;
+    if excerpt::never_split(&f.path) {
+        size.min(excerpt::data_limit(max_chunk_chars))
+    } else {
+        size
+    }
+}
+
 /// Estimation du plan d'enrichissement de `files` sans appel ni écriture (REQ-184, DEC-148) : même
 /// partition et mêmes unités que `enrich_with_stop`. Un lot ne lit aucun fichier (ses prompts
 /// valent ceux à texte vide plus la somme des tailles) ; un fichier envoyé seul est lu en série,
@@ -1384,7 +1395,9 @@ pub(crate) fn estimate(
                 est.nodes += items.iter().map(|i| i.node_ids.len()).sum::<usize>();
                 est.bytes += lot_system_prompt(language).len()
                     + lot_user_prompt(&items).len()
-                    + v.iter().map(|f| f.size as usize).sum::<usize>();
+                    + v.iter()
+                        .map(|f| sent_size(f, max_chunk_chars))
+                        .sum::<usize>();
             }
             Unit::Lot(v, _) => {
                 for f in v {
@@ -1393,7 +1406,7 @@ pub(crate) fn estimate(
                     est.nodes += requested.len();
                     est.bytes += enrichment_system_prompt(language).len()
                         + enrichment_user_prompt(&f.path, None, "", &requested).len()
-                        + f.size as usize;
+                        + sent_size(f, max_chunk_chars);
                 }
             }
             Unit::Big(f) => {
@@ -7119,6 +7132,65 @@ mod estimate_tests {
         );
         assert_eq!((e.files, e.sent_alone, e.without_call), (2, 0, 2));
         assert_eq!((e.calls, e.bytes, e.nodes), (0, 0, 0));
+    }
+
+    /// Octets d'un lot (ou d'un lot de 1) à textes vides, sans la taille des fichiers.
+    fn empty_lot_bytes(paths: &[&str], ids: &HashMap<String, Vec<(String, String)>>) -> usize {
+        if paths.len() == 1 {
+            let requested: Vec<String> = ids[paths[0]].iter().map(|(id, _)| id.clone()).collect();
+            return enrichment_system_prompt(LANG).len()
+                + enrichment_user_prompt(paths[0], None, "", &requested).len();
+        }
+        let items: Vec<LotItem> = paths
+            .iter()
+            .map(|p| LotItem {
+                file: p.to_string(),
+                text: String::new(),
+                node_ids: ids[*p].iter().map(|(id, _)| id.clone()).collect(),
+            })
+            .collect();
+        lot_system_prompt(LANG).len() + lot_user_prompt(&items).len()
+    }
+
+    #[test]
+    fn req241_ac3_data_file_in_a_lot_counts_at_most_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ids_of(&[
+            ("a.json", &["id1"]),
+            ("B.java", &["id2"]),
+            ("s.sql", &["id3"]),
+        ]);
+        let e = run(
+            dir.path(),
+            &[rec("a.json", 10_000), rec("B.java", 100)],
+            &ids,
+            2,
+            60_000,
+        );
+        assert_eq!(e.calls, 1);
+        assert_eq!(
+            e.bytes,
+            empty_lot_bytes(&["a.json", "B.java"], &ids) + 6_000 + 100
+        );
+        // Un SQL garde sa taille enregistrée (majorant).
+        let e = run(
+            dir.path(),
+            &[rec("s.sql", 10_000), rec("B.java", 100)],
+            &ids,
+            2,
+            60_000,
+        );
+        assert_eq!(
+            e.bytes,
+            empty_lot_bytes(&["s.sql", "B.java"], &ids) + 10_000 + 100
+        );
+        // Seul dans son lot : système et message d'un fichier + 6 000.
+        let e = run(dir.path(), &[rec("a.json", 10_000)], &ids, 2, 60_000);
+        assert_eq!(e.calls, 1);
+        assert_eq!(e.bytes, empty_lot_bytes(&["a.json"], &ids) + 6_000);
+        // L = min(6 000, max_chunk_chars) : plafond de 2 000 caractères.
+        let e = run(dir.path(), &[rec("a.json", 1_500)], &ids, 2, 2_000);
+        assert_eq!(e.bytes, empty_lot_bytes(&["a.json"], &ids) + 1_500);
     }
 
     #[test]

@@ -2589,3 +2589,38 @@ fn REQ237_AC8_reponses_a_numeros_reliees_par_empreinte_du_corps() {
         assert_eq!(fx.env.to_enrich(), 0);
     }
 }
+
+/// AC-241-2 : en mode lot, un JSON de 500 000 octets part réduit (marque) et son résumé est relié.
+#[test]
+fn req241_ac2_json_de_500_ko_en_mode_lot_porte_la_marque() {
+    let fx = Fx::new("anthropic", "enrich_code = true\n", &[], 0, |_| {
+        Outcome::Text(
+            json!({"version": 2,
+                   "summaries": [{"node": "document:config/big.json", "summary": "Gros JSON."}],
+                   "concepts": []})
+            .to_string(),
+        )
+    });
+    let mut text = String::from("{\"premiere_cle\":1,\"liste\":[");
+    while text.len() < 499_900 {
+        text.push_str("{\"n\":123456},");
+    }
+    text.push_str("{\"n\":\"FIN_UNIQUE_ZZ\"}]}");
+    text.push_str(&" ".repeat(500_000 - text.len()));
+    fs::create_dir_all(fx.env.repo.join("config")).unwrap();
+    fs::write(fx.env.repo.join("config/big.json"), &text).unwrap();
+    let o = fx.env.run(&["build", "--batch"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let hits = fx.server.hits("POST", "/v1/messages/batches");
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].body.contains("extrait tronqué de 489 Ko"));
+    assert!(!hits[0].body.contains("FIN_UNIQUE_ZZ"));
+    let summary = nephila::store::Store::open_readonly(&fx.env.repo)
+        .unwrap()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.id == "document:config/big.json")
+        .and_then(|n| n.summary);
+    assert_eq!(summary.as_deref(), Some("Gros JSON."));
+}

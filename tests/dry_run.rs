@@ -1111,3 +1111,41 @@ fn req228_ac4_plafond_compte_le_plan_entier_malgre_trois_appels_conserves() {
     );
     assert_eq!(kept_rows(&env), 3);
 }
+
+// ---- AC-241-4 : un gros JSON est estimé sur son extrait ----
+
+#[test]
+fn req241_ac4_gros_json_estime_sur_son_extrait() {
+    let server = ConformantServer::start();
+    let env = Env::new();
+    server_config(&env, &server);
+    fs::create_dir_all(env.repo.join("config")).unwrap();
+    let mut json = String::from("{\"cle\":[");
+    while json.len() < 3_200_000 - 20 {
+        json.push_str("{\"n\":1},");
+    }
+    json.push_str("{\"n\":2}]}");
+    fs::write(env.repo.join("config/big.json"), &json).unwrap();
+    fs::write(
+        env.repo.join(".nephila.toml"),
+        "batch_files = 1\nconcurrency = 1\n",
+    )
+    .unwrap();
+
+    let o = env.run(&["build", "--dry-run", "--enrich-code"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(!out(&o).contains("estimation au plafond"), "{}", out(&o));
+    let lines = estimation_lines(&o);
+    assert_eq!(lines.len(), 3, "{}", out(&o));
+    assert_eq!(number(&lines[1], "minimale : ", " appels"), 1);
+    let bytes = number(&lines[1], "appels, ", " octets");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+    assert!(bytes < 30_000, "{bytes}");
+
+    let mut real = env.command(&["build", "--enrich-code"]);
+    real.env(KEY_VAR, "sk-test");
+    let r = real.output().unwrap();
+    assert_eq!(code(&r), 0, "{}", err(&r));
+    assert_eq!(server.requests(), 1);
+    assert_eq!(server.bytes(), bytes);
+}

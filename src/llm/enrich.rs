@@ -41,8 +41,9 @@ pub const BUILD_PROMPT_VERSION: u32 = 9;
 /// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 9 depuis la 0.28.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
-/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées).
-pub const DATA_PROMPT_VERSION: u32 = 9;
+/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées) ; 10 depuis
+/// la 0.28.0 (marques de l'extrait JSON, YAML et XML, REQ-239, et du SQL réduit, REQ-240).
+pub const DATA_PROMPT_VERSION: u32 = 10;
 
 /// Version du prompt d'enrichissement de la famille `markdown` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
@@ -1231,10 +1232,15 @@ pub(crate) mod tests {
         texts
     }
 
-    /// Textes propres à une famille : `CONCEPT_RULES` pour `markdown`, aucun pour les autres.
+    /// Textes propres à une famille : `CONCEPT_RULES` pour `markdown`, les trois marques d'extrait (X = 7) pour `données`, aucun pour les autres.
     fn family_texts(f: PromptFamily) -> Vec<String> {
         match f {
             PromptFamily::Markdown => vec![CONCEPT_RULES.to_string()],
+            PromptFamily::Data => vec![
+                crate::excerpt::mark_with_skeleton(7),
+                crate::excerpt::mark_head_only(7),
+                crate::excerpt::mark_sql(7, 7),
+            ],
             _ => Vec::new(),
         }
     }
@@ -1271,10 +1277,10 @@ pub(crate) mod tests {
 
     #[test]
     fn req193_ac2_data_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(DATA_PROMPT_VERSION, 9);
+        assert_eq!(DATA_PROMPT_VERSION, 10);
         assert_eq!(
             family_fingerprint(PromptFamily::Data),
-            "20e843f61d06a7a8d84fd5badd4c8fd1793c750044084e948203ddeb494253f4",
+            "725c7d8480d02d219df0fb47c9f8cd8364ba45833c99f04f5671ba498854442c",
             "les textes du prompt de la famille données ont changé : incrémentez DATA_PROMPT_VERSION"
         );
     }
@@ -1348,7 +1354,12 @@ pub(crate) mod tests {
         }
         for t in FileType::ALL {
             assert!(expected.iter().any(|(e, _)| *e == t), "{t:?}");
-            assert_eq!(PromptVersions::CURRENT.of(t), 9, "{t:?}");
+            let want = if matches!(t, Sql | Xml | Json | Yaml) {
+                10
+            } else {
+                9
+            };
+            assert_eq!(PromptVersions::CURRENT.of(t), want, "{t:?}");
         }
         assert_eq!(v.of_path("src/A.java"), 1);
         assert_eq!(v.of_path("pom.xml"), 2);
@@ -1362,7 +1373,7 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [9; 4]
+            [9, 9, 10, 9]
         );
     }
 
@@ -1708,7 +1719,7 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [9; 4]
+            [9, 9, 10, 9]
         );
         assert_eq!(crate::llm::ask::ASK_PROMPT_VERSION, 2);
     }

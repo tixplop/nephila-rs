@@ -233,3 +233,189 @@ fn req240_ac6_ddl_pur_garde_son_plan() {
     let posts = sql_posts(&sql, 20_000);
     assert!(posts.len() > 1, "{}", posts.len());
 }
+
+/// Lance `nephila` dans `repo` contre le faux serveur `base_url`.
+fn run_openai(repo: &std::path::Path, config: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(cargo_bin("nephila"))
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("NEPHILA_CONFIG", config)
+        .env(KEY_VAR, "sk-test")
+        .env_remove("NEPHILA_MOCK_DIR")
+        .env_remove("NEPHILA_MOCK_LOG")
+        .output()
+        .unwrap()
+}
+
+/// AC-241-1 : un lot de trois fichiers de données envoie l'extrait, le fichier court entier et la
+/// marque du SQL, entre leurs lignes `=== FICHIER`.
+#[test]
+fn req241_ac1_lot_de_fichiers_de_donnees_envoie_le_texte_reduit() {
+    let json_text = format!(
+        "{{\"k\":\"{}FIN_UNIQUE_ZZ\"}}",
+        "x".repeat(10_000 - "{\"k\":\"FIN_UNIQUE_ZZ\"}".len())
+    );
+    assert_eq!(json_text.len(), 10_000);
+    let yaml_text = "court: oui\n";
+    let mut sql = String::from("");
+    let mut i = 0;
+    while sql.len() < 5_000 {
+        sql.push_str(&format!("INSERT INTO t VALUES ({i}, 'v');\n"));
+        i += 1;
+    }
+    // Chaque fichier ne demande que son nœud document : [1], [2], [3] en numérotation continue.
+    let lot = json!({"files":[
+        {"f":1,"summaries":[{"n":1,"summary":"Résumé JSON."}],"concepts":[]},
+        {"f":2,"summaries":[{"n":2,"summary":"Résumé YAML."}],"concepts":[]},
+        {"f":3,"summaries":[{"n":3,"summary":"Résumé SQL."}],"concepts":[]}
+    ]})
+    .to_string();
+    let server = FakeServer::start(vec![(200, reply(&lot)), (200, reply(&lot))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("a.json"), &json_text).unwrap();
+    fs::write(repo.join("b.yaml"), yaml_text).unwrap();
+    fs::write(repo.join("s.sql"), &sql).unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "provider = \"openai\"\nmodel = \"m\"\nenrich_code = true\nbase_url = \"{}\"\napi_key_env = \"{KEY_VAR}\"\nbatch_files = 3\nconcurrency = 1\nmax_chunk_chars = 60000\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let o = run_openai(&repo, &config, &["build"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let posts: Vec<String> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| r.body)
+        .collect();
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    let body: Value = serde_json::from_str(&posts[0]).unwrap();
+    let user = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let section = |name: &str| -> String {
+        let start = user
+            .find(&format!(" : {name} ===\n"))
+            .unwrap_or_else(|| panic!("{name} absent : {user}"));
+        let end = user[start..].find(&format!("=== FIN DU FICHIER : {name}"));
+        user[start..start + end.unwrap()].to_string()
+    };
+    let a = section("a.json");
+    assert!(a.contains("extrait tronqué de 10 Ko"), "{a}");
+    assert!(!a.contains("FIN_UNIQUE_ZZ"));
+    assert!(section("b.yaml").contains(yaml_text));
+    let s = section("s.sql");
+    assert!(s.contains("instructions INSERT ou COPY retirées"), "{s}");
+    assert!(s.contains("INSERT INTO t VALUES (0, 'v');"), "{s}");
+    assert!(!s.contains(&format!("VALUES ({}, 'v')", i - 1)), "{s}");
+    let store = nephila::store::Store::open_readonly(&repo).unwrap();
+    let summary = |id: &str| {
+        store
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.summary)
+    };
+    assert_eq!(summary("document:a.json").as_deref(), Some("Résumé JSON."));
+    assert_eq!(summary("document:b.yaml").as_deref(), Some("Résumé YAML."));
+    assert_eq!(summary("document:s.sql").as_deref(), Some("Résumé SQL."));
+}
+
+/// AC-241-7 : l'analyse lit le fichier entier, la réduction ne touche que l'envoi.
+#[test]
+fn req241_ac7_analyse_lit_le_fichier_entier() {
+    let json_text = format!(
+        "{{\"debut\":\"{}\",\"cle_tardive\":1}}",
+        "x".repeat(100_000)
+    );
+    let mut sql = String::new();
+    let mut i = 0;
+    while sql.len() < 100_000 {
+        sql.push_str(&format!("INSERT INTO t VALUES ({i}, 'v');\n"));
+        i += 1;
+    }
+    sql.push_str("CREATE TABLE tardive (id INT);\n");
+    let tmp = tempfile::tempdir().unwrap();
+    let mk = |name: &str| {
+        let repo = tmp.path().join(name);
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("big.json"), &json_text).unwrap();
+        fs::write(repo.join("big.sql"), &sql).unwrap();
+        repo
+    };
+    let (plain, enriched) = (mk("plain"), mk("enriched"));
+    let mock = tmp.path().join("mock");
+    fs::create_dir_all(&mock).unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\n",
+    )
+    .unwrap();
+    let build = |repo: &std::path::Path, extra: &str| -> Output {
+        let mut c = Command::new(cargo_bin("nephila"));
+        c.arg("-C").arg(repo).arg("build");
+        if !extra.is_empty() {
+            c.arg(extra);
+        }
+        c.env("NEPHILA_CONFIG", &config)
+            .env("NEPHILA_MOCK_DIR", &mock)
+            .env_remove("NEPHILA_MOCK_LOG")
+            .output()
+            .unwrap()
+    };
+    let a = build(&plain, "--no-llm");
+    let b = build(&enriched, "");
+    for o in [&a, &b] {
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    let warnings = |o: &Output| -> Vec<String> {
+        String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .filter(|l| l.starts_with("avertissement"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(warnings(&a), warnings(&b));
+    let ids = |repo: &std::path::Path| -> Vec<String> {
+        nephila::store::Store::open_readonly(repo)
+            .unwrap()
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect()
+    };
+    for repo in [&plain, &enriched] {
+        let ids = ids(repo);
+        assert!(
+            ids.contains(&"key:big.json#cle_tardive".to_string()),
+            "{ids:?}"
+        );
+        assert!(ids.contains(&"table:tardive".to_string()), "{ids:?}");
+    }
+}

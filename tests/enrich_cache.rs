@@ -1668,3 +1668,44 @@ fn REQ237_AC8_resumes_retraduits_d_un_appel_conserve_restent_sur_leurs_noeuds() 
         );
     }
 }
+
+#[test]
+fn req241_ac6_data_family_version_9_graph_reenriches_only_data_files() {
+    let env = tiny_env(&[
+        ("a.md", "# Un\n\ntexte\n"),
+        ("A.java", "public class A {\n  void run() {}\n}\n"),
+        ("app.yml", "port: 80\n"),
+    ]);
+    env.ok(&["build"]);
+    assert_eq!(to_enrich(&env), 0);
+
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let n = conn
+        .execute("UPDATE enrichments SET prompt_version = 9", [])
+        .unwrap();
+    assert_eq!(n, 3);
+    drop(conn);
+    assert_eq!(to_enrich(&env), 1);
+
+    env.ok(&["update"]);
+    assert_eq!(env.logged_paths(), BTreeSet::from(["app.yml".to_string()]));
+    assert_eq!(to_enrich(&env), 0);
+
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let version = |p: &str| -> i64 {
+        conn.query_row(
+            "SELECT prompt_version FROM enrichments WHERE path = ?1",
+            [p],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(version("app.yml"), 10);
+    assert_eq!(version("a.md"), 9);
+    assert_eq!(version("A.java"), 9);
+    drop(conn);
+
+    let again = env.ok(&["update"]);
+    assert_eq!(text(&again.stdout), "graphe à jour\n");
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+}
