@@ -12,6 +12,10 @@ use std::process::Output;
 mod schema6;
 use schema6::schema7::schema8;
 
+#[allow(dead_code)]
+#[path = "support/fake_server.rs"]
+mod fake_server;
+
 fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for e in fs::read_dir(from).unwrap() {
@@ -528,7 +532,7 @@ fn req115_ac3_texte_exact_et_place() {
 }
 
 /// Vérifie le motif de AC-115-3 (pas de dépendance de test nouvelle) :
-/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 11 en [0-9]+ ms$`.
+/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 12 en [0-9]+ ms$`.
 fn is_migration_trace_7(line: &str) -> bool {
     {
         let Some(rest) = line.strip_prefix("trace: [") else {
@@ -619,7 +623,7 @@ fn req147_ac4_update_migrates_schema8_to_current_and_traces_it() {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 8 vers 11 en ")),
+            .any(|l| l.starts_with("schéma: migration 8 vers 12 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -633,7 +637,7 @@ fn req147_ac4_update_migrates_schema8_to_current_and_traces_it() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v, "11");
+    assert_eq!(v, "12");
 }
 
 #[test]
@@ -646,7 +650,7 @@ fn req147_ac4_schema7_reaches_the_same_result_as_schema8() {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 7 vers 11 en ")),
+            .any(|l| l.starts_with("schéma: migration 7 vers 12 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -711,7 +715,7 @@ fn assert_ac173_4_chain(env: &Env, from: i32) {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with(&format!("schéma: migration {from} vers 11 en "))),
+            .any(|l| l.starts_with(&format!("schéma: migration {from} vers 12 en "))),
         "{}",
         text(&o.stderr)
     );
@@ -777,14 +781,14 @@ fn req226_ac7_schema10_is_read_unchanged_then_migrated_by_update() {
 
     let o = env.ok(&["update", "--no-llm", "--verbose"]);
     assert_eq!(env.user_version(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 11);
+    assert_eq!(SCHEMA_VERSION, 12);
     let migration: Vec<_> = trace_lines(&o.stderr)
         .into_iter()
         .filter(|l| l.starts_with("schéma: migration"))
         .collect();
     assert_eq!(migration.len(), 1, "{migration:?}");
     assert!(
-        migration[0].starts_with("schéma: migration 10 vers 11 en ")
+        migration[0].starts_with("schéma: migration 10 vers 12 en ")
             && migration[0].ends_with(" ms"),
         "{migration:?}"
     );
@@ -798,15 +802,15 @@ fn req226_ac7_schema10_is_read_unchanged_then_migrated_by_update() {
 }
 
 #[test]
-fn req226_ac7_older_schemas_reach_schema_11() {
+fn req226_ac7_older_schemas_reach_schema_12() {
     for from in [5, 6, 7, 8] {
         let env = built_at(from);
         let o = env.ok(&["update", "--no-llm", "--verbose"]);
-        assert_eq!(env.user_version(), 11, "schéma {from}");
+        assert_eq!(env.user_version(), 12, "schéma {from}");
         assert!(
             trace_lines(&o.stderr)
                 .iter()
-                .any(|l| l.starts_with(&format!("schéma: migration {from} vers 11 en "))),
+                .any(|l| l.starts_with(&format!("schéma: migration {from} vers 12 en "))),
             "{}",
             text(&o.stderr)
         );
@@ -818,5 +822,164 @@ fn req226_ac7_older_schemas_reach_schema_11() {
     }
     let (env, _) = enriched_at(9);
     env.ok(&["update", "--no-llm"]);
+    assert_eq!(env.user_version(), 12);
+}
+
+// ---- REQ-245 : schéma 12, doc gardée par déclaration (DEC-180) ----
+
+#[test]
+fn req245_ac1_schema11_is_read_unchanged_then_migrated_by_update() {
+    let env = Env::new();
+    env.build_enriched();
+    schema6::schema7::schema8::schema9::schema10::schema11::downgrade_to_11(&env.db());
     assert_eq!(env.user_version(), 11);
+    for args in [
+        &["status"][..],
+        &["summary"][..],
+        &["export", "--format", "json", "--output", "-"][..],
+    ] {
+        env.ok(args);
+        assert_eq!(env.user_version(), 11, "{args:?}");
+    }
+    let enrichments = env.enrichments();
+    let files = files_rows(&env);
+    let calls = table_rows(&env, "SELECT path, call_key, payload FROM enrich_calls", 3);
+    let resolution_before = resolution(&env);
+
+    let o = env.ok(&["update", "--no-llm", "--verbose"]);
+    assert_eq!(env.user_version(), 12);
+    let migration: Vec<_> = trace_lines(&o.stderr)
+        .into_iter()
+        .filter(|l| l.starts_with("schéma: migration"))
+        .collect();
+    assert_eq!(migration.len(), 1, "{migration:?}");
+    assert!(
+        migration[0].starts_with("schéma: migration 11 vers 12 en ")
+            && migration[0].ends_with(" ms"),
+        "{migration:?}"
+    );
+    assert_eq!(env.enrichments(), enrichments);
+    assert_eq!(files_rows(&env), files);
+    assert_eq!(
+        table_rows(&env, "SELECT path, call_key, payload FROM enrich_calls", 3),
+        calls
+    );
+    assert_eq!(resolution(&env), resolution_before);
+
+    let fresh = Env::new();
+    fresh.ok(&["build", "--no-llm"]);
+    assert_eq!(master(&env), master(&fresh));
+}
+
+#[test]
+fn req245_ac3_documented_nodes_are_asked_until_the_file_is_read_again() {
+    use fake_server::FakeServer;
+    const KEY: &str = "NEPHILA_T334_UPGRADE_KEY";
+    const LIVRE: &str = "package p;\n\n/** Un livre du catalogue de la librairie. */\npublic class Livre {\n    /** Renvoie le titre complet du livre. */\n    public String titre() { return \"t\"; }\n    public int prix() { return 1; }\n}\n";
+    let reply = |sums: &[(i64, &str)]| {
+        let s: Vec<_> = sums
+            .iter()
+            .map(|(n, t)| serde_json::json!({"n": n, "summary": t}))
+            .collect();
+        let content = serde_json::json!({"summaries": s, "concepts": []}).to_string();
+        serde_json::json!({"choices":[{"message":{"role":"assistant","content":content},"finish_reason":"stop"}]})
+            .to_string()
+    };
+    let server = FakeServer::start(
+        [
+            reply(&[(1, "Prix.")]),
+            reply(&[(1, "Classe LLM."), (2, "Titre LLM."), (3, "Prix LLM.")]),
+            reply(&[(1, "Prix bis.")]),
+        ]
+        .into_iter()
+        .map(|b| (200, b))
+        .collect(),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("src/p")).unwrap();
+    fs::write(repo.join("src/p/Livre.java"), LIVRE).unwrap();
+    let config = tmp.path().join("config.toml");
+    let write_config = |model: &str| {
+        fs::write(
+            &config,
+            format!(
+                "provider = \"openai\"\nmodel = \"{model}\"\napi_key_env = \"{KEY}\"\nbase_url = \"{}\"\nconcurrency = 1\nbatch_files = 1\nenrich_code = true\n",
+                server.base_url
+            ),
+        )
+        .unwrap();
+    };
+    let run = |args: &[&str]| {
+        let o = Command::cargo_bin("nephila")
+            .unwrap()
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &config)
+            .env(KEY, "sk-test")
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{args:?} : {}", text(&o.stderr));
+    };
+    let list = |i: usize| -> String {
+        let bodies: Vec<String> = server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == "/v1/chat/completions")
+            .map(|r| r.body)
+            .collect();
+        assert_eq!(bodies.len(), i + 1, "{bodies:?}");
+        let b = &bodies[i];
+        let start = b.find("Nœuds du fichier").unwrap();
+        b[start..b.find("Contenu").unwrap()].to_string()
+    };
+    let docs = || -> Vec<Option<String>> {
+        Connection::open(repo.join(".nephila/graph.db"))
+            .unwrap()
+            .prepare("SELECT doc FROM declarations ORDER BY node")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    write_config("m1");
+    run(&["build"]);
+    assert!(list(0).contains("method:p.Livre.prix") && !list(0).contains("method:p.Livre.titre"));
+    // Graphe de schéma 11 : aucune doc gardée.
+    let db = Connection::open(repo.join(".nephila/graph.db")).unwrap();
+    schema6::schema7::schema8::schema9::schema10::schema11::downgrade_to_11(&db);
+    drop(db);
+    // Autre modèle : le fichier est réenrichi, ses nœuds documentés sont encore demandés.
+    write_config("m2");
+    run(&["update"]);
+    let second = list(1);
+    for id in [
+        "type:p.Livre",
+        "method:p.Livre.titre",
+        "method:p.Livre.prix",
+    ] {
+        assert!(second.contains(id), "{second}");
+    }
+    assert!(docs().iter().all(Option::is_none));
+    // `build` relit le fichier : la doc est remplie.
+    run(&["build"]);
+    assert_eq!(docs().iter().filter(|d| d.is_some()).count(), 2);
+    // Fichier modifié : `update` ne demande plus que le nœud sans doc.
+    fs::write(
+        repo.join("src/p/Livre.java"),
+        LIVRE.replace("return 1;", "return 2;"),
+    )
+    .unwrap();
+    run(&["update"]);
+    let third = list(2);
+    assert!(third.contains("method:p.Livre.prix"), "{third}");
+    assert!(
+        !third.contains("type:p.Livre") && !third.contains("method:p.Livre.titre"),
+        "{third}"
+    );
 }

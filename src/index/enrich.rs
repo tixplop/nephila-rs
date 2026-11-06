@@ -1483,11 +1483,11 @@ fn estimate_alone(
     out
 }
 
-/// Nœuds déclarés par chaque fichier (identifiant, nom court), hors packages et clés de
-/// configuration (REQ-024).
+/// Nœuds à demander pour chaque fichier (identifiant, nom court) : déclarés sans doc (DEC-180),
+/// hors packages et clés de configuration (REQ-024).
 pub(crate) fn nodes_by_file(store: &Store) -> Result<HashMap<String, Vec<(String, String)>>> {
     let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for (file, node, short) in store.declared_short_names()? {
+    for (file, node, short) in store.undocumented_short_names()? {
         if !node.starts_with("package:") && !node.starts_with("key:") {
             map.entry(file).or_default().push((node, short));
         }
@@ -7488,5 +7488,54 @@ mod structured_fallback_tests {
                 "{e}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod doc_tests {
+    use super::*;
+
+    fn file(path: &str) -> FileRecord {
+        FileRecord {
+            path: path.into(),
+            hash: "h".into(),
+            size: 3,
+            mtime: 0,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        }
+    }
+
+    fn method(q: &str, file: &str, doc: Option<&str>) -> Node {
+        Node::new(NodeKind::Method, q, "m", Some(file), None, doc)
+    }
+
+    #[test]
+    fn req244_ac7_documented_node_is_absent_and_shared_node_stays_asked_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store
+            .insert_files(&[file("A.java"), file("B.java")])
+            .unwrap();
+        // `titre` documenté, `prix` sans doc ; `x:y` documenté dans A.java seulement.
+        let dep = |doc| Node::new(NodeKind::Dependency, "x:y", "y", None, None, doc);
+        store
+            .replace_structure(
+                "A.java",
+                &[
+                    method("p.A.titre", "A.java", Some("Le titre.")),
+                    method("p.A.prix", "A.java", None),
+                    dep(Some("Doc.")),
+                ],
+                &[],
+            )
+            .unwrap();
+        store
+            .replace_structure("B.java", &[dep(None)], &[])
+            .unwrap();
+        let map = nodes_by_file(&store).unwrap();
+        let ids = |f: &str| -> Vec<&str> { map[f].iter().map(|(id, _)| id.as_str()).collect() };
+        assert_eq!(ids("A.java"), ["method:p.A.prix"]);
+        assert_eq!(ids("B.java"), ["dependency:x:y"]);
     }
 }

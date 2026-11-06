@@ -52,7 +52,10 @@ CREATE TABLE declarations (
     short TEXT NOT NULL,
     subkind TEXT,
     located INTEGER NOT NULL,
-    summary TEXT,
+    -- `doc` : phrase de la doc de la déclaration (DEC-180), écrite à chaque écriture de la
+    -- structure ; `summary` vaut le résumé LLM s'il y en a un, sinon `doc`. Placée ici pour que
+    -- le texte égale celui d'un graphe migré par `ALTER TABLE ... ADD COLUMN`.
+    summary TEXT, doc TEXT,
     PRIMARY KEY (file, node)
 );
 CREATE INDEX idx_declarations_node_file ON declarations(node, file);

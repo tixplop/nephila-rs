@@ -521,12 +521,20 @@ fn word_stats(summaries: &[String]) -> Value {
 }
 
 /// Mesures de l'enrichissement (sans `exit_code`), d'après l'export et stderr de `build --verbose`.
-fn enrich_metrics(export: &Value, stderr: &str) -> Value {
+fn enrich_metrics(
+    export: &Value,
+    stderr: &str,
+    documented: &std::collections::HashSet<(String, String)>,
+) -> Value {
     let (mut requested, mut covered) = (0u64, 0u64);
     let mut summaries = Vec::new();
     for n in export["nodes"].as_array().map_or(&[][..], |a| &a[..]) {
         let id = n["id"].as_str().unwrap_or("");
         if n["file"].is_null() || id.starts_with("package:") || id.starts_with("key:") {
+            continue;
+        }
+        let file = n["file"].as_str().unwrap_or("").to_string();
+        if documented.contains(&(file, id.to_string())) {
             continue;
         }
         requested += 1;
@@ -732,6 +740,18 @@ fn last_line(stderr: &[u8]) -> String {
 
 /// Une passe : `build --enrich-code --verbose`, `export`, les questions, le juge, rapport écrit
 /// en une fois.
+/// Nœuds dont la doc est lue dans le source : (fichier, nœud) ; vide si le graphe manque.
+fn documented_nodes(db: &Path) -> std::collections::HashSet<(String, String)> {
+    let read = || -> rusqlite::Result<std::collections::HashSet<(String, String)>> {
+        let conn =
+            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut st = conn.prepare("SELECT file, node FROM declarations WHERE doc IS NOT NULL")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
+    };
+    read().unwrap_or_default()
+}
+
 fn run_pass(p: &Params) -> Res<Value> {
     if !p.config.is_file() {
         return Err(format!(
@@ -795,7 +815,8 @@ fn run_pass(p: &Params) -> Res<Value> {
             .and_then(|l| l.split_whitespace().find_map(|w| w.strip_prefix(key)))
             .map_or(Value::Null, Value::from)
     };
-    let mut enrich = enrich_metrics(&export, &stderr);
+    let documented = documented_nodes(&repo.join(".nephila").join("graph.db"));
+    let mut enrich = enrich_metrics(&export, &stderr, &documented);
     enrich["exit_code"] = code.into();
     let questions: Value =
         serde_json::from_slice(&fs::read(&p.questions).map_err(|e| e.to_string())?)
@@ -1186,7 +1207,11 @@ trace: [0.006s] llm enrich fin lot c +1 [1/1] tronquée 3 ms : réponse tronqué
 #[test]
 fn req222_ac1_first_try_counts_crossing_threads() {
     assert_eq!(parse_calls(CROSSING), (3, 1));
-    let m = enrich_metrics(&serde_json::json!({"nodes": []}), CROSSING);
+    let m = enrich_metrics(
+        &serde_json::json!({"nodes": []}),
+        CROSSING,
+        &Default::default(),
+    );
     assert_eq!(m["first_calls"], 3);
     assert_eq!(m["first_try_ok"], 1);
     assert_eq!(m["first_try_rate"], 0.3333);
@@ -1266,7 +1291,7 @@ fn req222_ac4_coverage_and_word_statistics() {
         {"id": "key:k", "file": "pom.xml", "summary": "ignoré"},
         {"id": "concept:x", "file": null, "summary": "ignoré"},
     ]});
-    let m = enrich_metrics(&export, "");
+    let m = enrich_metrics(&export, "", &Default::default());
     assert_eq!(m["nodes_requested"], 4);
     assert_eq!(m["nodes_covered"], 2);
     assert_eq!(m["coverage"], 0.5);
@@ -1288,10 +1313,31 @@ fn req222_ac4_coverage_and_word_statistics() {
         word_stats(&[]),
         serde_json::json!({"count": 0, "mean": 0, "median": 0, "p90": 0, "max": 0})
     );
-    let none = enrich_metrics(&serde_json::json!({"nodes": []}), "");
+    let none = enrich_metrics(&serde_json::json!({"nodes": []}), "", &Default::default());
     assert_eq!(none["coverage"], 0);
     assert_eq!(none["first_try_rate"], 0);
     assert_eq!(none["nodes_requested"], 0);
+}
+
+#[test]
+fn req244_ac9_documented_nodes_are_not_counted() {
+    let export = serde_json::json!({"nodes": [
+        {"id": "type:A", "file": "A.java", "summary": "un deux"},
+        {"id": "method:A.m", "file": "A.java", "summary": "trois"},
+        {"id": "type:B", "file": "B.java", "summary": ""},
+        {"id": "type:C", "file": "C.java", "summary": null},
+        {"id": "package:p", "file": "A.java", "summary": "ignoré"},
+        {"id": "key:k", "file": "pom.xml", "summary": "ignoré"},
+        {"id": "concept:x", "file": null, "summary": "ignoré"},
+        {"id": "method:A.d", "file": "A.java", "summary": "doc lue"},
+    ]});
+    let documented =
+        std::collections::HashSet::from([("A.java".to_string(), "method:A.d".to_string())]);
+    let m = enrich_metrics(&export, "", &documented);
+    assert_eq!(m["nodes_requested"], 4);
+    assert_eq!(m["nodes_covered"], 2);
+    assert_eq!(m["coverage"], 0.5);
+    assert_eq!(m["summary_words"]["count"], 2);
 }
 
 #[test]

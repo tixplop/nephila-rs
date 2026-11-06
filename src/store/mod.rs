@@ -29,7 +29,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 11;
+pub const SCHEMA_VERSION: i32 = 12;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -57,6 +57,9 @@ const ENRICH_CALLS_DDL: &str = "CREATE TABLE enrich_calls (\n    path     TEXT N
 
 /// Dernier schéma sans la table `enrich_calls`, migré sur place (DEC-173).
 const SCHEMA_WITHOUT_ENRICH_CALLS: i32 = 10;
+
+/// Dernier schéma sans `declarations.doc`, migré sur place (DEC-180).
+const SCHEMA_WITHOUT_DECLARATION_DOC: i32 = 11;
 
 /// Valeurs de `meta.resolution` (DEC-076) : le graphe est-il le résultat d'une passe terminée ?
 const RESOLUTION_DONE: &str = "à jour";
@@ -619,7 +622,8 @@ impl Store {
             | SCHEMA_WITH_FILE_CONTEXTS
             | SCHEMA_WITHOUT_COMMUNITIES
             | SCHEMA_WITHOUT_ENRICH_LANGUAGE
-            | SCHEMA_WITHOUT_ENRICH_CALLS => store.migrate_to_current()?,
+            | SCHEMA_WITHOUT_ENRICH_CALLS
+            | SCHEMA_WITHOUT_DECLARATION_DOC => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -656,7 +660,8 @@ impl Store {
             | SCHEMA_WITH_FILE_CONTEXTS
             | SCHEMA_WITHOUT_COMMUNITIES
             | SCHEMA_WITHOUT_ENRICH_LANGUAGE
-            | SCHEMA_WITHOUT_ENRICH_CALLS => {
+            | SCHEMA_WITHOUT_ENRICH_CALLS
+            | SCHEMA_WITHOUT_DECLARATION_DOC => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
                 Ok(store)
@@ -710,7 +715,8 @@ impl Store {
                 || v == SCHEMA_WITH_FILE_CONTEXTS
                 || v == SCHEMA_WITHOUT_COMMUNITIES
                 || v == SCHEMA_WITHOUT_ENRICH_LANGUAGE
-                || v == SCHEMA_WITHOUT_ENRICH_CALLS =>
+                || v == SCHEMA_WITHOUT_ENRICH_CALLS
+                || v == SCHEMA_WITHOUT_DECLARATION_DOC =>
             {
                 store.version = v
             }
@@ -725,13 +731,13 @@ impl Store {
         self.read_only && !self.conn.is_autocommit()
     }
 
-    /// Version du schéma du graphe ouvert (5 à 10 en lecture seule seulement : DEC-066, DEC-073,
+    /// Version du schéma du graphe ouvert (5 à 11 en lecture seule seulement : DEC-066, DEC-073,
     /// DEC-076).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
-    /// Migre un schéma 5 à 10 en schéma 11 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, puis 10 -> 11,
+    /// Migre un schéma 5 à 11 en schéma 12 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, puis 11 -> 12,
     /// chacune en une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         let from = self.user_version()?;
@@ -744,6 +750,7 @@ impl Store {
         self.migrate_8_to_9()?;
         self.migrate_9_to_10()?;
         self.migrate_10_to_11()?;
+        self.migrate_11_to_12()?;
         // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
         crate::trace!(
             "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
@@ -819,6 +826,28 @@ impl Store {
         }
         tx.execute_batch(&format!(
             "{ENRICH_CALLS_DDL}
+             UPDATE meta SET value = '{SCHEMA_WITHOUT_DECLARATION_DOC}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITHOUT_DECLARATION_DOC};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
+    }
+
+    /// Migre un schéma 11 en schéma 12 en une transaction `IMMEDIATE` (DEC-180) : colonne
+    /// `declarations.doc` (NULL pour les déclarations existantes, sans `IF NOT EXISTS` : une
+    /// colonne en conflit annule la migration), versions. Aucun marqueur `à résoudre`.
+    fn migrate_11_to_12(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_DECLARATION_DOC {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "ALTER TABLE declarations ADD COLUMN doc TEXT;
              UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
@@ -2464,13 +2493,16 @@ impl Store {
         rows.map(|r| r.map_err(db_err)).collect()
     }
 
-    /// Triplets (fichier, identifiant de nœud, nom court) des déclarations, dans l'ordre
-    /// (fichier, identifiant).
-    pub fn declared_short_names(&self) -> Result<Vec<(String, String, String)>> {
-        let mut st = self
-            .conn
-            .prepare_cached("SELECT file, node, short FROM declarations ORDER BY file, node")
-            .map_err(db_err)?;
+    /// Triplets (fichier, identifiant de nœud, nom court) des déclarations sans doc, dans l'ordre
+    /// (fichier, identifiant) : celles qu'on demande au LLM (DEC-180). Un graphe de schéma 11 en
+    /// lecture seule n'a pas de colonne `doc` : toutes ses déclarations sont rendues.
+    pub fn undocumented_short_names(&self) -> Result<Vec<(String, String, String)>> {
+        let sql = if self.version >= SCHEMA_VERSION {
+            "SELECT file, node, short FROM declarations WHERE doc IS NULL ORDER BY file, node"
+        } else {
+            "SELECT file, node, short FROM declarations ORDER BY file, node"
+        };
+        let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
         let rows = st
             .query_map([], |r| {
                 Ok((
@@ -3257,7 +3289,7 @@ fn clear_summaries(
     touched: &mut Touched,
 ) -> Result<()> {
     tx.prepare_cached(
-        "UPDATE declarations SET summary = NULL WHERE file = ?1 AND summary IS NOT NULL",
+        "UPDATE declarations SET summary = doc WHERE file = ?1 AND summary IS NOT doc",
     )
     .map_err(db_err)?
     .execute([path])
@@ -3359,11 +3391,17 @@ fn insert_nodes(
         .map_err(db_err)?;
     let mut decl = tx
         .prepare_cached(
-            "INSERT OR IGNORE INTO declarations(file, node, origin, short, subkind, located, summary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR IGNORE INTO declarations(file, node, origin, short, subkind, located, summary, doc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .map_err(db_err)?;
     for n in nodes {
+        // La doc n'existe que pour une déclaration d'analyse (DEC-180).
+        let doc = if origin == "parse" {
+            n.summary.as_deref()
+        } else {
+            None
+        };
         if n.file.as_deref().is_some_and(|f| f != path) {
             return Err(Error::Message(format!(
                 "le nœud {} n'appartient pas au fichier {path}",
@@ -3389,7 +3427,8 @@ fn insert_nodes(
             n.short,
             n.subkind.map(SubKind::as_str),
             n.file.is_some(),
-            n.summary
+            n.summary,
+            doc
         ])
         .map_err(db_err)?;
         touched.insert(n.id.clone());
@@ -3403,6 +3442,7 @@ fn insert_nodes_fresh(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
     nodes: &[Node],
+    docs: Option<&[Node]>,
     origin: &str,
     touched: &mut Touched,
 ) -> Result<()> {
@@ -3414,11 +3454,18 @@ fn insert_nodes_fresh(
         .map_err(db_err)?;
     let mut decl = tx
         .prepare_cached(
-            "INSERT OR IGNORE INTO declarations(file, node, origin, short, subkind, located, summary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR IGNORE INTO declarations(file, node, origin, short, subkind, located, summary, doc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .map_err(db_err)?;
-    for n in nodes {
+    for (i, n) in nodes.iter().enumerate() {
+        // La doc n'existe que pour une déclaration d'analyse (DEC-180) ; `docs` rend les nœuds
+        // d'avant la fusion de l'enrichissement conservé, dans le même ordre.
+        let doc = if origin == "parse" {
+            docs.map_or(n.summary.as_deref(), |d| d[i].summary.as_deref())
+        } else {
+            None
+        };
         if n.file.as_deref().is_some_and(|f| f != path) {
             return Err(Error::Message(format!(
                 "le nœud {} n'appartient pas au fichier {path}",
@@ -3445,7 +3492,8 @@ fn insert_nodes_fresh(
             n.short,
             n.subkind.map(SubKind::as_str),
             n.file.is_some(),
-            n.summary
+            n.summary,
+            doc
         ])
         .map_err(db_err)?;
         if inserted == 0 {
@@ -3814,9 +3862,7 @@ fn write_structure_fresh(tx: &rusqlite::Transaction<'_>, p: &PreparedStructure) 
         let (summaries, concepts, llm_refs) = filter_payload(payload, &declared);
         // Les résumés du fichier sont effacés puis remplacés par ceux de l'enrichissement.
         let mut parse_nodes = p.nodes.clone();
-        for n in &mut parse_nodes {
-            n.summary = None;
-        }
+        // Un nœud sans résumé dans l'enrichissement garde sa doc (DEC-180).
         for (id, text) in &summaries {
             for n in parse_nodes.iter_mut().filter(|n| n.id == *id) {
                 n.summary = Some(text.clone());
@@ -3829,6 +3875,7 @@ fn write_structure_fresh(tx: &rusqlite::Transaction<'_>, p: &PreparedStructure) 
         tx,
         path,
         merged.as_deref().unwrap_or(&p.nodes),
+        Some(&p.nodes),
         "parse",
         &mut touched,
     )?;
@@ -3839,7 +3886,7 @@ fn write_structure_fresh(tx: &rusqlite::Transaction<'_>, p: &PreparedStructure) 
         .map_err(db_err)?;
     let reapplied = kept.is_some();
     if let Some((concepts, llm_refs)) = kept {
-        insert_nodes_fresh(tx, path, &concepts, "llm", &mut touched)?;
+        insert_nodes_fresh(tx, path, &concepts, None, "llm", &mut touched)?;
         insert_refs(tx, path, &llm_refs, "llm", &mut touched)?;
     }
     let ids: Vec<&String> = touched.ids.iter().collect();
@@ -4502,14 +4549,29 @@ mod tests {
         PRAGMA user_version = 7;
         COMMIT;";
 
+    const SCHEMA11_DOWNGRADE: &str = "BEGIN;
+        ALTER TABLE declarations DROP COLUMN doc;
+        UPDATE meta SET value = '11' WHERE key = 'schema_version';
+        PRAGMA user_version = 11;
+        COMMIT;";
+
+    /// Ramène un graphe de schéma 12 au schéma 11 (DEC-180).
+    fn downgrade_to_11(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA11_DOWNGRADE)
+            .unwrap();
+    }
+
     const SCHEMA10_DOWNGRADE: &str = "BEGIN;
         DROP TABLE enrich_calls;
         UPDATE meta SET value = '10' WHERE key = 'schema_version';
         PRAGMA user_version = 10;
         COMMIT;";
 
-    /// Ramène un graphe de schéma 11 au schéma 10 (DEC-173).
+    /// Ramène un graphe de schéma 12 au schéma 10 (le schéma 11 d'abord, DEC-173).
     fn downgrade_to_10(repo: &Path) {
+        downgrade_to_11(repo);
         Connection::open(db_path(repo))
             .unwrap()
             .execute_batch(SCHEMA10_DOWNGRADE)
@@ -5991,7 +6053,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        assert_eq!(SCHEMA_VERSION, 11);
+        assert_eq!(SCHEMA_VERSION, 12);
     }
 
     #[test]
@@ -6125,11 +6187,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_to_11_without_touching_the_file() {
-        for version in [11, 10, 9, 8, 7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_12_without_touching_the_file() {
+        for version in [12, 11, 10, 9, 8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                11 => downgrade_to_11(dir.path()),
                 10 => downgrade_to_10(dir.path()),
                 9 => downgrade_to_9(dir.path()),
                 8 => downgrade_to_8(dir.path()),
@@ -7139,7 +7202,7 @@ mod tests {
         assert_eq!(st.opened_schema_version(), 10);
         drop(st);
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(st.schema_version().unwrap(), 11);
+        assert_eq!(st.schema_version().unwrap(), 12);
         assert!(st.call_results().unwrap().is_empty());
         drop(st);
         downgrade_to_10(dir.path());
@@ -8837,5 +8900,156 @@ mod tests {
             assert_eq!(st.community_of(&tid("p.A")).unwrap(), None);
             assert!(st.community_members(1).unwrap().is_empty());
         }
+    }
+
+    /// Fichier à un nœud documenté (`t`) et un nœud sans doc (`m`).
+    type DocItems = Vec<(String, Vec<Node>, Vec<Ref>)>;
+
+    fn doc_items() -> (DocItems, String, String) {
+        let t = Node::new(
+            NodeKind::Type,
+            "p.T",
+            "T",
+            Some("T.java"),
+            Some(SubKind::Class),
+            Some("Doc de T."),
+        );
+        let m = Node::new(NodeKind::Method, "p.T.m", "m", Some("T.java"), None, None);
+        let (tid, mid) = (t.id.clone(), m.id.clone());
+        (vec![("T.java".into(), vec![t, m], vec![])], tid, mid)
+    }
+
+    fn summary_of(st: &Store, id: &str) -> Option<String> {
+        st.nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == id)
+            .unwrap()
+            .summary
+    }
+
+    fn doc_column(st: &Store) -> Vec<(String, Option<String>)> {
+        let mut q = st
+            .conn
+            .prepare("SELECT node, doc FROM declarations ORDER BY node")
+            .unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn req244_ac6_enrichment_never_changes_the_doc() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("T.java")]).unwrap();
+        let (items, t, m) = doc_items();
+        st.replace_structures(&items).unwrap();
+        assert_eq!(summary_of(&st, &t).as_deref(), Some("Doc de T."));
+        assert_eq!(summary_of(&st, &m), None);
+        let apply = |st: &mut Store, s: &[(String, String)]| {
+            st.apply_enrichment("T.java", "h", "m", "français", s, &[], &[])
+                .unwrap()
+        };
+        apply(&mut st, &[(m.clone(), "Rôle de m.".into())]);
+        assert_eq!(summary_of(&st, &t).as_deref(), Some("Doc de T."));
+        assert_eq!(summary_of(&st, &m).as_deref(), Some("Rôle de m."));
+        // Aucun résumé : la doc reste, l'autre résumé est effacé.
+        apply(&mut st, &[]);
+        assert_eq!(summary_of(&st, &t).as_deref(), Some("Doc de T."));
+        assert_eq!(summary_of(&st, &m), None);
+        assert_eq!(
+            doc_column(&st),
+            [(m.clone(), None), (t.clone(), Some("Doc de T.".into()))]
+        );
+    }
+
+    #[test]
+    fn req244_ac6_kept_enrichment_with_a_summary_for_the_documented_node_is_reapplied() {
+        for fresh in [false, true] {
+            let dir = tempdir().unwrap();
+            let mut st = Store::open_or_create(dir.path()).unwrap();
+            st.insert_pending_files(&[file("T.java")]).unwrap();
+            let (items, t, m) = doc_items();
+            st.replace_structures(&items).unwrap();
+            st.apply_enrichment(
+                "T.java",
+                "h",
+                "m",
+                "français",
+                &[(t.clone(), "Résumé LLM de T.".into())],
+                &[],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(summary_of(&st, &t).as_deref(), Some("Résumé LLM de T."));
+            if fresh {
+                st.reset_with_pending_files(&[file("T.java")]).unwrap();
+            } else {
+                st.insert_files(&[file("T.java")]).unwrap();
+            }
+            st.replace_structures(&items).unwrap();
+            assert_eq!(
+                summary_of(&st, &t).as_deref(),
+                Some("Résumé LLM de T."),
+                "fresh={fresh}"
+            );
+            assert_eq!(summary_of(&st, &m), None);
+            // La colonne garde la phrase d'origine.
+            assert_eq!(
+                doc_column(&st)
+                    .into_iter()
+                    .find(|(n, _)| *n == t)
+                    .unwrap()
+                    .1
+                    .as_deref(),
+                Some("Doc de T."),
+                "fresh={fresh}"
+            );
+        }
+    }
+
+    #[test]
+    fn req244_ac6_kept_enrichment_without_summary_keeps_the_doc_on_a_fresh_base() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("T.java")]).unwrap();
+        let (items, t, m) = doc_items();
+        st.replace_structures(&items).unwrap();
+        st.apply_enrichment(
+            "T.java",
+            "h",
+            "m",
+            "français",
+            &[(m.clone(), "Rôle de m.".into())],
+            &[],
+            &[],
+        )
+        .unwrap();
+        st.reset_with_pending_files(&[file("T.java")]).unwrap();
+        st.replace_structures(&items).unwrap();
+        assert_eq!(summary_of(&st, &t).as_deref(), Some("Doc de T."));
+        assert_eq!(summary_of(&st, &m).as_deref(), Some("Rôle de m."));
+    }
+
+    #[test]
+    fn req245_ac4_new_graph_is_schema_12_and_schema_13_is_refused() {
+        let dir = tempdir().unwrap();
+        let st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(SCHEMA_VERSION, 12);
+        assert_eq!(st.schema_version().unwrap(), 12);
+        drop(st);
+        Connection::open(db_path(dir.path()))
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 13")
+            .unwrap();
+        let e = Store::open_or_create(dir.path()).err().unwrap().to_string();
+        assert!(
+            e.contains("version de schéma du graphe non prise en charge (13"),
+            "{e}"
+        );
+        assert!(Store::open_readonly(dir.path()).is_err());
+        assert_eq!(st_user_version(dir.path()), 13);
     }
 }

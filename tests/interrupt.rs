@@ -683,7 +683,7 @@ fn req191_ac1_ac5_ac6_annonce_et_ligne_de_fin() {
     // Bilan identique, aux comptes près, à celui de la même fixture arrêtée par une clé refusée.
     let server = Server::start(|i| {
         if i == 0 {
-            Act::Status(401, None)
+            Act::StatusAfter(401, 2)
         } else {
             Act::Ok(1000)
         }
@@ -691,6 +691,7 @@ fn req191_ac1_ac5_ac6_annonce_et_ligne_de_fin() {
     let env = Env::new(&docs(6), &server.base_url, FIX189);
     let refused = env.run(&["build"]);
     assert_eq!(refused.code(), Some(1), "{}", refused.stderr);
+    assert_eq!(server.requests(), 2, "{}", refused.stderr);
     assert!(!refused.stdout.is_empty());
     assert_eq!(shape(&d.stdout), shape(&refused.stdout));
 }
