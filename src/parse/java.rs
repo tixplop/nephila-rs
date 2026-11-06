@@ -7,6 +7,7 @@ use crate::error::Result;
 use crate::model::{EdgeKind, SubKind};
 
 use super::calls::{Calls, Locals, Receiver};
+use super::doc::doc_before;
 use super::jvm::{clean_type_name, Builder, INIT};
 use super::walk::Preorder;
 use super::{FileStructure, Lang};
@@ -83,7 +84,7 @@ fn type_declaration(b: &mut Builder, calls: &mut Calls, n: Node, src: &[u8]) {
     let Some(name) = n.child_by_field_name("name") else {
         return;
     };
-    let Some(q) = b.enter_type(&text_of(name, src), sub) else {
+    let Some(q) = b.enter_type_doc(&text_of(name, src), sub, doc_before(n, src)) else {
         return;
     };
 
@@ -157,7 +158,7 @@ fn member(b: &mut Builder, calls: &mut Calls, m: Node, src: &[u8]) {
         "method_declaration" | "annotation_type_element_declaration" => {
             if let Some(name) = m.child_by_field_name("name") {
                 let name = text_of(name, src);
-                if let Some(q) = b.declare_method(&name) {
+                if let Some(q) = b.declare_method_doc(&name, doc_before(m, src)) {
                     if let Some(t) = b.current_type() {
                         calls.declare_method(t, &name);
                     }
@@ -679,5 +680,34 @@ interface I extends J, K<X> { void m(); }
                 );
             }
         }
+    }
+
+    #[test]
+    fn req243_ac5_resume_des_commentaires_de_doc() {
+        let s = extract(
+            "package p;\n/** Un livre du catalogue, identifié par son ISBN. */\n@Entity\npublic class Livre {\n\
+             /** Renvoie le titre complet du livre. */\n@Override public String titre() { return null; }\n\
+             /** Doc séparée par un commentaire de ligne. */\n// note\npublic void a() {}\n\
+             /* Bloc simple sans double étoile ici. */\npublic void b() {}\n\
+             public void c(int x) {}\n\
+             /** Deuxième surcharge documentée de la méthode c. */\npublic void c(String s) {}\n}\n",
+        )
+        .unwrap();
+        let sum = |k, q: &str| decl(&s, k, q).unwrap().summary.as_deref();
+        assert_eq!(
+            sum(NodeKind::Type, "p.Livre"),
+            Some("Un livre du catalogue, identifié par son ISBN.")
+        );
+        assert_eq!(
+            sum(NodeKind::Method, "p.Livre.titre"),
+            Some("Renvoie le titre complet du livre.")
+        );
+        assert_eq!(sum(NodeKind::Method, "p.Livre.a"), None);
+        assert_eq!(sum(NodeKind::Method, "p.Livre.b"), None);
+        assert_eq!(
+            sum(NodeKind::Method, "p.Livre.c"),
+            Some("Deuxième surcharge documentée de la méthode c.")
+        );
+        assert_eq!(sum(NodeKind::Package, "p"), None);
     }
 }

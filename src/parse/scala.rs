@@ -10,6 +10,7 @@ use crate::error::Result;
 use crate::model::{EdgeKind, SubKind};
 
 use super::calls::{Calls, Locals, Receiver};
+use super::doc::doc_before;
 use super::jvm::{clean_type_name, file_stem_ident, Builder, INIT};
 use super::walk::Preorder;
 use super::{FileStructure, Lang};
@@ -156,7 +157,7 @@ impl Ctx<'_> {
         if name.is_empty() {
             return;
         }
-        let Some(q) = self.b.enter_type(&name, sub) else {
+        let Some(q) = self.b.enter_type_doc(&name, sub, doc_before(n, self.src)) else {
             return;
         };
 
@@ -209,7 +210,8 @@ impl Ctx<'_> {
                 } else {
                     name
                 };
-                if let Some(q) = self.b.declare_method(&name) {
+                let doc = (name != INIT).then(|| doc_before(m, self.src)).flatten();
+                if let Some(q) = self.b.declare_method_doc(&name, doc) {
                     if let Some(t) = self.b.current_type() {
                         self.calls.declare_method(t, &name);
                     }
@@ -609,6 +611,23 @@ mod tests {
             |i| format!("class C{i} {{\n def m(): Unit = {{}}\n"),
             "}\n",
             "class B { def m(): Unit = {} }",
+        );
+    }
+
+    #[test]
+    fn req243_ac6_resume_des_commentaires_de_doc() {
+        let s = run(
+            "A.scala",
+            "package p\n/** Un livre du catalogue, identifié par son ISBN. */\nclass Livre {\n  /** Renvoie le titre complet du livre. */\n  def titre(): String = \"\"\n}\n",
+        );
+        let sum = |k, q: &str| decl(&s, k, q).unwrap().summary.as_deref();
+        assert_eq!(
+            sum(NodeKind::Type, "p.Livre"),
+            Some("Un livre du catalogue, identifié par son ISBN.")
+        );
+        assert_eq!(
+            sum(NodeKind::Method, "p.Livre.titre"),
+            Some("Renvoie le titre complet du livre.")
         );
     }
 }

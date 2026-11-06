@@ -9,6 +9,7 @@ use tree_sitter::Node;
 use crate::error::Result;
 use crate::model::{node_id, EdgeKind, NodeKind, SubKind};
 
+use super::doc::doc_before;
 use super::js_calls;
 use super::js_imports::Imports;
 use super::jvm::INIT;
@@ -108,15 +109,30 @@ impl Extractor<'_> {
         String::from_utf8_lossy(&self.src[n.byte_range()]).into_owned()
     }
 
-    fn declare(&mut self, kind: NodeKind, qualified: String, subkind: Option<SubKind>) {
+    fn declare(
+        &mut self,
+        kind: NodeKind,
+        qualified: String,
+        subkind: Option<SubKind>,
+        doc: Option<String>,
+    ) {
         if self.seen.insert(node_id(kind, &qualified)) {
             self.declares.push(Declared {
                 kind,
                 qualified,
                 subkind,
-                summary: None,
+                summary: doc,
                 short: None,
             });
+        } else if doc.is_some() {
+            // Surcharge : la première doc retenue remplit le résumé encore vide.
+            if let Some(d) = self
+                .declares
+                .iter_mut()
+                .find(|d| d.kind == kind && d.qualified == qualified)
+            {
+                d.summary = d.summary.take().or(doc);
+            }
         }
     }
 
@@ -212,13 +228,15 @@ impl Extractor<'_> {
             "internal_module" | "module" => self.namespace(n, owner),
             "function_declaration" | "generator_function_declaration" | "function_signature" => {
                 if let Some(name) = self.name_of(n) {
-                    self.declare(NodeKind::Method, format!("{owner}.{name}"), None);
+                    let doc = doc_before(n, self.src);
+                    self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc);
                 }
             }
             // `export default function () {}` : fonction anonyme.
             "function_expression" | "function" | "generator_function" => {
                 let name = self.name_of(n).unwrap_or_else(|| "default".to_string());
-                self.declare(NodeKind::Method, format!("{owner}.{name}"), None);
+                let doc = doc_before(n, self.src);
+                self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc);
             }
             "lexical_declaration" | "variable_declaration" => {
                 let mut cur = n.walk();
@@ -234,7 +252,8 @@ impl Extractor<'_> {
                     };
                     if name.kind() == "identifier" && is_function_value(value) {
                         let name = self.text(name);
-                        self.declare(NodeKind::Method, format!("{owner}.{name}"), None);
+                        let doc = doc_before(n, self.src);
+                        self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc);
                     }
                 }
             }
@@ -265,7 +284,8 @@ impl Extractor<'_> {
             return;
         }
         let q = format!("{owner}.{}", self.text(name));
-        self.declare(NodeKind::Type, q.clone(), Some(SubKind::Object));
+        let doc = doc_before(n, self.src);
+        self.declare(NodeKind::Type, q.clone(), Some(SubKind::Object), doc);
         if let Some(body) = n.child_by_field_name("body") {
             self.level += 1;
             self.statements(body, &q);
@@ -279,7 +299,8 @@ impl Extractor<'_> {
             return;
         }
         let q = format!("{owner}.{name}");
-        self.declare(NodeKind::Type, q.clone(), Some(sub));
+        let doc = doc_before(n, self.src);
+        self.declare(NodeKind::Type, q.clone(), Some(sub), doc);
         let id = node_id(NodeKind::Type, &q);
         let mut cur = n.walk();
         for c in n.named_children(&mut cur) {
@@ -367,7 +388,8 @@ impl Extractor<'_> {
             let Some(name) = name.and_then(|n| self.member_name(n)) else {
                 continue;
             };
-            self.declare(NodeKind::Method, format!("{owner}.{name}"), None);
+            let doc = (name != INIT).then(|| doc_before(m, self.src)).flatten();
+            self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc);
         }
     }
 
@@ -859,5 +881,31 @@ mod tests {
         let s =
             on_extract_stack(move || extract(Lang::JavaScript, Path::new("e.js"), &src)).unwrap();
         assert!(s.declares.iter().any(|d| d.id() == "method:e.a"));
+    }
+
+    #[test]
+    fn req243_ac6_resume_des_commentaires_de_doc() {
+        let sum = |s: &FileStructure, q: &str| {
+            s.declares
+                .iter()
+                .find(|d| d.qualified == q)
+                .unwrap_or_else(|| panic!("{q} absent"))
+                .summary
+                .clone()
+        };
+        let type_doc = Some("Un livre du catalogue, identifié par son ISBN.".to_string());
+        let method_doc = Some("Renvoie le titre complet du livre.".to_string());
+        for (lang, name) in [(Lang::JavaScript, "a.js"), (Lang::TypeScript, "a.ts")] {
+            let text = "/** Un livre du catalogue, identifié par son ISBN. */\nclass Livre {\n  /** Renvoie le titre complet du livre. */\n  titre() { return 1; }\n}\n\
+                        /** Renvoie le titre complet du livre. */\nexport function titre() {}\n\
+                        /** Un livre du catalogue, identifié par son ISBN. */\nexport class Autre {}\n\
+                        // pas une doc pour cette fonction ici\nfunction nue() {}\n";
+            let s = extract(lang, Path::new(name), text).unwrap();
+            assert_eq!(sum(&s, "a.Livre"), type_doc, "{name}");
+            assert_eq!(sum(&s, "a.Livre.titre"), method_doc, "{name}");
+            assert_eq!(sum(&s, "a.titre"), method_doc, "{name} export function");
+            assert_eq!(sum(&s, "a.Autre"), type_doc, "{name} export class");
+            assert_eq!(sum(&s, "a.nue"), None, "{name}");
+        }
     }
 }

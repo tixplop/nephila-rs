@@ -80,7 +80,7 @@ impl Builder {
             return;
         }
         self.package = Some(name.to_string());
-        self.push_declared(NodeKind::Package, name.to_string(), None);
+        self.push_declared(NodeKind::Package, name.to_string(), None, None);
     }
 
     /// Rétablit le package courant à la sortie d'un `package p { … }` (sans rien déclarer).
@@ -120,6 +120,16 @@ impl Builder {
     /// l'appelant ne descend alors ni dans le corps ni dans les clauses du type, et n'appelle pas
     /// `exit_type`.
     pub fn enter_type(&mut self, name: &str, subkind: SubKind) -> Option<String> {
+        self.enter_type_doc(name, subkind, None)
+    }
+
+    /// Comme `enter_type`, avec la doc de la déclaration (REQ-243).
+    pub fn enter_type_doc(
+        &mut self,
+        name: &str,
+        subkind: SubKind,
+        doc: Option<String>,
+    ) -> Option<String> {
         if self.stack.len() >= MAX_NESTING {
             self.nesting_cut = true;
             return None;
@@ -128,7 +138,7 @@ impl Builder {
         if self.stack.is_empty() {
             self.top_level.push(node_id(NodeKind::Type, &q));
         }
-        self.push_declared(NodeKind::Type, q.clone(), Some(subkind));
+        self.push_declared(NodeKind::Type, q.clone(), Some(subkind), doc);
         self.stack.push(q.clone());
         Some(q)
     }
@@ -150,8 +160,13 @@ impl Builder {
     /// Déclare (une seule fois : surcharges fusionnées) la méthode `name` du type courant.
     /// Renvoie son nom qualifié, ou `None` hors de tout type.
     pub fn declare_method(&mut self, name: &str) -> Option<String> {
+        self.declare_method_doc(name, None)
+    }
+
+    /// Comme `declare_method`, avec la doc de la déclaration (REQ-243).
+    pub fn declare_method_doc(&mut self, name: &str, doc: Option<String>) -> Option<String> {
         let q = format!("{}.{}", self.stack.last()?, name);
-        self.push_declared(NodeKind::Method, q.clone(), None);
+        self.push_declared(NodeKind::Method, q.clone(), None, doc);
         Some(q)
     }
 
@@ -161,7 +176,7 @@ impl Builder {
         if self.stack.is_empty() {
             self.top_level.push(node_id(NodeKind::Type, &q));
         }
-        self.push_declared(NodeKind::Type, q.clone(), Some(subkind));
+        self.push_declared(NodeKind::Type, q.clone(), Some(subkind), None);
         q
     }
 
@@ -184,15 +199,30 @@ impl Builder {
         self.add_ref(&node_id(NodeKind::Type, source_qualified), kind, target);
     }
 
-    fn push_declared(&mut self, kind: NodeKind, qualified: String, subkind: Option<SubKind>) {
+    fn push_declared(
+        &mut self,
+        kind: NodeKind,
+        qualified: String,
+        subkind: Option<SubKind>,
+        doc: Option<String>,
+    ) {
         if self.seen.insert(node_id(kind, &qualified)) {
             self.declares.push(Declared {
                 kind,
                 qualified,
                 subkind,
-                summary: None,
+                summary: doc,
                 short: None,
             });
+        } else if doc.is_some() {
+            // Surcharge : la première doc retenue remplit le résumé encore vide.
+            if let Some(d) = self
+                .declares
+                .iter_mut()
+                .find(|d| d.kind == kind && d.qualified == qualified)
+            {
+                d.summary = d.summary.take().or(doc);
+            }
         }
     }
 

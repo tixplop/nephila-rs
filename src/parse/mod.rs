@@ -2,6 +2,7 @@
 
 pub mod calls;
 pub mod data;
+pub(crate) mod doc;
 pub mod gradle;
 pub mod gradle_lex;
 pub mod groovy;
@@ -498,6 +499,22 @@ pub(crate) mod nesting_support {
             assert_eq!(chain, MAX_NESTING, "types C… déclarés ({depth})");
             assert_eq!(s.nesting_cut, depth > MAX_NESTING, "drapeau ({depth})");
             assert!(s.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn req243_ac6_autres_fichiers_sans_resume() {
+        let text = "/** Commentaire assez long pour être retenu ici. */\n";
+        for name in [
+            "a.md",
+            "a.sql",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+        ] {
+            let s = extract(Path::new(name), text, &ParseCtx::default()).unwrap();
+            assert!(s.declares.iter().all(|d| d.summary.is_none()), "{name}");
         }
     }
 }

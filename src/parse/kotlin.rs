@@ -11,6 +11,7 @@ use crate::error::Result;
 use crate::model::{EdgeKind, SubKind};
 
 use super::calls::{Calls, Locals, Receiver};
+use super::doc::doc_before;
 use super::jvm::{Builder, INIT};
 use super::walk::Preorder;
 use super::{FileStructure, Lang};
@@ -185,7 +186,7 @@ fn declaration(b: &mut Builder, calls: &mut Calls, al: &Aliases, n: Node, src: &
     let Some(name) = name.filter(|s| !s.is_empty()) else {
         return;
     };
-    let Some(q) = b.enter_type(&name, sub) else {
+    let Some(q) = b.enter_type_doc(&name, sub, doc_before(n, src)) else {
         return;
     };
 
@@ -288,7 +289,7 @@ fn function(b: &mut Builder, calls: &mut Calls, al: &Aliases, f: Node, src: &[u8
         return;
     };
     let name = text_of(name, src);
-    if let Some(q) = b.declare_method(&name) {
+    if let Some(q) = b.declare_method_doc(&name, doc_before(f, src)) {
         if let Some(t) = b.current_type() {
             calls.declare_method(t, &name);
         }
@@ -588,6 +589,23 @@ mod tests {
             |i| format!("class C{i} {{\n fun m() {{}}\n"),
             "}\n",
             "class B {\n fun m() {}\n}",
+        );
+    }
+
+    #[test]
+    fn req243_ac6_resume_des_commentaires_de_doc() {
+        let s = run(
+            "A.kt",
+            "package p\n/** Un livre du catalogue, identifié par son ISBN. */\n@Entity\nclass Livre {\n    /** Renvoie le titre complet du livre. */\n    fun titre(): String = \"\"\n}\n",
+        );
+        let sum = |k, q: &str| decl(&s, k, q).unwrap().summary.as_deref();
+        assert_eq!(
+            sum(NodeKind::Type, "p.Livre"),
+            Some("Un livre du catalogue, identifié par son ISBN.")
+        );
+        assert_eq!(
+            sum(NodeKind::Method, "p.Livre.titre"),
+            Some("Renvoie le titre complet du livre.")
         );
     }
 }
