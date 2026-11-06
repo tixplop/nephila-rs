@@ -579,6 +579,7 @@ Chaque fichier est analysé localement : tree-sitter pour les langages JVM, Java
 - **JavaScript et TypeScript** : un fichier est un module ES nommé par son chemin sans extension ; les imports relatifs et les alias `@/`, `~/` sont suivis, un paquet npm est externe.
 - **Données** : noms SQL en minuscules ; en JSON et YAML, un nœud `key` par clé feuille, au plus 1000 par fichier.
 - **Commentaires de doc** : la première phrase d'un commentaire `/** … */` placé juste avant la déclaration d'un type ou d'une méthode devient son résumé, si elle a au moins 5 mots et au plus 300 caractères. Elle reste dans la langue du commentaire, et ce nœud n'est pas demandé au LLM.
+- **Accesseurs Java** : dans un fichier `.java`, un getter ou un setter trivial (une seule instruction, qui lit ou écrit le champ de son nom : `titre` pour `getTitre`) et un `equals`, `hashCode` ou `toString` réduit à un `return` ont pour résumé cette instruction (`return titre;`), si elle fait au plus 120 caractères. Ils ne sont pas demandés au LLM, et un commentaire de doc retenu passe avant.
 - **Noms JVM cités** : dans les fichiers XML, JSON et YAML, un nom d'au moins deux segments (`com.acme.Repo#save`) donne une `mention`, non résolue tant que le nom est absent du graphe.
 - **Résolution des appels** : le type du receveur est cherché dans le fichier seulement ; s'il est inconnu (chaîne d'appels, `var` sans initialiseur reconnaissable), aucun lien n'est créé, car un lien manquant coûte moins cher qu'un lien faux.
 
