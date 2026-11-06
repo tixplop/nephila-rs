@@ -578,6 +578,7 @@ Chaque fichier est analysé localement : tree-sitter pour les langages JVM, Java
 
 - **JavaScript et TypeScript** : un fichier est un module ES nommé par son chemin sans extension ; les imports relatifs et les alias `@/`, `~/` sont suivis, un paquet npm est externe.
 - **Données** : noms SQL en minuscules ; en JSON et YAML, un nœud `key` par clé feuille, au plus 1000 par fichier.
+- **Commentaires de doc** : la première phrase d'un commentaire `/** … */` placé juste avant la déclaration d'un type ou d'une méthode devient son résumé, si elle a au moins 5 mots et au plus 300 caractères. Elle reste dans la langue du commentaire, et ce nœud n'est pas demandé au LLM.
 - **Noms JVM cités** : dans les fichiers XML, JSON et YAML, un nom d'au moins deux segments (`com.acme.Repo#save`) donne une `mention`, non résolue tant que le nom est absent du graphe.
 - **Résolution des appels** : le type du receveur est cherché dans le fichier seulement ; s'il est inconnu (chaîne d'appels, `var` sans initialiseur reconnaissable), aucun lien n'est créé, car un lien manquant coûte moins cher qu'un lien faux.
 
@@ -605,7 +606,7 @@ Les versions qui demandent une action, la plus récente d'abord. L'historique de
 - **Vers 0.19** : les requêtes n'avertissent plus d'un graphe en retard. Un script qui s'appuyait sur l'avertissement ajoute `--check-stale` à ses requêtes, ou lance `nephila status` avant elles.
 - **Vers 0.18** : seuls les documents Markdown sont enrichis par défaut ; pour le code, `enrich_code = true` dans la configuration personnelle. Le premier `nephila build` remplace un graphe 0.17 et enrichit une fois tous les fichiers de la portée.
 
-Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`. Un graphe 0.25 à 0.27 est aussi migré sur place. La 0.28 réenrichit une fois la portée. Les versions antérieures refusent ensuite le graphe : pour y revenir, supprimez `.nephila/`, et le build suivant réenrichit tous les fichiers de la portée.
+Un graphe 0.18 à 0.24 est migré sur place par le premier `nephila update` ou `nephila build`, sans perdre les résumés. Un graphe plus ancien est refusé par un message qui dit de lancer `nephila build`. Un graphe 0.25 à 0.27 est aussi migré sur place. La 0.28 réenrichit une fois la portée. Lancez d'abord `nephila build` plutôt que `update` : `build` relit tous les fichiers, et un nœud qui a un [commentaire de doc](#ce-que-lanalyse-extrait) n'est pas demandé au LLM. Les versions antérieures refusent ensuite le graphe : pour y revenir, supprimez `.nephila/`, et le build suivant réenrichit tous les fichiers de la portée.
 
 ## Développement
 
