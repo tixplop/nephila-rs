@@ -962,7 +962,7 @@ fn req167_ac5_omitted_trivial_accessor_is_accepted() {
         "{}",
         text(&s.stdout)
     );
-    assert_eq!(summary_of(&env, &get), None);
+    assert_eq!(summary_of(&env, &get).as_deref(), Some("return x;"));
     assert!(summary_of(&env, &run).is_some());
 }
 

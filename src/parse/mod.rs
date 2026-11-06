@@ -517,4 +517,19 @@ pub(crate) mod nesting_support {
             assert!(s.declares.iter().all(|d| d.summary.is_none()), "{name}");
         }
     }
+    #[test]
+    fn req247_ac3_autres_langages_sans_resume_d_accesseur() {
+        for (path, text) in [
+            ("A.kt", "class A {\n fun getX(): Int { return x }\n}\n"),
+            ("A.groovy", "class A {\n String getX() { return x }\n}\n"),
+            ("a.js", "class A {\n getX() { return this.x; }\n}\n"),
+        ] {
+            let f = extract(Path::new(path), text, &ParseCtx::default()).unwrap();
+            assert!(f.declares.iter().all(|d| d.summary.is_none()), "{path}");
+            assert!(
+                f.declares.iter().any(|d| d.qualified.ends_with("getX")),
+                "{path}"
+            );
+        }
+    }
 }

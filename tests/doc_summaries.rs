@@ -291,3 +291,73 @@ fn REQ244_AC5_relecture_et_modifications_demandent_les_bons_noeuds() {
     assert_eq!(s.summary_of(PRIX).as_deref(), Some("Rôle ter."));
     assert_eq!(s.summary_of(CLASSE).as_deref(), Some(DOC_CLASSE));
 }
+
+const ACCESSEURS: &str = "package p;\n\npublic class Livre {\n    public String getTitre() { return titre; }\n    public void setTitre(String t) { this.titre = t; }\n    public int prix() { return 1; }\n}\n";
+
+#[test]
+fn REQ247_AC4_accesseurs_triviaux_non_demandes() {
+    let s = Setup::new(
+        vec![file_reply(&[(1, "Livre."), (2, "Prix.")])],
+        &[(LIVRE_PATH, ACCESSEURS)],
+        1,
+    );
+    let o = s.ok(&["build", "--verbose"]);
+    let prompts = s.prompts();
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    let list = list_of(&prompts[0]);
+    assert!(list.contains(CLASSE) && list.contains(PRIX), "{list}");
+    assert!(
+        !list.contains("getTitre") && !list.contains("setTitre"),
+        "{list}"
+    );
+    assert!(out(&o).contains(", 0 fichiers à enrichir"), "{}", out(&o));
+    assert_eq!(
+        s.summary_of("method:p.Livre.getTitre").as_deref(),
+        Some("return titre;")
+    );
+    assert!(
+        text(&o.stderr).contains("2/2 nœuds résumés"),
+        "{}",
+        text(&o.stderr)
+    );
+    s.ok(&["update"]);
+    assert_eq!(s.prompts().len(), 1);
+
+    let n = Setup::new(vec![], &[(LIVRE_PATH, ACCESSEURS)], 1);
+    n.ok(&["build", "--no-llm"]);
+    assert!(n.server.requests().is_empty());
+    let o = n.ok(&["export", "--format", "json", "--output", "-"]);
+    let doc: Value = serde_json::from_str(&out(&o)).unwrap();
+    let get = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == "method:p.Livre.getTitre")
+        .unwrap();
+    assert_eq!(get["summary"], json!("return titre;"));
+}
+
+#[test]
+fn REQ247_AC5_les_dependances_maven_restent_sans_resume() {
+    let pom = "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId><artifactId>a</artifactId><version>1</version><dependencies>\
+<dependency><groupId>x</groupId><artifactId>y</artifactId><version>1</version></dependency>\
+<dependency><groupId>z</groupId><artifactId>w</artifactId><version>2</version></dependency>\
+</dependencies></project>\n";
+    let s = Setup::new(vec![file_reply(&[(1, "Module.")])], &[("pom.xml", pom)], 1);
+    let o = s.ok(&["build", "--verbose"]);
+    assert!(
+        text(&o.stderr).contains("/1 nœuds résumés"),
+        "{}",
+        text(&o.stderr)
+    );
+    let o = s.ok(&["export", "--format", "json", "--output", "-"]);
+    let doc: Value = serde_json::from_str(&out(&o)).unwrap();
+    let deps: Vec<_> = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| x["id"].as_str().unwrap().starts_with("dependency:"))
+        .collect();
+    assert_eq!(deps.len(), 2);
+    assert!(deps.iter().all(|d| d["summary"].is_null()), "{deps:?}");
+}

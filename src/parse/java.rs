@@ -1,6 +1,8 @@
 //! Extracteur Java (REQ-006) : package, imports, types, méthodes, extends / implements.
 //! Les appels suivent les heuristiques de DEC-021 (`calls.rs`).
 
+use std::collections::HashSet;
+
 use tree_sitter::Node;
 
 use crate::error::Result;
@@ -148,17 +150,119 @@ fn type_names(n: Node, src: &[u8]) -> Vec<String> {
 
 fn members(b: &mut Builder, calls: &mut Calls, body: Node, src: &[u8]) {
     let mut cur = body.walk();
+    let mut seen = HashSet::new();
+    let mut overloaded = HashSet::new();
     for m in body.named_children(&mut cur) {
-        member(b, calls, m, src);
+        if m.kind() == "method_declaration" {
+            if let Some(name) = m.child_by_field_name("name") {
+                let name = text_of(name, src);
+                if !seen.insert(name.clone()) {
+                    overloaded.insert(name);
+                }
+            }
+        }
+    }
+    for m in body.named_children(&mut cur) {
+        member(b, calls, m, src, &overloaded);
     }
 }
 
-fn member(b: &mut Builder, calls: &mut Calls, m: Node, src: &[u8]) {
+/// Résumé d'un accesseur Java trivial (REQ-247) : le texte de sa seule instruction.
+fn trivial_accessor(m: Node, src: &[u8]) -> Option<String> {
+    let name = text_of(m.child_by_field_name("name")?, src);
+    let body = m.child_by_field_name("body")?;
+    if body.kind() != "block" || body.named_child_count() != 1 {
+        return None;
+    }
+    let stmt = body.named_child(0)?;
+    let params = m.child_by_field_name("parameters")?;
+    let mut cur = params.walk();
+    let ps: Vec<Node> = params.named_children(&mut cur).collect();
+    if ps.iter().any(|p| p.kind() != "formal_parameter") {
+        return None;
+    }
+    let field_of = |prefix: &str| {
+        let rest = name.strip_prefix(prefix)?;
+        rest.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+            .then_some(rest)
+    };
+    let this_field = |n: Node| -> Option<String> {
+        if n.kind() != "field_access" || n.child_by_field_name("object")?.kind() != "this" {
+            return None;
+        }
+        Some(text_of(n.child_by_field_name("field")?, src))
+    };
+    let ok = match stmt.kind() {
+        "return_statement" => {
+            if stmt.named_child_count() != 1 {
+                return None;
+            }
+            let ret = stmt.named_child(0)?;
+            match name.as_str() {
+                "hashCode" | "toString" => ps.is_empty(),
+                "equals" => ps.len() == 1,
+                _ => {
+                    let rest = field_of("get").or_else(|| field_of("is"))?;
+                    let f = match ret.kind() {
+                        "identifier" => text_of(ret, src),
+                        _ => this_field(ret)?,
+                    };
+                    ps.is_empty() && f.eq_ignore_ascii_case(rest)
+                }
+            }
+        }
+        "expression_statement" => {
+            let rest = field_of("set")?;
+            let a = stmt.named_child(0)?;
+            if a.kind() != "assignment_expression" || stmt.named_child_count() != 1 {
+                return None;
+            }
+            if text_of(a.child_by_field_name("operator")?, src) != "=" || ps.len() != 1 {
+                return None;
+            }
+            let p = text_of(ps[0].child_by_field_name("name")?, src);
+            let (left, right) = (
+                a.child_by_field_name("left")?,
+                a.child_by_field_name("right")?,
+            );
+            if right.kind() != "identifier" || text_of(right, src) != p {
+                return None;
+            }
+            match left.kind() {
+                "identifier" => {
+                    let f = text_of(left, src);
+                    f != p && f.eq_ignore_ascii_case(rest)
+                }
+                _ => this_field(left).is_some_and(|f| f.eq_ignore_ascii_case(rest)),
+            }
+        }
+        _ => false,
+    };
+    if !ok {
+        return None;
+    }
+    let text = text_of(stmt, src)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (text.chars().count() <= 120).then_some(text)
+}
+
+fn member(b: &mut Builder, calls: &mut Calls, m: Node, src: &[u8], overloaded: &HashSet<String>) {
     match m.kind() {
         "method_declaration" | "annotation_type_element_declaration" => {
             if let Some(name) = m.child_by_field_name("name") {
                 let name = text_of(name, src);
-                if let Some(q) = b.declare_method_doc(&name, doc_before(m, src)) {
+                let doc = doc_before(m, src).or_else(|| {
+                    if m.kind() == "method_declaration" && !overloaded.contains(name.as_str()) {
+                        trivial_accessor(m, src)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(q) = b.declare_method_doc(&name, doc) {
                     if let Some(t) = b.current_type() {
                         calls.declare_method(t, &name);
                     }
@@ -709,5 +813,77 @@ interface I extends J, K<X> { void m(); }
             Some("Deuxième surcharge documentée de la méthode c.")
         );
         assert_eq!(sum(NodeKind::Package, "p"), None);
+    }
+    fn msum(src: &str, name: &str) -> Option<String> {
+        let s = extract(src).unwrap();
+        decl(&s, NodeKind::Method, name).unwrap().summary.clone()
+    }
+
+    #[test]
+    fn req247_ac1_accesseurs_triviaux_resumes_par_leur_instruction() {
+        let s = extract(
+            "package p;\nclass Livre {\n String getTitre() { return titre; }\n boolean isDispo() { return this.dispo; }\n void setTitre(String t) { this.titre = t; }\n int hashCode() { return Objects.hash(titre); }\n public String toString() {\n    return\n      titre;\n}\n void setPrix(int p) { prix = p; }\n}\n",
+        )
+        .unwrap();
+        let sum = |q: &str| decl(&s, NodeKind::Method, q).unwrap().summary.as_deref();
+        assert_eq!(sum("p.Livre.getTitre"), Some("return titre;"));
+        assert_eq!(sum("p.Livre.isDispo"), Some("return this.dispo;"));
+        assert_eq!(sum("p.Livre.setTitre"), Some("this.titre = t;"));
+        assert_eq!(sum("p.Livre.hashCode"), Some("return Objects.hash(titre);"));
+        assert_eq!(sum("p.Livre.toString"), Some("return titre;"));
+        assert_eq!(sum("p.Livre.setPrix"), Some("prix = p;"));
+    }
+
+    #[test]
+    fn req247_ac2_methodes_non_triviales_sans_resume() {
+        let bodies = [
+            "String getTitre() { return autre; }",
+            "String getTitre() { log(); return titre; }",
+            "String getTitre() { /* x */ return titre; }",
+            "String getTitre(int i) { return titre; }",
+            "int getPrix() { return prix * 2; }",
+            "String getTitre() { return super.titre; }",
+            "String gettext() { return text; }",
+            "void setTitre(String titre) { titre = titre; }",
+            "void setTitre(String t) { this.titre = t.trim(); }",
+            "void setTitre(String t) { this.titre = t; }\n void setTitre(Titre t) { this.titre = t; }",
+            "abstract String getTitre();",
+            "boolean equals(Object a, Object b) { return a == b; }",
+            "String getTitre() { return titre; }\n String getTitre(int i) { return titre; }",
+        ];
+        for b in bodies {
+            let s = extract(&format!("package p;\nclass C {{\n {b}\n}}\n")).unwrap();
+            assert!(
+                s.declares
+                    .iter()
+                    .filter(|d| d.kind == NodeKind::Method)
+                    .all(|d| d.summary.is_none()),
+                "{b}"
+            );
+        }
+        let long = |n: usize| {
+            format!(
+                "package p;\nclass C {{\n String toString() {{ return \"{}\"; }}\n}}\n",
+                "x".repeat(n)
+            )
+        };
+        // `return "` + n + `";` = n + 10 caractères.
+        assert_eq!(
+            msum(&long(110), "p.C.toString").map(|t| t.chars().count()),
+            Some(120)
+        );
+        assert_eq!(msum(&long(111), "p.C.toString"), None);
+    }
+
+    #[test]
+    fn req247_ac3_la_doc_passe_avant_l_instruction() {
+        assert_eq!(
+            msum(
+                "package p;\nclass C {\n /** Renvoie le titre complet du livre. */\n String getTitre() { return titre; }\n}\n",
+                "p.C.getTitre"
+            )
+            .as_deref(),
+            Some("Renvoie le titre complet du livre.")
+        );
     }
 }
