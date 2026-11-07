@@ -11,6 +11,7 @@ pub mod mock;
 pub mod openai;
 pub mod retry;
 mod schema;
+mod sse;
 mod tidy;
 mod usage;
 #[cfg(test)]

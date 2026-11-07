@@ -12,6 +12,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 
 use super::batch::CreateError;
+use super::sse;
 use super::usage::CallStats;
 use crate::error::{Error, Result};
 
@@ -445,6 +446,38 @@ fn read_text(resp: ureq::Response, unlimited: bool) -> std::io::Result<String> {
     Ok(text)
 }
 
+/// Plafond de durée de la lecture d'un flux (REQ-250).
+const STREAM_CAP: Duration = Duration::from_secs(3600);
+
+/// Issue d'une lecture de réponse qui échoue : délai, lecture interrompue (un seul nouvel envoi,
+/// REQ-097) ou erreur réseau définitive.
+fn read_failure(provider: &str, url: &str, e: &std::io::Error) -> Attempt {
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionReset, TimedOut, UnexpectedEof, WouldBlock,
+    };
+    match e.kind() {
+        TimedOut | WouldBlock => Attempt::Done(Err(Error::Timeout(format!(
+            "délai dépassé avec {provider} sur {url} ; augmentez timeout_secs"
+        )))),
+        kind => {
+            let error = Error::Network(format!("{provider} : lecture de la réponse : {e}"));
+            if matches!(
+                kind,
+                UnexpectedEof | BrokenPipe | ConnectionReset | ConnectionAborted
+            ) {
+                Attempt::Retry {
+                    error,
+                    retry_after: None,
+                    cause: INTERRUPTED_CAUSE.into(),
+                    last: true,
+                }
+            } else {
+                Attempt::Done(Err(error))
+            }
+        }
+    }
+}
+
 /// Un envoi de la requête.
 fn attempt(
     provider: &str,
@@ -453,6 +486,7 @@ fn attempt(
     unlimited: bool,
 ) -> Attempt {
     let url = req.url().to_string();
+    let started = Instant::now();
     let result = match body {
         Some(b) => req
             .set("content-type", "application/json")
@@ -469,34 +503,33 @@ fn attempt(
                 location.as_deref(),
             )))
         }
+        Ok(resp) if !unlimited && resp.content_type().starts_with("text/event-stream") => {
+            let reader = std::io::BufReader::new(resp.into_reader());
+            match sse::read_body(reader, provider, STREAM_CAP, started) {
+                Ok(text) => Attempt::Done(Ok(text)),
+                Err(sse::SseError::Cap) => read_failure(
+                    provider,
+                    &url,
+                    &std::io::Error::from(std::io::ErrorKind::TimedOut),
+                ),
+                Err(sse::SseError::Overloaded) => Attempt::Retry {
+                    error: Error::Saturated(format!("erreur de {provider} (HTTP 529) sur {url}")),
+                    retry_after: None,
+                    cause: "HTTP 529".into(),
+                    last: false,
+                },
+                Err(sse::SseError::Api) => Attempt::Retry {
+                    error: Error::Network(format!("erreur de {provider} (HTTP 500) sur {url}")),
+                    retry_after: None,
+                    cause: "HTTP 500".into(),
+                    last: false,
+                },
+                Err(sse::SseError::Io(e)) => read_failure(provider, &url, &e),
+            }
+        }
         Ok(resp) => match read_text(resp, unlimited) {
             Ok(text) => Attempt::Done(Ok(text)),
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-                    Attempt::Done(Err(Error::Timeout(format!(
-                        "délai dépassé avec {provider} sur {url} ; augmentez timeout_secs"
-                    ))))
-                }
-                kind => {
-                    let error = Error::Network(format!("{provider} : lecture de la réponse : {e}"));
-                    if matches!(
-                        kind,
-                        std::io::ErrorKind::UnexpectedEof
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionAborted
-                    ) {
-                        Attempt::Retry {
-                            error,
-                            retry_after: None,
-                            cause: INTERRUPTED_CAUSE.into(),
-                            last: true,
-                        }
-                    } else {
-                        Attempt::Done(Err(error))
-                    }
-                }
-            },
+            Err(e) => read_failure(provider, &url, &e),
         },
         Err(ureq::Error::Status(code @ (401 | 403), _)) => {
             Attempt::Done(Err(invalid_key(provider, code)))
@@ -751,6 +784,11 @@ pub fn parse_body(provider: &str, body: &str) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn req250_ac4_stream_cap_is_3600_seconds() {
+        assert_eq!(STREAM_CAP, Duration::from_secs(3600));
+    }
 
     #[test]
     fn req091_ac4_long_message_is_one_line_of_200_chars_ending_with_ellipsis() {
