@@ -298,7 +298,7 @@ fn req049_ac8_schema4_graph_is_replaced_by_build_and_refused_elsewhere() {
         env.store().files().unwrap().len()
     };
     assert_eq!(env.store().schema_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 12);
+    assert_eq!(SCHEMA_VERSION, 13);
     assert_eq!(env.logged().len(), n_files, "{:?}", env.logged());
 }
 
@@ -445,16 +445,16 @@ fn set_personal_language(env: &Env, language: &str) {
     .unwrap();
 }
 
+/// Langues des entrées appliquées (`enrichment_entry`) des fichiers indexés (REQ-258).
 fn enrichment_languages(env: &Env) -> BTreeSet<String> {
-    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
-    let rows: Vec<String> = conn
-        .prepare("SELECT DISTINCT language FROM enrichments")
+    let store = nephila::store::Store::open_readonly(&env.repo).unwrap();
+    store
+        .files()
         .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    rows.into_iter().collect()
+        .iter()
+        .filter_map(|f| store.enrichment_entry(&f.path).unwrap())
+        .map(|e| e.language)
+        .collect()
 }
 
 #[test]
@@ -867,7 +867,7 @@ fn reenriched_once(old: i64) {
 
     let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
     let versions: Vec<i64> = conn
-        .prepare("SELECT DISTINCT prompt_version FROM enrichments")
+        .prepare("SELECT DISTINCT prompt_version FROM (SELECT prompt_version, ROW_NUMBER() OVER (PARTITION BY path ORDER BY used_at DESC) AS rn FROM enrichments) WHERE rn = 1")
         .unwrap()
         .query_map([], |r| r.get(0))
         .unwrap()
@@ -877,6 +877,10 @@ fn reenriched_once(old: i64) {
         versions,
         vec![i64::from(nephila::llm::enrich::MARKDOWN_PROMPT_VERSION)]
     );
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM enrichments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 4, "deux entrées par chemin");
 }
 
 #[test]
@@ -1694,7 +1698,7 @@ fn req241_ac6_data_family_version_9_graph_reenriches_only_data_files() {
     let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
     let version = |p: &str| -> i64 {
         conn.query_row(
-            "SELECT prompt_version FROM enrichments WHERE path = ?1",
+            "SELECT prompt_version FROM enrichments WHERE path = ?1 ORDER BY used_at DESC LIMIT 1",
             [p],
             |r| r.get(0),
         )

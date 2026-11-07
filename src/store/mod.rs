@@ -29,7 +29,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -60,6 +60,13 @@ const SCHEMA_WITHOUT_ENRICH_CALLS: i32 = 10;
 
 /// Dernier schéma sans `declarations.doc`, migré sur place (DEC-180).
 const SCHEMA_WITHOUT_DECLARATION_DOC: i32 = 11;
+
+/// Déclaration de `enrichments`, identique au caractère près à celle de `schema.sql` (DEC-190).
+const ENRICHMENTS_DDL: &str = "CREATE TABLE enrichments (\n    path           TEXT NOT NULL,\n    content_hash   TEXT NOT NULL,\n    model          TEXT NOT NULL,\n    prompt_version INTEGER NOT NULL,\n    payload        TEXT NOT NULL,\n    language       TEXT NOT NULL,\n    used_at        INTEGER NOT NULL,\n    PRIMARY KEY (path, content_hash, model, prompt_version, language)\n);";
+
+/// Dernier schéma sans `enrichments.used_at` (une seule entrée par chemin), migré sur place
+/// (DEC-190).
+const SCHEMA_WITHOUT_USED_AT: i32 = 12;
 
 /// Valeurs de `meta.resolution` (DEC-076) : le graphe est-il le résultat d'une passe terminée ?
 const RESOLUTION_DONE: &str = "à jour";
@@ -627,7 +634,8 @@ impl Store {
             | SCHEMA_WITHOUT_COMMUNITIES
             | SCHEMA_WITHOUT_ENRICH_LANGUAGE
             | SCHEMA_WITHOUT_ENRICH_CALLS
-            | SCHEMA_WITHOUT_DECLARATION_DOC => store.migrate_to_current()?,
+            | SCHEMA_WITHOUT_DECLARATION_DOC
+            | SCHEMA_WITHOUT_USED_AT => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -665,7 +673,8 @@ impl Store {
             | SCHEMA_WITHOUT_COMMUNITIES
             | SCHEMA_WITHOUT_ENRICH_LANGUAGE
             | SCHEMA_WITHOUT_ENRICH_CALLS
-            | SCHEMA_WITHOUT_DECLARATION_DOC => {
+            | SCHEMA_WITHOUT_DECLARATION_DOC
+            | SCHEMA_WITHOUT_USED_AT => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
                 Ok(store)
@@ -720,7 +729,8 @@ impl Store {
                 || v == SCHEMA_WITHOUT_COMMUNITIES
                 || v == SCHEMA_WITHOUT_ENRICH_LANGUAGE
                 || v == SCHEMA_WITHOUT_ENRICH_CALLS
-                || v == SCHEMA_WITHOUT_DECLARATION_DOC =>
+                || v == SCHEMA_WITHOUT_DECLARATION_DOC
+                || v == SCHEMA_WITHOUT_USED_AT =>
             {
                 store.version = v
             }
@@ -735,13 +745,13 @@ impl Store {
         self.read_only && !self.conn.is_autocommit()
     }
 
-    /// Version du schéma du graphe ouvert (5 à 11 en lecture seule seulement : DEC-066, DEC-073,
+    /// Version du schéma du graphe ouvert (5 à 12 en lecture seule seulement : DEC-066, DEC-073,
     /// DEC-076).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
-    /// Migre un schéma 5 à 11 en schéma 12 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, puis 11 -> 12,
+    /// Migre un schéma 5 à 12 en schéma 13 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, 11 -> 12, puis 12 -> 13,
     /// chacune en une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         let from = self.user_version()?;
@@ -755,6 +765,7 @@ impl Store {
         self.migrate_9_to_10()?;
         self.migrate_10_to_11()?;
         self.migrate_11_to_12()?;
+        self.migrate_12_to_13()?;
         // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
         crate::trace!(
             "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
@@ -852,6 +863,32 @@ impl Store {
         }
         tx.execute_batch(&format!(
             "ALTER TABLE declarations ADD COLUMN doc TEXT;
+             UPDATE meta SET value = '{SCHEMA_WITHOUT_USED_AT}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITHOUT_USED_AT};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
+    }
+
+    /// Migre un schéma 12 en schéma 13 en une transaction `IMMEDIATE` (DEC-190) : table
+    /// `enrichments` recréée (clé complète, colonne `used_at`), lignes copiées avec `used_at` = 0,
+    /// versions.
+    fn migrate_12_to_13(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_USED_AT {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "ALTER TABLE enrichments RENAME TO enrichments_old;
+             {ENRICHMENTS_DDL}
+             INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at)
+                 SELECT path, content_hash, model, prompt_version, payload, language, 0 FROM enrichments_old;
+             DROP TABLE enrichments_old;
              UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
@@ -1208,7 +1245,12 @@ impl Store {
             let p: &PreparedStructure = p.borrow();
             let fresh = self.fresh && !self.written.contains(path) && !newly.contains(path);
             if fresh {
-                written.add(write_structure_fresh(&tx, p, &self.orphans)?);
+                written.add(write_structure_fresh(
+                    &tx,
+                    p,
+                    &self.orphans,
+                    &self.prompt_versions,
+                )?);
                 newly.insert(path);
                 continue;
             }
@@ -1221,7 +1263,13 @@ impl Store {
                 .map_err(db_err)?
                 .execute([path])
                 .map_err(db_err)?;
-            written.add(reapply_enrichment(&tx, path, &self.orphans, &mut touched)?);
+            written.add(reapply_enrichment(
+                &tx,
+                path,
+                &self.orphans,
+                &self.prompt_versions,
+                &mut touched,
+            )?);
             finish_file(&tx, path, &mut touched)?;
             pending.merge(touched.log);
         }
@@ -1414,13 +1462,16 @@ impl Store {
         .map_err(db_err)?
         .collect::<std::result::Result<_, _>>()
         .map_err(db_err)?;
-        let paths: Vec<String> = rows
-            .into_iter()
-            .filter(|(p, v)| *v != Some(self.prompt_versions.of_path(p)) || all)
-            .map(|(p, _)| p)
+        // Plusieurs entrées par chemin : le fichier est à enrichir si aucune n'a la version du prompt.
+        let up_to_date: std::collections::HashSet<&str> = rows
+            .iter()
+            .filter(|(p, v)| !all && *v == Some(self.prompt_versions.of_path(p)))
+            .map(|(p, _)| p.as_str())
             .collect();
-        let set: std::collections::HashSet<String> = paths
-            .into_iter()
+        let set: std::collections::HashSet<String> = rows
+            .iter()
+            .filter(|(p, _)| !up_to_date.contains(p.as_str()))
+            .map(|(p, _)| p.clone())
             .filter(|p| (code || crate::llm::enrich::is_markdown(p)) && scope.contains(p))
             .collect();
         Ok(self
@@ -1442,9 +1493,12 @@ impl Store {
         let mut st = self
             .conn
             .prepare_cached(
-                "SELECT f.path FROM files f JOIN enrichments e
-                 ON e.path = f.path AND e.content_hash = f.hash
-                 WHERE f.state = 'indexed' AND e.model <> ?1",
+                "SELECT f.path FROM files f
+                 WHERE f.state = 'indexed'
+                 AND EXISTS (SELECT 1 FROM enrichments e
+                             WHERE e.path = f.path AND e.content_hash = f.hash)
+                 AND NOT EXISTS (SELECT 1 FROM enrichments e
+                                 WHERE e.path = f.path AND e.content_hash = f.hash AND e.model = ?1)",
             )
             .map_err(db_err)?;
         let paths: Vec<String> = st
@@ -1629,13 +1683,25 @@ impl Store {
         Ok(self.enrichment_entry(path)?.map(|e| e.content_hash))
     }
 
-    /// Entrée d'enrichissement conservée d'un chemin, sans son contenu.
+    /// Entrée d'enrichissement appliquée d'un chemin, sans son contenu : la dernière utilisée du
+    /// contenu enregistré (chemin hors graphe : la plus récente du chemin, DEC-190).
     pub fn enrichment_entry(&self, path: &str) -> Result<Option<EnrichmentEntry>> {
+        // Un graphe de schéma 12, lu seul, n'a qu'une entrée par chemin et pas de `used_at`.
+        let order = if self.version >= SCHEMA_VERSION {
+            "e.used_at DESC, e.rowid DESC"
+        } else {
+            "e.rowid DESC"
+        };
         match self
             .conn
-            .prepare_cached(
-                "SELECT content_hash, model, prompt_version, language FROM enrichments WHERE path = ?1",
-            )
+            .prepare_cached(&format!(
+                "SELECT e.content_hash, e.model, e.prompt_version, e.language FROM enrichments e
+                 WHERE e.path = ?1
+                 AND (e.content_hash = (SELECT hash FROM files WHERE path = ?1)
+                      OR NOT EXISTS (SELECT 1 FROM files WHERE path = ?1))
+                 ORDER BY {order}
+                 LIMIT 1"
+            ))
             .map_err(db_err)?
             .query_row([path], |r| {
                 Ok(EnrichmentEntry {
@@ -1659,7 +1725,7 @@ impl Store {
             let mut st = self
                 .conn
                 .prepare_cached(
-                    "SELECT path, content_hash FROM enrichments
+                    "SELECT DISTINCT path, content_hash FROM enrichments
                      WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = enrichments.path)
                      ORDER BY path",
                 )
@@ -1676,8 +1742,9 @@ impl Store {
         Ok(())
     }
 
-    /// Supprime les enrichissements conservés d'un chemin qui n'est plus connu du graphe ou dont
-    /// le contenu a changé. Renvoie le nombre d'entrées supprimées.
+    /// Supprime les enrichissements conservés d'un chemin qui n'est plus connu du graphe, puis
+    /// ceux de rang supérieur à 3 par chemin (`used_at` décroissant, DEC-190). Renvoie le nombre
+    /// d'entrées supprimées.
     pub fn prune_enrichments(&mut self) -> Result<usize> {
         self.ensure_writable()?;
         self.end_fresh();
@@ -1688,15 +1755,29 @@ impl Store {
                 [],
             )
             .map_err(db_err)?;
-        self.conn
+        let absent = self
+            .conn
             .prepare_cached(
                 "DELETE FROM enrichments WHERE NOT EXISTS
-                   (SELECT 1 FROM files f WHERE f.path = enrichments.path
-                    AND f.hash = enrichments.content_hash)",
+                   (SELECT 1 FROM files f WHERE f.path = enrichments.path)",
             )
             .map_err(db_err)?
             .execute([])
-            .map_err(db_err)
+            .map_err(db_err)?;
+        let surplus = self
+            .conn
+            .prepare_cached(
+                "DELETE FROM enrichments WHERE rowid IN (
+                   SELECT rowid FROM (
+                     SELECT rowid, ROW_NUMBER() OVER (
+                       PARTITION BY path ORDER BY used_at DESC, rowid DESC) AS rank
+                     FROM enrichments)
+                   WHERE rank > 3)",
+            )
+            .map_err(db_err)?
+            .execute([])
+            .map_err(db_err)?;
+        Ok(absent + surplus)
     }
 
     /// Supprime un fichier, ses nœuds, références et les liens attachés. Renvoie `false` si inconnu.
@@ -2522,7 +2603,7 @@ impl Store {
     /// (fichier, identifiant) : celles qu'on demande au LLM (DEC-180). Un graphe de schéma 11 en
     /// lecture seule n'a pas de colonne `doc` : toutes ses déclarations sont rendues.
     pub fn undocumented_short_names(&self) -> Result<Vec<(String, String, String)>> {
-        let sql = if self.version >= SCHEMA_VERSION {
+        let sql = if self.version >= SCHEMA_WITHOUT_USED_AT {
             "SELECT file, node, short FROM declarations WHERE doc IS NULL ORDER BY file, node"
         } else {
             "SELECT file, node, short FROM declarations ORDER BY file, node"
@@ -3272,11 +3353,10 @@ fn write_enrichment(
     let json = serde_json::to_string(&payload)
         .map_err(|e| Error::Message(format!("enrichissement non sérialisable : {e}")))?;
     tx.prepare_cached(
-        "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(path) DO UPDATE SET content_hash = excluded.content_hash,
-             model = excluded.model, prompt_version = excluded.prompt_version,
-             payload = excluded.payload, language = excluded.language",
+        "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(path, content_hash, model, prompt_version, language)
+         DO UPDATE SET payload = excluded.payload, used_at = excluded.used_at",
     )
     .map_err(db_err)?
     .execute(params![
@@ -3285,7 +3365,8 @@ fn write_enrichment(
         model,
         versions.of_path(path),
         json,
-        language
+        language,
+        now_ms()
     ])
     .map_err(db_err)?;
     Ok(touched.log)
@@ -3690,8 +3771,6 @@ enum KeptEnrichment {
     Readable(Payload),
     /// Entrée de même empreinte qui ne se lit plus : supprimée et comptée.
     Unreadable,
-    /// Entrée d'empreinte différente : supprimée, non comptée.
-    Stale,
 }
 
 /// Effet de la relecture sur un fichier écrit.
@@ -3751,47 +3830,70 @@ fn apply_enrichment_tx(
     insert_refs(tx, path, refs, "llm", touched)
 }
 
-/// Lit l'enrichissement conservé d'un fichier dont la structure vient d'être écrite : son contenu
-/// si l'empreinte est celle du fichier et la charge utile se lit ; une entrée périmée (contenu
-/// différent) ou illisible est supprimée, seule l'illisible est signalée (DEC-114).
+/// Choisit parmi les entrées d'un chemin pour un contenu : celle de la clé actuelle
+/// (`meta.enrich_model`, `meta.enrich_language`, version du prompt du chemin), sinon la dernière
+/// utilisée (DEC-190). Rend le `rowid` et la charge utile.
+fn pick_entry(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    hash: &str,
+    versions: &PromptVersions,
+) -> Result<Option<(i64, String)>> {
+    match tx
+        .prepare_cached(
+            "SELECT e.rowid, e.payload FROM enrichments e
+             WHERE e.path = ?1 AND e.content_hash = ?2
+             ORDER BY (e.model IS (SELECT value FROM meta WHERE key = 'enrich_model')
+                       AND e.language IS (SELECT value FROM meta WHERE key = 'enrich_language')
+                       AND e.prompt_version = ?3) DESC,
+                      e.used_at DESC, e.rowid DESC
+             LIMIT 1",
+        )
+        .map_err(db_err)?
+        .query_row(params![path, hash, versions.of_path(path)], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        }) {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(db_err(e)),
+    }
+}
+
+/// Lit l'enrichissement conservé d'un fichier dont la structure vient d'être écrite : parmi les
+/// entrées de son contenu, celle de la clé actuelle, sinon la dernière utilisée. Lisible, elle est
+/// réappliquée et marquée utilisée ; illisible, elle seule est supprimée et signalée (DEC-114).
+/// Aucune entrée pour ce contenu : reprise d'une orpheline (REQ-257).
 fn load_kept_enrichment(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
     orphans: &HashMap<String, Vec<String>>,
+    versions: &PromptVersions,
     declared: impl FnOnce() -> Result<std::collections::HashSet<String>>,
 ) -> Result<KeptEnrichment> {
-    let row: Option<(String, String)> = match tx
-        .prepare_cached("SELECT e.content_hash, e.payload FROM enrichments e WHERE e.path = ?1")
-        .map_err(db_err)?
-        .query_row([path], |r| Ok((r.get(0)?, r.get(1)?)))
-    {
-        Ok(v) => Some(v),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(db_err(e)),
-    };
-    let Some((entry_hash, json)) = row else {
-        return adopt_orphan(tx, path, orphans, declared);
-    };
     let file_hash: String = tx
         .prepare_cached("SELECT hash FROM files WHERE path = ?1")
         .map_err(db_err)?
         .query_row([path], |r| r.get(0))
         .map_err(db_err)?;
-    let outcome = if entry_hash != file_hash {
-        KeptEnrichment::Stale
-    } else {
-        match serde_json::from_str::<Payload>(&json) {
-            Ok(p) if p.v <= PAYLOAD_VERSION => KeptEnrichment::Readable(p),
-            _ => KeptEnrichment::Unreadable,
-        }
+    let Some((rowid, json)) = pick_entry(tx, path, &file_hash, versions)? else {
+        return adopt_orphan(tx, path, &file_hash, orphans, versions, declared);
     };
-    if !matches!(outcome, KeptEnrichment::Readable(_)) {
-        tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
-            .map_err(db_err)?
-            .execute([path])
-            .map_err(db_err)?;
+    match serde_json::from_str::<Payload>(&json) {
+        Ok(p) if p.v <= PAYLOAD_VERSION => {
+            tx.prepare_cached("UPDATE enrichments SET used_at = ?2 WHERE rowid = ?1")
+                .map_err(db_err)?
+                .execute(params![rowid, now_ms()])
+                .map_err(db_err)?;
+            Ok(KeptEnrichment::Readable(p))
+        }
+        _ => {
+            tx.prepare_cached("DELETE FROM enrichments WHERE rowid = ?1")
+                .map_err(db_err)?
+                .execute([rowid])
+                .map_err(db_err)?;
+            Ok(KeptEnrichment::Unreadable)
+        }
     }
-    Ok(outcome)
 }
 
 /// Identifiant de nœud d'un fichier renommé : réécrit ce qui dérive de l'ancien chemin, par les
@@ -3851,7 +3953,9 @@ fn rewritten_payload(
 fn adopt_orphan(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
+    file_hash: &str,
     orphans: &HashMap<String, Vec<String>>,
+    versions: &PromptVersions,
     declared: impl FnOnce() -> Result<std::collections::HashSet<String>>,
 ) -> Result<KeptEnrichment> {
     if orphans.is_empty() {
@@ -3860,12 +3964,7 @@ fn adopt_orphan(
     let Some(file_type) = FileType::of(path) else {
         return Ok(KeptEnrichment::Absent);
     };
-    let file_hash: String = tx
-        .prepare_cached("SELECT hash FROM files WHERE path = ?1")
-        .map_err(db_err)?
-        .query_row([path], |r| r.get(0))
-        .map_err(db_err)?;
-    let Some(candidates) = orphans.get(&file_hash) else {
+    let Some(candidates) = orphans.get(file_hash) else {
         return Ok(KeptEnrichment::Absent);
     };
     let declared = declared()?;
@@ -3873,20 +3972,17 @@ fn adopt_orphan(
         if FileType::of(old) != Some(file_type) {
             continue;
         }
-        let row: Option<(String, i64, String, String)> = match tx
-            .prepare_cached(
-                "SELECT model, prompt_version, language, payload FROM enrichments WHERE path = ?1",
-            )
-            .map_err(db_err)?
-            .query_row([old], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(db_err(e)),
-        };
-        let Some((model, version, language, json)) = row else {
+        // Mêmes règles de choix que pour un chemin indexé, parmi les entrées de l'orpheline.
+        let Some((rowid, json)) = pick_entry(tx, old, file_hash, versions)? else {
             continue;
         };
+        let (model, version, language): (String, i64, String) = tx
+            .prepare_cached(
+                "SELECT model, prompt_version, language FROM enrichments WHERE rowid = ?1",
+            )
+            .map_err(db_err)?
+            .query_row([rowid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(db_err)?;
         let Ok(payload) = serde_json::from_str::<Payload>(&json) else {
             continue;
         };
@@ -3899,11 +3995,21 @@ fn adopt_orphan(
         let json = serde_json::to_string(&payload)
             .map_err(|e| Error::Message(format!("enrichissement repris non sérialisable : {e}")))?;
         tx.prepare_cached(
-            "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(path, content_hash, model, prompt_version, language)
+             DO UPDATE SET payload = excluded.payload, used_at = excluded.used_at",
         )
         .map_err(db_err)?
-        .execute(params![path, file_hash, model, version, json, language])
+        .execute(params![
+            path,
+            file_hash,
+            model,
+            version,
+            json,
+            language,
+            now_ms()
+        ])
         .map_err(db_err)?;
         return Ok(KeptEnrichment::Readable(payload));
     }
@@ -3962,12 +4068,12 @@ fn filter_payload(
 }
 
 /// Réapplique l'enrichissement conservé d'un fichier dont la structure vient d'être écrite si
-/// son empreinte de contenu est celle du fichier ; une entrée de contenu différent est
-/// supprimée. Les éléments sans nœud correspondant sont écartés en silence.
+/// une entrée a l'empreinte de contenu du fichier. Les éléments sans nœud correspondant sont écartés en silence.
 fn reapply_enrichment(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
     orphans: &HashMap<String, Vec<String>>,
+    versions: &PromptVersions,
     touched: &mut Touched,
 ) -> Result<Kept> {
     let declared_set = || {
@@ -3977,7 +4083,7 @@ fn reapply_enrichment(
                 .collect::<std::collections::HashSet<String>>(),
         )
     };
-    let payload = match load_kept_enrichment(tx, path, orphans, declared_set)? {
+    let payload = match load_kept_enrichment(tx, path, orphans, versions, declared_set)? {
         KeptEnrichment::Readable(p) => p,
         other => return Ok(Kept::without_payload(&other)),
     };
@@ -4006,13 +4112,14 @@ fn write_structure_fresh(
     tx: &rusqlite::Transaction<'_>,
     p: &PreparedStructure,
     orphans: &HashMap<String, Vec<String>>,
+    versions: &PromptVersions,
 ) -> Result<Kept> {
     let path = p.path.as_str();
     // Base fraîche : le journal n'est pas tenu (DEC-077 point 1).
     let mut touched = Touched::new(false);
     let mut merged: Option<Vec<Node>> = None;
     let mut kept: Option<(Vec<Node>, Vec<Ref>)> = None;
-    let loaded = load_kept_enrichment(tx, path, orphans, || {
+    let loaded = load_kept_enrichment(tx, path, orphans, versions, || {
         Ok(p.nodes.iter().map(|n| n.id.clone()).collect())
     })?;
     let unreadable = matches!(loaded, KeptEnrichment::Unreadable);
@@ -4709,6 +4816,36 @@ mod tests {
         PRAGMA user_version = 7;
         COMMIT;";
 
+    /// Assistant « schéma 12 » (DEC-190), en SQL écrit en dur : une entrée par chemin (celle de plus
+    /// grand `used_at`), sans `used_at`, versions 12.
+    const SCHEMA12_DOWNGRADE: &str = "BEGIN;
+        CREATE TABLE enrichments_12 (
+            path           TEXT PRIMARY KEY,
+            content_hash   TEXT NOT NULL,
+            model          TEXT NOT NULL,
+            prompt_version INTEGER NOT NULL,
+            payload        TEXT NOT NULL,
+            language       TEXT NOT NULL
+        );
+        INSERT INTO enrichments_12(path, content_hash, model, prompt_version, payload, language)
+            SELECT e.path, e.content_hash, e.model, e.prompt_version, e.payload, e.language
+            FROM enrichments e
+            WHERE e.rowid = (SELECT x.rowid FROM enrichments x WHERE x.path = e.path
+                             ORDER BY x.used_at DESC, x.rowid DESC LIMIT 1);
+        DROP TABLE enrichments;
+        ALTER TABLE enrichments_12 RENAME TO enrichments;
+        UPDATE meta SET value = '12' WHERE key = 'schema_version';
+        PRAGMA user_version = 12;
+        COMMIT;";
+
+    /// Ramène un graphe de schéma 13 au schéma 12 (DEC-190).
+    fn downgrade_to_12(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA12_DOWNGRADE)
+            .unwrap();
+    }
+
     const SCHEMA11_DOWNGRADE: &str = "BEGIN;
         ALTER TABLE declarations DROP COLUMN doc;
         UPDATE meta SET value = '11' WHERE key = 'schema_version';
@@ -4717,6 +4854,7 @@ mod tests {
 
     /// Ramène un graphe de schéma 12 au schéma 11 (DEC-180).
     fn downgrade_to_11(repo: &Path) {
+        downgrade_to_12(repo);
         Connection::open(db_path(repo))
             .unwrap()
             .execute_batch(SCHEMA11_DOWNGRADE)
@@ -5487,7 +5625,7 @@ mod tests {
     }
 
     #[test]
-    fn req049_entry_of_changed_content_is_deleted() {
+    fn req049_entry_of_changed_content_is_kept_and_not_reapplied() {
         let (_d, mut st) = enriched_store();
         let mut modified = file("a.md");
         modified.hash = "h2".into();
@@ -5495,6 +5633,11 @@ mod tests {
         st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
             .unwrap();
         assert_eq!(st.enrichment_entry("a.md").unwrap(), None);
+        let kept: i64 = st
+            .conn
+            .query_row("SELECT COUNT(*) FROM enrichments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
         assert!(st.nodes().unwrap().iter().all(|n| n.summary.is_none()));
         assert_eq!(st.count_files_to_enrich().unwrap(), 1);
     }
@@ -6327,7 +6470,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        assert_eq!(SCHEMA_VERSION, 12);
+        assert_eq!(SCHEMA_VERSION, 13);
     }
 
     #[test]
@@ -6461,11 +6604,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_to_12_without_touching_the_file() {
-        for version in [12, 11, 10, 9, 8, 7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_13_without_touching_the_file() {
+        for version in [13, 12, 11, 10, 9, 8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                12 => downgrade_to_12(dir.path()),
                 11 => downgrade_to_11(dir.path()),
                 10 => downgrade_to_10(dir.path()),
                 9 => downgrade_to_9(dir.path()),
@@ -7451,8 +7595,13 @@ mod tests {
         st.conn
             .execute("UPDATE files SET hash = 'autre' WHERE path = 'b.md'", [])
             .unwrap();
-        assert_eq!(st.prune_enrichments().unwrap(), 1);
+        assert_eq!(st.prune_enrichments().unwrap(), 0);
         assert_eq!(call_rows(&st), vec![("a.md".to_string(), "k1".to_string())]);
+    }
+
+    #[test]
+    fn req258_schema_sql_and_constant_declare_the_same_table() {
+        assert!(SCHEMA.contains(ENRICHMENTS_DDL));
     }
 
     #[test]
@@ -7479,7 +7628,7 @@ mod tests {
         assert_eq!(st.opened_schema_version(), 10);
         drop(st);
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(st.schema_version().unwrap(), 12);
+        assert_eq!(st.schema_version().unwrap(), 13);
         assert!(st.call_results().unwrap().is_empty());
         drop(st);
         downgrade_to_10(dir.path());
@@ -8939,7 +9088,7 @@ mod tests {
                 "{\"v\":2,\"summaries\":[],\"concepts\":[],\"refs\":[]}",
             );
             r131_set_payload(&st, "f2.java", "{\"summaries\":5}");
-            // Quatrième : empreinte différente, périmée et non comptée.
+            // Quatrième : empreinte différente, gardée et non comptée (DEC-190).
             st.conn
                 .execute(
                     "UPDATE enrichments SET content_hash = 'x' WHERE path = 'f3.java'",
@@ -8948,7 +9097,7 @@ mod tests {
                 .unwrap();
             let w = r131_rewrite(&mut st, 4, fresh);
             assert_eq!((w.reapplied, w.unreadable), (0, 3), "fresh={fresh}");
-            assert_eq!(r131_entries(&st), 0);
+            assert_eq!(r131_entries(&st), 1);
             for i in 0..4 {
                 assert_eq!(r131_summary_of_node(&st, &format!("p.F{i}")), None);
             }
@@ -9311,22 +9460,239 @@ mod tests {
     }
 
     #[test]
-    fn req245_ac4_new_graph_is_schema_12_and_schema_13_is_refused() {
+    fn req245_ac4_new_graph_is_schema_13_and_schema_14_is_refused() {
         let dir = tempdir().unwrap();
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(SCHEMA_VERSION, 12);
-        assert_eq!(st.schema_version().unwrap(), 12);
+        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(st.schema_version().unwrap(), 13);
         drop(st);
         Connection::open(db_path(dir.path()))
             .unwrap()
-            .execute_batch("PRAGMA user_version = 13")
+            .execute_batch("PRAGMA user_version = 14")
             .unwrap();
         let e = Store::open_or_create(dir.path()).err().unwrap().to_string();
         assert!(
-            e.contains("version de schéma du graphe non prise en charge (13"),
+            e.contains("version de schéma du graphe non prise en charge (14"),
             "{e}"
         );
         assert!(Store::open_readonly(dir.path()).is_err());
-        assert_eq!(st_user_version(dir.path()), 13);
+        assert_eq!(st_user_version(dir.path()), 14);
+    }
+
+    // ---- REQ-258 : plusieurs enrichissements conservés par chemin (DEC-190) ----
+
+    fn r258_write(st: &mut Store, hash: &str, model: &str, language: &str, summary: &str) {
+        st.apply_enrichment(
+            "a.md",
+            hash,
+            model,
+            language,
+            &[("type:p.A".into(), summary.into())],
+            &[],
+            &[],
+        )
+        .unwrap();
+    }
+
+    fn r258_store() -> (tempfile::TempDir, Store) {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        (dir, st)
+    }
+
+    /// (modèle, langue, version, `used_at`) de chaque entrée de `a.md`, triées par `used_at`.
+    fn r258_rows(st: &Store) -> Vec<(String, String, i64, i64)> {
+        let mut q = st
+            .conn
+            .prepare(
+                "SELECT model, language, prompt_version, used_at FROM enrichments
+                 WHERE path = 'a.md' ORDER BY used_at, rowid",
+            )
+            .unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// Vieillit les `used_at` existants (millisecondes) : la prochaine écriture est strictement plus
+    /// récente, sans attente réelle.
+    fn r258_pause(st: &Store) {
+        st.conn
+            .execute("UPDATE enrichments SET used_at = used_at - 1000", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn req258_ac1_one_entry_per_full_key_with_used_at_of_the_latest_write() {
+        let (_d, mut st) = r258_store();
+        r258_write(&mut st, "h", "a", "français", "SA");
+        r258_pause(&st);
+        r258_write(&mut st, "h", "b", "français", "SB1");
+        assert_eq!(r258_rows(&st).len(), 2);
+        r258_pause(&st);
+        r258_write(&mut st, "h", "b", "français", "SB2");
+        let rows = r258_rows(&st);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, "b");
+        assert!(rows[1].3 > rows[0].3);
+        let payload: String = st
+            .conn
+            .query_row(
+                "SELECT payload FROM enrichments WHERE model = 'b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(payload.contains("SB2") && !payload.contains("SB1"));
+        r258_pause(&st);
+        r258_write(&mut st, "h", "b", "English", "SE");
+        let rows = r258_rows(&st);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].1, "English");
+        // Version du prompt différente (écrite en SQL) : entrée distincte.
+        st.conn
+            .execute(
+                "UPDATE enrichments SET prompt_version = prompt_version + 100 WHERE model = 'a'",
+                [],
+            )
+            .unwrap();
+        r258_pause(&st);
+        r258_write(&mut st, "h", "a", "français", "SA2");
+        let rows = r258_rows(&st);
+        assert_eq!(rows.len(), 4);
+        let max = rows.iter().map(|r| r.3).max().unwrap();
+        assert_eq!(rows.last().unwrap().3, max);
+        assert_eq!(rows.iter().filter(|r| r.3 == max).count(), 1);
+    }
+
+    fn r258_two_models() -> (tempfile::TempDir, Store) {
+        let (d, mut st) = r258_store();
+        r258_write(&mut st, "h", "a", "français", "SA");
+        r258_pause(&st);
+        r258_write(&mut st, "h", "b", "français", "SB");
+        // Entrée d'un autre contenu, la plus récente de toutes.
+        r258_pause(&st);
+        r258_write(&mut st, "h2", "a", "français", "SA-h2");
+        (d, st)
+    }
+
+    fn r258_used_at(st: &Store, model: &str, hash: &str) -> i64 {
+        st.conn
+            .query_row(
+                "SELECT used_at FROM enrichments WHERE model = ?1 AND content_hash = ?2",
+                params![model, hash],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn req258_ac2_analysis_picks_the_current_key_else_the_most_recent_entry() {
+        for fresh in [false, true] {
+            // Modèle enregistré `a` : « SA », même si `b` est plus récent.
+            let (_d, mut st) = r258_two_models();
+            st.set_enrich_model("a").unwrap();
+            st.set_enrich_language("français").unwrap();
+            r258_pause(&st);
+            let h2_before = r258_used_at(&st, "a", "h2");
+            let b_before = r258_used_at(&st, "b", "h");
+            if fresh {
+                st.reset_with_pending_files(&[file("a.md")]).unwrap();
+            }
+            st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+                .unwrap();
+            assert_eq!(r131_summary_of_node(&st, "p.A").as_deref(), Some("SA"));
+            assert!(r258_used_at(&st, "a", "h") > b_before, "fresh={fresh}");
+            // Entrée d'un autre contenu : ni lue ni modifiée.
+            assert_eq!(r258_used_at(&st, "a", "h2"), h2_before);
+            assert_eq!(r258_rows(&st).len(), 3);
+
+            // Sans modèle enregistré : la plus récente du contenu, « SB ».
+            let (_d, mut st) = r258_two_models();
+            st.conn
+                .execute("DELETE FROM meta WHERE key = 'enrich_model'", [])
+                .unwrap();
+            if fresh {
+                st.reset_with_pending_files(&[file("a.md")]).unwrap();
+            }
+            st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+                .unwrap();
+            assert_eq!(r131_summary_of_node(&st, "p.A").as_deref(), Some("SB"));
+        }
+    }
+
+    #[test]
+    fn req258_ac2_files_to_enrich_depends_on_the_model_of_an_entry() {
+        let (_d, mut st) = r258_two_models();
+        st.set_enrich_model("a").unwrap();
+        assert!(st.files_to_enrich().unwrap().is_empty());
+        st.set_enrich_model("c").unwrap();
+        assert_eq!(st.files_to_enrich().unwrap().len(), 1);
+        // Une entrée d'une autre version du prompt ne rend pas le fichier « à enrichir » si une
+        // autre entrée a la bonne version.
+        st.set_enrich_model("a").unwrap();
+        st.conn
+            .execute(
+                "UPDATE enrichments SET prompt_version = 99 WHERE model = 'b'",
+                [],
+            )
+            .unwrap();
+        assert!(st.files_to_enrich().unwrap().is_empty());
+    }
+
+    #[test]
+    fn req258_ac3_prune_keeps_the_three_most_recent_entries_per_path() {
+        let (_d, mut st) = r258_store();
+        for h in ["h1", "h2", "h3", "h4"] {
+            r258_write(&mut st, h, "m", "français", h);
+            r258_pause(&st);
+        }
+        assert_eq!(r258_rows(&st).len(), 4);
+        assert_eq!(st.prune_enrichments().unwrap(), 1);
+        let hashes: Vec<String> = st
+            .conn
+            .prepare("SELECT content_hash FROM enrichments ORDER BY used_at")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(hashes, ["h2", "h3", "h4"]);
+        // Le contenu enregistré est `h` : aucune entrée appliquée.
+        assert_eq!(st.enrichment_entry("a.md").unwrap(), None);
+        let mut modified = file("a.md");
+        modified.hash = "h3".into();
+        st.insert_files(&[modified]).unwrap();
+        assert_eq!(
+            st.enrichment_entry("a.md").unwrap().unwrap().content_hash,
+            "h3"
+        );
+        assert_eq!(st.enriched_hash("a.md").unwrap().as_deref(), Some("h3"));
+        // Chemin absent de `files` : toutes ses entrées sont retirées.
+        st.remove_file("a.md").unwrap();
+        assert_eq!(st.prune_enrichments().unwrap(), 3);
+        assert!(r258_rows(&st).is_empty());
+    }
+
+    #[test]
+    fn req258_ac7_count_enriched_with_other_model_looks_for_the_requested_model() {
+        let (_d, mut st) = r258_store();
+        let scope = EnrichScope::default();
+        r258_write(&mut st, "h", "m-old", "français", "S");
+        assert_eq!(
+            st.count_enriched_with_other_model("m-projet", true, &scope)
+                .unwrap(),
+            1
+        );
+        r258_write(&mut st, "h", "m-projet", "français", "S");
+        assert_eq!(
+            st.count_enriched_with_other_model("m-projet", true, &scope)
+                .unwrap(),
+            0
+        );
     }
 }

@@ -1017,7 +1017,7 @@ fn req069_ac5_schema_7_graph_is_read_unchanged_then_migrated_by_update() {
     let enrichment_rows = |repo: &Path| -> Vec<Vec<String>> {
         let db = db_of(repo);
         let mut q = db
-            .prepare("SELECT path, content_hash, model, prompt_version, payload, language FROM enrichments ORDER BY path")
+            .prepare("SELECT path, content_hash, model, prompt_version, payload, language FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY path ORDER BY used_at DESC) AS rn FROM enrichments) WHERE rn = 1 ORDER BY path")
             .unwrap();
         q.query_map([], |r| {
             (0..6).map(|i| Ok(format!("{:?}", r.get_ref(i)?))).collect()

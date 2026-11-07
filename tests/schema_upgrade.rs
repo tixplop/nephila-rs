@@ -151,8 +151,21 @@ impl Env {
 
     fn enrichments(&self) -> Vec<EnrichRow> {
         let db = self.db();
+        // Avant le schéma 13, une seule ligne par chemin et pas de `used_at`.
+        let has_used_at: bool = db
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('enrichments') WHERE name = 'used_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let from = if has_used_at {
+            "(SELECT *, ROW_NUMBER() OVER (PARTITION BY path ORDER BY used_at DESC) AS rn FROM enrichments) WHERE rn = 1"
+        } else {
+            "enrichments"
+        };
         let mut q = db
-            .prepare("SELECT path, content_hash, model, prompt_version, payload, language FROM enrichments ORDER BY path")
+            .prepare(&format!("SELECT path, content_hash, model, prompt_version, payload, language FROM {from} ORDER BY path"))
             .unwrap();
         q.query_map([], |r| {
             Ok((
@@ -532,7 +545,7 @@ fn req115_ac3_texte_exact_et_place() {
 }
 
 /// Vérifie le motif de AC-115-3 (pas de dépendance de test nouvelle) :
-/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 12 en [0-9]+ ms$`.
+/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 13 en [0-9]+ ms$`.
 fn is_migration_trace_7(line: &str) -> bool {
     {
         let Some(rest) = line.strip_prefix("trace: [") else {
@@ -623,7 +636,7 @@ fn req147_ac4_update_migrates_schema8_to_current_and_traces_it() {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 8 vers 12 en ")),
+            .any(|l| l.starts_with("schéma: migration 8 vers 13 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -637,7 +650,7 @@ fn req147_ac4_update_migrates_schema8_to_current_and_traces_it() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v, "12");
+    assert_eq!(v, "13");
 }
 
 #[test]
@@ -650,7 +663,7 @@ fn req147_ac4_schema7_reaches_the_same_result_as_schema8() {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 7 vers 12 en ")),
+            .any(|l| l.starts_with("schéma: migration 7 vers 13 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -715,7 +728,7 @@ fn assert_ac173_4_chain(env: &Env, from: i32) {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with(&format!("schéma: migration {from} vers 12 en "))),
+            .any(|l| l.starts_with(&format!("schéma: migration {from} vers 13 en "))),
         "{}",
         text(&o.stderr)
     );
@@ -781,14 +794,14 @@ fn req226_ac7_schema10_is_read_unchanged_then_migrated_by_update() {
 
     let o = env.ok(&["update", "--no-llm", "--verbose"]);
     assert_eq!(env.user_version(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 12);
+    assert_eq!(SCHEMA_VERSION, 13);
     let migration: Vec<_> = trace_lines(&o.stderr)
         .into_iter()
         .filter(|l| l.starts_with("schéma: migration"))
         .collect();
     assert_eq!(migration.len(), 1, "{migration:?}");
     assert!(
-        migration[0].starts_with("schéma: migration 10 vers 12 en ")
+        migration[0].starts_with("schéma: migration 10 vers 13 en ")
             && migration[0].ends_with(" ms"),
         "{migration:?}"
     );
@@ -802,15 +815,15 @@ fn req226_ac7_schema10_is_read_unchanged_then_migrated_by_update() {
 }
 
 #[test]
-fn req226_ac7_older_schemas_reach_schema_12() {
+fn req226_ac7_older_schemas_reach_schema_13() {
     for from in [5, 6, 7, 8] {
         let env = built_at(from);
         let o = env.ok(&["update", "--no-llm", "--verbose"]);
-        assert_eq!(env.user_version(), 12, "schéma {from}");
+        assert_eq!(env.user_version(), 13, "schéma {from}");
         assert!(
             trace_lines(&o.stderr)
                 .iter()
-                .any(|l| l.starts_with(&format!("schéma: migration {from} vers 12 en "))),
+                .any(|l| l.starts_with(&format!("schéma: migration {from} vers 13 en "))),
             "{}",
             text(&o.stderr)
         );
@@ -822,7 +835,7 @@ fn req226_ac7_older_schemas_reach_schema_12() {
     }
     let (env, _) = enriched_at(9);
     env.ok(&["update", "--no-llm"]);
-    assert_eq!(env.user_version(), 12);
+    assert_eq!(env.user_version(), 13);
 }
 
 // ---- REQ-245 : schéma 12, doc gardée par déclaration (DEC-180) ----
@@ -847,14 +860,14 @@ fn req245_ac1_schema11_is_read_unchanged_then_migrated_by_update() {
     let resolution_before = resolution(&env);
 
     let o = env.ok(&["update", "--no-llm", "--verbose"]);
-    assert_eq!(env.user_version(), 12);
+    assert_eq!(env.user_version(), 13);
     let migration: Vec<_> = trace_lines(&o.stderr)
         .into_iter()
         .filter(|l| l.starts_with("schéma: migration"))
         .collect();
     assert_eq!(migration.len(), 1, "{migration:?}");
     assert!(
-        migration[0].starts_with("schéma: migration 11 vers 12 en ")
+        migration[0].starts_with("schéma: migration 11 vers 13 en ")
             && migration[0].ends_with(" ms"),
         "{migration:?}"
     );
@@ -982,4 +995,62 @@ fn req245_ac3_documented_nodes_are_asked_until_the_file_is_read_again() {
         !third.contains("type:p.Livre") && !third.contains("method:p.Livre.titre"),
         "{third}"
     );
+}
+
+// ---- REQ-258 : schéma 13, plusieurs enrichissements par chemin (DEC-190) ----
+
+#[test]
+fn req258_ac6_schema12_is_read_unchanged_then_migrated_by_update() {
+    let env = Env::new();
+    env.build_enriched();
+    let initial = env.enrichments();
+    schema6::schema7::schema8::schema9::schema10::schema11::schema12::downgrade_to_12(&env.db());
+    assert_eq!(env.user_version(), 12);
+    assert_eq!(env.enrichments(), initial);
+    for args in [
+        &["status"][..],
+        &["query", "neighbors", "OrderRepository.save"][..],
+    ] {
+        env.ok(args);
+        assert_eq!(env.user_version(), 12, "{args:?}");
+    }
+    // `update` avec le LLM actif : migration sans aucun appel, entrées inchangées.
+    env.ok(&["update"]);
+    assert_eq!(env.user_version(), 13);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    assert_eq!(env.enrichments(), initial);
+    let used: Vec<i64> = env
+        .db()
+        .prepare("SELECT used_at FROM enrichments")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(!used.is_empty() && used.iter().all(|u| *u == 0), "{used:?}");
+}
+
+#[test]
+fn req258_ac6_downgrade_keeps_the_entry_with_the_greatest_used_at() {
+    let env = Env::new();
+    env.build_enriched();
+    // Une seconde entrée (autre modèle, plus récente) pour un chemin : le schéma 12 garde celle de
+    // plus grand `used_at`.
+    env.db()
+        .execute_batch(
+            "UPDATE enrichments SET used_at = 5;
+             INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at)
+                 SELECT path, content_hash, 'autre', prompt_version, payload, language, 9
+                 FROM enrichments WHERE path = 'README.md';",
+        )
+        .unwrap();
+    let applied = env.enrichments();
+    schema6::schema7::schema8::schema9::schema10::schema11::schema12::downgrade_to_12(&env.db());
+    assert_eq!(env.user_version(), 12);
+    let rows = env.enrichments();
+    assert_eq!(rows, applied);
+    assert_eq!(rows.iter().find(|r| r.0 == "README.md").unwrap().2, "autre");
+    env.ok(&["update", "--no-llm"]);
+    assert_eq!(env.user_version(), 13);
+    assert_eq!(env.enrichments(), rows);
 }

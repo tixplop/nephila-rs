@@ -111,7 +111,7 @@ impl Env {
     fn models(&self) -> Vec<String> {
         let db = rusqlite::Connection::open(self.repo.join(".nephila/graph.db")).unwrap();
         let mut st = db
-            .prepare("SELECT DISTINCT model FROM enrichments ORDER BY model")
+            .prepare("SELECT DISTINCT model FROM (SELECT model, ROW_NUMBER() OVER (PARTITION BY path ORDER BY used_at DESC) AS rn FROM enrichments) WHERE rn = 1 ORDER BY model")
             .unwrap();
         st.query_map([], |r| r.get::<_, String>(0))
             .unwrap()

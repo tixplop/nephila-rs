@@ -12,16 +12,20 @@ CREATE TABLE files (
     state TEXT NOT NULL CHECK (state IN ('indexed', 'pending'))
 );
 
--- Enrichissements conservés (DEC-062) : une entrée par chemin, la dernière. Survit à la
--- réinitialisation du graphe ; `payload` = JSON des résumés, concepts et mentions.
+-- Enrichissements conservés (DEC-062, DEC-190) : plusieurs entrées par chemin, une par
+-- (contenu, modèle, version du prompt, langue). Survit à la réinitialisation du graphe ;
+-- `payload` = JSON des résumés, concepts et mentions ; `language` = langue des résumés demandée
+-- (DEC-138), comprise dans l'empreinte ; `used_at` = dernier usage (ms depuis l'epoch : écriture
+-- ou réapplication ; 0 après migration).
 CREATE TABLE enrichments (
-    path           TEXT PRIMARY KEY,
+    path           TEXT NOT NULL,
     content_hash   TEXT NOT NULL,
     model          TEXT NOT NULL,
     prompt_version INTEGER NOT NULL,
     payload        TEXT NOT NULL,
-    -- Langue des résumés demandée (DEC-138), comprise dans l'empreinte.
-    language       TEXT NOT NULL
+    language       TEXT NOT NULL,
+    used_at        INTEGER NOT NULL,
+    PRIMARY KEY (path, content_hash, model, prompt_version, language)
 );
 
 CREATE TABLE nodes (
