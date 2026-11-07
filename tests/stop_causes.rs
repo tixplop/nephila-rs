@@ -766,7 +766,14 @@ const E12: &str =
 /// REQ-095 : première requête `status` avec `retry-after: 30`, seconde `401` 300 ms plus tard.
 fn waiting_then_refused(status: u16, verbose: bool) -> (FakeServer, Output, std::time::Duration) {
     let s = FakeServer::start_replies(vec![
-        Reply::with_header(status, "{}", "retry-after", "30"),
+        // Réponse retardée : la seconde requête est déjà partie quand la pause d'un 429 (REQ-254)
+        // est posée, même sous forte charge.
+        Reply::Http {
+            status,
+            body: "{}".into(),
+            headers: vec![("retry-after".into(), "30".into())],
+            delay_ms: 500,
+        },
         Reply::Http {
             status: 401,
             body: "{}".into(),
