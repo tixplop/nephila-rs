@@ -6,7 +6,11 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Instant d'arrivée d'une requête et instant d'écriture de sa réponse.
+pub type Times = Vec<(Instant, Option<Instant>)>;
 
 pub enum Act {
     /// Réponse conforme après `delay_ms`.
@@ -15,6 +19,9 @@ pub enum Act {
     Status(u16, Option<&'static str>),
     /// Réponse HTTP d'erreur écrite une fois `n` requêtes reçues (attente plafonnée à 10 s).
     StatusAfter(u16, usize),
+    /// Réponse HTTP d'erreur avec `retry-after`, écrite une fois `n` requêtes reçues (attente
+    /// plafonnée à 10 s).
+    HeldRetry(u16, usize, &'static str),
     /// Réponse 200 qui n'est pas un JSON conforme.
     Garbage,
     /// Réponse 200 de JSON valide mais hors schéma, après `delay_ms`.
@@ -25,6 +32,7 @@ pub struct Server {
     pub base_url: String,
     count: Arc<AtomicUsize>,
     served: Arc<AtomicUsize>,
+    times: Arc<Mutex<Times>>,
 }
 
 impl Server {
@@ -35,19 +43,26 @@ impl Server {
         let count = Arc::new(AtomicUsize::new(0));
         let served = Arc::new(AtomicUsize::new(0));
         let plan = Arc::new(plan);
-        let (c, sv) = (count.clone(), served.clone());
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let (c, sv, tm) = (count.clone(), served.clone(), times.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
-                let (c, sv, plan) = (c.clone(), sv.clone(), plan.clone());
-                std::thread::spawn(move || serve(stream, &c, &sv, &*plan));
+                let (c, sv, plan, tm) = (c.clone(), sv.clone(), plan.clone(), tm.clone());
+                std::thread::spawn(move || serve(stream, &c, &sv, &tm, &*plan));
             }
         });
         Server {
             base_url,
             count,
             served,
+            times,
         }
+    }
+
+    /// Arrivée et réponse de chaque requête, dans l'ordre d'arrivée.
+    pub fn times(&self) -> Times {
+        self.times.lock().unwrap().clone()
     }
 
     /// Requêtes entièrement reçues.
@@ -76,6 +91,7 @@ fn serve(
     mut stream: std::net::TcpStream,
     count: &AtomicUsize,
     served: &AtomicUsize,
+    times: &Mutex<Times>,
     plan: &dyn Fn(usize) -> Act,
 ) {
     let mut buf: Vec<u8> = Vec::new();
@@ -101,7 +117,11 @@ fn serve(
         }
         let body: Vec<u8> = buf[head_end..head_end + len].to_vec();
         buf.drain(..head_end + len);
-        let i = count.fetch_add(1, Ordering::SeqCst);
+        let i = {
+            let mut t = times.lock().unwrap();
+            t.push((Instant::now(), None));
+            count.fetch_add(1, Ordering::SeqCst)
+        };
         let act = plan(i);
         let (status, extra, payload) = match act {
             Act::Ok(delay) => {
@@ -126,6 +146,19 @@ fn serve(
                     serde_json::json!({"error":{"message":"simulé"}}).to_string(),
                 )
             }
+            Act::HeldRetry(s, n, retry) => {
+                let start = Instant::now();
+                while count.load(Ordering::SeqCst) < n
+                    && start.elapsed() < std::time::Duration::from_secs(10)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                (
+                    s,
+                    format!("retry-after: {retry}\r\n"),
+                    serde_json::json!({"error":{"message":"simulé"}}).to_string(),
+                )
+            }
             Act::Status(s, retry) => (
                 s,
                 retry
@@ -141,6 +174,7 @@ fn serve(
         if stream.write_all(resp.as_bytes()).is_err() {
             return;
         }
+        times.lock().unwrap()[i].1 = Some(Instant::now());
         served.fetch_add(1, Ordering::SeqCst);
     }
 }

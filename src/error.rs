@@ -48,6 +48,9 @@ pub enum Error {
     /// Requête mise de côté par le collecteur du mode lot (DEC-168) : erreur interne, sans issue
     /// pour le fichier ; jamais affichée ni écrite dans un avertissement.
     Deferred,
+    /// Appel arrêté avant son premier envoi, pendant la pause partagée (REQ-254) : erreur
+    /// interne, sans issue pour le fichier ; jamais affichée ni écrite dans un avertissement.
+    Unsent,
     /// Requête du lot du fournisseur en échec (A-17) : `cause` est le texte de l'avertissement,
     /// `refused` le message d'un refus HTTP 400 ou `invalid_request_error`, lu par le repli de
     /// `structured_output`.
@@ -121,6 +124,8 @@ impl fmt::Display for Error {
             Error::Capped => f.write_str("plafond d'appels atteint"),
             // Jamais affichée : la requête est mise de côté (voir `Error::Deferred`).
             Error::Deferred => f.write_str("requête mise de côté"),
+            // Jamais affichée : l'appel n'a rien envoyé (voir `Error::Unsent`).
+            Error::Unsent => f.write_str("aucun envoi"),
             Error::BatchItem { cause, .. } => write!(
                 f,
                 "requête du lot du fournisseur en échec ({cause}) ; relancez nephila update --batch"

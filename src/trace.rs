@@ -192,6 +192,7 @@ pub fn classify(e: &crate::error::Error) -> String {
         Error::Capped => unreachable!("un essai refusé par le plafond n'est jamais classé"),
         // Une requête mise de côté part avant toute trace d'appel : elle n'arrive jamais ici.
         Error::Deferred => unreachable!("une requête mise de côté n'est jamais classée"),
+        Error::Unsent => unreachable!("un appel arrêté avant tout envoi n'est jamais classé"),
         // Erreur de fin de commande : jamais le résultat d'un appel.
         Error::Interrupted(_) => unreachable!("une fin de commande n'est jamais classée"),
     };

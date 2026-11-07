@@ -726,7 +726,9 @@ fn run_unit<'a>(
                 }
                 // Essai refusé par le plafond, ou requête mise de côté par le collecteur du mode
                 // lot : aucune issue pour les fichiers du lot.
-                Err(Error::Capped | Error::Deferred) => Step::Finished(outcomes, None),
+                Err(Error::Capped | Error::Deferred | Error::Unsent) => {
+                    Step::Finished(outcomes, None)
+                }
                 Err(e) => {
                     let per_file = truncation_advice(e.clone());
                     for (f, _) in &readable {
@@ -787,6 +789,7 @@ fn trace_detail(e: &Error) -> String {
         Error::BatchItem { .. } => "requête du lot du fournisseur en échec".to_string(),
         Error::Capped => unreachable!("un essai refusé par le plafond n'a pas de détail de trace"),
         Error::Deferred => unreachable!("une requête mise de côté n'a pas de détail de trace"),
+        Error::Unsent => unreachable!("un appel sans envoi n'a pas de détail de trace"),
         other => other.to_string(),
     }
 }
@@ -873,7 +876,7 @@ fn traced_enrich(
             )
         }
         // Essai refusé par le plafond ou requête mise de côté (mode lot) : ni appel ni fin à tracer.
-        Err(Error::Capped | Error::Deferred) => {}
+        Err(Error::Capped | Error::Deferred | Error::Unsent) => {}
         Err(e) => trace!(
             "llm enrich fin {path} [{index}/{total}] {} {ms} ms : {}{tokens}{mark}",
             trace::classify(e),
@@ -968,7 +971,7 @@ fn traced_lot_once(
             )
         }
         // Essai refusé par le plafond ou requête mise de côté (mode lot) : ni appel ni fin à tracer.
-        Err(Error::Capped | Error::Deferred) => {}
+        Err(Error::Capped | Error::Deferred | Error::Unsent) => {}
         Err(e) => trace!(
             "llm enrich fin {label} [1/1] {} {ms} ms : {}{tokens}",
             trace::classify(e),
@@ -2012,7 +2015,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 }
                 // Nouvel essai refusé par le plafond : ni issue, ni échec, ni compte ; les appels
                 // non partis du fichier sont sautés.
-                if matches!(result, Err(Error::Capped)) {
+                if matches!(result, Err(Error::Capped | Error::Unsent)) {
                     shared
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())

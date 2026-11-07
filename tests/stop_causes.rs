@@ -870,7 +870,11 @@ fn req095_ac5_no_interrupted_line_and_warning_only_for_the_waiting_document() {
             .filter(|l| l.starts_with("trace:") && l.contains("llm enrich "))
         {
             assert!(
-                l.contains(" départ ") || l.contains(" fin ") || l.contains(" attente "),
+                l.contains(" départ ")
+                    || l.contains(" fin ")
+                    || l.contains(" attente ")
+                    // Ligne de pause après un 429 (REQ-254).
+                    || l.contains(" pause "),
                 "{l}"
             );
             assert!(!l.contains("interrompue"), "{l}");

@@ -99,6 +99,7 @@ pub struct AnthropicLlm {
     key: String,
     agent: ureq::Agent,
     retry: http::Retry,
+    pause: http::Pause,
     gen: Generation,
     structured: Structured,
     structured_key: &'static str,
@@ -123,6 +124,7 @@ impl AnthropicLlm {
             key,
             agent: http::agent(timeout_secs, concurrency, tls),
             retry: http::Retry::default(),
+            pause: http::Pause::default(),
             gen,
             structured: Structured::Off,
             structured_key: "structured_output",
@@ -353,6 +355,7 @@ impl Complete for AnthropicLlm {
                 label,
                 stop,
                 stats,
+                &self.pause,
             )
         };
         let with_schema = match self.structured {

@@ -3,7 +3,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -290,6 +290,7 @@ enum Attempt {
 /// trace d'attente (`<chemin> [i/n]`) ; `None` (`query ask`) : aucune ligne d'attente. `stop` :
 /// arrêt de l'envoi (REQ-095) ; posé, l'attente s'interrompt, aucun nouvel envoi n'a lieu et
 /// l'erreur du dernier envoi est rendue. `stats` compte chaque envoi réel (REQ-165).
+#[allow(clippy::too_many_arguments)]
 pub fn send(
     provider: &str,
     req: ureq::Request,
@@ -298,8 +299,19 @@ pub fn send(
     label: Option<&str>,
     stop: Option<&AtomicBool>,
     stats: &CallStats,
+    pause: &Pause,
 ) -> Result<String> {
-    send_with(provider, req, body, retry, label, stop, stats, false)
+    send_with(
+        provider,
+        req,
+        body,
+        retry,
+        label,
+        stop,
+        stats,
+        Some(pause),
+        false,
+    )
 }
 
 /// Comme `send` pour un `GET`, mais le corps est lu en entier : les résultats d'un lot du
@@ -318,6 +330,7 @@ pub fn send_all(
         None,
         Some(stop),
         &CallStats::default(),
+        None,
         true,
     )
 }
@@ -331,11 +344,18 @@ fn send_with(
     label: Option<&str>,
     stop: Option<&AtomicBool>,
     stats: &CallStats,
+    pause: Option<&Pause>,
     unlimited: bool,
 ) -> Result<String> {
     let mut k = 0;
     let mut definitive = false;
+    let mut last_error = None;
     loop {
+        if pause.is_some_and(|p| p.attendre(stop)) {
+            // REQ-254 : arrêt posé pendant la pause. Rien envoyé : erreur interne ; sinon l'erreur
+            // du dernier envoi (REQ-095).
+            return Err(last_error.unwrap_or(Error::Unsent));
+        }
         stats.add_send();
         match attempt(provider, req.clone(), body, unlimited) {
             Attempt::Done(r) => return r,
@@ -371,9 +391,21 @@ fn send_with(
                                 stats.mark()
                             );
                         }
+                        if let (Some(pause), "HTTP 429" | "HTTP 529") = (pause, cause.as_str()) {
+                            if pause.poser(Instant::now() + d) {
+                                if let Some(label) = label {
+                                    crate::trace!(
+                                        "llm enrich pause {label} : aucun envoi pendant {} ms après {cause}{}",
+                                        d.as_millis(),
+                                        stats.mark()
+                                    );
+                                }
+                            }
+                        }
                         if wait(d, stop) {
                             return Err(error);
                         }
+                        last_error = Some(error);
                     }
                     None => return Err(error),
                 }
@@ -483,6 +515,47 @@ pub fn send_create(
 
 /// Durée maximale d'une tranche d'attente (REQ-095).
 const WAIT_SLICE: Duration = Duration::from_millis(100);
+
+/// Pause partagée par tous les appels d'un adaptateur (REQ-254, DEC-186) : instant avant lequel
+/// aucun envoi n'a lieu, posé après un HTTP 429 ou 529 suivi d'un nouvel essai.
+#[derive(Debug, Default)]
+pub struct Pause {
+    end: Mutex<Option<Instant>>,
+}
+
+impl Pause {
+    fn end(&self) -> Option<Instant> {
+        *self.end.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Garde la fin la plus tardive ; vrai si la fin a reculé (pause nouvelle ou prolongée).
+    pub fn poser(&self, fin: Instant) -> bool {
+        let mut end = self.end.lock().unwrap_or_else(|p| p.into_inner());
+        if end.is_some_and(|e| e >= fin) {
+            return false;
+        }
+        *end = Some(fin);
+        true
+    }
+
+    /// Attend la fin de la pause par tranches de `WAIT_SLICE` ; vrai si l'arrêt est posé pendant
+    /// la pause (aucun envoi ne doit suivre), l'arrêt étant lu avant chaque tranche. Sans pause en
+    /// cours, rend faux aussitôt.
+    pub fn attendre(&self, stop: Option<&AtomicBool>) -> bool {
+        loop {
+            let rest = self.end().map_or(Duration::ZERO, |e| {
+                e.saturating_duration_since(Instant::now())
+            });
+            if rest.is_zero() {
+                return false;
+            }
+            if is_stopped(stop) {
+                return true;
+            }
+            std::thread::sleep(rest.min(WAIT_SLICE));
+        }
+    }
+}
 
 fn is_stopped(stop: Option<&AtomicBool>) -> bool {
     stop.is_some_and(|s| s.load(Ordering::SeqCst))
@@ -1150,6 +1223,99 @@ mod tests {
         }
     }
 
+    mod shared_pause {
+        use super::*;
+
+        const SCHED_SLACK: Duration = Duration::from_millis(200);
+
+        fn ms(n: u64) -> Duration {
+            Duration::from_millis(n)
+        }
+
+        #[test]
+        fn req254_ac4_pause_keeps_the_latest_end_and_says_if_it_moved() {
+            let p = Pause::default();
+            let t = Instant::now();
+            assert!(p.poser(t + ms(1000)));
+            assert!(!p.poser(t + ms(300)));
+            assert_eq!(p.end(), Some(t + ms(1000)));
+            assert!(p.poser(t + ms(2000)));
+            assert_eq!(p.end(), Some(t + ms(2000)));
+        }
+
+        #[test]
+        fn req254_ac4_wait_without_pause_returns_at_once() {
+            let p = Pause::default();
+            let t = Instant::now();
+            assert!(!p.attendre(None));
+            assert!(t.elapsed() < ms(50));
+            // Une pause déjà finie n'attend pas non plus.
+            p.poser(Instant::now());
+            assert!(!p.attendre(Some(&AtomicBool::new(false))));
+            assert!(t.elapsed() < ms(50));
+        }
+
+        #[test]
+        fn req254_ac4_wait_lasts_until_the_end_of_the_pause() {
+            let p = Pause::default();
+            let t = Instant::now();
+            p.poser(t + ms(350));
+            assert!(!p.attendre(None));
+            let e = t.elapsed();
+            assert!(
+                e >= ms(350) && e < ms(350) + WAIT_SLICE + SCHED_SLACK,
+                "{e:?}"
+            );
+        }
+
+        #[test]
+        fn req254_ac4_stop_set_by_another_thread_interrupts_the_wait() {
+            let p = Pause::default();
+            let stop = AtomicBool::new(false);
+            p.poser(Instant::now() + Duration::from_secs(5));
+            let t = Instant::now();
+            let (interrupted, ended, set_at) = std::thread::scope(|scope| {
+                let setter = scope.spawn(|| {
+                    std::thread::sleep(ms(250));
+                    stop.store(true, Ordering::SeqCst);
+                    Instant::now()
+                });
+                let interrupted = p.attendre(Some(&stop));
+                (interrupted, Instant::now(), setter.join().unwrap())
+            });
+            assert!(interrupted);
+            assert!(ended - t >= ms(250));
+            let lag = ended.saturating_duration_since(set_at);
+            assert!(lag <= ms(100) + SCHED_SLACK, "{lag:?}");
+        }
+
+        #[test]
+        fn req254_ac4_stop_already_set_returns_at_once_and_sends_nothing() {
+            let p = Pause::default();
+            p.poser(Instant::now() + Duration::from_secs(5));
+            let stop = AtomicBool::new(true);
+            let t = Instant::now();
+            assert!(p.attendre(Some(&stop)));
+            assert!(t.elapsed() < ms(50));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/x", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let r = send_with(
+                "openai",
+                ureq::agent().post(&url),
+                None,
+                &Retry::from_millis(1),
+                None,
+                Some(&stop),
+                &CallStats::default(),
+                Some(&p),
+                false,
+            );
+            assert_eq!(r, Err(Error::Unsent));
+            assert!(listener.accept().is_err(), "une requête est partie");
+        }
+    }
+
     mod interrupted_wait {
         use super::*;
         use std::io::{Read, Write};
@@ -1227,6 +1393,7 @@ mod tests {
                 None,
                 Some(&stop),
                 &CallStats::default(),
+                &Pause::default(),
             );
             assert!(t.elapsed() < Duration::from_secs(2));
             assert!(matches!(r, Err(Error::Network(_))), "{r:?}");
@@ -1392,6 +1559,7 @@ mod tests {
                                 None,
                                 None,
                                 &CallStats::default(),
+                                &Pause::default(),
                             )
                             .unwrap();
                             if round == 0 {
@@ -1437,6 +1605,7 @@ mod tests {
                 None,
                 None,
                 &stats,
+                &Pause::default(),
             );
             (r, stats.sends())
         }

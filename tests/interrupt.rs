@@ -870,3 +870,78 @@ fn req191_ac8_autre_cause_verbose() {
         d.stderr
     );
 }
+
+// ---- AC-254-3, AC-254-7 : Ctrl-C pendant la pause partagée ----
+
+/// Fixture d'AC-254-3 : 3 documents, la 1re requête reçoit 429 `retry-after: 30` (écrit une fois
+/// la 2e requête reçue), SIGINT 500 ms après cette réponse.
+fn fixture_254(args: &[&str]) -> (Env, Server, Done) {
+    let server = Server::start(|i| match i {
+        0 => Act::HeldRetry(429, 2, "30"),
+        1 => Act::Ok(150),
+        _ => Act::Ok(0),
+    });
+    let env = Env::new(&docs(3), &server.base_url, FIX189);
+    let mut run = env.spawn(args);
+    wait_until("429 servie", || {
+        server.times().first().is_some_and(|t| t.1.is_some())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    run.sigint();
+    let d = run.finish();
+    (env, server, d)
+}
+
+#[test]
+fn req254_ac3_signal_pendant_la_pause() {
+    let (env, server, d) = fixture_254(&["build"]);
+    assert_eq!(d.code(), Some(130), "{}", d.stderr);
+    assert_eq!(server.requests(), 2, "{}", d.stderr);
+    assert!(
+        d.after_signal.unwrap() < Duration::from_secs(3),
+        "{:?}",
+        d.after_signal
+    );
+    assert_eq!(env.to_enrich(), 2, "{}", d.stderr);
+    assert!(
+        d.lines("avertissement: ")
+            .iter()
+            .all(|l| !l.contains("d3.md")),
+        "{}",
+        d.stderr
+    );
+    let first: Vec<&str> = d
+        .lines("avertissement: ")
+        .into_iter()
+        .filter(|l| l.contains("(HTTP 429)"))
+        .collect();
+    assert_eq!(first.len(), 1, "{}", d.stderr);
+    assert_eq!(d.last(), e27(2), "{}", d.stderr);
+}
+
+#[test]
+fn req254_ac7_appel_arrete_avant_tout_envoi() {
+    let (_env, _server, d) = fixture_254(&["build", "--verbose"]);
+    assert_eq!(d.code(), Some(130), "{}", d.stderr);
+    let pause = d
+        .lines("trace: ")
+        .into_iter()
+        .filter(|l| l.contains("llm enrich pause"));
+    let pause: Vec<&str> = pause.collect();
+    assert_eq!(pause.len(), 1, "{}", d.stderr);
+    assert!(
+        pause[0].ends_with(" [1/1] : aucun envoi pendant 30000 ms après HTTP 429"),
+        "{}",
+        pause[0]
+    );
+    let third: Vec<&str> = d.stderr.lines().filter(|l| l.contains("d3.md")).collect();
+    assert_eq!(third.len(), 1, "{}", d.stderr);
+    assert!(third[0].contains("llm enrich départ d3.md"), "{}", d.stderr);
+    let calls: Vec<&str> = d.stderr.lines().filter(|l| l.contains("appels:")).collect();
+    assert_eq!(calls.len(), 1, "{}", d.stderr);
+    assert!(calls[0].contains("3 appels"), "{}", calls[0]);
+    assert!(calls[0].contains("2 envois HTTP"), "{}", calls[0]);
+    for l in d.stderr.lines().filter(|l| l.contains("politique:")) {
+        assert!(!l.contains("pause") && !l.contains("limite"), "{l}");
+    }
+}
