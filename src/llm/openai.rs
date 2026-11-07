@@ -72,7 +72,7 @@ impl OpenAiLlm {
             key,
             agent: http::agent(timeout_secs, concurrency, tls),
             retry: http::Retry::default(),
-            pause: http::Pause::default(),
+            pause: http::Pause::new(concurrency),
             gen,
             structured: Structured::Off,
             structured_key: "structured_output",

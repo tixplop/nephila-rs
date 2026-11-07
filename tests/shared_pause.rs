@@ -21,6 +21,10 @@ struct Env {
 
 impl Env {
     fn new(n: usize, url: &str) -> Env {
+        Env::with_concurrency(n, url, 2)
+    }
+
+    fn with_concurrency(n: usize, url: &str, concurrency: usize) -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         fs::create_dir_all(&repo).unwrap();
@@ -34,7 +38,7 @@ impl Env {
         fs::write(
             tmp.path().join("config.toml"),
             format!(
-                "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{url}\"\napi_key_env = \"{KEY_VAR}\"\nconcurrency = 2\nbatch_files = 1\nformat_retries = 0\n"
+                "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{url}\"\napi_key_env = \"{KEY_VAR}\"\nconcurrency = {concurrency}\nbatch_files = 1\nformat_retries = 0\n"
             ),
         )
         .unwrap();
@@ -178,4 +182,77 @@ fn req254_ac6_une_seule_ligne_de_pause() {
     let reference = Env::new(3, &ok.base_url).run(&["build"]);
     assert_eq!(quiet.status.code(), Some(0));
     assert_eq!(stderr(&quiet), stderr(&reference));
+}
+
+fn limit_lines(err: &str) -> Vec<&str> {
+    err.lines()
+        .filter(|l| l.contains("limite d'envois:"))
+        .collect()
+}
+
+/// Premier envoi en 429 sans `retry-after`, tous les autres conformes.
+fn first_is_429(concurrency: usize, args: &[&str]) -> (Server, Output) {
+    let server = Server::start(|i| {
+        if i == 0 {
+            Act::Status(429, None)
+        } else {
+            Act::Ok(0)
+        }
+    });
+    let out = Env::with_concurrency(10, &server.base_url, concurrency).run(args);
+    (server, out)
+}
+
+#[test]
+fn req255_ac3_un_429_ne_perd_aucun_envoi() {
+    let (server, out) = first_is_429(4, &["build"]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(server.requests(), 11, "{err}");
+    assert!(!err.contains("avertissement:"), "{err}");
+    assert_eq!(enriched(&out), 0, "{err}");
+}
+
+#[test]
+fn req255_ac5_lignes_de_limite() {
+    let (_server, out) = first_is_429(4, &["build", "--verbose"]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(enriched(&out), 10, "{err}");
+    let lines = limit_lines(&err);
+    let texts: Vec<&str> = lines
+        .iter()
+        .map(|l| l.split("] ").nth(1).unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "limite d'envois: 2/4, baissée par la pause",
+            "limite d'envois: 3/4, remontée après 2 envois réussis",
+            "limite d'envois: 4/4, remontée après 3 envois réussis",
+        ],
+        "{err}"
+    );
+    let all: Vec<&str> = err.lines().collect();
+    let pause = all
+        .iter()
+        .position(|l| l.contains("llm enrich pause"))
+        .unwrap();
+    let first = all
+        .iter()
+        .position(|l| l.contains("limite d'envois:"))
+        .unwrap();
+    assert_eq!(first, pause + 1, "{err}");
+
+    // Sans --verbose : aucune ligne de limite.
+    let (_s, quiet) = first_is_429(4, &["build"]);
+    assert!(limit_lines(&stderr(&quiet)).is_empty());
+    assert_eq!(stderr(&quiet), "");
+
+    // concurrency = 1 : la pause existe, la limite ne bouge pas.
+    let (_s, one) = first_is_429(1, &["build", "--verbose"]);
+    let err = stderr(&one);
+    assert_eq!(one.status.code(), Some(0), "{err}");
+    assert!(err.contains("llm enrich pause"), "{err}");
+    assert!(limit_lines(&err).is_empty(), "{err}");
 }

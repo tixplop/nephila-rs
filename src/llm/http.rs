@@ -3,7 +3,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -356,9 +356,31 @@ fn send_with(
             // du dernier envoi (REQ-095).
             return Err(last_error.unwrap_or(Error::Unsent));
         }
+        // REQ-255 : une place d'envoi, rendue dès la réponse reçue ou l'échec.
+        let place = match pause {
+            Some(p) => match p.prendre(stop) {
+                Some(place) => Some(place),
+                None => return Err(last_error.unwrap_or(Error::Unsent)),
+            },
+            None => None,
+        };
         stats.add_send();
-        match attempt(provider, req.clone(), body, unlimited) {
-            Attempt::Done(r) => return r,
+        let result = attempt(provider, req.clone(), body, unlimited);
+        match result {
+            Attempt::Done(r) => {
+                drop(place);
+                if let (Some(p), Ok(_)) = (pause, &r) {
+                    if let Some((new, old)) = p.reussir() {
+                        if label.is_some() {
+                            crate::trace!(
+                                "limite d'envois: {new}/{}, remontée après {old} envois réussis",
+                                p.concurrency()
+                            );
+                        }
+                    }
+                }
+                return r;
+            }
             Attempt::Retry { error, .. } if definitive => return Err(error),
             Attempt::Retry {
                 error,
@@ -392,16 +414,25 @@ fn send_with(
                             );
                         }
                         if let (Some(pause), "HTTP 429" | "HTTP 529") = (pause, cause.as_str()) {
-                            if pause.poser(Instant::now() + d) {
-                                if let Some(label) = label {
+                            let now = Instant::now();
+                            let (moved, lowered) = pause.poser_limite(now, now + d);
+                            if let (true, Some(label)) = (moved, label) {
+                                crate::trace!(
+                                    "llm enrich pause {label} : aucun envoi pendant {} ms après {cause}{}",
+                                    d.as_millis(),
+                                    stats.mark()
+                                );
+                                if let Some(l) = lowered {
                                     crate::trace!(
-                                        "llm enrich pause {label} : aucun envoi pendant {} ms après {cause}{}",
-                                        d.as_millis(),
-                                        stats.mark()
+                                        "limite d'envois: {l}/{}, baissée par la pause",
+                                        pause.concurrency()
                                     );
                                 }
                             }
                         }
+                        // La place est rendue après la pause posée : aucun fil en attente d'une
+                        // place ne part pendant la pause.
+                        drop(place);
                         if wait(d, stop) {
                             return Err(error);
                         }
@@ -516,26 +547,142 @@ pub fn send_create(
 /// Durée maximale d'une tranche d'attente (REQ-095).
 const WAIT_SLICE: Duration = Duration::from_millis(100);
 
-/// Pause partagée par tous les appels d'un adaptateur (REQ-254, DEC-186) : instant avant lequel
-/// aucun envoi n'a lieu, posé après un HTTP 429 ou 529 suivi d'un nouvel essai.
-#[derive(Debug, Default)]
+/// Pause partagée et limite d'envois d'un adaptateur (REQ-254, REQ-255, DEC-186) : instant avant
+/// lequel aucun envoi n'a lieu, posé après un HTTP 429 ou 529 suivi d'un nouvel essai ; nombre
+/// d'envois simultanés permis, entre 1 et `concurrency`.
+#[derive(Debug)]
 pub struct Pause {
-    end: Mutex<Option<Instant>>,
+    state: Mutex<State>,
+    freed: Condvar,
+}
+
+#[derive(Debug)]
+struct State {
+    end: Option<Instant>,
+    concurrency: usize,
+    limit: usize,
+    taken: usize,
+    successes: usize,
+}
+
+/// Place d'envoi prise ; rendue à la destruction, aussi sur erreur.
+pub struct Place<'a>(&'a Pause);
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        self.0.lock().taken -= 1;
+        self.0.freed.notify_all();
+    }
+}
+
+impl Default for Pause {
+    /// Sans limite pratique (tests de transport).
+    fn default() -> Pause {
+        Pause::new(usize::MAX)
+    }
 }
 
 impl Pause {
+    pub fn new(concurrency: usize) -> Pause {
+        let concurrency = concurrency.max(1);
+        Pause {
+            state: Mutex::new(State {
+                end: None,
+                concurrency,
+                limit: concurrency,
+                taken: 0,
+                successes: 0,
+            }),
+            freed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn end(&self) -> Option<Instant> {
-        *self.end.lock().unwrap_or_else(|p| p.into_inner())
+        self.lock().end
+    }
+
+    /// Limite d'envois en cours.
+    #[cfg(test)]
+    pub fn limit(&self) -> usize {
+        self.lock().limit
+    }
+
+    pub fn concurrency(&self) -> usize {
+        self.lock().concurrency
     }
 
     /// Garde la fin la plus tardive ; vrai si la fin a reculé (pause nouvelle ou prolongée).
+    #[cfg(test)]
     pub fn poser(&self, fin: Instant) -> bool {
-        let mut end = self.end.lock().unwrap_or_else(|p| p.into_inner());
-        if end.is_some_and(|e| e >= fin) {
-            return false;
+        self.poser_limite(Instant::now(), fin).0
+    }
+
+    /// Comme `poser`, à l'instant `now`; rend aussi la nouvelle limite si elle a baissé (pause
+    /// qui commence : limite / 2, au moins 1).
+    pub fn poser_limite(&self, now: Instant, fin: Instant) -> (bool, Option<usize>) {
+        let mut st = self.lock();
+        if st.end.is_some_and(|e| e >= fin) {
+            return (false, None);
         }
-        *end = Some(fin);
-        true
+        let started = st.end.is_none_or(|e| e <= now);
+        st.end = Some(fin);
+        if started {
+            let lower = (st.limit / 2).max(1);
+            if lower != st.limit {
+                st.limit = lower;
+                st.successes = 0;
+                return (true, Some(lower));
+            }
+        }
+        (true, None)
+    }
+
+    /// Compte une réussite ; rend `(nouvelle limite, limite d'avant)` si elle monte.
+    pub fn reussir(&self) -> Option<(usize, usize)> {
+        let mut st = self.lock();
+        if st.limit >= st.concurrency {
+            return None;
+        }
+        st.successes += 1;
+        if st.successes < st.limit {
+            return None;
+        }
+        let old = st.limit;
+        st.limit += 1;
+        st.successes = 0;
+        drop(st);
+        self.freed.notify_all();
+        Some((old + 1, old))
+    }
+
+    /// Prend une place d'envoi, par tranches de `WAIT_SLICE`, l'arrêt lu avant chaque tranche ;
+    /// `None` si l'arrêt est posé (aucune place prise).
+    pub fn prendre(&self, stop: Option<&AtomicBool>) -> Option<Place<'_>> {
+        let mut st = self.lock();
+        loop {
+            let rest = st.end.map_or(Duration::ZERO, |e| {
+                e.saturating_duration_since(Instant::now())
+            });
+            if st.taken < st.limit && rest.is_zero() {
+                st.taken += 1;
+                return Some(Place(self));
+            }
+            if is_stopped(stop) {
+                return None;
+            }
+            st = self
+                .freed
+                .wait_timeout(
+                    st,
+                    WAIT_SLICE.min(if rest.is_zero() { WAIT_SLICE } else { rest }),
+                )
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
     }
 
     /// Attend la fin de la pause par tranches de `WAIT_SLICE` ; vrai si l'arrêt est posé pendant
@@ -1313,6 +1460,133 @@ mod tests {
             );
             assert_eq!(r, Err(Error::Unsent));
             assert!(listener.accept().is_err(), "une requête est partie");
+        }
+    }
+
+    mod send_limit {
+        use super::*;
+
+        const SCHED_SLACK: Duration = Duration::from_millis(200);
+
+        fn ms(n: u64) -> Duration {
+            Duration::from_millis(n)
+        }
+
+        fn limits(concurrency: usize) -> Vec<usize> {
+            let p = Pause::new(concurrency);
+            let t = Instant::now();
+            let mut seen = vec![];
+            let mut pose = |at: Duration, end: Duration| {
+                p.poser_limite(t + at, t + end);
+                seen.push(p.limit());
+            };
+            pose(ms(0), ms(1000));
+            pose(ms(500), ms(1500));
+            pose(ms(2000), ms(3000));
+            pose(ms(4000), ms(5000));
+            for _ in 0..16 {
+                p.reussir();
+                seen.push(p.limit());
+            }
+            seen
+        }
+
+        #[test]
+        fn req255_ac1_limit_halves_per_pause_and_climbs_back() {
+            let seen = limits(4);
+            assert_eq!(seen[..4], [2, 2, 1, 1]);
+            // 1 réussite -> 2, 2 -> 3, 3 -> 4, puis plus rien.
+            let climb: Vec<usize> = seen[4..].to_vec();
+            let mut expected = vec![2, 2, 3, 3, 3, 4];
+            expected.extend([4; 10]);
+            assert_eq!(climb, expected);
+        }
+
+        #[test]
+        fn req255_ac1_climb_reports_new_and_old_limit() {
+            let p = Pause::new(4);
+            let t = Instant::now();
+            assert_eq!(p.poser_limite(t, t + ms(10)), (true, Some(2)));
+            assert_eq!(p.poser_limite(t + ms(5), t + ms(20)), (true, None));
+            assert_eq!(p.reussir(), None);
+            assert_eq!(p.reussir(), Some((3, 2)));
+        }
+
+        #[test]
+        fn req255_ac1_concurrency_one_never_moves() {
+            let p = Pause::new(1);
+            let t = Instant::now();
+            assert_eq!(p.poser_limite(t, t + ms(10)), (true, None));
+            assert_eq!(p.poser_limite(t + ms(50), t + ms(60)), (true, None));
+            for _ in 0..5 {
+                assert_eq!(p.reussir(), None);
+            }
+            assert_eq!(p.limit(), 1);
+        }
+
+        #[test]
+        fn req255_ac2_third_place_waits_for_a_freed_one() {
+            let p = Pause::new(4);
+            let t = Instant::now();
+            p.poser_limite(t, t + ms(1)); // limite 2
+            assert_eq!(p.limit(), 2);
+            let a = p.prendre(None).unwrap();
+            let _b = p.prendre(None).unwrap();
+            let (got, freed_at, served_at) = std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| {
+                    let r = p.prendre(None).is_some();
+                    (r, Instant::now())
+                });
+                std::thread::sleep(ms(250));
+                let freed_at = Instant::now();
+                drop(a);
+                let (r, served_at) = waiter.join().unwrap();
+                (r, freed_at, served_at)
+            });
+            assert!(got);
+            assert!(served_at >= freed_at);
+            assert!(served_at - freed_at <= ms(100) + SCHED_SLACK);
+        }
+
+        #[test]
+        fn req255_ac2_waiting_thread_is_not_served_during_the_pause() {
+            let p = Pause::new(2);
+            let t = Instant::now();
+            p.poser_limite(t, t + ms(1)); // limite 1
+            let a = p.prendre(None).unwrap();
+            let (served_at, pause_end) = std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| {
+                    assert!(p.prendre(None).is_some());
+                    Instant::now()
+                });
+                std::thread::sleep(ms(100));
+                let end = Instant::now() + ms(300);
+                p.poser(end);
+                drop(a);
+                (waiter.join().unwrap(), end)
+            });
+            assert!(served_at >= pause_end, "servi pendant la pause");
+        }
+
+        #[test]
+        fn req255_ac2_stop_interrupts_the_wait_and_takes_no_place() {
+            let p = Pause::new(2);
+            let t = Instant::now();
+            p.poser_limite(t, t + ms(1)); // limite 1
+            let _a = p.prendre(None).unwrap();
+            let stop = AtomicBool::new(false);
+            let (got, ended, set_at) = std::thread::scope(|scope| {
+                let setter = scope.spawn(|| {
+                    std::thread::sleep(ms(250));
+                    stop.store(true, Ordering::SeqCst);
+                    Instant::now()
+                });
+                let got = p.prendre(Some(&stop)).is_some();
+                (got, Instant::now(), setter.join().unwrap())
+            });
+            assert!(!got);
+            assert!(ended.saturating_duration_since(set_at) <= ms(100) + SCHED_SLACK);
+            assert_eq!(p.lock().taken, 1);
         }
     }
 
