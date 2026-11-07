@@ -587,3 +587,28 @@ fn REQ251_AC3_corps_fini_sans_marque_de_fin_donne_les_memes_constats() {
         check_broken(provider, unfinished_sse);
     }
 }
+
+#[test]
+fn REQ250_AC5_defaut_de_timeout_secs_a_60_dans_la_ligne_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("a.md"), "# A\n").unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, "provider = \"mock\"\n").unwrap();
+    let o = Command::new(cargo_bin("nephila"))
+        .arg("-C")
+        .arg(&repo)
+        .args(["build", "--verbose"])
+        .env("NEPHILA_CONFIG", &config)
+        .env_remove("NEPHILA_MOCK_DIR")
+        .env_remove("NEPHILA_MOCK_LOG")
+        .output()
+        .unwrap();
+    let line = err(&o)
+        .lines()
+        .find(|l| l.contains("] config: "))
+        .unwrap_or_else(|| panic!("{}", err(&o)))
+        .to_string();
+    assert!(line.contains(" timeout_secs=60 "), "{line}");
+}

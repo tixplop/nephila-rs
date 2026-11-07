@@ -11,7 +11,8 @@ use crate::error::{Error, Result};
 
 pub const DEFAULT_MAX_CHUNK_CHARS: usize = 60_000;
 pub const DEFAULT_CONCURRENCY: usize = 4;
-pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Délai d'inactivité par défaut, en secondes : silence permis pendant un appel (REQ-250).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Langue par défaut des résumés (`summary_language`, REQ-172).
 pub const DEFAULT_SUMMARY_LANGUAGE: &str = "français";
 /// Longueur maximale, en caractères, de `summary_language` (REQ-172).

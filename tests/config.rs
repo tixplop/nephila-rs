@@ -318,7 +318,7 @@ fn req003_non_numeric_numeric_variables_fail() {
 
 #[test]
 fn req002_ac7_timeout_secs_default_and_value() {
-    assert_eq!(parse("provider='mock'").unwrap().timeout_secs, 300);
+    assert_eq!(parse("provider='mock'").unwrap().timeout_secs, 60);
     let c = Config::parse("provider='mock'\ntimeout_secs=7", Path::new("/x")).unwrap();
     assert_eq!(c.timeout_secs, 7);
 }

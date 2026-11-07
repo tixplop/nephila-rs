@@ -146,8 +146,8 @@ api_key_env = "ANTHROPIC_API_KEY"
 # c'est le remède quand un serveur ou un modèle refuse la requête (HTTP 400) à cause de ce
 # champ. Sans effet avec « mock ». Un niveau plus haut donne des réponses plus lentes et plus
 # coûteuses, et sa réflexion compte dans max_output_tokens.
-# À "medium" ou "high", augmentez timeout_secs (600, par exemple) : un appel plus long échoue
-# en délai dépassé, et trois délais dépassés de suite arrêtent l'envoi. Lue ici seulement :
+# À "medium" ou "high", augmentez timeout_secs (600, par exemple) avec « openai », qui se tait
+# pendant la réflexion : trois délais dépassés de suite arrêtent l'envoi. Lue ici seulement :
 # .nephila.toml la refuse.
 # effort = "low"
 
@@ -188,11 +188,15 @@ api_key_env = "ANTHROPIC_API_KEY"
 # Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # concurrency = 4
 
-# Durée maximale d'un appel LLM HTTP entier, en secondes. Entier > 0. Défaut : 300. La
-# connexion est limitée à 10 s, quelle que soit cette valeur. Sans effet avec « mock ».
+# Silence permis, en secondes, pendant un appel LLM HTTP : si rien n'est reçu ni envoyé pendant
+# ce temps, avant la réponse ou au milieu, l'appel échoue en délai dépassé. Une réponse qui
+# continue d'arriver n'est pas coupée, mais un appel dure au plus 3600 s. Entier > 0. Défaut : 60.
+# Augmentez-le si le serveur se tait longtemps : réflexion de « openai » à effort "medium" ou
+# "high", modèle local lent à commencer sa réponse, proxy qui ne transmet la réponse qu'à la fin.
+# La connexion est limitée à 10 s, quelle que soit cette valeur. Sans effet avec « mock ».
 # Un dépôt peut le remplacer par son .nephila.toml.
 # Priorité : .nephila.toml du dépôt > ce fichier > défaut.
-# timeout_secs = 300
+# timeout_secs = 60
 
 # Nombre maximal de fichiers par appel d'enrichissement. Entier > 0. Défaut : 10 ; 1 = un fichier
 # par appel. Un lot ne dépasse jamais

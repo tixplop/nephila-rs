@@ -1051,13 +1051,16 @@ const EFFORT_BLOCK: &str =
 # c'est le remède quand un serveur ou un modèle refuse la requête (HTTP 400) à cause de ce
 # champ. Sans effet avec « mock ». Un niveau plus haut donne des réponses plus lentes et plus
 # coûteuses, et sa réflexion compte dans max_output_tokens.
-# À \"medium\" ou \"high\", augmentez timeout_secs (600, par exemple) : un appel plus long échoue
-# en délai dépassé, et trois délais dépassés de suite arrêtent l'envoi. Lue ici seulement :
+# À \"medium\" ou \"high\", augmentez timeout_secs (600, par exemple) avec « openai », qui se tait
+# pendant la réflexion : trois délais dépassés de suite arrêtent l'envoi. Lue ici seulement :
 # .nephila.toml la refuse.
 # effort = \"low\"";
 
 fn example_block_ending_at(key_line: &str) -> String {
-    let text = example("config.toml");
+    example_block_ending_at_in(&example("config.toml"), key_line)
+}
+
+fn example_block_ending_at_in(text: &str, key_line: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let at = position_of(&lines, key_line);
     let mut block = exact_doc_of(&lines, at);
@@ -3166,4 +3169,91 @@ fn REQ246_AC2_AC5_readme_mise_a_niveau_build() {
 fn REQ246_AC3_readme_au_plus_51000_octets() {
     let n = repo_file("README.md").len();
     assert!(n <= 51_500, "README : {n} octets");
+}
+
+// ---- REQ-252 : timeout_secs, silence permis (T-341) ----
+
+fn has_word(text: &str, w: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric()).any(|x| x == w)
+}
+
+const TIMEOUT_BLOCK: &str = "# Silence permis, en secondes, pendant un appel LLM HTTP : si rien n'est reçu ni envoyé pendant
+# ce temps, avant la réponse ou au milieu, l'appel échoue en délai dépassé. Une réponse qui
+# continue d'arriver n'est pas coupée, mais un appel dure au plus 3600 s. Entier > 0. Défaut : 60.
+# Augmentez-le si le serveur se tait longtemps : réflexion de « openai » à effort \"medium\" ou
+# \"high\", modèle local lent à commencer sa réponse, proxy qui ne transmet la réponse qu'à la fin.
+# La connexion est limitée à 10 s, quelle que soit cette valeur. Sans effet avec « mock ».
+# Un dépôt peut le remplacer par son .nephila.toml.
+# Priorité : .nephila.toml du dépôt > ce fichier > défaut.
+# timeout_secs = 60";
+
+#[test]
+fn REQ252_AC4_readme_lignes_du_delai_d_inactivite() {
+    let readme = repo_file("README.md");
+    let lines: Vec<&str> = readme.lines().collect();
+    let wanted = [
+        "| `timeout_secs` | Silence permis pendant un appel HTTP, en secondes, entier > 0 ; une réponse qui arrive n'est pas coupée, mais un appel dure au plus une heure | 60 |",
+        "| `effort` | Niveau d'effort, avec ou sans `thinking` : `\"low\"`, `\"medium\"`, `\"high\"`, ou `\"default\"` pour n'en envoyer aucun ; avec `openai`, à `\"medium\"` ou `\"high\"`, augmentez `timeout_secs` ; configuration personnelle seulement | `\"low\"` |",
+        "| Délais dépassés | 3 appels de suite muets pendant `timeout_secs` secondes, ou de plus d'une heure | augmenter `timeout_secs` (réflexion d'`openai`, modèle local lent, proxy qui retient la réponse), ou vérifier le fournisseur |",
+        "trace: [0.000s] config: llm=mock model=m-projet enrich_code=false summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=60 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)",
+    ];
+    for w in wanted {
+        assert_eq!(lines.iter().filter(|l| **l == w).count(), 1, "{w}");
+    }
+    for bad in [
+        "Durée maximale d'un appel HTTP",
+        "sans réponse dans",
+        "timeout_secs=300",
+    ] {
+        assert!(!readme.contains(bad), "{bad}");
+    }
+    for w in ["flux", "inactivité", "SSE"] {
+        assert!(!has_word(&readme, w), "{w}");
+    }
+    assert_eq!(readme.matches("config: llm=").count(), 1);
+    let table = readme_section(&readme, "### Arrêt de l'envoi");
+    assert_eq!(table.lines().filter(|l| l.starts_with("| ")).count() - 1, 6);
+    assert!(readme.len() <= 51_500, "README : {} octets", readme.len());
+}
+
+#[test]
+fn REQ252_AC5_exemples_du_delai_d_inactivite() {
+    let config = example("config.toml");
+    assert_eq!(
+        example_block_ending_at("# timeout_secs = 60"),
+        TIMEOUT_BLOCK
+    );
+    assert!(!config.lines().any(|l| l == "# timeout_secs = 300"));
+    let effort = example_block_ending_at("# effort = \"low\"");
+    assert!(!effort.contains("un appel plus long échoue"));
+    let project = example("nephila.toml");
+    let block = example_block_ending_at_in(&project, "# timeout_secs = 600");
+    let first: Vec<&str> = block.lines().take(3).collect();
+    assert_eq!(
+        first,
+        [
+            "# Silence permis, en secondes, pendant un appel LLM HTTP : au-delà, l'appel échoue en délai",
+            "# dépassé. Entier > 0. Remplace la valeur de la configuration personnelle.",
+            "# Plafond dans ce fichier : au plus 3600.",
+        ]
+    );
+    for text in [&config, &project] {
+        assert!(!text.contains("Durée maximale d'un appel LLM HTTP entier"));
+        for w in ["flux", "inactivité", "SSE"] {
+            assert!(!has_word(text, w), "{w}");
+        }
+    }
+    for b in [TIMEOUT_BLOCK.to_string(), effort.clone(), block.clone()] {
+        for l in b.lines() {
+            assert!(l.chars().count() <= 100, "{l}");
+        }
+    }
+    for b in [TIMEOUT_BLOCK.to_string(), block] {
+        assert_eq!(
+            b.lines()
+                .filter(|l| l.starts_with("# timeout_secs ="))
+                .count(),
+            1
+        );
+    }
 }

@@ -218,7 +218,7 @@ Modules (3)
 Avec `-v`, `build` et `update` écrivent sur stderr une ligne `trace:` par événement, horodatée : configuration effective (et réglages venus de `.nephila.toml`), parcours, migration du schéma, phases, chaque appel LLM avec son résultat, ses jetons et ses nouveaux essais, découpes, politique d'arrêt, bilan des appels et des jetons (que `query ask -v` écrit aussi). stdout est inchangé : `nephila build -v 2>trace.log` garde le bilan lisible.
 
 ```
-trace: [0.000s] config: llm=mock model=m-projet enrich_code=false summary_language="français" thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=300 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
+trace: [0.000s] config: llm=mock model=m-projet enrich_code=false summary_language="français" thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=60 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)
 trace: [0.009s] structure: fin 7 ms, 0 en attente, 3 enrichissements conservés
 trace: [0.012s] llm enrich départ src/shop/Order.java [1/1] 812 car.
 trace: [0.031s] llm enrich fin src/shop/Order.java [1/1] ok (1 résumés, 0 concepts, 1/1 nœuds résumés) 19 ms
@@ -375,13 +375,13 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 | `enrich_include` | Motifs des seuls fichiers à enrichir ; aussi dans `.nephila.toml` | aucune restriction |
 | `enrich_exclude` | Motifs des fichiers à ne pas enrichir, qui l'emportent sur `enrich_include` ; écrite, elle remplace la liste par défaut ; aussi dans `.nephila.toml` | `**/test/**`, `**/__tests__/**`, `*.spec.*`, `*.test.*`, `**/generated/**`, `**/migrations/**`, `*.min.js`, `*.d.ts` |
 | `thinking` | `true` demande au modèle de réfléchir ; configuration personnelle seulement ; chez anthropic, modèle Claude 4.6 ou suivant | `false` |
-| `effort` | Niveau d'effort, avec ou sans `thinking` : `"low"`, `"medium"`, `"high"`, ou `"default"` pour n'en envoyer aucun ; à `"medium"` ou `"high"`, augmentez `timeout_secs` ; configuration personnelle seulement | `"low"` |
+| `effort` | Niveau d'effort, avec ou sans `thinking` : `"low"`, `"medium"`, `"high"`, ou `"default"` pour n'en envoyer aucun ; avec `openai`, à `"medium"` ou `"high"`, augmentez `timeout_secs` ; configuration personnelle seulement | `"low"` |
 | `max_output_tokens` | Limite de jetons de la réponse, entier > 0 ; configuration personnelle seulement | 16384 |
 | `structured_output` | Schéma JSON imposé aux réponses d'enrichissement : `"auto"` l'envoie sans `base_url` et, s'il est refusé (HTTP 400), s'en passe pour la commande ; `"on"` l'envoie toujours, et un refus arrête l'envoi ; `"off"` jamais ; configuration personnelle seulement | `"auto"` |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |
 | `format_retries` | Nouveaux essais d'une réponse non conforme, entier ≥ 0 | 2 |
 | `max_calls` | Plafond d'appels d'enrichissement par commande, nouveaux essais de format compris ; configuration personnelle seulement | aucun |
-| `timeout_secs` | Durée maximale d'un appel HTTP, entier > 0 | 300 |
+| `timeout_secs` | Silence permis pendant un appel HTTP, en secondes, entier > 0 ; une réponse qui arrive n'est pas coupée, mais un appel dure au plus une heure | 60 |
 | `tls_ca_cert` | Fichier PEM d'autorités ajoutées aux autorités publiques ; chemin absolu, `~/…` ou relatif | aucun |
 | `tls_insecure` | `true` désactive le contrôle du certificat du serveur, comme `curl -k` | `false` |
 | `ask` | Réglages de `query ask` seul : voir **Section `[ask]`** ci-dessous | aucun |
@@ -489,7 +489,7 @@ Huit causes arrêtent l'envoi au LLM. Les six de la table sont des erreurs : cha
 | Redirection | HTTP 300 à 399, jamais suivie | corriger `base_url` d'après l'adresse affichée |
 | Fournisseur saturé | 3 appels de suite en échec sur HTTP 429 ou 529 | relancer plus tard, ou réduire `concurrency` |
 | Panne réseau | 3 erreurs réseau de suite | vérifier le réseau et `base_url` |
-| Délais dépassés | 3 appels de suite sans réponse dans `timeout_secs` | augmenter `timeout_secs`, ou vérifier le fournisseur |
+| Délais dépassés | 3 appels de suite muets pendant `timeout_secs` secondes, ou de plus d'une heure | augmenter `timeout_secs` (réflexion d'`openai`, modèle local lent, proxy qui retient la réponse), ou vérifier le fournisseur |
 
 Les appels en cours se terminent et sont enregistrés. Les fichiers non envoyés restent « à enrichir » : une fois la cause corrigée, `nephila update` ne renvoie qu'eux. Sans fichier à enrichir, aucun appel n'a lieu, et une clé fausse passe inaperçue.
 

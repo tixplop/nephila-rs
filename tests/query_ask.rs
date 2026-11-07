@@ -743,7 +743,7 @@ fn req142_ac6_late_link_reaches_the_context_for_the_three_questions() {
 // ---- REQ-162, REQ-163 : ligne `config` d'`ask`, `--context-chars` ----
 
 const MOCK_CFG: &str = "provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\n";
-const CFG_DEFAULT: &str = "config: llm=mock model=mock thinking=false effort=low max_output_tokens=16384 max_context_chars=12000 max_seeds=20 max_nodes=60 timeout_secs=300 format_retries=2";
+const CFG_DEFAULT: &str = "config: llm=mock model=mock thinking=false effort=low max_output_tokens=16384 max_context_chars=12000 max_seeds=20 max_nodes=60 timeout_secs=60 format_retries=2";
 
 const CALLS_UNKNOWN: &str =
     "appels: 1 appels, 0 nouveaux essais de format, 1 envois HTTP, jetons : inconnus";
