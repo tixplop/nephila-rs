@@ -4,7 +4,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{ring, CryptoProvider, WebPkiSupportedAlgorithms};
@@ -166,21 +166,81 @@ impl Retry {
 }
 
 /// Attente avant le nouvel essai `k` (1 à 4), ou `None` si le serveur demande d'attendre plus de
-/// 60 s. `retry_after` : valeur brute de l'en-tête ; seule la forme en secondes entières compte.
-/// `alea` dans [0, 1] positionne l'attente dans [d/2, d], d = min(30 s, base × 2^(k−1)).
+/// 60 s (REQ-253). Ordre de lecture : `retry_after_ms` (millisecondes, partie décimale ignorée),
+/// `retry_after` en secondes entières, `retry_after` en IMF-fixdate (date − `now`, 0 si passée) ;
+/// un en-tête illisible est ignoré, aucune forme lisible → attente calculée.
+/// `alea` dans [0, 1] positionne l'attente calculée dans [d/2, d], d = min(30 s, base × 2^(k−1)).
 pub fn retry_delay(
     k: u32,
     base: Duration,
+    retry_after_ms: Option<&str>,
     retry_after: Option<&str>,
+    now: SystemTime,
     alea: f64,
 ) -> Option<Duration> {
-    if let Some(secs) = retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
-        return (secs <= MAX_RETRY_AFTER_SECS).then(|| Duration::from_secs(secs));
+    if let Some(ms) = retry_after_ms.and_then(parse_millis) {
+        return (ms <= MAX_RETRY_AFTER_SECS * 1000).then(|| Duration::from_millis(ms));
+    }
+    if let Some(v) = retry_after {
+        let requested = match v.trim().parse::<u64>() {
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => parse_http_date(v.trim()).map(|t| t.duration_since(now).unwrap_or_default()),
+        };
+        if let Some(d) = requested {
+            return (d <= Duration::from_secs(MAX_RETRY_AFTER_SECS)).then_some(d);
+        }
     }
     let factor = 1u32.checked_shl(k.saturating_sub(1)).unwrap_or(u32::MAX);
     let d = base.saturating_mul(factor).min(MAX_BACKOFF);
     let half = d / 2;
     Some(half + half.mul_f64(alea.clamp(0.0, 1.0)))
+}
+
+/// Nombre de millisecondes entier ou décimal ≥ 0 ; la partie décimale est ignorée.
+fn parse_millis(v: &str) -> Option<u64> {
+    let v = v.trim();
+    let (int, frac) = v.split_once('.').unwrap_or((v, "0"));
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    (digits(int) && digits(frac)).then(|| int.parse().unwrap_or(u64::MAX))
+}
+
+/// Date HTTP au format IMF-fixdate (`Wed, 21 Oct 2015 07:28:00 GMT`) ; toute autre forme → `None`.
+fn parse_http_date(v: &str) -> Option<SystemTime> {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let parts: Vec<&str> = v.split(' ').collect();
+    let [day_name, day, month, year, time, "GMT"] = parts[..] else {
+        return None;
+    };
+    let day_name = day_name.strip_suffix(',')?;
+    let weekday = DAYS.iter().position(|d| *d == day_name)? as i64;
+    let month = MONTHS.iter().position(|m| *m == month)? as i64 + 1;
+    let num = |t: &str, len: usize| -> Option<i64> {
+        (t.len() == len && t.bytes().all(|b| b.is_ascii_digit())).then(|| t.parse().ok())?
+    };
+    let (day, year) = (num(day, 2)?, num(year, 4)?);
+    let t: Vec<&str> = time.split(':').collect();
+    let [h, mi, se] = t[..] else {
+        return None;
+    };
+    let (h, mi, se) = (num(h, 2)?, num(mi, 2)?, num(se, 2)?);
+    if !(1..=31).contains(&day) || h > 23 || mi > 59 || se > 60 || year < 1970 {
+        return None;
+    }
+    // Jours depuis 1970-01-01 (calendrier grégorien proleptique).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    if (days + 3).rem_euclid(7) != weekday {
+        return None;
+    }
+    let secs = u64::try_from(days * 86_400 + h * 3600 + mi * 60 + se).ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 /// Gigue dans [0, 1[ : `RandomState` de la bibliothèque standard haché avec un compteur.
@@ -215,6 +275,7 @@ enum Attempt {
     Done(Result<String>),
     Retry {
         error: Error,
+        retry_after_ms: Option<String>,
         retry_after: Option<String>,
         /// Cause dite dans la trace d'attente : `HTTP <code>`, `erreur réseau` ou `lecture interrompue`.
         cause: String,
@@ -281,6 +342,7 @@ fn send_with(
             Attempt::Retry { error, .. } if definitive => return Err(error),
             Attempt::Retry {
                 error,
+                retry_after_ms,
                 retry_after,
                 cause,
                 last,
@@ -290,7 +352,14 @@ fn send_with(
                 if k > MAX_RETRIES {
                     return Err(error);
                 }
-                match retry_delay(k, retry.base, retry_after.as_deref(), jitter()) {
+                match retry_delay(
+                    k,
+                    retry.base,
+                    retry_after_ms.as_deref(),
+                    retry_after.as_deref(),
+                    SystemTime::now(),
+                    jitter(),
+                ) {
                     Some(d) => {
                         if is_stopped(stop) {
                             return Err(error);
@@ -333,7 +402,7 @@ pub fn send_create(
         let failed = |cause: &str| CreateError::Failed {
             cause: cause.into(),
         };
-        let (code, retry_after) = match result {
+        let (code, retry_after_ms, retry_after) = match result {
             Ok(resp) if (300..400).contains(&resp.status()) => {
                 let location = resp.header("location").map(provider_text);
                 return Err(CreateError::Other(redirected(
@@ -378,7 +447,11 @@ pub fn send_create(
                 if !matches!(code, 429 | 503 | 529) {
                     return Err(failed(&format!("HTTP {code}")));
                 }
-                (code, resp.header("retry-after").map(String::from))
+                (
+                    code,
+                    resp.header("retry-after-ms").map(String::from),
+                    resp.header("retry-after").map(String::from),
+                )
             }
             Err(e) if is_timeout(&e) => return Err(failed("délai dépassé")),
             Err(e) => {
@@ -392,7 +465,14 @@ pub fn send_create(
         let delay = if k > MAX_RETRIES || stop.load(Ordering::SeqCst) {
             None
         } else {
-            retry_delay(k, retry.base, retry_after.as_deref(), jitter())
+            retry_delay(
+                k,
+                retry.base,
+                retry_after_ms.as_deref(),
+                retry_after.as_deref(),
+                SystemTime::now(),
+                jitter(),
+            )
         };
         match delay {
             Some(d) if !wait(d, Some(stop)) => {}
@@ -473,6 +553,7 @@ fn read_failure(provider: &str, url: &str, e: &std::io::Error) -> Attempt {
             ) {
                 Attempt::Retry {
                     error,
+                    retry_after_ms: None,
                     retry_after: None,
                     cause: INTERRUPTED_CAUSE.into(),
                     last: true,
@@ -520,12 +601,14 @@ fn attempt(
                 ),
                 Err(sse::SseError::Overloaded) => Attempt::Retry {
                     error: Error::Saturated(format!("erreur de {provider} (HTTP 529) sur {url}")),
+                    retry_after_ms: None,
                     retry_after: None,
                     cause: "HTTP 529".into(),
                     last: false,
                 },
                 Err(sse::SseError::Api) => Attempt::Retry {
                     error: Error::Network(format!("erreur de {provider} (HTTP 500) sur {url}")),
+                    retry_after_ms: None,
                     retry_after: None,
                     cause: "HTTP 500".into(),
                     last: false,
@@ -558,6 +641,7 @@ fn attempt(
             if is_retryable_status(code) {
                 Attempt::Retry {
                     error,
+                    retry_after_ms: resp.header("retry-after-ms").map(String::from),
                     retry_after: resp.header("retry-after").map(String::from),
                     cause: format!("HTTP {code}"),
                     last: false,
@@ -577,6 +661,7 @@ fn attempt(
                 if is_transient(&e) {
                     Attempt::Retry {
                         error,
+                        retry_after_ms: None,
                         retry_after: None,
                         cause: NETWORK_CAUSE.into(),
                         last: false,
@@ -855,12 +940,25 @@ mod tests {
 
     const S: Duration = Duration::from_secs(1);
 
+    /// Mercredi 21 octobre 2015, 07:28:00 GMT.
+    fn now() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_445_412_480)
+    }
+
+    fn delay(k: u32, base: Duration, after: Option<&str>, alea: f64) -> Option<Duration> {
+        retry_delay(k, base, None, after, now(), alea)
+    }
+
+    fn full(ms: Option<&str>, after: Option<&str>) -> Option<Duration> {
+        retry_delay(1, S, ms, after, now(), 1.0)
+    }
+
     #[test]
     fn req052_ac5_delay_is_within_half_and_full_of_exponential_base() {
         for (k, d) in [(1, 1), (2, 2), (3, 4), (4, 8)] {
             let d = Duration::from_secs(d);
             for alea in [0.0, 0.3, 0.999, 1.0] {
-                let w = retry_delay(k, S, None, alea).unwrap();
+                let w = delay(k, S, None, alea).unwrap();
                 assert!(w >= d / 2 && w <= d, "k={k} alea={alea} w={w:?}");
             }
         }
@@ -869,15 +967,15 @@ mod tests {
     #[test]
     fn req052_ac5_delay_is_capped_at_30_seconds() {
         let base = Duration::from_secs(20);
-        let w = retry_delay(4, base, None, 1.0).unwrap();
+        let w = delay(4, base, None, 1.0).unwrap();
         assert_eq!(w, Duration::from_secs(30));
-        let w = retry_delay(4, base, None, 0.0).unwrap();
+        let w = delay(4, base, None, 0.0).unwrap();
         assert_eq!(w, Duration::from_secs(15));
     }
 
     #[test]
     fn req052_ac5_different_sources_give_different_delays() {
-        let differs = (1..=4).any(|k| retry_delay(k, S, None, 0.1) != retry_delay(k, S, None, 0.9));
+        let differs = (1..=4).any(|k| delay(k, S, None, 0.1) != delay(k, S, None, 0.9));
         assert!(differs);
         // La vraie source varie d'un appel à l'autre.
         let draws: Vec<f64> = (0..8).map(|_| jitter()).collect();
@@ -887,37 +985,76 @@ mod tests {
 
     #[test]
     fn req052_ac5_retry_after_seconds_is_respected() {
-        assert_eq!(
-            retry_delay(1, S, Some("7"), 0.5),
-            Some(Duration::from_secs(7))
-        );
-        assert_eq!(retry_delay(3, S, Some("0"), 0.5), Some(Duration::ZERO));
-        assert_eq!(
-            retry_delay(1, S, Some("60"), 0.5),
-            Some(Duration::from_secs(60))
-        );
+        assert_eq!(delay(1, S, Some("7"), 0.5), Some(Duration::from_secs(7)));
+        assert_eq!(delay(3, S, Some("0"), 0.5), Some(Duration::ZERO));
+        assert_eq!(delay(1, S, Some("60"), 0.5), Some(Duration::from_secs(60)));
     }
 
     #[test]
     fn req052_ac5_retry_after_above_60_gives_no_retry() {
-        assert_eq!(retry_delay(1, S, Some("61"), 0.5), None);
-        assert_eq!(retry_delay(1, S, Some("120"), 0.5), None);
+        assert_eq!(delay(1, S, Some("61"), 0.5), None);
+        assert_eq!(delay(1, S, Some("120"), 0.5), None);
     }
 
     #[test]
-    fn req052_ac5_http_date_or_garbage_falls_back_to_computed_delay() {
-        for v in ["Wed, 21 Oct 2026 07:28:00 GMT", "bientôt", "-3", "1.5", ""] {
-            let w = retry_delay(2, S, Some(v), 1.0).unwrap();
+    fn req052_ac5_http_date_follows_req253_and_garbage_falls_back() {
+        let w = delay(2, S, Some("Wed, 21 Oct 2015 07:28:07 GMT"), 1.0);
+        assert_eq!(w, Some(Duration::from_secs(7)));
+        for v in ["bientôt", "-3", "1.5", ""] {
+            let w = delay(2, S, Some(v), 1.0).unwrap();
             assert_eq!(w, Duration::from_secs(2), "{v}");
         }
     }
 
     #[test]
-    fn req052_ac5_zero_base_means_no_wait() {
+    fn req253_ac1_retry_after_ms_is_read_first() {
+        let ms = |v| full(Some(v), None);
+        assert_eq!(ms("250"), Some(Duration::from_millis(250)));
+        assert_eq!(ms("1500.7"), Some(Duration::from_millis(1500)));
+        assert_eq!(ms("0"), Some(Duration::ZERO));
         assert_eq!(
-            retry_delay(4, Duration::ZERO, None, 0.7),
-            Some(Duration::ZERO)
+            full(Some("250"), Some("7")),
+            Some(Duration::from_millis(250))
         );
+        assert_eq!(full(Some("abc"), Some("7")), Some(Duration::from_secs(7)));
+        assert_eq!(full(Some("-5"), None), Some(S));
+        assert_eq!(ms("60000"), Some(Duration::from_secs(60)));
+        assert_eq!(ms("60001"), None);
+        assert_eq!(ms("99999999999999999999999"), None);
+    }
+
+    #[test]
+    fn req253_ac1_imf_fixdate_is_the_date_minus_now() {
+        let d = |v| full(None, Some(v));
+        assert_eq!(
+            d("Wed, 21 Oct 2015 07:28:07 GMT"),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(d("Wed, 21 Oct 2015 07:27:00 GMT"), Some(Duration::ZERO));
+        assert_eq!(d("Wed, 21 Oct 2015 07:29:01 GMT"), None);
+        assert_eq!(
+            d("Wed, 21 Oct 2015 07:29:00 GMT"),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn req253_ac1_other_date_forms_give_the_computed_delay() {
+        for v in [
+            "Wednesday, 21-Oct-15 07:28:07 GMT",
+            "Wed Oct 21 07:28:07 2015",
+            "demain",
+            "Thu, 21 Oct 2015 07:28:07 GMT",
+            "Wed, 21 Oct 2015 07:28:07 UTC",
+        ] {
+            assert_eq!(full(None, Some(v)), Some(S), "{v}");
+        }
+        assert_eq!(full(None, None), Some(S));
+    }
+
+    #[test]
+    fn req052_ac5_zero_base_means_no_wait() {
+        assert_eq!(delay(4, Duration::ZERO, None, 0.7), Some(Duration::ZERO));
     }
 
     #[test]

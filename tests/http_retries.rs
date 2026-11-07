@@ -779,3 +779,77 @@ fn req097_ac4_cut_then_503_gives_one_wait_line_and_http_503_end() {
     let end = &lines[position(&lines, "llm enrich fin")];
     assert!(end.contains("HTTP 503"), "{end}");
 }
+
+fn assert_gap(s: &FakeServer, min_ms: u64, max_ms: u64) {
+    let r = posts(s);
+    assert_eq!(r.len(), 2);
+    let gap = r[1].at - r[0].answered_at.unwrap();
+    assert!(
+        gap >= Duration::from_millis(min_ms) && gap < Duration::from_millis(max_ms),
+        "écart mesuré : {gap:?}"
+    );
+}
+
+#[test]
+fn req253_ac2_retry_after_ms_is_the_wait() {
+    for provider in ["openai", "anthropic"] {
+        let s = FakeServer::start_replies(vec![
+            Reply::with_header(429, "{}", "retry-after-ms", "1200"),
+            good(provider),
+        ]);
+        let env = Env::new(provider, &s);
+        let o = env.run(&["build"], Some("10000"));
+        assert_eq!(o.status.code(), Some(0), "{provider}: {}", text(&o.stderr));
+        assert_gap(&s, 1150, 3000);
+        assert!(env.search_finds_summary(), "{provider}");
+    }
+}
+
+#[test]
+fn req253_ac2_http_date_is_the_wait() {
+    for provider in ["openai", "anthropic"] {
+        let s =
+            FakeServer::start_replies(vec![Reply::retry_after_date(429, "{}", 3), good(provider)]);
+        let env = Env::new(provider, &s);
+        let o = env.run(&["build"], Some("10000"));
+        assert_eq!(o.status.code(), Some(0), "{provider}: {}", text(&o.stderr));
+        assert_gap(&s, 1950, 5000);
+    }
+}
+
+#[test]
+fn req253_ac2_retry_after_ms_120000_gives_no_retry_and_no_wait() {
+    let s = FakeServer::start_replies(vec![
+        Reply::with_header(503, "{}", "retry-after-ms", "120000"),
+        good("openai"),
+    ]);
+    let env = Env::new("openai", &s);
+    let t = Instant::now();
+    let o = env.run(&["build"], None);
+    assert!(t.elapsed() < Duration::from_secs(5));
+    assert_ne!(o.status.code(), Some(0));
+    assert_eq!(posts(&s).len(), 1);
+    assert!(!warnings(&o).is_empty());
+}
+
+#[test]
+fn req253_ac3_wait_line_gives_the_wait_read_and_no_message_names_retry_after() {
+    let s = FakeServer::start_replies(vec![
+        Reply::with_header(429, "{}", "retry-after-ms", "1200"),
+        good("openai"),
+    ]);
+    let env = Env::new("openai", &s);
+    let o = env.run(&["build", "--verbose"], Some("10000"));
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let w = waits(&o);
+    assert_eq!(w.len(), 1, "{w:#?}");
+    let (ms, rest) = wait_parts(&w[0], &format!("{DOC} [1/1]"));
+    assert_eq!(ms, 1200);
+    assert_eq!(rest, "après HTTP 429 (nouvel essai 1/4)");
+    for l in text(&o.stderr)
+        .lines()
+        .filter(|l| l.starts_with("avertissement:") || l.starts_with("erreur:"))
+    {
+        assert!(!l.contains("retry-after"), "{l}");
+    }
+}

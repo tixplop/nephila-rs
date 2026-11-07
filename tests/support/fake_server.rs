@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Réponse programmée du faux serveur.
 #[derive(Debug, Clone)]
@@ -56,6 +56,39 @@ impl Reply {
             delay_ms: 0,
         }
     }
+
+    /// Réponse dont `retry-after` est la date HTTP (IMF-fixdate) `secs` secondes après l'écriture.
+    #[allow(dead_code)]
+    pub fn retry_after_date(status: u16, body: &str, secs: u64) -> Reply {
+        Reply::with_header(status, body, "retry-after", &format!("@date+{secs}"))
+    }
+}
+
+/// Date HTTP au format IMF-fixdate de `t`.
+fn imf_fixdate(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let names = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{}, {day:02} {} {year} {:02}:{:02}:{:02} GMT",
+        names[(days % 7) as usize],
+        months[month as usize - 1],
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -398,7 +431,15 @@ fn serve<S: Read + Write + Send + 'static>(
     if delay_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     }
-    let extra: String = extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+    // `@date+<n>` : date HTTP n secondes après l'écriture de la réponse.
+    let value = |v: &str| match v.strip_prefix("@date+").and_then(|n| n.parse::<u64>().ok()) {
+        Some(n) => imf_fixdate(SystemTime::now() + std::time::Duration::from_secs(n)),
+        None => v.to_string(),
+    };
+    let extra: String = extra
+        .iter()
+        .map(|(k, v)| format!("{k}: {}\r\n", value(v)))
+        .collect();
     let resp = format!(
         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}\
          Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
