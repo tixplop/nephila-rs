@@ -457,7 +457,8 @@ const STREAM_CAP: Duration = Duration::from_secs(3600);
 /// REQ-097) ou erreur réseau définitive.
 fn read_failure(provider: &str, url: &str, e: &std::io::Error) -> Attempt {
     use std::io::ErrorKind::{
-        BrokenPipe, ConnectionAborted, ConnectionReset, TimedOut, UnexpectedEof, WouldBlock,
+        BrokenPipe, ConnectionAborted, ConnectionReset, InvalidInput, TimedOut, UnexpectedEof,
+        WouldBlock,
     };
     match e.kind() {
         TimedOut | WouldBlock => Attempt::Done(Err(Error::Timeout(format!(
@@ -465,9 +466,10 @@ fn read_failure(provider: &str, url: &str, e: &std::io::Error) -> Attempt {
         )))),
         kind => {
             let error = Error::Network(format!("{provider} : lecture de la réponse : {e}"));
+            // `InvalidInput` : le décodeur `chunked` d'ureq refuse un corps coupé en plein flux.
             if matches!(
                 kind,
-                UnexpectedEof | BrokenPipe | ConnectionReset | ConnectionAborted
+                UnexpectedEof | BrokenPipe | ConnectionReset | ConnectionAborted | InvalidInput
             ) {
                 Attempt::Retry {
                     error,

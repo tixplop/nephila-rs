@@ -329,7 +329,11 @@ fn serve_keep_alive<S: Read + Write>(stream: S, rec: &Arc<Mutex<Vec<Recorded>>>,
 }
 
 /// Lit une requête, l'enregistre, écrit la réponse suivante de la file.
-fn serve<S: Read + Write>(mut stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, queue: &Queue) {
+fn serve<S: Read + Write + Send + 'static>(
+    mut stream: S,
+    rec: &Arc<Mutex<Vec<Recorded>>>,
+    queue: &Queue,
+) {
     let mut reader = BufReader::new(&mut stream);
     let Some(req) = read_request(&mut reader) else {
         return;
@@ -367,22 +371,27 @@ fn serve<S: Read + Write>(mut stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, queue:
         }
         Reply::Close => return, // fermeture sans réponse
         Reply::Sse { chunks, cut } => {
-            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                        Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.flush();
-            for (wait_ms, text) in chunks {
-                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-                let framed = format!("{:x}\r\n{text}\r\n", text.len());
-                if stream.write_all(framed.as_bytes()).is_err() || stream.flush().is_err() {
-                    return;
-                }
-            }
-            if !cut {
-                let _ = stream.write_all(b"0\r\n\r\n");
+            // Fil à part : un silence long ne bloque pas les connexions suivantes ; la connexion
+            // est fermée à la fin de l'écriture (ou dès que le client est parti).
+            let rec = rec.clone();
+            std::thread::spawn(move || {
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                            Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(head.as_bytes());
                 let _ = stream.flush();
-            }
-            rec.lock().unwrap()[index].answered_at = Some(Instant::now());
+                for (wait_ms, text) in chunks {
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    let framed = format!("{:x}\r\n{text}\r\n", text.len());
+                    if stream.write_all(framed.as_bytes()).is_err() || stream.flush().is_err() {
+                        return;
+                    }
+                }
+                if !cut {
+                    let _ = stream.write_all(b"0\r\n\r\n");
+                    let _ = stream.flush();
+                }
+                rec.lock().unwrap()[index].answered_at = Some(Instant::now());
+            });
             return;
         }
     };

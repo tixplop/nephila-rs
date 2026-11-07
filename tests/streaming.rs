@@ -78,10 +78,22 @@ impl Fx {
     }
 
     fn with_url(provider: &'static str, server: FakeServer) -> Fx {
+        Fx::with_opts(provider, server, "", 1)
+    }
+
+    /// `extra` : lignes ajoutées à la configuration ; `docs` : nombre de documents Markdown.
+    fn with_opts(provider: &'static str, server: FakeServer, extra: &str, docs: usize) -> Fx {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         fs::create_dir_all(repo.join("docs")).unwrap();
         fs::write(repo.join("docs/d.md"), "# D\n\nTexte du document.\n").unwrap();
+        for i in 2..=docs {
+            fs::write(
+                repo.join(format!("docs/d{i}.md")),
+                format!("# D{i}\n\nTexte {i}.\n"),
+            )
+            .unwrap();
+        }
         fs::write(
             repo.join("Alpha.java"),
             "package p;\npublic class Alpha {}\n",
@@ -91,7 +103,7 @@ impl Fx {
         fs::write(
             &config,
             format!(
-                "provider = \"{provider}\"\nmodel = \"m\"\napi_key_env = \"{KEY_VAR}\"\nbase_url = \"{}\"\nconcurrency = 1\nbatch_files = 1\n",
+                "provider = \"{provider}\"\nmodel = \"m\"\napi_key_env = \"{KEY_VAR}\"\nbase_url = \"{}\"\nconcurrency = 1\nbatch_files = 1\n{extra}",
                 server.base_url
             ),
         )
@@ -106,13 +118,17 @@ impl Fx {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_retry(args, "5")
+    }
+
+    fn run_retry(&self, args: &[&str], retry_base_ms: &str) -> Output {
         Command::new(cargo_bin("nephila"))
             .arg("-C")
             .arg(&self.repo)
             .args(args)
             .env("NEPHILA_CONFIG", &self.config)
             .env(KEY_VAR, "sk-test")
-            .env("NEPHILA_RETRY_BASE_MS", "5")
+            .env("NEPHILA_RETRY_BASE_MS", retry_base_ms)
             .env_remove("NEPHILA_MOCK_DIR")
             .env_remove("NEPHILA_MOCK_LOG")
             .output()
@@ -265,5 +281,309 @@ fn REQ249_AC3_query_ask_sur_un_flux_affiche_la_reponse() {
         let o = fx.run(&["query", "ask", "Alpha"]);
         assert_eq!(o.status.code(), Some(0), "{provider} : {}", err(&o));
         assert!(out(&o).contains("réponse-ask"), "{provider} : {}", out(&o));
+    }
+}
+
+// ---- Silences, erreurs et coupures au milieu d'un flux (REQ-250, REQ-251, REQ-094, T-340) ----
+
+const TIMEOUT_CFG: &str = "timeout_secs = 1\n";
+const E22: &str = "erreur: envoi interrompu : délais dépassés répétés : augmentez timeout_secs ou vérifiez le fournisseur ; 6 fichier(s) à enrichir";
+
+fn lines_of(o: &Output) -> Vec<String> {
+    err(o).lines().map(String::from).collect()
+}
+
+fn warnings_of(o: &Output) -> Vec<String> {
+    lines_of(o)
+        .into_iter()
+        .filter(|l| l.starts_with("avertissement:"))
+        .collect()
+}
+
+fn waits_of(o: &Output) -> Vec<String> {
+    lines_of(o)
+        .into_iter()
+        .filter(|l| l.contains("llm enrich attente"))
+        .collect()
+}
+
+/// Flux conforme dont les `n` premiers événements sont espacés de 400 ms.
+fn slow_sse(provider: &str, n: usize) -> Reply {
+    let Reply::Sse { mut chunks, cut } = sse(provider, &enrichment()) else {
+        unreachable!()
+    };
+    assert!(chunks.len() >= n);
+    for c in chunks.iter_mut().take(n) {
+        c.0 = 400;
+    }
+    Reply::Sse { chunks, cut }
+}
+
+/// Premier événement, puis 5 s de silence, puis la fin du flux.
+fn silent_sse(provider: &str) -> Reply {
+    let Reply::Sse { mut chunks, cut } = sse(provider, &enrichment()) else {
+        unreachable!()
+    };
+    chunks[1].0 = 5000;
+    Reply::Sse { chunks, cut }
+}
+
+fn sse_chunks(provider: &str) -> Vec<(u64, String)> {
+    let Reply::Sse { chunks, .. } = sse(provider, &enrichment()) else {
+        unreachable!()
+    };
+    chunks
+}
+
+#[test]
+fn REQ250_AC1_evenements_reguliers_plus_longs_que_le_delai_total() {
+    for provider in PROVIDERS {
+        // 8 événements à 400 ms : 3,2 s au total pour un délai d'inactivité de 1 s.
+        let server = FakeServer::start_replies(vec![slow_sse(provider, 8)]);
+        let fx = Fx::with_opts(provider, server, TIMEOUT_CFG, 1);
+        let o = fx.run(&["build"]);
+        assert_eq!(o.status.code(), Some(0), "{provider} : {}", err(&o));
+        assert_eq!(fx.bodies().len(), 1, "{provider}");
+        assert_eq!(fx.to_enrich(), 0, "{provider}");
+        assert!(warnings_of(&o).is_empty(), "{provider} : {}", err(&o));
+    }
+}
+
+#[test]
+fn REQ250_AC2_silence_apres_le_premier_evenement_donne_delai_depasse() {
+    for provider in PROVIDERS {
+        let server = FakeServer::start_replies(vec![silent_sse(provider)]);
+        let fx = Fx::with_opts(provider, server, TIMEOUT_CFG, 1);
+        let o = fx.run(&["build"]);
+        let reqs = fx.server.requests();
+        let posts: Vec<_> = reqs.iter().filter(|r| r.method == "POST").collect();
+        assert_eq!(posts.len(), 1, "{provider}");
+        let elapsed = std::time::Instant::now().duration_since(posts[0].at);
+        assert!(elapsed.as_secs_f64() < 3.0, "{provider} : {elapsed:?}");
+        assert_eq!(fx.to_enrich(), 1, "{provider}");
+        let w = warnings_of(&o);
+        assert_eq!(w.len(), 1, "{provider} : {}", err(&o));
+        assert!(w[0].contains("délai dépassé"), "{}", w[0]);
+
+        let server = FakeServer::start_replies(vec![silent_sse(provider)]);
+        let fx = Fx::with_opts(provider, server, TIMEOUT_CFG, 1);
+        assert!(fx.run(&["build", "--no-llm"]).status.success());
+        let o = fx.run(&["query", "ask", "Alpha"]);
+        assert_eq!(o.status.code(), Some(1), "{provider} : {}", err(&o));
+        assert_eq!(fx.bodies().len(), 1, "{provider}");
+        assert!(
+            lines_of(&o)
+                .iter()
+                .any(|l| l.starts_with("erreur:") && l.contains("délai dépassé")),
+            "{provider} : {}",
+            err(&o)
+        );
+    }
+}
+
+#[test]
+fn REQ250_AC6_texte_du_delai_depasse_sans_et_avec_verbose() {
+    let server = FakeServer::start_replies(vec![silent_sse("anthropic")]);
+    let fx = Fx::with_opts("anthropic", server, TIMEOUT_CFG, 1);
+    let o = fx.run(&["build"]);
+    let w = warnings_of(&o);
+    assert_eq!(w.len(), 1, "{}", err(&o));
+    assert!(w[0].starts_with("avertissement: docs/d.md"), "{}", w[0]);
+    assert!(
+        w[0].contains(" : délai dépassé avec anthropic sur "),
+        "{}",
+        w[0]
+    );
+    assert!(w[0].ends_with(" ; augmentez timeout_secs"), "{}", w[0]);
+    assert!(
+        lines_of(&o)
+            .iter()
+            .all(|l| l.starts_with("avertissement:") || l.starts_with("erreur:")),
+        "{}",
+        err(&o)
+    );
+    no_stream_words(&o);
+
+    let server = FakeServer::start_replies(vec![silent_sse("anthropic")]);
+    let fx = Fx::with_opts("anthropic", server, TIMEOUT_CFG, 1);
+    let o = fx.run(&["build", "--verbose"]);
+    let fin: Vec<String> = lines_of(&o)
+        .into_iter()
+        .filter(|l| l.contains("llm enrich fin docs/d.md"))
+        .collect();
+    assert_eq!(fin.len(), 1, "{}", err(&o));
+    assert!(fin[0].contains(" délai dépassé"), "{}", fin[0]);
+}
+
+fn no_stream_words(o: &Output) {
+    for l in lines_of(o) {
+        for w in ["inactivité", "plafond", "flux", "SSE"] {
+            assert!(!l.contains(w), "{w} dans : {l}");
+        }
+    }
+}
+
+#[test]
+fn REQ250_AC6_trois_silences_de_suite_arretent_l_envoi() {
+    let server = FakeServer::start_replies((0..6).map(|_| silent_sse("anthropic")).collect());
+    let fx = Fx::with_opts("anthropic", server, TIMEOUT_CFG, 6);
+    let o = fx.run(&["build"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert_eq!(
+        lines_of(&o).last().map(String::as_str),
+        Some(E22),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(fx.bodies().len(), 3);
+    no_stream_words(&o);
+}
+
+fn error_event(provider: &str, kind: &str) -> String {
+    if provider == "anthropic" {
+        format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{kind}\",\"message\":\"x\"}}}}\n\n")
+    } else {
+        "data: {\"error\": {\"message\": \"x\"}}\n\n".into()
+    }
+}
+
+/// Début de flux, puis l'événement d'erreur, puis la fermeture propre.
+fn error_sse(provider: &str, kind: &str) -> Reply {
+    let mut chunks = sse_chunks(provider);
+    chunks.truncate(1);
+    chunks.push((0, error_event(provider, kind)));
+    Reply::Sse { chunks, cut: false }
+}
+
+#[test]
+fn REQ251_AC1_overloaded_error_en_plein_flux_est_reessaye() {
+    let server = FakeServer::start_replies(vec![
+        error_sse("anthropic", "overloaded_error"),
+        sse("anthropic", &enrichment()),
+    ]);
+    let fx = Fx::with_opts("anthropic", server, "", 1);
+    let o = fx.run_retry(&["build", "--verbose"], "10");
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(fx.bodies().len(), 2);
+    assert_eq!(fx.to_enrich(), 0);
+    let w = waits_of(&o);
+    assert_eq!(w.len(), 1, "{}", err(&o));
+    assert!(
+        w[0].ends_with("après HTTP 529 (nouvel essai 1/4)"),
+        "{}",
+        w[0]
+    );
+
+    // Toujours saturé : 5 requêtes, même avertissement que pour cinq réponses HTTP 529.
+    let server = FakeServer::start_replies(
+        (0..5)
+            .map(|_| error_sse("anthropic", "overloaded_error"))
+            .collect(),
+    );
+    let fx = Fx::with_opts("anthropic", server, "", 1);
+    let o = fx.run_retry(&["build", "--verbose"], "10");
+    assert_eq!(fx.bodies().len(), 5);
+    assert_eq!(fx.to_enrich(), 1);
+    let server = FakeServer::start_replies((0..5).map(|_| Reply::status(529, "{}")).collect());
+    let http = Fx::with_opts("anthropic", server, "", 1);
+    let h = http.run_retry(&["build", "--verbose"], "10");
+    let norm = |o: &Output, fx: &Fx| -> Vec<String> {
+        warnings_of(o)
+            .into_iter()
+            .map(|l| l.replace(&fx.server.base_url, "URL"))
+            .collect()
+    };
+    assert_eq!(norm(&o, &fx).len(), 1, "{}", err(&o));
+    assert_eq!(norm(&o, &fx), norm(&h, &http));
+}
+
+#[test]
+fn REQ251_AC2_api_error_et_erreur_openai_en_plein_flux_sont_reessayees() {
+    for provider in PROVIDERS {
+        let server = FakeServer::start_replies(vec![
+            error_sse(provider, "api_error"),
+            sse(provider, &enrichment()),
+        ]);
+        let fx = Fx::with_opts(provider, server, "", 1);
+        let o = fx.run_retry(&["build", "--verbose"], "10");
+        assert_eq!(o.status.code(), Some(0), "{provider} : {}", err(&o));
+        assert_eq!(fx.bodies().len(), 2, "{provider}");
+        assert_eq!(fx.to_enrich(), 0, "{provider}");
+        let w = waits_of(&o);
+        assert_eq!(w.len(), 1, "{provider} : {}", err(&o));
+        assert!(
+            w[0].ends_with("après HTTP 500 (nouvel essai 1/4)"),
+            "{}",
+            w[0]
+        );
+    }
+}
+
+/// Flux coupé après deux événements (connexion fermée sans la fin du corps).
+fn cut_sse(provider: &str) -> Reply {
+    let mut chunks = sse_chunks(provider);
+    chunks.truncate(2);
+    Reply::Sse { chunks, cut: true }
+}
+
+/// Corps fini proprement, sans `message_stop` (Anthropic) ou sans `finish_reason` ni `[DONE]`.
+fn unfinished_sse(provider: &str) -> Reply {
+    let mut chunks = sse_chunks(provider);
+    let drop = if provider == "anthropic" { 1 } else { 3 };
+    chunks.truncate(chunks.len() - drop);
+    if provider == "openai" {
+        // Le jeton de fin (usage) reste : il n'a ni `finish_reason` ni `[DONE]` avant lui.
+        chunks.push((
+            0,
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":7}}\n\n"
+                .into(),
+        ));
+    }
+    Reply::Sse { chunks, cut: false }
+}
+
+fn check_broken(provider: &'static str, broken: fn(&str) -> Reply) {
+    // Rompu à chaque requête : 2 requêtes, document à enrichir, avertissement, code non nul.
+    let server = FakeServer::start_replies((0..5).map(|_| broken(provider)).collect());
+    let fx = Fx::with_opts(provider, server, "", 1);
+    let o = fx.run_retry(&["build"], "10");
+    assert_eq!(fx.bodies().len(), 2, "{provider} : {}", err(&o));
+    assert_eq!(fx.to_enrich(), 1, "{provider}");
+    assert!(
+        warnings_of(&o)
+            .iter()
+            .any(|l| l.contains("lecture de la réponse")),
+        "{provider} : {}",
+        err(&o)
+    );
+    assert_ne!(o.status.code(), Some(0), "{provider}");
+
+    // Rompu à la première requête seulement.
+    let server = FakeServer::start_replies(vec![broken(provider), sse(provider, &enrichment())]);
+    let fx = Fx::with_opts(provider, server, "", 1);
+    let o = fx.run_retry(&["build", "--verbose"], "10");
+    assert_eq!(o.status.code(), Some(0), "{provider} : {}", err(&o));
+    assert_eq!(fx.bodies().len(), 2, "{provider}");
+    assert_eq!(fx.to_enrich(), 0, "{provider}");
+    let w = waits_of(&o);
+    assert_eq!(w.len(), 1, "{provider} : {}", err(&o));
+    assert!(
+        w[0].ends_with("après lecture interrompue (nouvel essai 1/4)"),
+        "{}",
+        w[0]
+    );
+}
+
+#[test]
+fn REQ251_AC3_flux_coupe_est_reessaye_une_fois() {
+    for provider in PROVIDERS {
+        check_broken(provider, cut_sse);
+    }
+}
+
+#[test]
+fn REQ251_AC3_corps_fini_sans_marque_de_fin_donne_les_memes_constats() {
+    for provider in PROVIDERS {
+        check_broken(provider, unfinished_sse);
     }
 }
