@@ -246,7 +246,8 @@ fn req011_ac4_rename_is_delete_plus_add() {
     fs::rename(env.repo.join(ORDER), env.repo.join(new)).unwrap();
     env.clear_log();
     env.ok("update");
-    assert_eq!(env.logged_paths(), BTreeSet::from([new.to_string()]));
+    // AC-011-4 révisé (REQ-257) : le nouveau chemin reprend l'enrichissement, rien n'est envoyé.
+    assert!(env.log_lines().is_empty(), "{:?}", env.log_lines());
     let order = env
         .store()
         .nodes()
@@ -264,6 +265,216 @@ fn req011_ac4_rename_is_delete_plus_add() {
         .collect();
     assert!(!files.contains(&ORDER.to_string()));
     assert!(files.contains(&new.to_string()));
+}
+
+const ORDER_SUMMARY: &str = r#"{"version":2,"summaries":[{"node":"type:com.acme.domain.Order","summary":"Une commande."}],"concepts":[]}"#;
+
+fn summaries(env: &Env) -> std::collections::BTreeMap<String, String> {
+    env.store()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .filter_map(|n| n.summary.map(|s| (n.id, s)))
+        .collect()
+}
+
+fn to_enrich(env: &Env) -> u64 {
+    let out = env.command("status", &[]).arg("--json").output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["to_enrich"].as_u64().unwrap()
+}
+
+fn rename_order(env: &Env) -> String {
+    let new = "core/src/main/java/com/acme/domain/Order2.java".to_string();
+    fs::rename(env.repo.join(ORDER), env.repo.join(&new)).unwrap();
+    env.clear_log();
+    new
+}
+
+#[test]
+fn req257_ac1_renamed_java_file_keeps_its_enrichment() {
+    let env = Env::maven();
+    env.fixture(ORDER, ORDER_SUMMARY);
+    env.ok("build");
+    assert_eq!(
+        summaries(&env)
+            .get("type:com.acme.domain.Order")
+            .map(String::as_str),
+        Some("Une commande.")
+    );
+    let new = rename_order(&env);
+    env.ok("update");
+    assert!(env.log_lines().is_empty(), "{:?}", env.log_lines());
+    let order = env
+        .store()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.id == "type:com.acme.domain.Order")
+        .unwrap();
+    assert_eq!(order.file.as_deref(), Some(new.as_str()));
+    assert_eq!(order.summary.as_deref(), Some("Une commande."));
+    assert_eq!(to_enrich(&env), 0);
+    let store = env.store();
+    assert!(store.enrichment_entry(&new).unwrap().is_some());
+    assert!(store.enrichment_entry(ORDER).unwrap().is_none());
+}
+
+#[test]
+fn req257_ac1_verbose_counts_the_adopted_enrichment() {
+    let env = Env::maven();
+    env.fixture(ORDER, ORDER_SUMMARY);
+    env.ok("build");
+    rename_order(&env);
+    let out = env
+        .command("update", &[])
+        .arg("--verbose")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let line = stderr(&out)
+        .lines()
+        .find(|l| l.contains("structure: fin"))
+        .unwrap_or_default()
+        .to_string();
+    assert!(line.ends_with(", 1 enrichissements conservés"), "{line}");
+}
+
+const DOC_FIXTURE: &str = r#"{"version":2,"summaries":[{"node":"document:docs/a.md","summary":"Le document."},{"node":"section:docs/a.md#intro","summary":"L'intro."},{"node":"section:docs/a.md#détails","summary":"Les détails."}],"concepts":[{"name":"Idée","summary":"Une idée.","sections":["section:docs/a.md#intro","section:docs/a.md#détails"]}]}"#;
+
+fn doc_env() -> Env {
+    let env = Env::empty();
+    fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
+    env.write("docs/a.md", "# Intro\n\nTexte.\n\n## Détails\n\nSuite.\n");
+    env.fixture("docs/a.md", DOC_FIXTURE);
+    env
+}
+
+fn check_moved_document(env: &Env) {
+    assert!(env.log_lines().is_empty(), "{:?}", env.log_lines());
+    let s = summaries(env);
+    assert_eq!(s["document:guide/a.md"], "Le document.");
+    assert_eq!(s["section:guide/a.md#intro"], "L'intro.");
+    assert_eq!(s["section:guide/a.md#détails"], "Les détails.");
+    let ids = env.node_ids();
+    assert!(ids.contains("concept:idée"));
+    assert!(ids.iter().all(|i| !i.contains("docs/a.md")), "{ids:?}");
+    for sec in ["intro", "détails"] {
+        assert!(env.has_edge(
+            &format!("section:guide/a.md#{sec}"),
+            EdgeKind::Mentions,
+            "concept:idée"
+        ));
+    }
+}
+
+#[test]
+fn req257_ac2_moved_markdown_keeps_summaries_and_concepts_with_update() {
+    let env = doc_env();
+    env.ok("build");
+    assert_eq!(summaries(&env)["document:docs/a.md"], "Le document.");
+    fs::create_dir_all(env.repo.join("guide")).unwrap();
+    fs::rename(env.repo.join("docs/a.md"), env.repo.join("guide/a.md")).unwrap();
+    env.clear_log();
+    env.ok("update");
+    check_moved_document(&env);
+}
+
+#[test]
+fn req257_ac2_moved_markdown_keeps_summaries_and_concepts_with_build() {
+    let env = doc_env();
+    env.ok("build");
+    fs::create_dir_all(env.repo.join("guide")).unwrap();
+    fs::rename(env.repo.join("docs/a.md"), env.repo.join("guide/a.md")).unwrap();
+    env.clear_log();
+    env.ok("build");
+    check_moved_document(&env);
+}
+
+#[test]
+fn req257_ac3_moved_json_and_typescript_keep_summaries() {
+    let env = Env::empty();
+    env.write("conf/x.json", "{\"a\":{\"b\":1},\"c\":2}\n");
+    env.write("src/a.ts", "export class Foo {\n  run() { return 1; }\n}\n");
+    env.fixture(
+        "conf/x.json",
+        r#"{"version":2,"summaries":[{"node":"document:conf/x.json","summary":"La conf."},{"node":"key:conf/x.json#a.b","summary":"La clé b."}],"concepts":[]}"#,
+    );
+    env.fixture(
+        "src/a.ts",
+        r#"{"version":2,"summaries":[{"node":"package:src/a","summary":"Le module."},{"node":"type:src/a.Foo","summary":"La classe."},{"node":"method:src/a.Foo.run","summary":"La méthode."}],"concepts":[]}"#,
+    );
+    env.ok("build");
+    fs::create_dir_all(env.repo.join("etc")).unwrap();
+    fs::create_dir_all(env.repo.join("lib")).unwrap();
+    fs::rename(env.repo.join("conf/x.json"), env.repo.join("etc/x.json")).unwrap();
+    fs::rename(env.repo.join("src/a.ts"), env.repo.join("lib/b.ts")).unwrap();
+    env.clear_log();
+    env.ok("update");
+    assert!(env.log_lines().is_empty(), "{:?}", env.log_lines());
+    let s = summaries(&env);
+    assert_eq!(s["document:etc/x.json"], "La conf.", "{s:?}");
+    // Les nœuds `key:` et `package:` n'ont pas de résumé : ils existent sous leur nouvel identifiant.
+    let ids = env.node_ids();
+    assert!(ids.contains("key:etc/x.json#a.b") && ids.contains("package:lib/b"));
+    assert_eq!(s["type:lib/b.Foo"], "La classe.");
+    assert_eq!(s["method:lib/b.Foo.run"], "La méthode.");
+}
+
+#[test]
+fn req257_ac4_no_adoption_when_content_or_type_differs() {
+    // (a) renommé et modifié dans le même update : envoyé.
+    let env = doc_env();
+    env.ok("build");
+    fs::create_dir_all(env.repo.join("guide")).unwrap();
+    fs::remove_file(env.repo.join("docs/a.md")).unwrap();
+    env.write("guide/a.md", "# Intro\n\nAutre texte.\n");
+    env.clear_log();
+    env.ok("update");
+    assert_eq!(
+        env.logged_paths(),
+        BTreeSet::from(["guide/a.md".to_string()])
+    );
+
+    // (b) copié, l'original gardé : la copie est envoyée.
+    let env = doc_env();
+    env.ok("build");
+    env.write("docs/b.md", "# Intro\n\nTexte.\n\n## Détails\n\nSuite.\n");
+    env.clear_log();
+    env.ok("update");
+    assert_eq!(
+        env.logged_paths(),
+        BTreeSet::from(["docs/b.md".to_string()])
+    );
+
+    // (c) autre type de fichier, même contenu : envoyé.
+    let env = Env::empty();
+    env.write("conf/x.json", "{\"a\":1}\n");
+    env.fixture(
+        "conf/x.json",
+        r#"{"version":2,"summaries":[{"node":"document:conf/x.json","summary":"La conf."}],"concepts":[]}"#,
+    );
+    env.ok("build");
+    fs::rename(env.repo.join("conf/x.json"), env.repo.join("conf/x.yaml")).unwrap();
+    env.clear_log();
+    env.ok("update");
+    assert_eq!(
+        env.logged_paths(),
+        BTreeSet::from(["conf/x.yaml".to_string()])
+    );
+
+    // (d) renommage avec un autre modèle : envoyé une seule fois.
+    let env = doc_env();
+    env.ok("build");
+    fs::write(&env.config, "provider = \"mock\"\nmodel = \"autre\"\n").unwrap();
+    fs::create_dir_all(env.repo.join("guide")).unwrap();
+    fs::rename(env.repo.join("docs/a.md"), env.repo.join("guide/a.md")).unwrap();
+    env.clear_log();
+    env.ok("update");
+    assert_eq!(env.log_lines().len(), 1, "{:?}", env.log_lines());
+    env.clear_log();
+    env.ok("update");
+    assert!(env.log_lines().is_empty(), "{:?}", env.log_lines());
 }
 
 #[test]

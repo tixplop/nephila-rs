@@ -655,6 +655,49 @@ fn export_line(lines: &mut Vec<String>, name: &str, step: &str, raw: &str) {
     lines.push(format!("{name}\t{step}\texport\t0\t{hash}"));
 }
 
+/// Résumés repris lors d'un renommage (REQ-257, DEC-189) : scénario, première étape, nœuds avec
+/// le résumé repris. Le second `build` renvoie ces fichiers au mock, qui n'a pas de réponse pour
+/// le nouveau chemin : ces résumés sont donc absents de l'oracle 0.21.0.
+type Adopted = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+const ADOPTED: &[Adopted] = &[
+    (
+        "inc-data",
+        "10-renommage-de-fichier",
+        &[("table:orders", "Table des commandes.")],
+    ),
+    (
+        "inc-js-mixed",
+        "07-renommage-de-fichier",
+        &[(
+            "type:web/src/api/http.ApiClient",
+            "Client HTTP des commandes.",
+        )],
+    ),
+];
+
+/// Export JSON dont les résumés repris `adopted` sont vérifiés puis mis à `null`.
+fn without_adopted(ctx: &str, raw: &str, adopted: &[(&str, &str)]) -> String {
+    let mut doc: serde_json::Value = serde_json::from_str(raw).expect("export JSON");
+    let nodes = doc["nodes"].as_array_mut().expect("nodes");
+    for (id, summary) in adopted {
+        let node = nodes
+            .iter_mut()
+            .find(|n| n["id"] == *id)
+            .unwrap_or_else(|| panic!("{ctx} : nœud {id} absent de l'export"));
+        assert_eq!(
+            node["summary"].as_str(),
+            Some(*summary),
+            "{ctx} : résumé du nœud {id}"
+        );
+        node["summary"] = serde_json::Value::Null;
+    }
+    serde_json::to_string(&doc).unwrap()
+}
+
 /// Suite `update --no-llm` : égalité avec un `build --no-llm` de l'arbre copié sans `.nephila/`.
 fn suite_no_llm(sc: &Scenario, lines: &mut Vec<String>) -> Vec<String> {
     let mut diffs = Vec::new();
@@ -723,6 +766,15 @@ fn suite_mock(sc: &Scenario, lines: &mut Vec<String>) -> Vec<String> {
         let inc_counts = counts(&String::from_utf8_lossy(&out.stdout), &ctx);
         eprintln!("{ctx} : {inc_counts:?}");
         let (raw, snap) = snapshot(&env, &repo, &ctx);
+        let idx = sc.steps.iter().position(|s| s.name == step.name).unwrap();
+        let adopted: Vec<(&str, &str)> = ADOPTED
+            .iter()
+            .filter(|(n, first, _)| {
+                *n == sc.name && sc.steps.iter().position(|s| s.name == *first) <= Some(idx)
+            })
+            .flat_map(|(_, _, nodes)| nodes.iter().copied())
+            .collect();
+        let raw = without_adopted(&ctx, &raw, &adopted);
         export_line(lines, sc.name, &format!("mock-{}", step.name), &raw);
         let inc = (snap, inc_counts);
 
@@ -800,6 +852,31 @@ fn req070_ac2_oracle_0_21_0() {
             i + 1
         );
     }
+}
+
+#[test]
+fn without_adopted_nulls_only_the_listed_summaries() {
+    let raw = r#"{"nodes":[{"id":"a","summary":"S."},{"id":"b","summary":"T."}],"edges":[]}"#;
+    let out: serde_json::Value =
+        serde_json::from_str(&without_adopted("t", raw, &[("a", "S.")])).unwrap();
+    assert_eq!(out["nodes"][0]["summary"], serde_json::Value::Null);
+    assert_eq!(out["nodes"][1]["summary"], "T.");
+}
+
+#[test]
+#[should_panic(expected = "absent de l'export")]
+fn without_adopted_panics_on_a_missing_node() {
+    without_adopted("t", r#"{"nodes":[]}"#, &[("a", "S.")]);
+}
+
+#[test]
+#[should_panic(expected = "résumé du nœud a")]
+fn without_adopted_panics_on_a_different_summary() {
+    without_adopted(
+        "t",
+        r#"{"nodes":[{"id":"a","summary":"X."}]}"#,
+        &[("a", "S.")],
+    );
 }
 
 #[test]

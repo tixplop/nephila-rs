@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::filter::EnrichScope;
+use crate::filter::{EnrichScope, FileType};
 use crate::llm::enrich::{Concept, Enrichment, PromptVersions};
 
 use crate::error::{Error, Result};
@@ -487,6 +487,9 @@ pub struct Store {
     log: Option<ChangeLog>,
     /// Versions du prompt d'enrichissement par famille (REQ-193) ; remplaçables par les tests.
     prompt_versions: PromptVersions,
+    /// Entrées d'enrichissement orphelines (chemin absent de `files`) : empreinte de contenu →
+    /// chemins triés (REQ-257, DEC-188). Vide tant que `load_orphan_enrichments` n'est pas appelée.
+    orphans: HashMap<String, Vec<String>>,
 }
 
 /// Ce que le stockage retient des écritures faites depuis la dernière passe terminée (DEC-077,
@@ -563,6 +566,7 @@ impl Store {
             stale: true,
             log: None,
             prompt_versions: PromptVersions::CURRENT,
+            orphans: HashMap::new(),
         }
     }
 
@@ -1204,7 +1208,7 @@ impl Store {
             let p: &PreparedStructure = p.borrow();
             let fresh = self.fresh && !self.written.contains(path) && !newly.contains(path);
             if fresh {
-                written.add(write_structure_fresh(&tx, p)?);
+                written.add(write_structure_fresh(&tx, p, &self.orphans)?);
                 newly.insert(path);
                 continue;
             }
@@ -1217,7 +1221,7 @@ impl Store {
                 .map_err(db_err)?
                 .execute([path])
                 .map_err(db_err)?;
-            written.add(reapply_enrichment(&tx, path, &mut touched)?);
+            written.add(reapply_enrichment(&tx, path, &self.orphans, &mut touched)?);
             finish_file(&tx, path, &mut touched)?;
             pending.merge(touched.log);
         }
@@ -1647,6 +1651,31 @@ impl Store {
         }
     }
 
+    /// Garde en mémoire les entrées d'enrichissement orphelines (chemin absent de `files`) :
+    /// empreinte de contenu → chemins triés (REQ-257). À appeler juste avant l'analyse des fichiers.
+    pub fn load_orphan_enrichments(&mut self) -> Result<()> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut st = self
+                .conn
+                .prepare_cached(
+                    "SELECT path, content_hash FROM enrichments
+                     WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = enrichments.path)
+                     ORDER BY path",
+                )
+                .map_err(db_err)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(db_err)?;
+            for row in rows {
+                let (path, hash) = row.map_err(db_err)?;
+                map.entry(hash).or_default().push(path);
+            }
+        }
+        self.orphans = map;
+        Ok(())
+    }
+
     /// Supprime les enrichissements conservés d'un chemin qui n'est plus connu du graphe ou dont
     /// le contenu a changé. Renvoie le nombre d'entrées supprimées.
     pub fn prune_enrichments(&mut self) -> Result<usize> {
@@ -1694,10 +1723,6 @@ impl Store {
             release_file(&tx, path, None, &mut touched)?;
             finish_file(&tx, path, &mut touched)?;
             pending.merge(touched.log);
-            tx.prepare_cached("DELETE FROM enrichments WHERE path = ?1")
-                .map_err(db_err)?
-                .execute([path])
-                .map_err(db_err)?;
             removed += tx
                 .prepare_cached("DELETE FROM files WHERE path = ?1")
                 .map_err(db_err)?
@@ -3729,7 +3754,12 @@ fn apply_enrichment_tx(
 /// Lit l'enrichissement conservé d'un fichier dont la structure vient d'être écrite : son contenu
 /// si l'empreinte est celle du fichier et la charge utile se lit ; une entrée périmée (contenu
 /// différent) ou illisible est supprimée, seule l'illisible est signalée (DEC-114).
-fn load_kept_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<KeptEnrichment> {
+fn load_kept_enrichment(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    orphans: &HashMap<String, Vec<String>>,
+    declared: impl FnOnce() -> Result<std::collections::HashSet<String>>,
+) -> Result<KeptEnrichment> {
     let row: Option<(String, String)> = match tx
         .prepare_cached("SELECT e.content_hash, e.payload FROM enrichments e WHERE e.path = ?1")
         .map_err(db_err)?
@@ -3740,7 +3770,7 @@ fn load_kept_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Ke
         Err(e) => return Err(db_err(e)),
     };
     let Some((entry_hash, json)) = row else {
-        return Ok(KeptEnrichment::Absent);
+        return adopt_orphan(tx, path, orphans, declared);
     };
     let file_hash: String = tx
         .prepare_cached("SELECT hash FROM files WHERE path = ?1")
@@ -3762,6 +3792,122 @@ fn load_kept_enrichment(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Ke
             .map_err(db_err)?;
     }
     Ok(outcome)
+}
+
+/// Identifiant de nœud d'un fichier renommé : réécrit ce qui dérive de l'ancien chemin, par les
+/// fonctions des analyseurs (REQ-257). Les types sans identifiant tiré du chemin sont inchangés.
+fn rewrite_node_id(old: &str, new: &str, file_type: FileType, id: &str) -> String {
+    let Some((kind, qualified)) = id.split_once(':') else {
+        return id.to_string();
+    };
+    let (old_name, new_name, sep) = match file_type {
+        FileType::Markdown | FileType::Sql | FileType::Xml | FileType::Json | FileType::Yaml => (
+            crate::parse::data::doc_path(Path::new(old)),
+            crate::parse::data::doc_path(Path::new(new)),
+            '#',
+        ),
+        FileType::JavaScript | FileType::TypeScript => (
+            crate::parse::js::module_name(Path::new(old)).0,
+            crate::parse::js::module_name(Path::new(new)).0,
+            '.',
+        ),
+        _ => return id.to_string(),
+    };
+    if qualified == old_name {
+        return format!("{kind}:{new_name}");
+    }
+    match qualified
+        .strip_prefix(old_name.as_str())
+        .and_then(|rest| rest.strip_prefix(sep))
+    {
+        Some(rest) => format!("{kind}:{new_name}{sep}{rest}"),
+        None => id.to_string(),
+    }
+}
+
+/// Charge utile d'une entrée orpheline réécrite pour `new`, si tous les identifiants réécrits
+/// (résumés et sources des références) sont déclarés par le nouveau fichier.
+fn rewritten_payload(
+    mut p: Payload,
+    old: &str,
+    new: &str,
+    file_type: FileType,
+    declared: &std::collections::HashSet<String>,
+) -> Option<Payload> {
+    for (id, _) in &mut p.summaries {
+        *id = rewrite_node_id(old, new, file_type, id);
+    }
+    for r in &mut p.refs {
+        r.source = rewrite_node_id(old, new, file_type, &r.source);
+    }
+    let all_declared = p.summaries.iter().all(|(id, _)| declared.contains(id))
+        && p.refs.iter().all(|r| declared.contains(&r.source));
+    all_declared.then_some(p)
+}
+
+/// Reprise (REQ-257) : un fichier sans entrée pour son chemin reprend l'entrée orpheline de même
+/// empreinte et de même type, la première par ordre des chemins qui convient. L'entrée du
+/// nouveau chemin est insérée ; l'appelant la traite ensuite comme un enrichissement conservé.
+fn adopt_orphan(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    orphans: &HashMap<String, Vec<String>>,
+    declared: impl FnOnce() -> Result<std::collections::HashSet<String>>,
+) -> Result<KeptEnrichment> {
+    if orphans.is_empty() {
+        return Ok(KeptEnrichment::Absent);
+    }
+    let Some(file_type) = FileType::of(path) else {
+        return Ok(KeptEnrichment::Absent);
+    };
+    let file_hash: String = tx
+        .prepare_cached("SELECT hash FROM files WHERE path = ?1")
+        .map_err(db_err)?
+        .query_row([path], |r| r.get(0))
+        .map_err(db_err)?;
+    let Some(candidates) = orphans.get(&file_hash) else {
+        return Ok(KeptEnrichment::Absent);
+    };
+    let declared = declared()?;
+    for old in candidates {
+        if FileType::of(old) != Some(file_type) {
+            continue;
+        }
+        let row: Option<(String, i64, String, String)> = match tx
+            .prepare_cached(
+                "SELECT model, prompt_version, language, payload FROM enrichments WHERE path = ?1",
+            )
+            .map_err(db_err)?
+            .query_row([old], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(db_err(e)),
+        };
+        let Some((model, version, language, json)) = row else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Payload>(&json) else {
+            continue;
+        };
+        if payload.v > PAYLOAD_VERSION {
+            continue;
+        }
+        let Some(payload) = rewritten_payload(payload, old, path, file_type, &declared) else {
+            continue;
+        };
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| Error::Message(format!("enrichissement repris non sérialisable : {e}")))?;
+        tx.prepare_cached(
+            "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(db_err)?
+        .execute(params![path, file_hash, model, version, json, language])
+        .map_err(db_err)?;
+        return Ok(KeptEnrichment::Readable(payload));
+    }
+    Ok(KeptEnrichment::Absent)
 }
 
 /// Éléments de l'enrichissement conservé qui ont un nœud correspondant (les autres sont écartés
@@ -3821,9 +3967,17 @@ fn filter_payload(
 fn reapply_enrichment(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
+    orphans: &HashMap<String, Vec<String>>,
     touched: &mut Touched,
 ) -> Result<Kept> {
-    let payload = match load_kept_enrichment(tx, path)? {
+    let declared_set = || {
+        Ok::<_, Error>(
+            declared_by(tx, path)?
+                .into_iter()
+                .collect::<std::collections::HashSet<String>>(),
+        )
+    };
+    let payload = match load_kept_enrichment(tx, path, orphans, declared_set)? {
         KeptEnrichment::Readable(p) => p,
         other => return Ok(Kept::without_payload(&other)),
     };
@@ -3848,13 +4002,19 @@ impl Kept {
 /// Écriture de la structure d'un fichier pas encore écrit sur une base fraîche (DEC-075) : rien
 /// à libérer ni à effacer ; l'enrichissement conservé est fusionné dans les enregistrements avant
 /// leur insertion. Renvoie ce qu'est devenu l'enrichissement conservé du fichier.
-fn write_structure_fresh(tx: &rusqlite::Transaction<'_>, p: &PreparedStructure) -> Result<Kept> {
+fn write_structure_fresh(
+    tx: &rusqlite::Transaction<'_>,
+    p: &PreparedStructure,
+    orphans: &HashMap<String, Vec<String>>,
+) -> Result<Kept> {
     let path = p.path.as_str();
     // Base fraîche : le journal n'est pas tenu (DEC-077 point 1).
     let mut touched = Touched::new(false);
     let mut merged: Option<Vec<Node>> = None;
     let mut kept: Option<(Vec<Node>, Vec<Ref>)> = None;
-    let loaded = load_kept_enrichment(tx, path)?;
+    let loaded = load_kept_enrichment(tx, path, orphans, || {
+        Ok(p.nodes.iter().map(|n| n.id.clone()).collect())
+    })?;
     let unreadable = matches!(loaded, KeptEnrichment::Unreadable);
     if let KeptEnrichment::Readable(payload) = loaded {
         let declared: std::collections::HashSet<String> =
@@ -5346,10 +5506,124 @@ mod tests {
         assert!(st.enrichment_entry("a.md").unwrap().is_some());
         assert_eq!(st.prune_enrichments().unwrap(), 1);
         assert_eq!(st.enrichment_entry("a.md").unwrap(), None);
-        // `remove_file` supprime aussi l'entrée.
+    }
+
+    #[test]
+    fn req257_ac5_remove_file_keeps_the_entry_until_pruned() {
         let (_d, mut st) = enriched_store();
         st.remove_file("a.md").unwrap();
+        assert!(st.enrichment_entry("a.md").unwrap().is_some());
+        assert_eq!(st.prune_enrichments().unwrap(), 1);
         assert_eq!(st.enrichment_entry("a.md").unwrap(), None);
+    }
+
+    /// Orpheline `a.md` (résumé sur `type:p.A`) ; nouveaux fichiers `news` de même empreinte,
+    /// chacun déclarant `declared`. Renvoie le magasin et le nombre de reprises.
+    fn adoption(news: &[&str], declared: &str) -> (tempfile::TempDir, Store, usize) {
+        let (d, mut st) = enriched_store();
+        st.remove_file("a.md").unwrap();
+        let files: Vec<_> = news.iter().map(|p| file(p)).collect();
+        st.insert_pending_files(&files).unwrap();
+        st.load_orphan_enrichments().unwrap();
+        let items: Vec<_> = news
+            .iter()
+            .map(|p| (p.to_string(), vec![ty(declared, p)], vec![]))
+            .collect();
+        let n = st.replace_structures_counted(&items).unwrap();
+        (d, st, n)
+    }
+
+    #[test]
+    fn req257_ac5_orphan_entry_is_adopted_by_a_new_path() {
+        let (_d, mut st, n) = adoption(&["b.md"], "p.A");
+        assert_eq!(n, 1);
+        let e = st.enrichment_entry("b.md").unwrap().unwrap();
+        assert_eq!((e.content_hash.as_str(), e.model.as_str()), ("h", "m"));
+        assert_eq!(e.language, "français");
+        let summary = st
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == "type:p.A")
+            .and_then(|n| n.summary);
+        assert_eq!(summary.as_deref(), Some("résumé"));
+        st.set_enrich_model("m").unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+        assert_eq!(st.prune_enrichments().unwrap(), 1);
+        assert!(st.enrichment_entry("b.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn req257_ac5_no_adoption_when_a_cited_node_is_not_declared() {
+        let (_d, mut st, n) = adoption(&["b.md"], "p.B");
+        assert_eq!(n, 0);
+        assert_eq!(st.enrichment_entry("b.md").unwrap(), None);
+        st.set_enrich_model("m").unwrap();
+        assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+    }
+
+    #[test]
+    fn req257_ac5_one_orphan_serves_two_new_files() {
+        let (_d, st, n) = adoption(&["b.md", "c.md"], "p.A");
+        assert_eq!(n, 2);
+        assert!(st.enrichment_entry("b.md").unwrap().is_some());
+        assert!(st.enrichment_entry("c.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn req257_ac5_no_adoption_across_file_types() {
+        let (_d, st, n) = adoption(&["b.json"], "p.A");
+        assert_eq!(n, 0);
+        assert_eq!(st.enrichment_entry("b.json").unwrap(), None);
+    }
+
+    #[test]
+    fn req257_ac5_rewrite_follows_the_analyzers() {
+        use crate::parse::{extract, ParseCtx};
+        let ids = |path: &str, text: &str| -> Vec<String> {
+            extract(Path::new(path), text, &ParseCtx::default())
+                .unwrap()
+                .declares
+                .iter()
+                .map(|d| d.id())
+                .collect()
+        };
+        let cases = [
+            ("docs/a.md", "guide/a.md", "# Intro\n\nx\n\n## Suite\n\ny\n"),
+            ("conf/x.json", "etc/x.json", "{\"a\":{\"b\":1}}\n"),
+            (
+                "src/a.ts",
+                "lib/b.ts",
+                "export class Foo {\n  run() { return 1; }\n}\n",
+            ),
+        ];
+        for (old, new, text) in cases {
+            let file_type = FileType::of(old).unwrap();
+            let (before, after) = (ids(old, text), ids(new, text));
+            assert!(before.len() >= 2, "{before:?}");
+            for (b, a) in before.iter().zip(&after) {
+                assert_eq!(&rewrite_node_id(old, new, file_type, b), a);
+            }
+        }
+        let md = FileType::Markdown;
+        for unchanged in [
+            "document:docs/a.mdx",
+            "section:docs/a.md2#x",
+            "concept:Idée",
+        ] {
+            assert_eq!(
+                rewrite_node_id("docs/a.md", "guide/a.md", md, unchanged),
+                unchanged
+            );
+        }
+        assert_eq!(
+            rewrite_node_id("docs/a.md", "guide/a.md", md, "section:docs/a.md#intro-1"),
+            "section:guide/a.md#intro-1"
+        );
+        assert_eq!(
+            rewrite_node_id("Foo.java", "Bar.java", FileType::Java, "type:Foo"),
+            "type:Foo"
+        );
     }
 
     #[test]
@@ -6867,6 +7141,9 @@ mod tests {
         }
         assert_eq!(removal_dump(&grouped), removal_dump(&single));
         assert_eq!(grouped.remove_files(&[]).unwrap(), 0);
+        // REQ-257 : `remove_files` garde l'entrée, la purge de fin de commande la retire.
+        assert!(grouped.enrichment_entry("d02.md").unwrap().is_some());
+        grouped.prune_enrichments().unwrap();
         assert!(grouped.enrichment_entry("d02.md").unwrap().is_none());
     }
 

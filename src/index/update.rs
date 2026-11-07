@@ -243,6 +243,7 @@ pub fn update_with_dry_run(
     // un échec ou une interruption les laisse repérables par le prochain update.
     let records: Vec<FileRecord> = todo.iter().map(|f| record(f, FileState::Pending)).collect();
     store.insert_files(&records)?;
+    store.load_orphan_enrichments()?;
 
     let mut report = BuildReport {
         excluded: matcher.is_active().then_some(d.excluded),

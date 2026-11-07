@@ -678,6 +678,7 @@ fn build_impl(
         matcher.trace_suffix(scanned.excluded)
     );
     store.reset_with_pending_files(&records)?;
+    store.load_orphan_enrichments()?;
     if let Some(llm) = llm {
         store.set_enrich_model(llm.model())?;
         store.set_enrich_language(llm.summary_language())?;
