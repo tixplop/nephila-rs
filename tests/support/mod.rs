@@ -189,3 +189,87 @@ pub fn export_fingerprint(raw: &[u8]) -> String {
         .to_hex()
         .to_string()
 }
+
+/// Découpe `text` en `parts` morceaux au plus, sur des frontières de caractères.
+fn split_text(text: &str, parts: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let size = chars.len().div_ceil(parts.max(1)).max(1);
+    chars.chunks(size).map(|c| c.iter().collect()).collect()
+}
+
+fn event(name: &str, data: serde_json::Value) -> (u64, String) {
+    (0, format!("event: {name}\ndata: {data}\n\n"))
+}
+
+/// Flux SSE Anthropic (REQ-249, AC-249-2) : `message_start` (`usage` 10 entrées), bloc `thinking`
+/// à deux `thinking_delta`, `ping`, bloc `text` en `parts` `text_delta`, `message_delta`
+/// (`end_turn`, 7 sorties), `message_stop`.
+pub fn anthropic_sse(text: &str, parts: usize) -> Vec<(u64, String)> {
+    use serde_json::json;
+    let mut v = vec![
+        event(
+            "message_start",
+            json!({"type":"message_start","message":{"id":"m","role":"assistant","content":[],
+                "usage":{"input_tokens":10,"output_tokens":1}}}),
+        ),
+        event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        ),
+    ];
+    for t in ["je réfléchis ", "puis je réponds"] {
+        v.push(event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":t}}),
+        ));
+    }
+    v.push(event(
+        "content_block_stop",
+        json!({"type":"content_block_stop","index":0}),
+    ));
+    v.push(event("ping", json!({"type":"ping"})));
+    v.push(event(
+        "content_block_start",
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+    ));
+    for t in split_text(text, parts) {
+        v.push(event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":t}}),
+        ));
+    }
+    v.push(event(
+        "content_block_stop",
+        json!({"type":"content_block_stop","index":1}),
+    ));
+    v.push(event(
+        "message_delta",
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}),
+    ));
+    v.push(event("message_stop", json!({"type":"message_stop"})));
+    v
+}
+
+/// Flux SSE OpenAI (REQ-249, AC-249-3) : morceau `role`, `parts` morceaux `delta.content`,
+/// morceau `finish_reason` `stop`, morceau `usage` (10 entrées, 7 sorties) à `choices` vide,
+/// `data: [DONE]`.
+pub fn openai_sse(text: &str, parts: usize) -> Vec<(u64, String)> {
+    use serde_json::json;
+    let data = |v: serde_json::Value| (0, format!("data: {v}\n\n"));
+    let mut v = vec![data(
+        json!({"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
+    )];
+    for t in split_text(text, parts) {
+        v.push(data(
+            json!({"choices":[{"index":0,"delta":{"content":t},"finish_reason":null}]}),
+        ));
+    }
+    v.push(data(
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ));
+    v.push(data(
+        json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":7}}),
+    ));
+    v.push((0, "data: [DONE]\n\n".into()));
+    v
+}

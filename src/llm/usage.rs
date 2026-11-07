@@ -172,6 +172,42 @@ pub(crate) fn fake_server(replies: Vec<(u16, String)>) -> String {
     recording_server(replies, 0).0
 }
 
+/// Faux serveur qui répond toujours 200 en `text/event-stream` avec `body` (flux SSE complet).
+#[cfg(test)]
+pub(crate) fn sse_server(body: String) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { return };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if s.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let text = String::from_utf8_lossy(&head).to_lowercase();
+            let len: usize = text
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let _ = s.read_exact(&mut vec![0u8; len]);
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    base
+}
+
 /// Comme `fake_server`, et rend aussi les corps reçus, dans l'ordre d'arrivée. Les `hold`
 /// premières requêtes sont lues toutes avant que la première réponse parte (appels simultanés).
 #[cfg(test)]

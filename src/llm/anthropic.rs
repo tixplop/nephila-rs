@@ -339,10 +339,12 @@ impl Complete for AnthropicLlm {
         let send = |with_schema: bool| {
             let schema = with_schema.then(|| reply.schema());
             let format = schema.as_ref().map(|s| (reply.name(), s));
-            let body = request_body(&self.model, &self.gen, &system, &user, format);
+            let mut body = request_body(&self.model, &self.gen, &system, &user, format);
             if let Some(collector) = &self.collector {
                 return collector.exchange(&body, stats);
             }
+            // Réponse reçue en flux (REQ-249) ; le mode lot ne passe pas ici.
+            body["stream"] = serde_json::json!(true);
             http::send(
                 "anthropic",
                 self.request("POST", "/v1/messages"),
@@ -639,6 +641,91 @@ mod tests {
         }
     }
 
+    fn event(name: &str, data: serde_json::Value) -> String {
+        format!("event: {name}\ndata: {data}\n\n")
+    }
+
+    /// Flux Anthropic : texte en deux deltas (s'il y en a un), `stop_reason`, fin.
+    fn stream(text: Option<&str>, stop: &str) -> String {
+        let mut s = event(
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}),
+        );
+        if let Some(t) = text {
+            s += &event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            );
+            let (a, b) = t.split_at(1);
+            for part in [a, b] {
+                s += &event(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":part}}),
+                );
+            }
+        }
+        s += &event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":3}}),
+        );
+        s + &event("message_stop", json!({"type":"message_stop"}))
+    }
+
+    #[test]
+    fn req249_ac4_stream_max_tokens_is_truncated_with_the_received_text() {
+        let l = llm(crate::llm::usage::sse_server(stream(
+            Some("abc"),
+            "max_tokens",
+        )));
+        let stats = CallStats::default();
+        let e = l
+            .complete(None, None, &stats, "s".into(), "u".into(), Reply::File)
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Truncated { message: m, partial } if m == TRUNCATED && partial == "abc"),
+            "{e:?}"
+        );
+        assert_eq!(stats.usage().map(|u| (u.input, u.output)), Some((10, 3)));
+    }
+
+    #[test]
+    fn req249_ac4_stream_without_text_block_is_the_format_error() {
+        let l = llm(crate::llm::usage::sse_server(stream(None, "end_turn")));
+        let e = l
+            .complete(
+                None,
+                None,
+                &CallStats::default(),
+                "s".into(),
+                "u".into(),
+                Reply::File,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Format(m) if m == "réponse de anthropic sans bloc texte"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn req249_ac4_complete_stream_gives_the_text() {
+        let l = llm(crate::llm::usage::sse_server(stream(
+            Some("abc"),
+            "end_turn",
+        )));
+        let t = l
+            .complete(
+                None,
+                None,
+                &CallStats::default(),
+                "s".into(),
+                "u".into(),
+                Reply::File,
+            )
+            .unwrap();
+        assert_eq!(t, "abc");
+    }
+
     #[test]
     fn req202_ac4_corps_anthropic_avec_schema() {
         let schema = crate::llm::schema::file();
@@ -713,6 +800,13 @@ mod tests {
         request_body("m", &gen(false, Effort::Low, 100), "s", "u", format).to_string()
     }
 
+    /// Corps attendu d'un appel direct : celui du lot, plus `stream` (REQ-249).
+    fn live_body(with_schema: bool) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&expected_body(with_schema)).unwrap();
+        v["stream"] = serde_json::json!(true);
+        v.to_string()
+    }
+
     fn same_json(a: &str, b: &str) -> bool {
         serde_json::from_str::<serde_json::Value>(a).unwrap()
             == serde_json::from_str::<serde_json::Value>(b).unwrap()
@@ -742,9 +836,9 @@ mod tests {
         }
         let b = bodies.lock().unwrap();
         assert_eq!(b.len(), 4);
-        assert!(same_json(&b[0], &expected_body(true)));
+        assert!(same_json(&b[0], &live_body(true)));
         for later in &b[1..] {
-            assert!(same_json(later, &expected_body(false)), "{later}");
+            assert!(same_json(later, &live_body(false)), "{later}");
         }
         assert_ne!(expected_body(true), expected_body(false));
     }
@@ -826,8 +920,8 @@ mod tests {
         assert_eq!(call(&l, &CallStats::default()).unwrap(), "x");
         let b = bodies.lock().unwrap();
         assert_eq!(b.len(), 5);
-        assert!(b[..2].iter().all(|x| same_json(x, &expected_body(true))));
-        assert!(b[2..].iter().all(|x| same_json(x, &expected_body(false))));
+        assert!(b[..2].iter().all(|x| same_json(x, &live_body(true))));
+        assert!(b[2..].iter().all(|x| same_json(x, &live_body(false))));
     }
 
     #[test]

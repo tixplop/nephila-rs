@@ -460,7 +460,7 @@ fn REQ157_AC4_anthropic_corps_de_la_requete() {
         no_fields(&b, &["thinking"]);
         let b = body(m, "effort = \"default\"\n");
         no_fields(&b, &["thinking", "output_config"]);
-        assert_eq!(b.as_object().unwrap().len(), 4, "{which}");
+        assert_eq!(b.as_object().unwrap().len(), 5, "{which}");
         let b = body(m, "thinking = true\n");
         assert_eq!(b["thinking"], serde_json::json!({"type": "adaptive"}));
         assert_eq!(b["output_config"], serde_json::json!({"effort": "low"}));
@@ -469,7 +469,7 @@ fn REQ157_AC4_anthropic_corps_de_la_requete() {
         assert_eq!(b["output_config"], serde_json::json!({"effort": "high"}));
         let b = body("claude-sonnet-4-5", "");
         no_fields(&b, &["thinking", "output_config"]);
-        assert_eq!(b.as_object().unwrap().len(), 4, "{which}");
+        assert_eq!(b.as_object().unwrap().len(), 5, "{which}");
     }
     check_seen(14);
 }
@@ -495,7 +495,7 @@ fn REQ157_AC5_openai_corps_de_la_requete() {
                 "output_config",
             ],
         );
-        assert_eq!(b.as_object().unwrap().len(), 3);
+        assert_eq!(b.as_object().unwrap().len(), 5);
         assert_eq!(
             body("max_output_tokens = 1234\n")["max_completion_tokens"],
             1234
@@ -508,7 +508,7 @@ fn REQ157_AC5_openai_corps_de_la_requete() {
         ] {
             let b = body(extra);
             no_fields(&b, &["reasoning_effort"]);
-            assert_eq!(b.as_object().unwrap().len(), 3, "{extra}");
+            assert_eq!(b.as_object().unwrap().len(), 5, "{extra}");
         }
         assert_eq!(body("thinking = true\n")["reasoning_effort"], "low");
         assert_eq!(

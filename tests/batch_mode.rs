@@ -450,7 +450,14 @@ fn sync_bodies(provider: &'static str, names: &[&str], extra: &str) -> Vec<Value
         .requests()
         .into_iter()
         .filter(|r| r.method == "POST" && r.path == p)
-        .map(|r| serde_json::from_str(&r.body).unwrap())
+        .map(|r| {
+            // Le synchrone demande un flux (REQ-249) ; le lot non : seul écart permis.
+            let mut b: Value = serde_json::from_str(&r.body).unwrap();
+            assert_eq!(b["stream"], json!(true), "{b}");
+            b.as_object_mut().unwrap().remove("stream");
+            b.as_object_mut().unwrap().remove("stream_options");
+            b
+        })
         .collect()
 }
 

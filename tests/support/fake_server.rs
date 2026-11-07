@@ -18,6 +18,13 @@ pub enum Reply {
         headers: Vec<(String, String)>,
         delay_ms: u64,
     },
+    /// Réponse `text/event-stream` à corps `chunked`, `Connection: close` : chaque morceau
+    /// `(attente en ms avant l'écriture, texte)` est écrit et vidé seul. `cut` : fermeture
+    /// sans le dernier morceau de fin du corps `chunked` (coupure au milieu du flux).
+    Sse {
+        chunks: Vec<(u64, String)>,
+        cut: bool,
+    },
     /// Ferme la connexion sans répondre (après lecture de la requête).
     Close,
     /// En-tête `Content-Length: <declared_len>`, puis `sent` octets du corps, puis fermeture.
@@ -359,6 +366,25 @@ fn serve<S: Read + Write>(mut stream: S, rec: &Arc<Mutex<Vec<Recorded>>>, queue:
             return; // fermeture avant la fin du corps
         }
         Reply::Close => return, // fermeture sans réponse
+        Reply::Sse { chunks, cut } => {
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                        Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+            for (wait_ms, text) in chunks {
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                let framed = format!("{:x}\r\n{text}\r\n", text.len());
+                if stream.write_all(framed.as_bytes()).is_err() || stream.flush().is_err() {
+                    return;
+                }
+            }
+            if !cut {
+                let _ = stream.write_all(b"0\r\n\r\n");
+                let _ = stream.flush();
+            }
+            rec.lock().unwrap()[index].answered_at = Some(Instant::now());
+            return;
+        }
     };
     if delay_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));

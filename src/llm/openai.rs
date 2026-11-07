@@ -348,10 +348,13 @@ impl Complete for OpenAiLlm {
         let send = |with_schema: bool| {
             let schema = with_schema.then(|| reply.schema());
             let format = schema.as_ref().map(|s| (reply.name(), s));
-            let body = request_body(&self.model, &self.gen, &system, &user, format);
+            let mut body = request_body(&self.model, &self.gen, &system, &user, format);
             if let Some(collector) = &self.collector {
                 return collector.exchange(&body, stats);
             }
+            // Réponse reçue en flux (REQ-249) ; le mode lot ne passe pas ici.
+            body["stream"] = serde_json::json!(true);
+            body["stream_options"] = serde_json::json!({"include_usage": true});
             http::send(
                 "openai",
                 self.request("POST", "/v1/chat/completions"),
@@ -565,6 +568,63 @@ mod tests {
         }
     }
 
+    /// Flux OpenAI : texte en deux morceaux (s'il y en a un), `finish_reason`, `usage`, `[DONE]`.
+    fn stream(text: Option<&str>, finish: &str) -> String {
+        let data = |v: serde_json::Value| format!("data: {v}\n\n");
+        let mut s = data(serde_json::json!({"choices":[{"delta":{"role":"assistant"}}]}));
+        if let Some(t) = text {
+            let (a, b) = t.split_at(1);
+            for part in [a, b] {
+                s += &data(serde_json::json!({"choices":[{"delta":{"content":part}}]}));
+            }
+        }
+        s += &data(serde_json::json!({"choices":[{"delta":{},"finish_reason":finish}]}));
+        s += &data(
+            serde_json::json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3}}),
+        );
+        s + "data: [DONE]\n\n"
+    }
+
+    fn streamed(body: String) -> (Result<String>, CallStats) {
+        let l = OpenAiLlm::new(
+            Some(crate::llm::usage::sse_server(body)),
+            "m".into(),
+            None,
+            10,
+            &Tls::default(),
+            1,
+            gen(false, Effort::Low, false, 100),
+        );
+        let stats = CallStats::default();
+        let r = l.complete(None, None, &stats, "s".into(), "u".into(), Reply::File);
+        (r, stats)
+    }
+
+    #[test]
+    fn req249_ac4_stream_length_is_truncated_with_the_received_text() {
+        let (r, stats) = streamed(stream(Some("abc"), "length"));
+        assert!(
+            matches!(&r, Err(Error::Truncated { message: m, partial }) if m == TRUNCATED && partial == "abc"),
+            "{r:?}"
+        );
+        assert_eq!(stats.usage().map(|u| (u.input, u.output)), Some((10, 3)));
+    }
+
+    #[test]
+    fn req249_ac4_stream_without_content_is_the_format_error() {
+        let (r, _) = streamed(stream(None, "stop"));
+        assert!(
+            matches!(&r, Err(Error::Format(m)) if m == "réponse de openai sans message"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn req249_ac4_complete_stream_gives_the_text() {
+        let (r, _) = streamed(stream(Some("abc"), "stop"));
+        assert_eq!(r.unwrap(), "abc");
+    }
+
     #[test]
     fn req202_ac4_corps_openai_avec_schema() {
         for (name, schema) in [
@@ -612,6 +672,14 @@ mod tests {
         request_body("m", &gen(false, Effort::Low, false, 100), "s", "u", format).to_string()
     }
 
+    /// Corps attendu d'un appel direct : celui du lot, plus `stream` (REQ-249).
+    fn live_body(with_schema: bool) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&expected_body(with_schema)).unwrap();
+        v["stream"] = serde_json::json!(true);
+        v["stream_options"] = serde_json::json!({"include_usage": true});
+        v.to_string()
+    }
+
     fn same_json(a: &str, b: &str) -> bool {
         serde_json::from_str::<serde_json::Value>(a).unwrap()
             == serde_json::from_str::<serde_json::Value>(b).unwrap()
@@ -641,9 +709,9 @@ mod tests {
         }
         let b = bodies.lock().unwrap();
         assert_eq!(b.len(), 4);
-        assert!(same_json(&b[0], &expected_body(true)));
+        assert!(same_json(&b[0], &live_body(true)));
         for later in &b[1..] {
-            assert!(same_json(later, &expected_body(false)), "{later}");
+            assert!(same_json(later, &live_body(false)), "{later}");
         }
         assert_ne!(expected_body(true), expected_body(false));
     }
@@ -725,8 +793,8 @@ mod tests {
         assert_eq!(call(&l, &CallStats::default()).unwrap(), "x");
         let b = bodies.lock().unwrap();
         assert_eq!(b.len(), 5);
-        assert!(b[..2].iter().all(|x| same_json(x, &expected_body(true))));
-        assert!(b[2..].iter().all(|x| same_json(x, &expected_body(false))));
+        assert!(b[..2].iter().all(|x| same_json(x, &live_body(true))));
+        assert!(b[2..].iter().all(|x| same_json(x, &live_body(false))));
     }
 
     #[test]

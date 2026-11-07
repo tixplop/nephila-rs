@@ -234,7 +234,7 @@ fn serve(
             declared_len,
             sent,
         } => (status, "x".repeat(sent), vec![], declared_len),
-        Reply::Close => return, // connexion fermée sans réponse
+        Reply::Close | Reply::Sse { .. } => return, // connexion fermée sans réponse
     };
     let extra: String = extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
     let head = format!(

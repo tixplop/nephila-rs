@@ -92,7 +92,10 @@ fn client_config(tls: &Tls) -> Arc<rustls::ClientConfig> {
     Arc::new(config)
 }
 
-/// Agent HTTP ; `timeout_secs` borne la durée totale d'une requête. Il garde au moins
+/// Agent HTTP ; `timeout_secs` est le délai maximal sans octet reçu (`timeout_read`) ni envoyé
+/// (`timeout_write`) : une réponse qui continue d'arriver n'est pas coupée (REQ-250). Pas de
+/// `.timeout(d)` : en ureq 2 il a priorité sur les délais de lecture et d'écriture et bornerait la
+/// durée totale (DEC-185) ; le plafond d'un flux est vérifié par `sse::read_body`. Il garde au moins
 /// `concurrency` connexions inactives par hôte (et au moins 100 au total), pour que chaque fil
 /// d'une commande réutilise une connexion établie (REQ-053).
 pub fn agent(timeout_secs: u64, concurrency: usize, tls: &Tls) -> ureq::Agent {
@@ -101,7 +104,8 @@ pub fn agent(timeout_secs: u64, concurrency: usize, tls: &Tls) -> ureq::Agent {
         .max_idle_connections(concurrency.max(100))
         .tls_config(client_config(tls))
         .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(timeout_secs))
+        .timeout_read(Duration::from_secs(timeout_secs))
+        .timeout_write(Duration::from_secs(timeout_secs))
         // Aucune redirection suivie (REQ-092, DEC-100) : ni requête ni clé vers une autre adresse.
         .redirects(0)
         .build()
@@ -1104,7 +1108,7 @@ mod tests {
         const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/");
         const THREADS: usize = 4;
 
-        fn serve<S: Read + Write>(mut stream: S, arrived: &(Mutex<usize>, Condvar)) {
+        fn serve<S: Read + Write>(mut stream: S, arrived: &(Mutex<usize>, Condvar), sse: bool) {
             loop {
                 let mut head = Vec::new();
                 let mut byte = [0u8; 1];
@@ -1133,18 +1137,34 @@ mod tests {
                         n = cv.wait(n).unwrap();
                     }
                 }
-                let reply = "{}";
-                let out = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
-                    reply.len()
-                );
+                let out = if sse {
+                    // Flux OpenAI complet, corps `chunked` : un morceau par ligne de flux.
+                    let events = [
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    ];
+                    let mut out = String::from(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                    );
+                    for e in events {
+                        out += &format!("{:x}\r\n{e}\r\n", e.len());
+                    }
+                    out + "0\r\n\r\n"
+                } else {
+                    let reply = "{}";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                };
                 if stream.write_all(out.as_bytes()).is_err() || stream.flush().is_err() {
                     return;
                 }
             }
         }
 
-        fn server(tls: bool) -> (String, Arc<AtomicUsize>) {
+        fn server(tls: bool, sse: bool) -> (String, Arc<AtomicUsize>) {
             use rustls::pki_types::PrivateKeyDer;
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1177,7 +1197,7 @@ mod tests {
                     std::thread::spawn(move || match cfg {
                         None => {
                             counted.fetch_add(1, Ordering::SeqCst);
-                            serve(stream, &arrived)
+                            serve(stream, &arrived, sse)
                         }
                         Some(cfg) => {
                             let Ok(conn) = rustls::ServerConnection::new(cfg) else {
@@ -1191,7 +1211,7 @@ mod tests {
                                 }
                             }
                             counted.fetch_add(1, Ordering::SeqCst);
-                            serve(s, &arrived)
+                            serve(s, &arrived, sse)
                         }
                     });
                 }
@@ -1201,8 +1221,8 @@ mod tests {
         }
 
         /// `THREADS` fils : une requête, puis (une fois les réponses toutes lues) une seconde.
-        fn connections_for(tls: bool) -> usize {
-            let (url, conns) = server(tls);
+        fn connections_for(tls: bool, sse: bool) -> usize {
+            let (url, conns) = server(tls, sse);
             let settings = Tls {
                 ca_certs: if tls {
                     CertificateDer::pem_slice_iter(
@@ -1247,12 +1267,18 @@ mod tests {
 
         #[test]
         fn req053_ac2_idle_pool_keeps_one_connection_per_thread() {
-            assert_eq!(connections_for(false), THREADS);
+            assert_eq!(connections_for(false, false), THREADS);
         }
 
         #[test]
         fn req053_ac3_idle_pool_keeps_one_tls_connection_per_thread() {
-            assert_eq!(connections_for(true), THREADS);
+            assert_eq!(connections_for(true, false), THREADS);
+        }
+
+        #[test]
+        fn req249_ac6_chunked_event_stream_keeps_one_connection_per_thread() {
+            assert_eq!(connections_for(false, true), THREADS);
+            assert_eq!(connections_for(true, true), THREADS);
         }
     }
 
