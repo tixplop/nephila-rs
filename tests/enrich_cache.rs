@@ -1713,3 +1713,90 @@ fn req241_ac6_data_family_version_9_graph_reenriches_only_data_files() {
     assert_eq!(text(&again.stdout), "graphe à jour\n");
     assert!(env.logged().is_empty(), "{:?}", env.logged());
 }
+
+const MARK: &str = "marque-origine";
+const SVC_TYPE: &str = "type:com.acme.core.OrderService";
+
+/// Marque en SQL le résumé du type de `path` dans la charge utile de ses entrées du modèle `model`.
+fn mark_payload(env: &Env, path: &str, model: &str) {
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let (rowid, json): (i64, String) = conn
+        .query_row(
+            "SELECT rowid, payload FROM enrichments WHERE path = ?1 AND model = ?2",
+            [path, model],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let pair = v["summaries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p[0] == SVC_TYPE)
+        .expect("résumé du type");
+    pair[1] = MARK.into();
+    conn.execute(
+        "UPDATE enrichments SET payload = ?2 WHERE rowid = ?1",
+        rusqlite::params![rowid, v.to_string()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn req258_ac4_returning_to_original_content_reapplies_its_entry_without_call() {
+    for verb in ["update", "build"] {
+        let env = Env::new();
+        env.ok(&["build"]);
+        mark_payload(&env, SVC, "mock");
+        let original = fs::read_to_string(env.repo.join(SVC)).unwrap();
+        env.write(SVC, &format!("{original}\n// autre branche\n"));
+        env.ok(&["update"]);
+        assert_eq!(
+            env.logged_paths(),
+            BTreeSet::from([SVC.to_string()]),
+            "{verb}"
+        );
+        assert_ne!(summary_of(&env, SVC_TYPE).as_deref(), Some(MARK));
+
+        env.write(SVC, &original);
+        env.ok(&[verb]);
+        assert!(env.logged().is_empty(), "{verb} : {:?}", env.logged());
+        assert_eq!(to_enrich(&env), 0, "{verb}");
+        assert_eq!(summary_of(&env, SVC_TYPE).as_deref(), Some(MARK), "{verb}");
+    }
+}
+
+#[test]
+fn req258_ac5_returning_to_previous_model_or_language_reapplies_entry_without_call() {
+    for verb in ["update", "build"] {
+        for language in [false, true] {
+            let env = Env::new();
+            env.ok(&["build"]);
+            mark_payload(&env, SVC, "mock");
+            let files = all_paths(&env);
+            if language {
+                set_personal_language(&env, "anglais");
+            } else {
+                set_personal_model(&env, "autre");
+            }
+            env.ok(&["update"]);
+            assert_eq!(env.logged_paths(), files, "{verb} {language}");
+            assert_eq!(env.logged().len(), files.len(), "{verb} {language}");
+            assert_ne!(summary_of(&env, SVC_TYPE).as_deref(), Some(MARK));
+
+            set_personal_model(&env, "mock");
+            env.ok(&[verb]);
+            assert!(
+                env.logged().is_empty(),
+                "{verb} {language} : {:?}",
+                env.logged()
+            );
+            assert_eq!(to_enrich(&env), 0, "{verb} {language}");
+            assert_eq!(summary_of(&env, SVC_TYPE).as_deref(), Some(MARK));
+
+            let again = env.ok(&["update"]);
+            assert_eq!(text(&again.stdout), "graphe à jour\n", "{verb} {language}");
+            assert!(env.logged().is_empty());
+        }
+    }
+}

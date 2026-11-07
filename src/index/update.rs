@@ -193,9 +193,20 @@ pub fn update_with_dry_run(
         store.set_enrich_code(opts.enrich_code)?;
         store.set_enrich_scope(&opts.enrich_scope)?;
     }
+    // Retour à un modèle ou une langue déjà utilisés : ces fichiers inchangés sont réanalysés, sans
+    // appel, pour réappliquer l'entrée de la clé actuelle (REQ-258).
+    let returning: Vec<String> = if llm.is_some() {
+        store.paths_with_unapplied_current_entry()?
+    } else {
+        Vec::new()
+    };
     // « Aucun changement » : rien d'ajouté, modifié, supprimé ou en attente, graphe marqué
     // « à jour », et (LLM inactif ou aucun fichier à enrichir).
-    if d.is_up_to_date() && !to_resolve && (llm.is_none() || store.count_files_to_enrich()? == 0) {
+    if d.is_up_to_date()
+        && returning.is_empty()
+        && !to_resolve
+        && (llm.is_none() || store.count_files_to_enrich()? == 0)
+    {
         // Plus rien à enrichir : les lots du fournisseur enregistrés ne servent plus (REQ-215).
         if llm.is_some() {
             store.set_enrich_batches(&[])?;
@@ -226,6 +237,7 @@ pub fn update_with_dry_run(
         .iter()
         .filter(|c| c.change != Change::Deleted)
         .map(|c| c.path.as_str())
+        .chain(returning.iter().map(String::as_str))
         .collect();
     let abs = build::abs_paths(&d.scanned);
     // Les fichiers à analyser sont déplacés (contenu retenu compris) ; les autres sont libérés,

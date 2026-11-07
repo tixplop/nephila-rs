@@ -1717,6 +1717,38 @@ impl Store {
         }
     }
 
+    /// Chemins indexés qui ont, pour leur contenu enregistré, une entrée de la clé actuelle (modèle
+    /// et langue enregistrés, version de la famille) qui n'est pas leur entrée appliquée (REQ-258).
+    pub fn paths_with_unapplied_current_entry(&self) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT e.path, e.prompt_version FROM enrichments e
+                 JOIN files f ON f.path = e.path AND f.hash = e.content_hash
+                 WHERE f.state = 'indexed'
+                   AND e.model IS (SELECT value FROM meta WHERE key = 'enrich_model')
+                   AND e.language IS (SELECT value FROM meta WHERE key = 'enrich_language')
+                   AND EXISTS (SELECT 1 FROM enrichments o
+                               WHERE o.path = e.path AND o.content_hash = e.content_hash
+                                 AND (o.used_at > e.used_at
+                                      OR (o.used_at = e.used_at AND o.rowid > e.rowid)))
+                 ORDER BY e.path",
+            )
+            .map_err(db_err)?;
+        let rows: Vec<(String, u32)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(db_err)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        let mut paths: Vec<String> = rows
+            .into_iter()
+            .filter(|(p, v)| *v == self.prompt_versions.of_path(p))
+            .map(|(p, _)| p)
+            .collect();
+        paths.dedup();
+        Ok(paths)
+    }
+
     /// Garde en mémoire les entrées d'enrichissement orphelines (chemin absent de `files`) :
     /// empreinte de contenu → chemins triés (REQ-257). À appeler juste avant l'analyse des fichiers.
     pub fn load_orphan_enrichments(&mut self) -> Result<()> {
