@@ -3,6 +3,8 @@
 
 use std::borrow::Cow;
 
+use crate::model::EdgeKind;
+
 /// Lettre de base d'une lettre latine accentuée (blocs Latin-1 et Latin étendu A), minuscule.
 fn base_letter(c: char) -> Option<char> {
     Some(match c {
@@ -76,7 +78,8 @@ pub(crate) fn stem(word: &str) -> &str {
 
 /// Mots vides des mots ordinaires de la question (formes repliées) : liaison et relation, anglais
 /// et français. Aucun mot de genre (`class`, `type`, `file`...) : ils désignent souvent un nom.
-/// Un identifiant cité de cette liste reste cherché (REQ-183, DEC-147).
+/// Un identifiant cité de cette liste reste cherché (REQ-183, DEC-147). Les 45 derniers mots sont
+/// des formes de verbe de la table de `link_kinds` qui nomment rarement un nœud (REQ-259, DEC-192).
 pub(crate) const PROSE_STOP_WORDS: &[&str] = &[
     "this",
     "that",
@@ -214,7 +217,87 @@ pub(crate) const PROSE_STOP_WORDS: &[&str] = &[
     "appellent",
     "utilise",
     "utilisent",
+    "invoke",
+    "invokes",
+    "invoked",
+    "invoking",
+    "appele",
+    "appelee",
+    "appeles",
+    "appelees",
+    "appeler",
+    "appelant",
+    "appelants",
+    "invoque",
+    "invoquent",
+    "utilisee",
+    "utilisees",
+    "utiliser",
+    "utilisant",
+    "extending",
+    "etend",
+    "etendent",
+    "inherit",
+    "inherits",
+    "inherited",
+    "inheriting",
+    "herite",
+    "heritent",
+    "heriter",
+    "implementing",
+    "implemente",
+    "implementent",
+    "implementee",
+    "implementer",
+    "referenced",
+    "referencing",
+    "referencent",
+    "mentioned",
+    "mentionne",
+    "mentionnent",
+    "linked",
+    "contain",
+    "contains",
+    "contained",
+    "containing",
+    "contient",
+    "contiennent",
 ];
+
+/// Genres de lien visés par un mot de relation de la question (forme repliée exacte, sans racine),
+/// vide pour tout autre mot (REQ-259, DEC-192). Une branche par famille de la table.
+pub(crate) fn link_kinds(word: &str) -> &'static [EdgeKind] {
+    use EdgeKind::*;
+    match word {
+        "call" | "calls" | "called" | "calling" | "caller" | "callers" | "invoke" | "invokes"
+        | "invoked" | "invoking" | "appel" | "appels" | "appelle" | "appellent" | "appele"
+        | "appelee" | "appeles" | "appelees" | "appeler" | "appelant" | "appelants" | "invoque"
+        | "invoquent" => &[Calls],
+        "use" | "uses" | "used" | "using" | "usage" | "utilise" | "utilisent" | "utilisee"
+        | "utilisees" | "utiliser" | "utilisant" => &[Calls, References, Imports, DependsOn],
+        "extend" | "extends" | "extended" | "extending" | "subclass" | "subclasses"
+        | "superclass" | "superclasses" | "etend" | "etendent" => &[Extends],
+        "inherit" | "inherits" | "inherited" | "inheriting" | "herite" | "heritent" | "heriter" => {
+            &[Extends, Implements]
+        }
+        "implement" | "implements" | "implemented" | "implementing" | "implementation"
+        | "implementations" | "implemente" | "implementent" | "implementee" | "implementer" => {
+            &[Implements]
+        }
+        "import" | "imports" | "imported" | "importing" | "importe" | "importent" | "importer" => {
+            &[Imports]
+        }
+        "depend" | "depends" | "depending" | "dependent" | "dependency" | "dependencies"
+        | "dependance" | "dependances" => &[DependsOn],
+        "reference" | "references" | "referenced" | "referencing" | "referencent" => &[References],
+        "mention" | "mentions" | "mentioned" | "mentionne" | "mentionnent" => &[Mentions],
+        "link" | "links" | "linked" | "lien" | "liens" => &[LinksTo],
+        "contain" | "contains" | "contained" | "containing" | "contient" | "contiennent" => {
+            &[Contains]
+        }
+        _ => &[],
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -316,6 +399,43 @@ mod tests {
             assert_eq!(fold(w), *w, "non replié {w}");
             assert!(!STOP_WORDS.contains(w), "déjà dans STOP_WORDS {w}");
         }
-        assert_eq!(PROSE_STOP_WORDS.len(), 136);
+        assert_eq!(PROSE_STOP_WORDS.len(), 181);
+    }
+
+    /// Les 45 derniers mots vides ajoutés par REQ-259, dans l'ordre.
+    #[test]
+    fn req259_ac4_last_45_stop_words() {
+        let want: Vec<&str> = "invoke invokes invoked invoking appele appelee appeles appelees appeler appelant appelants invoque invoquent utilisee utilisees utiliser utilisant extending etend etendent inherit inherits inherited inheriting herite heritent heriter implementing implemente implementent implementee implementer referenced referencing referencent mentioned mentionne mentionnent linked contain contains contained containing contient contiennent".split(' ').collect();
+        assert_eq!(want.len(), 45);
+        assert_eq!(&PROSE_STOP_WORDS[PROSE_STOP_WORDS.len() - 45..], &want[..]);
+    }
+
+    #[test]
+    fn req259_ac1_link_kinds_table() {
+        use EdgeKind::*;
+        assert_eq!(link_kinds("calls"), &[Calls]);
+        assert_eq!(
+            link_kinds("utilise"),
+            &[Calls, References, Imports, DependsOn]
+        );
+        assert_eq!(link_kinds("inherits"), &[Extends, Implements]);
+        assert_eq!(link_kinds("contient"), &[Contains]);
+        assert_eq!(link_kinds("lien"), &[LinksTo]);
+        assert!(link_kinds("alpha").is_empty());
+        assert!(link_kinds("Calls").is_empty());
+    }
+
+    /// Formes de la table : repliées, d'au moins 3 caractères, sans doublon, hors `STOP_WORDS`.
+    #[test]
+    fn req259_ac1_link_words_are_folded_and_distinct() {
+        let all = "call calls called calling caller callers invoke invokes invoked invoking appel appels appelle appellent appele appelee appeles appelees appeler appelant appelants invoque invoquent use uses used using usage utilise utilisent utilisee utilisees utiliser utilisant extend extends extended extending subclass subclasses superclass superclasses etend etendent inherit inherits inherited inheriting herite heritent heriter implement implements implemented implementing implementation implementations implemente implementent implementee implementer import imports imported importing importe importent importer depend depends depending dependent dependency dependencies dependance dependances reference references referenced referencing referencent mention mentions mentioned mentionne mentionnent link links linked lien liens contain contains contained containing contient contiennent";
+        let mut seen = std::collections::HashSet::new();
+        for w in all.split(' ') {
+            assert!(seen.insert(w), "doublon {w}");
+            assert!(w.chars().count() >= 3, "trop court {w}");
+            assert_eq!(fold(w), w, "non replié {w}");
+            assert!(!STOP_WORDS.contains(&w), "dans STOP_WORDS {w}");
+            assert!(!link_kinds(w).is_empty(), "absent de la table {w}");
+        }
     }
 }

@@ -18,7 +18,7 @@ use crate::config::{Config, ModelOverride};
 use crate::error::{Error, Result, TRUNCATED};
 use crate::filter::ProjectFile;
 use crate::llm::{build_llm, calls_line, with_format_retries, AskReply, CallStats, Llm, LlmTotals};
-use crate::model::{Edge, Node};
+use crate::model::{Edge, EdgeKind, Node};
 use crate::store::Store;
 
 pub use crate::config::{
@@ -206,6 +206,17 @@ fn folded_qualified_terms(question: &str) -> Vec<String> {
         .collect()
 }
 
+/// Intention de la question (REQ-259, DEC-192) : union des genres de lien visés par ses mots
+/// ordinaires repliés ; un identifiant cité ne vise rien. Vide sans mot de relation.
+fn link_intent(question: &str) -> HashSet<EdgeKind> {
+    let cited = cited_identifiers(question);
+    keywords(question)
+        .into_iter()
+        .filter(|w| !cited.contains(w))
+        .flat_map(|w| words::link_kinds(&words::fold(&w)).iter().copied())
+        .collect()
+}
+
 /// Nœuds de départ d'une question, chemin de production : graphe, noms qualifiés cités et mots
 /// repliés, mots ordinaires filtrés et racinisés, puis le classement de `rank_seeds` (REQ-183,
 /// DEC-147).
@@ -379,11 +390,14 @@ struct Context<'a> {
 /// jamais de contenu de fichier source. Rend aussi les nœuds montrés (lignes de nœuds écrites,
 /// dans l'ordre ; extrémités des liens comprises) : les citations de la réponse sont résolues
 /// parmi eux (REQ-161, DEC-130). Le premier nœud de départ coupé n'est montré que si sa ligne
-/// coupée commence encore par `- <identifiant> ` (identifiant suivi d'une espace).
+/// coupée commence encore par `- <identifiant> ` (identifiant suivi d'une espace). Les liens de
+/// chaque nœud de départ sont pris par classe : genres de l'intention de la question, autres, puis
+/// `contains` non visés, dans l'ordre de la base au sein d'une classe (REQ-259, DEC-192).
 fn build_context<'a>(
     nodes: &'a [Node],
     edges: &'a [Edge],
     seeds: &'a [Node],
+    intent: &HashSet<EdgeKind>,
     limits: &AskLimits,
 ) -> Context<'a> {
     const NODES_HEADER: &str = "Nœuds :\n";
@@ -400,6 +414,14 @@ fn build_context<'a>(
         if e.target != e.source && seed_ids.contains(e.target.as_str()) {
             adjacent.entry(e.target.as_str()).or_default().push(e);
         }
+    }
+    // Classe d'un lien (REQ-259) : 0 genre visé, 1 autre, 2 `contains` non visé ; tri stable.
+    for list in adjacent.values_mut() {
+        list.sort_by_key(|e| match e.kind {
+            k if intent.contains(&k) => 0,
+            EdgeKind::Contains => 2,
+            _ => 1,
+        });
     }
     let neighbour_cap = limits.max_nodes.saturating_sub(seed_ids.len());
     let mut fill = Fill {
@@ -491,7 +513,7 @@ pub fn answer(
         return Err(not_found());
     }
     let edges = store.edges()?;
-    let context = build_context(&nodes, &edges, &seeds, limits);
+    let context = build_context(&nodes, &edges, &seeds, &link_intent(question), limits);
     let mut totals = LlmTotals::default();
     let result = ask_with_retries(llm, question, &context.text, format_retries, &mut totals);
     if totals.calls > 0 {
@@ -1492,6 +1514,7 @@ mod tests {
             &nodes,
             &edges,
             &[late.clone(), big.clone()],
+            &HashSet::new(),
             &AskLimits::default(),
         )
         .text;
@@ -1503,6 +1526,216 @@ mod tests {
         assert!(ctx.chars().count() <= DEFAULT_ASK_MAX_CONTEXT_CHARS);
         let (n, _) = sections(&ctx);
         assert!(n.len() <= DEFAULT_ASK_MAX_NODES, "{}", n.len());
+    }
+
+    /// Graphe d'AC-259-2 : Alpha, 70 méthodes contenues, 70 importeurs, un enfant.
+    fn req259_graph() -> (Vec<Node>, Vec<Edge>) {
+        use crate::model::EdgeKind::{Contains, Extends, Imports};
+        let alpha = mk(NodeKind::Type, "p.Alpha", None);
+        let mut nodes = vec![alpha.clone()];
+        let mut edges = Vec::new();
+        for i in 0..70 {
+            let m = mk(NodeKind::Method, &format!("m.M{i:02}"), None);
+            edges.push(edge(&alpha, &m, Contains));
+            nodes.push(m);
+        }
+        for i in 0..70 {
+            let t = mk(NodeKind::Type, &format!("q.Imp{i:02}"), None);
+            edges.push(edge(&t, &alpha, Imports));
+            nodes.push(t);
+        }
+        let child = mk(NodeKind::Type, "z.Child", None);
+        edges.push(edge(&child, &alpha, Extends));
+        nodes.push(child);
+        (nodes, edges)
+    }
+
+    fn req259_context(question: &str) -> (Vec<String>, Vec<String>) {
+        let (nodes, edges) = req259_graph();
+        let limits = AskLimits::default();
+        let seeds = question_seeds(&nodes, question, &limits);
+        assert_eq!(
+            seeds.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            ["type:p.Alpha"]
+        );
+        let ctx = build_context(&nodes, &edges, &seeds, &link_intent(question), &limits).text;
+        let (n, l) = sections(&ctx);
+        assert!(n.len() <= 60, "{}", n.len());
+        (
+            n.iter().map(|s| s.to_string()).collect(),
+            l.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn req259_ac2_links_follow_the_intention_of_the_question() {
+        // (a) intention {extends} : l'extends d'abord, puis les imports, aucun contains.
+        let (_, l) = req259_context("Which class extends Alpha?");
+        let mut want = vec!["- type:z.Child -extends-> type:p.Alpha".to_string()];
+        want.extend((0..58).map(|i| format!("- type:q.Imp{i:02} -imports-> type:p.Alpha")));
+        assert_eq!(l, want);
+        // (b) sans intention : les imports, ni extends ni contains.
+        let (_, l) = req259_context("Que fait Alpha ?");
+        let want: Vec<String> = (0..59)
+            .map(|i| format!("- type:q.Imp{i:02} -imports-> type:p.Alpha"))
+            .collect();
+        assert_eq!(l, want);
+        // (c) intention {contains} : les contains seuls.
+        let (_, l) = req259_context("Quelles méthodes contient Alpha ?");
+        let want: Vec<String> = (0..59)
+            .map(|i| format!("- type:p.Alpha -contains-> method:m.M{i:02}"))
+            .collect();
+        assert_eq!(l, want);
+    }
+
+    #[test]
+    fn req259_ac1_link_intent() {
+        use crate::model::EdgeKind::*;
+        let uses = [Calls, References, Imports, DependsOn];
+        let cases: Vec<(&str, Vec<EdgeKind>)> = vec![
+            ("Who calls suggestedImports in CodeWriter?", vec![Calls]),
+            (
+                "Which method calls CodeWriter.suggestedImports()?",
+                vec![Calls],
+            ),
+            (
+                "Quelle méthode est appelée par EmpruntService ?",
+                vec![Calls],
+            ),
+            ("Which classes use Foo?", uses.to_vec()),
+            ("Qui hérite de Base ?", vec![Extends, Implements]),
+            ("Quelles classes implémentent Repo ?", vec![Implements]),
+            ("Quel document décrit l'import des livres ?", vec![Imports]),
+            ("Which tables reference orders?", vec![References]),
+            ("Quelle table contient les amendes ?", vec![Contains]),
+            (
+                "Which classes use and extend Foo?",
+                [&uses[..], &[Extends]].concat(),
+            ),
+            ("What does use() return?", vec![]),
+            ("How does Foo.contains work?", vec![]),
+            ("Que fait OrderService ?", vec![]),
+        ];
+        for (q, want) in cases {
+            let want: HashSet<EdgeKind> = want.into_iter().collect();
+            assert_eq!(link_intent(q), want, "{q}");
+        }
+    }
+
+    /// Lignes de liens d'un nœud de départ S aux liens L1 contains, L2 calls, L3 contains,
+    /// L4 imports, L5 references, pour une intention.
+    fn req259_order(intent: &[EdgeKind]) -> (Vec<&'static str>, Vec<String>) {
+        use crate::model::EdgeKind::*;
+        let s = mk(NodeKind::Type, "p.S", None);
+        let others: Vec<Node> = (1..=5)
+            .map(|i| mk(NodeKind::Type, &format!("p.O{i}"), None))
+            .collect();
+        let kinds = [Contains, Calls, Contains, Imports, References];
+        let edges: Vec<Edge> = others
+            .iter()
+            .zip(kinds)
+            .map(|(o, k)| edge(&s, o, k))
+            .collect();
+        let mut nodes = others.clone();
+        nodes.push(s.clone());
+        let intent: HashSet<EdgeKind> = intent.iter().copied().collect();
+        let ctx = build_context(&nodes, &edges, &[s], &intent, &AskLimits::default()).text;
+        let (n, l) = sections(&ctx);
+        let links = l
+            .iter()
+            .map(|line| match line.rsplit('O').next().unwrap() {
+                "1" => "L1",
+                "2" => "L2",
+                "3" => "L3",
+                "4" => "L4",
+                "5" => "L5",
+                _ => "?",
+            })
+            .collect();
+        (links, node_ids(&n))
+    }
+
+    /// Identifiants (sans le préfixe de genre) des lignes de nœuds, dans l'ordre.
+    fn node_ids(lines: &[&str]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                let id = l.trim_start_matches("- ").split(' ').next().unwrap();
+                id.split_once(':').unwrap().1.to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn req259_ac3_links_are_ordered_by_class() {
+        use crate::model::EdgeKind::*;
+        let (l, n) = req259_order(&[]);
+        assert_eq!(l, ["L2", "L4", "L5", "L1", "L3"]);
+        assert_eq!(n, ["p.S", "p.O2", "p.O4", "p.O5", "p.O1", "p.O3"]);
+        let (l, n) = req259_order(&[Imports]);
+        assert_eq!(l, ["L4", "L2", "L5", "L1", "L3"]);
+        assert_eq!(n[..3], ["p.S", "p.O4", "p.O2"]);
+        assert_eq!(req259_order(&[Contains]).0, ["L1", "L3", "L2", "L4", "L5"]);
+        assert_eq!(
+            req259_order(&[Calls, References, Imports, DependsOn]).0,
+            ["L2", "L4", "L5", "L1", "L3"]
+        );
+    }
+
+    #[test]
+    fn req259_ac3_two_seeds_keep_their_groups() {
+        use crate::model::EdgeKind::*;
+        let s1 = mk(NodeKind::Type, "p.S1", None);
+        let s2 = mk(NodeKind::Type, "p.S2", None);
+        let a = mk(NodeKind::Type, "p.A", None);
+        let b = mk(NodeKind::Type, "p.B", None);
+        let nodes = vec![s1.clone(), s2.clone(), a.clone(), b.clone()];
+        let edges = vec![
+            edge(&s1, &a, Contains),
+            edge(&s2, &b, Contains),
+            edge(&s1, &s2, Imports),
+            edge(&s1, &a, Calls),
+            edge(&s2, &b, Calls),
+        ];
+        let ctx = build_context(
+            &nodes,
+            &edges,
+            &[s1, s2],
+            &HashSet::new(),
+            &AskLimits::default(),
+        )
+        .text;
+        let (n, l) = sections(&ctx);
+        assert_eq!(node_ids(&n), ["p.S1", "p.S2", "p.A", "p.B"]);
+        assert_eq!(
+            l,
+            [
+                "- type:p.S1 -imports-> type:p.S2",
+                "- type:p.S1 -calls-> type:p.A",
+                "- type:p.S1 -contains-> type:p.A",
+                "- type:p.S2 -calls-> type:p.B",
+                "- type:p.S2 -contains-> type:p.B",
+            ]
+        );
+    }
+
+    #[test]
+    fn req259_ac4_question_terms() {
+        let terms =
+            |q: &str| -> Vec<String> { question_words(q).into_iter().map(|w| w.exact).collect() };
+        assert_eq!(terms("Which class inherits from Base?"), ["class", "base"]);
+        assert_eq!(
+            terms("Quelle méthode est appelée par EmpruntService ?"),
+            ["methode", "empruntservice"]
+        );
+        assert_eq!(
+            terms("Quelle classe importe le catalogue ?"),
+            ["classe", "importe", "catalogue"]
+        );
+        assert_eq!(
+            terms("What does contains() return?"),
+            ["contains", "return"]
+        );
     }
 
     #[test]
@@ -1525,7 +1758,14 @@ mod tests {
             seeds.push(s.clone());
             nodes.push(s);
         }
-        let ctx = build_context(&nodes, &edges, &seeds, &AskLimits::default()).text;
+        let ctx = build_context(
+            &nodes,
+            &edges,
+            &seeds,
+            &HashSet::new(),
+            &AskLimits::default(),
+        )
+        .text;
         assert!(ctx.chars().count() <= DEFAULT_ASK_MAX_CONTEXT_CHARS);
         assert!(ctx.ends_with('\n'));
         assert_eq!(ctx.matches("Liens :\n").count(), 1);
@@ -1564,7 +1804,7 @@ mod tests {
             s[1].clone(),
             s[0].clone(),
         ];
-        let ctx = build_context(&nodes, &edges, &s, &AskLimits::default()).text;
+        let ctx = build_context(&nodes, &edges, &s, &HashSet::new(), &AskLimits::default()).text;
         let want: Vec<String> = [2, 4, 5, 1, 3, 0]
             .iter()
             .map(|&i| link_line(&edges[i]))
@@ -1595,7 +1835,14 @@ mod tests {
             edges.push(edge(&seeds[0], &v, Calls));
             nodes.push(v);
         }
-        let ctx = build_context(&nodes, &edges, &seeds, &AskLimits::default()).text;
+        let ctx = build_context(
+            &nodes,
+            &edges,
+            &seeds,
+            &HashSet::new(),
+            &AskLimits::default(),
+        )
+        .text;
         let (n, l) = sections(&ctx);
         assert_eq!(n.len(), 60);
         for s in &seeds {
@@ -1617,6 +1864,7 @@ mod tests {
             &[s.clone(), v],
             &edges,
             std::slice::from_ref(&s),
+            &HashSet::new(),
             &AskLimits::default(),
         )
         .text;
@@ -1659,7 +1907,9 @@ mod tests {
         }
         let valid_nodes: HashSet<String> = nodes.iter().map(node_line).collect();
         let valid_links: HashSet<String> = edges.iter().map(link_line).collect();
-        let at = |n: usize| build_context(&nodes, &edges, &seeds, &limits_chars(n)).text;
+        let at = |n: usize| {
+            build_context(&nodes, &edges, &seeds, &HashSet::new(), &limits_chars(n)).text
+        };
         for (limit, min) in [(2000, 1500), (30_000, 12_001)] {
             let ctx = at(limit);
             let len = ctx.chars().count();
@@ -1670,7 +1920,14 @@ mod tests {
             assert!(l.iter().all(|x| valid_links.contains(*x)));
             assert!(!l.is_empty());
         }
-        let default = build_context(&nodes, &edges, &seeds, &AskLimits::default()).text;
+        let default = build_context(
+            &nodes,
+            &edges,
+            &seeds,
+            &HashSet::new(),
+            &AskLimits::default(),
+        )
+        .text;
         assert_eq!(at(DEFAULT_ASK_MAX_CONTEXT_CHARS), default);
         assert!(default.chars().count() <= DEFAULT_ASK_MAX_CONTEXT_CHARS);
     }
@@ -1700,7 +1957,7 @@ mod tests {
                 ..AskLimits::default()
             };
             let seeds = find_seeds(&nodes, &[], &["seed".to_string()], &HashSet::new(), &limits);
-            let ctx = build_context(&nodes, &edges, &seeds, &limits).text;
+            let ctx = build_context(&nodes, &edges, &seeds, &HashSet::new(), &limits).text;
             let (n, l) = sections(&ctx);
             (seeds.len(), n.len(), l.len())
         };
@@ -1725,7 +1982,7 @@ mod tests {
         assert_eq!(ids(60, 5), all[..5]);
         // Une borne de contexte absurde ne fait pas paniquer.
         let seeds = &nodes[..1];
-        let ctx = build_context(&nodes, &edges, seeds, &limits_chars(3)).text;
+        let ctx = build_context(&nodes, &edges, seeds, &HashSet::new(), &limits_chars(3)).text;
         assert!(ctx.starts_with("Nœuds :\n"));
     }
 
@@ -1739,6 +1996,7 @@ mod tests {
             &[s.clone(), v],
             &edges,
             std::slice::from_ref(&s),
+            &HashSet::new(),
             &limits_chars(ASK_MIN_CONTEXT_CHARS),
         )
         .text;
@@ -1821,6 +2079,7 @@ mod tests {
             &[f.clone(), g],
             &edges,
             std::slice::from_ref(&f),
+            &HashSet::new(),
             &AskLimits::default(),
         )
         .text;
@@ -1866,6 +2125,7 @@ mod tests {
             &nodes,
             &edges,
             std::slice::from_ref(&m),
+            &HashSet::new(),
             &AskLimits::default(),
         );
         assert_eq!(shown_ids(&c), written_ids(&c.text));
@@ -1888,7 +2148,13 @@ mod tests {
             seeds.push(s.clone());
             nodes.push(s);
         }
-        let c = build_context(&nodes, &edges, &seeds, &AskLimits::default());
+        let c = build_context(
+            &nodes,
+            &edges,
+            &seeds,
+            &HashSet::new(),
+            &AskLimits::default(),
+        );
         let shown = shown_ids(&c);
         assert_eq!(shown, written_ids(&c.text));
         assert!(shown.len() > 5);
@@ -1910,6 +2176,7 @@ mod tests {
             std::slice::from_ref(&s),
             &[],
             std::slice::from_ref(&s),
+            &HashSet::new(),
             &AskLimits::default(),
         );
         assert_eq!(shown_ids(&c), vec![s.id.clone()]);
@@ -1919,6 +2186,7 @@ mod tests {
             std::slice::from_ref(&long),
             &[],
             std::slice::from_ref(&long),
+            &HashSet::new(),
             &AskLimits::default(),
         );
         assert!(c.shown.is_empty());
@@ -1933,6 +2201,7 @@ mod tests {
             std::slice::from_ref(&edge_case),
             &[],
             std::slice::from_ref(&edge_case),
+            &HashSet::new(),
             &AskLimits::default(),
         );
         assert!(c.shown.is_empty());
