@@ -8,6 +8,7 @@ pub(crate) enum Reply {
     File,
     Lot,
     Ask,
+    Subsystem,
 }
 
 impl Reply {
@@ -17,6 +18,7 @@ impl Reply {
             Reply::File => "nephila_fichier",
             Reply::Lot => "nephila_lot",
             Reply::Ask => "nephila_ask",
+            Reply::Subsystem => "nephila_sous_systeme",
         }
     }
 
@@ -25,6 +27,7 @@ impl Reply {
             Reply::File => file(),
             Reply::Lot => lot(),
             Reply::Ask => ask(),
+            Reply::Subsystem => subsystem(),
         }
     }
 }
@@ -105,6 +108,19 @@ pub(crate) fn ask() -> Value {
     })
 }
 
+/// Schéma de la réponse de la passe des sous-systèmes.
+pub(crate) fn subsystem() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "description": {"type": "string"}
+        },
+        "required": ["name", "description"],
+        "additionalProperties": false
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,7 +191,12 @@ mod tests {
 
     #[test]
     fn req202_ac3_objets_fermes_et_sans_version_ni_enum() {
-        for (reply, objects) in [(Reply::File, 3), (Reply::Lot, 4), (Reply::Ask, 1)] {
+        for (reply, objects) in [
+            (Reply::File, 3),
+            (Reply::Lot, 4),
+            (Reply::Ask, 1),
+            (Reply::Subsystem, 1),
+        ] {
             let mut seen = 0;
             walk(&reply.schema(), &mut seen);
             assert_eq!(seen, objects, "{reply:?}");
@@ -183,5 +204,6 @@ mod tests {
         assert_eq!(Reply::File.name(), "nephila_fichier");
         assert_eq!(Reply::Lot.name(), "nephila_lot");
         assert_eq!(Reply::Ask.name(), "nephila_ask");
+        assert_eq!(Reply::Subsystem.name(), "nephila_sous_systeme");
     }
 }

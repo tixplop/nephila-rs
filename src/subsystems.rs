@@ -15,8 +15,7 @@ pub const MAX_LINES: usize = 30;
 /// Longueur maximale d'un résumé envoyé, en caractères.
 pub const MAX_SUMMARY_CHARS: usize = 200;
 
-/// Version du prompt de la passe ; T-352 la remplace par celle du module du prompt.
-pub(crate) const SUBSYSTEM_PROMPT_VERSION: u32 = 1;
+pub(crate) use crate::llm::subsystem::SUBSYSTEM_PROMPT_VERSION;
 
 /// Lignes `- <identifiant> : <résumé>` d'une communauté : les membres au résumé non vide, par
 /// degré décroissant puis identifiant en ordre d'octets, 30 au plus, résumé coupé à 200

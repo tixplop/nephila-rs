@@ -12,6 +12,7 @@ pub mod openai;
 pub mod retry;
 mod schema;
 mod sse;
+pub mod subsystem;
 mod tidy;
 mod usage;
 #[cfg(test)]
@@ -33,6 +34,8 @@ use enrich::{
 pub use enrich::{Enrichment, Excerpt, LotItem};
 pub use retry::{with_format_retries, with_note, FormatFault};
 use schema::Reply;
+pub use subsystem::SubsystemName;
+use subsystem::{subsystem_system_prompt, subsystem_user_prompt};
 
 /// Variable de test qui remplace le sondage d'un lot du fournisseur, une fois par minute
 /// (millisecondes).
@@ -154,6 +157,21 @@ pub trait Llm: Send + Sync {
         let _ = (stats, fault);
         self.ask(question, context)
     }
+    /// Nom et description d'une communauté d'après ses lignes `- <identifiant> : <résumé>`
+    /// (REQ-261). `label` nomme l'appel pour les traces d'attente. Par défaut, une erreur.
+    fn name_subsystem(
+        &self,
+        label: &str,
+        lines: &[String],
+        stop: &AtomicBool,
+        stats: &CallStats,
+        fault: Option<FormatFault>,
+    ) -> Result<SubsystemName> {
+        let _ = (label, lines, stop, stats, fault);
+        Err(Error::Message(
+            "ce fournisseur LLM ne nomme pas de sous-système".into(),
+        ))
+    }
 }
 
 /// Appel de complétion d'un adaptateur HTTP : le reste de `Llm` s'en déduit (REQ-127).
@@ -182,6 +200,8 @@ const KEY_SUMMARIES: &str = "summaries";
 const KEY_FILES: &str = "files";
 /// Clé de premier niveau d'une réponse de `query ask`.
 const KEY_FOUND: &str = "found";
+/// Clé de premier niveau d'une réponse de la passe des sous-systèmes.
+const KEY_NAME: &str = "name";
 
 impl<T: Complete> Llm for T {
     fn batch(&self) -> Option<BatchLink<'_>> {
@@ -295,6 +315,25 @@ impl<T: Complete> Llm for T {
         )?;
         http::parse_reply(&out, KEY_FOUND, AskReply::parse)
     }
+
+    fn name_subsystem(
+        &self,
+        label: &str,
+        lines: &[String],
+        stop: &AtomicBool,
+        stats: &CallStats,
+        fault: Option<FormatFault>,
+    ) -> Result<SubsystemName> {
+        let out = self.complete(
+            Some(label),
+            Some(stop),
+            stats,
+            subsystem_system_prompt(self.summary_language()),
+            with_note(subsystem_user_prompt(lines), fault),
+            Reply::Subsystem,
+        )?;
+        http::parse_reply(&out, KEY_NAME, SubsystemName::parse).map_err(subsystem::fixed_label)
+    }
 }
 
 /// Fournisseur qui porte le modèle effectif de la configuration (le simulé n'en a pas).
@@ -374,6 +413,17 @@ impl Llm for WithModel {
         fault: Option<FormatFault>,
     ) -> Result<AskReply> {
         self.inner.ask_with(question, context, stats, fault)
+    }
+
+    fn name_subsystem(
+        &self,
+        label: &str,
+        lines: &[String],
+        stop: &AtomicBool,
+        stats: &CallStats,
+        fault: Option<FormatFault>,
+    ) -> Result<SubsystemName> {
+        self.inner.name_subsystem(label, lines, stop, stats, fault)
     }
 }
 

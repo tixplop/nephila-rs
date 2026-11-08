@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use super::ask::AskReply;
 use super::enrich::parse_lot;
+use super::subsystem::SubsystemName;
 use super::{CallStats, Enrichment, Excerpt, FormatFault, Llm, LotItem};
 use crate::error::{Error, Result};
 use serde_json::Value;
@@ -333,6 +334,21 @@ impl MockLlm {
             None => Ok(AskReply::NotFound),
         }
     }
+
+    /// Appel de la passe des sous-systèmes : journalisé comme `_subsystem`, mêmes échecs simulés
+    /// que l'enrichissement (`_subsystem` comme chemin de `NEPHILA_MOCK_MALFORMED` et de
+    /// `NEPHILA_MOCK_TIMEOUT_FILES`) ; fixture `_subsystem.json`, sinon réponse déterministe.
+    fn subsystem_stats(&self, label: &str, stats: &CallStats) -> Result<SubsystemName> {
+        self.gate("_subsystem", 1, &["_subsystem"], stats)?;
+        self.check_malformed(&["_subsystem"])?;
+        match self.read_fixture("_subsystem.json")? {
+            Some(j) => SubsystemName::parse(&j),
+            None => Ok(SubsystemName {
+                name: format!("Sous-système {label}"),
+                description: format!("Description du sous-système {label}."),
+            }),
+        }
+    }
 }
 
 impl Llm for MockLlm {
@@ -392,6 +408,17 @@ impl Llm for MockLlm {
     ) -> Result<AskReply> {
         self.ask_stats(stats)
     }
+
+    fn name_subsystem(
+        &self,
+        label: &str,
+        _lines: &[String],
+        _stop: &std::sync::atomic::AtomicBool,
+        stats: &CallStats,
+        _fault: Option<FormatFault>,
+    ) -> Result<SubsystemName> {
+        self.subsystem_stats(label, stats)
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +465,57 @@ mod tests {
         let s = CallStats::default();
         m.ask_with("q", "c", &s, None).unwrap();
         assert_eq!((s.sends(), s.responded(), s.usage()), (1, true, None));
+    }
+
+    #[test]
+    fn req261_mock_names_a_subsystem_deterministically_and_logs_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let m = MockLlm::new(MockOptions {
+            log: Some(log.clone()),
+            malformed: vec![("_subsystem".into(), 1)],
+            ..MockOptions::default()
+        });
+        let stop = AtomicBool::new(false);
+        let s = CallStats::default();
+        let first = m.name_subsystem("communauté 3", &[], &stop, &s, None);
+        assert!(matches!(first, Err(Error::Format(_))));
+        let ok = m
+            .name_subsystem("communauté 3", &[], &stop, &s, None)
+            .unwrap();
+        assert_eq!(ok.name, "Sous-système communauté 3");
+        assert_eq!(s.sends(), 2);
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "_subsystem\t1\n_subsystem\t1\n"
+        );
+    }
+
+    #[test]
+    fn req261_ac6_fixture_invalid_name_is_retried_then_fails_with_the_fixed_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        std::fs::write(
+            dir.path().join("_subsystem.json"),
+            serde_json::json!({"name": "n".repeat(61), "description": "ok"}).to_string(),
+        )
+        .unwrap();
+        let m = MockLlm::new(MockOptions {
+            dir: Some(dir.path().to_path_buf()),
+            log: Some(log.clone()),
+            ..MockOptions::default()
+        });
+        let stop = AtomicBool::new(false);
+        let s = CallStats::default();
+        let r = crate::llm::with_format_retries(2, &stop, |_, f| {
+            m.name_subsystem("communauté 0", &[], &stop, &s, f)
+        });
+        let expected = format!("{} (3 essais sur 3)", crate::llm::subsystem::BAD_NAME);
+        assert!(
+            matches!(&r, Err(Error::Format(m)) if *m == expected),
+            "{r:?}"
+        );
+        assert_eq!(std::fs::read_to_string(log).unwrap().lines().count(), 3);
     }
 
     #[test]
