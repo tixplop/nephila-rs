@@ -69,7 +69,7 @@ pub fn compact(name: &str, graph: &Value) -> Value {
             Some(json!([a, b, kind_idx(kind, &edge_kinds)]))
         })
         .collect();
-    // `communities` = [[nom, taille], …] indexée par numéro (l'export les donne triées par numéro).
+    // `communities` = [[nom, taille(, description)], …] indexée par numéro (l'export les donne triées par numéro).
     let mut comms: Vec<&Value> = graph["communities"]
         .as_array()
         .map(|a| a.iter().collect())
@@ -77,7 +77,10 @@ pub fn compact(name: &str, graph: &Value) -> Value {
     comms.sort_by_key(|c| c["id"].as_i64().unwrap_or(i64::MAX));
     let communities: Vec<Value> = comms
         .iter()
-        .map(|c| json!([c["label"], c["size"]]))
+        .map(|c| match c.get("description") {
+            Some(d) => json!([c["label"], c["size"], d]),
+            None => json!([c["label"], c["size"]]),
+        })
         .collect();
     json!({
         "version": DATA_VERSION,
@@ -155,6 +158,14 @@ mod tests {
             {"source": "type:b", "target": "method:a", "kind": "contains"},
             {"source": "method:a", "target": "type:b", "kind": "calls"}],
           "unresolved": [{"source": "x", "kind": "calls", "target": "y"}]})
+    }
+
+    #[test]
+    fn req263_ac5_compact_keeps_description() {
+        let mut g = graph();
+        g["communities"][0]["description"] = json!("<b>Desc</b>");
+        let c = compact("p", &g);
+        assert_eq!(c["communities"], json!([["B", 5], ["A", 2, "<b>Desc</b>"]]));
     }
 
     #[test]

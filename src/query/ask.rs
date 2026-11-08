@@ -266,16 +266,27 @@ fn summary_block(summary: &Value, max_chars: usize) -> Option<SummaryBlock> {
         sections.push(("Thèmes :".to_string(), lines));
     }
     let top = list(&summary["communities"]["top"]);
+    let mut described = 0;
+    let mut described_over = false;
     if !top.is_empty() {
         let lines = top
             .iter()
             .map(|c| {
                 let label = text_of(&c["label"]);
-                (
-                    format!("- {label} ({} nœuds)", c["size"]),
-                    None,
-                    Some(label),
-                )
+                let mut line = format!("- {label} ({} nœuds)", c["size"]);
+                // Descriptions cumulées au plus `max_chars / 2` ; la première qui dépasse et les
+                // suivantes sont omises (REQ-263).
+                if let (Some(d), false) = (c["description"].as_str(), described_over) {
+                    let n = d.chars().count();
+                    if described + n > max_chars / 2 {
+                        described_over = true;
+                    } else {
+                        described += n;
+                        line.push_str(" : ");
+                        line.push_str(d);
+                    }
+                }
+                (line, None, Some(label))
             })
             .collect();
         sections.push((
@@ -2463,6 +2474,28 @@ mod tests {
         assert!(!t.contains("Thèmes") && !t.contains("Communautés"), "{t}");
         let empty = json!({"modules": [], "top_nodes": [], "themes": [], "communities": null});
         assert!(summary_block(&empty, 3000).is_none());
+    }
+
+    #[test]
+    fn req263_ac2_descriptions() {
+        let mut v = summary_value();
+        v["communities"]["top"][0]["description"] = json!("Description.");
+        let t = summary_block(&v, 3000).unwrap().text;
+        assert!(t.contains("\n- A (5 nœuds) : Description.\n"), "{t}");
+        let top: Vec<Value> = (0..10)
+            .map(|i| json!({"id": i, "label": format!("C{i}"), "size": 3, "cohesion": 0.5, "description": "d".repeat(400)}))
+            .collect();
+        v["communities"] = json!({"total": 10, "top": top});
+        let t = summary_block(&v, 3000).unwrap().text;
+        let described: usize = t
+            .lines()
+            .filter_map(|l| l.split_once(" : "))
+            .map(|(_, d)| d.chars().count())
+            .sum();
+        assert!(described > 0 && described <= 1500, "{described}");
+        assert_eq!(t.lines().filter(|l| l.starts_with("- C")).count(), 10);
+        assert!(t.contains("- C9 (3 nœuds)\n"), "{t}");
+        assert!(t.contains("Nœuds les plus reliés :"), "{t}");
     }
 
     #[test]

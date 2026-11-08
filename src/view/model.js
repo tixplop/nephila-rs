@@ -160,6 +160,12 @@ function nodeColor(g, i, mode) {
   return KIND_PALETTE[g.kind[i] % KIND_PALETTE.length];
 }
 
+// Description de la communauté c (troisième élément de l'entrée), null sans description.
+function communityDescription(g, c) {
+  var d = g.communities[c][2];
+  return typeof d === "string" && d !== "" ? d : null;
+}
+
 function communityText(g, c) {
   return c + " " + g.communities[c][0] + " (" + g.communities[c][1] + " nœuds)";
 }
@@ -169,7 +175,11 @@ function communityText(g, c) {
 function communityLegend(g) {
   var k = Math.min(COMMUNITY_PALETTE.length, g.communities.length);
   var out = [];
-  for (var c = 0; c < k; c++) out.push({ color: COMMUNITY_PALETTE[c], text: communityText(g, c) });
+  for (var c = 0; c < k; c++) {
+    var entry = { color: COMMUNITY_PALETTE[c], text: communityText(g, c) };
+    if (communityDescription(g, c) !== null) entry.description = communityDescription(g, c);
+    out.push(entry);
+  }
   if (g.communities.length > k) {
     var sum = 0;
     for (var r = k; r < g.communities.length; r++) sum += g.communities[r][1];
@@ -189,7 +199,9 @@ function colorChoice(g) {
 function nodeCommunity(g, i) {
   var c = g.community[i];
   if (c < 0 || c >= g.communities.length) return null;
-  return { number: c, name: g.communities[c][0], text: c + " " + g.communities[c][0] };
+  var out = { number: c, name: g.communities[c][0], text: c + " " + g.communities[c][0] };
+  if (communityDescription(g, c) !== null) out.description = communityDescription(g, c);
+  return out;
 }
 
 function details(g, i) {

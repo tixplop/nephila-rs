@@ -988,3 +988,164 @@ fn req255_req261_ac15_wait_and_pause_traces_use_the_subsystem_words() {
         "{err}"
     );
 }
+
+// ---- REQ-263 : noms et descriptions dans les lectures ----
+
+/// Graphe construit avec une communauté nommée (le groupe 0) ; `fixture` = `_subsystem.json`.
+/// Retourne l'environnement, le nom, la description, le numéro et la taille de la communauté.
+fn named_graph_with(fixture: Option<&str>) -> (Env, String, String, i64, i64) {
+    let mut f = Vec::new();
+    group(&mut f, 0, 11, 5);
+    group(&mut f, 1, 8, 5);
+    let env = Env::mock(&f, "");
+    if let Some(j) = fixture {
+        fs::write(env.mock.join("_subsystem.json"), j).unwrap();
+    }
+    let o = env.run(&["build", "--subsystems"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    let (id, size, label, description): (i64, i64, String, Option<String>) = env
+        .db()
+        .query_row(
+            "SELECT c.id, c.size, c.label, c.description FROM communities c
+             JOIN node_communities m ON m.community = c.id
+             JOIN nodes n ON n.id = m.node
+             WHERE n.id LIKE '%p0.C0' ORDER BY c.size DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    (env, label, description.expect("description"), id, size)
+}
+
+fn named_graph() -> (Env, String, String, i64, i64) {
+    named_graph_with(None)
+}
+
+#[test]
+fn req263_ac3_ac019_ac8_summary_query_community_and_export() {
+    let (env, label, description, id, size) = named_graph();
+    // summary : texte et JSON, lignes entières.
+    let (out, _) = text(&env.run(&["summary"]));
+    let expected = format!("  {id} {label} ({size} nœuds) : {description}");
+    assert!(out.lines().any(|l| l == expected), "{expected}\n{out}");
+    let other = env.community_of(1).0;
+    let (oid, osize): (i64, i64) = env
+        .db()
+        .query_row(
+            "SELECT id, size FROM communities WHERE label = ?1",
+            [&other],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let plain = format!("  {oid} {other} ({osize} nœuds)");
+    assert!(out.lines().any(|l| l == plain), "{plain}\n{out}");
+    let (json, _) = text(&env.run(&["summary", "--json"]));
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let top = v["communities"]["top"].as_array().unwrap();
+    let named = top.iter().find(|c| c["label"] == label.as_str()).unwrap();
+    assert_eq!(named["description"], description.as_str());
+    let keys: Vec<&String> = named.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["cohesion", "description", "id", "label", "size"]);
+    let unnamed = top.iter().find(|c| c["label"] == other.as_str()).unwrap();
+    assert!(unnamed.get("description").is_none());
+    // query community : le nom, jamais la description (AC-148-10), sous les trois formes.
+    let member: String = env
+        .db()
+        .query_row(
+            "SELECT node FROM node_communities WHERE community = ?1 AND node LIKE '%p0.C0'",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let head = format!("{id} {label} ({size} nœuds, cohésion ");
+    for args in [
+        vec!["query", "community"],
+        vec!["query", "community", &format!("{id}")],
+        vec!["query", "community", "--node", &member],
+    ] {
+        let (out, _) = text(&env.run(&args));
+        assert!(out.contains(&head), "{args:?}\n{out}");
+        assert!(!out.contains(&description), "{args:?}\n{out}");
+        let mut a = args.clone();
+        a.push("--json");
+        let (out, _) = text(&env.run(&a));
+        assert!(!out.contains("description"), "{a:?}\n{out}");
+        let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let first = j["communities"]
+            .get(0)
+            .or_else(|| j.get("community"))
+            .unwrap_or(&j)
+            .clone();
+        let obj = first.as_object().unwrap_or_else(|| panic!("{out}"));
+        let keys: Vec<&String> = obj.keys().collect();
+        assert_eq!(keys, ["cohesion", "id", "label", "pivot", "size"], "{out}");
+    }
+    // export : clé à sa place alphabétique, version 1.
+    let (out, _) = text(&env.run(&["export", "--format", "json", "--output", "-"]));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["version"], 1);
+    assert!(out.contains(&format!(
+        "\"description\":{},\"id\":",
+        serde_json::to_string(&description).unwrap()
+    )));
+    let comms = v["communities"].as_array().unwrap();
+    let named = comms.iter().find(|c| c["label"] == label.as_str()).unwrap();
+    assert_eq!(named["description"], description.as_str());
+    let unnamed = comms.iter().find(|c| c["label"] == other.as_str()).unwrap();
+    assert!(unnamed.get("description").is_none());
+}
+
+#[test]
+fn req263_ac8_escape_in_summary_and_query_community() {
+    let fixture = serde_json::json!({"name": "No\u{1b}[1mm", "description": "a\u{1b}[31mb\u{7}c"})
+        .to_string();
+    let (env, _, _, id, _) = named_graph_with(Some(&fixture));
+    for no_color in [false, true] {
+        let extra: &[(&str, &str)] = if no_color { &[("NO_COLOR", "1")] } else { &[] };
+        let o = env.run_env(&["summary"], extra);
+        assert!(!o.stdout.contains(&0x1b), "octet 0x1B");
+        let out = text(&o).0;
+        assert!(out.contains("No\\u{001B}[1mm"), "{out}");
+        assert!(out.contains("a\\u{001B}[31mb\\u{0007}c"), "{out}");
+        let o = env.run_env(&["query", "community", &format!("{id}")], extra);
+        assert!(!o.stdout.contains(&0x1b) && !o.stderr.contains(&0x1b));
+        assert!(text(&o).0.contains("No\\u{001B}[1mm"), "{}", text(&o).0);
+    }
+}
+
+#[test]
+fn req263_ac4_ac260_ac12_ask_without_seed_carries_name_and_description() {
+    let (env, label, description, id, size) = named_graph();
+    let reply = serde_json::json!({"found": true, "answer": "vue", "nodes": [label]}).to_string();
+    let ok = (
+        200,
+        serde_json::json!({"content": [{"type": "text", "text": reply}]}).to_string(),
+    );
+    let server = FakeServer::start(vec![ok.clone(), ok]);
+    fs::write(
+        &env.config,
+        format!(
+            "provider = \"anthropic\"\nmodel = \"claude-x\"\napi_key_env = \"{KEY_VAR}\"\nbase_url = \"{}\"\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let o = env.run(&["query", "ask", "zzzabsent qqqabsent ?"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let reqs = server.requests();
+    let post = reqs.iter().find(|r| r.method == "POST").unwrap();
+    assert!(post.body.contains("Résumé du graphe :"), "{}", post.body);
+    let line = format!("- {label} ({size} nœuds) : {description}");
+    assert!(post.body.contains(&line), "{line}\n{}", post.body);
+    assert!(!out.contains(&description) && !err.contains(&description));
+    assert!(!out.contains("Résumé du graphe") && !err.contains("Résumé du graphe"));
+    assert_eq!(out, "vue\n");
+    assert!(err.contains("réponse non vérifiable"), "{err}");
+    let _ = id;
+    let o = env.run(&["query", "ask", "zzzabsent qqqabsent ?", "--json"]);
+    let (out, _) = text(&o);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["nodes"], serde_json::json!([]));
+}

@@ -388,6 +388,7 @@
       ["Nom qualifié", d.qualified],
       ["Fichier", d.file],
       ["Communauté", d.community && d.community.text],
+      ["Description de la communauté", d.community && d.community.description],
       ["Résumé", d.summary],
     ].forEach(function (f) {
       if (f[1] === null || f[1] === undefined || f[1] === "") return;
@@ -469,6 +470,10 @@
         li.appendChild(sw);
         li.appendChild(document.createTextNode(entry.text));
         li.title = entry.text;
+        if (entry.description) {
+          li.appendChild(el("span", entry.description, "description"));
+          li.title = entry.text + " : " + entry.description;
+        }
         ul.appendChild(li);
       });
     }

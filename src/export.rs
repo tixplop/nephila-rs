@@ -56,6 +56,8 @@ struct NodeOut<'a> {
 #[derive(Serialize)]
 struct CommunityOut<'a> {
     cohesion: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
     id: i64,
     label: &'a str,
     pivot: &'a str,
@@ -95,6 +97,7 @@ pub fn write_json<W: Write>(store: &Store, w: &mut W) -> std::result::Result<(),
     for c in store.community_list()? {
         let item = CommunityOut {
             cohesion: c.cohesion,
+            description: c.description.as_deref(),
             id: c.id,
             label: &c.label,
             pivot: &c.pivot,
@@ -172,7 +175,13 @@ fn nodes_and_edges(store: &Store) -> Result<Value> {
     let communities: Vec<Value> = store
         .community_list()?
         .into_iter()
-        .map(|c| json!({"id": c.id, "label": c.label, "size": c.size}))
+        .map(|c| {
+            let mut v = json!({"id": c.id, "label": c.label, "size": c.size});
+            if let Some(d) = &c.description {
+                v["description"] = json!(d);
+            }
+            v
+        })
         .collect();
     let edges: Vec<Value> = store
         .edges()?

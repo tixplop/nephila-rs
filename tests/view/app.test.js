@@ -34,3 +34,15 @@ test("REQ150_app_js_utilise_le_modele_pour_les_communautes", () => {
   }
   for (const hex of ["#36b", "#c60", "#888"]) assert.ok(!src.includes(hex), hex + " en dur dans app.js");
 });
+
+test("REQ150_AC8 AC-150-8 app.js : description par textContent, champ et span de la légende", () => {
+  const src = fs.readFileSync(path.join(dir, "app.js"), "utf8");
+  assert.ok(src.includes('"Description de la communauté"'));
+  assert.ok(src.indexOf('"Communauté"') < src.indexOf('"Description de la communauté"'));
+  assert.ok(src.indexOf('"Description de la communauté"') < src.indexOf('"Résumé"'));
+  assert.ok(src.includes('el("span", entry.description, "description")'));
+  assert.ok(src.includes('entry.text + " : " + entry.description'));
+  assert.ok(!src.includes("innerHTML"));
+  const css = fs.readFileSync(path.join(dir, "style.css"), "utf8");
+  assert.ok(css.includes("#legend .description"));
+});

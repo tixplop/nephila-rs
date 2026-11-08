@@ -787,3 +787,16 @@ test("REQ150_AC7 contraste des 8 couleurs et du neutre sur le fond du canevas >=
     assert.ok(ratio >= 3, c + " : " + ratio);
   }
 });
+
+test("REQ150_AC8 AC-150-8 description d'une communauté : légende et détails, sans description sinon", () => {
+  const data = withCommunities(3, [5, 2]);
+  data.communities[0] = ["A", 5, "<b>x</b>"];
+  const g = model.load(data);
+  const legend = model.communityLegend(g);
+  assert.equal(legend[0].text, "0 A (5 nœuds)");
+  assert.equal(legend[0].description, "<b>x</b>");
+  assert.ok(!("description" in legend[1]));
+  assert.equal(model.details(g, 0).community.description, "<b>x</b>");
+  assert.ok(!("description" in model.details(g, 1).community));
+  assert.equal(model.communityLegend(model.load(withCommunities(3, [5, 2])))[0].text, "0 C0 (5 nœuds)");
+});

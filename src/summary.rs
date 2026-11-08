@@ -171,6 +171,21 @@ pub(crate) fn load(store: &Store) -> Result<Value> {
     // stocké avant elles) : `null`.
     if v.get("communities").is_none() || !store.communities_computed()? {
         v["communities"] = Value::Null;
+    } else if let Some(top) = v["communities"]["top"].as_array_mut() {
+        // Noms et descriptions de sous-système (REQ-263) : `communities` est la seule source.
+        let rows = store.community_list()?;
+        for e in top {
+            let Some(row) = e["id"]
+                .as_i64()
+                .and_then(|id| rows.iter().find(|r| r.id == id))
+            else {
+                continue;
+            };
+            e["label"] = json!(row.label);
+            if let Some(d) = &row.description {
+                e["description"] = json!(d);
+            }
+        }
     }
     Ok(v)
 }
@@ -252,8 +267,63 @@ fn write_communities(c: &Value, out: &mut Out) -> Result<()> {
             cohesion: 0.0,
             description: None,
         };
-        let l = format!("  {}", crate::query::community::community_line(&row, false));
+        let mut l = format!("  {}", crate::query::community::community_line(&row, false));
+        if let Some(d) = e["description"].as_str() {
+            l.push_str(" : ");
+            l.push_str(d);
+        }
         writeln!(out, "{}", crate::escape::data(&l))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: i64, label: &str, description: Option<&str>) -> CommunityRow {
+        CommunityRow {
+            id,
+            label: label.to_string(),
+            pivot: String::new(),
+            size: 12,
+            cohesion: 0.5,
+            description: description.map(String::from),
+        }
+    }
+
+    #[test]
+    fn req263_ac1_load_overlays_names_and_descriptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        let stored = compute(
+            vec![],
+            vec![],
+            vec![],
+            &[row(0, "pivot0", None), row(1, "pivot1", None)],
+        );
+        let (text, at) = stamped(&stored);
+        store.set_summary(&text, at).unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(dir.path().join(".nephila/graph.db")).unwrap();
+        let rows = [
+            row(0, "Commandes", Some("Reçoit les commandes.")),
+            row(1, "pivot1", None),
+        ];
+        crate::store::replace_communities_tx(&conn, &rows, &[]).unwrap();
+        conn.execute(
+            "UPDATE communities SET label = ?1, description = ?2 WHERE id = 0",
+            ["Commandes", "Reçoit les commandes."],
+        )
+        .unwrap();
+        let store = Store::open_readonly(dir.path()).unwrap();
+        let v = load(&store).unwrap();
+        let top = &v["communities"]["top"];
+        assert_eq!(top[0]["label"], "Commandes");
+        assert_eq!(top[0]["description"], "Reçoit les commandes.");
+        assert_eq!(top[1]["label"], "pivot1");
+        assert!(top[1].get("description").is_none());
+        // Le texte stocké n'est pas réécrit (AC-019-3).
+        assert_eq!(store.summary().unwrap().unwrap().0, text);
+    }
 }
