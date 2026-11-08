@@ -258,7 +258,7 @@ fn req161_ac5_answer_without_valid_citation_is_shown() {
     assert_eq!(text(&o.stderr), "erreur: pas trouvé dans le graphe\n");
     assert_eq!(o.status.code(), Some(1));
     env.fixture(r#"{"found":true,"answer":"inventé","nodes":[]}"#);
-    let o = env.ask("zzzabsent qqqabsent ?", &[]);
+    let o = env.ask("?!", &[]);
     assert_not_found(&o);
     assert_eq!(text(&o.stderr), "erreur: pas trouvé dans le graphe\n");
     assert_eq!(o.status.code(), Some(1));
@@ -295,15 +295,127 @@ fn req016_ac3_llm_not_found_signal() {
     assert_eq!(env.llm_calls(), 1);
 }
 
+/// AC-260-7 (remplace l'ancien test sans appel) : sans nœud de départ, le résumé global part au LLM.
 #[test]
-fn req016_ac3_no_matching_node_means_no_llm_call() {
+fn req260_ac7_no_matching_node_asks_with_the_summary() {
     let env = Env::new();
-    env.fixture(r#"{"found":true,"answer":"inventé","nodes":["com.acme.billing.Ledger"]}"#);
+    env.fixture(r#"{"found":true,"answer":"vue d'ensemble","nodes":["com.acme.billing.Ledger"]}"#);
+    let o = env.ask("zzzabsent qqqabsent ?", &[]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(text(&o.stdout).lines().next(), Some("vue d'ensemble"));
+    assert_eq!(env.llm_calls(), 1);
+    env.fixture(r#"{"found":false}"#);
     let o = env.ask("zzzabsent qqqabsent ?", &[]);
     assert_not_found(&o);
-    assert_eq!(env.llm_calls(), 0);
+    assert_eq!(env.llm_calls(), 1);
+    env.fixture(r#"{"found":true,"answer":"inventé","nodes":["com.acme.billing.Ledger"]}"#);
     assert_not_found(&env.ask("?!", &["--json"]));
     assert_eq!(env.llm_calls(), 0);
+    assert_not_found(&env.ask("?!", &[]));
+    assert_eq!(env.llm_calls(), 0);
+}
+
+/// AC-260-7 (corps de la requête) et AC-016-4 : le bloc part, pas le contenu des fichiers.
+#[test]
+fn req260_ac7_request_body_has_the_summary_block() {
+    let env = Env::new();
+    let reply = r#"{"found":true,"answer":"vue","nodes":[]}"#;
+    let server = FakeServer::start(vec![(
+        200,
+        serde_json::json!({"content":[{"type":"text","text":reply}]}).to_string(),
+    )]);
+    http_env(&env, &server);
+    let o = env
+        .cmd(&["query", "ask", "zzzabsent qqqabsent ?"])
+        .env("NEPHILA_TEST_ASK_KEY", "sk-test")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let reqs = server.requests();
+    let post = reqs.iter().find(|r| r.method == "POST").unwrap();
+    assert!(post.body.contains("Résumé du graphe :"), "{}", post.body);
+    assert!(!post.body.contains("SECRET_SOURCE_BODY"), "{}", post.body);
+}
+
+/// AC-016-7 : une erreur d'appel n'est pas transformée en « pas trouvé ».
+#[test]
+fn req016_ac7_call_error_is_not_not_found() {
+    let env = Env::new();
+    let server = FakeServer::start(vec![(401, "{}".to_string())]);
+    http_env(&env, &server);
+    let o = env
+        .cmd(&["query", "ask", "zzzabsent qqqabsent ?"])
+        .env("NEPHILA_TEST_ASK_KEY", "sk-test")
+        .output()
+        .unwrap();
+    assert!(o.stdout.is_empty(), "{}", text(&o.stdout));
+    assert_eq!(
+        text(&o.stderr),
+        "erreur: clé d'API refusée par anthropic (HTTP 401) ; vérifiez la variable désignée par api_key_env\n"
+    );
+    assert!(!text(&o.stderr).contains("pas trouvé dans le graphe"));
+    assert_eq!(o.status.code(), Some(1));
+    let posts = server
+        .requests()
+        .iter()
+        .filter(|r| r.method == "POST")
+        .count();
+    assert_eq!(posts, 1);
+}
+
+/// AC-260-10 : citations du bloc, sortie sans le bloc.
+#[test]
+fn req260_ac10_cited_summary_nodes_are_shown() {
+    let env = Env::new();
+    env.fixture(
+        r#"{"found":true,"answer":"la voici","nodes":["type:com.acme.billing.BillingService"]}"#,
+    );
+    let o = env.ask("zzzabsent qqqabsent ?", &[]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let out = text(&o.stdout);
+    assert!(out.starts_with("la voici\nNœuds cités :\n- "), "{out}");
+    assert_eq!(out.lines().count(), 3, "{out}");
+    assert!(text(&o.stderr).is_empty(), "{}", text(&o.stderr));
+    assert!(!out.contains("Résumé du graphe"));
+    let o = env.ask("zzzabsent qqqabsent ?", &["--json"]);
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["nodes"].as_array().unwrap().len(), 1);
+    // Libellé réel de communauté (celui d'un nœud existant) : aucune citation retenue, A-9.
+    let sum = env.cmd(&["summary", "--json"]).output().unwrap();
+    let v: Value = serde_json::from_slice(&sum.stdout).unwrap();
+    let labels: Vec<&str> = v["communities"]["top"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["label"].as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"charge"), "{labels:?}");
+    env.fixture(r#"{"found":true,"answer":"la voici","nodes":["charge"]}"#);
+    let o = env.ask("zzzabsent qqqabsent ?", &[]);
+    assert_eq!(text(&o.stdout), "la voici\n");
+    assert_eq!(text(&o.stderr), A9);
+    assert_eq!(o.status.code(), Some(0));
+    let o = env.ask("zzzabsent qqqabsent ?", &["--json"]);
+    assert_eq!(text(&o.stdout), "{\"answer\":\"la voici\",\"nodes\":[]}\n");
+}
+
+/// AC-260-11 : traces.
+#[test]
+fn req260_ac11_verbose_traces() {
+    let env = Env::new();
+    ask_ok_fixture(&env);
+    let o = env.ask("zzzabsent qqqabsent ?", &["--verbose"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let err = text(&o.stderr);
+    assert_eq!(err.lines().count(), 2, "{err}");
+    assert_eq!(traces(&o), [CFG_DEFAULT, CALLS_UNKNOWN]);
+    let o = env.ask("?!", &["--verbose"]);
+    let err = text(&o.stderr);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 2, "{err}");
+    assert!(lines[0].ends_with(CFG_DEFAULT), "{err}");
+    assert_eq!(lines[1], "erreur: pas trouvé dans le graphe");
+    assert!(!err.contains("appels:"));
 }
 
 #[test]
@@ -859,7 +971,7 @@ fn req162_ac14_config_line_place_in_stderr() {
     let o = env.ask(Q, &["--check-stale"]);
     assert!(!text(&o.stderr).contains("trace:"));
     // (b) aucun nœud de départ : config puis erreur.
-    let o = env.ask("zzzabsent qqqabsent ?", &["--verbose"]);
+    let o = env.ask("?!", &["--verbose"]);
     let err = text(&o.stderr);
     let lines: Vec<&str> = err.lines().collect();
     assert_eq!(lines.len(), 2, "{err}");

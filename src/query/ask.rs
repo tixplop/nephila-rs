@@ -20,6 +20,7 @@ use crate::filter::ProjectFile;
 use crate::llm::{build_llm, calls_line, with_format_retries, AskReply, CallStats, Llm, LlmTotals};
 use crate::model::{Edge, EdgeKind, Node};
 use crate::store::Store;
+use crate::summary;
 
 pub use crate::config::{
     AskLimits, ASK_MIN_CONTEXT_CHARS, DEFAULT_ASK_MAX_CONTEXT_CHARS, DEFAULT_ASK_MAX_NODES,
@@ -215,6 +216,130 @@ fn link_intent(question: &str) -> HashSet<EdgeKind> {
         .filter(|w| !cited.contains(w))
         .flat_map(|w| words::link_kinds(&words::fold(&w)).iter().copied())
         .collect()
+}
+
+/// Vrai si la question porte sur l'architecture : un mot de `keywords` qui n'est pas un
+/// identifiant cité, replié, est un mot d'architecture (REQ-260, DEC-193).
+fn asks_overview(question: &str) -> bool {
+    let cited = cited_identifiers(question);
+    keywords(question)
+        .into_iter()
+        .filter(|w| !cited.contains(w))
+        .any(|w| words::is_architecture_word(&words::fold(&w)))
+}
+
+/// Taille maximale du bloc de résumé, aux défauts (REQ-260).
+const SUMMARY_BLOCK_CHARS: usize = 3000;
+
+/// Bloc de résumé global du contexte : son texte et les identifiants de nœuds qu'il écrit
+/// (REQ-260, DEC-193).
+struct SummaryBlock {
+    text: String,
+    ids: Vec<String>,
+    /// Libellés des lignes de communauté écrites (DEC-195).
+    labels: Vec<String>,
+}
+
+/// Bloc de résumé tiré du résumé stocké : sections `Thèmes`, `Communautés`, `Nœuds les plus
+/// reliés` puis `Modules`, au plus `max_chars` caractères, coupé seulement en fin de ligne ; le
+/// titre d'une section n'est écrit qu'avec sa première ligne. `None` sans aucune ligne de section
+/// (REQ-260, DEC-193).
+fn summary_block(summary: &Value, max_chars: usize) -> Option<SummaryBlock> {
+    let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
+    let text_of = |v: &Value| v.as_str().unwrap_or("?").to_string();
+    // Section : titre et lignes (texte, identifiant de nœud écrit, libellé de communauté écrit).
+    type Line = (String, Option<String>, Option<String>);
+    let mut sections: Vec<(String, Vec<Line>)> = Vec::new();
+    let themes = list(&summary["themes"]);
+    if !themes.is_empty() {
+        let lines = themes
+            .iter()
+            .map(|t| {
+                let id = text_of(&t["concept"]);
+                (
+                    format!("- {id} ({} mentions)", t["mentions"]),
+                    Some(id),
+                    None,
+                )
+            })
+            .collect();
+        sections.push(("Thèmes :".to_string(), lines));
+    }
+    let top = list(&summary["communities"]["top"]);
+    if !top.is_empty() {
+        let lines = top
+            .iter()
+            .map(|c| {
+                let label = text_of(&c["label"]);
+                (
+                    format!("- {label} ({} nœuds)", c["size"]),
+                    None,
+                    Some(label),
+                )
+            })
+            .collect();
+        sections.push((
+            format!("Communautés ({}) :", summary["communities"]["total"]),
+            lines,
+        ));
+    }
+    let top_nodes = list(&summary["top_nodes"]);
+    if !top_nodes.is_empty() {
+        let lines = top_nodes
+            .iter()
+            .map(|n| {
+                let id = text_of(&n["id"]);
+                (format!("- {id} (degré {})", n["degree"]), Some(id), None)
+            })
+            .collect();
+        sections.push(("Nœuds les plus reliés :".to_string(), lines));
+    }
+    let modules = list(&summary["modules"]);
+    if !modules.is_empty() {
+        let lines = modules
+            .iter()
+            .map(|m| {
+                let id = text_of(&m["id"]);
+                let deps: Vec<String> = list(&m["depends_on"]).iter().map(text_of).collect();
+                let line = if deps.is_empty() {
+                    format!("- {id}")
+                } else {
+                    format!("- {id} -> {}", deps.join(", "))
+                };
+                (line, Some(id), None)
+            })
+            .collect();
+        sections.push((format!("Modules ({}) :", modules.len()), lines));
+    }
+    let mut text = "Résumé du graphe :\n".to_string();
+    let mut used = text.chars().count();
+    if used > max_chars {
+        return None;
+    }
+    let mut ids = Vec::new();
+    let mut labels = Vec::new();
+    let mut lines_written = 0;
+    'sections: for (title, lines) in &sections {
+        for (i, (line, id, label)) in lines.iter().enumerate() {
+            let head = if i == 0 {
+                format!("{title}\n")
+            } else {
+                String::new()
+            };
+            let cost = head.chars().count() + line.chars().count() + 1;
+            if used + cost > max_chars {
+                break 'sections;
+            }
+            used += cost;
+            text.push_str(&head);
+            text.push_str(line);
+            text.push('\n');
+            lines_written += 1;
+            ids.extend(id.clone());
+            labels.extend(label.clone());
+        }
+    }
+    (lines_written > 0).then_some(SummaryBlock { text, ids, labels })
 }
 
 /// Nœuds de départ d'une question, chemin de production : graphe, noms qualifiés cités et mots
@@ -499,7 +624,8 @@ fn to_json(n: &Node) -> Value {
 /// Pose la question ; retourne la réponse et les nœuds cités retenus, éventuellement aucun
 /// (REQ-161, DEC-130). Chaque citation est résolue parmi les seuls nœuds montrés dans le
 /// contexte envoyé, sans requête à la base ; une citation introuvable ou ambiguë parmi eux est
-/// écartée. `found: false` et l'absence de nœud de départ donnent « pas trouvé ».
+/// écartée. `found: false` donne « pas trouvé », comme l'absence de nœud de départ sans bloc de
+/// résumé (REQ-260, DEC-193).
 pub fn answer(
     store: &Store,
     llm: &dyn Llm,
@@ -509,11 +635,52 @@ pub fn answer(
 ) -> Result<(String, Vec<Node>)> {
     let nodes = store.nodes()?;
     let seeds = question_seeds(&nodes, question, limits);
-    if seeds.is_empty() {
+    let wants_block = if seeds.is_empty() {
+        !keywords(question).is_empty()
+    } else {
+        asks_overview(question)
+    };
+    let block = if wants_block {
+        let max_chars = SUMMARY_BLOCK_CHARS.min(limits.max_context_chars / 4);
+        summary::load(store)
+            .ok()
+            .and_then(|v| summary_block(&v, max_chars))
+    } else {
+        None
+    };
+    if seeds.is_empty() && block.is_none() {
         return Err(not_found());
     }
-    let edges = store.edges()?;
-    let context = build_context(&nodes, &edges, &seeds, &link_intent(question), limits);
+    let edges = if seeds.is_empty() {
+        Vec::new()
+    } else {
+        store.edges()?
+    };
+    let mut context = if seeds.is_empty() {
+        Context {
+            text: String::new(),
+            shown: Vec::new(),
+        }
+    } else {
+        let mut left = *limits;
+        if let Some(b) = &block {
+            left.max_context_chars = limits
+                .max_context_chars
+                .saturating_sub(b.text.chars().count());
+        }
+        build_context(&nodes, &edges, &seeds, &link_intent(question), &left)
+    };
+    let labels = block.as_ref().map(|b| b.labels.clone()).unwrap_or_default();
+    if let Some(b) = block {
+        context.text = format!("{}{}", b.text, context.text);
+        let in_block: HashSet<&str> = b.ids.iter().map(String::as_str).collect();
+        let present: HashSet<&str> = context.shown.iter().map(|n| n.id.as_str()).collect();
+        let extra: Vec<&Node> = nodes
+            .iter()
+            .filter(|n| in_block.contains(n.id.as_str()) && !present.contains(n.id.as_str()))
+            .collect();
+        context.shown.extend(extra);
+    }
     let mut totals = LlmTotals::default();
     let result = ask_with_retries(llm, question, &context.text, format_retries, &mut totals);
     if totals.calls > 0 {
@@ -529,8 +696,10 @@ pub fn answer(
         AskReply::NotFound => Err(not_found()),
         AskReply::Found {
             answer,
-            nodes: cited,
+            nodes: mut cited,
         } => {
+            // Un libellé de communauté du bloc n'est pas un nœud (DEC-195).
+            cited.retain(|c| !labels.contains(c));
             let retained = retain_cited(&context.shown, &cited);
             Ok((answer, retained))
         }
@@ -2240,6 +2409,314 @@ mod tests {
             resolve_cited(&shown, &["type:p.A", "p.A", "method:p.A.save"]),
             vec!["type:p.A", "method:p.A.save"]
         );
+    }
+
+    // ---- REQ-260 : résumé global dans le contexte ----
+
+    #[test]
+    fn req260_ac1_overview_detection() {
+        for q in [
+            "Quelle est l'architecture du projet ?",
+            "Give me an overview of the repo",
+            "Comment le code est-il organisé ?",
+            "Quelles sont les communautés ?",
+        ] {
+            assert!(asks_overview(q), "{q}");
+        }
+        for q in [
+            "Quel module gère la facturation ?",
+            "Que fait OrderService ?",
+            "What does structure() return?",
+            "How does Foo.overview work?",
+        ] {
+            assert!(!asks_overview(q), "{q}");
+        }
+    }
+
+    fn summary_value() -> Value {
+        json!({
+            "modules": [
+                {"id": "module:a", "name": "a", "depends_on": ["module:b", "module:c"]},
+                {"id": "module:b", "name": "b", "depends_on": []},
+            ],
+            "top_nodes": [{"id": "type:p.A", "degree": 7}],
+            "themes": [{"concept": "concept:paiement", "mentions": 3}],
+            "communities": {"total": 12, "top": [{"id": 1, "label": "A", "size": 5, "cohesion": 0.5}]},
+        })
+    }
+
+    #[test]
+    fn req260_ac2_block_form() {
+        let b = summary_block(&summary_value(), 3000).unwrap();
+        assert_eq!(
+            b.text,
+            "Résumé du graphe :\nThèmes :\n- concept:paiement (3 mentions)\nCommunautés (12) :\n- A (5 nœuds)\nNœuds les plus reliés :\n- type:p.A (degré 7)\nModules (2) :\n- module:a -> module:b, module:c\n- module:b\n"
+        );
+        assert_eq!(
+            b.ids,
+            ["concept:paiement", "type:p.A", "module:a", "module:b"]
+        );
+        let mut v = summary_value();
+        v["themes"] = json!([]);
+        v["communities"] = Value::Null;
+        let t = summary_block(&v, 3000).unwrap().text;
+        assert!(!t.contains("Thèmes") && !t.contains("Communautés"), "{t}");
+        let empty = json!({"modules": [], "top_nodes": [], "themes": [], "communities": null});
+        assert!(summary_block(&empty, 3000).is_none());
+    }
+
+    #[test]
+    fn req260_ac3_block_size() {
+        let modules: Vec<Value> = (0..500)
+            .map(|i| json!({"id": format!("module:{}{i:03}", "x".repeat(30)), "name": "x", "depends_on": []}))
+            .collect();
+        let v = json!({"modules": modules, "top_nodes": [], "themes": [], "communities": null});
+        for (max, expect_title) in [(3000, true), (250, true)] {
+            let b = summary_block(&v, max).unwrap();
+            assert!(b.text.chars().count() <= max, "{max}");
+            assert!(b.text.ends_with('\n'));
+            assert_eq!(b.text.contains("Modules (500) :\n"), expect_title);
+            let last = b.text.lines().last().unwrap();
+            assert!(last.starts_with("- module:"), "{last}");
+            let rows: Vec<String> = (0..b.ids.len())
+                .map(|i| format!("- module:{}{i:03}", "x".repeat(30)))
+                .collect();
+            let written: Vec<&str> = b
+                .text
+                .lines()
+                .skip_while(|l| !l.starts_with("- "))
+                .collect();
+            assert_eq!(written, rows, "{max}");
+            assert!(rows.iter().all(|l| l.len() == 42));
+        }
+        // Le titre d'une section n'est pas écrit sans sa première ligne.
+        let b = summary_block(&v, 19 + 16 + 5).unwrap_or(SummaryBlock {
+            text: String::new(),
+            ids: vec![],
+            labels: vec![],
+        });
+        assert!(!b.text.ends_with("Modules (500) :\n"));
+    }
+
+    /// Faux `Llm` qui garde le contexte reçu et répond avec des citations.
+    struct Keeper {
+        contexts: std::sync::Mutex<Vec<String>>,
+        cited: Vec<String>,
+    }
+
+    impl Llm for Keeper {
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<crate::llm::Enrichment> {
+            unreachable!("enrich")
+        }
+        fn enrich_lot(
+            &self,
+            _: &[crate::llm::LotItem],
+        ) -> Result<Vec<(String, Result<crate::llm::Enrichment>)>> {
+            unreachable!("enrich_lot")
+        }
+        fn ask(&self, _: &str, context: &str) -> Result<AskReply> {
+            self.contexts.lock().unwrap().push(context.to_string());
+            Ok(AskReply::Found {
+                answer: "ok".into(),
+                nodes: self.cited.clone(),
+            })
+        }
+    }
+
+    fn keeper(cited: &[&str]) -> Keeper {
+        Keeper {
+            contexts: std::sync::Mutex::new(Vec::new()),
+            cited: cited.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Store d'un nœud (`type:p.Order`), avec ou sans résumé.
+    fn store_with_summary(dir: &std::path::Path, summary: Option<&str>) -> Store {
+        let ty = mk(NodeKind::Type, "p.Order", Some("Gère les commandes"));
+        store_with_nodes(dir, summary, vec![ty])
+    }
+
+    fn store_with_nodes(dir: &std::path::Path, summary: Option<&str>, nodes: Vec<Node>) -> Store {
+        let mut st = Store::open_or_create(dir).unwrap();
+        st.insert_pending_files(&[crate::model::FileRecord {
+            path: "A.java".into(),
+            hash: "h".into(),
+            size: 3,
+            mtime: 7,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        }])
+        .unwrap();
+        st.replace_file("A.java", &nodes, &[]).unwrap();
+        if let Some(t) = summary {
+            st.set_summary(t, 1).unwrap();
+        }
+        st
+    }
+
+    fn stored_summary() -> String {
+        json!({
+            "modules": [{"id": "module:a", "name": "a", "depends_on": []}],
+            "top_nodes": [{"id": "type:p.Order", "degree": 7}, {"id": "type:p.Ghost", "degree": 2}],
+            "themes": [],
+            "communities": {"total": 1, "top": [{"id": 1, "label": "Zone", "size": 5, "cohesion": 0.5}]},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn req260_ac4_no_seed_context_is_the_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let nodes = vec![
+            mk(NodeKind::Type, "p.Order", Some("Gère les commandes")),
+            mk(NodeKind::Type, "p.Other", None),
+            mk(NodeKind::Module, "a", None),
+            mk(NodeKind::Concept, "paiement", None),
+        ];
+        let summary = json!({
+            "modules": [{"id": "module:a", "name": "a", "depends_on": []}],
+            "top_nodes": [{"id": "type:p.Order", "degree": 7}, {"id": "type:p.Ghost", "degree": 2}],
+            "themes": [{"concept": "concept:paiement", "mentions": 3}],
+            "communities": {"total": 1, "top": [{"id": 1, "label": "Order", "size": 5, "cohesion": 0.5}]},
+        })
+        .to_string();
+        let st = store_with_nodes(dir.path(), Some(&summary), nodes);
+        // `summary::load` ne lit les communautés que si elles sont calculées dans le store.
+        let conn = rusqlite::Connection::open(dir.path().join(".nephila/graph.db")).unwrap();
+        let row = crate::store::CommunityRow {
+            id: 1,
+            label: "Order".into(),
+            pivot: "type:p.Order".into(),
+            size: 5,
+            cohesion: 0.5,
+        };
+        crate::store::replace_communities_tx(&conn, &[row], &[]).unwrap();
+        // Retenues : nœud, module et concept du bloc. Écartées : nœud hors bloc, identifiant
+        // absent du graphe, libellé de communauté `Order` (DEC-195).
+        let llm = keeper(&[
+            "Order",
+            "type:p.Other",
+            "type:p.Ghost",
+            "module:a",
+            "concept:paiement",
+            "type:p.Order",
+        ]);
+        let (_, nodes) =
+            answer(&st, &llm, "zzzabsent qqqabsent ?", 0, &AskLimits::default()).unwrap();
+        let ctx = llm.contexts.lock().unwrap().clone();
+        assert_eq!(ctx.len(), 1);
+        assert!(ctx[0].starts_with("Résumé du graphe :\n"), "{}", ctx[0]);
+        assert!(!ctx[0].contains("Nœuds :") && !ctx[0].contains("Liens :"));
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["module:a", "concept:paiement", "type:p.Order"],
+            "{}",
+            ctx[0]
+        );
+        // Le libellé seul ne retient rien.
+        let llm = keeper(&["Order"]);
+        let (_, nodes) =
+            answer(&st, &llm, "zzzabsent qqqabsent ?", 0, &AskLimits::default()).unwrap();
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn req260_ac5_seed_context_follows_the_block() {
+        let dir = tempfile::tempdir().unwrap();
+        // Assez de nœuds de départ pour remplir 1000 caractères sans le bloc.
+        let mut nodes = vec![mk(NodeKind::Type, "p.Order", Some("Gère les commandes"))];
+        for i in 0..120 {
+            nodes.push(mk(
+                NodeKind::Method,
+                &format!("p.Order.operation{i:03}"),
+                None,
+            ));
+        }
+        let st = store_with_nodes(dir.path(), Some(&stored_summary()), nodes);
+        let wide = |n| AskLimits {
+            max_seeds: 100,
+            max_nodes: 200,
+            ..limits_chars(n)
+        };
+        let q = "Quelle architecture pour Order ?";
+        let all = st.nodes().unwrap();
+        let seeds = question_seeds(&all, q, &wide(1000));
+        let edges = st.edges().unwrap();
+        let alone = build_context(&all, &edges, &seeds, &link_intent(q), &wide(1000));
+        assert!(alone.text.chars().count() > 900, "{}", alone.text);
+        for limits in [wide(12_000), wide(1000)] {
+            let llm = keeper(&["type:p.Order"]);
+            let (_, nodes) = answer(&st, &llm, q, 0, &limits).unwrap();
+            let ctx = llm.contexts.lock().unwrap()[0].clone();
+            assert!(ctx.starts_with("Résumé du graphe :\n"), "{ctx}");
+            assert!(ctx.contains("Nœuds :\n"), "{ctx}");
+            assert!(
+                ctx.chars().count() <= limits.max_context_chars,
+                "{}",
+                ctx.chars().count()
+            );
+            assert_eq!(nodes.len(), 1);
+            // `type:p.Order` est dans le bloc et dans le contexte : montré une fois.
+            assert_eq!(nodes[0].id, "type:p.Order");
+        }
+        let st = store_with_summary(dir.path(), Some(&stored_summary()));
+        // Sans mot d'architecture : contexte de REQ-142 seul.
+        let llm = keeper(&[]);
+        answer(&st, &llm, "Que fait Order ?", 0, &AskLimits::default()).unwrap();
+        let ctx = llm.contexts.lock().unwrap()[0].clone();
+        let nodes = st.nodes().unwrap();
+        let seeds = question_seeds(&nodes, "Que fait Order ?", &AskLimits::default());
+        let edges = st.edges().unwrap();
+        let expected = build_context(
+            &nodes,
+            &edges,
+            &seeds,
+            &link_intent("Que fait Order ?"),
+            &AskLimits::default(),
+        );
+        assert_eq!(ctx, expected.text);
+    }
+
+    #[test]
+    fn req260_ac6_no_usable_summary_changes_nothing() {
+        let bad = [
+            None,
+            Some("pas du json"),
+            Some(r#"{"modules":[],"top_nodes":[],"themes":[],"communities":null}"#),
+        ];
+        for summary in bad {
+            let dir = tempfile::tempdir().unwrap();
+            let st = store_with_summary(dir.path(), summary);
+            let llm = keeper(&[]);
+            let r = answer(&st, &llm, "zzzabsent qqqabsent ?", 0, &AskLimits::default());
+            assert_eq!(r.unwrap_err().to_string(), not_found().to_string());
+            assert!(llm.contexts.lock().unwrap().is_empty());
+            let r = answer(
+                &st,
+                &llm,
+                "Quelle architecture pour Order ?",
+                0,
+                &AskLimits::default(),
+            );
+            assert!(r.is_ok());
+            let ctx = llm.contexts.lock().unwrap().clone();
+            assert_eq!(ctx.len(), 1);
+            assert!(ctx[0].starts_with("Nœuds :\n"), "{}", ctx[0]);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let st = store_with_summary(dir.path(), Some(&stored_summary()));
+        let llm = keeper(&[]);
+        let r = answer(&st, &llm, "?!", 0, &AskLimits::default());
+        assert_eq!(r.unwrap_err().to_string(), not_found().to_string());
+        assert!(llm.contexts.lock().unwrap().is_empty());
     }
 
     /// Faux `Llm` de `query ask` (REQ-177, AC-177-4) : erreur `Shape` puis `NotFound`.

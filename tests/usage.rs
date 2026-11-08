@@ -1143,13 +1143,13 @@ fn req166_ac2_ac6_mock_format_retries() {
 fn req166_ac3_no_call_no_calls_line() {
     let env = AskEnv::new("mock", "");
     fs::write(&env.config, "provider = \"mock\"\nmodel = \"mock\"\n").unwrap();
-    let o = env.cmd(&["query", "ask", "zzzabsent qqqabsent ?", "--verbose"], &[]);
+    let o = env.cmd(&["query", "ask", "?!", "--verbose"], &[]);
     assert!(!o.status.success());
     let err = stderr(&o);
     assert_eq!(err.lines().count(), 2, "{err}");
     assert!(!err.contains("appels:"), "{err}");
     assert!(err.lines().nth(1).unwrap().starts_with("erreur:"), "{err}");
-    let o = env.cmd(&["query", "ask", "zzzabsent qqqabsent ?"], &[]);
+    let o = env.cmd(&["query", "ask", "?!"], &[]);
     assert!(!stderr(&o).contains("appels:"));
 }
 

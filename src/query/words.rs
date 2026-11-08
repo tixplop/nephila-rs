@@ -299,6 +299,44 @@ pub(crate) fn link_kinds(word: &str) -> &'static [EdgeKind] {
     }
 }
 
+/// Mots d'architecture (REQ-260, DEC-193) : formes repliées, comparées mot à mot, sans racine. Ils
+/// restent cherchés comme des noms : ils ne sont pas des mots vides.
+const ARCHITECTURE_WORDS: &[&str] = &[
+    "architecture",
+    "architectures",
+    "architectural",
+    "architecturale",
+    "architecturales",
+    "architecturaux",
+    "overview",
+    "overviews",
+    "apercu",
+    "structure",
+    "structures",
+    "organisation",
+    "organisations",
+    "organization",
+    "organizations",
+    "organized",
+    "organise",
+    "organisee",
+    "organises",
+    "organisees",
+    "subsystem",
+    "subsystems",
+    "theme",
+    "themes",
+    "community",
+    "communities",
+    "communaute",
+    "communautes",
+];
+
+/// Vrai si le mot (forme repliée exacte) est un mot d'architecture (REQ-260, DEC-193).
+pub(crate) fn is_architecture_word(word: &str) -> bool {
+    ARCHITECTURE_WORDS.contains(&word)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::ask::STOP_WORDS;
@@ -437,5 +475,20 @@ mod tests {
             assert!(!STOP_WORDS.contains(&w), "dans STOP_WORDS {w}");
             assert!(!link_kinds(w).is_empty(), "absent de la table {w}");
         }
+    }
+
+    #[test]
+    fn req260_ac1_architecture_words_table() {
+        assert_eq!(ARCHITECTURE_WORDS.len(), 28);
+        let mut seen = std::collections::HashSet::new();
+        for w in ARCHITECTURE_WORDS {
+            assert_eq!(fold(w), *w, "{w}");
+            assert!(w.chars().count() >= 3, "{w}");
+            assert!(seen.insert(*w), "doublon {w}");
+            assert!(!STOP_WORDS.contains(w), "{w}");
+            assert!(is_architecture_word(w));
+        }
+        assert!(!is_architecture_word("module"));
+        assert!(!is_architecture_word("modules"));
     }
 }

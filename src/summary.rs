@@ -157,7 +157,7 @@ pub(crate) fn stamped(summary: &Value) -> (String, i64) {
 }
 
 /// Résumé stocké, avec `computed_at`.
-fn load(store: &Store) -> Result<Value> {
+pub(crate) fn load(store: &Store) -> Result<Value> {
     let (text, at) = store.summary()?.ok_or_else(|| {
         Error::Message("aucun résumé enregistré : lancez `nephila build`".to_string())
     })?;
