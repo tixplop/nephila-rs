@@ -29,7 +29,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 14;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -67,6 +67,16 @@ const ENRICHMENTS_DDL: &str = "CREATE TABLE enrichments (\n    path           TE
 /// Dernier schéma sans `enrichments.used_at` (une seule entrée par chemin), migré sur place
 /// (DEC-190).
 const SCHEMA_WITHOUT_USED_AT: i32 = 12;
+
+/// Déclaration de `subsystem_names`, identique au caractère près à celle de `schema.sql` (DEC-196).
+const SUBSYSTEM_NAMES_DDL: &str = "CREATE TABLE subsystem_names (\n    fingerprint TEXT PRIMARY KEY,\n    name        TEXT NOT NULL,\n    description TEXT NOT NULL\n);";
+
+/// Dernier schéma sans `communities.description` ni table `subsystem_names`, migré sur place
+/// (DEC-196).
+const SCHEMA_WITHOUT_SUBSYSTEMS: i32 = 13;
+
+/// Nombre de lignes gardées dans `subsystem_names` (AC-262-6).
+const SUBSYSTEM_NAMES_KEPT: i64 = 5000;
 
 /// Valeurs de `meta.resolution` (DEC-076) : le graphe est-il le résultat d'une passe terminée ?
 const RESOLUTION_DONE: &str = "à jour";
@@ -635,7 +645,8 @@ impl Store {
             | SCHEMA_WITHOUT_ENRICH_LANGUAGE
             | SCHEMA_WITHOUT_ENRICH_CALLS
             | SCHEMA_WITHOUT_DECLARATION_DOC
-            | SCHEMA_WITHOUT_USED_AT => store.migrate_to_current()?,
+            | SCHEMA_WITHOUT_USED_AT
+            | SCHEMA_WITHOUT_SUBSYSTEMS => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -674,7 +685,8 @@ impl Store {
             | SCHEMA_WITHOUT_ENRICH_LANGUAGE
             | SCHEMA_WITHOUT_ENRICH_CALLS
             | SCHEMA_WITHOUT_DECLARATION_DOC
-            | SCHEMA_WITHOUT_USED_AT => {
+            | SCHEMA_WITHOUT_USED_AT
+            | SCHEMA_WITHOUT_SUBSYSTEMS => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
                 Ok(store)
@@ -730,7 +742,8 @@ impl Store {
                 || v == SCHEMA_WITHOUT_ENRICH_LANGUAGE
                 || v == SCHEMA_WITHOUT_ENRICH_CALLS
                 || v == SCHEMA_WITHOUT_DECLARATION_DOC
-                || v == SCHEMA_WITHOUT_USED_AT =>
+                || v == SCHEMA_WITHOUT_USED_AT
+                || v == SCHEMA_WITHOUT_SUBSYSTEMS =>
             {
                 store.version = v
             }
@@ -745,13 +758,13 @@ impl Store {
         self.read_only && !self.conn.is_autocommit()
     }
 
-    /// Version du schéma du graphe ouvert (5 à 12 en lecture seule seulement : DEC-066, DEC-073,
+    /// Version du schéma du graphe ouvert (5 à 13 en lecture seule seulement : DEC-066, DEC-073,
     /// DEC-076).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
-    /// Migre un schéma 5 à 12 en schéma 13 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, 11 -> 12, puis 12 -> 13,
+    /// Migre un schéma 5 à 13 en schéma 14 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, 11 -> 12, 12 -> 13, puis 13 -> 14,
     /// chacune en une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         let from = self.user_version()?;
@@ -766,6 +779,7 @@ impl Store {
         self.migrate_10_to_11()?;
         self.migrate_11_to_12()?;
         self.migrate_12_to_13()?;
+        self.migrate_13_to_14()?;
         // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
         crate::trace!(
             "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
@@ -889,6 +903,29 @@ impl Store {
              INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at)
                  SELECT path, content_hash, model, prompt_version, payload, language, 0 FROM enrichments_old;
              DROP TABLE enrichments_old;
+             UPDATE meta SET value = '{SCHEMA_WITHOUT_SUBSYSTEMS}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITHOUT_SUBSYSTEMS};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
+    }
+
+    /// Migre un schéma 13 en schéma 14 en une transaction `IMMEDIATE` (DEC-196) : colonne
+    /// `communities.description`, table `subsystem_names` (sans `IF NOT EXISTS` : un objet en
+    /// conflit annule la migration), versions.
+    fn migrate_13_to_14(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_SUBSYSTEMS {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "ALTER TABLE communities ADD COLUMN description TEXT;
+             {SUBSYSTEM_NAMES_DDL}
              UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
@@ -1687,7 +1724,7 @@ impl Store {
     /// contenu enregistré (chemin hors graphe : la plus récente du chemin, DEC-190).
     pub fn enrichment_entry(&self, path: &str) -> Result<Option<EnrichmentEntry>> {
         // Un graphe de schéma 12, lu seul, n'a qu'une entrée par chemin et pas de `used_at`.
-        let order = if self.version >= SCHEMA_VERSION {
+        let order = if self.version >= SCHEMA_WITHOUT_SUBSYSTEMS {
             "e.used_at DESC, e.rowid DESC"
         } else {
             "e.rowid DESC"
@@ -2762,7 +2799,11 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare_cached("SELECT id, label, pivot, size, cohesion FROM communities ORDER BY id")
+            .prepare_cached(if self.version >= SCHEMA_VERSION {
+                "SELECT id, label, pivot, size, cohesion, description FROM communities ORDER BY id"
+            } else {
+                "SELECT id, label, pivot, size, cohesion, NULL FROM communities ORDER BY id"
+            })
             .map_err(db_err)?;
         let rows = st.query_map([], community_row).map_err(db_err)?;
         rows.collect::<std::result::Result<_, _>>().map_err(db_err)
@@ -2775,15 +2816,82 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare_cached(
-                "SELECT id, label, pivot, size, cohesion FROM communities WHERE id = ?1",
-            )
+            .prepare_cached(if self.version >= SCHEMA_VERSION {
+                "SELECT id, label, pivot, size, cohesion, description FROM communities WHERE id = ?1"
+            } else {
+                "SELECT id, label, pivot, size, cohesion, NULL FROM communities WHERE id = ?1"
+            })
             .map_err(db_err)?;
         match st.query_row([id], community_row) {
             Ok(r) => Ok(Some(r)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(db_err(e)),
         }
+    }
+
+    /// Vrai si le cache des noms de sous-systèmes est vide (DEC-196) ; un schéma < 14, lu sans
+    /// migration, n'a pas la table.
+    pub fn subsystem_names_empty(&self) -> Result<bool> {
+        if self.version < SCHEMA_VERSION {
+            return Ok(true);
+        }
+        Ok(self.count("subsystem_names")? == 0)
+    }
+
+    /// Nom et description en cache pour l'empreinte `fingerprint` (REQ-262).
+    pub fn subsystem_name(&self, fingerprint: &str) -> Result<Option<(String, String)>> {
+        if self.version < SCHEMA_VERSION {
+            return Ok(None);
+        }
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT name, description FROM subsystem_names WHERE fingerprint = ?1")
+            .map_err(db_err)?;
+        match st.query_row([fingerprint], |r| Ok((r.get(0)?, r.get(1)?))) {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    /// Écrit aussitôt une réponse valide dans le cache et ne garde que les 5 000 lignes les plus
+    /// récentes (AC-262-6).
+    pub fn put_subsystem_name(
+        &mut self,
+        fingerprint: &str,
+        name: &str,
+        description: &str,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        let tx = self.conn.transaction().map_err(db_err)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO subsystem_names(fingerprint, name, description) VALUES (?1, ?2, ?3)",
+            params![fingerprint, name, description],
+        )
+        .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM subsystem_names WHERE rowid NOT IN
+                 (SELECT rowid FROM subsystem_names ORDER BY rowid DESC LIMIT ?1)",
+            [SUBSYSTEM_NAMES_KEPT],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+
+    /// Remplace `label` et `description` des communautés `(id, nom, description)`, en une
+    /// transaction (REQ-262).
+    pub fn apply_subsystem_names(&mut self, names: &[(i64, String, String)]) -> Result<()> {
+        self.ensure_writable()?;
+        let tx = self.conn.transaction().map_err(db_err)?;
+        {
+            let mut up = tx
+                .prepare_cached("UPDATE communities SET label = ?2, description = ?3 WHERE id = ?1")
+                .map_err(db_err)?;
+            for (id, name, description) in names {
+                up.execute(params![id, name, description]).map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)
     }
 
     /// Identifiant de la communauté du nœud `node_id`.
@@ -3143,6 +3251,8 @@ pub struct CommunityRow {
     pub pivot: String,
     pub size: i64,
     pub cohesion: f64,
+    /// Description du sous-système (DEC-196) ; `None` sans nom de sous-système.
+    pub description: Option<String>,
 }
 
 fn community_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CommunityRow> {
@@ -3152,6 +3262,7 @@ fn community_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CommunityRow> {
         pivot: r.get(2)?,
         size: r.get(3)?,
         cohesion: r.get(4)?,
+        description: r.get(5)?,
     })
 }
 
@@ -4870,12 +4981,28 @@ mod tests {
         PRAGMA user_version = 12;
         COMMIT;";
 
-    /// Ramène un graphe de schéma 13 au schéma 12 (DEC-190).
-    fn downgrade_to_12(repo: &Path) {
+    /// Assistant « schéma 13 » (DEC-196), en SQL écrit en dur : table `subsystem_names` et colonne
+    /// `communities.description` supprimées, versions 13.
+    const SCHEMA13_DOWNGRADE: &str = "BEGIN;
+        DROP TABLE subsystem_names;
+        ALTER TABLE communities DROP COLUMN description;
+        UPDATE meta SET value = '13' WHERE key = 'schema_version';
+        PRAGMA user_version = 13;
+        COMMIT;";
+
+    /// Ramène un graphe de schéma 14 au schéma 13 (DEC-196).
+    fn downgrade_to_13(repo: &Path) {
         Connection::open(db_path(repo))
             .unwrap()
-            .execute_batch(SCHEMA12_DOWNGRADE)
+            .execute_batch(SCHEMA13_DOWNGRADE)
             .unwrap();
+    }
+
+    /// Ramène un graphe de schéma 14 au schéma 12 (le 13 d'abord, DEC-196, puis DEC-190).
+    fn downgrade_to_12(repo: &Path) {
+        let c = Connection::open(db_path(repo)).unwrap();
+        c.execute_batch(SCHEMA13_DOWNGRADE).unwrap();
+        c.execute_batch(SCHEMA12_DOWNGRADE).unwrap();
     }
 
     const SCHEMA11_DOWNGRADE: &str = "BEGIN;
@@ -6502,7 +6629,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(SCHEMA_VERSION, 14);
     }
 
     #[test]
@@ -6636,11 +6763,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_to_13_without_touching_the_file() {
-        for version in [13, 12, 11, 10, 9, 8, 7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_14_without_touching_the_file() {
+        for version in [14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                13 => downgrade_to_13(dir.path()),
                 12 => downgrade_to_12(dir.path()),
                 11 => downgrade_to_11(dir.path()),
                 10 => downgrade_to_10(dir.path()),
@@ -7660,7 +7788,7 @@ mod tests {
         assert_eq!(st.opened_schema_version(), 10);
         drop(st);
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(st.schema_version().unwrap(), 13);
+        assert_eq!(st.schema_version().unwrap(), 14);
         assert!(st.call_results().unwrap().is_empty());
         drop(st);
         downgrade_to_10(dir.path());
@@ -9149,6 +9277,7 @@ mod tests {
             pivot: pivot.to_string(),
             size,
             cohesion,
+            description: None,
         }
     }
 
@@ -9282,7 +9411,7 @@ mod tests {
                 assert!(!shape.is_empty());
                 assert_eq!(table_shape(&migrated, t), shape, "{t}");
             }
-            let names = ["id", "label", "pivot", "size", "cohesion"];
+            let names = ["id", "label", "pivot", "size", "cohesion", "description"];
             let got: Vec<String> = table_shape(&migrated, "communities")
                 .into_iter()
                 .map(|c| c.1)
@@ -9492,23 +9621,23 @@ mod tests {
     }
 
     #[test]
-    fn req245_ac4_new_graph_is_schema_13_and_schema_14_is_refused() {
+    fn req245_ac4_new_graph_is_schema_14_and_schema_15_is_refused() {
         let dir = tempdir().unwrap();
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(SCHEMA_VERSION, 13);
-        assert_eq!(st.schema_version().unwrap(), 13);
+        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(st.schema_version().unwrap(), 14);
         drop(st);
         Connection::open(db_path(dir.path()))
             .unwrap()
-            .execute_batch("PRAGMA user_version = 14")
+            .execute_batch("PRAGMA user_version = 15")
             .unwrap();
         let e = Store::open_or_create(dir.path()).err().unwrap().to_string();
         assert!(
-            e.contains("version de schéma du graphe non prise en charge (14"),
+            e.contains("version de schéma du graphe non prise en charge (15"),
             "{e}"
         );
         assert!(Store::open_readonly(dir.path()).is_err());
-        assert_eq!(st_user_version(dir.path()), 14);
+        assert_eq!(st_user_version(dir.path()), 15);
     }
 
     // ---- REQ-258 : plusieurs enrichissements conservés par chemin (DEC-190) ----

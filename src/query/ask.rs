@@ -2596,6 +2596,7 @@ mod tests {
             pivot: "type:p.Order".into(),
             size: 5,
             cohesion: 0.5,
+            description: None,
         };
         crate::store::replace_communities_tx(&conn, &[row], &[]).unwrap();
         // Retenues : nœud, module et concept du bloc. Écartées : nœud hors bloc, identifiant

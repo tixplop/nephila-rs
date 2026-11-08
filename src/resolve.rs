@@ -2577,6 +2577,7 @@ import q.R;",
                 pivot: ids[c.pivot as usize].to_string(),
                 size: c.members.len() as i64,
                 cohesion: c.cohesion,
+                description: None,
             });
             members.extend(
                 c.members

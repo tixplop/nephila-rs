@@ -250,6 +250,7 @@ fn write_communities(c: &Value, out: &mut Out) -> Result<()> {
             pivot: String::new(),
             size: e["size"].as_i64().unwrap_or(0),
             cohesion: 0.0,
+            description: None,
         };
         let l = format!("  {}", crate::query::community::community_line(&row, false));
         writeln!(out, "{}", crate::escape::data(&l))?;

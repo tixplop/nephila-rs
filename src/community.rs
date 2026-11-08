@@ -659,6 +659,7 @@ pub(crate) fn for_pass<'a>(
             pivot: ids[c.pivot as usize].to_string(),
             size: c.members.len() as i64,
             cohesion: c.cohesion,
+            description: None,
         });
         out.members.extend(
             c.members

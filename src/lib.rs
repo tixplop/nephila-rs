@@ -21,6 +21,7 @@ pub mod resolve;
 pub mod scan;
 pub mod status;
 pub mod store;
+pub(crate) mod subsystems;
 pub mod summary;
 pub mod trace;
 pub mod view;

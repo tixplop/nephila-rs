@@ -107,13 +107,15 @@ CREATE TABLE summary (
 );
 
 -- Communautés calculées par la dernière passe qui a écrit le résumé (DEC-120) ; sans autre index.
+-- `description` (DEC-196) : sur sa propre ligne, virgule en tête, pour que le texte égale celui
+-- d'un graphe migré par `ALTER TABLE ... ADD COLUMN`.
 CREATE TABLE communities (
     id       INTEGER PRIMARY KEY,
     label    TEXT NOT NULL,
     pivot    TEXT NOT NULL,
     size     INTEGER NOT NULL,
     cohesion REAL NOT NULL
-);
+, description TEXT);
 
 -- Sans rowid : la clé primaire est la table elle-même, sans index automatique doublon (DEC-123).
 CREATE TABLE node_communities (
@@ -129,3 +131,11 @@ CREATE TABLE enrich_calls (
     payload  TEXT NOT NULL,
     PRIMARY KEY (path, call_key)
 ) WITHOUT ROWID;
+
+-- Noms et descriptions de sous-systèmes par empreinte de communauté (DEC-196), conservés par
+-- `build` ; les 5 000 lignes les plus récentes (rowid) sont gardées.
+CREATE TABLE subsystem_names (
+    fingerprint TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL
+);

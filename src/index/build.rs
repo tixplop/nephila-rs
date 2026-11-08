@@ -745,6 +745,8 @@ pub(crate) fn finalize(
             stats = resolve_pass(store)?;
         }
     }
+    // REQ-262 : noms de sous-systèmes en cache réappliqués aux communautés recalculées.
+    crate::subsystems::reapply(store)?;
     report.nodes = store.count_nodes()?;
     report.edges = stats.edges;
     report.unresolved = stats.unresolved;
