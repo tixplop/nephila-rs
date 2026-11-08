@@ -67,6 +67,8 @@ pub struct BuildReport {
     pub subsystems: Option<crate::subsystems::SubsystemsOutcome>,
     /// Vrai si `--subsystems` n'a fait aucun appel parce que des fichiers restent à enrichir (A-21).
     pub subsystems_skipped: bool,
+    /// Bilan sans appel quand `subsystems_skipped` : tout nom absent du cache est laissé (V-002).
+    pub subsystems_tally: Option<crate::subsystems::SubsystemsOutcome>,
 }
 
 /// Réglages de l'indexation : ceux de la configuration, ou les défauts sans configuration.
@@ -400,6 +402,7 @@ pub fn run(
         &matcher,
     )?;
     write_report(out, &report, "build")?;
+    write_subsystems(out, &report)?;
     write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
     let done = finish(&report);
     warn_transient(&cli_filters);
@@ -488,6 +491,19 @@ pub(crate) fn coverage_segment(n: usize, m: usize) -> String {
 /// Écrit la ligne de bilan sur stdout ; en cas d'échec (E-17), la commande s'arrête là.
 pub(crate) fn write_report(out: &mut Out, report: &BuildReport, verb: &str) -> Result<()> {
     writeln!(out, "{}", report.line_for(verb))
+}
+
+/// Ligne `sous-systèmes :` de V-002, après le bilan ou `graphe à jour` ; rien sans bilan de passe
+/// (sans `--subsystems`, sans configuration LLM).
+pub(crate) fn write_subsystems(out: &mut Out, report: &BuildReport) -> Result<()> {
+    match report
+        .subsystems
+        .as_ref()
+        .or(report.subsystems_tally.as_ref())
+    {
+        Some(s) => writeln!(out, "{}", s.line()),
+        None => Ok(()),
+    }
 }
 
 /// Écrit les lignes de l'estimation sur stdout, après le bilan (V-002) ; E-17 si stdout est

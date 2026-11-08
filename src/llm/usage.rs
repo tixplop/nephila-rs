@@ -50,16 +50,40 @@ pub fn openai_usage(body: &Value) -> Option<Usage> {
 }
 
 /// Relevé d'un appel : le fil de l'appel l'écrit, l'appelant le lit après coup.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CallStats {
     sends: Cell<u32>,
     responded: Cell<bool>,
     usage: Cell<Option<Usage>>,
     /// Marque d'un sous-appel, ajoutée en fin de la ligne d'attente (REQ-231).
     mark: String,
+    /// Début des traces d'attente et de pause : `llm enrich`, ou `llm sous-système` (REQ-261).
+    word: &'static str,
+}
+
+impl Default for CallStats {
+    fn default() -> Self {
+        CallStats {
+            sends: Cell::new(0),
+            responded: Cell::new(false),
+            usage: Cell::new(None),
+            mark: String::new(),
+            word: "llm enrich",
+        }
+    }
 }
 
 impl CallStats {
+    /// Relevé d'un appel dont les traces d'attente et de pause commencent par `word`.
+    pub fn with_word(word: &'static str) -> Self {
+        CallStats {
+            word,
+            ..CallStats::default()
+        }
+    }
+    pub(crate) fn word(&self) -> &'static str {
+        self.word
+    }
     /// Relevé d'un appel dont les traces d'attente portent `mark`.
     pub fn with_mark(mark: String) -> Self {
         CallStats {

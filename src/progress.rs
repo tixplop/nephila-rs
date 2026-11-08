@@ -23,6 +23,8 @@ pub enum Phase {
     /// Attente des lots du fournisseur (`--batch`, REQ-217) : compte des requêtes.
     ProviderBatch,
     Enrichment,
+    /// Passe des sous-systèmes (REQ-261) : compte des communautés à nommer.
+    Subsystems,
 }
 
 impl Phase {
@@ -31,12 +33,14 @@ impl Phase {
             Phase::Extraction => "extraction",
             Phase::ProviderBatch => "lot du fournisseur",
             Phase::Enrichment => "enrichissement",
+            Phase::Subsystems => "sous-systèmes",
         }
     }
 
     fn unit(self) -> &'static str {
         match self {
             Phase::ProviderBatch => "requêtes",
+            Phase::Subsystems => "communautés",
             _ => "fichiers",
         }
     }

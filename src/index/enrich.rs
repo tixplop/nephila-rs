@@ -911,7 +911,7 @@ fn add_totals(totals: &Mutex<LlmTotals>, stats: &CallStats, attempt: Attempt) {
 }
 
 /// Fin de la ligne `llm enrich fin` : ` (<segment de jetons>)`, ou rien sans compte de jetons.
-fn tokens_suffix(stats: &CallStats) -> String {
+pub(crate) fn tokens_suffix(stats: &CallStats) -> String {
     stats
         .usage()
         .map(|u| format!(" ({})", tokens_segment(&u)))

@@ -6,11 +6,13 @@ use crate::index::build::{BuildReport, IndexOptions};
 use crate::index::enrich::{Policy, ANNOUNCE};
 use crate::llm::{with_format_retries, CallStats, Llm, LlmTotals, SubsystemName};
 use crate::model::Node;
+use crate::progress::{Meter, Phase};
 use crate::store::Store;
+use crate::trace;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Taille minimale d'une communauté retenue.
 pub const MIN_MEMBERS: usize = 10;
@@ -135,6 +137,17 @@ impl SubsystemsOutcome {
     pub fn left(&self) -> usize {
         self.failed + self.capped
     }
+
+    /// Ligne de stdout du bilan (V-002) : seul endroit qui la construit.
+    pub fn line(&self) -> String {
+        format!(
+            "sous-systèmes : {} communautés nommées, {} reprises sans appel, {} laissées, {} non retenues (moins de {MIN_MEMBERS} membres ou de {MIN_LINES} résumés)",
+            self.named,
+            self.reused,
+            self.left(),
+            self.not_retained
+        )
+    }
 }
 
 /// Communauté retenue dont le nom n'est pas en cache.
@@ -151,6 +164,15 @@ fn cause(e: &Error) -> String {
         Error::Truncated { .. } => format!("{TRUNCATED} ; augmentez max_output_tokens"),
         Error::Rejected { trace, .. } | Error::Redirected { trace, .. } => trace.clone(),
         other => other.to_string(),
+    }
+}
+
+/// Détail d'une trace `fin` : comme `cause`, sans l'action à faire (design.md : une trace ne
+/// reprend jamais l'action).
+fn trace_cause(e: &Error) -> String {
+    match e {
+        Error::Truncated { .. } => TRUNCATED.to_string(),
+        other => cause(other),
     }
 }
 
@@ -189,8 +211,36 @@ fn worker(
             if !policy.lock().unwrap_or_else(|e| e.into_inner()).take(1) {
                 return Err(Error::Capped);
             }
-            let stats = CallStats::default();
+            let stats = CallStats::with_word("llm sous-système");
+            let traced = trace::enabled();
+            if traced {
+                let mark = if current >= 2 {
+                    format!(" (essai {current}/{})", retries.saturating_add(1))
+                } else {
+                    String::new()
+                };
+                let chars: usize = item.lines.iter().map(|l| l.chars().count() + 1).sum();
+                trace!(
+                    "llm sous-système départ {label} : {} lignes, {chars} car.{mark}",
+                    item.lines.len()
+                );
+            }
+            let started = Instant::now();
             let r = llm.name_subsystem(&label, &item.lines, stop, &stats, fault);
+            if traced {
+                let ms = started.elapsed().as_millis();
+                let tokens = crate::index::enrich::tokens_suffix(&stats);
+                match &r {
+                    Ok(_) => trace!("llm sous-système fin {label} ok {ms} ms{tokens}"),
+                    // Essai refusé par le plafond ou sans envoi : ni appel ni fin à tracer.
+                    Err(Error::Capped | Error::Deferred | Error::Unsent) => {}
+                    Err(e) => trace!(
+                        "llm sous-système fin {label} {} {ms} ms : {}{tokens}",
+                        trace::classify(e),
+                        trace::short(&trace_cause(e), trace::MAX_MESSAGE_CHARS)
+                    ),
+                }
+            }
             totals
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -249,9 +299,35 @@ pub(crate) fn run(
     report: &mut BuildReport,
 ) -> Result<SubsystemsOutcome> {
     let _guard = crate::interrupt::Guard::install();
+    let (mut out, todo) = classify(store, opts.max_calls)?;
+    trace!(
+        "sous-systèmes: début {} communautés à nommer, {} reprises sans appel, {} fils",
+        todo.len(),
+        out.reused,
+        opts.concurrency
+    );
+    let started = Instant::now();
+    if !todo.is_empty() {
+        send(store, llm, opts, report, &todo, &mut out)?;
+    }
+    reapply(store)?;
+    trace!(
+        "sous-systèmes: fin {} ms, {} nommées, {} laissées",
+        started.elapsed().as_millis(),
+        out.named,
+        out.left()
+    );
+    if out.totals.calls > 0 {
+        trace!("{}", crate::llm::calls_line(&out.totals));
+    }
+    Ok(out)
+}
+
+/// Classe les communautés : non retenues, reprises du cache, ou à nommer par un appel.
+fn classify(store: &Store, max_calls: Option<usize>) -> Result<(SubsystemsOutcome, Vec<Todo>)> {
     let language = store.enrich_language()?.unwrap_or_default();
     let mut out = SubsystemsOutcome {
-        max_calls: opts.max_calls,
+        max_calls,
         ..SubsystemsOutcome::default()
     };
     let mut todo: Vec<Todo> = Vec::new();
@@ -279,10 +355,13 @@ pub(crate) fn run(
             });
         }
     }
-    if !todo.is_empty() {
-        send(store, llm, opts, report, &todo, &mut out)?;
-    }
-    reapply(store)?;
+    Ok((out, todo))
+}
+
+/// Bilan sans appel (V-002) : les communautés retenues dont le nom n'est pas en cache sont laissées.
+fn tally(store: &Store) -> Result<SubsystemsOutcome> {
+    let (mut out, todo) = classify(store, None)?;
+    out.capped = todo.len();
     Ok(out)
 }
 
@@ -310,6 +389,7 @@ fn send(
     let (tx, rx) = mpsc::channel::<Reply>();
     let mut write_error: Option<Error> = None;
     let mut capped_replies = 0;
+    let mut meter = Meter::start(Phase::Subsystems, todo.len());
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let tx = tx.clone();
@@ -331,6 +411,13 @@ fn send(
         scope.spawn(|| watch_interrupt(&policy, &stop, &done));
         while let Ok((i, result)) = rx.recv() {
             let item = &todo[i];
+            // Un appel terminé, réussi ou non, fait avancer la progression ; pas un essai refusé.
+            if let Some(m) = meter
+                .as_mut()
+                .filter(|_| !matches!(&result, Err(Error::Capped | Error::Unsent)))
+            {
+                m.advance(1);
+            }
             match result {
                 Ok(named) if write_error.is_none() => {
                     match store.put_subsystem_name(
@@ -373,7 +460,7 @@ fn send(
     // Communautés jamais envoyées : le plafond les a laissées, sauf si un arrêt a eu lieu avant.
     let unsent = queue.into_inner().unwrap_or_else(|e| e.into_inner()).len();
     if report.stop_cause.is_some() {
-        out.failed += unsent;
+        out.failed += unsent + capped_replies;
         out.capped = 0;
     } else {
         out.capped = capped_replies + unsent;
@@ -396,15 +483,19 @@ pub(crate) fn after_enrichment(
     let Some(llm) = llm else {
         return Ok(());
     };
-    // Clé ou requête refusée (E-12, E-19, E-20) : la ligne `erreur:` reste seule.
+    // Clé ou requête refusée (E-12, E-19, E-20) ou envoi arrêté : aucun appel, la ligne du bilan
+    // compte les communautés laissées ; la ligne `erreur:` dit la cause.
     if report.refused.is_some() {
+        report.subsystems_tally = Some(tally(store)?);
         return Ok(());
     }
     if report.to_enrich > 0 {
         report.subsystems_skipped = true;
+        report.subsystems_tally = Some(tally(store)?);
         return Ok(());
     }
     if report.stop_cause.is_some() || report.interrupted {
+        report.subsystems_tally = Some(tally(store)?);
         return Ok(());
     }
     report.subsystems = Some(run(store, llm, opts, report)?);

@@ -408,7 +408,8 @@ fn send_with(
                         }
                         if let Some(label) = label {
                             crate::trace!(
-                                "llm enrich attente {label} {} ms après {cause} (nouvel essai {k}/{MAX_RETRIES}){}",
+                                "{} attente {label} {} ms après {cause} (nouvel essai {k}/{MAX_RETRIES}){}",
+                                stats.word(),
                                 d.as_millis(),
                                 stats.mark()
                             );
@@ -418,7 +419,8 @@ fn send_with(
                             let (moved, lowered) = pause.poser_limite(now, now + d);
                             if let (true, Some(label)) = (moved, label) {
                                 crate::trace!(
-                                    "llm enrich pause {label} : aucun envoi pendant {} ms après {cause}{}",
+                                    "{} pause {label} : aucun envoi pendant {} ms après {cause}{}",
+                                    stats.word(),
                                     d.as_millis(),
                                     stats.mark()
                                 );

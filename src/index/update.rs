@@ -60,6 +60,7 @@ pub fn run(
             &matcher,
         )?;
         build::write_report(out, &report, "build")?;
+        build::write_subsystems(out, &report)?;
         build::write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
         let done = build::finish(&report);
         build::warn_transient(&cli_filters);
@@ -79,6 +80,9 @@ pub fn run(
     let done = match updated {
         Updated::UpToDate(estimate, subsystems) => {
             writeln!(out, "graphe à jour")?;
+            if let Some(r) = &subsystems {
+                build::write_subsystems(out, r)?;
+            }
             build::write_estimate_lines(
                 out,
                 estimate.as_ref(),
@@ -91,6 +95,7 @@ pub fn run(
         }
         Updated::Report(report) => {
             build::write_report(out, &report, "update")?;
+            build::write_subsystems(out, &report)?;
             build::write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
             let done = build::finish(&report);
             capped_report = Some(*report);

@@ -351,7 +351,12 @@ fn req261_ac5_ac13_files_left_to_enrich_skip_the_pass() {
             == "avertissement: sous-systèmes non nommés : 1 fichiers restent à enrichir ; relancez nephila update --subsystems"),
         "{err}"
     );
-    assert!(!out.contains("sous-systèmes :"));
+    // A-21 : la ligne est écrite, chaque communauté retenue est laissée (V-002).
+    assert!(
+        out.lines().any(|l| l
+            == "sous-systèmes : 0 communautés nommées, 0 reprises sans appel, 3 laissées, 1 non retenues (moins de 10 membres ou de 3 résumés)"),
+        "{out}"
+    );
     // Le code et la dernière ligne sont ceux d'un build sans l'option.
     assert_eq!(last(&err), "erreur: 1 fichier(s) à enrichir");
     assert_eq!(named_count(&env), 0);
@@ -613,7 +618,10 @@ fn req261_ac9_update_without_change_runs_the_pass_then_writes_nothing() {
     let labels = env.labels();
     let o = env.run(&["update", "--subsystems"]);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
-    assert_eq!(text(&o).0, "graphe à jour\n");
+    assert_eq!(
+        text(&o).0,
+        "graphe à jour\nsous-systèmes : 0 communautés nommées, 3 reprises sans appel, 0 laissées, 0 non retenues (moins de 10 membres ou de 3 résumés)\n"
+    );
     assert_eq!(env.subsystem_calls(), 3, "aucun appel de plus");
     assert_eq!(env.labels(), labels);
     assert!(env.state() == before, "le second lancement a écrit");
@@ -724,4 +732,259 @@ fn req261_ac14_help_lists_the_option_between_batch_and_exclude() {
         let out = text(&env.run(&[cmd, "--help"])).0;
         assert!(!out.contains("--subsystems"), "{cmd}");
     }
+}
+
+// ---- AC-261-11, AC-261-12, AC-261-15 : bilan, traces et progression ----
+
+const NOT_RETAINED: &str = "2 non retenues (moins de 10 membres ou de 3 résumés)";
+
+/// Dépôt d'AC-261-2 : une communauté retenue, deux qui ne le sont pas.
+fn one_retained() -> Vec<(String, String)> {
+    let mut f = Vec::new();
+    group(&mut f, 0, 11, 5);
+    group(&mut f, 1, 8, 5);
+    group(&mut f, 2, 11, 2);
+    f
+}
+
+#[test]
+fn req261_ac12_ac11_the_subsystems_line_follows_the_report() {
+    let env = Env::mock(&one_retained(), "");
+    let o = env.run(&["build", "--subsystems"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("build terminé"), "{out}");
+    assert_eq!(
+        lines[1],
+        format!("sous-systèmes : 1 communautés nommées, 0 reprises sans appel, 0 laissées, {NOT_RETAINED}")
+    );
+    assert_eq!(lines.len(), 2, "{out}");
+    let o = env.run(&["update", "--subsystems"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    assert_eq!(
+        text(&o).0,
+        format!("graphe à jour\nsous-systèmes : 0 communautés nommées, 1 reprises sans appel, 0 laissées, {NOT_RETAINED}\n")
+    );
+}
+
+#[test]
+fn req261_ac12_without_the_option_no_subsystems_line() {
+    let env = Env::mock(&one_retained(), "");
+    for args in [&["build"][..], &["update"], &["update", "--no-llm"]] {
+        let (out, _) = text(&env.run(args));
+        assert!(
+            !out.lines().any(|l| l.starts_with("sous-systèmes")),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn req261_ac12_ac11_files_left_to_enrich_count_every_community_as_left() {
+    let mut f = one_retained();
+    f.push(("doc.md".into(), "# Doc\n\nTexte.\n".into()));
+    let env = Env::mock(&f, "");
+    let o = env.run_env(
+        &["build", "--subsystems"],
+        &[("NEPHILA_MOCK_MALFORMED", "doc.md:9")],
+    );
+    let (out, _) = text(&o);
+    assert!(
+        out.lines().any(|l| l
+            == "sous-systèmes : 0 communautés nommées, 0 reprises sans appel, 1 laissées, 3 non retenues (moins de 10 membres ou de 3 résumés)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn req261_ac15_verbose_traces_in_order_without_llm_text() {
+    let env = Env::mock(&one_retained(), "");
+    env.write("docs/a.md", "# Titre\n\nUn texte.\n");
+    let o = env.run(&["build", "--subsystems", "--verbose"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let events: Vec<&str> = err
+        .lines()
+        .filter_map(|l| l.split_once("] ").map(|(_, e)| e))
+        .filter(|e| {
+            e.starts_with("sous-systèmes:")
+                || e.starts_with("llm sous-système")
+                || e.starts_with("appels:")
+        })
+        .collect();
+    assert_eq!(events.len(), 6, "{events:?}");
+    assert!(events[0].starts_with("appels: "), "{events:?}");
+    assert_eq!(
+        events[1],
+        "sous-systèmes: début 1 communautés à nommer, 0 reprises sans appel, 1 fils"
+    );
+    assert!(
+        events[2].starts_with("llm sous-système départ communauté 0 : ")
+            && events[2].contains(" lignes, ")
+            && events[2].ends_with(" car."),
+        "{events:?}"
+    );
+    assert!(
+        events[3].starts_with("llm sous-système fin communauté 0 ok "),
+        "{events:?}"
+    );
+    assert!(
+        events[4].starts_with("sous-systèmes: fin ")
+            && events[4].ends_with(" ms, 1 nommées, 0 laissées"),
+        "{events:?}"
+    );
+    assert!(events[5].starts_with("appels: 1 appels, "), "{events:?}");
+    let enrich_starts: Vec<&str> = err
+        .lines()
+        .filter(|l| l.contains("] llm enrich départ "))
+        .collect();
+    assert_eq!(enrich_starts.len(), 1, "{enrich_starts:?}");
+    assert!(enrich_starts[0].contains("docs/a.md"), "{enrich_starts:?}");
+    assert!(
+        !err.contains("Sous-système") && !err.contains("Description du"),
+        "{err}"
+    );
+    assert!(!err.contains('\u{1b}'));
+}
+
+#[test]
+fn req261_ac15_progress_lines_after_the_enrichment_ones() {
+    let mut f = Vec::new();
+    group(&mut f, 0, 11, 5);
+    group(&mut f, 1, 11, 5);
+    let env = Env::mock(&f, "");
+    env.write("docs/a.md", "# Titre\n\nUn texte.\n");
+    let o = env.run(&["build", "--subsystems", "--show-progress"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let progress: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("progression: "))
+        .collect();
+    let n = progress.len();
+    assert_eq!(
+        &progress[n - 3..],
+        [
+            "progression: sous-systèmes 0 % (0/2 communautés)",
+            "progression: sous-systèmes 50 % (1/2 communautés)",
+            "progression: sous-systèmes 100 % (2/2 communautés)"
+        ]
+    );
+    assert!(progress[..n - 3]
+        .iter()
+        .any(|l| l.starts_with("progression: enrichissement")));
+    assert!(!err.contains('\u{1b}'));
+    // Même sortie avec NO_COLOR=1, sur un dépôt identique.
+    let other = Env::mock(&f, "");
+    other.write("docs/a.md", "# Titre\n\nUn texte.\n");
+    let o2 = other.run_env(
+        &["build", "--subsystems", "--show-progress"],
+        &[("NO_COLOR", "1")],
+    );
+    let err2 = text(&o2).1;
+    let progress2: Vec<&str> = err2
+        .lines()
+        .filter(|l| l.starts_with("progression: "))
+        .collect();
+    assert_eq!(progress, progress2);
+    assert!(!err2.contains('\u{1b}'));
+    let again = env.run(&["update", "--subsystems", "--show-progress"]);
+    assert!(!text(&again).1.contains("progression: sous-systèmes"));
+}
+
+// ---- Corrections de relecture ----
+
+#[test]
+fn req261_ac11_refused_key_during_enrichment_still_writes_the_line() {
+    let mut f = three_groups();
+    f.push(("doc.md".into(), "# Doc\n\nTexte.\n".into()));
+    let env = Env::mock(&f, "");
+    let o = env.run_env(
+        &["build", "--subsystems"],
+        &[("NEPHILA_MOCK_INVALID_KEY", "1")],
+    );
+    let (out, err) = text(&o);
+    assert_ne!(o.status.code(), Some(0), "{err}");
+    assert!(last(&err).starts_with("erreur: clé d'API refusée"), "{err}");
+    assert_eq!(env.subsystem_calls(), 0);
+    assert!(
+        out.lines().any(|l| l
+            == "sous-systèmes : 0 communautés nommées, 0 reprises sans appel, 3 laissées, 1 non retenues (moins de 10 membres ou de 3 résumés)"),
+        "{out}"
+    );
+    assert!(!err.contains("fichiers restent à enrichir"), "{err}");
+}
+
+#[test]
+fn req261_ac15_failed_call_trace_is_fixed_and_without_llm_text() {
+    let mut f = Vec::new();
+    group(&mut f, 0, 11, 5);
+    let env = Env::mock(&f, "");
+    fs::write(
+        env.mock.join("_subsystem.json"),
+        serde_json::json!({"name": format!("SECRET{}", "x".repeat(60)), "description": "SECRETDESC"})
+            .to_string(),
+    )
+    .unwrap();
+    let o = env.run(&["build", "--subsystems", "--verbose"]);
+    let (_, err) = text(&o);
+    assert!(
+        err.lines().any(
+            |l| l.contains("] llm sous-système fin communauté 0 erreur ")
+                && l.ends_with(
+                    ": réponse LLM non conforme : name vide ou de plus de 60 caractères"
+                )
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("SECRET"), "{err}");
+}
+
+#[test]
+fn req261_ac15_truncated_trace_has_no_action() {
+    let mut f = Vec::new();
+    group(&mut f, 0, 11, 5);
+    let cut = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": "{\"name\":"}, "finish_reason": "length"}]
+    })
+    .to_string();
+    let server = FakeServer::start_replies(vec![Reply::status(200, &cut)]);
+    let env = Env::server(&f, &server.base_url, "");
+    let o = env.run(&["build", "--subsystems", "--verbose"]);
+    let (_, err) = text(&o);
+    let fin = err
+        .lines()
+        .find(|l| l.contains("] llm sous-système fin communauté 0 "))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(fin.contains(" tronquée "), "{fin}");
+    assert!(!fin.contains("augmentez"), "{fin}");
+}
+
+#[test]
+fn req255_req261_ac15_wait_and_pause_traces_use_the_subsystem_words() {
+    let mut f = Vec::new();
+    group(&mut f, 0, 11, 5);
+    let server = FakeServer::start_replies(vec![
+        Reply::with_header(429, "{\"error\":\"x\"}", "retry-after-ms", "20"),
+        Reply::status(200, &valid_reply("Un")),
+    ]);
+    let env = Env::server(&f, &server.base_url, "");
+    let o = env.run(&["build", "--subsystems", "--verbose"]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert!(
+        err.lines()
+            .any(|l| l.contains("] llm sous-système attente communauté 0 20 ms après HTTP 429")),
+        "{err}"
+    );
+    assert!(
+        err.lines()
+            .any(|l| l.contains("] llm sous-système pause communauté 0 : aucun envoi pendant")),
+        "{err}"
+    );
+    assert!(
+        !err.contains("llm enrich attente") && !err.contains("llm enrich pause"),
+        "{err}"
+    );
 }
