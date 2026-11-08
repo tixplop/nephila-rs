@@ -45,6 +45,7 @@ pub fn run(
     if let Some(j) = over.jobs {
         setup.opts.jobs = j;
     }
+    setup.opts.subsystems = over.subsystems;
     let lock = RepoLock::acquire(repo)?;
     build::check_project_model(repo, &setup, over.accept_project_model, over.dry_run)?;
     // Le test d'existence se fait sous verrou : aucun build concurrent ne peut le créer entre-temps.
@@ -63,6 +64,7 @@ pub fn run(
         let done = build::finish(&report);
         build::warn_transient(&cli_filters);
         build::warn_capped(&report);
+        build::warn_subsystems(&report, &setup.opts);
         return done;
     }
     let updated = update_with_dry_run(
@@ -73,9 +75,9 @@ pub fn run(
         &lock,
         &matcher,
     )?;
-    let mut capped_report = None;
+    let capped_report;
     let done = match updated {
-        Updated::UpToDate(estimate) => {
+        Updated::UpToDate(estimate, subsystems) => {
             writeln!(out, "graphe à jour")?;
             build::write_estimate_lines(
                 out,
@@ -83,19 +85,22 @@ pub fn run(
                 &setup.opts,
                 setup.dry_run.as_ref(),
             )?;
-            Ok(())
+            let done = subsystems.as_deref().map_or(Ok(()), build::finish);
+            capped_report = subsystems.map(|r| *r);
+            done
         }
         Updated::Report(report) => {
             build::write_report(out, &report, "update")?;
             build::write_estimate(out, &report, &setup.opts, setup.dry_run.as_ref())?;
             let done = build::finish(&report);
-            capped_report = Some(report);
+            capped_report = Some(*report);
             done
         }
     };
     build::warn_transient(&cli_filters);
     if let Some(report) = &capped_report {
         build::warn_capped(report);
+        build::warn_subsystems(report, &setup.opts);
     }
     done
 }
@@ -118,10 +123,10 @@ fn is_build_script_under(path: &str, dir: &str) -> bool {
 }
 
 /// Résultat d'un `update` : rien n'a changé (avec, sous `--dry-run`, l'estimation du graphe
-/// ouvert), ou un bilan.
+/// ouvert, et, sous `--subsystems`, le bilan de la passe des sous-systèmes), ou un bilan.
 #[derive(Debug)]
 pub enum Updated {
-    UpToDate(Option<Estimate>),
+    UpToDate(Option<Estimate>, Option<Box<BuildReport>>),
     Report(Box<BuildReport>),
 }
 
@@ -136,7 +141,7 @@ pub fn update(
 ) -> Result<Option<BuildReport>> {
     Ok(
         match update_with_dry_run(repo, opts, llm, None, _lock, matcher)? {
-            Updated::UpToDate(_) => None,
+            Updated::UpToDate(..) => None,
             Updated::Report(report) => Some(*report),
         },
     )
@@ -218,7 +223,19 @@ pub fn update_with_dry_run(
             }
             None => None,
         };
-        return Ok(Updated::UpToDate(estimate));
+        // `--subsystems` : les communautés sans nom sont nommées même sans changement (REQ-261).
+        let subsystems = if opts.subsystems {
+            let mut report = BuildReport {
+                llm_active: llm.is_some(),
+                ..BuildReport::default()
+            };
+            crate::subsystems::reapply(&mut store)?;
+            crate::subsystems::after_enrichment(&mut store, llm, opts, &mut report)?;
+            Some(Box::new(report))
+        } else {
+            None
+        };
+        return Ok(Updated::UpToDate(estimate, subsystems));
     }
 
     // Tous les fichiers supprimés partent en une seule transaction (DEC-074).
@@ -908,7 +925,7 @@ mod tests {
         let d = dry();
         let first =
             update_with_dry_run(&repo, &opts, None, Some(&d), &lock, &Matcher::none()).unwrap();
-        let Updated::UpToDate(Some(est)) = first else {
+        let Updated::UpToDate(Some(est), _) = first else {
             panic!("graphe à jour attendu : {first:?}");
         };
         // Aucun enrichissement enregistré : les deux documents restent à enrichir.
@@ -943,6 +960,6 @@ mod tests {
             &Matcher::none(),
         )
         .unwrap();
-        assert!(matches!(r, Updated::UpToDate(None)), "{r:?}");
+        assert!(matches!(r, Updated::UpToDate(None, _)), "{r:?}");
     }
 }

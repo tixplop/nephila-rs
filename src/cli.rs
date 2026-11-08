@@ -84,6 +84,7 @@ fn parse_context_chars(s: &str) -> std::result::Result<usize, String> {
 
 const ACCEPT_PROJECT_MODEL_HELP: &str = "Accepte le modèle de .nephila.toml pour cette commande, même s'il fait réenrichir plus de 50 fichiers déjà enrichis (voir `model_override` de la configuration ; défaut : refus au-delà de 50)";
 const BATCH_HELP: &str = "Confie l'enrichissement au mode lot du fournisseur : moins cher, mais jusqu'à 24 h d'attente ; nephila update --batch reprend après Ctrl-C (sans rapport avec --batch-files, qui règle les fichiers par appel ; incompatible avec --no-llm)";
+const SUBSYSTEMS_HELP: &str = "Nomme chaque grande communauté par un appel LLM, à la fin de la commande ; le nom reste gardé tant que la communauté ne change pas (incompatible avec --no-llm et --dry-run)";
 const MAX_CALLS_HELP: &str = "Nombre maximal d'appels d'enrichissement de cette commande, nouveaux essais de format compris ; les fichiers restants attendent le prochain nephila update (remplace `max_calls` de la configuration ; défaut : aucun plafond)";
 
 const FORMAT_RETRIES_HELP: &str = "Nombre de nouveaux essais d'un appel LLM dont la réponse est non conforme (remplace `format_retries` de la configuration ; défaut 2 ; 0 = aucun nouvel essai)";
@@ -154,6 +155,8 @@ pub struct IndexOpts {
     pub accept_project_model: bool,
     #[arg(help = BATCH_HELP, long, conflicts_with = "no_llm")]
     pub batch: bool,
+    #[arg(help = SUBSYSTEMS_HELP, long, conflicts_with_all = ["no_llm", "dry_run"])]
+    pub subsystems: bool,
     /// Exclut de l'analyse les fichiers qui correspondent au motif (syntaxe .gitignore, relatif à la racine du dépôt ; répétable ; !motif réinclut un fichier exclu par un motif précédent)
     #[arg(long, value_name = "MOTIF", action = clap::ArgAction::Append, value_parser = parse_exclude)]
     pub exclude: Vec<String>,
@@ -285,6 +288,7 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
                     accept_project_model: o.accept_project_model,
                     batch: o.batch,
                     dry_run: o.dry_run,
+                    subsystems: o.subsystems,
                 },
                 o.filters(),
                 out,
@@ -305,6 +309,7 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
                     accept_project_model: o.accept_project_model,
                     batch: o.batch,
                     dry_run: o.dry_run,
+                    subsystems: o.subsystems,
                 },
                 o.filters(),
                 out,

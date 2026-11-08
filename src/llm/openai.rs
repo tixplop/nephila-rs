@@ -351,7 +351,8 @@ impl Complete for OpenAiLlm {
             let schema = with_schema.then(|| reply.schema());
             let format = schema.as_ref().map(|s| (reply.name(), s));
             let mut body = request_body(&self.model, &self.gen, &system, &user, format);
-            if let Some(collector) = &self.collector {
+            // La passe des sous-systèmes part toujours hors mode lot (REQ-261).
+            if let (Some(collector), false) = (&self.collector, matches!(reply, Reply::Subsystem)) {
                 return collector.exchange(&body, stats);
             }
             // Réponse reçue en flux (REQ-249) ; le mode lot ne passe pas ici.

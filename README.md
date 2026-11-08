@@ -538,6 +538,8 @@ Une communauté est un groupe de nœuds plus reliés entre eux qu'avec le reste 
 
 **Quand** : à chaque `build` et à chaque `update` qui change le graphe. Les numéros sont refaits à chaque calcul : désignez une communauté par un de ses nœuds (`--node`).
 
+**Noms de sous-systèmes** : avec `--subsystems`, `build` et `update` font nommer et décrire par le LLM chaque communauté d'au moins 10 membres et 3 résumés. Coût : un appel par communauté, compté dans `max_calls`. Le nom et la description restent gardés, et réappliqués sans appel, tant que la communauté et ses résumés ne changent pas.
+
 ```
 $ nephila query community [<numéro>] [--node <nœud>] [--limit N]
 $ nephila query community

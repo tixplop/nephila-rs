@@ -63,6 +63,10 @@ pub struct BuildReport {
     pub summarized: usize,
     /// Nœuds demandés des fichiers écrits par cette commande (REQ-235).
     pub requested: usize,
+    /// Bilan de la passe `--subsystems` ; `None` si elle n'a pas eu lieu (REQ-261).
+    pub subsystems: Option<crate::subsystems::SubsystemsOutcome>,
+    /// Vrai si `--subsystems` n'a fait aucun appel parce que des fichiers restent à enrichir (A-21).
+    pub subsystems_skipped: bool,
 }
 
 /// Réglages de l'indexation : ceux de la configuration, ou les défauts sans configuration.
@@ -85,6 +89,8 @@ pub struct IndexOptions {
     pub enrich_scope: EnrichScope,
     /// `--batch` (REQ-211) : l'enrichissement passe par le mode lot du fournisseur.
     pub batch: bool,
+    /// `--subsystems` (REQ-261) : passe des noms de sous-systèmes à la fin de la commande.
+    pub subsystems: bool,
 }
 
 impl Default for IndexOptions {
@@ -99,6 +105,7 @@ impl Default for IndexOptions {
             max_calls: None,
             enrich_scope: EnrichScope::default(),
             batch: false,
+            subsystems: false,
         }
     }
 }
@@ -115,6 +122,7 @@ impl From<&Config> for IndexOptions {
             max_calls: c.max_calls,
             enrich_scope: EnrichScope::default(),
             batch: false,
+            subsystems: false,
         }
     }
 }
@@ -347,6 +355,8 @@ pub struct Overrides {
     pub dry_run: bool,
     /// `--batch` (REQ-211) : enrichissement par le mode lot du fournisseur.
     pub batch: bool,
+    /// `--subsystems` (REQ-261) : nomme les grandes communautés à la fin de la commande.
+    pub subsystems: bool,
 }
 
 /// Point d'entrée de `nephila build` : valide le dépôt, la configuration et la clé, puis construit.
@@ -377,6 +387,7 @@ pub fn run(
     if let Some(j) = over.jobs {
         setup.opts.jobs = j;
     }
+    setup.opts.subsystems = over.subsystems;
     // Le verrou précède toute écriture, mais suit les contrôles qui ne doivent rien créer.
     let lock = RepoLock::acquire(repo)?;
     check_project_model(repo, &setup, over.accept_project_model, over.dry_run)?;
@@ -393,6 +404,7 @@ pub fn run(
     let done = finish(&report);
     warn_transient(&cli_filters);
     warn_capped(&report);
+    warn_subsystems(&report, &setup.opts);
     done
 }
 
@@ -523,6 +535,10 @@ pub(crate) fn finish(report: &BuildReport) -> Result<()> {
     if report.llm_active && to_enrich > 0 {
         problems.push(format!("{to_enrich} fichier(s) à enrichir"));
     }
+    // Communautés restées sans nom à cause d'un échec ou d'un arrêt ; celles du plafond sont dites par A-22.
+    if let Some(s) = report.subsystems.as_ref().filter(|s| s.failed > 0) {
+        problems.push(format!("{} communauté(s) à nommer", s.failed));
+    }
     if problems.is_empty() {
         Ok(())
     } else {
@@ -548,6 +564,38 @@ pub(crate) fn warn_capped(report: &BuildReport) {
             "{} : {} fichiers laissés à enrichir ; relancez {command} pour continuer ou augmentez max_calls",
             crate::index::enrich::cap_label(m),
             report.left_by_cap
+        ));
+    }
+}
+
+/// Avertissements de la passe `--subsystems` (design.md V-006), après A-10 et avant la ligne
+/// `erreur:` : A-20 sans configuration LLM, sinon A-21 (fichiers à enrichir), sinon A-22 (plafond).
+pub(crate) fn warn_subsystems(report: &BuildReport, opts: &IndexOptions) {
+    if !opts.subsystems {
+        return;
+    }
+    let command = if opts.batch {
+        "nephila update --batch --subsystems"
+    } else {
+        "nephila update --subsystems"
+    };
+    if !report.llm_active {
+        let create = crate::config::config_path()
+            .map(|p| format!(" ; créez {}", p.display()))
+            .unwrap_or_default();
+        warn(&format!(
+            "sous-systèmes non nommés : aucune configuration LLM{create}"
+        ));
+    } else if report.subsystems_skipped {
+        warn(&format!(
+            "sous-systèmes non nommés : {} fichiers restent à enrichir ; relancez {command}",
+            report.to_enrich
+        ));
+    } else if let Some(s) = report.subsystems.as_ref().filter(|s| s.capped > 0) {
+        warn(&format!(
+            "{} : {} communautés laissées sans nom ; relancez nephila update --subsystems pour continuer ou augmentez max_calls",
+            crate::index::enrich::cap_label(s.max_calls.unwrap_or(0)),
+            s.capped
         ));
     }
 }
@@ -762,6 +810,9 @@ pub(crate) fn finalize(
     }
     if llm.is_some() || dry.is_some() {
         report.out_of_scope = store.count_out_of_scope(opts.enrich_code, &opts.enrich_scope)?;
+    }
+    if opts.subsystems {
+        crate::subsystems::after_enrichment(store, llm, opts, report)?;
     }
     if let Some(dry) = dry {
         report.estimate = Some(estimate_enrichment(store, dry, opts, repo, abs)?);

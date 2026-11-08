@@ -1,10 +1,16 @@
 //! Noms de sous-systèmes (REQ-261, REQ-262, DEC-196) : sélection des lignes envoyées, empreinte
 //! d'une communauté et réapplication du cache à chaque passe qui recalcule les communautés.
 
-use crate::error::Result;
+use crate::error::{warn, Error, Result, TRUNCATED};
+use crate::index::build::{BuildReport, IndexOptions};
+use crate::index::enrich::{Policy, ANNOUNCE};
+use crate::llm::{with_format_retries, CallStats, Llm, LlmTotals, SubsystemName};
 use crate::model::Node;
 use crate::store::Store;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Mutex};
+use std::time::Duration;
 
 /// Taille minimale d'une communauté retenue.
 pub const MIN_MEMBERS: usize = 10;
@@ -95,13 +101,314 @@ pub fn reapply(store: &mut Store) -> Result<()> {
         let ids: Vec<String> = members.into_iter().map(|n| n.id).collect();
         let fp = fingerprint(SUBSYSTEM_PROMPT_VERSION, &language, &ids, &lines);
         if let Some((name, description)) = store.subsystem_name(&fp)? {
-            found.push((c.id, name, description));
+            // Déjà appliqué : rien à écrire (AC-261-9).
+            if c.label != name || c.description.as_deref() != Some(description.as_str()) {
+                found.push((c.id, name, description));
+            }
         }
     }
     if found.is_empty() {
         return Ok(());
     }
     store.apply_subsystem_names(&found)
+}
+
+/// Bilan de la passe (REQ-261) : communautés nommées par un appel, reprises du cache, laissées
+/// (échec ou plafond) et non retenues.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubsystemsOutcome {
+    pub named: usize,
+    pub reused: usize,
+    pub not_retained: usize,
+    /// Communautés retenues restées sans nom à cause d'un échec ou d'un arrêt (ligne `erreur:`).
+    pub failed: usize,
+    /// Communautés retenues restées sans nom à cause du plafond (A-22).
+    pub capped: usize,
+    /// Plafond d'appels de la commande, pour le texte d'A-22.
+    pub max_calls: Option<usize>,
+    /// Totaux des appels de la passe.
+    pub totals: LlmTotals,
+}
+
+impl SubsystemsOutcome {
+    /// Communautés retenues restées sans nom.
+    pub fn left(&self) -> usize {
+        self.failed + self.capped
+    }
+}
+
+/// Communauté retenue dont le nom n'est pas en cache.
+struct Todo {
+    id: i64,
+    name: String,
+    fingerprint: String,
+    lines: Vec<String>,
+}
+
+/// Cause d'un échec pour A-23 : libellés fixes, jamais le texte reçu.
+fn cause(e: &Error) -> String {
+    match e {
+        Error::Truncated { .. } => format!("{TRUNCATED} ; augmentez max_output_tokens"),
+        Error::Rejected { trace, .. } | Error::Redirected { trace, .. } => trace.clone(),
+        other => other.to_string(),
+    }
+}
+
+type Reply = (usize, Result<SubsystemName>);
+
+/// Un fil d'envoi : prend les communautés dans l'ordre, un appel (nouveaux essais compris) chacune.
+#[allow(clippy::too_many_arguments)]
+fn worker(
+    todo: &[Todo],
+    queue: &Mutex<VecDeque<usize>>,
+    policy: &Mutex<Policy>,
+    stop: &AtomicBool,
+    llm: &dyn Llm,
+    retries: u32,
+    totals: &Mutex<LlmTotals>,
+    tx: mpsc::Sender<Reply>,
+) {
+    crate::interrupt::block_in_this_thread();
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let ticket = {
+            let p = policy.lock().unwrap_or_else(|e| e.into_inner());
+            if p.capped {
+                return;
+            }
+            p.dispatch()
+        };
+        let Some(i) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front() else {
+            return;
+        };
+        let item = &todo[i];
+        let label = format!("communauté {}", item.id);
+        let result = with_format_retries(retries, stop, |current, fault| {
+            if !policy.lock().unwrap_or_else(|e| e.into_inner()).take(1) {
+                return Err(Error::Capped);
+            }
+            let stats = CallStats::default();
+            let r = llm.name_subsystem(&label, &item.lines, stop, &stats, fault);
+            totals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add(&stats, current >= 2);
+            r
+        });
+        // Une requête refusée laisse la communauté et la passe continue (REQ-261) ; un essai
+        // refusé par le plafond n'est pas un échec.
+        let counted = match &result {
+            Ok(_) => Some(None),
+            Err(Error::Capped | Error::Rejected { .. } | Error::Redirected { .. }) => None,
+            Err(e) => Some(Some(e)),
+        };
+        if let Some(error) = counted {
+            let halt = policy
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(ticket, error);
+            if halt {
+                stop.store(true, Ordering::SeqCst);
+            }
+        }
+        if tx.send((i, result)).is_err() {
+            return;
+        }
+    }
+}
+
+/// Fil de veille : au premier Ctrl-C, demande l'arrêt et annonce A-12.
+fn watch_interrupt(policy: &Mutex<Policy>, stop: &AtomicBool, done: &AtomicBool) {
+    loop {
+        if crate::interrupt::received() >= 1 {
+            policy
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .request_stop();
+            stop.store(true, Ordering::SeqCst);
+            warn(ANNOUNCE);
+            return;
+        }
+        if done.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Passe des noms de sous-systèmes (REQ-261, REQ-262) : un appel par communauté retenue dont
+/// l'empreinte n'est pas en cache, `concurrency` au plus à la fois, sur ce que le plafond de la
+/// commande a laissé à l'enrichissement. Chaque réponse valide est écrite aussitôt ; les noms en
+/// cache sont réappliqués à la fin. Rend le bilan ; la politique d'arrêt est reportée sur `report`.
+pub(crate) fn run(
+    store: &mut Store,
+    llm: &dyn Llm,
+    opts: &IndexOptions,
+    report: &mut BuildReport,
+) -> Result<SubsystemsOutcome> {
+    let _guard = crate::interrupt::Guard::install();
+    let language = store.enrich_language()?.unwrap_or_default();
+    let mut out = SubsystemsOutcome {
+        max_calls: opts.max_calls,
+        ..SubsystemsOutcome::default()
+    };
+    let mut todo: Vec<Todo> = Vec::new();
+    for c in store.community_list()? {
+        if (c.size as usize) < MIN_MEMBERS {
+            out.not_retained += 1;
+            continue;
+        }
+        let members = store.community_members(c.id)?;
+        let lines = select_lines(&members, &store.community_degrees(c.id)?);
+        if lines.len() < MIN_LINES {
+            out.not_retained += 1;
+            continue;
+        }
+        let ids: Vec<String> = members.into_iter().map(|n| n.id).collect();
+        let fingerprint = fingerprint(SUBSYSTEM_PROMPT_VERSION, &language, &ids, &lines);
+        if store.subsystem_name(&fingerprint)?.is_some() {
+            out.reused += 1;
+        } else {
+            todo.push(Todo {
+                id: c.id,
+                name: c.label,
+                fingerprint,
+                lines,
+            });
+        }
+    }
+    if !todo.is_empty() {
+        send(store, llm, opts, report, &todo, &mut out)?;
+    }
+    reapply(store)?;
+    Ok(out)
+}
+
+/// Envoie les appels de `todo` et écrit chaque réponse valide aussitôt.
+fn send(
+    store: &mut Store,
+    llm: &dyn Llm,
+    opts: &IndexOptions,
+    report: &mut BuildReport,
+    todo: &[Todo],
+    out: &mut SubsystemsOutcome,
+) -> Result<()> {
+    // Budget unique de la commande : ce que l'enrichissement a laissé.
+    let left = opts
+        .max_calls
+        .map(|m| m.saturating_sub(report.llm.calls as usize));
+    let mut initial = Policy::with_cap(left);
+    initial.subsystems = true;
+    let policy = Mutex::new(initial);
+    let queue = Mutex::new((0..todo.len()).collect::<VecDeque<usize>>());
+    let totals = Mutex::new(LlmTotals::default());
+    let stop = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
+    let workers = opts.concurrency.clamp(1, todo.len());
+    let (tx, rx) = mpsc::channel::<Reply>();
+    let mut write_error: Option<Error> = None;
+    let mut capped_replies = 0;
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let (queue, policy, stop, totals) = (&queue, &policy, &stop, &totals);
+            scope.spawn(move || {
+                worker(
+                    todo,
+                    queue,
+                    policy,
+                    stop,
+                    llm,
+                    opts.format_retries,
+                    totals,
+                    tx,
+                )
+            });
+        }
+        drop(tx);
+        scope.spawn(|| watch_interrupt(&policy, &stop, &done));
+        while let Ok((i, result)) = rx.recv() {
+            let item = &todo[i];
+            match result {
+                Ok(named) if write_error.is_none() => {
+                    match store.put_subsystem_name(
+                        &item.fingerprint,
+                        &named.name,
+                        &named.description,
+                    ) {
+                        Ok(()) => out.named += 1,
+                        Err(e) => {
+                            write_error = Some(e);
+                            stop.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(Error::Capped) => capped_replies += 1,
+                // Appel qui n'a rien envoyé : la communauté reste sans nom, sans avertissement.
+                Err(Error::Unsent) => out.failed += 1,
+                Err(e) => {
+                    // La clé refusée est dite par l'erreur finale, sans avertissement par communauté.
+                    if !matches!(e, Error::InvalidKey(_)) {
+                        warn(&format!(
+                            "communauté {} {} : {}",
+                            item.id,
+                            item.name,
+                            cause(&e)
+                        ));
+                    }
+                    out.failed += 1;
+                }
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+    });
+    out.totals = totals.into_inner().unwrap_or_else(|e| e.into_inner());
+    let policy = policy.into_inner().unwrap_or_else(|e| e.into_inner());
+    report.stop_cause = policy.stop_cause;
+    report.refused = policy.refused;
+    report.interrupted = policy.interrupted;
+    // Communautés jamais envoyées : le plafond les a laissées, sauf si un arrêt a eu lieu avant.
+    let unsent = queue.into_inner().unwrap_or_else(|e| e.into_inner()).len();
+    if report.stop_cause.is_some() {
+        out.failed += unsent;
+        out.capped = 0;
+    } else {
+        out.capped = capped_replies + unsent;
+    }
+    if let Some(e) = write_error {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Fin commune de `build` et `update` quand `--subsystems` est donné : pas de LLM, rien à faire
+/// ici (A-20 est dit par la commande) ; envoi refusé : rien ; des fichiers restent à enrichir :
+/// aucune passe (A-21) ; envoi arrêté sans fichier restant : rien ; sinon la passe.
+pub(crate) fn after_enrichment(
+    store: &mut Store,
+    llm: Option<&dyn Llm>,
+    opts: &IndexOptions,
+    report: &mut BuildReport,
+) -> Result<()> {
+    let Some(llm) = llm else {
+        return Ok(());
+    };
+    // Clé ou requête refusée (E-12, E-19, E-20) : la ligne `erreur:` reste seule.
+    if report.refused.is_some() {
+        return Ok(());
+    }
+    if report.to_enrich > 0 {
+        report.subsystems_skipped = true;
+        return Ok(());
+    }
+    if report.stop_cause.is_some() || report.interrupted {
+        return Ok(());
+    }
+    report.subsystems = Some(run(store, llm, opts, report)?);
+    Ok(())
 }
 
 #[cfg(test)]

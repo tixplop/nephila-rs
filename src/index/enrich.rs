@@ -61,27 +61,29 @@ pub(crate) const ANNOUNCE: &str = "Ctrl-C reçu : plus aucun appel ne part, ceux
 
 /// Politique d'échec partagée entre les threads de travail (DEC-015).
 #[derive(Default)]
-struct Policy {
+pub(crate) struct Policy {
     consecutive_network: usize,
     network_total: usize,
     consecutive_timeout: usize,
     timeout_total: usize,
     /// Cause de la ligne `erreur:` finale.
-    stop_cause: Option<String>,
+    pub(crate) stop_cause: Option<String>,
     /// Libellé de la cause dans la trace `politique: arrêt de l'envoi`.
-    stop_label: Option<String>,
+    pub(crate) stop_label: Option<String>,
     /// Première erreur d'arrêt immédiat (clé refusée REQ-054, requête refusée REQ-091), si elle
     /// est la cause de l'arrêt.
-    refused: Option<Error>,
+    pub(crate) refused: Option<Error>,
     /// Appels (essais) encore permis par le plafond de la commande (REQ-186) ; `None` sans plafond.
     budget: Option<usize>,
     /// Valeur du plafond, pour son libellé ; `None` sans plafond.
-    limit: Option<usize>,
+    pub(crate) limit: Option<usize>,
     /// Vrai dès qu'une prise a été refusée faute de compte. N'écrit jamais `stop_cause`,
     /// `stop_label` ni `refused` : le plafond n'est pas une erreur (REQ-187).
-    capped: bool,
+    pub(crate) capped: bool,
     /// Vrai si l'arrêt demandé par Ctrl-C est la cause de l'arrêt (REQ-191).
-    interrupted: bool,
+    pub(crate) interrupted: bool,
+    /// Vrai pour la passe des sous-systèmes : la commande à relancer porte `--subsystems`.
+    pub(crate) subsystems: bool,
 }
 
 /// Libellé du plafond atteint : seule source du texte, pour la trace `politique:` et pour A-10.
@@ -90,11 +92,11 @@ pub(crate) fn cap_label(max: usize) -> String {
 }
 
 /// Totaux des erreurs réseau et des délais dépassés constatés au départ d'un appel (DEC-022).
-type Ticket = (usize, usize);
+pub(crate) type Ticket = (usize, usize);
 
 impl Policy {
     /// Politique d'une commande dont le plafond d'appels est `max_calls`.
-    fn with_cap(max_calls: Option<usize>) -> Policy {
+    pub(crate) fn with_cap(max_calls: Option<usize>) -> Policy {
         Policy {
             budget: max_calls,
             limit: max_calls,
@@ -105,7 +107,7 @@ impl Policy {
     /// Prend `n` appels sur le plafond (sous le verrou de la politique). Sans plafond : vrai.
     /// Reste suffisant : le décompte est fait. Sinon le plafond est marqué atteint, le reste
     /// n'est pas touché et la prise est refusée.
-    fn take(&mut self, n: usize) -> bool {
+    pub(crate) fn take(&mut self, n: usize) -> bool {
         match self.budget {
             None => true,
             Some(left) if left >= n => {
@@ -120,20 +122,24 @@ impl Policy {
     }
 
     /// Prend un ticket au départ d'un appel (sous le verrou de la politique).
-    fn dispatch(&self) -> Ticket {
+    pub(crate) fn dispatch(&self) -> Ticket {
         (self.network_total, self.timeout_total)
     }
 
     fn stop_with(&mut self, label: &str, cause: &str) {
         if self.stop_cause.is_none() {
             self.stop_label = Some(label.to_string());
-            self.stop_cause = Some(cause.to_string());
+            self.stop_cause = Some(if self.subsystems {
+                cause.replace("nephila update", "nephila update --subsystems")
+            } else {
+                cause.to_string()
+            });
         }
     }
 
     /// Arrêt demandé par Ctrl-C : pose la cause si aucune n'est posée et rend vrai ; sinon ne
     /// change rien et rend faux. N'écrit ni `capped` ni `refused`.
-    fn request_stop(&mut self) -> bool {
+    pub(crate) fn request_stop(&mut self) -> bool {
         if self.stop_cause.is_some() {
             return false;
         }
@@ -144,7 +150,7 @@ impl Policy {
 
     /// Met à jour la politique ; renvoie vrai si l'envoi de nouveaux fichiers doit s'arrêter.
     /// Une réussite n'efface que les échecs constatés avant le départ de son appel (DEC-022).
-    fn record(&mut self, ticket: Ticket, result: Option<&Error>) -> bool {
+    pub(crate) fn record(&mut self, ticket: Ticket, result: Option<&Error>) -> bool {
         match result {
             None => {
                 self.consecutive_network = self
