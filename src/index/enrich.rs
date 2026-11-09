@@ -234,6 +234,9 @@ pub(crate) enum Unit<'a> {
         path: Vec<usize>,
         /// Le contenu du morceau porte `cache_control` (REQ-268).
         cache: bool,
+        /// Appels marqués du même morceau, qui partent à la fin de celui-ci (REQ-269) ; vide
+        /// pour tout autre appel.
+        followers: Vec<Unit<'a>>,
     },
 }
 
@@ -286,6 +289,7 @@ fn recover_call<'a>(unit: &Unit<'a>, kept: Enrichment) -> Recovery<'a> {
         known,
         path,
         cache,
+        ..
     } = unit
     else {
         return Recovery::Nothing;
@@ -321,6 +325,7 @@ fn recover_call<'a>(unit: &Unit<'a>, kept: Enrichment) -> Recovery<'a> {
         known: Arc::clone(known),
         path,
         cache: *cache,
+        followers: Vec::new(),
     };
     Recovery::Rest(kept, sub)
 }
@@ -340,6 +345,7 @@ fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Uni
         known,
         path,
         cache,
+        ..
     } = unit
     else {
         return None;
@@ -364,6 +370,7 @@ fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Uni
             known: Arc::clone(known),
             path,
             cache,
+            followers: Vec::new(),
         }
     };
     let by_list = || {
@@ -667,6 +674,7 @@ fn run_unit<'a>(
                         outcomes.push(Outcome::Failed(f.path.clone(), e.clone()));
                         Step::Finished(outcomes, Some(Some(e)))
                     } else if k == 0 || take(k, 1) {
+                        let calls = chain_followers(calls);
                         match kept_msg {
                             Some(msg) => Step::Resumed(msg, calls),
                             None => Step::Calls(outcomes, calls, None),
@@ -1284,6 +1292,7 @@ fn plan_calls<'a>(
             known: Arc::clone(&known),
             path: Vec::new(),
             cache: false,
+            followers: Vec::new(),
         })
         .collect())
 }
@@ -1674,7 +1683,11 @@ fn next_unit<'a>(
                 |u| matches!(u, Unit::Call { file, .. } if !state.failed.contains(&file.path)),
             );
             if let Some(i) = pos {
-                return guard.queue.remove(i);
+                let unit = guard.queue.remove(i);
+                if unit.as_ref().is_some_and(has_followers) {
+                    guard.expanding += 1;
+                }
+                return unit;
             }
             if guard.expanding == 0 {
                 return None;
@@ -1688,7 +1701,7 @@ fn next_unit<'a>(
         match guard.queue.pop_front() {
             Some(Unit::Call { file, .. }) if guard.failed.contains(&file.path) => continue,
             Some(unit) => {
-                if !matches!(unit, Unit::Call { .. }) {
+                if !matches!(unit, Unit::Call { .. }) || has_followers(&unit) {
                     guard.expanding += 1;
                 }
                 return Some(unit);
@@ -1702,6 +1715,49 @@ fn next_unit<'a>(
             }
         }
     }
+}
+
+/// Un appel qui garde ses suivants : il compte parmi les unités qui peuvent encore ajouter des
+/// appels à la file (REQ-269).
+fn has_followers(unit: &Unit<'_>) -> bool {
+    matches!(unit, Unit::Call { followers, .. } if !followers.is_empty())
+}
+
+/// Le premier appel marqué de chaque morceau prend les suivants du même morceau (REQ-269) ; les
+/// autres appels gardent leur place et leur ordre.
+fn chain_followers(calls: Vec<Unit<'_>>) -> Vec<Unit<'_>> {
+    let mut out: Vec<Unit<'_>> = Vec::new();
+    // Position, dans `out`, du premier appel marqué de chaque morceau.
+    let mut heads: Vec<(Arc<str>, usize)> = Vec::new();
+    for call in calls {
+        let head = match &call {
+            Unit::Call {
+                cache: true, part, ..
+            } => heads
+                .iter()
+                .find(|(p, _)| Arc::ptr_eq(p, part))
+                .map(|h| h.1),
+            _ => None,
+        };
+        match (head, &call) {
+            (Some(i), _) => {
+                if let Unit::Call { followers, .. } = &mut out[i] {
+                    followers.push(call);
+                }
+            }
+            (
+                None,
+                Unit::Call {
+                    cache: true, part, ..
+                },
+            ) => {
+                heads.push((Arc::clone(part), out.len()));
+                out.push(call);
+            }
+            _ => out.push(call),
+        }
+    }
+    out
 }
 
 /// Fin de l'expansion d'une unité : ses appels passent en tête de file, dans l'ordre du plan.
@@ -1926,11 +1982,18 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
         kept,
         answers_known,
     } = ctx;
-    while let Some(unit) = next_unit(shared, wake, stop, capped) {
+    while let Some(mut unit) = next_unit(shared, wake, stop, capped) {
+        // Suivants d'un appel marqué : ils repartent à la fin de l'appel, sur tous ses chemins
+        // de sortie (REQ-269), une fois l'échec éventuel du fichier posé.
+        let mut followers = match &mut unit {
+            Unit::Call { followers, .. } => std::mem::take(followers),
+            _ => Vec::new(),
+        };
+        let ran = !followers.is_empty();
         let mut expand = ExpandGuard {
             shared,
             wake,
-            armed: !matches!(unit, Unit::Call { .. }),
+            armed: !matches!(unit, Unit::Call { .. }) || ran,
         };
         let ticket = policy.lock().unwrap_or_else(|p| p.into_inner()).dispatch();
         // Résultat de l'unité : l'erreur de l'appel pour la politique s'il y en a eu un.
@@ -1945,6 +2008,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 known,
                 path,
                 cache,
+                ..
             } => {
                 let (file, index, count, excerpt) = (*file, *index, *count, *excerpt);
                 let mut result = run_call(
@@ -2025,7 +2089,9 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                                     key: None,
                                 });
                                 expand.armed = false;
-                                finish_unit(shared, wake, vec![sub], false);
+                                let mut next = vec![sub];
+                                next.append(&mut followers);
+                                finish_unit(shared, wake, next, ran);
                                 if split.is_err() || chunk.is_err() {
                                     break;
                                 }
@@ -2066,7 +2132,9 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                                 let added = subs.len() - 1;
                                 let sent = tx.send(Msg::Split { file, count, added });
                                 expand.armed = false;
-                                finish_unit(shared, wake, subs, false);
+                                let mut next = subs;
+                                next.append(&mut followers);
+                                finish_unit(shared, wake, next, ran);
                                 if sent.is_err() {
                                     break;
                                 }
@@ -2085,7 +2153,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 // échec, pour que les autres appels d'un gros fichier soient relevés (AC-214-4).
                 if matches!(result, Err(Error::Deferred)) {
                     expand.armed = false;
-                    finish_unit(shared, wake, Vec::new(), false);
+                    finish_unit(shared, wake, followers, ran);
                     continue;
                 }
                 // Nouvel essai refusé par le plafond : ni issue, ni échec, ni compte ; les appels
@@ -2097,7 +2165,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                         .failed
                         .insert(file.path.clone());
                     expand.armed = false;
-                    finish_unit(shared, wake, Vec::new(), false);
+                    finish_unit(shared, wake, followers, ran);
                     continue;
                 }
                 let err = result.as_ref().err().cloned();
@@ -2123,8 +2191,8 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                         result,
                         key,
                     }),
-                    Vec::new(),
-                    false,
+                    std::mem::take(&mut followers),
+                    ran,
                 )
             }
             _ => {
@@ -5318,6 +5386,7 @@ mod tests {
             known: Arc::from(Vec::<String>::new()),
             path: Vec::new(),
             cache: false,
+            followers: Vec::new(),
         };
         let files: &'static [FileRecord] = Box::leak(files.into_boxed_slice());
         let shared = Mutex::new(Shared {
@@ -5938,6 +6007,7 @@ mod tests {
             known: Arc::from(vec!["x".to_string()]),
             path: path.to_vec(),
             cache: false,
+            followers: Vec::new(),
         }
     }
 
@@ -6339,6 +6409,7 @@ mod tests {
             known: known.iter().map(|s| s.to_string()).collect(),
             path: vec![],
             cache: false,
+            followers: Vec::new(),
         }
     }
 
@@ -7749,6 +7820,7 @@ mod cache_tests {
             known: Arc::from(Vec::<String>::new()),
             path: vec![],
             cache: false,
+            followers: Vec::new(),
         };
         let text = "x".repeat(400);
         let mut calls = vec![one(&text), one(&text)];
@@ -7769,6 +7841,7 @@ mod cache_tests {
             known: requested.iter().map(|s| s.to_string()).collect(),
             path: vec![],
             cache: true,
+            followers: Vec::new(),
         }
     }
 
@@ -7941,5 +8014,409 @@ mod cache_tests {
             unreachable!()
         };
         assert!(part.len() < text.len());
+    }
+}
+
+#[cfg(test)]
+mod first_call_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    /// Attente maximale d'un événement attendu : filet contre un blocage, jamais atteint au vert.
+    const LIMIT: Duration = Duration::from_secs(8);
+    /// Fenêtre d'observation d'un envoi qui ne doit pas avoir lieu.
+    const QUIET: Duration = Duration::from_millis(150);
+
+    #[derive(Default)]
+    struct State {
+        /// Appels commencés : (premier nœud demandé, le premier appel du morceau était fini).
+        started: Vec<(String, bool)>,
+        /// Nœuds demandés par les appels réussis.
+        ok: Vec<String>,
+        seen_heads: HashSet<String>,
+        head_done: bool,
+        open_heads: bool,
+        open_rest: bool,
+    }
+
+    /// Ce que rend le premier appel d'un morceau quand il est libéré.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Head {
+        Ok,
+        Fails,
+        Truncated,
+        /// Tronqué après deux résumés complets (récupération partielle).
+        Partial,
+        /// Nouvel essai refusé par le plafond.
+        Capped,
+    }
+
+    /// Faux `Llm` avec `cache_floor` : le premier appel de chaque morceau et les autres attendent
+    /// chacun une barrière ouverte par le test.
+    struct Gate {
+        heads: Vec<String>,
+        head: Head,
+        st: Mutex<State>,
+        cv: Condvar,
+    }
+
+    impl Gate {
+        fn new(heads: &[&str], head: Head, open_rest: bool) -> Gate {
+            Gate {
+                heads: heads.iter().map(|s| s.to_string()).collect(),
+                head,
+                st: Mutex::new(State {
+                    open_rest,
+                    ..State::default()
+                }),
+                cv: Condvar::new(),
+            }
+        }
+
+        fn set(&self, f: impl FnOnce(&mut State)) {
+            f(&mut self.st.lock().unwrap());
+            self.cv.notify_all();
+        }
+
+        fn wait_started(&self, n: usize) {
+            let t0 = Instant::now();
+            let mut g = self.st.lock().unwrap();
+            while g.started.len() < n {
+                let left = LIMIT.checked_sub(t0.elapsed()).expect("appels attendus");
+                g = self.cv.wait_timeout(g, left).unwrap().0;
+            }
+        }
+
+        /// Attend que `n` appels soient partis, puis `QUIET` : aucun autre ne doit partir.
+        fn started_stays(&self, n: usize) -> usize {
+            self.wait_started(n);
+            let g = self.st.lock().unwrap();
+            let g = self
+                .cv
+                .wait_timeout_while(g, QUIET, |s| s.started.len() <= n)
+                .unwrap()
+                .0;
+            g.started.len()
+        }
+    }
+
+    impl Llm for Gate {
+        fn cache_floor(&self) -> Option<usize> {
+            Some(1)
+        }
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn enrich_labeled(
+            &self,
+            _: &str,
+            _: &str,
+            _: usize,
+            _: Option<Excerpt>,
+            _: &str,
+            requested: &[String],
+            _: &[String],
+            _: &AtomicBool,
+            _: &CallStats,
+            _: Option<FormatFault>,
+            _: bool,
+        ) -> Result<Enrichment> {
+            let name = requested[0].clone();
+            let mut g = self.st.lock().unwrap();
+            let is_head = self.heads.iter().any(|h| name.ends_with(h.as_str()))
+                && g.seen_heads.insert(name.clone());
+            let done = g.head_done;
+            g.started.push((name, done));
+            self.cv.notify_all();
+            let t0 = Instant::now();
+            while !(if is_head { g.open_heads } else { g.open_rest }) {
+                let left = LIMIT.checked_sub(t0.elapsed()).expect("barrière ouverte");
+                g = self.cv.wait_timeout(g, left).unwrap().0;
+            }
+            if is_head {
+                g.head_done = true;
+                self.cv.notify_all();
+                match self.head {
+                    Head::Ok => {}
+                    Head::Fails => return Err(Error::Message("échec du premier".into())),
+                    Head::Capped => return Err(Error::Capped),
+                    Head::Partial => {
+                        return Err(Error::Truncated {
+                            message: "réponse tronquée par la limite de jetons".into(),
+                            partial: r#"{"version":2,"summaries":[{"node":"method:A.txt.a0","summary":"x"},{"node":"method:A.txt.a1","summary":"y"},{"node":"me"#.into(),
+                        })
+                    }
+                    Head::Truncated => {
+                        return Err(Error::truncated("réponse tronquée par la limite de jetons"))
+                    }
+                }
+            }
+            g.ok.extend(requested.iter().cloned());
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    /// Fichier `A.txt` dont chaque ligne est un morceau ; `lines[i]` = nœuds du morceau i, nommés
+    /// `<lettre>0`, `<lettre>1`… Un seul morceau : texte quelconque.
+    fn repo(letters: &[char], per_chunk: usize) -> (tempfile::TempDir, Vec<FileRecord>, Vec<Node>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text = String::new();
+        let mut nodes = Vec::new();
+        for l in letters {
+            for i in 0..per_chunk {
+                text.push_str(&format!("{l}{i} "));
+                nodes.push(Node::new(
+                    NodeKind::Method,
+                    &format!("A.txt.{l}{i}"),
+                    &format!("{l}{i}"),
+                    Some("A.txt"),
+                    None,
+                    None,
+                ));
+            }
+            text.push('\n');
+        }
+        std::fs::write(dir.path().join("A.txt"), &text).unwrap();
+        let f = FileRecord {
+            path: "A.txt".into(),
+            hash: String::new(),
+            size: text.len() as u64,
+            mtime: 0,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        };
+        (dir, vec![f], nodes)
+    }
+
+    fn run(
+        dir: &tempfile::TempDir,
+        files: &[FileRecord],
+        nodes: &[Node],
+        llm: &Gate,
+        concurrency: usize,
+        max_calls: Option<usize>,
+    ) -> (Vec<(String, Error)>, BuildReport) {
+        let _t = crate::interrupt::test_lock();
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(files).unwrap();
+        store.replace_structure("A.txt", nodes, &[]).unwrap();
+        let opts = IndexOptions {
+            jobs: 1,
+            concurrency,
+            max_chunk_chars: 1000,
+            batch_files: 1,
+            format_retries: 0,
+            enrich_code: false,
+            max_calls,
+            ..IndexOptions::default()
+        };
+        let mut report = BuildReport::default();
+        let failures = enrich_with_stop(
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+                redact: None,
+            },
+            files,
+            &opts,
+            llm,
+            &mut store,
+            &mut report,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        (failures, report)
+    }
+
+    #[test]
+    fn req269_ac1_les_suivants_partent_apres_la_fin_du_premier() {
+        let (dir, files, nodes) = repo(&['a'], 301);
+        let llm = Gate::new(&["a0"], Head::Ok, false);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| run(&dir, &files, &nodes, &llm, 3, None));
+            assert_eq!(llm.started_stays(1), 1, "seul le premier appel part");
+            llm.set(|s| s.open_heads = true);
+            // Le 2e et le 3e partent ensemble (ils se chevauchent) une fois le premier fini.
+            llm.wait_started(3);
+            {
+                let g = llm.st.lock().unwrap();
+                assert!(
+                    g.started[1..].iter().all(|(_, after)| *after),
+                    "{:?}",
+                    g.started
+                );
+            }
+            llm.set(|s| s.open_rest = true);
+            let (failures, _) = h.join().unwrap();
+            assert!(failures.is_empty(), "{failures:?}");
+        });
+    }
+
+    #[test]
+    fn req269_ac2_deux_morceaux_ne_s_attendent_pas() {
+        let (dir, files, nodes) = repo(&['a', 'b'], 151);
+        let llm = Gate::new(&["a0", "b0"], Head::Ok, false);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| run(&dir, &files, &nodes, &llm, 4, None));
+            assert_eq!(llm.started_stays(2), 2, "un premier appel par morceau");
+            {
+                let g = llm.st.lock().unwrap();
+                let mut got: Vec<&str> = g.started.iter().map(|(n, _)| n.as_str()).collect();
+                got.sort_unstable();
+                assert_eq!(got, ["method:A.txt.a0", "method:A.txt.b0"]);
+            }
+            llm.set(|s| {
+                s.open_heads = true;
+                s.open_rest = true;
+            });
+            let (failures, _) = h.join().unwrap();
+            assert!(failures.is_empty(), "{failures:?}");
+            assert_eq!(llm.st.lock().unwrap().started.len(), 4);
+        });
+    }
+
+    #[test]
+    fn req269_ac3_premier_appel_en_echec_pas_d_attente_infinie() {
+        let (dir, files, nodes) = repo(&['a'], 301);
+        let llm = Gate::new(&["a0"], Head::Fails, true);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| run(&dir, &files, &nodes, &llm, 3, None));
+            assert_eq!(llm.started_stays(1), 1);
+            llm.set(|s| s.open_heads = true);
+            let (failures, _) = h.join().unwrap();
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].0, "A.txt");
+            assert_eq!(llm.st.lock().unwrap().started.len(), 1, "suivants sautés");
+        });
+    }
+
+    #[test]
+    fn req269_ac4_premier_appel_tronque_rien_n_est_perdu() {
+        let (dir, files, nodes) = repo(&['a'], 301);
+        let llm = Gate::new(&["a0"], Head::Truncated, true);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| run(&dir, &files, &nodes, &llm, 3, None));
+            assert_eq!(llm.started_stays(1), 1);
+            llm.set(|s| s.open_heads = true);
+            let (failures, _) = h.join().unwrap();
+            assert!(failures.is_empty(), "{failures:?}");
+            let mut ok = llm.st.lock().unwrap().ok.clone();
+            ok.sort_unstable();
+            ok.dedup();
+            assert_eq!(ok.len(), 301, "tous les nœuds demandés");
+        });
+    }
+
+    #[test]
+    fn req269_ac3_premier_appel_refuse_par_le_plafond_suivants_sautes() {
+        let (dir, files, nodes) = repo(&['a'], 301);
+        let llm = Gate::new(&["a0"], Head::Capped, true);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| run(&dir, &files, &nodes, &llm, 3, None));
+            assert_eq!(llm.started_stays(1), 1);
+            llm.set(|s| s.open_heads = true);
+            h.join().unwrap();
+            assert_eq!(llm.st.lock().unwrap().started.len(), 1, "suivants sautés");
+        });
+    }
+
+    #[test]
+    fn req269_ac4_premier_appel_tronque_avec_resumes_recus() {
+        let (dir, files, nodes) = repo(&['a'], 301);
+        let llm = Gate::new(&["a0"], Head::Partial, true);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| run(&dir, &files, &nodes, &llm, 3, None));
+            assert_eq!(llm.started_stays(1), 1);
+            llm.set(|s| s.open_heads = true);
+            let (failures, _) = h.join().unwrap();
+            assert!(failures.is_empty(), "{failures:?}");
+            let mut ok = llm.st.lock().unwrap().ok.clone();
+            ok.sort_unstable();
+            ok.dedup();
+            // Les 2 résumés reçus sont gardés : le reste (299 nœuds) repart, suivants compris.
+            assert_eq!(ok.len(), 299);
+            assert!(!ok.iter().any(|n| n.ends_with(".a0") || n.ends_with(".a1")));
+        });
+    }
+
+    #[test]
+    fn req269_ac5_plafond_inferieur_aux_appels_refuse_avant_tout_envoi() {
+        let (dir, files, nodes) = repo(&['a'], 301);
+        let llm = Gate::new(&["a0"], Head::Ok, true);
+        let (failures, _) = run(&dir, &files, &nodes, &llm, 3, Some(2));
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            matches!(failures[0].1, Error::CallsOverCap { calls: 3, max: 2 }),
+            "{failures:?}"
+        );
+        assert!(llm.st.lock().unwrap().started.is_empty());
+    }
+
+    #[test]
+    fn req269_ac5_file_fermee_un_appel_a_suivants_compte_dans_expanding() {
+        let f: &'static FileRecord = Box::leak(Box::new(FileRecord {
+            path: "A.txt".into(),
+            hash: String::new(),
+            size: 1,
+            mtime: 0,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        }));
+        let call = |followers: Vec<Unit<'static>>| Unit::Call {
+            file: f,
+            index: 1,
+            count: 2,
+            excerpt: None,
+            part: Arc::from("x"),
+            requested: vec![],
+            known: Arc::from(Vec::<String>::new()),
+            path: vec![],
+            cache: true,
+            followers,
+        };
+        let shared = Mutex::new(Shared {
+            queue: vec![call(vec![call(vec![])])].into(),
+            failed: HashSet::new(),
+            expanding: 0,
+            split_calls: HashMap::new(),
+        });
+        let wake = Condvar::new();
+        let stop = AtomicBool::new(false);
+        let capped = AtomicBool::new(true);
+        let got = next_unit(&shared, &wake, &stop, &capped);
+        assert!(has_followers(&got.unwrap()));
+        assert_eq!(shared.lock().unwrap().expanding, 1);
+    }
+
+    #[test]
+    fn req269_ac5_plafond_et_fils_disponibles_pendant_le_premier_appel() {
+        let (dir, files, nodes) = repo(&['a'], 301);
+        let llm = Gate::new(&["a0"], Head::Ok, false);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| run(&dir, &files, &nodes, &llm, 2, Some(3)));
+            assert_eq!(llm.started_stays(1), 1);
+            llm.set(|s| s.open_heads = true);
+            // Les deux fils sont encore là : le 2e et le 3e appel sont en cours en même temps.
+            llm.wait_started(3);
+            llm.set(|s| s.open_rest = true);
+            let (failures, report) = h.join().unwrap();
+            assert!(failures.is_empty(), "{failures:?}");
+            assert_eq!(report.capped, None);
+            assert_eq!(llm.st.lock().unwrap().started.len(), 3);
+        });
     }
 }
