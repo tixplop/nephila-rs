@@ -232,6 +232,8 @@ pub(crate) enum Unit<'a> {
         /// Rangs (à partir de 1) des coupes successives qui ont donné ce sous-appel ; vide pour
         /// un appel du plan (REQ-230).
         path: Vec<usize>,
+        /// Le contenu du morceau porte `cache_control` (REQ-268).
+        cache: bool,
     },
 }
 
@@ -283,6 +285,7 @@ fn recover_call<'a>(unit: &Unit<'a>, kept: Enrichment) -> Recovery<'a> {
         requested,
         known,
         path,
+        cache,
     } = unit
     else {
         return Recovery::Nothing;
@@ -317,6 +320,7 @@ fn recover_call<'a>(unit: &Unit<'a>, kept: Enrichment) -> Recovery<'a> {
         requested: rest,
         known: Arc::clone(known),
         path,
+        cache: *cache,
     };
     Recovery::Rest(kept, sub)
 }
@@ -335,6 +339,7 @@ fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Uni
         requested,
         known,
         path,
+        cache,
     } = unit
     else {
         return None;
@@ -342,7 +347,11 @@ fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Uni
     if path.len() >= MAX_SPLIT_DEPTH {
         return None;
     }
-    let sub = |i: usize, excerpt: Option<Excerpt>, part: Arc<str>, requested: Vec<String>| {
+    let sub = |i: usize,
+               excerpt: Option<Excerpt>,
+               part: Arc<str>,
+               requested: Vec<String>,
+               cache: bool| {
         let mut path = path.clone();
         path.push(i + 1);
         Unit::Call {
@@ -354,6 +363,7 @@ fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Uni
             requested,
             known: Arc::clone(known),
             path,
+            cache,
         }
     };
     let by_list = || {
@@ -362,7 +372,7 @@ fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Uni
             [first, second]
                 .into_iter()
                 .enumerate()
-                .map(|(i, list)| sub(i, *excerpt, Arc::clone(part), list.to_vec()))
+                .map(|(i, list)| sub(i, *excerpt, Arc::clone(part), list.to_vec(), *cache))
                 .collect(),
         )
     };
@@ -406,7 +416,7 @@ fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Uni
                     first_line,
                     last_line: real(own.last_line).max(first_line),
                 };
-                Some(sub(i, Some(e), Arc::from(parts[k].as_str()), list))
+                Some(sub(i, Some(e), Arc::from(parts[k].as_str()), list, false))
             })
             .collect::<Option<Vec<_>>>()
     };
@@ -638,7 +648,8 @@ fn run_unit<'a>(
                     Step::Finished(outcomes, None)
                 }
                 Ok(calls) => {
-                    let (calls, held) = split_kept(calls, kept);
+                    let (mut calls, held) = split_kept(calls, kept);
+                    mark_rereads(&mut calls, llm.cache_floor());
                     let k = calls.len();
                     // Appels conservés : ils ne prennent rien sur le plafond (REQ-227).
                     let kept_msg = (!held.is_empty()).then(|| Msg::Kept {
@@ -860,13 +871,14 @@ fn traced_enrich(
     stop: &AtomicBool,
     totals: &Mutex<LlmTotals>,
     sub: &[usize],
+    cached: bool,
 ) -> Result<Enrichment> {
     let mark = sub_mark(sub);
     let stats = CallStats::with_mark(mark.clone());
     let label = format!("{path} [{index}/{total}]");
     if !trace::enabled() {
         let result = llm.enrich_labeled(
-            &label, path, index, excerpt, text, requested, known, stop, &stats, fault,
+            &label, path, index, excerpt, text, requested, known, stop, &stats, fault, cached,
         );
         add_totals(totals, &stats, attempt);
         return result;
@@ -878,7 +890,7 @@ fn traced_enrich(
     );
     let started = Instant::now();
     let result = llm.enrich_labeled(
-        &label, path, index, excerpt, text, requested, known, stop, &stats, fault,
+        &label, path, index, excerpt, text, requested, known, stop, &stats, fault, cached,
     );
     let ms = started.elapsed().as_millis();
     add_totals(totals, &stats, attempt);
@@ -1271,8 +1283,36 @@ fn plan_calls<'a>(
             requested,
             known: Arc::clone(&known),
             path: Vec::new(),
+            cache: false,
         })
         .collect())
+}
+
+/// Marque `cache` les appels d'un même morceau (même `Arc`) quand ils sont au moins deux et que
+/// le morceau dépasse `floor` jetons, à raison de 4 caractères par jeton (REQ-268). Sans `floor`,
+/// aucun appel n'est marqué.
+fn mark_rereads(calls: &mut [Unit<'_>], floor: Option<usize>) {
+    let Some(floor) = floor else {
+        return;
+    };
+    let shared: Vec<Option<Arc<str>>> = calls
+        .iter()
+        .map(|c| match c {
+            Unit::Call { part, .. } => Some(Arc::clone(part)),
+            _ => None,
+        })
+        .collect();
+    for (i, c) in calls.iter_mut().enumerate() {
+        let (Some(me), Unit::Call { cache, .. }) = (&shared[i], c) else {
+            continue;
+        };
+        let same = shared
+            .iter()
+            .flatten()
+            .filter(|p| Arc::ptr_eq(p, me))
+            .count();
+        *cache = same >= 2 && me.chars().count() / 4 > floor;
+    }
 }
 
 /// Sépare les appels du plan dont la réponse est conservée (rang à partir de 1 et réponse) des
@@ -1328,6 +1368,7 @@ fn run_call(
     totals: &Mutex<LlmTotals>,
     take: Take<'_>,
     sub: &[usize],
+    cache: bool,
 ) -> Result<Enrichment> {
     let total = retries.saturating_add(1);
     with_format_retries(retries, stop, |current, fault| {
@@ -1349,6 +1390,7 @@ fn run_call(
             stop,
             totals,
             sub,
+            cache,
         )
     })
 }
@@ -1902,6 +1944,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 requested,
                 known,
                 path,
+                cache,
             } => {
                 let (file, index, count, excerpt) = (*file, *index, *count, *excerpt);
                 let mut result = run_call(
@@ -1918,6 +1961,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     totals,
                     &take,
                     path,
+                    *cache,
                 );
                 // Appel tronqué : sa liste de nœuds ou son texte est coupé et les sous-appels
                 // passent en tête de file (REQ-230). Pas de coupe possible, total au-delà de la borne : l'échec
@@ -3141,6 +3185,7 @@ mod tests {
                 &totals,
                 &|_, _| true,
                 &[],
+                false,
             )?);
         }
         match results.len() {
@@ -3711,6 +3756,7 @@ mod tests {
                         &stop,
                         &totals,
                         &[],
+                        false,
                     ),
                     traced_lot_once(&llm, &items, attempt, None, &stop, &totals),
                 )
@@ -5271,6 +5317,7 @@ mod tests {
             requested: Vec::new(),
             known: Arc::from(Vec::<String>::new()),
             path: Vec::new(),
+            cache: false,
         };
         let files: &'static [FileRecord] = Box::leak(files.into_boxed_slice());
         let shared = Mutex::new(Shared {
@@ -5890,6 +5937,7 @@ mod tests {
             requested: requested.iter().map(|s| s.to_string()).collect(),
             known: Arc::from(vec!["x".to_string()]),
             path: path.to_vec(),
+            cache: false,
         }
     }
 
@@ -6290,6 +6338,7 @@ mod tests {
             requested: requested.iter().map(|s| s.to_string()).collect(),
             known: known.iter().map(|s| s.to_string()).collect(),
             path: vec![],
+            cache: false,
         }
     }
 
@@ -6875,6 +6924,7 @@ mod plan_index_tests {
             _: &AtomicBool,
             _: &CallStats,
             fault: Option<FormatFault>,
+            _: bool,
         ) -> Result<Enrichment> {
             match self.next(fault) {
                 Some(e) => Err(e),
@@ -6925,6 +6975,7 @@ mod plan_index_tests {
             &totals,
             &|_, _| true,
             &[],
+            false,
         );
         assert!(r.is_ok());
         assert_eq!(
@@ -7587,5 +7638,308 @@ mod doc_tests {
         let ids = |f: &str| -> Vec<&str> { map[f].iter().map(|(id, _)| id.as_str()).collect() };
         assert_eq!(ids("A.java"), ["method:p.A.prix"]);
         assert_eq!(ids("B.java"), ["dependency:x:y"]);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    const FLOOR: usize = 10;
+
+    fn file(path: &str) -> &'static FileRecord {
+        Box::leak(Box::new(FileRecord {
+            path: path.into(),
+            hash: String::new(),
+            size: 1,
+            mtime: 0,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        }))
+    }
+
+    fn nodes(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| (format!("method:A.m{i}"), format!("m{i}")))
+            .collect()
+    }
+
+    /// Appels du plan d'un fichier d'un seul morceau de `chars` caractères, puis marquage.
+    fn marked(chars: usize, node_count: usize, held: usize) -> Vec<bool> {
+        let text = "x".repeat(chars);
+        let f = file("A.java");
+        let calls = plan_calls(f, &text, 10_000, &nodes(node_count)).unwrap();
+        let mut kept = KeptCalls {
+            results: HashMap::new(),
+            model: "m".into(),
+            language: "français".into(),
+            versions: PromptVersions::CURRENT,
+        };
+        for call in calls.iter().take(held) {
+            let Unit::Call {
+                file,
+                index,
+                count,
+                excerpt,
+                part,
+                requested,
+                known,
+                ..
+            } = call
+            else {
+                unreachable!()
+            };
+            let key = kept.key(&file.path, *index, *count, *excerpt, part, requested, known);
+            kept.results.insert(key, Enrichment::default());
+        }
+        let (mut send, _) = split_kept(calls, &kept);
+        mark_rereads(&mut send, Some(FLOOR));
+        send.iter()
+            .map(|u| match u {
+                Unit::Call { cache, .. } => *cache,
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn req268_ac3_deux_appels_d_un_gros_morceau_sont_marques() {
+        // 4 × 10 + 4 caractères : 11 jetons, au-dessus du minimum.
+        assert_eq!(marked(44, 160, 0), [true, true]);
+    }
+
+    #[test]
+    fn req268_ac3_un_seul_appel_n_est_pas_marque() {
+        assert_eq!(marked(400, 100, 0), [false]);
+    }
+
+    #[test]
+    fn req268_ac3_morceau_au_plus_4_fois_le_minimum_n_est_pas_marque() {
+        assert_eq!(marked(40, 160, 0), [false, false]);
+        assert_eq!(marked(43, 160, 0), [false, false]);
+    }
+
+    #[test]
+    fn req268_ac3_appel_conserve_ne_compte_pas() {
+        assert_eq!(marked(400, 160, 1), [false]);
+    }
+
+    #[test]
+    fn req268_ac3_sans_minimum_aucun_appel_n_est_marque() {
+        let f = file("A.java");
+        let text = "x".repeat(400);
+        let mut calls = plan_calls(f, &text, 10_000, &nodes(160)).unwrap();
+        mark_rereads(&mut calls, None);
+        assert!(calls
+            .iter()
+            .all(|u| matches!(u, Unit::Call { cache: false, .. })));
+    }
+
+    #[test]
+    fn req268_ac3_deux_morceaux_distincts_ne_se_comptent_pas() {
+        // Deux morceaux de même texte mais distincts : un appel chacun, rien n'est relu.
+        let f = file("A.java");
+        let one = |part: &str| Unit::Call {
+            file: f,
+            index: 1,
+            count: 2,
+            excerpt: None,
+            part: Arc::from(part),
+            requested: vec![],
+            known: Arc::from(Vec::<String>::new()),
+            path: vec![],
+            cache: false,
+        };
+        let text = "x".repeat(400);
+        let mut calls = vec![one(&text), one(&text)];
+        mark_rereads(&mut calls, Some(FLOOR));
+        assert!(calls
+            .iter()
+            .all(|u| matches!(u, Unit::Call { cache: false, .. })));
+    }
+
+    fn cached_call(requested: &[&str], text: &str) -> Unit<'static> {
+        Unit::Call {
+            file: file("A.java"),
+            index: 1,
+            count: 2,
+            excerpt: None,
+            part: Arc::from(text),
+            requested: requested.iter().map(|s| s.to_string()).collect(),
+            known: requested.iter().map(|s| s.to_string()).collect(),
+            path: vec![],
+            cache: true,
+        }
+    }
+
+    /// Faux `Llm` qui annonce `floor` et enregistre le `cached` de chaque appel.
+    struct Recorder {
+        floor: Option<usize>,
+        cached: Mutex<Vec<bool>>,
+    }
+    impl Llm for Recorder {
+        fn cache_floor(&self) -> Option<usize> {
+            self.floor
+        }
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn enrich_labeled(
+            &self,
+            _: &str,
+            _: &str,
+            _: usize,
+            _: Option<Excerpt>,
+            _: &str,
+            _: &[String],
+            _: &[String],
+            _: &AtomicBool,
+            _: &CallStats,
+            _: Option<FormatFault>,
+            cached: bool,
+        ) -> Result<Enrichment> {
+            self.cached.lock().unwrap().push(cached);
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    /// Enrichit un fichier de 60 caractères et 160 nœuds (2 appels, un seul morceau).
+    fn cached_seen(floor: Option<usize>) -> Vec<bool> {
+        let _t = crate::interrupt::test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.txt"), "x".repeat(60)).unwrap();
+        let f = FileRecord {
+            path: "A.txt".into(),
+            hash: String::new(),
+            size: 60,
+            mtime: 0,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        };
+        let files = vec![f];
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(&files).unwrap();
+        let ns: Vec<Node> = (0..160)
+            .map(|i| {
+                Node::new(
+                    NodeKind::Method,
+                    &format!("A.m{i}"),
+                    "m",
+                    Some("A.txt"),
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        store.replace_structure("A.txt", &ns, &[]).unwrap();
+        let llm = Recorder {
+            floor,
+            cached: Mutex::new(Vec::new()),
+        };
+        let opts = IndexOptions {
+            jobs: 1,
+            concurrency: 1,
+            max_chunk_chars: 10_000,
+            batch_files: 1,
+            format_retries: 0,
+            enrich_code: false,
+            max_calls: None,
+            ..IndexOptions::default()
+        };
+        enrich_all(
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+                redact: None,
+            },
+            &files,
+            &opts,
+            &llm,
+            &mut store,
+            &mut BuildReport::default(),
+        )
+        .unwrap();
+        let seen = llm.cached.lock().unwrap().clone();
+        seen
+    }
+
+    #[test]
+    fn req268_ac3_enrich_all_passe_cached_a_enrich_labeled() {
+        assert_eq!(cached_seen(Some(10)), [true, true]);
+    }
+
+    #[test]
+    fn req268_ac4_enrich_all_sans_minimum_n_envoie_aucun_marqueur() {
+        assert_eq!(cached_seen(None), [false, false]);
+    }
+
+    fn flags(units: &[Unit<'_>]) -> Vec<bool> {
+        units
+            .iter()
+            .map(|u| match u {
+                Unit::Call { cache, .. } => *cache,
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    fn kept_of(nodes: &[&str]) -> Enrichment {
+        Enrichment {
+            summaries: nodes
+                .iter()
+                .map(|n| (n.to_string(), "Résumé.".to_string()))
+                .collect(),
+            ..Enrichment::default()
+        }
+    }
+
+    #[test]
+    fn req268_ac5_sous_appels_de_meme_texte_gardent_le_marqueur() {
+        let unit = cached_call(&["a", "b", "c"], "texte");
+        let Recovery::Rest(_, sub) = recover_call(&unit, kept_of(&["a"])) else {
+            panic!("reste attendu");
+        };
+        assert_eq!(flags(&[sub]), [true]);
+        let both = vec![
+            ("a".to_string(), "a".to_string()),
+            ("b".to_string(), "b".to_string()),
+        ];
+        let subs = split_call(&cached_call(&["a", "b"], "texte"), &both).unwrap();
+        assert_eq!(flags(&subs), [true, true]);
+        // Un appel non marqué ne le devient pas.
+        let mut plain = cached_call(&["a", "b"], "texte");
+        if let Unit::Call { cache, .. } = &mut plain {
+            *cache = false;
+        }
+        assert_eq!(flags(&split_call(&plain, &both).unwrap()), [false, false]);
+    }
+
+    #[test]
+    fn req268_ac5_sous_appel_a_texte_coupe_n_est_pas_marque() {
+        let text: String = (1..=30)
+            .map(|i| format!("// ligne {i:0>50}\n"))
+            .collect::<String>()
+            + "    void zed() {}\n";
+        let unit = cached_call(&["method:A.zed"], &text);
+        let nodes = vec![("method:A.zed".to_string(), "zed".to_string())];
+        let subs = split_call(&unit, &nodes).unwrap();
+        assert_eq!(flags(&subs), [false]);
+        let Unit::Call { part, .. } = &subs[0] else {
+            unreachable!()
+        };
+        assert!(part.len() < text.len());
     }
 }

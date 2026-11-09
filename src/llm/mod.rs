@@ -30,7 +30,8 @@ use crate::error::{Error, Result};
 pub use ask::AskReply;
 use ask::{ask_system_prompt, ask_user_prompt};
 use enrich::{
-    enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt, lot_user_prompt, parse_lot,
+    cacheable_prefix_len, enrichment_system_prompt, enrichment_user_prompt, lot_system_prompt,
+    lot_user_prompt, parse_lot,
 };
 pub use enrich::{Enrichment, Excerpt, LotItem};
 pub use retry::{with_format_retries, with_note, FormatFault};
@@ -100,6 +101,11 @@ pub trait Llm: Send + Sync {
     fn summary_language(&self) -> &str {
         crate::config::DEFAULT_SUMMARY_LANGUAGE
     }
+    /// Minimum de jetons au-delà duquel le contenu d'un morceau relu porte `cache_control`
+    /// (REQ-268) ; `None` : jamais de marqueur.
+    fn cache_floor(&self) -> Option<usize> {
+        None
+    }
     /// Enrichit un appel : résumés et concepts (schéma version 2). `requested` = nœuds écrits
     /// dans le prompt ; `known` = liste complète du fichier, qui filtre la réponse.
     fn enrich(
@@ -126,8 +132,9 @@ pub trait Llm: Send + Sync {
         stop: &AtomicBool,
         stats: &CallStats,
         fault: Option<FormatFault>,
+        cached: bool,
     ) -> Result<Enrichment> {
-        let _ = (label, excerpt, stop, stats, fault);
+        let _ = (label, excerpt, stop, stats, fault, cached);
         self.enrich(file, call, text, requested, known)
     }
     /// Enrichit un lot de 2 fichiers ou plus en un seul appel (schéma version 3, DEC-033).
@@ -183,7 +190,12 @@ pub(crate) trait Complete: Send + Sync {
     }
     /// Langue des résumés demandée dans les prompts système (REQ-172).
     fn summary_language(&self) -> &str;
+    /// Voir `Llm::cache_floor`.
+    fn cache_floor(&self) -> Option<usize> {
+        None
+    }
     /// Envoie la consigne système et la requête, retourne le texte de la réponse.
+    #[allow(clippy::too_many_arguments)]
     fn complete(
         &self,
         label: Option<&str>,
@@ -192,6 +204,7 @@ pub(crate) trait Complete: Send + Sync {
         system: String,
         user: String,
         reply: Reply,
+        cache_upto: Option<usize>,
     ) -> Result<String>;
 }
 
@@ -213,6 +226,10 @@ impl<T: Complete> Llm for T {
         Complete::summary_language(self)
     }
 
+    fn cache_floor(&self) -> Option<usize> {
+        Complete::cache_floor(self)
+    }
+
     fn enrich(
         &self,
         file: &str,
@@ -228,6 +245,7 @@ impl<T: Complete> Llm for T {
             enrichment_system_prompt(self.summary_language()),
             enrichment_user_prompt(file, None, text, requested),
             Reply::File,
+            None,
         )?;
         http::parse_reply(&out, KEY_SUMMARIES, |j| {
             Enrichment::parse_numbered(j, file, requested, known)
@@ -247,6 +265,7 @@ impl<T: Complete> Llm for T {
         stop: &AtomicBool,
         stats: &CallStats,
         fault: Option<FormatFault>,
+        cached: bool,
     ) -> Result<Enrichment> {
         let out = self.complete(
             Some(label),
@@ -258,6 +277,7 @@ impl<T: Complete> Llm for T {
                 fault,
             ),
             Reply::File,
+            cached.then(|| cacheable_prefix_len(file, text)),
         )?;
         http::parse_reply(&out, KEY_SUMMARIES, |j| {
             Enrichment::parse_numbered(j, file, requested, known)
@@ -272,6 +292,7 @@ impl<T: Complete> Llm for T {
             lot_system_prompt(self.summary_language()),
             lot_user_prompt(items),
             Reply::Lot,
+            None,
         )?;
         Ok(http::parse_reply(&out, KEY_FILES, |j| parse_lot(j, items))?.into_results())
     }
@@ -291,6 +312,7 @@ impl<T: Complete> Llm for T {
             lot_system_prompt(self.summary_language()),
             with_note(lot_user_prompt(items), fault),
             Reply::Lot,
+            None,
         )?;
         Ok(http::parse_reply(&out, KEY_FILES, |j| parse_lot(j, items))?.into_results())
     }
@@ -313,6 +335,7 @@ impl<T: Complete> Llm for T {
             ask_system_prompt(),
             with_note(ask_user_prompt(question, context), fault),
             Reply::Ask,
+            None,
         )?;
         http::parse_reply(&out, KEY_FOUND, AskReply::parse)
     }
@@ -332,6 +355,7 @@ impl<T: Complete> Llm for T {
             subsystem_system_prompt(self.summary_language()),
             with_note(subsystem_user_prompt(lines), fault),
             Reply::Subsystem,
+            None,
         )?;
         http::parse_reply(&out, KEY_NAME, SubsystemName::parse).map_err(subsystem::fixed_label)
     }
@@ -357,6 +381,10 @@ impl Llm for WithModel {
         &self.summary_language
     }
 
+    fn cache_floor(&self) -> Option<usize> {
+        self.inner.cache_floor()
+    }
+
     fn enrich(
         &self,
         file: &str,
@@ -380,9 +408,10 @@ impl Llm for WithModel {
         stop: &AtomicBool,
         stats: &CallStats,
         fault: Option<FormatFault>,
+        cached: bool,
     ) -> Result<Enrichment> {
         self.inner.enrich_labeled(
-            label, file, call, excerpt, text, requested, known, stop, stats, fault,
+            label, file, call, excerpt, text, requested, known, stop, stats, fault, cached,
         )
     }
 
@@ -570,5 +599,82 @@ mod structured_tests {
             assert_eq!(eff("off", false), Structured::Off, "{provider}");
             assert_eq!(eff("off", true), Structured::Off, "{provider}");
         }
+    }
+}
+
+#[cfg(test)]
+mod with_model_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Fake {
+        seen: Arc<Mutex<Vec<bool>>>,
+    }
+    impl Llm for Fake {
+        fn cache_floor(&self) -> Option<usize> {
+            Some(42)
+        }
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn enrich_labeled(
+            &self,
+            _: &str,
+            _: &str,
+            _: usize,
+            _: Option<Excerpt>,
+            _: &str,
+            _: &[String],
+            _: &[String],
+            _: &AtomicBool,
+            _: &CallStats,
+            _: Option<FormatFault>,
+            cached: bool,
+        ) -> Result<Enrichment> {
+            self.seen.lock().unwrap().push(cached);
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req268_ac4_with_model_relays_cache_floor_and_cached() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let wrapped = WithModel {
+            inner: Box::new(Fake { seen: seen.clone() }),
+            model: "m".into(),
+            summary_language: "français".into(),
+        };
+        assert_eq!(wrapped.cache_floor(), Some(42));
+        for cached in [true, false] {
+            wrapped
+                .enrich_labeled(
+                    "l",
+                    "A.java",
+                    1,
+                    None,
+                    "t",
+                    &[],
+                    &[],
+                    &AtomicBool::new(false),
+                    &CallStats::default(),
+                    None,
+                    cached,
+                )
+                .unwrap();
+        }
+        assert_eq!(*seen.lock().unwrap(), [true, false]);
     }
 }

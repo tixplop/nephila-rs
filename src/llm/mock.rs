@@ -376,6 +376,7 @@ impl Llm for MockLlm {
         _stop: &std::sync::atomic::AtomicBool,
         stats: &CallStats,
         _fault: Option<FormatFault>,
+        _cached: bool,
     ) -> Result<Enrichment> {
         self.enrich_stats(file, call, known, stats)
     }
@@ -448,6 +449,7 @@ mod tests {
             &AtomicBool::new(false),
             &s,
             None,
+            false,
         )
         .unwrap();
         assert_eq!((s.sends(), s.responded(), s.usage()), (1, true, None));
@@ -533,6 +535,7 @@ mod tests {
             &AtomicBool::new(false),
             &s,
             None,
+            false,
         );
         assert!(matches!(r, Err(Error::Network(_))));
         assert_eq!((s.sends(), s.responded()), (1, false));

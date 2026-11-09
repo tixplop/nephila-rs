@@ -346,6 +346,7 @@ impl Complete for OpenAiLlm {
         system: String,
         user: String,
         reply: Reply,
+        _cache_upto: Option<usize>,
     ) -> Result<String> {
         let send = |with_schema: bool| {
             let schema = with_schema.then(|| reply.schema());
@@ -553,7 +554,15 @@ mod tests {
             );
             let stats = CallStats::default();
             let e = l
-                .complete(None, None, &stats, "s".into(), "u".into(), Reply::File)
+                .complete(
+                    None,
+                    None,
+                    &stats,
+                    "s".into(),
+                    "u".into(),
+                    Reply::File,
+                    None,
+                )
                 .unwrap_err();
             if truncated {
                 assert!(
@@ -600,7 +609,15 @@ mod tests {
             gen(false, Effort::Low, false, 100),
         );
         let stats = CallStats::default();
-        let r = l.complete(None, None, &stats, "s".into(), "u".into(), Reply::File);
+        let r = l.complete(
+            None,
+            None,
+            &stats,
+            "s".into(),
+            "u".into(),
+            Reply::File,
+            None,
+        );
         (r, stats)
     }
 
@@ -690,7 +707,7 @@ mod tests {
     }
 
     fn call(l: &OpenAiLlm, stats: &CallStats) -> Result<String> {
-        l.complete(None, None, stats, "s".into(), "u".into(), Reply::File)
+        l.complete(None, None, stats, "s".into(), "u".into(), Reply::File, None)
     }
 
     fn rejected_code(e: &Error) -> u16 {
@@ -927,5 +944,59 @@ mod tests {
             Err(Error::BatchItem { .. })
         ));
         assert!(c.take_pending().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::llm::usage::recording_server;
+    use crate::llm::Llm;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn req268_ac4_openai_has_no_floor_and_keeps_a_string_content() {
+        let text = r#"{\"summaries\":[],\"concepts\":[]}"#;
+        let reply = format!(
+            r#"{{"choices":[{{"finish_reason":"stop","message":{{"content":"{text}"}}}}]}}"#
+        );
+        let (base, seen) = recording_server(vec![(200, reply)], 0);
+        let l = OpenAiLlm::new(
+            Some(base),
+            "m".into(),
+            None,
+            10,
+            &Tls::default(),
+            1,
+            Generation {
+                effort: Effort::Low,
+                effort_explicit: false,
+                thinking: false,
+                max_output_tokens: 100,
+            },
+        );
+        assert_eq!(Llm::cache_floor(&l), None);
+        l.enrich_labeled(
+            "l",
+            "A.java",
+            1,
+            None,
+            "t",
+            &[],
+            &[],
+            &AtomicBool::new(false),
+            &CallStats::default(),
+            None,
+            true,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+        assert!(body["messages"][1]["content"].is_string(), "{body}");
+    }
+
+    #[test]
+    fn req268_ac4_mock_has_no_floor() {
+        let m = crate::llm::mock::MockLlm::new(crate::llm::mock::MockOptions::default());
+        assert_eq!(Llm::cache_floor(&m), None);
     }
 }

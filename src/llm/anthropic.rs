@@ -17,6 +17,32 @@ const API_VERSION: &str = "2023-06-01";
 /// dernière occurrence de `claude-`, découpé sur `-`. Liste fermée : seuls les modèles sortis
 /// avant Opus 4.5 sont anciens.
 pub fn is_legacy_claude(model: &str) -> bool {
+    let Some(segs) = claude_segments(model) else {
+        return false;
+    };
+    let s0 = segs[0].as_str();
+    if let Some(n) = number(s0) {
+        return n <= 3;
+    }
+    if s0 == "instant" {
+        return true;
+    }
+    if !matches!(s0, "opus" | "sonnet" | "haiku") {
+        return false;
+    }
+    let (major, minor) = version(&segs);
+    let Some(major) = major else {
+        return false;
+    };
+    if s0 == "opus" && major == 4 && minor == 5 {
+        return false;
+    }
+    major <= 3 || (major == 4 && minor <= 5)
+}
+
+/// Segments qui suivent la dernière occurrence de `claude-` dans le nom normalisé du modèle
+/// (minuscules, `.`, `@`, `:` et `_` remplacés par `-`), découpés sur `-`.
+fn claude_segments(model: &str) -> Option<Vec<String>> {
     let norm: String = model
         .to_lowercase()
         .chars()
@@ -28,39 +54,64 @@ pub fn is_legacy_claude(model: &str) -> bool {
             }
         })
         .collect();
-    let Some(at) = norm.rfind("claude-") else {
-        return false;
-    };
-    let segs: Vec<&str> = norm[at + "claude-".len()..].split('-').collect();
-    let number = |s: &str| -> Option<u32> {
-        if !s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit()) {
-            s.parse().ok()
-        } else {
-            None
-        }
-    };
-    let s0 = segs[0];
-    if let Some(n) = number(s0) {
-        return n <= 3;
+    let at = norm.rfind("claude-")?;
+    Some(
+        norm[at + "claude-".len()..]
+            .split('-')
+            .map(String::from)
+            .collect(),
+    )
+}
+
+fn number(s: &str) -> Option<u32> {
+    if !s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit()) {
+        s.parse().ok()
+    } else {
+        None
     }
-    if s0 == "instant" {
-        return true;
-    }
-    if !matches!(s0, "opus" | "sonnet" | "haiku") {
-        return false;
-    }
-    let Some(major) = segs.get(1).and_then(|s| number(s)) else {
-        return false;
-    };
+}
+
+/// Version majeure et mineure (0 si absente ou si le segment est une date) d'après les segments.
+fn version(segs: &[String]) -> (Option<u32>, u32) {
+    let major = segs.get(1).and_then(|s| number(s));
     let minor = segs
         .get(2)
         .filter(|s| s.len() <= 2)
         .and_then(|s| number(s))
         .unwrap_or(0);
-    if s0 == "opus" && major == 4 && minor == 5 {
-        return false;
+    (major, minor)
+}
+
+/// Plus petit nombre de jetons qu'un préfixe doit compter pour être mis en cache (REQ-268,
+/// documentation Anthropic relevée le 2026-11-09). Modèle inconnu : 1 024.
+pub fn min_cacheable_tokens(model: &str) -> usize {
+    let Some(segs) = claude_segments(model) else {
+        return 1024;
+    };
+    if segs[0] == "mythos" && segs.get(1).is_some_and(|s| s == "preview") {
+        return 2048;
     }
-    major <= 3 || (major == 4 && minor <= 5)
+    match (segs[0].as_str(), version(&segs)) {
+        ("opus", (Some(5), 0 | 5))
+        | ("sonnet" | "haiku", (Some(5), 5))
+        | ("fable" | "mythos", (Some(5), 0 | 1)) => 512,
+        ("opus", (Some(4), 7)) => 2048,
+        ("opus", (Some(4), 5 | 6)) | ("haiku", (Some(4), 5)) => 4096,
+        _ => 1024,
+    }
+}
+
+/// `content` du premier message en deux blocs de texte, coupés à `upto` octets ; le premier porte
+/// `cache_control` (REQ-268). Coupe hors du texte, hors d'une frontière de caractère ou sans
+/// reste : le texte seul, inchangé.
+fn cached_content(user: &str, upto: usize) -> serde_json::Value {
+    match (user.get(..upto), user.get(upto..)) {
+        (Some(head), Some(rest)) if !head.is_empty() && !rest.is_empty() => serde_json::json!([
+            {"type": "text", "text": head, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": rest},
+        ]),
+        _ => serde_json::json!(user),
+    }
 }
 
 /// Corps de la requête `/v1/messages` (REQ-058, REQ-157, DEC-126) : jamais de `thinking`
@@ -106,6 +157,8 @@ pub struct AnthropicLlm {
     fallback: AtomicBool,
     summary_language: String,
     collector: Option<Arc<Collector>>,
+    /// Marqueur `cache_control` permis : faux avec une `base_url` écrite (REQ-268).
+    prefix_cache: bool,
 }
 
 impl AnthropicLlm {
@@ -119,6 +172,7 @@ impl AnthropicLlm {
         gen: Generation,
     ) -> AnthropicLlm {
         AnthropicLlm {
+            prefix_cache: base_url.is_none(),
             base_url,
             model,
             key,
@@ -155,6 +209,13 @@ impl AnthropicLlm {
     /// Collecteur du mode lot : les réponses viennent de lui au lieu du réseau (DEC-168).
     pub fn with_collector(mut self, collector: Arc<Collector>) -> AnthropicLlm {
         self.collector = Some(collector);
+        self
+    }
+
+    /// Permet ou interdit le marqueur `cache_control` (tests sur faux serveur).
+    #[cfg(test)]
+    pub(crate) fn with_prefix_cache(mut self, on: bool) -> AnthropicLlm {
+        self.prefix_cache = on;
         self
     }
 
@@ -328,6 +389,10 @@ impl Complete for AnthropicLlm {
         &self.summary_language
     }
 
+    fn cache_floor(&self) -> Option<usize> {
+        (self.prefix_cache && self.collector.is_none()).then(|| min_cacheable_tokens(&self.model))
+    }
+
     /// Appelle `/v1/messages` et retourne le texte de la réponse.
     fn complete(
         &self,
@@ -337,11 +402,15 @@ impl Complete for AnthropicLlm {
         system: String,
         user: String,
         reply: Reply,
+        cache_upto: Option<usize>,
     ) -> Result<String> {
         let send = |with_schema: bool| {
             let schema = with_schema.then(|| reply.schema());
             let format = schema.as_ref().map(|s| (reply.name(), s));
             let mut body = request_body(&self.model, &self.gen, &system, &user, format);
+            if let Some(upto) = cache_upto {
+                body["messages"][0]["content"] = cached_content(&user, upto);
+            }
             // La passe des sous-systèmes part toujours hors mode lot (REQ-261).
             if let (Some(collector), false) = (&self.collector, matches!(reply, Reply::Subsystem)) {
                 return collector.exchange(&body, stats);
@@ -626,7 +695,15 @@ mod tests {
             let l = llm(fake_server(vec![(200, body)]));
             let stats = CallStats::default();
             let e = l
-                .complete(None, None, &stats, "s".into(), "u".into(), Reply::File)
+                .complete(
+                    None,
+                    None,
+                    &stats,
+                    "s".into(),
+                    "u".into(),
+                    Reply::File,
+                    None,
+                )
                 .unwrap_err();
             if truncated {
                 assert!(
@@ -683,7 +760,15 @@ mod tests {
         )));
         let stats = CallStats::default();
         let e = l
-            .complete(None, None, &stats, "s".into(), "u".into(), Reply::File)
+            .complete(
+                None,
+                None,
+                &stats,
+                "s".into(),
+                "u".into(),
+                Reply::File,
+                None,
+            )
             .unwrap_err();
         assert!(
             matches!(&e, Error::Truncated { message: m, partial } if m == TRUNCATED && partial == "abc"),
@@ -703,6 +788,7 @@ mod tests {
                 "s".into(),
                 "u".into(),
                 Reply::File,
+                None,
             )
             .unwrap_err();
         assert!(
@@ -725,6 +811,7 @@ mod tests {
                 "s".into(),
                 "u".into(),
                 Reply::File,
+                None,
             )
             .unwrap();
         assert_eq!(t, "abc");
@@ -817,7 +904,7 @@ mod tests {
     }
 
     fn call(l: &AnthropicLlm, stats: &CallStats) -> Result<String> {
-        l.complete(None, None, stats, "s".into(), "u".into(), Reply::File)
+        l.complete(None, None, stats, "s".into(), "u".into(), Reply::File, None)
     }
 
     fn rejected_code(e: &Error) -> u16 {
@@ -1054,5 +1141,201 @@ mod tests {
             Err(Error::BatchItem { .. })
         ));
         assert!(c.take_pending().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::llm::enrich::{cacheable_prefix_len, enrichment_user_prompt};
+    use crate::llm::usage::recording_server;
+    use crate::llm::{calls_line, FormatFault, Llm, LlmTotals};
+
+    fn gen() -> Generation {
+        Generation {
+            effort: Effort::Low,
+            effort_explicit: false,
+            thinking: false,
+            max_output_tokens: 100,
+        }
+    }
+
+    fn make(base: Option<String>, model: &str) -> AnthropicLlm {
+        AnthropicLlm::new(
+            base,
+            model.into(),
+            "k".into(),
+            10,
+            &Tls::default(),
+            1,
+            gen(),
+        )
+    }
+
+    fn reply(cache_read: u64) -> (u16, String) {
+        let text = r#"{\"summaries\":[],\"concepts\":[]}"#;
+        (
+            200,
+            format!(
+                r#"{{"stop_reason":"end_turn","content":[{{"type":"text","text":"{text}"}}],"usage":{{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":{cache_read}}}}}"#
+            ),
+        )
+    }
+
+    /// Envoie un appel d'enrichissement de `A.java` et vérifie qu'il aboutit.
+    fn send(
+        l: &AnthropicLlm,
+        stats: &CallStats,
+        requested: &[String],
+        fault: Option<FormatFault>,
+        cached: bool,
+    ) {
+        l.enrich_labeled(
+            "l",
+            "A.java",
+            1,
+            None,
+            "contenu du morceau",
+            requested,
+            &[],
+            &AtomicBool::new(false),
+            stats,
+            fault,
+            cached,
+        )
+        .unwrap();
+    }
+
+    fn bodies(seen: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<serde_json::Value> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn req268_ac1_min_cacheable_tokens() {
+        let cases = [
+            ("claude-opus-5-5", 512),
+            ("claude-haiku-5-5", 512),
+            ("claude-sonnet-4-6", 1024),
+            ("claude-opus-4-1-20250805", 1024),
+            ("claude-opus-4-7", 2048),
+            ("claude-opus-4-5-20251101", 4096),
+            ("claude-haiku-4-5", 4096),
+            ("gpt-x", 1024),
+        ];
+        for (model, want) in cases {
+            assert_eq!(min_cacheable_tokens(model), want, "{model}");
+        }
+    }
+
+    #[test]
+    fn req268_ac2_content_is_two_blocks_with_the_marker_on_the_first() {
+        let (base, seen) = recording_server(vec![reply(0)], 0);
+        let l = make(Some(base), "m").with_prefix_cache(true);
+        let one = vec!["class:A".to_string()];
+        let two = vec!["class:A".to_string(), "method:A.f".to_string()];
+        send(&l, &CallStats::default(), &one, None, true);
+        send(&l, &CallStats::default(), &two, None, true);
+        send(&l, &CallStats::default(), &one, None, false);
+        let b = bodies(&seen);
+        let head = "Fichier : A.java\n\nContenu :\ncontenu du morceau";
+        assert_eq!(
+            head.len(),
+            cacheable_prefix_len("A.java", "contenu du morceau")
+        );
+        for (body, list) in b.iter().zip([&one, &two]) {
+            let full = enrichment_user_prompt("A.java", None, "contenu du morceau", list);
+            let content = &body["messages"][0]["content"];
+            assert_eq!(
+                *content,
+                serde_json::json!([
+                    {"type": "text", "text": head, "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": &full[head.len()..]},
+                ])
+            );
+            let joined: String = content
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["text"].as_str().unwrap())
+                .collect();
+            assert_eq!(joined, full);
+        }
+        // Le premier bloc ne dépend pas de la liste de nœuds.
+        assert_eq!(
+            b[0]["messages"][0]["content"][0],
+            b[1]["messages"][0]["content"][0]
+        );
+        // Sans marqueur : la chaîne de la requête, inchangée.
+        assert_eq!(
+            b[2]["messages"][0]["content"],
+            enrichment_user_prompt("A.java", None, "contenu du morceau", &one)
+        );
+    }
+
+    #[test]
+    fn req268_ac2_cut_outside_the_text_leaves_the_string() {
+        assert_eq!(cached_content("abc", 3), serde_json::json!("abc"));
+        assert_eq!(cached_content("abc", 9), serde_json::json!("abc"));
+        assert_eq!(cached_content("aé", 2), serde_json::json!("aé"));
+    }
+
+    #[test]
+    fn req268_ac4_cache_floor_of_anthropic() {
+        let m = "claude-opus-4-7";
+        assert_eq!(Llm::cache_floor(&make(None, m)), Some(2048));
+        assert_eq!(Llm::cache_floor(&make(Some("http://x".into()), m)), None);
+        let compat = make(Some("http://x".into()), m).with_prefix_cache(true);
+        assert_eq!(Llm::cache_floor(&compat), Some(2048));
+        let batch = make(None, m).with_collector(Arc::new(Collector::new()));
+        assert_eq!(Llm::cache_floor(&batch), None);
+    }
+
+    #[test]
+    fn req268_ac6_format_retry_keeps_the_first_block() {
+        let (base, seen) = recording_server(vec![reply(0)], 0);
+        let l = make(Some(base), "m").with_prefix_cache(true);
+        let list = vec!["class:A".to_string()];
+        send(&l, &CallStats::default(), &list, None, true);
+        send(
+            &l,
+            &CallStats::default(),
+            &list,
+            Some(FormatFault::Absent),
+            true,
+        );
+        let b = bodies(&seen);
+        let (first, retry) = (
+            &b[0]["messages"][0]["content"],
+            &b[1]["messages"][0]["content"],
+        );
+        assert_eq!(first[0], retry[0]);
+        let note = FormatFault::Absent.note();
+        let tail = retry[1]["text"].as_str().unwrap();
+        assert!(tail.ends_with(&format!("\n\n{note}")), "{tail}");
+        assert_eq!(
+            tail,
+            format!("{}\n\n{note}", first[1]["text"].as_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn req268_ac7_cache_read_of_the_second_call_is_counted() {
+        let (base, _) = recording_server(vec![reply(0), reply(500)], 0);
+        let l = make(Some(base), "m").with_prefix_cache(true);
+        let mut totals = LlmTotals::default();
+        for _ in 0..2 {
+            let stats = CallStats::default();
+            send(&l, &stats, &[], None, true);
+            totals.add(&stats, false);
+        }
+        assert!(
+            calls_line(&totals).contains("dont cache 500"),
+            "{}",
+            calls_line(&totals)
+        );
     }
 }

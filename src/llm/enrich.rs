@@ -562,6 +562,12 @@ pub fn enrichment_system_prompt(language: &str) -> String {
     )
 }
 
+/// Longueur en octets du début du message d'enrichissement qui ne dépend que du fichier et du
+/// morceau : `Fichier : {file}\n\nContenu :\n{text}` (REQ-268).
+pub fn cacheable_prefix_len(file: &str, text: &str) -> usize {
+    format!("Fichier : {file}\n\nContenu :\n{text}").len()
+}
+
 /// Message utilisateur d'enrichissement : contenu du morceau puis liste des nœuds (REQ-267).
 pub fn enrichment_user_prompt(
     file: &str,
