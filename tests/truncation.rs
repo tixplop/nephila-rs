@@ -1028,8 +1028,14 @@ fn listed(body: &str) -> Vec<String> {
 /// Partie « Contenu » d'une requête.
 fn content_of(body: &str) -> String {
     let t = user_text(body);
-    let rest = t.split_once("Contenu :").unwrap().1;
-    rest.split_once("\n\nNœuds du fichier :")
+    let rest = t
+        .split_once("<file path=")
+        .unwrap()
+        .1
+        .split_once(">\n")
+        .unwrap()
+        .1;
+    rest.split_once("\n</file>\n\nNœuds du fichier :")
         .unwrap()
         .0
         .to_string()

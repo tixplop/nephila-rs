@@ -1241,7 +1241,7 @@ mod cache_tests {
         send(&l, &CallStats::default(), &two, None, true);
         send(&l, &CallStats::default(), &one, None, false);
         let b = bodies(&seen);
-        let head = "Fichier : A.java\n\nContenu :\ncontenu du morceau";
+        let head = "<file path=\"A.java\">\ncontenu du morceau\n</file>";
         assert_eq!(
             head.len(),
             cacheable_prefix_len("A.java", "contenu du morceau")

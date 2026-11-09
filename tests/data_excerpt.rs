@@ -315,7 +315,7 @@ fn req241_ac1_lot_de_fichiers_de_donnees_envoie_le_texte_reduit() {
         let start = user
             .find(&format!(" : {name} ===\n"))
             .unwrap_or_else(|| panic!("{name} absent : {user}"));
-        let end = user[start..].find(&format!("=== FIN DU FICHIER : {name}"));
+        let end = user[start..].find("\n</file>");
         user[start..start + end.unwrap()].to_string()
     };
     let a = section("a.json");

@@ -919,7 +919,7 @@ fn req236_ac8_prompt_version_8_graph_is_reenriched_once() {
 }
 
 #[test]
-fn req267_ac5_previous_prompt_versions_are_reenriched_once() {
+fn req270_ac8_previous_prompt_versions_are_reenriched_once() {
     use nephila::llm::enrich::{
         BUILD_PROMPT_VERSION, CODE_PROMPT_VERSION, DATA_PROMPT_VERSION, MARKDOWN_PROMPT_VERSION,
     };
@@ -930,15 +930,15 @@ fn req267_ac5_previous_prompt_versions_are_reenriched_once() {
             DATA_PROMPT_VERSION,
             MARKDOWN_PROMPT_VERSION
         ],
-        [10, 11, 12, 10]
+        [11, 12, 13, 11]
     );
     let env = redact_env();
     env.ok(&["build"]);
-    set_prompt_version(&env, "A.java", 9);
-    set_prompt_version(&env, "a.md", 9);
-    set_prompt_version(&env, "app.yml", 11);
-    set_prompt_version(&env, "package.json", 10);
-    set_prompt_version(&env, "pom.xml", 10);
+    set_prompt_version(&env, "A.java", 10);
+    set_prompt_version(&env, "a.md", 10);
+    set_prompt_version(&env, "app.yml", 12);
+    set_prompt_version(&env, "package.json", 11);
+    set_prompt_version(&env, "pom.xml", 11);
     assert_eq!(to_enrich(&env), 5);
     env.ok(&["update"]);
     assert_eq!(env.logged().len(), 5);
@@ -1715,7 +1715,7 @@ fn req241_ac6_data_family_previous_version_graph_reenriches_only_data_files() {
     let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
     let n = conn
         .execute(
-            "UPDATE enrichments SET prompt_version = CASE WHEN path = 'app.yml' THEN 11 ELSE 10 END",
+            "UPDATE enrichments SET prompt_version = CASE WHEN path = 'app.yml' THEN 12 ELSE 11 END",
             [],
         )
         .unwrap();
@@ -1736,9 +1736,9 @@ fn req241_ac6_data_family_previous_version_graph_reenriches_only_data_files() {
         )
         .unwrap()
     };
-    assert_eq!(version("app.yml"), 12);
-    assert_eq!(version("a.md"), 10);
-    assert_eq!(version("A.java"), 10);
+    assert_eq!(version("app.yml"), 13);
+    assert_eq!(version("a.md"), 11);
+    assert_eq!(version("A.java"), 11);
     drop(conn);
 
     let again = env.ok(&["update"]);
@@ -1930,10 +1930,10 @@ fn req265_ac5_versions_and_old_graph_reenriches_data_and_build_families_once() {
     use nephila::llm::enrich::{
         BUILD_PROMPT_VERSION, CODE_PROMPT_VERSION, DATA_PROMPT_VERSION, MARKDOWN_PROMPT_VERSION,
     };
-    assert_eq!(DATA_PROMPT_VERSION, 12);
-    assert_eq!(BUILD_PROMPT_VERSION, 11);
-    assert_eq!(CODE_PROMPT_VERSION, 10);
-    assert_eq!(MARKDOWN_PROMPT_VERSION, 10);
+    assert_eq!(DATA_PROMPT_VERSION, 13);
+    assert_eq!(BUILD_PROMPT_VERSION, 12);
+    assert_eq!(CODE_PROMPT_VERSION, 11);
+    assert_eq!(MARKDOWN_PROMPT_VERSION, 11);
     assert_eq!(SCHEMA_VERSION, 14);
     let env = redact_env();
     env.ok(&["build"]);
@@ -2086,11 +2086,13 @@ fn sent_bodies(files: &[(&str, String)], batch_files: usize, extra: &str) -> Vec
         .collect()
 }
 
-/// Chaînes des requêtes qui portent des fichiers (celles qui contiennent `Contenu :`).
+/// Chaînes des requêtes qui portent des fichiers (celles qui contiennent `Nœuds du fichier :`, que les prompts système ne contiennent pas).
 fn contents_of(values: &[serde_json::Value]) -> Vec<String> {
     fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
         match v {
-            serde_json::Value::String(s) if s.contains("Contenu :") => out.push(s.clone()),
+            serde_json::Value::String(s) if s.contains("Nœuds du fichier :") => {
+                out.push(s.clone())
+            }
             serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
             serde_json::Value::Object(o) => o.values().for_each(|x| walk(x, out)),
             _ => {}
@@ -2109,19 +2111,18 @@ fn contents_of_bodies(bodies: &[String]) -> Vec<String> {
     contents_of(&values)
 }
 
-/// Partie d'une requête qui porte `path` : le message d'un fichier seul (`Fichier : <chemin>`)
+/// Partie d'une requête qui porte `path` : le message d'un fichier seul (`<file path="<chemin>">`)
 /// ou la section du fichier dans un lot.
 fn section_of(contents: &[String], path: &str) -> Option<String> {
     for c in contents {
         let head = c.lines().next().unwrap_or("");
-        if head == format!("Fichier : {path}") || head.starts_with(&format!("Fichier : {path} (")) {
+        if head == format!("<file path=\"{path}\">") {
             return Some(c.clone());
         }
         let open = format!(" : {path} ===\n");
-        let close = format!("=== FIN DU FICHIER : {path} ===");
-        if let (Some(i), Some(j)) = (c.find(&open), c.find(&close)) {
-            if i < j {
-                return Some(c[i..j].to_string());
+        if let Some(i) = c.find(&open) {
+            if let Some(j) = c[i..].find("\n</file>") {
+                return Some(c[i..i + j].to_string());
             }
         }
     }
@@ -2275,7 +2276,7 @@ fn req264_ac11_sql_chunks_keep_original_line_numbers() {
     assert!(contents.len() >= 2, "un seul morceau");
     let mut covered = 0;
     for c in &contents {
-        assert_eq!(c.lines().next().unwrap(), "Fichier : big.sql");
+        assert_eq!(c.lines().next().unwrap(), "<file path=\"big.sql\">");
         let head = c
             .lines()
             .find(|l| l.starts_with("(extrait "))
@@ -2284,10 +2285,10 @@ fn req264_ac11_sql_chunks_keep_original_line_numbers() {
         let (a, b) = range.split_once('–').unwrap();
         let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
         let sent = c
-            .split("Contenu :\n")
+            .split("<file path=\"big.sql\">\n")
             .nth(1)
             .unwrap()
-            .split("\n\nNœuds du fichier :")
+            .split("\n</file>\n\nNœuds du fichier :")
             .next()
             .unwrap()
             .trim_end();

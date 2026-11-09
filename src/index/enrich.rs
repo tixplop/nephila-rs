@@ -7177,17 +7177,17 @@ mod estimate_tests {
         // + 4 par fichier pour ` [k]` de `=== FICHIER [k] : `, + 2 × chemin (4) par fichier, + liste numérotée
         // en continu (`[1] id1 — id1\n` = 4 + 3 + 5 + 3 + 1 = 16 ; `[2] id22 — id22\n` = 18 ;
         // `[3] id3 — id3\n` = 16 ; le tiret long « — » et ses deux espaces font 5 octets) + tailles
-        // 3 + 4 = (78+8+4) + 16 + (78+8+4) + 34 + 7 = 90+16 + 90+34 + 7 = 237.
+        // 3 + 4 = (78+8+4) + 16 + (78+8+4) + 34 + 7 = 90+16 + 90+34 + 7 = 237 avant REQ-270 ; 211 depuis (encadrement `<file path="…">` + `\n</file>` à la place de `Contenu :` et de `FIN DU FICHIER`).
         // Lot de 1 (c.md), ordre de REQ-267 : système d'un fichier + encadrement (`Fichier : ` 10,
         // chemin 4, `\n\n` 2, `Contenu :` 9, `\n` 1, [contenu], `\n\n` 2, `Nœuds du fichier :` 19,
-        // `\n` 1, [liste], `\n` 1, consigne de 72 octets → 121) + liste `[1] id5 — id5\n` 16 +
-        // taille 2 = 121 + 16 + 2 = 139.
-        let lot2 = lot_system_prompt(LANG).len() + 237;
-        let lot1 = enrichment_system_prompt(LANG).len() + 139;
+        // `\n` 1, [liste], `\n` 1, consigne de 72 octets → 121 ; bloc `<file path="c.md">\n…\n</file>` depuis REQ-270) +
+        // liste `[1] id5 — id5\n` 16 + taille 2 = 140.
+        let lot2 = lot_system_prompt(LANG).len() + 211;
+        let lot1 = enrichment_system_prompt(LANG).len() + 140;
         // Big de 3 appels : par appel, système + `Fichier : d.txt` (15) + `\n\nContenu :\n` (12) +
         // morceau de 10 + `\n\nNœuds du fichier :\n` (22) + liste `[1] n0k — n0k\n` (16) + `\n` (1) +
-        // ligne d'extrait `(extrait k/3, lignes k–k)\n` (28, le tiret demi-cadratin fait 3 octets) + consigne (72) = 176.
-        let big = 3 * (enrichment_system_prompt(LANG).len() + 176);
+        // ligne d'extrait `(extrait k/3, lignes k–k)\n` (28, le tiret demi-cadratin fait 3 octets) + consigne (72) = 177 (bloc `<file path="d.txt">\n…\n</file>` depuis REQ-270).
+        let big = 3 * (enrichment_system_prompt(LANG).len() + 177);
         assert_eq!(e.bytes, lot2 + lot1 + big);
         assert_eq!(e.alone.len(), 1);
         assert_eq!(e.alone[0].path, "d.txt");
@@ -7239,11 +7239,11 @@ mod estimate_tests {
         let e = run(dir.path(), &files, &ids, 5, 10);
         // Par appel : système + 15 (`Fichier : d.txt`) + extrait (26 + 3 × chiffres de k) + 49
         // (ligne `[1] n0k — n0k\n` de 16 octets) + 10 + 74 (consigne) ; 9 appels à un chiffre (177),
-        // 41 à deux chiffres (180) : 9 × 177 + 41 × 180 = 8 973.
+        // 41 à deux chiffres (180) : 9 × 177 + 41 × 180 = 8 973 ; + 1 par appel depuis REQ-270 : 9 023.
         let sys = enrichment_system_prompt(LANG).len();
         assert_eq!(e.calls, 50);
         assert_eq!(e.nodes, 50);
-        assert_eq!(e.bytes, 50 * sys + 8_973);
+        assert_eq!(e.bytes, 50 * sys + 9_023);
         assert_eq!((e.files, e.sent_alone, e.without_call), (1, 1, 0));
         assert!(e.capped.is_empty());
         assert_eq!(e.alone[0].case, AloneCase::Counted);

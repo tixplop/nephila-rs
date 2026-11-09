@@ -2430,12 +2430,12 @@ fn nine_nodes_doc(env: &Env) {
     fs::write(env.repo.join("docs/a.md"), s).unwrap();
 }
 
-/// Liste de nœuds du fichier d'une requête (REQ-267) : avant `Contenu :` dans un lot, entre le
-/// contenu et la consigne pour un fichier seul.
+/// Liste de nœuds du fichier d'une requête (REQ-267) : avant `<file path=` dans un lot, entre le
+/// bloc et la consigne pour un fichier seul.
 fn list_segment(text: &str) -> &str {
     let start = text.find("Nœuds du fichier :").unwrap();
     let rest = &text[start..];
-    let end = ["Contenu :", "Réponds par l'objet JSON demandé, sur"]
+    let end = ["<file path=", "Réponds par l'objet JSON demandé, sur"]
         .iter()
         .filter_map(|m| rest.find(m))
         .min()

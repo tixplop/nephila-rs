@@ -226,10 +226,12 @@ fn listed_ids(prompt: &str) -> Vec<String> {
     out
 }
 
-/// Contenu du fichier d'un prompt de fichier seul (après `Contenu :\n`).
+/// Contenu du fichier d'un prompt de fichier seul (entre `<file path="…">` et `</file>`).
 fn content_of(prompt: &str) -> &str {
-    let rest = prompt.split_once("\nContenu :\n").unwrap().1;
-    rest.split_once("\n\nNœuds du fichier :\n").unwrap().0
+    let rest = prompt.split_once(">\n").unwrap().1;
+    rest.split_once("\n</file>\n\nNœuds du fichier :\n")
+        .unwrap()
+        .0
 }
 
 /// Ligne d'indice d'extrait d'un prompt de fichier seul (REQ-267), placée après la liste.
@@ -288,7 +290,7 @@ fn req047_ac3_http_trois_requetes_de_150_nœuds_au_plus() {
         for body in &posts {
             let prompt = user_prompt(body);
             assert!(
-                prompt.starts_with("Fichier : src/Big.java\n\nContenu :\n"),
+                prompt.starts_with("<file path=\"src/Big.java\">\n"),
                 "{provider}: {prompt:.80}"
             );
             assert!(
@@ -442,7 +444,10 @@ fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
     assert_eq!(prompts.len(), 2);
     // REQ-169 : première ligne de chaque requête, `<b>` lu dans la requête 1.
     let total_lines = src_lines;
-    assert_eq!(prompts[0].lines().next().unwrap(), "Fichier : src/Big.java");
+    assert_eq!(
+        prompts[0].lines().next().unwrap(),
+        "<file path=\"src/Big.java\">"
+    );
     let first1 = excerpt_line(&prompts[0]);
     let b: usize = first1
         .strip_prefix("(extrait 1/2, lignes 1–")
