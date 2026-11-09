@@ -19,8 +19,8 @@ pub const ENRICH_SCHEMA_VERSION: u32 = 2;
 /// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 9 depuis la 0.28.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
-/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées).
-pub const CODE_PROMPT_VERSION: u32 = 9;
+/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées) ; 10 depuis la 0.28.0 (gabarit réordonné, REQ-267).
+pub const CODE_PROMPT_VERSION: u32 = 10;
 
 /// Version du prompt d'enrichissement de la famille `build` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
@@ -31,8 +31,8 @@ pub const CODE_PROMPT_VERSION: u32 = 9;
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
 /// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées) ; 10 depuis
-/// la 0.28.0 (valeurs sensibles de `package.json` masquées avant l'envoi, REQ-265).
-pub const BUILD_PROMPT_VERSION: u32 = 10;
+/// la 0.28.0 (valeurs sensibles de `package.json` masquées avant l'envoi, REQ-265) ; 11 depuis la 0.28.0 (gabarit réordonné, REQ-267).
+pub const BUILD_PROMPT_VERSION: u32 = 11;
 
 /// Version du prompt d'enrichissement de la famille `données` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
@@ -44,8 +44,8 @@ pub const BUILD_PROMPT_VERSION: u32 = 10;
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
 /// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées) ; 10 depuis
 /// la 0.28.0 (marques de l'extrait JSON, YAML et XML, REQ-239, et du SQL réduit, REQ-240) ; 11 depuis
-/// la 0.28.0 (valeurs sensibles masquées avant l'envoi, REQ-265).
-pub const DATA_PROMPT_VERSION: u32 = 11;
+/// la 0.28.0 (valeurs sensibles masquées avant l'envoi, REQ-265) ; 12 depuis la 0.28.0 (gabarit réordonné, REQ-267).
+pub const DATA_PROMPT_VERSION: u32 = 12;
 
 /// Version du prompt d'enrichissement de la famille `markdown` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
@@ -55,8 +55,8 @@ pub const DATA_PROMPT_VERSION: u32 = 11;
 /// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 9 depuis la 0.28.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
-/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées).
-pub const MARKDOWN_PROMPT_VERSION: u32 = 9;
+/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées) ; 10 depuis la 0.28.0 (gabarit réordonné, REQ-267).
+pub const MARKDOWN_PROMPT_VERSION: u32 = 10;
 
 /// Versions du prompt d'enrichissement des quatre familles (REQ-193).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +105,7 @@ pub const SUMMARY_RULES: &str = "Résumés (de nœud ou de concept) : une phrase
 
 /// Consignes d'extrait : ligne du prompt système du fichier envoyé seul, après `SUMMARY_RULES`
 /// (REQ-169, DEC-136).
-pub const EXCERPT_RULES: &str = "Un fichier trop long est envoyé en extraits : sa ligne \"Fichier :\" porte alors \"(extrait k/n, lignes a–b)\" et tu ne vois que ces lignes. À partir du deuxième extrait, le contenu commence par une copie partielle du début du fichier (package, imports, déclaration du type englobant, ou titres des sections englobantes), donnée pour contexte : n'en tire aucun résumé. Un nœud de la liste seulement cité dans un extrait se résume d'après ce que l'extrait en montre ; omets-le si l'extrait n'en montre pas le rôle.";
+pub const EXCERPT_RULES: &str = "Un fichier trop long est envoyé en extraits : une ligne \"(extrait k/n, lignes a–b)\" suit alors la liste des nœuds et tu ne vois que ces lignes. À partir du deuxième extrait, le contenu commence par une copie partielle du début du fichier (package, imports, déclaration du type englobant, ou titres des sections englobantes), donnée pour contexte : n'en tire aucun résumé. Un nœud de la liste seulement cité dans un extrait se résume d'après ce que l'extrait en montre ; omets-le si l'extrait n'en montre pas le rôle.";
 
 /// Angle du résumé selon le genre du nœud : ligne commune aux deux prompts système (DEC-137).
 pub const KIND_RULES: &str = "Angle du résumé selon le genre du nœud, donné par le préfixe de son identifiant : module → ce que le module produit et à quoi lui servent ses dépendances ; type → sa responsabilité ; method → son effet et ce qu'elle renvoie ; table → son rôle métier et ses colonnes clés ; document → le sujet du document, ou ce que décrit ou configure un fichier de données (SQL, XML, JSON, YAML) ; section → le sujet qu'elle traite.";
@@ -562,7 +562,7 @@ pub fn enrichment_system_prompt(language: &str) -> String {
     )
 }
 
-/// Message utilisateur d'enrichissement : liste des nœuds puis contenu du morceau.
+/// Message utilisateur d'enrichissement : contenu du morceau puis liste des nœuds (REQ-267).
 pub fn enrichment_user_prompt(
     file: &str,
     excerpt: Option<Excerpt>,
@@ -570,16 +570,18 @@ pub fn enrichment_user_prompt(
     requested: &[String],
 ) -> String {
     let list = list_lines(requested, 1);
-    let head = match excerpt {
-        None => format!("Fichier : {file}"),
+    let hint = match excerpt {
+        None => String::new(),
         Some(Excerpt {
             rank,
             total,
             first_line,
             last_line,
-        }) => format!("Fichier : {file} (extrait {rank}/{total}, lignes {first_line}–{last_line})"),
+        }) => format!("(extrait {rank}/{total}, lignes {first_line}–{last_line})\n"),
     };
-    format!("{head}\n\nNœuds du fichier :\n{list}\nContenu :\n{text}")
+    format!(
+        "Fichier : {file}\n\nContenu :\n{text}\n\nNœuds du fichier :\n{list}\n{hint}Réponds par l'objet JSON demandé, sur les seuls nœuds de cette liste."
+    )
 }
 
 /// Version du schéma de réponse d'un lot de 2 fichiers ou plus (DEC-033).
@@ -993,7 +995,7 @@ pub(crate) mod tests {
     /// `EXCERPT_RULES`, requête `None` réécrite en `(morceau 2)`. `f` transforme les prompts
     /// système.
     fn texts_0_26(f: impl Fn(String) -> String) -> Vec<String> {
-        let user = texts_v8_user(user_prompt(None)).replacen(
+        let user = texts_v8_user(user_prompt_v9(None)).replacen(
             "Fichier : a.md\n",
             "Fichier : a.md (morceau 2)\n",
             1,
@@ -1002,7 +1004,7 @@ pub(crate) mod tests {
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             f(
                 texts_v3_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE))
-                    .replace(&format!("{EXCERPT_RULES}\n"), ""),
+                    .replace(&format!("{EXTRAIT}\n"), ""),
             ),
             user,
             f(texts_v3_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE))),
@@ -1015,7 +1017,9 @@ pub(crate) mod tests {
 
     /// Prompt système de la version 5 : sans les règles des concepts (REQ-175).
     fn texts_v5_system(p: String) -> String {
-        texts_v7_system(p).replace(&format!("{CONCEPT_RULES}\n"), "")
+        texts_v7_system(p)
+            .replacen(EXCERPT_RULES, EXTRAIT, 1)
+            .replace(&format!("{CONCEPT_RULES}\n"), "")
     }
 
     /// Les six textes figés par la version 5 (AC-175-2).
@@ -1023,8 +1027,8 @@ pub(crate) mod tests {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             texts_v5_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
-            texts_v8_user(user_prompt(None)),
-            texts_v8_user(user_prompt(Some(EXCERPT_2_3))),
+            texts_v8_user(user_prompt_v9(None)),
+            texts_v8_user(user_prompt_v9(Some(EXCERPT_2_3))),
             texts_v5_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
             texts_v8_user(lot_user_prompt(&lot_items())),
         ]
@@ -1051,8 +1055,8 @@ pub(crate) mod tests {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             texts_v4_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
-            texts_v8_user(user_prompt(None)),
-            texts_v8_user(user_prompt(Some(EXCERPT_2_3))),
+            texts_v8_user(user_prompt_v9(None)),
+            texts_v8_user(user_prompt_v9(Some(EXCERPT_2_3))),
             texts_v4_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
             texts_v8_user(lot_user_prompt(&lot_items())),
         ]
@@ -1095,8 +1099,8 @@ pub(crate) mod tests {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             texts_v3_system(enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
-            texts_v8_user(user_prompt(None)),
-            texts_v8_user(user_prompt(Some(EXCERPT_2_3))),
+            texts_v8_user(user_prompt_v9(None)),
+            texts_v8_user(user_prompt_v9(Some(EXCERPT_2_3))),
             texts_v3_system(lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE)),
             texts_v8_user(lot_user_prompt(&lot_items())),
         ]
@@ -1179,8 +1183,8 @@ pub(crate) mod tests {
         t
     }
 
-    /// Les six textes actuels (version 9 : liste numérotée, réponses à numéros).
-    fn texts_v9() -> Vec<String> {
+    /// Les six textes actuels (version 10 : contenu avant la liste, REQ-267).
+    fn texts_v10() -> Vec<String> {
         vec![
             format!("{ENRICH_SCHEMA_VERSION}/{ENRICH_LOT_SCHEMA_VERSION}"),
             enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
@@ -1189,6 +1193,28 @@ pub(crate) mod tests {
             lot_system_prompt(DEFAULT_SUMMARY_LANGUAGE),
             lot_user_prompt(&lot_items()),
         ]
+    }
+
+    /// Requête de la version 9 : liste avant le contenu, extrait sur la ligne `Fichier :`.
+    fn user_prompt_v9(excerpt: Option<Excerpt>) -> String {
+        let list = list_lines(&ids(&["document:a.md", "section:a.md#x"]), 1);
+        let head = match excerpt {
+            None => "Fichier : a.md".to_string(),
+            Some(e) => format!(
+                "Fichier : a.md (extrait {}/{}, lignes {}–{})",
+                e.rank, e.total, e.first_line, e.last_line
+            ),
+        };
+        format!("{head}\n\nNœuds du fichier :\n{list}\nContenu :\ntexte a")
+    }
+
+    /// Les six textes de la version 9 reconstruits depuis les textes actuels.
+    fn texts_v9() -> Vec<String> {
+        let mut t = texts_v10();
+        t[1] = t[1].replacen(EXCERPT_RULES, EXTRAIT, 1);
+        t[2] = user_prompt_v9(None);
+        t[3] = user_prompt_v9(Some(EXCERPT_2_3));
+        t
     }
 
     #[test]
@@ -1231,7 +1257,7 @@ pub(crate) mod tests {
     /// ligne `CONCEPT_RULES` + `\n` retirée des deux prompts système.
     fn common_texts() -> Vec<String> {
         let strip = |p: String| p.replacen(&format!("{CONCEPT_RULES}\n"), "", 1);
-        let mut texts = texts_v9();
+        let mut texts = texts_v10();
         texts[1] = strip(texts[1].clone());
         texts[4] = strip(texts[4].clone());
         texts.push(
@@ -1267,40 +1293,40 @@ pub(crate) mod tests {
 
     #[test]
     fn req193_ac2_code_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(CODE_PROMPT_VERSION, 9);
+        assert_eq!(CODE_PROMPT_VERSION, 10);
         assert_eq!(
             family_fingerprint(PromptFamily::Code),
-            "20e843f61d06a7a8d84fd5badd4c8fd1793c750044084e948203ddeb494253f4",
+            "9e6aea0b850cd7ed5e65bc224a7ff326f53b24a4b3f4f96209d7a27b9eef66f5",
             "les textes du prompt de la famille code ont changé : incrémentez CODE_PROMPT_VERSION"
         );
     }
 
     #[test]
     fn req193_ac2_build_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(BUILD_PROMPT_VERSION, 10);
+        assert_eq!(BUILD_PROMPT_VERSION, 11);
         assert_eq!(
             family_fingerprint(PromptFamily::Build),
-            "20e843f61d06a7a8d84fd5badd4c8fd1793c750044084e948203ddeb494253f4",
+            "9e6aea0b850cd7ed5e65bc224a7ff326f53b24a4b3f4f96209d7a27b9eef66f5",
             "les textes du prompt de la famille build ont changé : incrémentez BUILD_PROMPT_VERSION"
         );
     }
 
     #[test]
     fn req193_ac2_data_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(DATA_PROMPT_VERSION, 11);
+        assert_eq!(DATA_PROMPT_VERSION, 12);
         assert_eq!(
             family_fingerprint(PromptFamily::Data),
-            "725c7d8480d02d219df0fb47c9f8cd8364ba45833c99f04f5671ba498854442c",
+            "1ee976e3afda38cd6ff4afbc39173fd78f3fa0a80324a4d6740cecf18f210b40",
             "les textes du prompt de la famille données ont changé : incrémentez DATA_PROMPT_VERSION"
         );
     }
 
     #[test]
     fn req193_ac2_markdown_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(MARKDOWN_PROMPT_VERSION, 9);
+        assert_eq!(MARKDOWN_PROMPT_VERSION, 10);
         assert_eq!(
             family_fingerprint(PromptFamily::Markdown),
-            "8cffd935c920b47f3e28a758582ddf2d8ef03bf9a1715e679fdb42ca49592d8d",
+            "d08806bf925afbc5378c560164b731c1276013b9291e62120e72f4250d4377fe",
             "les textes du prompt de la famille markdown ont changé : incrémentez MARKDOWN_PROMPT_VERSION"
         );
         assert_ne!(
@@ -1366,9 +1392,9 @@ pub(crate) mod tests {
         for t in FileType::ALL {
             assert!(expected.iter().any(|(e, _)| *e == t), "{t:?}");
             let want = match t {
-                Sql | Xml | Json | Yaml => 11,
-                Maven | Ivy | Gradle | Npm => 10,
-                _ => 9,
+                Sql | Xml | Json | Yaml => 12,
+                Maven | Ivy | Gradle | Npm => 11,
+                _ => 10,
             };
             assert_eq!(PromptVersions::CURRENT.of(t), want, "{t:?}");
         }
@@ -1395,7 +1421,7 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [9, 10, 11, 9]
+            [10, 11, 12, 10]
         );
     }
 
@@ -1425,7 +1451,7 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [9, 10, 11, 9]
+            [10, 11, 12, 10]
         );
     }
 
@@ -1585,7 +1611,6 @@ pub(crate) mod tests {
 
     #[test]
     fn req169_ac1_excerpt_rules_text_and_placement() {
-        assert_eq!(EXCERPT_RULES, EXTRAIT);
         let needle = format!("\n{SUMMARY_RULES}\n{EXCERPT_RULES}\n");
         assert_eq!(
             enrichment_system_prompt(DEFAULT_SUMMARY_LANGUAGE)
@@ -1602,25 +1627,60 @@ pub(crate) mod tests {
     fn req169_ac2_user_prompt_first_line() {
         let none = user_prompt(None);
         assert_eq!(
-            none,
-            "Fichier : a.md\n\nNœuds du fichier :\n[1] a.md — document:a.md\n[2] x — section:a.md#x\n\nContenu :\ntexte a"
-        );
-        assert_eq!(
             enrichment_user_prompt("a.md", None, "t", &ids(&["document:a.md"])),
-            "Fichier : a.md\n\nNœuds du fichier :\n[1] a.md — document:a.md\n\nContenu :\nt"
+            format!("Fichier : a.md\n\nContenu :\nt\n\nNœuds du fichier :\n[1] a.md — document:a.md\n\n{INSTRUCTION}")
         );
         let some = user_prompt(Some(EXCERPT_2_3));
-        let (first, rest) = some.split_once('\n').unwrap();
-        assert_eq!(first, "Fichier : a.md (extrait 2/3, lignes 10–20)");
-        assert_eq!(rest, none.split_once('\n').unwrap().1);
+        assert_eq!(some.lines().next().unwrap(), "Fichier : a.md");
         assert!(!none.contains("morceau") && !some.contains("morceau"));
+        assert!(!none.contains("extrait"));
+    }
+
+    const INSTRUCTION: &str =
+        "Réponds par l'objet JSON demandé, sur les seuls nœuds de cette liste.";
+
+    #[test]
+    fn req267_ac1_content_before_list() {
+        assert_eq!(
+            user_prompt(None),
+            format!("Fichier : a.md\n\nContenu :\ntexte a\n\nNœuds du fichier :\n[1] a.md — document:a.md\n[2] x — section:a.md#x\n\n{INSTRUCTION}")
+        );
+    }
+
+    #[test]
+    fn req267_ac2_excerpt_hint_after_list() {
+        let some = user_prompt(Some(EXCERPT_2_3));
+        assert_eq!(some.lines().next().unwrap(), "Fichier : a.md");
+        assert!(some.ends_with(&format!(
+            "[2] x — section:a.md#x\n\n(extrait 2/3, lignes 10–20)\n{INSTRUCTION}"
+        )));
+    }
+
+    #[test]
+    fn req267_ac3_excerpt_rules_start() {
+        assert!(EXCERPT_RULES.starts_with("Un fichier trop long est envoyé en extraits : une ligne \"(extrait k/n, lignes a–b)\" suit alors la liste des nœuds et tu ne vois que ces lignes. À partir du deuxième extrait,"));
+        assert!(EXCERPT_RULES
+            .ends_with(&EXTRAIT[EXTRAIT.find(" À partir du deuxième extrait,").unwrap()..]));
+    }
+
+    #[test]
+    fn req267_ac4_versions() {
+        assert_eq!(
+            (
+                CODE_PROMPT_VERSION,
+                BUILD_PROMPT_VERSION,
+                DATA_PROMPT_VERSION,
+                MARKDOWN_PROMPT_VERSION
+            ),
+            (10, 11, 12, 10)
+        );
     }
 
     #[test]
     fn req236_ac1_numbered_list_in_user_prompt() {
         assert_eq!(
             user_prompt(None),
-            "Fichier : a.md\n\nNœuds du fichier :\n[1] a.md — document:a.md\n[2] x — section:a.md#x\n\nContenu :\ntexte a"
+            format!("Fichier : a.md\n\nContenu :\ntexte a\n\nNœuds du fichier :\n[1] a.md — document:a.md\n[2] x — section:a.md#x\n\n{INSTRUCTION}")
         );
         let line = |id: &str, rank: usize| {
             let mut v = vec!["document:z".to_string(); rank - 1];
@@ -1795,7 +1855,7 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [9, 10, 11, 9]
+            [10, 11, 12, 10]
         );
         assert_eq!(crate::llm::ask::ASK_PROMPT_VERSION, 2);
     }

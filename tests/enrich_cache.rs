@@ -919,6 +919,35 @@ fn req236_ac8_prompt_version_8_graph_is_reenriched_once() {
 }
 
 #[test]
+fn req267_ac5_previous_prompt_versions_are_reenriched_once() {
+    use nephila::llm::enrich::{
+        BUILD_PROMPT_VERSION, CODE_PROMPT_VERSION, DATA_PROMPT_VERSION, MARKDOWN_PROMPT_VERSION,
+    };
+    assert_eq!(
+        [
+            CODE_PROMPT_VERSION,
+            BUILD_PROMPT_VERSION,
+            DATA_PROMPT_VERSION,
+            MARKDOWN_PROMPT_VERSION
+        ],
+        [10, 11, 12, 10]
+    );
+    let env = redact_env();
+    env.ok(&["build"]);
+    set_prompt_version(&env, "A.java", 9);
+    set_prompt_version(&env, "a.md", 9);
+    set_prompt_version(&env, "app.yml", 11);
+    set_prompt_version(&env, "package.json", 10);
+    set_prompt_version(&env, "pom.xml", 10);
+    assert_eq!(to_enrich(&env), 5);
+    env.ok(&["update"]);
+    assert_eq!(env.logged().len(), 5);
+    assert_eq!(to_enrich(&env), 0);
+    let again = env.ok(&["update"]);
+    assert_eq!(text(&again.stdout), "graphe à jour\n");
+}
+
+#[test]
 fn req167_ac5_omitted_trivial_accessor_is_accepted() {
     let env = tiny_env(&[(
         "src/A.java",
@@ -1545,9 +1574,9 @@ fn two_calls() -> (String, usize, [Vec<String>; 2]) {
     let ids = |b: &str| -> Vec<String> {
         let v: serde_json::Value = serde_json::from_str(b).unwrap();
         let user = v["messages"][1]["content"].as_str().unwrap().to_string();
-        user.split("Contenu :")
-            .next()
+        user.split_once("Nœuds du fichier :")
             .unwrap()
+            .1
             .lines()
             .filter_map(|l| {
                 l.strip_prefix('[')
@@ -1674,7 +1703,7 @@ fn REQ237_AC8_resumes_retraduits_d_un_appel_conserve_restent_sur_leurs_noeuds() 
 }
 
 #[test]
-fn req241_ac6_data_family_version_9_graph_reenriches_only_data_files() {
+fn req241_ac6_data_family_previous_version_graph_reenriches_only_data_files() {
     let env = tiny_env(&[
         ("a.md", "# Un\n\ntexte\n"),
         ("A.java", "public class A {\n  void run() {}\n}\n"),
@@ -1685,7 +1714,10 @@ fn req241_ac6_data_family_version_9_graph_reenriches_only_data_files() {
 
     let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
     let n = conn
-        .execute("UPDATE enrichments SET prompt_version = 9", [])
+        .execute(
+            "UPDATE enrichments SET prompt_version = CASE WHEN path = 'app.yml' THEN 11 ELSE 10 END",
+            [],
+        )
         .unwrap();
     assert_eq!(n, 3);
     drop(conn);
@@ -1704,9 +1736,9 @@ fn req241_ac6_data_family_version_9_graph_reenriches_only_data_files() {
         )
         .unwrap()
     };
-    assert_eq!(version("app.yml"), 11);
-    assert_eq!(version("a.md"), 9);
-    assert_eq!(version("A.java"), 9);
+    assert_eq!(version("app.yml"), 12);
+    assert_eq!(version("a.md"), 10);
+    assert_eq!(version("A.java"), 10);
     drop(conn);
 
     let again = env.ok(&["update"]);
@@ -1898,16 +1930,16 @@ fn req265_ac5_versions_and_old_graph_reenriches_data_and_build_families_once() {
     use nephila::llm::enrich::{
         BUILD_PROMPT_VERSION, CODE_PROMPT_VERSION, DATA_PROMPT_VERSION, MARKDOWN_PROMPT_VERSION,
     };
-    assert_eq!(DATA_PROMPT_VERSION, 11);
-    assert_eq!(BUILD_PROMPT_VERSION, 10);
-    assert_eq!(CODE_PROMPT_VERSION, 9);
-    assert_eq!(MARKDOWN_PROMPT_VERSION, 9);
+    assert_eq!(DATA_PROMPT_VERSION, 12);
+    assert_eq!(BUILD_PROMPT_VERSION, 11);
+    assert_eq!(CODE_PROMPT_VERSION, 10);
+    assert_eq!(MARKDOWN_PROMPT_VERSION, 10);
     assert_eq!(SCHEMA_VERSION, 14);
     let env = redact_env();
     env.ok(&["build"]);
-    set_prompt_version(&env, "app.yml", 10);
-    set_prompt_version(&env, "package.json", 9);
-    set_prompt_version(&env, "pom.xml", 9);
+    set_prompt_version(&env, "app.yml", 11);
+    set_prompt_version(&env, "package.json", 10);
+    set_prompt_version(&env, "pom.xml", 10);
     assert_eq!(to_enrich(&env), 3);
     env.ok(&["update"]);
     assert_eq!(
@@ -2243,12 +2275,22 @@ fn req264_ac11_sql_chunks_keep_original_line_numbers() {
     assert!(contents.len() >= 2, "un seul morceau");
     let mut covered = 0;
     for c in &contents {
-        let head = c.lines().next().unwrap();
-        assert!(head.starts_with("Fichier : big.sql (extrait "), "{head}");
+        assert_eq!(c.lines().next().unwrap(), "Fichier : big.sql");
+        let head = c
+            .lines()
+            .find(|l| l.starts_with("(extrait "))
+            .expect("indice d'extrait");
         let range = head.split("lignes ").nth(1).unwrap().trim_end_matches(')');
         let (a, b) = range.split_once('–').unwrap();
         let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
-        let sent = c.split("Contenu :\n").nth(1).unwrap().trim_end();
+        let sent = c
+            .split("Contenu :\n")
+            .nth(1)
+            .unwrap()
+            .split("\n\nNœuds du fichier :")
+            .next()
+            .unwrap()
+            .trim_end();
         let expected: Vec<String> = original[a - 1..b]
             .iter()
             .map(|l| l.replace(&format!("'{SECRET}'"), "'***'"))

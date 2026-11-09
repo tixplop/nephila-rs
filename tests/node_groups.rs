@@ -228,7 +228,16 @@ fn listed_ids(prompt: &str) -> Vec<String> {
 
 /// Contenu du fichier d'un prompt de fichier seul (après `Contenu :\n`).
 fn content_of(prompt: &str) -> &str {
-    prompt.split_once("\nContenu :\n").unwrap().1
+    let rest = prompt.split_once("\nContenu :\n").unwrap().1;
+    rest.split_once("\n\nNœuds du fichier :\n").unwrap().0
+}
+
+/// Ligne d'indice d'extrait d'un prompt de fichier seul (REQ-267), placée après la liste.
+fn excerpt_line(prompt: &str) -> &str {
+    prompt
+        .lines()
+        .find(|l| l.starts_with("(extrait "))
+        .unwrap_or_else(|| panic!("aucune ligne d'extrait : {prompt}"))
 }
 
 fn reply(provider: &str, text: &str) -> (u16, String) {
@@ -279,7 +288,7 @@ fn req047_ac3_http_trois_requetes_de_150_nœuds_au_plus() {
         for body in &posts {
             let prompt = user_prompt(body);
             assert!(
-                prompt.starts_with("Fichier : src/Big.java\n\nNœuds du fichier :\n"),
+                prompt.starts_with("Fichier : src/Big.java\n\nContenu :\n"),
                 "{provider}: {prompt:.80}"
             );
             assert!(
@@ -433,20 +442,18 @@ fn req047_ac5_deux_morceaux_une_liste_par_morceau() {
     assert_eq!(prompts.len(), 2);
     // REQ-169 : première ligne de chaque requête, `<b>` lu dans la requête 1.
     let total_lines = src_lines;
-    let first1 = prompts[0].lines().next().unwrap();
+    assert_eq!(prompts[0].lines().next().unwrap(), "Fichier : src/Big.java");
+    let first1 = excerpt_line(&prompts[0]);
     let b: usize = first1
-        .strip_prefix("Fichier : src/Big.java (extrait 1/2, lignes 1–")
+        .strip_prefix("(extrait 1/2, lignes 1–")
         .and_then(|r| r.strip_suffix(')'))
         .unwrap_or_else(|| panic!("première ligne : {first1}"))
         .parse()
         .unwrap();
     assert!(b >= 1 && b < total_lines, "b = {b}");
     assert_eq!(
-        prompts[1].lines().next().unwrap(),
-        format!(
-            "Fichier : src/Big.java (extrait 2/2, lignes {}–{total_lines})",
-            b + 1
-        )
+        excerpt_line(&prompts[1]),
+        format!("(extrait 2/2, lignes {}–{total_lines})", b + 1)
     );
     for (p, body) in prompts.iter().zip(env.enrich_posts("openai")) {
         assert!(!p.contains("(morceau"), "{p}");

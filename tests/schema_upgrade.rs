@@ -947,7 +947,7 @@ fn req245_ac3_documented_nodes_are_asked_until_the_file_is_read_again() {
         assert_eq!(bodies.len(), i + 1, "{bodies:?}");
         let b = &bodies[i];
         let start = b.find("Nœuds du fichier").unwrap();
-        b[start..b.find("Contenu").unwrap()].to_string()
+        b[start..b.find("Réponds par l'objet JSON demandé").unwrap()].to_string()
     };
     let docs = || -> Vec<Option<String>> {
         Connection::open(repo.join(".nephila/graph.db"))

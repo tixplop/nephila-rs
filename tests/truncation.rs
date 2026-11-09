@@ -1013,11 +1013,9 @@ fn user_text(body: &str) -> String {
 
 /// Identifiants de la liste « Nœuds du fichier » d'une requête.
 fn listed(body: &str) -> Vec<String> {
-    user_text(body)
-        .split("Contenu :")
-        .next()
-        .unwrap()
-        .lines()
+    let t = user_text(body);
+    let list = t.split_once("Nœuds du fichier :").unwrap().1;
+    list.lines()
         .filter_map(|l| {
             l.strip_prefix('[')
                 .and_then(|r| r.split_once(" — "))
@@ -1030,7 +1028,11 @@ fn listed(body: &str) -> Vec<String> {
 /// Partie « Contenu » d'une requête.
 fn content_of(body: &str) -> String {
     let t = user_text(body);
-    t.split_once("Contenu :").unwrap().1.to_string()
+    let rest = t.split_once("Contenu :").unwrap().1;
+    rest.split_once("\n\nNœuds du fichier :")
+        .unwrap()
+        .0
+        .to_string()
 }
 
 fn ok_for(provider: &str, summaries: &[(&str, &str)]) -> String {

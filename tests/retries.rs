@@ -910,6 +910,30 @@ fn req177_ac7_openai_text_without_json_then_note_absent() {
 }
 
 #[test]
+fn req267_ac6_retried_request_ends_with_instruction_then_note() {
+    let server = FakeServer::start(vec![
+        (200, openai_reply("désolé, pas de JSON")),
+        (200, openai_reply(GOOD)),
+    ]);
+    let env = server_env(&server, "");
+    let o = env.run(&["build"], &[("NEPHILA_RETRIES_TEST_KEY", "sk")]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let reqs = posts(&server);
+    assert_eq!(reqs.len(), 2);
+    let (u1, _) = split_user(&reqs[0].body);
+    let (u2, _) = split_user(&reqs[1].body);
+    let instruction = "Réponds par l'objet JSON demandé, sur les seuls nœuds de cette liste.";
+    assert!(u1.ends_with(instruction), "{u1}");
+    assert!(
+        u2.ends_with(&format!(
+            "{instruction}\n\n{}",
+            nephila::llm::retry::NOTE_ABSENT
+        )),
+        "{u2}"
+    );
+}
+
+#[test]
 fn req177_ac7_anthropic_text_without_json_then_note_absent() {
     let good = serde_json::json!({"content":[{"type":"text","text":GOOD}]}).to_string();
     let bad =

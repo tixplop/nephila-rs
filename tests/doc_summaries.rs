@@ -137,7 +137,7 @@ fn user_text(v: &Value) -> String {
 /// La liste numérotée d'un prompt, sans le contenu du fichier.
 fn list_of(prompt: &str) -> &str {
     let start = prompt.find("Nœuds du fichier :").unwrap();
-    let end = prompt.find("Contenu :").unwrap();
+    let end = prompt.find("\n\nRéponds par l'objet JSON").unwrap();
     &prompt[start..end]
 }
 
