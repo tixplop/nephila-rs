@@ -67,9 +67,18 @@ fn sections(prefix: &str, k: usize) -> String {
 /// et `src/Big.java` sont envoyés seuls, `web/src/side.js` n'a aucun nœud à demander.
 fn write_fixture(repo: &Path) {
     let files: Vec<(&str, String)> = vec![
-        ("docs/a.md", format!("# A\n\n{}\n", "alpha ".repeat(65))),
-        ("docs/b.md", format!("# B\n\n{}\n", "beta ".repeat(75))),
-        ("docs/c.md", format!("# C\n\n{}\n", "gamma ".repeat(150))),
+        (
+            "docs/a.md",
+            format!("# A\n\n{}\n", "alpha ".repeat(65).trim_end()),
+        ),
+        (
+            "docs/b.md",
+            format!("# B\n\n{}\n", "beta ".repeat(75).trim_end()),
+        ),
+        (
+            "docs/c.md",
+            format!("# C\n\n{}\n", "gamma ".repeat(150).trim_end()),
+        ),
         ("docs/d.md", sections("S", 8)),
         ("src/Big.java", java("Big", 200)),
         ("web/src/side.js", "console.log(1);\n".to_string()),

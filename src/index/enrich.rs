@@ -611,18 +611,19 @@ pub(crate) struct Sources<'a> {
 }
 
 impl Sources<'_> {
-    /// Texte d'un fichier à envoyer au LLM : lu, puis masqué et compté si `redact` est présent.
+    /// Texte d'un fichier à envoyer au LLM : lu, masqué et compté si `redact` est présent, puis
+    /// compacté (REQ-272).
     fn read_for_llm(&self, path: &str) -> std::io::Result<String> {
         let text = std::fs::read_to_string(self.real_path(path))?;
         let Some(tally) = self.redact else {
-            return Ok(text);
+            return Ok(crate::llm::compact::compact(path, &text));
         };
         if !crate::filter::FileType::of(path).is_some_and(crate::llm::redact::is_targeted) {
-            return Ok(text);
+            return Ok(crate::llm::compact::compact(path, &text));
         }
         let (masked, n) = crate::llm::redact::redact(path, &text);
         tally.record(path, n);
-        Ok(masked.into_owned())
+        Ok(crate::llm::compact::compact(path, &masked))
     }
 
     /// Chemin réel d'un fichier : l'entrée d'`abs`, sinon la racine jointe au chemin.

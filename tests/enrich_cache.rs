@@ -2301,3 +2301,159 @@ fn req264_ac11_sql_chunks_keep_original_line_numbers() {
     }
     assert_eq!(covered, 60);
 }
+
+// ---- REQ-272 : texte compacté avant l'envoi (T-366) ----
+
+const LICENSE_TXT: &str = "LICENCE_ACME_272";
+
+fn java_with_blanks(name: &str) -> String {
+    format!(
+        "/*\n * Copyright {LICENSE_TXT}\n */\n\n\npackage a;   \n\n\n\n\nclass {name} {{  \n  int x;\t\n\n\n  int y;\n}}\n"
+    )
+}
+
+fn assert_compact(part: &str, what: &str) {
+    assert!(
+        !part.contains(LICENSE_TXT),
+        "{what} : licence envoyée : {part}"
+    );
+    assert!(part.contains("class "), "{what} : code absent : {part}");
+    assert!(
+        !part.contains(" \n") && !part.contains("\t\n"),
+        "{what} : blanc de fin : {part:?}"
+    );
+    assert!(!part.contains("\n\n\n"), "{what} : lignes vides : {part:?}");
+}
+
+fn java_files() -> Vec<(&'static str, String)> {
+    vec![
+        ("src/A.java", java_with_blanks("A")),
+        ("src/B.java", java_with_blanks("B")),
+    ]
+}
+
+fn assert_java_compact(contents: &[String], what: &str) {
+    for p in ["src/A.java", "src/B.java"] {
+        let part = section_of(contents, p).unwrap_or_else(|| panic!("{what} : {p} non envoyé"));
+        assert_compact(&part, &format!("{what} {p}"));
+    }
+}
+
+#[test]
+fn req272_ac8_license_and_blanks_are_not_sent() {
+    for redact in ["", "enrich_redact = false\n"] {
+        for n in [1, 2] {
+            let bodies = sent_bodies(&java_files(), n, redact);
+            assert_java_compact(
+                &contents_of_bodies(&bodies),
+                &format!("batch_files={n} {redact}"),
+            );
+        }
+        use batch_server::{BatchServer, Outcome};
+        let (env, cfg) = Redacted::new(&java_files(), 2, redact);
+        let server = BatchServer::start();
+        server.simulate("openai", 0, |_| {
+            Outcome::Text(r#"{"version": 2, "summaries": [], "concepts": []}"#.into())
+        });
+        env.run(&server.base_url, &cfg, &["build", "--batch"]);
+        let flat: Vec<serde_json::Value> = server.lots().into_iter().flatten().collect();
+        assert!(!flat.is_empty(), "aucun lot créé");
+        assert_java_compact(&contents_of(&flat), &format!("--batch {redact}"));
+    }
+}
+
+#[test]
+fn req272_ac9_masked_value_and_blank_runs_with_one_masked_value_counted() {
+    let sql =
+        format!("ALTER USER u WITH PASSWORD '{SECRET}';\n\n\n\n\nCREATE TABLE t (id int);  \n");
+    let (env, cfg) = Redacted::new(&[("db/a.sql", sql)], 1, "enrich_redact = true\n");
+    let empty = openai_body(r#"{"version": 2, "summaries": [], "concepts": []}"#, "stop");
+    let server = fake_server::FakeServer::start((0..10).map(|_| (200, empty.clone())).collect());
+    let o = env.run(&server.base_url, &cfg, &["build", "--verbose"]);
+    let bodies: Vec<String> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/chat/completions")
+        .map(|r| r.body)
+        .collect();
+    let contents = contents_of_bodies(&bodies);
+    let part = section_of(&contents, "db/a.sql").expect("db/a.sql non envoyé");
+    assert!(part.contains("***"), "{part}");
+    assert!(!part.contains(SECRET), "{part}");
+    assert!(!part.contains("\n\n\n"), "{part:?}");
+    assert!(
+        text(&o.stderr).contains("masquage: 1 valeurs masquées dans 1 fichiers"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+#[test]
+fn req272_ac10_markdown_chunks_follow_compacted_lines() {
+    let doc: String = (1..=8)
+        .map(|i| format!("# Sect{i}  \n\n\n\n\n{}  \n\n\n\n", "mot ".repeat(30)))
+        .collect();
+    let bodies = sent_bodies(&[("big.md", doc.clone())], 1, "max_chunk_chars = 400\n");
+    let contents = contents_of_bodies(&bodies);
+    assert!(contents.len() >= 2, "un seul morceau");
+    let compacted = nephila::llm::compact::compact("big.md", &doc);
+    let total = compacted.lines().count();
+    let range = |c: &str| {
+        let head = c
+            .lines()
+            .find(|l| l.starts_with("(extrait "))
+            .expect("indice");
+        let r = head.split("lignes ").nth(1).unwrap().trim_end_matches(')');
+        let (a, b) = r.split_once('–').unwrap();
+        (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())
+    };
+    let mut ranges: Vec<(usize, usize)> = contents.iter().map(|c| range(c)).collect();
+    ranges.sort();
+    assert_eq!(ranges.first().unwrap().0, 1);
+    assert_eq!(ranges.last().unwrap().1, total);
+    assert!(total < doc.lines().count());
+    // Chaque section est demandée au morceau dont les lignes (du texte compacté) portent son titre.
+    for i in 1..=8 {
+        let title_line = compacted
+            .lines()
+            .position(|l| l == format!("# Sect{i}"))
+            .unwrap()
+            + 1;
+        for c in &contents {
+            let (a, b) = range(c);
+            let listed = c
+                .split("Nœuds du fichier :")
+                .nth(1)
+                .unwrap()
+                .contains(&format!("section:big.md#sect{i}\n"));
+            assert_eq!(
+                listed,
+                (a..=b).contains(&title_line),
+                "Sect{i} lignes {a}–{b}"
+            );
+        }
+    }
+}
+
+#[test]
+fn req272_ac11_compacted_text_does_not_change_the_batch_budget() {
+    let pad = " ".repeat(300);
+    let file = |n: &str| format!("class {n} {{}}{pad}\n{}\n", "\n".repeat(200));
+    let files = vec![("src/A.java", file("A")), ("src/B.java", file("B"))];
+    let size: usize = files.iter().map(|(_, c)| c.len()).sum();
+    assert!(size > 600);
+    let compact_size: usize = files
+        .iter()
+        .map(|(p, c)| nephila::llm::compact::compact(p, c).len())
+        .sum();
+    assert!(compact_size < 100);
+    let bodies = sent_bodies(&files, 2, "max_chunk_chars = 600\n");
+    let contents = contents_of_bodies(&bodies);
+    assert_eq!(contents.len(), 2, "{contents:?}");
+    for c in &contents {
+        assert!(
+            c.lines().next().unwrap().starts_with("<file path=\"src/"),
+            "{c}"
+        );
+    }
+}

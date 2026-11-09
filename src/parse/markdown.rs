@@ -2,6 +2,7 @@
 //! (REQ-023, DEC-017, DEC-021).
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::Path;
 
 use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
@@ -151,6 +152,15 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
 /// suffixe `-n` des doublons compris) et octet de début de la ligne de leur titre (DEC-061).
 pub fn section_offsets(text: &str) -> Vec<(String, usize)> {
     scan(String::new(), text).offsets
+}
+
+/// Plages d'octets des blocs de code (clôturés ou indentés) dans l'ordre du texte (REQ-272).
+pub fn code_block_ranges(text: &str) -> Vec<Range<usize>> {
+    Parser::new(text)
+        .into_offset_iter()
+        .filter(|(ev, _)| matches!(ev, Event::Start(Tag::CodeBlock(_))))
+        .map(|(_, range)| range)
+        .collect()
 }
 
 /// Titres du document dans l'ordre du texte : niveau (1 à 6), octet de début de la ligne du titre

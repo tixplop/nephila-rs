@@ -3,6 +3,7 @@
 pub mod anthropic;
 pub mod ask;
 pub mod batch;
+pub mod compact;
 pub use batch::BatchLink;
 pub mod enrich;
 pub(crate) mod http;
