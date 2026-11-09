@@ -9,6 +9,7 @@ pub(crate) mod http;
 pub use http::{Retry, Tls};
 pub mod mock;
 pub mod openai;
+pub mod redact;
 pub mod retry;
 mod schema;
 mod sse;
