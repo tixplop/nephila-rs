@@ -1964,3 +1964,297 @@ fn req265_ac4_dry_run_keeps_the_applied_summary_when_both_entries_exist() {
         assert!(env.logged().is_empty());
     }
 }
+
+// ---- REQ-264 : masquage à la lecture (T-359) ----
+
+#[allow(dead_code)]
+#[path = "support/batch_server.rs"]
+mod batch_server;
+
+const SECRET: &str = "SECRET_VAL_43";
+const PEM_BODY: &str = "PEMBODY_43";
+
+fn secret_files() -> Vec<(&'static str, String)> {
+    vec![
+        ("config/app.yml", format!("password: {SECRET}\nname: app\n")),
+        (
+            "db/a.sql",
+            format!("INSERT INTO u (id, api_key, nom) VALUES (1, '{SECRET}', 'a');\n"),
+        ),
+        (
+            "conf/b.xml",
+            format!("<conf><password>{SECRET}</password></conf>\n"),
+        ),
+        ("c.json", format!("{{\"token\": \"{SECRET}\", \"n\": 1}}\n")),
+        (
+            "package.json",
+            format!("{{\"name\": \"p\", \"secret\": \"{SECRET}\"}}\n"),
+        ),
+        (
+            "k.yml",
+            format!("cert:\n-----BEGIN CERT-----\n{PEM_BODY}\n-----END CERT-----\n"),
+        ),
+    ]
+}
+
+struct Redacted {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    config: PathBuf,
+}
+
+impl Redacted {
+    fn new(files: &[(&str, String)], batch_files: usize, extra: &str) -> (Redacted, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        for (p, c) in files {
+            let path = repo.join(p);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, c).unwrap();
+        }
+        let config = tmp.path().join("config.toml");
+        (
+            Redacted {
+                _tmp: tmp,
+                repo,
+                config,
+            },
+            format!(
+                "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\napi_key_env = \"NEPHILA_T359_KEY\"\nconcurrency = 1\nformat_retries = 0\nbatch_files = {batch_files}\n{extra}"
+            ),
+        )
+    }
+
+    fn run(&self, base_url: &str, cfg: &str, args: &[&str]) -> Output {
+        fs::write(&self.config, format!("{cfg}base_url = \"{base_url}\"\n")).unwrap();
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_T359_KEY", "sk-test")
+            .env("NEPHILA_RETRY_BASE_MS", "1")
+            .env("NEPHILA_BATCH_POLL_MS", "5")
+            .output()
+            .unwrap()
+    }
+}
+
+/// Corps des requêtes reçues par un faux serveur `openai` après `build` (réponses vides).
+fn sent_bodies(files: &[(&str, String)], batch_files: usize, extra: &str) -> Vec<String> {
+    let (env, cfg) = Redacted::new(files, batch_files, extra);
+    let empty = openai_body(r#"{"version": 2, "summaries": [], "concepts": []}"#, "stop");
+    let server = fake_server::FakeServer::start((0..60).map(|_| (200, empty.clone())).collect());
+    env.run(&server.base_url, &cfg, &["build"]);
+    server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/chat/completions")
+        .map(|r| r.body)
+        .collect()
+}
+
+/// Chaînes des requêtes qui portent des fichiers (celles qui contiennent `Contenu :`).
+fn contents_of(values: &[serde_json::Value]) -> Vec<String> {
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) if s.contains("Contenu :") => out.push(s.clone()),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    values.iter().for_each(|v| walk(v, &mut out));
+    out
+}
+
+fn contents_of_bodies(bodies: &[String]) -> Vec<String> {
+    let values: Vec<serde_json::Value> = bodies
+        .iter()
+        .map(|b| serde_json::from_str(b).unwrap())
+        .collect();
+    contents_of(&values)
+}
+
+/// Partie d'une requête qui porte `path` : le message d'un fichier seul (`Fichier : <chemin>`)
+/// ou la section du fichier dans un lot.
+fn section_of(contents: &[String], path: &str) -> Option<String> {
+    for c in contents {
+        let head = c.lines().next().unwrap_or("");
+        if head == format!("Fichier : {path}") || head.starts_with(&format!("Fichier : {path} (")) {
+            return Some(c.clone());
+        }
+        let open = format!(" : {path} ===\n");
+        let close = format!("=== FIN DU FICHIER : {path} ===");
+        if let (Some(i), Some(j)) = (c.find(&open), c.find(&close)) {
+            if i < j {
+                return Some(c[i..j].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Clé qui doit rester visible dans le texte envoyé de chaque fichier.
+const KEYS: [(&str, &str); 6] = [
+    ("config/app.yml", "password"),
+    ("db/a.sql", "api_key"),
+    ("conf/b.xml", "password"),
+    ("c.json", "token"),
+    ("package.json", "secret"),
+    ("k.yml", "BEGIN CERT"),
+];
+
+fn assert_masked(contents: &[String]) {
+    assert!(!contents.is_empty());
+    let all = contents.join("\n");
+    assert!(!all.contains(SECRET), "valeur envoyée : {all}");
+    assert!(!all.contains(PEM_BODY), "bloc PEM envoyé");
+    for (path, key) in KEYS {
+        let part = section_of(contents, path).unwrap_or_else(|| panic!("{path} non envoyé"));
+        assert!(part.contains(key), "clé {key} absente de {path} : {part}");
+        assert!(part.contains("***"), "marque absente de {path} : {part}");
+    }
+}
+
+#[test]
+fn req264_ac9_batch_files_1_and_2_send_no_secret() {
+    for n in [1, 2] {
+        assert_masked(&contents_of_bodies(&sent_bodies(&secret_files(), n, "")));
+    }
+}
+
+#[test]
+fn req264_ac9_redact_false_sends_the_marker() {
+    let bodies = sent_bodies(&secret_files(), 1, "enrich_redact = false\n");
+    assert!(bodies.join("\n").contains(SECRET));
+}
+
+#[test]
+fn req264_ac9_batch_mode_requests_carry_no_secret() {
+    use batch_server::{BatchServer, Outcome};
+    let (env, cfg) = Redacted::new(&secret_files(), 2, "");
+    let server = BatchServer::start();
+    server.simulate("openai", 0, |_| {
+        Outcome::Text(r#"{"version": 2, "summaries": [], "concepts": []}"#.into())
+    });
+    env.run(&server.base_url, &cfg, &["build", "--batch"]);
+    let lots = server.lots();
+    assert!(!lots.is_empty(), "aucun lot créé");
+    let flat: Vec<serde_json::Value> = lots.into_iter().flatten().collect();
+    assert_masked(&contents_of(&flat));
+}
+
+#[test]
+fn req264_ac10_excerpt_after_masking_keeps_key_skeleton_and_drops_value() {
+    use nephila::excerpt::for_llm;
+    use nephila::llm::redact::redact;
+    let filler: String = (0..800).map(|i| format!("  k{i}: v{i}\n")).collect();
+    let yaml = format!("root:\n  password: {SECRET}\n{filler}");
+    let filler_json: String = (0..800).map(|i| format!("\"k{i}\": \"v{i}\", ")).collect();
+    let json = format!("{{\"token\": \"{SECRET}\", {filler_json}\"z\": 1}}");
+    for (path, text, key) in [("a.yml", yaml, "password"), ("a.json", json, "token")] {
+        assert!(text.chars().count() > 7000);
+        let (masked, n) = redact(path, &text);
+        assert_eq!(n, 1, "{path}");
+        let sent = for_llm(path, &masked, 3000);
+        assert!(sent.contains("extrait tronqué"), "{path}");
+        assert!(!sent.contains(SECRET), "{path}");
+        assert!(sent.contains(key), "{path}");
+        assert!(sent.contains("[squelette des clés]"), "{path}");
+    }
+    let sql = format!(
+        "CREATE TABLE u (id int, api_key text);\nINSERT INTO u VALUES (1, 'a');\nINSERT INTO u (id, api_key) VALUES (2, '{SECRET}');\n{}",
+        (0..300)
+            .map(|i| format!("INSERT INTO u (id, api_key) VALUES ({i}, 'zzzzzzzzzz{i}');\n"))
+            .collect::<String>()
+    );
+    let (masked, n) = redact("a.sql", &sql);
+    assert!(n >= 1);
+    let sent = for_llm("a.sql", &masked, 60000);
+    assert!(sent.contains("instructions INSERT ou COPY retirées"));
+    assert!(sent.contains("'***'"));
+    assert!(sent.contains("api_key"));
+    assert!(!sent.contains(SECRET));
+}
+
+#[test]
+fn req264_ac11_graph_identical_with_and_without_masking_and_lines_kept() {
+    let files = secret_files();
+    let build = |on: bool| {
+        let (env, _) = Redacted::new(&files, 1, "");
+        let cfg = format!("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\nenrich_redact = {on}\n");
+        fs::write(&env.config, cfg).unwrap();
+        let o = std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&env.repo)
+            .arg("build")
+            .env("NEPHILA_CONFIG", &env.config)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", text(&o.stderr));
+        let st = Store::open_readonly(&env.repo).unwrap();
+        let (nodes, edges, refs) = snapshot(&st);
+        let ids: Vec<String> = nodes.into_iter().map(|n| n.id).collect();
+        (ids, edges, refs)
+    };
+    assert_eq!(build(true), build(false));
+    // Le masquage ne change jamais le nombre de lignes : les numéros d'un extrait restent valides.
+    let sql =
+        format!("-- c\nCREATE TABLE t (pwd text);\nINSERT INTO t (pwd) VALUES ('{SECRET}');\n");
+    let (masked, n) = nephila::llm::redact::redact("big.sql", &sql);
+    assert_eq!(n, 1);
+    assert_eq!(masked.matches('\n').count(), sql.matches('\n').count());
+    let before: Vec<usize> = nephila::chunk::split(&sql, 40)
+        .iter()
+        .map(|c| c.matches('\n').count())
+        .collect();
+    let after: Vec<usize> = nephila::chunk::split(&masked, 40)
+        .iter()
+        .map(|c| c.matches('\n').count())
+        .collect();
+    assert_eq!(before.iter().sum::<usize>(), after.iter().sum::<usize>());
+}
+
+#[test]
+fn req264_ac12_file_without_value_is_sent_unchanged() {
+    let files = vec![("plain.yml", "port: 80\nname: app\n".to_string())];
+    let with = sent_bodies(&files, 1, "");
+    let without = sent_bodies(&files, 1, "enrich_redact = false\n");
+    assert!(!with.is_empty());
+    assert_eq!(with, without);
+}
+
+#[test]
+fn req264_ac11_sql_chunks_keep_original_line_numbers() {
+    let original: Vec<String> = (0..60)
+        .map(|i| {
+            if i % 10 == 0 {
+                format!("ALTER USER u{i} WITH PASSWORD '{SECRET}';")
+            } else {
+                format!("CREATE TABLE t{i} (id int);")
+            }
+        })
+        .collect();
+    let file = format!("{}\n", original.join("\n"));
+    let bodies = sent_bodies(&[("big.sql", file)], 1, "max_chunk_chars = 500\n");
+    let contents = contents_of_bodies(&bodies);
+    assert!(contents.len() >= 2, "un seul morceau");
+    let mut covered = 0;
+    for c in &contents {
+        let head = c.lines().next().unwrap();
+        assert!(head.starts_with("Fichier : big.sql (extrait "), "{head}");
+        let range = head.split("lignes ").nth(1).unwrap().trim_end_matches(')');
+        let (a, b) = range.split_once('–').unwrap();
+        let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+        let sent = c.split("Contenu :\n").nth(1).unwrap().trim_end();
+        let expected: Vec<String> = original[a - 1..b]
+            .iter()
+            .map(|l| l.replace(&format!("'{SECRET}'"), "'***'"))
+            .collect();
+        assert_eq!(sent, expected.join("\n"), "lignes {a}–{b}");
+        covered += b - a + 1;
+    }
+    assert_eq!(covered, 60);
+}

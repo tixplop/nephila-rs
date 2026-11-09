@@ -12,6 +12,7 @@ use crate::filter::{EnrichScope, Filters, Matcher, ProjectFile};
 use crate::index::estimate::{self, Estimate};
 use crate::index::lock::RepoLock;
 use crate::index::{enrich, structure};
+use crate::llm::redact::RedactTally;
 use crate::llm::{build_llm_for, Llm, LlmTotals};
 use crate::model::{FileRecord, FileState};
 use crate::out::Out;
@@ -800,12 +801,18 @@ pub(crate) fn finalize(
     }
     store.prune_enrichments()?;
     let mut stats = resolve_pass(store)?;
+    // Un seul décompte du masquage pour toute la commande (REQ-266).
+    let tally = opts.enrich_redact.then(RedactTally::new);
     report.llm_active = llm.is_some();
     if let Some(llm) = llm {
         let files = store.files_to_enrich()?;
         // Sans fichier à enrichir, le graphe n'a pas changé : pas de seconde résolution.
         if !files.is_empty() {
-            let sources = enrich::Sources { repo, abs };
+            let sources = enrich::Sources {
+                repo,
+                abs,
+                redact: tally.as_ref(),
+            };
             if opts.batch {
                 crate::index::batch::enrich_batched(sources, &files, opts, llm, store, report)?;
             } else {
@@ -876,8 +883,13 @@ pub(crate) fn estimate_enrichment(
             versions: store.prompt_versions(),
         },
     };
+    let tally = opts.enrich_redact.then(RedactTally::new);
     let est = enrich::estimate(
-        enrich::Sources { repo, abs },
+        enrich::Sources {
+            repo,
+            abs,
+            redact: tally.as_ref(),
+        },
         &files,
         &ids,
         &dry.language,
@@ -886,6 +898,9 @@ pub(crate) fn estimate_enrichment(
         &kept,
     );
     for line in estimate::trace_lines(&est) {
+        trace!("{line}");
+    }
+    if let Some(line) = tally.as_ref().and_then(RedactTally::line) {
         trace!("{line}");
     }
     Ok(est)

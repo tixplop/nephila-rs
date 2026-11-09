@@ -558,9 +558,25 @@ enum Step<'a> {
 pub(crate) struct Sources<'a> {
     pub(crate) repo: &'a Path,
     pub(crate) abs: &'a HashMap<String, PathBuf>,
+    /// Décompte du masquage (REQ-264, REQ-266) ; `None` : texte envoyé tel quel.
+    pub(crate) redact: Option<&'a crate::llm::redact::RedactTally>,
 }
 
 impl Sources<'_> {
+    /// Texte d'un fichier à envoyer au LLM : lu, puis masqué et compté si `redact` est présent.
+    fn read_for_llm(&self, path: &str) -> std::io::Result<String> {
+        let text = std::fs::read_to_string(self.real_path(path))?;
+        let Some(tally) = self.redact else {
+            return Ok(text);
+        };
+        if !crate::filter::FileType::of(path).is_some_and(crate::llm::redact::is_targeted) {
+            return Ok(text);
+        }
+        let (masked, n) = crate::llm::redact::redact(path, &text);
+        tally.record(path, n);
+        Ok(masked.into_owned())
+    }
+
     /// Chemin réel d'un fichier : l'entrée d'`abs`, sinon la racine jointe au chemin.
     fn real_path(&self, path: &str) -> PathBuf {
         self.abs
@@ -597,7 +613,7 @@ fn run_unit<'a>(
     let mut outcomes = Vec::new();
     let mut readable: Vec<(&'a FileRecord, String)> = Vec::new();
     for f in files {
-        match std::fs::read_to_string(sources.real_path(&f.path)) {
+        match sources.read_for_llm(&f.path) {
             Ok(t) => readable.push((f, t)),
             Err(e) => outcomes.push(Outcome::Failed(
                 f.path.clone(),
@@ -1361,7 +1377,8 @@ fn sent_size(f: &FileRecord, max_chunk_chars: usize) -> usize {
 
 /// Estimation du plan d'enrichissement de `files` sans appel ni écriture (REQ-184, DEC-148) : même
 /// partition et mêmes unités que `enrich_with_stop`. Un lot ne lit aucun fichier (ses prompts
-/// valent ceux à texte vide plus la somme des tailles) ; un fichier envoyé seul est lu en série,
+/// valent ceux à texte vide plus la somme des tailles), sauf, pour le seul décompte du masquage
+/// (REQ-266), les fichiers visés par REQ-264, lus sans effet sur l'estimation ; un fichier envoyé seul est lu en série,
 /// puis `plan_calls` donne ses appels. Un fichier illisible ou au plafond ne compte aucun appel.
 pub(crate) fn estimate(
     sources: Sources<'_>,
@@ -1390,6 +1407,14 @@ pub(crate) fn estimate(
             .unwrap_or_default()
     };
     for unit in &units {
+        // Pour le seul décompte du masquage : un lot n'est pas lu pour son estimation (REQ-266).
+        if let (Unit::Lot(v, _), Some(_)) = (unit, sources.redact) {
+            for f in v.iter().filter(|f| {
+                crate::filter::FileType::of(&f.path).is_some_and(crate::llm::redact::is_targeted)
+            }) {
+                let _ = sources.read_for_llm(&f.path);
+            }
+        }
         match unit {
             Unit::Lot(v, _) if v.len() >= 2 => {
                 let items: Vec<LotItem> = v
@@ -1461,7 +1486,7 @@ fn estimate_alone(
         bytes: 0,
         case: AloneCase::Counted,
     };
-    let Ok(text) = std::fs::read_to_string(sources.real_path(&f.path)) else {
+    let Ok(text) = sources.read_for_llm(&f.path) else {
         out.case = AloneCase::Unreadable;
         return out;
     };
@@ -2541,6 +2566,9 @@ pub(crate) fn enrich_pass(
     );
     let totals = totals.into_inner().unwrap_or_else(|p| p.into_inner());
     trace!("{}", calls_line(&totals));
+    if let Some(line) = sources.redact.and_then(|t| t.line()) {
+        trace!("{line}");
+    }
     report.llm = totals;
     let policy = policy.into_inner().unwrap_or_else(|p| p.into_inner());
     report.stop_cause = policy.stop_cause;
@@ -3824,6 +3852,7 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
+                redact: None,
             },
             &files,
             &opts,
@@ -3898,6 +3927,7 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
+                redact: None,
             },
             &files,
             &opts,
@@ -3979,6 +4009,7 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
+                redact: None,
             },
             &files,
             &opts,
@@ -4113,6 +4144,7 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
+                redact: None,
             },
             &files,
             &opts,
@@ -4225,6 +4257,7 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
+                redact: None,
             },
             &files,
             &opts,
@@ -4527,6 +4560,7 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
+                redact: None,
             },
             files,
             &opts,
@@ -5009,6 +5043,7 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
+                redact: None,
             },
             &files,
             &interrupt_opts(1),
@@ -5033,6 +5068,7 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
+                redact: None,
             },
             &files,
             &interrupt_opts(1),
@@ -5107,6 +5143,7 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
+                redact: None,
             },
             &files,
             &interrupt_opts(1),
@@ -6970,6 +7007,7 @@ mod estimate_tests {
         let sources = Sources {
             repo: dir,
             abs: &abs,
+            redact: None,
         };
         let kept = KeptCalls {
             results: HashMap::new(),
@@ -7359,6 +7397,7 @@ mod structured_fallback_tests {
         let sources = Sources {
             repo: dir.path(),
             abs: &HashMap::new(),
+            redact: None,
         };
         let stop = AtomicBool::new(false);
         let mut go = |report: &mut BuildReport| {

@@ -477,7 +477,11 @@ mod tests {
         let mut report = BuildReport::default();
         reset_diagnostics();
         crate::index::enrich::enrich_all(
-            crate::index::enrich::Sources { repo, abs: &abs },
+            crate::index::enrich::Sources {
+                repo,
+                abs: &abs,
+                redact: None,
+            },
             &files,
             opts,
             llm,

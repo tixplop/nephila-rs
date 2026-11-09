@@ -90,6 +90,39 @@ pub fn redact<'a>(path: &str, text: &'a str) -> (Cow<'a, str>, usize) {
     }
 }
 
+/// Décompte du masquage d'une commande (REQ-266) : valeurs masquées par fichier visé lu. Un
+/// fichier lu plusieurs fois (moitiés de lot, nouveaux essais, passes) n'est inscrit qu'une fois.
+#[derive(Debug, Default)]
+pub struct RedactTally(std::sync::Mutex<std::collections::HashMap<String, usize>>);
+
+impl RedactTally {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inscrit `n` valeurs masquées pour `path`, sauf s'il l'est déjà.
+    pub fn record(&self, path: &str, n: usize) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(path.to_string())
+            .or_insert(n);
+    }
+
+    /// Ligne `masquage:` de design V-005 ; `None` si aucun fichier visé n'a été lu.
+    pub fn line(&self) -> Option<String> {
+        let map = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if map.is_empty() {
+            return None;
+        }
+        let values: usize = map.values().sum();
+        let files = map.values().filter(|n| **n > 0).count();
+        Some(format!(
+            "masquage: {values} valeurs masquées dans {files} fichiers"
+        ))
+    }
+}
+
 fn split_eol(line: &str) -> (&str, &str) {
     let body = line.strip_suffix('\n').unwrap_or(line);
     let body = body.strip_suffix('\r').unwrap_or(body);

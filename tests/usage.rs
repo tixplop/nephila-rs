@@ -1203,3 +1203,236 @@ fn req166_ac6_not_found_reply_still_writes_calls_line() {
     );
     assert_eq!(lines[2], "erreur: pas trouvé dans le graphe");
 }
+
+// ---- REQ-266 : décompte du masquage sous --verbose (T-359) ----
+
+fn masking(err: &str) -> Vec<String> {
+    traces(err)
+        .into_iter()
+        .filter(|l| l.starts_with("masquage:"))
+        .collect()
+}
+
+fn write_repo(env: &Env, files: &[(&str, &str)]) {
+    for (p, c) in files {
+        let path = env.repo.join(p);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, c).unwrap();
+    }
+}
+
+const THREE: &str = "password: SECRET_VAL_43\ntoken: abc\napi_key: def\nname: app\n";
+
+#[test]
+fn req266_ac1_one_line_with_values_and_files_stdout_unchanged() {
+    let files = [("config/app.yml", THREE), ("config/b.yml", "name: b\n")];
+    let other = Env::empty(CONFIG);
+    write_repo(&other, &files);
+    let plain = other.run(&["build"], &[]);
+    let env = Env::empty(CONFIG);
+    write_repo(&env, &files);
+    assert!(masking(&stderr(&plain)).is_empty());
+    assert!(!stderr(&plain).contains("masquage"));
+    let verbose = env.run(&["build", "--verbose"], &[]);
+    assert_eq!(
+        masking(&stderr(&verbose)),
+        vec!["masquage: 3 valeurs masquées dans 1 fichiers"]
+    );
+    assert_eq!(stdout(&plain), stdout(&verbose));
+    // Place : juste après `appels:`, qui suit `enrichissement: fin`.
+    let t = traces(&stderr(&verbose));
+    let i = t.iter().position(|l| l.starts_with("appels:")).unwrap();
+    assert!(t[i - 1].starts_with("enrichissement: fin"));
+    assert!(t[i + 1].starts_with("masquage:"));
+}
+
+#[test]
+fn req266_ac2_zero_line_and_absences() {
+    // Fichier visé sans valeur à masquer : ligne à zéro.
+    let env = Env::empty(CONFIG);
+    write_repo(&env, &[("b.yml", "name: b\n")]);
+    let o = env.run(&["build", "--verbose"], &[]);
+    assert_eq!(
+        masking(&stderr(&o)),
+        vec!["masquage: 0 valeurs masquées dans 0 fichiers"]
+    );
+    // enrich_redact = false : pas de ligne.
+    let env = Env::empty(&format!("{CONFIG}enrich_redact = false\n"));
+    write_repo(&env, &[("config/app.yml", THREE)]);
+    let o = env.run(&["build", "--verbose"], &[]);
+    assert!(masking(&stderr(&o)).is_empty());
+    // Fichiers non visés seuls : pas de ligne.
+    let env = Env::empty(CONFIG);
+    write_repo(
+        &env,
+        &[("A.java", "public class A {}\n"), ("d.md", "# D\n\nt\n")],
+    );
+    let o = env.run(&["build", "--verbose"], &[]);
+    assert!(masking(&stderr(&o)).is_empty());
+}
+
+#[test]
+fn req266_ac2_file_read_twice_is_counted_once() {
+    use nephila::llm::redact::RedactTally;
+    let t = RedactTally::new();
+    assert_eq!(t.line(), None);
+    t.record("a.yml", 3);
+    t.record("a.yml", 3);
+    t.record("b.yml", 0);
+    assert_eq!(
+        t.line().unwrap(),
+        "masquage: 3 valeurs masquées dans 1 fichiers"
+    );
+}
+
+const SECRET: &str = "SECRET_VAL_43";
+const NOT_COMPLIANT: &str = r#"{"version": 2, "summaries": [], "concepts": []}"#;
+
+/// Les six fichiers visés du scénario d'AC-264-9.
+fn six_files() -> Vec<(&'static str, String)> {
+    vec![
+        ("config/app.yml", format!("password: {SECRET}\nname: app\n")),
+        (
+            "db/a.sql",
+            format!("INSERT INTO u (id, api_key, nom) VALUES (1, '{SECRET}', 'a');\n"),
+        ),
+        (
+            "conf/b.xml",
+            format!("<conf><password>{SECRET}</password></conf>\n"),
+        ),
+        ("c.json", format!("{{\"token\": \"{SECRET}\", \"n\": 1}}\n")),
+        (
+            "package.json",
+            format!("{{\"name\": \"p\", \"secret\": \"{SECRET}\"}}\n"),
+        ),
+        (
+            "k.yml",
+            "cert:\n-----BEGIN CERT-----\nPEMBODY_43\n-----END CERT-----\n".to_string(),
+        ),
+    ]
+}
+
+#[test]
+fn req266_ac3_no_trace_carries_the_value_and_dry_run_gives_the_same_line() {
+    let cfg = CONFIG.replace("batch_files = 1", "batch_files = 2");
+    let files = six_files();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    let env = Env::empty(&cfg);
+    write_repo(&env, &refs);
+    let dry = env.run(&["build", "--dry-run", "--verbose"], &[]);
+    assert_eq!(env.log_len(), 0, "aucun appel sous --dry-run");
+    let other = Env::empty(&cfg);
+    write_repo(&other, &refs);
+    let real = other.run(&["build", "--verbose"], &[]);
+    for o in [&dry, &real] {
+        let err = stderr(o);
+        assert!(!err.contains(SECRET), "{err}");
+        assert!(!err.contains("PEMBODY_43"), "{err}");
+    }
+    let line = masking(&stderr(&real));
+    assert_eq!(line, vec!["masquage: 6 valeurs masquées dans 6 fichiers"]);
+    assert_eq!(masking(&stderr(&dry)), line);
+}
+
+#[test]
+fn req266_ac4_one_value_and_zero_value_lines_and_place() {
+    let env = Env::empty(CONFIG);
+    write_repo(&env, &[("app.yml", "password: x\n")]);
+    let o = env.run(&["build", "--verbose"], &[]);
+    assert_eq!(
+        masking(&stderr(&o)),
+        vec!["masquage: 1 valeurs masquées dans 1 fichiers"]
+    );
+    let t = traces(&stderr(&o));
+    let i = t.iter().position(|l| l.starts_with("appels:")).unwrap();
+    assert!(t[i - 1].starts_with("enrichissement: fin"));
+    assert_eq!(t[i + 1], "masquage: 1 valeurs masquées dans 1 fichiers");
+    let env = Env::empty(CONFIG);
+    write_repo(&env, &[("app.yml", "name: x\n")]);
+    let o = env.run(&["build", "--verbose"], &[]);
+    assert_eq!(
+        masking(&stderr(&o)),
+        vec!["masquage: 0 valeurs masquées dans 0 fichiers"]
+    );
+    let plain = env.run(&["update"], &[]);
+    assert!(!stderr(&plain).contains("masquage"));
+}
+
+#[test]
+fn req266_ac5_dry_run_two_files_in_one_lot() {
+    let cfg = CONFIG.replace("batch_files = 1", "batch_files = 10");
+    let env = Env::empty(&cfg);
+    write_repo(
+        &env,
+        &[
+            ("config/app.yml", THREE),
+            ("config/b.yml", "name: b\n"),
+            ("A.java", "public class A {}\n"),
+        ],
+    );
+    let o = env.run(&["build", "--dry-run", "--verbose"], &[]);
+    assert_eq!(env.log_len(), 0);
+    let t = traces(&stderr(&o));
+    assert_eq!(
+        masking(&stderr(&o)),
+        vec!["masquage: 3 valeurs masquées dans 1 fichiers"]
+    );
+    let m = t.iter().position(|l| l.starts_with("masquage:")).unwrap();
+    assert!(
+        t[m - 1].starts_with("estimation") || t[m - 1].starts_with("communautés:"),
+        "{:?}",
+        t[m - 1]
+    );
+    assert!(t[m..].iter().all(|l| !l.starts_with("estimation")));
+    assert!(
+        t.iter()
+            .all(|l| !(l.starts_with("estimation ") && l.contains(".yml"))),
+        "{t:?}"
+    );
+}
+
+#[test]
+fn req266_ac2_split_lot_counts_each_file_once() {
+    let files: Vec<(String, String)> = (0..4)
+        .map(|i| {
+            (
+                format!("c/f{i}.yml"),
+                format!("password: {SECRET}\nn: {i}\n"),
+            )
+        })
+        .collect();
+    let bad = body("openai", NOT_COMPLIANT, Some("stop"), None);
+    let server = FakeServer::start((0..6).map(|_| (200, bad.clone())).collect());
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    for (p, c) in &files {
+        fs::create_dir_all(repo.join(p).parent().unwrap()).unwrap();
+        fs::write(repo.join(p), c).unwrap();
+    }
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\napi_key_env = \"{KEY_VAR}\"\nbase_url = \"{}\"\nconcurrency = 1\nbatch_files = 4\nformat_retries = 0\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let o = Command::new(cargo_bin("nephila"))
+        .env("NEPHILA_RETRY_BASE_MS", "1")
+        .env("NEPHILA_CONFIG", &cfg)
+        .env(KEY_VAR, "sk-test")
+        .arg("-C")
+        .arg(&repo)
+        .args(["build", "--verbose"])
+        .output()
+        .unwrap();
+    let err = stderr(&o);
+    assert_eq!(server.requests().len(), 3, "lot puis deux moitiés : {err}");
+    assert!(err.contains("llm enrich découpe"), "{err}");
+    assert_eq!(
+        masking(&err),
+        vec!["masquage: 4 valeurs masquées dans 4 fichiers"],
+        "{err}"
+    );
+}

@@ -557,6 +557,7 @@ mod tests {
             Sources {
                 repo: Path::new("."),
                 abs: &abs,
+                redact: None,
             },
             &[],
             &IndexOptions::default(),
