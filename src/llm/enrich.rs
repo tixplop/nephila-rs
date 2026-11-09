@@ -30,8 +30,9 @@ pub const CODE_PROMPT_VERSION: u32 = 9;
 /// cette valeur. 1 de la 0.18.0 à la 0.25.x ; 9 depuis la 0.28.0 (consignes de forme des
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
-/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées).
-pub const BUILD_PROMPT_VERSION: u32 = 9;
+/// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées) ; 10 depuis
+/// la 0.28.0 (valeurs sensibles de `package.json` masquées avant l'envoi, REQ-265).
+pub const BUILD_PROMPT_VERSION: u32 = 10;
 
 /// Version du prompt d'enrichissement de la famille `données` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
@@ -42,8 +43,9 @@ pub const BUILD_PROMPT_VERSION: u32 = 9;
 /// résumés, REQ-167 ; extraits, REQ-169 ; genres et types de fichiers, REQ-171 ; langue,
 /// REQ-172 ; concepts, REQ-175 ; notes de correction des nouveaux essais, REQ-177 ; liste
 /// numérotée et réponses à numéros, REQ-236 ; les valeurs 2 à 8 n'ont pas été livrées) ; 10 depuis
-/// la 0.28.0 (marques de l'extrait JSON, YAML et XML, REQ-239, et du SQL réduit, REQ-240).
-pub const DATA_PROMPT_VERSION: u32 = 10;
+/// la 0.28.0 (marques de l'extrait JSON, YAML et XML, REQ-239, et du SQL réduit, REQ-240) ; 11 depuis
+/// la 0.28.0 (valeurs sensibles masquées avant l'envoi, REQ-265).
+pub const DATA_PROMPT_VERSION: u32 = 11;
 
 /// Version du prompt d'enrichissement de la famille `markdown` (DEC-062, DEC-157). Règle d'incrément
 /// (REQ-193) : changer un texte commun (consignes système communes, gabarits de requête, schémas
@@ -63,6 +65,8 @@ pub struct PromptVersions {
     pub build: u32,
     pub data: u32,
     pub markdown: u32,
+    /// `enrich_redact` est faux (REQ-265) : les fichiers visés par le masquage prennent + 1 000.
+    pub masking_off: bool,
 }
 
 impl PromptVersions {
@@ -72,15 +76,21 @@ impl PromptVersions {
         build: BUILD_PROMPT_VERSION,
         data: DATA_PROMPT_VERSION,
         markdown: MARKDOWN_PROMPT_VERSION,
+        masking_off: false,
     };
 
     /// Version de la famille du type `t`.
     pub fn of(&self, t: FileType) -> u32 {
-        match prompt_family(t) {
+        let family = match prompt_family(t) {
             PromptFamily::Code => self.code,
             PromptFamily::Build => self.build,
             PromptFamily::Data => self.data,
             PromptFamily::Markdown => self.markdown,
+        };
+        if self.masking_off && crate::llm::redact::is_targeted(t) {
+            family + 1000
+        } else {
+            family
         }
     }
 
@@ -1267,7 +1277,7 @@ pub(crate) mod tests {
 
     #[test]
     fn req193_ac2_build_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(BUILD_PROMPT_VERSION, 9);
+        assert_eq!(BUILD_PROMPT_VERSION, 10);
         assert_eq!(
             family_fingerprint(PromptFamily::Build),
             "20e843f61d06a7a8d84fd5badd4c8fd1793c750044084e948203ddeb494253f4",
@@ -1277,7 +1287,7 @@ pub(crate) mod tests {
 
     #[test]
     fn req193_ac2_data_prompt_texts_are_frozen_next_to_its_version() {
-        assert_eq!(DATA_PROMPT_VERSION, 10);
+        assert_eq!(DATA_PROMPT_VERSION, 11);
         assert_eq!(
             family_fingerprint(PromptFamily::Data),
             "725c7d8480d02d219df0fb47c9f8cd8364ba45833c99f04f5671ba498854442c",
@@ -1348,19 +1358,31 @@ pub(crate) mod tests {
             build: 2,
             data: 3,
             markdown: 4,
+            ..PromptVersions::CURRENT
         };
         for (t, n) in expected {
             assert_eq!(v.of(t), n, "{t:?}");
         }
         for t in FileType::ALL {
             assert!(expected.iter().any(|(e, _)| *e == t), "{t:?}");
-            let want = if matches!(t, Sql | Xml | Json | Yaml) {
-                10
-            } else {
-                9
+            let want = match t {
+                Sql | Xml | Json | Yaml => 11,
+                Maven | Ivy | Gradle | Npm => 10,
+                _ => 9,
             };
             assert_eq!(PromptVersions::CURRENT.of(t), want, "{t:?}");
         }
+    }
+
+    #[test]
+    fn req193_ac2_rest_of_version_table() {
+        let v = PromptVersions {
+            code: 1,
+            build: 2,
+            data: 3,
+            markdown: 4,
+            ..PromptVersions::CURRENT
+        };
         assert_eq!(v.of_path("src/A.java"), 1);
         assert_eq!(v.of_path("pom.xml"), 2);
         assert_eq!(v.of_path("app.yml"), 3);
@@ -1373,8 +1395,62 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [9, 9, 10, 9]
+            [9, 10, 11, 9]
         );
+    }
+
+    #[test]
+    fn req265_ac2_masking_off_adds_1000_to_targeted_types_only() {
+        use FileType::*;
+        let off = PromptVersions {
+            masking_off: true,
+            ..PromptVersions::CURRENT
+        };
+        let mut targeted = 0;
+        for t in FileType::ALL {
+            let base = PromptVersions::CURRENT.of(t);
+            if matches!(t, Yaml | Json | Xml | Sql | Npm) {
+                targeted += 1;
+                assert_eq!(off.of(t), base + 1000, "{t:?}");
+            } else {
+                assert_eq!(off.of(t), base, "{t:?}");
+            }
+        }
+        assert_eq!(targeted, 5);
+        assert_eq!(FileType::ALL.len(), 15);
+        assert_eq!(
+            [
+                CODE_PROMPT_VERSION,
+                BUILD_PROMPT_VERSION,
+                DATA_PROMPT_VERSION,
+                MARKDOWN_PROMPT_VERSION
+            ],
+            [9, 10, 11, 9]
+        );
+    }
+
+    #[test]
+    fn req265_ac2_call_key_differs_with_masking_state() {
+        use crate::store::{call_key, CallKeyParts};
+        let key = |v: PromptVersions| {
+            call_key(&CallKeyParts {
+                model: "m",
+                language: "français",
+                prompt_version: v.of_path("app.yml"),
+                path: "app.yml",
+                rank: 1,
+                total: 1,
+                lines: None,
+                text: "a: 1",
+                requested: &[],
+                known: &[],
+            })
+        };
+        let off = PromptVersions {
+            masking_off: true,
+            ..PromptVersions::CURRENT
+        };
+        assert_ne!(key(PromptVersions::CURRENT), key(off));
     }
 
     const TYPES: &str = "code Java/Kotlin/Groovy/Scala/JavaScript/TypeScript, build Maven/Ivy/Gradle/npm, données SQL/XML/JSON/YAML, ou Markdown";
@@ -1719,7 +1795,7 @@ pub(crate) mod tests {
                 DATA_PROMPT_VERSION,
                 MARKDOWN_PROMPT_VERSION
             ],
-            [9, 9, 10, 9]
+            [9, 10, 11, 9]
         );
         assert_eq!(crate::llm::ask::ASK_PROMPT_VERSION, 2);
     }

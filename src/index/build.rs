@@ -85,6 +85,8 @@ pub struct IndexOptions {
     pub format_retries: u32,
     /// Enrichit aussi les fichiers de code : option ou clé `enrich_code` (REQ-050).
     pub enrich_code: bool,
+    /// Masque les valeurs sensibles avant l'envoi : clé `enrich_redact` (REQ-265).
+    pub enrich_redact: bool,
     /// Plafond d'appels d'enrichissement de la commande (REQ-186) ; `None` : aucun plafond.
     pub max_calls: Option<usize>,
     /// Motifs de la portée d'enrichissement, personnels et du dépôt (REQ-207).
@@ -104,6 +106,7 @@ impl Default for IndexOptions {
             batch_files: crate::config::DEFAULT_BATCH_FILES,
             format_retries: crate::config::DEFAULT_FORMAT_RETRIES,
             enrich_code: false,
+            enrich_redact: true,
             max_calls: None,
             enrich_scope: EnrichScope::default(),
             batch: false,
@@ -121,6 +124,7 @@ impl From<&Config> for IndexOptions {
             batch_files: c.batch_files,
             format_retries: c.format_retries,
             enrich_code: c.enrich_code,
+            enrich_redact: c.enrich_redact,
             max_calls: c.max_calls,
             enrich_scope: EnrichScope::default(),
             batch: false,
@@ -746,6 +750,7 @@ fn build_impl(
     if let Some(llm) = llm {
         store.set_enrich_model(llm.model())?;
         store.set_enrich_language(llm.summary_language())?;
+        store.set_enrich_redact(opts.enrich_redact)?;
         store.set_enrich_code(opts.enrich_code)?;
         store.set_enrich_scope(&opts.enrich_scope)?;
     }
@@ -789,6 +794,10 @@ pub(crate) fn finalize(
     abs: &HashMap<String, PathBuf>,
     report: &mut BuildReport,
 ) -> Result<()> {
+    // Estimation : le réglage de la configuration, sans l'enregistrer (REQ-265).
+    if dry.is_some() {
+        store.use_enrich_redact(opts.enrich_redact);
+    }
     store.prune_enrichments()?;
     let mut stats = resolve_pass(store)?;
     report.llm_active = llm.is_some();

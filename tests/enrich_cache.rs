@@ -1704,7 +1704,7 @@ fn req241_ac6_data_family_version_9_graph_reenriches_only_data_files() {
         )
         .unwrap()
     };
-    assert_eq!(version("app.yml"), 10);
+    assert_eq!(version("app.yml"), 11);
     assert_eq!(version("a.md"), 9);
     assert_eq!(version("A.java"), 9);
     drop(conn);
@@ -1798,5 +1798,169 @@ fn req258_ac5_returning_to_previous_model_or_language_reapplies_entry_without_ca
             assert_eq!(text(&again.stdout), "graphe à jour\n", "{verb} {language}");
             assert!(env.logged().is_empty());
         }
+    }
+}
+
+// ---- REQ-265 : réglage enrich_redact et version effective (T-358) ----
+
+const POM: &str = "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId><artifactId>x</artifactId><version>1</version><dependencies><dependency><groupId>d</groupId><artifactId>e</artifactId><version>1</version></dependency></dependencies></project>\n";
+
+fn redact_env() -> Env {
+    let env = tiny_env(&[
+        ("a.md", "# Un\n\ntexte\n"),
+        ("A.java", "public class A {\n  void run() {}\n}\n"),
+        ("pom.xml", POM),
+        ("app.yml", "port: 80\n"),
+        ("package.json", "{\"name\":\"x\",\"version\":\"1.0.0\"}\n"),
+    ]);
+    set_redact(&env, true);
+    env
+}
+
+fn set_redact(env: &Env, on: bool) {
+    fs::write(
+        &env.config,
+        format!("provider = \"mock\"\nenrich_code = true\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\nenrich_redact = {on}\n"),
+    )
+    .unwrap();
+}
+
+fn targeted() -> BTreeSet<String> {
+    BTreeSet::from(["app.yml".to_string(), "package.json".to_string()])
+}
+
+fn bascule(cmd: &str) {
+    let env = redact_env();
+    env.ok(&["build"]);
+    assert_eq!(to_enrich(&env), 0);
+    set_redact(&env, false);
+    env.ok(&[cmd]);
+    assert_eq!(env.logged_paths(), targeted(), "{:?}", env.logged());
+    assert_eq!(env.logged().len(), 2);
+    assert_eq!(to_enrich(&env), 0);
+    let again = env.ok(&["update"]);
+    assert_eq!(text(&again.stdout), "graphe à jour\n");
+    assert!(env.logged().is_empty());
+    set_redact(&env, true);
+    let back = env.ok(&[cmd]);
+    assert_eq!(back.status.code(), Some(0));
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    assert_eq!(to_enrich(&env), 0);
+}
+
+#[test]
+fn req265_ac3_switching_redact_resends_only_targeted_files_by_update() {
+    bascule("update");
+}
+
+#[test]
+fn req265_ac3_switching_redact_resends_only_targeted_files_by_build() {
+    bascule("build");
+}
+
+#[test]
+fn req265_ac4_dry_run_estimates_targeted_files_and_records_nothing() {
+    let env = redact_env();
+    env.ok(&["build"]);
+    set_redact(&env, false);
+    let meta = || -> String {
+        let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'enrich_redact'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(meta(), "true");
+    for cmd in ["update", "build"] {
+        let o = env.ok(&[cmd, "--dry-run"]);
+        let out = text(&o.stdout);
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("estimation : 2 fichiers à enrichir")),
+            "{cmd}: {out}"
+        );
+        assert!(env.logged().is_empty());
+        assert_eq!(meta(), "true");
+    }
+    set_redact(&env, true);
+    let o = env.ok(&["update", "--dry-run"]);
+    assert!(
+        !text(&o.stdout).contains("estimation : 2 fichiers"),
+        "{}",
+        text(&o.stdout)
+    );
+}
+
+#[test]
+fn req265_ac5_versions_and_old_graph_reenriches_data_and_build_families_once() {
+    use nephila::llm::enrich::{
+        BUILD_PROMPT_VERSION, CODE_PROMPT_VERSION, DATA_PROMPT_VERSION, MARKDOWN_PROMPT_VERSION,
+    };
+    assert_eq!(DATA_PROMPT_VERSION, 11);
+    assert_eq!(BUILD_PROMPT_VERSION, 10);
+    assert_eq!(CODE_PROMPT_VERSION, 9);
+    assert_eq!(MARKDOWN_PROMPT_VERSION, 9);
+    assert_eq!(SCHEMA_VERSION, 14);
+    let env = redact_env();
+    env.ok(&["build"]);
+    set_prompt_version(&env, "app.yml", 10);
+    set_prompt_version(&env, "package.json", 9);
+    set_prompt_version(&env, "pom.xml", 9);
+    assert_eq!(to_enrich(&env), 3);
+    env.ok(&["update"]);
+    assert_eq!(
+        env.logged_paths(),
+        BTreeSet::from([
+            "app.yml".to_string(),
+            "package.json".to_string(),
+            "pom.xml".to_string()
+        ])
+    );
+    assert_eq!(env.logged().len(), 3);
+    assert_eq!(to_enrich(&env), 0);
+    let again = env.ok(&["update"]);
+    assert_eq!(text(&again.stdout), "graphe à jour\n");
+    assert!(env.logged().is_empty());
+}
+
+#[test]
+fn req265_ac4_dry_run_keeps_the_applied_summary_when_both_entries_exist() {
+    let env = tiny_env(&[("app.yml", "port: 80\n")]);
+    set_redact(&env, true);
+    env.ok(&["build", "--no-llm"]);
+    let id = env
+        .store()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.file.as_deref() == Some("app.yml"))
+        .expect("nœud de app.yml")
+        .id;
+    let mock = |summary: &str| {
+        fs::write(
+            env.mock.join("app.yml.json"),
+            format!(
+                "{{\"version\":2,\"summaries\":[{{\"node\":\"{id}\",\"summary\":\"{summary}\"}}],\"concepts\":[]}}"
+            ),
+        )
+        .unwrap();
+    };
+    mock("MASQUE");
+    env.ok(&["build"]);
+    assert_eq!(summary_of(&env, &id).as_deref(), Some("MASQUE"));
+    set_redact(&env, false);
+    mock("NON_MASQUE");
+    env.ok(&["update"]);
+    assert_eq!(summary_of(&env, &id).as_deref(), Some("NON_MASQUE"));
+    set_redact(&env, true);
+    env.ok(&["update"]);
+    assert_eq!(summary_of(&env, &id).as_deref(), Some("MASQUE"));
+    set_redact(&env, false);
+    for cmd in ["build", "update"] {
+        env.ok(&[cmd, "--dry-run"]);
+        assert_eq!(summary_of(&env, &id).as_deref(), Some("MASQUE"), "{cmd}");
+        assert!(env.logged().is_empty());
     }
 }

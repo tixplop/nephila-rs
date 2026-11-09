@@ -457,6 +457,8 @@ pub struct Config {
     pub max_calls: Option<usize>,
     /// Enrichit aussi les fichiers de code, pas seulement les documents (REQ-050).
     pub enrich_code: bool,
+    /// Masque les valeurs sensibles des fichiers de données avant l'envoi (REQ-265) ; défaut vrai.
+    pub enrich_redact: bool,
     /// Motifs des seuls fichiers à enrichir ; vide = aucune restriction (REQ-206).
     pub enrich_include: Vec<String>,
     /// Motifs des fichiers à ne pas enrichir ; défaut : `DEFAULT_ENRICH_EXCLUDE` (REQ-206).
@@ -501,6 +503,7 @@ struct RawConfig {
     format_retries: Option<toml::Value>,
     max_calls: Option<toml::Value>,
     enrich_code: Option<toml::Value>,
+    enrich_redact: Option<toml::Value>,
     enrich_include: Option<toml::Value>,
     enrich_exclude: Option<toml::Value>,
     summary_language: Option<toml::Value>,
@@ -871,6 +874,16 @@ impl Config {
                 )))
             }
         };
+        let enrich_redact = match &raw.enrich_redact {
+            None => true,
+            Some(toml::Value::Boolean(b)) => *b,
+            Some(v) => {
+                return Err(Error::Message(format!(
+                    "configuration invalide ({at}) : clé « enrich_redact » doit être un booléen, \
+                     true ou false (reçu : {v})"
+                )))
+            }
+        };
         let summary_language = match &raw.summary_language {
             None => DEFAULT_SUMMARY_LANGUAGE.to_string(),
             Some(toml::Value::String(s)) if summary_language_of(s).is_some() => {
@@ -1060,6 +1073,7 @@ impl Config {
             format_retries,
             max_calls,
             enrich_code,
+            enrich_redact,
             enrich_include,
             enrich_exclude,
             thinking,
@@ -1165,6 +1179,7 @@ mod project_tests {
             format_retries: 1,
             max_calls: None,
             enrich_code: false,
+            enrich_redact: true,
             enrich_include: Vec::new(),
             enrich_exclude: Vec::new(),
             thinking: false,
@@ -1465,6 +1480,34 @@ mod llm_options_tests {
             &format!("provider = \"mock\"\n{extra}"),
             Path::new("/x/config.toml"),
         )
+    }
+
+    #[test]
+    fn req265_ac1_enrich_redact_defaut_vrai_faux_et_invalide() {
+        assert!(parse("").unwrap().enrich_redact);
+        assert!(parse("enrich_redact = true").unwrap().enrich_redact);
+        assert!(!parse("enrich_redact = false").unwrap().enrich_redact);
+        let e = parse("enrich_redact = \"non\"").unwrap_err().to_string();
+        assert!(
+            e.contains(
+                "clé « enrich_redact » doit être un booléen, true ou false (reçu : \"non\")"
+            ),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn req265_ac1_enrich_redact_refusee_dans_le_fichier_de_projet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".nephila.toml"), "enrich_redact = false\n").unwrap();
+        let e = crate::filter::ProjectFile::load(dir.path())
+            .map(|_| ())
+            .expect_err("clé refusée")
+            .to_string();
+        assert!(e.contains("clé inconnue `enrich_redact`"), "{e}");
+        let permitted = e.split("clés permises").nth(1).unwrap_or("");
+        assert!(!permitted.contains("enrich_redact"), "{e}");
+        assert_eq!(PROJECT_SETTINGS.len(), 7);
     }
 
     #[test]

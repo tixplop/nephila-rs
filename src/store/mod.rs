@@ -652,6 +652,7 @@ impl Store {
             v => return Err(version_error(v)),
         }
         store.load_resolution_marker()?;
+        store.load_enrich_redact()?;
         Ok(store)
     }
 
@@ -676,6 +677,7 @@ impl Store {
         match store.user_version()? {
             v if v == SCHEMA_VERSION => {
                 store.load_resolution_marker()?;
+                store.load_enrich_redact()?;
                 Ok(store)
             }
             SCHEMA_WITHOUT_REV
@@ -689,6 +691,7 @@ impl Store {
             | SCHEMA_WITHOUT_SUBSYSTEMS => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
+                store.load_enrich_redact()?;
                 Ok(store)
             }
             v => Err(Error::Message(format!(
@@ -749,6 +752,7 @@ impl Store {
             }
             v => return Err(version_error(v)),
         }
+        store.load_enrich_redact()?;
         Ok(store)
     }
 
@@ -1126,7 +1130,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_scope', 'enrich_batches');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_redact', 'enrich_scope', 'enrich_batches');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -1144,7 +1148,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_scope', 'enrich_batches');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_redact', 'enrich_scope', 'enrich_batches');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -1641,6 +1645,43 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
             Err(e) => Err(db_err(e)),
         }
+    }
+
+    /// Lit `meta.enrich_redact` (absent : vrai) et règle les versions effectives (REQ-265).
+    fn load_enrich_redact(&mut self) -> Result<()> {
+        let value = match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'enrich_redact'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get::<_, String>(0))
+        {
+            Ok(v) => v != "false",
+            Err(rusqlite::Error::QueryReturnedNoRows) => true,
+            Err(e) => return Err(db_err(e)),
+        };
+        self.use_enrich_redact(value);
+        Ok(())
+    }
+
+    /// Règle le masquage pris en compte par les versions effectives, sans rien écrire
+    /// (estimation `--dry-run`, REQ-265).
+    pub fn use_enrich_redact(&mut self, redact: bool) {
+        self.prompt_versions.masking_off = !redact;
+    }
+
+    /// Enregistre `enrich_redact` d'une commande LLM active et règle les versions effectives.
+    pub fn set_enrich_redact(&mut self, redact: bool) -> Result<()> {
+        self.ensure_writable()?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO meta(key, value) VALUES ('enrich_redact', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .map_err(db_err)?
+            .execute([if redact { "true" } else { "false" }])
+            .map_err(db_err)?;
+        self.use_enrich_redact(redact);
+        Ok(())
     }
 
     /// Enregistre la portée effective d'une commande LLM active.
@@ -5956,6 +5997,7 @@ mod tests {
             build: 12,
             data: 13,
             markdown: 14,
+            ..PromptVersions::CURRENT
         });
         let paths = ["a.md", "A.java", "pom.xml", "app.yml"];
         let files: Vec<_> = paths.iter().map(|p| file(p)).collect();
@@ -6023,6 +6065,7 @@ mod tests {
             build: 12,
             data: 13,
             markdown: 14,
+            ..PromptVersions::CURRENT
         };
         for (name, changed) in [
             (

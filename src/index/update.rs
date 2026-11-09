@@ -200,6 +200,7 @@ pub fn update_with_dry_run(
     if let Some(llm) = llm {
         store.set_enrich_model(llm.model())?;
         store.set_enrich_language(llm.summary_language())?;
+        store.set_enrich_redact(opts.enrich_redact)?;
         store.set_enrich_code(opts.enrich_code)?;
         store.set_enrich_scope(&opts.enrich_scope)?;
     }
@@ -223,6 +224,7 @@ pub fn update_with_dry_run(
         }
         let estimate = match dry {
             Some(dry) => {
+                store.use_enrich_redact(opts.enrich_redact);
                 let abs = build::abs_paths(&d.scanned);
                 Some(build::estimate_enrichment(&store, dry, opts, repo, &abs)?)
             }
