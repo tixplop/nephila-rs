@@ -28,8 +28,8 @@
 # réduire la portée de l'enrichissement (voir « Portée d'enrichissement »).
 #
 # Enrichissements conservés : un fichier déjà enrichi n'est renvoyé au LLM que si son contenu
-# change, ou si le modèle, summary_language (ici ou dans .nephila.toml) ou le prompt de la
-# version de nephila changent ; les autres réglages ne réenrichissent rien.
+# change, ou si le modèle, summary_language (ici ou dans .nephila.toml), enrich_redact ou le
+# prompt de la version de nephila changent ; les autres réglages ne réenrichissent rien.
 #
 # Les clés communes à tous les fournisseurs (taille des morceaux, parallélisme, délais, TLS)
 # sont en fin de fichier, dans « Options communes ».
@@ -180,6 +180,17 @@ api_key_env = "ANTHROPIC_API_KEY"
 # Un dépôt peut le remplacer par son .nephila.toml.
 # Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # max_chunk_chars = 60000
+
+# Masque les secrets avant l'envoi au LLM. Booléen ; défaut : true.
+# Dans les fichiers YAML, JSON, XML, SQL et package.json, la valeur d'une clé sensible et le
+# contenu d'un bloc PEM sont remplacés par *** ; la clé reste lisible. Une clé est sensible si
+# son nom contient, sans égard à la casse : password, passwd, pwd, secret, token, credential,
+# apikey, api_key, api-key, privatekey, private_key ou private-key.
+# Un secret sous un autre nom, dans un commentaire ou dans un autre type de fichier part tel
+# quel. false envoie ces valeurs au LLM. Changer ce réglage réenrichit une fois ces fichiers.
+# Lue ici seulement, pour qu'un dépôt cloné ne puisse pas couper le masquage :
+# .nephila.toml la refuse.
+# enrich_redact = true
 
 # Nombre d'appels LLM simultanés. Entier > 0. Défaut : 4. Sans effet sur l'extraction : ses
 # fils, et ceux du parcours du dépôt, se règlent par l'option --jobs de build et update
