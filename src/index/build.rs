@@ -84,6 +84,8 @@ pub struct IndexOptions {
     pub batch_files: usize,
     /// Nouveaux essais d'un appel LLM dont la réponse est non conforme (REQ-038).
     pub format_retries: u32,
+    /// Nœuds demandés au plus par appel (REQ-271), dérivé de `max_output_tokens` et `thinking`.
+    pub nodes_per_call: usize,
     /// Enrichit aussi les fichiers de code : option ou clé `enrich_code` (REQ-050).
     pub enrich_code: bool,
     /// Masque les valeurs sensibles avant l'envoi : clé `enrich_redact` (REQ-265).
@@ -106,6 +108,7 @@ impl Default for IndexOptions {
             max_chunk_chars: DEFAULT_MAX_CHUNK_CHARS,
             batch_files: crate::config::DEFAULT_BATCH_FILES,
             format_retries: crate::config::DEFAULT_FORMAT_RETRIES,
+            nodes_per_call: enrich::MAX_NODES_PER_CALL,
             enrich_code: false,
             enrich_redact: true,
             max_calls: None,
@@ -124,6 +127,7 @@ impl From<&Config> for IndexOptions {
             max_chunk_chars: c.max_chunk_chars,
             batch_files: c.batch_files,
             format_retries: c.format_retries,
+            nodes_per_call: enrich::nodes_per_call(c.max_output_tokens, c.thinking),
             enrich_code: c.enrich_code,
             enrich_redact: c.enrich_redact,
             max_calls: c.max_calls,
@@ -186,7 +190,7 @@ fn effective_config(
         tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
     }
     trace!(
-        "config: llm={} model={} enrich_code={} summary_language=\"{}\" thinking={} effort={} max_output_tokens={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}{}",
+        "config: llm={} model={} enrich_code={} summary_language=\"{}\" thinking={} effort={} max_output_tokens={} nodes_per_call={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}{}",
         config.provider.as_str(),
         config.model,
         config.enrich_code,
@@ -194,6 +198,7 @@ fn effective_config(
         config.thinking,
         config.effort.as_str(),
         config.max_output_tokens,
+        enrich::nodes_per_call(config.max_output_tokens, config.thinking),
         config.concurrency,
         config.timeout_secs,
         config.max_chunk_chars,
@@ -896,6 +901,7 @@ pub(crate) fn estimate_enrichment(
         opts.batch_files,
         opts.max_chunk_chars,
         &kept,
+        opts.nodes_per_call,
     );
     for line in estimate::trace_lines(&est) {
         trace!("{line}");

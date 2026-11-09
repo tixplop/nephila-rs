@@ -2899,7 +2899,7 @@ fn REQ208_AC2_AC5_readme_tables_et_phrases() {
         .iter()
         .find(|l| l.starts_with("- **Plafond**"))
         .unwrap();
-    let plafond_exact = "- **Plafond** : un fichier qui demanderait plus de 50 appels n'est pas envoyé et reste « à enrichir », nommé par l'avertissement `trop d'appels d'enrichissement`. Trois remèdes : `enrich_exclude`, qui garde sa structure dans le graphe, `exclude` dans `.nephila.toml`, qui la retire, ou un `max_chunk_chars` plus grand, qui réduit le nombre de morceaux pour tous les fichiers. Au-delà de 7500 nœuds, `max_chunk_chars` ne suffit plus.";
+    let plafond_exact = "- **Plafond** : un fichier qui demanderait plus de 50 appels n'est pas envoyé et reste « à enrichir », nommé par l'avertissement `trop d'appels d'enrichissement`. Trois remèdes : `enrich_exclude`, qui garde sa structure dans le graphe, `exclude` dans `.nephila.toml`, qui la retire, ou un `max_chunk_chars` plus grand, qui réduit le nombre de morceaux pour tous les fichiers. Au-delà de 7500 nœuds par défaut, `max_chunk_chars` ne suffit plus.";
     assert_eq!(readme.matches(plafond_exact).count(), 1);
     assert_eq!(*plafond, plafond_exact);
     assert!(!plafond.contains("seul `exclude` suffit"));
@@ -3195,7 +3195,7 @@ fn REQ252_AC4_readme_lignes_du_delai_d_inactivite() {
         "| `timeout_secs` | Silence permis pendant un appel HTTP, en secondes, entier > 0 ; une réponse qui arrive n'est pas coupée, mais un appel dure au plus une heure | 60 |",
         "| `effort` | Niveau d'effort, avec ou sans `thinking` : `\"low\"`, `\"medium\"`, `\"high\"`, ou `\"default\"` pour n'en envoyer aucun ; avec `openai`, à `\"medium\"` ou `\"high\"`, augmentez `timeout_secs` ; configuration personnelle seulement | `\"low\"` |",
         "| Délais dépassés | 3 appels de suite muets pendant `timeout_secs` secondes, ou de plus d'une heure | augmenter `timeout_secs` (réflexion d'`openai`, modèle local lent, proxy qui retient la réponse), ou vérifier le fournisseur |",
-        "trace: [0.000s] config: llm=mock model=m-projet enrich_code=false summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 concurrency=4 timeout_secs=60 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)",
+        "trace: [0.000s] config: llm=mock model=m-projet enrich_code=false summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 nodes_per_call=150 concurrency=4 timeout_secs=60 max_chunk_chars=60000 batch_files=1 format_retries=1 (.nephila.toml : model,format_retries)",
     ];
     for w in wanted {
         assert_eq!(lines.iter().filter(|l| **l == w).count(), 1, "{w}");
@@ -3359,4 +3359,26 @@ fn REQ265_AC7_AC9_readme_ligne_de_table_et_puce_secrets() {
     assert!(last_line.starts_with("- **Plafond**"), "{last_line}");
     assert!(before.ends_with("\n") && !before.ends_with("\n\n"));
     assert!(readme.len() <= 52_861);
+}
+
+#[test]
+fn req271_ac9_readme_nœuds_par_appel() {
+    let readme = repo_file("README.md");
+    let lines: Vec<&str> = readme.lines().collect();
+    let gros = "- **Gros fichier** : envoyé seul, en morceaux de `max_chunk_chars`, de 10 à 150 nœuds demandés par appel : moins si `max_output_tokens` est petit, moins encore avec `thinking`.";
+    assert_eq!(lines.iter().filter(|l| **l == gros).count(), 1);
+    let plafond = lines
+        .iter()
+        .find(|l| l.starts_with("- **Plafond**"))
+        .unwrap();
+    assert!(
+        plafond.ends_with("Au-delà de 7500 nœuds par défaut, `max_chunk_chars` ne suffit plus.")
+    );
+    assert!(!readme.contains("au plus 150 nœuds demandés par appel"));
+    let trace = lines
+        .iter()
+        .find(|l| l.starts_with("trace: ") && l.contains("config: llm="))
+        .unwrap();
+    assert!(trace.contains(" max_output_tokens=16384 nodes_per_call=150 concurrency=4 "));
+    assert!(readme.len() <= 52_861, "README : {} octets", readme.len());
 }

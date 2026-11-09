@@ -913,3 +913,63 @@ fn without_coverage(out: &str) -> String {
     assert!(tail.ends_with(" nœuds résumés"), "{out}");
     head.to_string()
 }
+
+// ---- REQ-271 : nombre de nœuds par appel dérivé de la limite de sortie ----
+
+#[test]
+fn req271_ac4_http_requetes_bornees_par_la_limite_de_sortie() {
+    // (réglages, nœuds par appel attendus, requêtes attendues)
+    let cases = [
+        ("max_output_tokens = 4096\n", 79usize, 6usize),
+        ("max_output_tokens = 8192\nthinking = true\n", 91, 5),
+    ];
+    for provider in ["openai", "anthropic"] {
+        for (extra, per_call, requests) in cases {
+            let src = java("Big", 400);
+            let probe = Env::mock(&[(BIG, src.clone())], "");
+            let ids = probe.node_ids(BIG);
+            assert_eq!(ids.len(), 401);
+            let responses: Vec<(u16, String)> = ids
+                .chunks(per_call)
+                .map(|g| reply(provider, &summary_json(&[(&g[0], "Résumé")])))
+                .collect();
+            assert_eq!(responses.len(), requests);
+            let env = Env::http(provider, &[(BIG, src)], extra, FakeServer::start(responses));
+            let o = env.run(&["build"], &[]);
+            let (out, err) = text(&o);
+            assert_eq!(o.status.code(), Some(0), "{provider} {extra} {out} {err}");
+            let posts = env.enrich_posts(provider);
+            assert_eq!(posts.len(), requests, "{provider} {extra}");
+            let mut seen: Vec<String> = Vec::new();
+            for body in &posts {
+                let listed = listed_ids(&user_prompt(body));
+                assert!(
+                    !listed.is_empty() && listed.len() <= per_call,
+                    "{provider} {extra} {}",
+                    listed.len()
+                );
+                seen.extend(listed);
+            }
+            assert_eq!(seen.len(), 401, "{provider} {extra}: doublons");
+            let set: BTreeSet<&String> = seen.iter().collect();
+            let expected: BTreeSet<&String> = ids.iter().collect();
+            assert_eq!(set, expected, "{provider} {extra}");
+        }
+    }
+}
+
+#[test]
+fn req271_ac5_lots_bornes_par_la_limite_de_sortie() {
+    let files: Vec<(String, String)> = (0..4)
+        .map(|i| (format!("src/F{i}.java"), java(&format!("F{i}"), 14)))
+        .collect();
+    let refs: Vec<(&str, String)> = files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+    let env = Env::mock(&refs, "batch_files = 4\nmax_output_tokens = 2048\n");
+    let o = env.run(&["build"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    let lines = env.log_lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for l in &lines {
+        assert_eq!(l.split('\t').next().unwrap().split(';').count(), 2, "{l}");
+    }
+}

@@ -169,7 +169,7 @@ fn REQ058_AC10_AC13_ligne_config_mock() {
     let l = config_line(&env.run(&["build", "--verbose"]));
     assert!(
         l.contains(
-            " model=mock enrich_code=false summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 concurrency=4 "
+            " model=mock enrich_code=false summary_language=\"français\" thinking=false effort=low max_output_tokens=16384 nodes_per_call=150 concurrency=4 "
         ),
         "{l}"
     );
@@ -181,7 +181,7 @@ fn REQ058_AC10_AC13_ligne_config_mock() {
     let l = config_line(&env.run(&["build", "--verbose"]));
     assert!(
         l.contains(
-            " enrich_code=false summary_language=\"français\" thinking=true effort=high max_output_tokens=4096 concurrency="
+            " enrich_code=false summary_language=\"français\" thinking=true effort=high max_output_tokens=4096 nodes_per_call=10 concurrency="
         ),
         "{l}"
     );
@@ -190,7 +190,7 @@ fn REQ058_AC10_AC13_ligne_config_mock() {
     let l = config_line(&env.run(&["build", "--verbose"]));
     assert!(
         l.contains(
-            " enrich_code=true summary_language=\"français\" thinking=false effort=medium max_output_tokens=16384 concurrency="
+            " enrich_code=true summary_language=\"français\" thinking=false effort=medium max_output_tokens=16384 nodes_per_call=150 concurrency="
         ),
         "{l}"
     );
@@ -228,7 +228,7 @@ fn REQ058_AC10_ligne_config_openai() {
     let o = env.run(&["build", "--verbose"]);
     let l = config_line(&o);
     assert!(
-        l.contains(" llm=openai model=m enrich_code=false summary_language=\"français\" thinking=true effort=low max_output_tokens=99 concurrency="),
+        l.contains(" llm=openai model=m enrich_code=false summary_language=\"français\" thinking=true effort=low max_output_tokens=99 nodes_per_call=10 concurrency="),
         "{l}"
     );
     assert!(server.accept().is_err());
@@ -1204,4 +1204,56 @@ fn req195_ac5_ac8_trace_du_modele_ignore_sous_deny() {
     // deny sans model dans le projet : aucune trace.
     fs::remove_file(env.repo.join(".nephila.toml")).unwrap();
     assert!(!stderr(&env.run(&["build", "--verbose"])).contains("ignoré (model_override"));
+}
+
+// ---- REQ-271 : champ `nodes_per_call` de la ligne `config` (design.md V-005) ----
+
+#[test]
+fn req271_ac8_ligne_config_nodes_per_call() {
+    let env = Env::new(MOCK);
+    let l = config_line(&env.run(&["build", "--verbose"]));
+    assert!(
+        l.contains(" max_output_tokens=16384 nodes_per_call=150 concurrency="),
+        "{l}"
+    );
+
+    env.write_config(&format!(
+        "{MOCK}thinking = true\nmax_output_tokens = 4096\n"
+    ));
+    let l = config_line(&env.run(&["build", "--verbose"]));
+    assert!(
+        l.contains(" max_output_tokens=4096 nodes_per_call=10 concurrency="),
+        "{l}"
+    );
+
+    // `[ask]` ne change pas la valeur de `build`.
+    env.write_config(&format!("{MOCK}[ask]\nmax_output_tokens = 1024\n"));
+    let l = config_line(&env.run(&["build", "--verbose"]));
+    assert!(l.contains(" nodes_per_call=150 "), "{l}");
+
+    // `query ask` ne l'écrit pas.
+    let o = env.run(&["query", "ask", "--verbose", "Alpha"]);
+    assert!(!stderr(&o).contains("nodes_per_call"), "{}", stderr(&o));
+
+    // Sans `--verbose`, rien.
+    let o = env.run(&["build"]);
+    assert!(!stderr(&o).contains("nodes_per_call"), "{}", stderr(&o));
+}
+
+#[test]
+fn req271_ac11_dry_run_et_build_meme_champ() {
+    let env = Env::new(&format!("{MOCK}max_output_tokens = 4096\n"));
+    fs::write(env.repo.join(".nephila.toml"), "model = \"m-projet\"\n").unwrap();
+    let dry = config_line(&env.run(&["build", "--dry-run", "--verbose"]));
+    let real = config_line(&env.run(&["build", "--verbose"]));
+    for l in [&dry, &real] {
+        assert!(l.contains(" nodes_per_call=79 "), "{l}");
+        assert!(l.ends_with(" (.nephila.toml : model)"), "{l}");
+        let project = l.split("(.nephila.toml").nth(1).unwrap();
+        assert!(!project.contains("nodes_per_call"), "{l}");
+    }
+    let o = env.run(&["build", "--verbose", "--no-llm"]);
+    let l = config_line(&o);
+    assert!(l.ends_with("config: llm inactif (--no-llm)"), "{l}");
+    assert!(!stderr(&o).contains("nodes_per_call"), "{}", stderr(&o));
 }

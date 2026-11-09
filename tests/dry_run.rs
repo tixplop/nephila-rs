@@ -1149,3 +1149,29 @@ fn req241_ac4_gros_json_estime_sur_son_extrait() {
     assert_eq!(server.requests(), 1);
     assert_eq!(server.bytes(), bytes);
 }
+
+// ---- REQ-271 / AC-271-6 : l'estimation suit la borne dérivée de la limite de sortie ----
+
+#[test]
+fn req271_ac6_estimation_egale_a_la_commande_reelle_avec_petite_limite() {
+    let env = Env::new();
+    env.config_text(
+        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\nmax_output_tokens = 4096\n",
+    );
+    fs::create_dir_all(env.repo.join("src")).unwrap();
+    fs::write(env.repo.join("src/Big.java"), java("Big", 400)).unwrap();
+
+    let o = env.run(&["build", "--dry-run"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let min = &estimation_lines(&o)[1];
+    assert_eq!(number(min, "minimale : ", " appels"), 6, "{min}");
+
+    let log = env.repo.parent().unwrap().join("mock.log");
+    let mut real = env.command(&["build"]);
+    real.env("NEPHILA_MOCK_LOG", &log);
+    let r = real.output().unwrap();
+    assert_eq!(code(&r), 0, "{}", err(&r));
+    let lines = fs::read_to_string(&log).unwrap();
+    let n = lines.lines().filter(|l| l.contains("src/Big.java")).count();
+    assert_eq!(n, 6, "{lines}");
+}

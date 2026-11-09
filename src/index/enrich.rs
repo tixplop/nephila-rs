@@ -251,10 +251,30 @@ impl Unit<'_> {
     }
 }
 
-/// Nombre maximal de nœuds demandés par appel d'enrichissement (DEC-058) : environ 40 jetons par
-/// résumé, soit environ 6 000 jetons, sous la limite par défaut
-/// (`DEFAULT_MAX_OUTPUT_TOKENS`) ; un `max_output_tokens` plus bas configuré peut tronquer la réponse.
-const MAX_NODES_PER_CALL: usize = 150;
+/// Nombre maximal de nœuds demandés par appel d'enrichissement (DEC-058) : valeur des réglages par
+/// défaut. La borne effective est `nodes_per_call(max_output_tokens, thinking)`, de
+/// `MIN_NODES_PER_CALL` à cette valeur (REQ-271, DEC-200).
+pub(crate) const MAX_NODES_PER_CALL: usize = 150;
+/// Plancher du nombre de nœuds demandés par appel.
+const MIN_NODES_PER_CALL: usize = 10;
+/// Jetons de sortie réservés hors des résumés, sans réflexion.
+const NODES_RESERVE: u32 = 512;
+/// Jetons de sortie réservés hors des résumés, avec réflexion.
+const NODES_RESERVE_THINKING: u32 = 4096;
+/// Jetons de sortie estimés par résumé.
+const TOKENS_PER_SUMMARY: u32 = 45;
+
+/// Nombre de nœuds demandés par appel, dérivé de la limite de sortie (REQ-271, DEC-200) :
+/// `(max_output_tokens - réserve) / 45`, borné de 10 à 150.
+pub(crate) fn nodes_per_call(max_output_tokens: u32, thinking: bool) -> usize {
+    let reserve = if thinking {
+        NODES_RESERVE_THINKING
+    } else {
+        NODES_RESERVE
+    };
+    ((max_output_tokens.saturating_sub(reserve) / TOKENS_PER_SUMMARY) as usize)
+        .clamp(MIN_NODES_PER_CALL, MAX_NODES_PER_CALL)
+}
 
 /// Profondeur maximale de la découpe d'un appel tronqué (REQ-230, non configurable) : au pire
 /// 4 appels d'affilée.
@@ -334,7 +354,11 @@ fn recover_call<'a>(unit: &Unit<'a>, kept: Enrichment) -> Recovery<'a> {
 /// premiers puis les autres) sur le même texte pour 2 nœuds ou plus, sinon le texte. Markdown :
 /// le texte, sinon la liste. `nodes` : `(identifiant, nom court)` des nœuds demandés. `None` si
 /// aucune coupe n'est possible ou à la profondeur maximale.
-fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Unit<'a>>> {
+fn split_call<'a>(
+    unit: &Unit<'a>,
+    nodes: &[(String, String)],
+    nodes_per_call: usize,
+) -> Option<Vec<Unit<'a>>> {
     let Unit::Call {
         file,
         index,
@@ -395,7 +419,7 @@ fn split_call<'a>(unit: &Unit<'a>, nodes: &[(String, String)]) -> Option<Vec<Uni
         let homes = section_homes(part, &spans, nodes);
         let excerpts = excerpts_of(part, &spans);
         let parts: Vec<String> = spans.into_iter().map(|(p, _)| p).collect();
-        let mut plan = call_plan(&parts, nodes, &homes);
+        let mut plan = call_plan(&parts, nodes, &homes, nodes_per_call);
         retain_calls(&mut plan, &file.path, known);
         if plan.is_empty() {
             return None;
@@ -450,16 +474,16 @@ fn retain_calls(plan: &mut Vec<(usize, Vec<String>)>, path: &str, known: &[Strin
 }
 
 /// Nombre maximal d'appels d'enrichissement pour un fichier envoyé seul (DEC-059, non
-/// configurable) : 50 appels = 7 500 nœuds d'un seul morceau. Au-delà, aucun appel n'est envoyé.
+/// configurable) : 50 appels = 7 500 nœuds d'un seul morceau aux réglages par défaut. Au-delà, aucun appel n'est envoyé.
 pub(crate) const MAX_CALLS_PER_FILE: usize = 50;
 
-/// Découpe la liste des nœuds d'un fichier en groupes d'au plus `MAX_NODES_PER_CALL` ; au moins
+/// Découpe la liste des nœuds d'un fichier en groupes d'au plus `nodes_per_call` ; au moins
 /// un groupe, vide si la liste l'est.
-fn node_groups(ids: &[String]) -> Vec<&[String]> {
+fn node_groups(ids: &[String], nodes_per_call: usize) -> Vec<&[String]> {
     if ids.is_empty() {
         return vec![ids];
     }
-    ids.chunks(MAX_NODES_PER_CALL).collect()
+    ids.chunks(nodes_per_call).collect()
 }
 
 /// Forme les unités avec 0 nœud par fichier (tests de la forme par taille et par nombre).
@@ -469,18 +493,25 @@ pub(crate) fn form_units(
     batch_files: usize,
     max_chunk_chars: usize,
 ) -> Vec<Unit<'_>> {
-    form_units_by_nodes(files, |_| 0, batch_files, max_chunk_chars)
+    form_units_by_nodes(
+        files,
+        |_| 0,
+        batch_files,
+        max_chunk_chars,
+        MAX_NODES_PER_CALL,
+    )
 }
 
 /// Forme les unités dans l'ordre des fichiers : un lot compte au plus `batch_files` fichiers, au
-/// plus `max_chunk_chars` octets et au plus `MAX_NODES_PER_CALL` nœuds au total ; un fichier plus
-/// gros que `max_chunk_chars` ou de plus de `MAX_NODES_PER_CALL` nœuds forme une unité `Big` et
+/// plus `max_chunk_chars` octets et au plus `nodes_per_call` nœuds au total ; un fichier plus
+/// gros que `max_chunk_chars` ou de plus de `nodes_per_call` nœuds forme une unité `Big` et
 /// coupe le lot en cours.
 pub(crate) fn form_units_by_nodes<'a>(
     files: &'a [FileRecord],
     nodes: impl Fn(&FileRecord) -> usize,
     batch_files: usize,
     max_chunk_chars: usize,
+    nodes_per_call: usize,
 ) -> Vec<Unit<'a>> {
     let batch_files = batch_files.max(1);
     let mut units = Vec::new();
@@ -489,7 +520,7 @@ pub(crate) fn form_units_by_nodes<'a>(
     let mut total_nodes = 0usize;
     for f in files {
         let n = nodes(f);
-        if f.size > max_chunk_chars as u64 || n > MAX_NODES_PER_CALL {
+        if f.size > max_chunk_chars as u64 || n > nodes_per_call {
             if !current.is_empty() {
                 units.push(Unit::Lot(std::mem::take(&mut current), Pass::First));
                 total = 0;
@@ -501,7 +532,7 @@ pub(crate) fn form_units_by_nodes<'a>(
         if !current.is_empty()
             && (current.len() >= batch_files
                 || total + f.size > max_chunk_chars as u64
-                || total_nodes + n > MAX_NODES_PER_CALL)
+                || total_nodes + n > nodes_per_call)
         {
             units.push(Unit::Lot(std::mem::take(&mut current), Pass::First));
             total = 0;
@@ -617,6 +648,7 @@ fn run_unit<'a>(
     max_calls: Option<usize>,
     take: Take<'_>,
     kept: &KeptCalls,
+    nodes_per_call: usize,
 ) -> Step<'a> {
     let pass = match unit {
         Unit::Lot(_, pass) => *pass,
@@ -649,7 +681,7 @@ fn run_unit<'a>(
         0 => Step::Finished(outcomes, None),
         1 => {
             let (f, text) = &readable[0];
-            match plan_calls(f, text, max_chunk_chars, &nodes(f)) {
+            match plan_calls(f, text, max_chunk_chars, &nodes(f), nodes_per_call) {
                 Ok(calls) if calls.is_empty() => {
                     outcomes.push(Outcome::Done((*f).clone(), Enrichment::default()));
                     Step::Finished(outcomes, None)
@@ -1036,10 +1068,11 @@ fn call_plan(
     parts: &[String],
     nodes: &[(String, String)],
     homes: &HashMap<String, usize>,
+    nodes_per_call: usize,
 ) -> Vec<(usize, Vec<String>)> {
     let ids: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
     if parts.len() <= 1 {
-        return node_groups(&ids)
+        return node_groups(&ids, nodes_per_call)
             .into_iter()
             .map(|g| (0, g.to_vec()))
             .collect();
@@ -1084,7 +1117,7 @@ fn call_plan(
     }
     let mut plan = Vec::new();
     for (k, list) in lists.iter().enumerate() {
-        for g in node_groups(list) {
+        for g in node_groups(list, nodes_per_call) {
             plan.push((k, g.to_vec()));
         }
     }
@@ -1257,6 +1290,7 @@ fn plan_calls<'a>(
     text: &str,
     max_chunk_chars: usize,
     nodes: &[(String, String)],
+    nodes_per_call: usize,
 ) -> Result<Vec<Unit<'a>>> {
     let known: Arc<[String]> = nodes.iter().map(|(id, _)| id.clone()).collect();
     let text = excerpt::for_llm(&file.path, text, max_chunk_chars);
@@ -1269,7 +1303,7 @@ fn plan_calls<'a>(
     let homes = section_homes(text, &spans, nodes);
     let excerpts = excerpts_of(text, &spans);
     let parts: Vec<String> = spans.into_iter().map(|(part, _)| part).collect();
-    let mut plan = call_plan(&parts, nodes, &homes);
+    let mut plan = call_plan(&parts, nodes, &homes, nodes_per_call);
     retain_calls(&mut plan, &file.path, &known);
     let count = plan.len();
     if count > MAX_CALLS_PER_FILE {
@@ -1431,6 +1465,7 @@ fn sent_size(f: &FileRecord, max_chunk_chars: usize) -> usize {
 /// valent ceux à texte vide plus la somme des tailles), sauf, pour le seul décompte du masquage
 /// (REQ-266), les fichiers visés par REQ-264, lus sans effet sur l'estimation ; un fichier envoyé seul est lu en série,
 /// puis `plan_calls` donne ses appels. Un fichier illisible ou au plafond ne compte aucun appel.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn estimate(
     sources: Sources<'_>,
     files: &[FileRecord],
@@ -1439,6 +1474,7 @@ pub(crate) fn estimate(
     batch_files: usize,
     max_chunk_chars: usize,
     kept: &KeptCalls,
+    nodes_per_call: usize,
 ) -> Estimate {
     let (with_nodes, without_nodes) = partition_by_nodes(files, ids);
     let units = form_units_by_nodes(
@@ -1446,6 +1482,7 @@ pub(crate) fn estimate(
         |f| ids.get(&f.path).map_or(0, Vec::len),
         batch_files,
         max_chunk_chars,
+        nodes_per_call,
     );
     let mut est = Estimate {
         files: files.len(),
@@ -1504,6 +1541,7 @@ pub(crate) fn estimate(
                     max_chunk_chars,
                     kept,
                     &mut est.nodes,
+                    nodes_per_call,
                 ));
                 let last = est.alone.last().expect("fichier seul ajouté");
                 est.calls += last.calls;
@@ -1522,6 +1560,7 @@ pub(crate) fn estimate(
 
 /// Estimation d'un fichier envoyé seul ; ajoute ses nœuds demandés à `nodes`. Le texte lu est
 /// libéré au retour.
+#[allow(clippy::too_many_arguments)]
 fn estimate_alone(
     f: &FileRecord,
     sources: Sources<'_>,
@@ -1530,6 +1569,7 @@ fn estimate_alone(
     max_chunk_chars: usize,
     kept: &KeptCalls,
     nodes: &mut usize,
+    nodes_per_call: usize,
 ) -> AloneFile {
     let mut out = AloneFile {
         path: f.path.clone(),
@@ -1542,7 +1582,7 @@ fn estimate_alone(
         return out;
     };
     let file_nodes = ids.get(&f.path).cloned().unwrap_or_default();
-    match plan_calls(f, &text, max_chunk_chars, &file_nodes) {
+    match plan_calls(f, &text, max_chunk_chars, &file_nodes, nodes_per_call) {
         Ok(calls) => {
             let system = enrichment_system_prompt(language).len();
             // Les appels dont la réponse est conservée ne partent pas (REQ-228).
@@ -1918,6 +1958,8 @@ struct Ctx<'s, 'a> {
     /// sauté après un échec, pour que celles des autres appels du fichier soient conservées
     /// (REQ-228).
     answers_known: bool,
+    /// Nœuds demandés au plus par appel (REQ-271).
+    nodes_per_call: usize,
 }
 
 /// Prise de `n` appels sur le plafond, sous le verrou de la politique. Au premier refus, écrit la
@@ -1981,6 +2023,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
         capped,
         kept,
         answers_known,
+        nodes_per_call,
     } = ctx;
     while let Some(mut unit) = next_unit(shared, wake, stop, capped) {
         // Suivants d'un appel marqué : ils repartent à la fin de l'appel, sur tous ses chemins
@@ -2120,7 +2163,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                             })
                             .collect()
                     };
-                    if let Some(subs) = split_call(&unit, &nodes) {
+                    if let Some(subs) = split_call(&unit, &nodes, nodes_per_call) {
                         if reserve_split(shared, &file.path, count, subs.len()) {
                             if take(subs.len(), 0) {
                                 trace!(
@@ -2208,6 +2251,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                     max_calls,
                     &take,
                     kept,
+                    nodes_per_call,
                 );
                 match step {
                     Step::Resumed(msg, calls) => (None, Some(msg), calls, true),
@@ -2460,6 +2504,7 @@ pub(crate) fn enrich_pass(
         |f| ids.get(&f.path).map_or(0, Vec::len),
         batch_files,
         max_chunk_chars,
+        opts.nodes_per_call,
     );
     // Un gros fichier peut donner jusqu'à `MAX_CALLS_PER_FILE` appels : autant de fils utiles.
     let useful: usize = units
@@ -2518,6 +2563,7 @@ pub(crate) fn enrich_pass(
             capped: &capped,
             kept: &kept,
             answers_known: matches!(mode, PassMode::Last { .. }),
+            nodes_per_call: opts.nodes_per_call,
         };
         for _ in 0..workers {
             let tx = tx.clone();
@@ -2776,15 +2822,19 @@ mod tests {
 
     #[test]
     fn req047_ac2_node_groups_bounds() {
-        assert_eq!(node_groups(&[]).len(), 1);
-        assert!(node_groups(&[])[0].is_empty());
-        let sizes =
-            |n: usize| -> Vec<usize> { node_groups(&ids(n)).iter().map(|g| g.len()).collect() };
+        assert_eq!(node_groups(&[], MAX_NODES_PER_CALL).len(), 1);
+        assert!(node_groups(&[], MAX_NODES_PER_CALL)[0].is_empty());
+        let sizes = |n: usize| -> Vec<usize> {
+            node_groups(&ids(n), MAX_NODES_PER_CALL)
+                .iter()
+                .map(|g| g.len())
+                .collect()
+        };
         assert_eq!(sizes(150), [150]);
         assert_eq!(sizes(151), [150, 1]);
         assert_eq!(sizes(401), [150, 150, 101]);
         let all = ids(401);
-        let joined: Vec<String> = node_groups(&all).concat();
+        let joined: Vec<String> = node_groups(&all, MAX_NODES_PER_CALL).concat();
         assert_eq!(joined, all);
     }
 
@@ -2815,7 +2865,7 @@ mod tests {
             ("vide", ""),
         ]);
         assert_eq!(
-            call_plan(&parts, &nodes, &HashMap::new()),
+            call_plan(&parts, &nodes, &HashMap::new(), MAX_NODES_PER_CALL),
             vec![
                 (0, strs(&["A", "foo", "m1", "qux", "vide"])),
                 (1, strs(&["bar", "m12"])),
@@ -2828,8 +2878,8 @@ mod tests {
             .map(|i| (format!("id{i}"), format!("n{i}")))
             .collect();
         let all: Vec<String> = many.iter().map(|(a, _)| a.clone()).collect();
-        let plan = call_plan(&parts[2..], &many, &HashMap::new());
-        let expected: Vec<(usize, Vec<String>)> = node_groups(&all)
+        let plan = call_plan(&parts[2..], &many, &HashMap::new(), MAX_NODES_PER_CALL);
+        let expected: Vec<(usize, Vec<String>)> = node_groups(&all, MAX_NODES_PER_CALL)
             .into_iter()
             .map(|g| (0, g.to_vec()))
             .collect();
@@ -2839,7 +2889,7 @@ mod tests {
         // 160 nœuds tous dans le morceau 1, aucun dans le morceau 2.
         let text1: String = (0..160).map(|i| format!("n{i} ")).collect();
         let two = vec![text1, "rien".to_string()];
-        let plan = call_plan(&two, &many, &HashMap::new());
+        let plan = call_plan(&two, &many, &HashMap::new(), MAX_NODES_PER_CALL);
         let sizes: Vec<(usize, usize)> = plan.iter().map(|(k, l)| (*k, l.len())).collect();
         assert_eq!(sizes, [(0, 150), (0, 10), (1, 0)]);
     }
@@ -2851,7 +2901,7 @@ mod tests {
         let nodes: Vec<(String, String)> = (0..170)
             .map(|i| (format!("id{i}"), format!("n{i}")))
             .collect();
-        let plan = call_plan(&parts, &nodes, &HashMap::new());
+        let plan = call_plan(&parts, &nodes, &HashMap::new(), MAX_NODES_PER_CALL);
         let sizes: Vec<(usize, usize)> = plan.iter().map(|(k, l)| (*k, l.len())).collect();
         assert_eq!(sizes, [(0, 150), (0, 10), (1, 10), (2, 0)]);
     }
@@ -2871,7 +2921,7 @@ mod tests {
         let mut homes = HashMap::new();
         homes.insert("section:d.md#guide".to_string(), 2usize);
         assert_eq!(
-            call_plan(&parts, &nodes, &homes),
+            call_plan(&parts, &nodes, &homes, MAX_NODES_PER_CALL),
             vec![
                 (0, vec![]),
                 (1, strs(&["table:orders"])),
@@ -2889,7 +2939,7 @@ mod tests {
             ("dollar", "foo$bar"),
             ("prefixe", "foo"),
         ]);
-        let plan = call_plan(&parts, &nodes, &HashMap::new());
+        let plan = call_plan(&parts, &nodes, &HashMap::new(), MAX_NODES_PER_CALL);
         assert_eq!(plan[0], (0, strs(&["plus", "prefixe"])));
         assert_eq!(plan[1], (1, strs(&["bords", "dollar"])));
     }
@@ -2912,7 +2962,7 @@ mod tests {
                 s
             })
             .collect();
-        let plan = call_plan(&parts, &nodes, &HashMap::new());
+        let plan = call_plan(&parts, &nodes, &HashMap::new(), MAX_NODES_PER_CALL);
         let total: usize = plan.iter().map(|(_, l)| l.len()).sum();
         assert_eq!(total, 20_000);
         let expected: usize = (0..5)
@@ -2955,7 +3005,7 @@ mod tests {
         .map(|(a, b)| (a.to_string(), *b))
         .collect();
         assert_eq!(
-            call_plan(&parts, &nodes, &homes),
+            call_plan(&parts, &nodes, &homes, MAX_NODES_PER_CALL),
             vec![
                 (
                     0,
@@ -2984,18 +3034,18 @@ mod tests {
             ("table:public.customers", "customers"),
         ]);
         assert_eq!(
-            call_plan(&parts, &nodes, &HashMap::new()),
+            call_plan(&parts, &nodes, &HashMap::new(), MAX_NODES_PER_CALL),
             vec![
                 (0, strs(&["table:orders"])),
                 (1, strs(&["table:orders_archive", "table:public.customers"])),
             ]
         );
         let nodes = pairs(&[("method:p.C.order", "order")]);
-        let plan = call_plan(&parts, &nodes, &HashMap::new());
+        let plan = call_plan(&parts, &nodes, &HashMap::new(), MAX_NODES_PER_CALL);
         assert_eq!(plan[0], (0, strs(&["method:p.C.order"])));
         let parts = strs(&["Order\n", "rien\n"]);
         let nodes = pairs(&[("method:p.C.order", "order"), ("table:order", "order")]);
-        let plan = call_plan(&parts, &nodes, &HashMap::new());
+        let plan = call_plan(&parts, &nodes, &HashMap::new(), MAX_NODES_PER_CALL);
         assert_eq!(plan[0], (0, strs(&["method:p.C.order", "table:order"])));
         assert_eq!(plan[1], (1, vec![]));
     }
@@ -3016,7 +3066,7 @@ mod tests {
         let homes = section_homes(&text, &spans, &nodes);
         assert_eq!(homes.len(), 10_000);
         let parts: Vec<String> = spans.iter().map(|(p, _)| p.clone()).collect();
-        let plan = call_plan(&parts, &nodes, &homes);
+        let plan = call_plan(&parts, &nodes, &homes, MAX_NODES_PER_CALL);
         let total: usize = plan.iter().map(|(_, l)| l.len()).sum();
         assert_eq!(total, 10_000);
         let mut seen = HashSet::new();
@@ -3040,10 +3090,10 @@ mod tests {
         let counts = [100usize, 60, 40, 200, 10];
         let files: Vec<_> = (0..5).map(|i| rec(&format!("f{i}"), 1)).collect();
         let nodes = |f: &FileRecord| counts[f.path[1..].parse::<usize>().unwrap()];
-        let u = form_units_by_nodes(&files, nodes, 8, 1000);
+        let u = form_units_by_nodes(&files, nodes, 8, 1000, MAX_NODES_PER_CALL);
         assert_eq!(shape(&u), ["f0", "f1,f2", "BIG:f3", "f4"]);
         let files = vec![rec("a", 1)];
-        let u = form_units_by_nodes(&files, |_| 150, 8, 1000);
+        let u = form_units_by_nodes(&files, |_| 150, 8, 1000, MAX_NODES_PER_CALL);
         assert_eq!(shape(&u), ["a"]);
     }
 
@@ -3072,7 +3122,7 @@ mod tests {
             let nodes = |f: &FileRecord| node_counts[f.path[1..].parse::<usize>().unwrap()];
             for batch in [1usize, 10, 100] {
                 for max in [100usize, 1_000, 60_000] {
-                    let units = form_units_by_nodes(&files, nodes, batch, max);
+                    let units = form_units_by_nodes(&files, nodes, batch, max, MAX_NODES_PER_CALL);
                     let ctx = format!("jeu {set}, batch {batch}, max {max}");
                     let mut seen: Vec<&str> = Vec::new();
                     for u in &units {
@@ -3226,7 +3276,7 @@ mod tests {
         let file = rec(path, text.len() as u64);
         let totals = Mutex::new(LlmTotals::default());
         let mut results = Vec::new();
-        for unit in plan_calls(&file, text, max_chunk_chars, nodes)? {
+        for unit in plan_calls(&file, text, max_chunk_chars, nodes, MAX_NODES_PER_CALL)? {
             let Unit::Call {
                 index,
                 count,
@@ -3268,7 +3318,7 @@ mod tests {
 
     fn planned(path: &str, text: &str, max: usize, nodes: &[(String, String)]) -> Vec<PlannedCall> {
         let file = rec(path, text.len() as u64);
-        plan_calls(&file, text, max, nodes)
+        plan_calls(&file, text, max, nodes, MAX_NODES_PER_CALL)
             .unwrap()
             .into_iter()
             .map(|u| match u {
@@ -3316,7 +3366,7 @@ mod tests {
         let nodes = [node("class:A", "alpha"), node("method:A.g", "gamma")];
         let parts: Vec<String> = spans.iter().map(|(p, _)| p.clone()).collect();
         let homes = section_homes(text, &spans, &nodes);
-        let plan = call_plan(&parts, &nodes, &homes);
+        let plan = call_plan(&parts, &nodes, &homes, MAX_NODES_PER_CALL);
         assert_eq!(plan.len(), 3);
         assert!(plan[1].1.is_empty());
         let calls = planned("src/A.java", text, 10, &nodes);
@@ -3344,7 +3394,8 @@ mod tests {
             assert!(text.chars().count() >= 500_000, "{path}");
             for max in [60_000, 10] {
                 let file = rec(path, text.len() as u64);
-                let units = plan_calls(&file, &text, max, &nodes_of(path)).unwrap();
+                let units =
+                    plan_calls(&file, &text, max, &nodes_of(path), MAX_NODES_PER_CALL).unwrap();
                 assert_eq!(units.len(), 1, "{path} {max}");
                 match &units[0] {
                     Unit::Call {
@@ -3391,7 +3442,7 @@ mod tests {
             .collect();
         nodes.push(node("method:A.g", "gamma"));
         let file = rec("src/A.java", text.len() as u64);
-        let units = plan_calls(&file, text, 20, &nodes).unwrap();
+        let units = plan_calls(&file, text, 20, &nodes, MAX_NODES_PER_CALL).unwrap();
         let got: Vec<(usize, usize, Option<Excerpt>)> = units
             .iter()
             .map(|u| match u {
@@ -3420,7 +3471,7 @@ mod tests {
         let many: Vec<(String, String)> = (0..400)
             .map(|i| node(&format!("method:A.m{i}"), "alpha"))
             .collect();
-        let units = plan_calls(&file, text, 1000, &many).unwrap();
+        let units = plan_calls(&file, text, 1000, &many, MAX_NODES_PER_CALL).unwrap();
         assert_eq!(units.len(), 3);
         for u in &units {
             let Unit::Call { excerpt, .. } = u else {
@@ -3442,7 +3493,7 @@ mod tests {
         ];
         let homes = section_homes(text, &spans, &nodes);
         let parts: Vec<String> = spans.into_iter().map(|(p, _)| p).collect();
-        let plan = call_plan(&parts, &nodes, &homes);
+        let plan = call_plan(&parts, &nodes, &homes, MAX_NODES_PER_CALL);
         assert_eq!(plan.len(), 3);
         assert!(plan[1].1.is_empty());
         let calls = planned("docs/g.md", text, 8, &nodes);
@@ -3489,6 +3540,86 @@ mod tests {
         assert_eq!(calls, 0);
     }
 
+    // ---- REQ-271 : nombre de nœuds par appel ----
+
+    #[test]
+    fn req271_ac1_nodes_per_call() {
+        let cases: [(u32, bool, usize); 14] = [
+            (16384, false, 150),
+            (16384, true, 150),
+            (7262, false, 150),
+            (7261, false, 149),
+            (10846, true, 150),
+            (10845, true, 149),
+            (8192, true, 91),
+            (4096, false, 79),
+            (2048, false, 34),
+            (962, false, 10),
+            (4096, true, 10),
+            (1, false, 10),
+            (1, true, 10),
+            (u32::MAX, true, 150),
+        ];
+        for (tokens, thinking, expected) in cases {
+            assert_eq!(
+                nodes_per_call(tokens, thinking),
+                expected,
+                "{tokens} {thinking}"
+            );
+        }
+    }
+
+    #[test]
+    fn req271_ac2_form_units_borne_40() {
+        let counts = [30usize, 30, 10, 41];
+        let files: Vec<_> = (0..4).map(|i| rec(&format!("f{i}"), 1)).collect();
+        let nodes = |f: &FileRecord| counts[f.path[1..].parse::<usize>().unwrap()];
+        let u = form_units_by_nodes(&files, nodes, 8, 1000, 40);
+        assert_eq!(shape(&u), ["f0", "f1,f2", "BIG:f3"]);
+    }
+
+    #[test]
+    fn req271_ac3_node_groups_et_call_plan_borne_40() {
+        let ids = |n: usize| -> Vec<String> { (0..n).map(|i| format!("n{i}")).collect() };
+        let sizes =
+            |n: usize| -> Vec<usize> { node_groups(&ids(n), 40).iter().map(|g| g.len()).collect() };
+        assert_eq!(sizes(0), [0]);
+        assert_eq!(sizes(40), [40]);
+        assert_eq!(sizes(41), [40, 1]);
+        assert_eq!(sizes(81), [40, 40, 1]);
+        let all = ids(81);
+        assert_eq!(node_groups(&all, 40).concat(), all);
+
+        let parts = vec!["alpha beta".to_string(), "gamma delta".to_string()];
+        let nodes: Vec<(String, String)> = (0..90)
+            .map(|i| {
+                let short = if i % 2 == 0 { "alpha" } else { "gamma" };
+                (format!("n{i}"), short.to_string())
+            })
+            .collect();
+        let plan = call_plan(&parts, &nodes, &HashMap::new(), 40);
+        assert!(plan.iter().all(|(_, l)| !l.is_empty() && l.len() <= 40));
+        let mut seen: Vec<String> = plan.iter().flat_map(|(_, l)| l.clone()).collect();
+        seen.sort();
+        let mut expected: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn req271_ac7_plafond_d_appels_borne_34() {
+        let f = rec("big.java", 1);
+        let nodes = |n: usize| -> Vec<(String, String)> {
+            (0..n).map(|i| (format!("n{i}"), String::new())).collect()
+        };
+        let calls = plan_calls(&f, "x", 10_000, &nodes(1700), 34).unwrap();
+        assert_eq!(calls.len(), 50);
+        match plan_calls(&f, "x", 10_000, &nodes(1701), 34) {
+            Err(e) => assert_eq!(e, Error::TooManyCalls { calls: 51, max: 50 }),
+            Ok(c) => panic!("{} appels planifiés", c.len()),
+        }
+    }
+
     #[test]
     fn req048_ac1_plafond_de_50_appels() {
         let stop = AtomicBool::new(false);
@@ -3529,7 +3660,7 @@ mod tests {
         for i in 0..51 {
             assert_eq!(homes[&format!("section:x.md#t{i}")], i);
         }
-        let plan = call_plan(&parts, &nodes, &homes);
+        let plan = call_plan(&parts, &nodes, &homes, MAX_NODES_PER_CALL);
         assert_eq!(plan.len(), 51);
         for (i, (_, list)) in plan.iter().enumerate() {
             assert_eq!(list, &vec![format!("section:x.md#t{i}")]);
@@ -6347,7 +6478,7 @@ mod tests {
     #[test]
     fn req230_split_call_coupe_la_liste_en_deux_sans_perte() {
         let ids = ["a", "b", "c", "d", "e"];
-        let subs = split_call(&call_of(&ids, &[2]), &[]).unwrap();
+        let subs = split_call(&call_of(&ids, &[2]), &[], MAX_NODES_PER_CALL).unwrap();
         let lists: Vec<(Vec<String>, Vec<usize>)> = subs
             .iter()
             .map(|u| match u {
@@ -6374,10 +6505,10 @@ mod tests {
                 (vec!["d".into(), "e".into()], vec![2, 2]),
             ]
         );
-        assert!(split_call(&call_of(&["a"], &[]), &[]).is_none());
-        assert!(split_call(&call_of(&[], &[]), &[]).is_none());
-        assert!(split_call(&call_of(&ids, &[1, 1, 1]), &[]).is_none());
-        assert!(split_call(&call_of(&ids, &[1, 1]), &[]).is_some());
+        assert!(split_call(&call_of(&["a"], &[]), &[], MAX_NODES_PER_CALL).is_none());
+        assert!(split_call(&call_of(&[], &[]), &[], MAX_NODES_PER_CALL).is_none());
+        assert!(split_call(&call_of(&ids, &[1, 1, 1]), &[], MAX_NODES_PER_CALL).is_none());
+        assert!(split_call(&call_of(&ids, &[1, 1]), &[], MAX_NODES_PER_CALL).is_some());
     }
 
     /// Appel factice sur `part`, avec l'extrait `excerpt` s'il y en a un.
@@ -6453,6 +6584,7 @@ mod tests {
         let subs = split_call(
             &text_call("A.java", &text, None, &["method:A.zed"]),
             &named(&["method:A.zed"]),
+            MAX_NODES_PER_CALL,
         )
         .unwrap();
         assert_eq!(subs.len(), 1);
@@ -6476,6 +6608,7 @@ mod tests {
         let subs = split_call(
             &text_call("A.java", &text, None, &["method:A.aa"]),
             &named(&["method:A.aa"]),
+            MAX_NODES_PER_CALL,
         )
         .unwrap();
         assert_eq!(subs.len(), 1);
@@ -6484,6 +6617,7 @@ mod tests {
         let by_list = split_call(
             &text_call("A.java", &text, None, &["method:A.aa", "method:A.bb"]),
             &both,
+            MAX_NODES_PER_CALL,
         )
         .unwrap();
         assert_eq!(by_list.len(), 2);
@@ -6497,6 +6631,7 @@ mod tests {
         let subs = split_call(
             &text_call("D.md", &md, None, &["section:D.md#aa", "section:D.md#bb"]),
             &nodes,
+            MAX_NODES_PER_CALL,
         )
         .unwrap();
         let lists: Vec<Vec<String>> = subs.iter().map(|u| unit_shape(u).0).collect();
@@ -6510,13 +6645,15 @@ mod tests {
         assert!(short.chars().count() < MIN_SPLIT_CHARS);
         assert!(split_call(
             &text_call("A.java", &short, None, &["type:A"]),
-            &named(&["type:A"])
+            &named(&["type:A"]),
+            MAX_NODES_PER_CALL
         )
         .is_none());
         let one_line = format!("class A {{ {} }}", "x".repeat(2000));
         assert!(split_call(
             &text_call("A.java", &one_line, None, &["type:A"]),
-            &named(&["type:A"])
+            &named(&["type:A"]),
+            MAX_NODES_PER_CALL
         )
         .is_none());
     }
@@ -6545,6 +6682,7 @@ mod tests {
             let subs = split_call(
                 &text_call("A.java", &text, Some(parent), &[node]),
                 &named(&[node]),
+                MAX_NODES_PER_CALL,
             )
             .unwrap();
             assert_eq!(subs.len(), 1, "{node}");
@@ -6577,6 +6715,7 @@ mod tests {
                 (ids[1].to_string(), "beta".to_string()),
                 (ids[2].to_string(), "gamma".to_string()),
             ],
+            MAX_NODES_PER_CALL,
         )
         .unwrap();
         assert_eq!(subs.len(), 3);
@@ -6595,6 +6734,7 @@ mod tests {
         let subs = split_call(
             &text_call_known("D.md", &text, None, &[], &["section:D.md#a"]),
             &[],
+            MAX_NODES_PER_CALL,
         )
         .unwrap();
         assert!(subs.len() >= 2);
@@ -6602,7 +6742,8 @@ mod tests {
         // Sans section dans le fichier, les parts vides sont retirées : aucune coupe.
         assert!(split_call(
             &text_call_known("D.md", &text, None, &[], &["document:D.md"]),
-            &[]
+            &[],
+            MAX_NODES_PER_CALL
         )
         .is_none());
     }
@@ -6649,7 +6790,7 @@ mod plan_index_tests {
     ) -> Vec<(usize, Vec<String>)> {
         let ids: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
         if parts.len() <= 1 {
-            return node_groups(&ids)
+            return node_groups(&ids, MAX_NODES_PER_CALL)
                 .into_iter()
                 .map(|g| (0, g.to_vec()))
                 .collect();
@@ -6693,7 +6834,7 @@ mod plan_index_tests {
         }
         let mut plan = Vec::new();
         for (k, list) in lists.iter().enumerate() {
-            for g in node_groups(list) {
+            for g in node_groups(list, MAX_NODES_PER_CALL) {
                 plan.push((k, g.to_vec()));
             }
         }
@@ -6713,7 +6854,7 @@ mod plan_index_tests {
         }
         let mut out = Vec::new();
         for (k, list) in per_part.iter().enumerate() {
-            for g in node_groups(list) {
+            for g in node_groups(list, MAX_NODES_PER_CALL) {
                 out.push((k, g.to_vec()));
             }
         }
@@ -6834,7 +6975,7 @@ mod plan_index_tests {
                     }
                 }
             }
-            let got = call_plan(&parts, &nodes, &homes);
+            let got = call_plan(&parts, &nodes, &homes, MAX_NODES_PER_CALL);
             let oracle = oracle_call_plan(&parts, &nodes, &homes);
             let want = if parts.len() > 1 {
                 first_only(oracle, parts.len())
@@ -6858,7 +6999,7 @@ mod plan_index_tests {
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        let got = call_plan(&parts, &nodes, &HashMap::new());
+        let got = call_plan(&parts, &nodes, &HashMap::new(), MAX_NODES_PER_CALL);
         let oracle = oracle_call_plan(&parts, &nodes, &HashMap::new());
         let want = if parts.len() > 1 {
             first_only(oracle, parts.len())
@@ -6941,7 +7082,7 @@ mod plan_index_tests {
                 s
             })
             .collect();
-        let plan = call_plan(&parts, &nodes, &HashMap::new());
+        let plan = call_plan(&parts, &nodes, &HashMap::new(), MAX_NODES_PER_CALL);
         let mut lists: Vec<usize> = vec![0; 5];
         for (k, l) in &plan {
             lists[*k] += l.len();
@@ -7137,7 +7278,16 @@ mod estimate_tests {
             language: LANG.into(),
             versions: PromptVersions::CURRENT,
         };
-        estimate(sources, files, ids, LANG, batch, max, &kept)
+        estimate(
+            sources,
+            files,
+            ids,
+            LANG,
+            batch,
+            max,
+            &kept,
+            MAX_NODES_PER_CALL,
+        )
     }
 
     /// Lignes de 10 octets `nNN xxxxx` : une par morceau pour `max_chunk_chars` = 10.
@@ -7739,7 +7889,7 @@ mod cache_tests {
     fn marked(chars: usize, node_count: usize, held: usize) -> Vec<bool> {
         let text = "x".repeat(chars);
         let f = file("A.java");
-        let calls = plan_calls(f, &text, 10_000, &nodes(node_count)).unwrap();
+        let calls = plan_calls(f, &text, 10_000, &nodes(node_count), MAX_NODES_PER_CALL).unwrap();
         let mut kept = KeptCalls {
             results: HashMap::new(),
             model: "m".into(),
@@ -7799,7 +7949,7 @@ mod cache_tests {
     fn req268_ac3_sans_minimum_aucun_appel_n_est_marque() {
         let f = file("A.java");
         let text = "x".repeat(400);
-        let mut calls = plan_calls(f, &text, 10_000, &nodes(160)).unwrap();
+        let mut calls = plan_calls(f, &text, 10_000, &nodes(160), MAX_NODES_PER_CALL).unwrap();
         mark_rereads(&mut calls, None);
         assert!(calls
             .iter()
@@ -7990,14 +8140,22 @@ mod cache_tests {
             ("a".to_string(), "a".to_string()),
             ("b".to_string(), "b".to_string()),
         ];
-        let subs = split_call(&cached_call(&["a", "b"], "texte"), &both).unwrap();
+        let subs = split_call(
+            &cached_call(&["a", "b"], "texte"),
+            &both,
+            MAX_NODES_PER_CALL,
+        )
+        .unwrap();
         assert_eq!(flags(&subs), [true, true]);
         // Un appel non marqué ne le devient pas.
         let mut plain = cached_call(&["a", "b"], "texte");
         if let Unit::Call { cache, .. } = &mut plain {
             *cache = false;
         }
-        assert_eq!(flags(&split_call(&plain, &both).unwrap()), [false, false]);
+        assert_eq!(
+            flags(&split_call(&plain, &both, MAX_NODES_PER_CALL).unwrap()),
+            [false, false]
+        );
     }
 
     #[test]
@@ -8008,7 +8166,7 @@ mod cache_tests {
             + "    void zed() {}\n";
         let unit = cached_call(&["method:A.zed"], &text);
         let nodes = vec![("method:A.zed".to_string(), "zed".to_string())];
-        let subs = split_call(&unit, &nodes).unwrap();
+        let subs = split_call(&unit, &nodes, MAX_NODES_PER_CALL).unwrap();
         assert_eq!(flags(&subs), [false]);
         let Unit::Call { part, .. } = &subs[0] else {
             unreachable!()
