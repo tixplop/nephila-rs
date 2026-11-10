@@ -2926,7 +2926,7 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare_cached(if self.version >= SCHEMA_WITHOUT_SUBSYSTEMS + 1 {
+            .prepare_cached(if self.version > SCHEMA_WITHOUT_SUBSYSTEMS {
                 "SELECT id, label, pivot, size, cohesion, description FROM communities ORDER BY id"
             } else {
                 "SELECT id, label, pivot, size, cohesion, NULL FROM communities ORDER BY id"
@@ -2943,7 +2943,7 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare_cached(if self.version >= SCHEMA_WITHOUT_SUBSYSTEMS + 1 {
+            .prepare_cached(if self.version > SCHEMA_WITHOUT_SUBSYSTEMS {
                 "SELECT id, label, pivot, size, cohesion, description FROM communities WHERE id = ?1"
             } else {
                 "SELECT id, label, pivot, size, cohesion, NULL FROM communities WHERE id = ?1"
@@ -2959,7 +2959,7 @@ impl Store {
     /// Vrai si le cache des noms de sous-systèmes est vide (DEC-196) ; un schéma < 14, lu sans
     /// migration, n'a pas la table.
     pub fn subsystem_names_empty(&self) -> Result<bool> {
-        if self.version < SCHEMA_WITHOUT_SUBSYSTEMS + 1 {
+        if self.version <= SCHEMA_WITHOUT_SUBSYSTEMS {
             return Ok(true);
         }
         Ok(self.count("subsystem_names")? == 0)
@@ -2967,7 +2967,7 @@ impl Store {
 
     /// Nom et description en cache pour l'empreinte `fingerprint` (REQ-262).
     pub fn subsystem_name(&self, fingerprint: &str) -> Result<Option<(String, String)>> {
-        if self.version < SCHEMA_WITHOUT_SUBSYSTEMS + 1 {
+        if self.version <= SCHEMA_WITHOUT_SUBSYSTEMS {
             return Ok(None);
         }
         let mut st = self
