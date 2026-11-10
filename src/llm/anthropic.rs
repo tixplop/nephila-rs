@@ -2,7 +2,9 @@
 
 use super::batch::{Answer, BatchApi, BatchLink, Collector, CreateError, LotStatus, Pending};
 use super::schema::Reply;
-use super::{anthropic_usage, http, CallStats, Complete, Generation, Retry, Structured, Tls};
+use super::{
+    anthropic_usage, http, served_model, CallStats, Complete, Generation, Retry, Structured, Tls,
+};
 use crate::config::Effort;
 use crate::error::{Error, Result, BLOCKED, TRUNCATED};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -452,7 +454,7 @@ impl Complete for AnthropicLlm {
         }
         let raw = sent?;
         let v = http::parse_body("anthropic", &raw)?;
-        stats.record_response(anthropic_usage(&v));
+        stats.record_response(anthropic_usage(&v), served_model(&v));
         if v["stop_reason"] == "refusal" {
             return Err(Error::Refused(BLOCKED.into()));
         }
@@ -823,6 +825,72 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(&e, Error::Refused(m) if m == BLOCKED), "{e:?}");
+    }
+
+    fn served_of(body: String) -> (String, Option<String>) {
+        let l = llm(fake_server(vec![(200, body)]));
+        let stats = CallStats::default();
+        let r = l.complete(
+            None,
+            None,
+            &stats,
+            "s".into(),
+            "u".into(),
+            Reply::File,
+            None,
+        );
+        (r.unwrap(), stats.served())
+    }
+
+    #[test]
+    fn req278_ac1_anthropic_served_model_whole_body_and_stream() {
+        let body = |model: serde_json::Value| {
+            json!({"stop_reason":"end_turn","content":[{"type":"text","text":"x"}],"model":model})
+                .to_string()
+        };
+        assert_eq!(
+            served_of(body(json!("claude-x-20250929"))),
+            ("x".into(), Some("claude-x-20250929".into()))
+        );
+        let max = "a".repeat(256);
+        assert_eq!(served_of(body(json!(max.clone()))), ("x".into(), Some(max)));
+        for bad in [json!(""), json!(3), json!("a".repeat(257))] {
+            assert_eq!(served_of(body(bad.clone())), ("x".into(), None), "{bad}");
+        }
+        let absent = json!({"stop_reason":"end_turn","content":[{"type":"text","text":"x"}]});
+        assert_eq!(served_of(absent.to_string()), ("x".into(), None));
+        let streamed = stream(Some("abc"), "end_turn").replace(
+            r#""message":{"usage""#,
+            r#""message":{"model":"claude-x-20250929","usage""#,
+        );
+        let l = llm(crate::llm::usage::sse_server(streamed));
+        let stats = CallStats::default();
+        let r = l.complete(
+            None,
+            None,
+            &stats,
+            "s".into(),
+            "u".into(),
+            Reply::File,
+            None,
+        );
+        assert_eq!(r.unwrap(), "abc");
+        assert_eq!(stats.served().as_deref(), Some("claude-x-20250929"));
+        let l = llm(crate::llm::usage::sse_server(stream(
+            Some("abc"),
+            "end_turn",
+        )));
+        let stats = CallStats::default();
+        let _ = l.complete(
+            None,
+            None,
+            &stats,
+            "s".into(),
+            "u".into(),
+            Reply::File,
+            None,
+        );
+        assert_eq!(stats.served(), None);
     }
 
     fn event(name: &str, data: serde_json::Value) -> String {

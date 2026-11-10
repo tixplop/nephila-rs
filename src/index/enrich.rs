@@ -996,6 +996,7 @@ fn traced_enrich(
     let ms = started.elapsed().as_millis();
     add_totals(totals, &stats, attempt);
     let tokens = tokens_suffix(&stats);
+    let served = served_suffix(&stats, llm.model());
     match &result {
         Ok(x) => {
             let n = x
@@ -1004,7 +1005,7 @@ fn traced_enrich(
                 .filter(|(id, _)| requested.contains(id))
                 .count();
             trace!(
-                "llm enrich fin {path} [{index}/{total}] ok ({} résumés, {} concepts, {}) {ms} ms{tokens}{mark}",
+                "llm enrich fin {path} [{index}/{total}] ok ({} résumés, {} concepts, {}) {ms} ms{served}{tokens}{mark}",
                 x.summaries.len(),
                 x.concepts.len(),
                 coverage_segment(n, requested.len())
@@ -1037,6 +1038,17 @@ fn add_totals(totals: &Mutex<LlmTotals>, stats: &CallStats, attempt: Attempt) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .add(stats, attempt.current >= 2);
+}
+
+/// Segment ` (modèle servi : <nom>)` de la ligne `llm enrich fin … ok` : le nom lu dans la réponse,
+/// seulement s'il diffère à la lettre du modèle demandé (REQ-278) ; échappé, jamais coupé.
+fn served_suffix(stats: &CallStats, requested: &str) -> String {
+    match stats.served() {
+        Some(name) if name != requested => {
+            format!(" (modèle servi : {})", crate::escape::data(&name))
+        }
+        _ => String::new(),
+    }
 }
 
 /// Fin de la ligne `llm enrich fin` : ` (<segment de jetons>)`, ou rien sans compte de jetons.
@@ -1091,6 +1103,7 @@ fn traced_lot_once(
     let ms = started.elapsed().as_millis();
     add_totals(totals, &stats, attempt);
     let tokens = tokens_suffix(&stats);
+    let served = served_suffix(&stats, llm.model());
     match &result {
         Ok(results) => {
             let (r, k) = results
@@ -1101,7 +1114,7 @@ fn traced_lot_once(
                 });
             let m: usize = items.iter().map(|i| i.node_ids.len()).sum();
             trace!(
-                "llm enrich fin {label} [1/1] ok ({r} résumés, {k} concepts, {}) {ms} ms{tokens}",
+                "llm enrich fin {label} [1/1] ok ({r} résumés, {k} concepts, {}) {ms} ms{served}{tokens}",
                 coverage_segment(r, m)
             )
         }

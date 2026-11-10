@@ -97,6 +97,8 @@ struct Assembler {
     refusal: Option<String>,
     stop: Value,
     usage: Value,
+    /// Nom du modèle servi : `message.model` (Anthropic), premier `model` non vide (OpenAI).
+    model: Value,
     done: bool,
 }
 
@@ -107,7 +109,10 @@ impl Assembler {
             return Ok(false);
         };
         match v["type"].as_str() {
-            Some("message_start") => self.usage = v["message"]["usage"].clone(),
+            Some("message_start") => {
+                self.usage = v["message"]["usage"].clone();
+                self.model = v["message"]["model"].clone();
+            }
             Some("content_block_start") => {
                 if self.text_block.is_none() && v["content_block"]["type"] == "text" {
                     self.text_block = v["index"].as_i64();
@@ -179,6 +184,9 @@ impl Assembler {
         if !v["usage"].is_null() {
             self.usage = v["usage"].clone();
         }
+        if self.model.is_null() && v["model"].as_str().is_some_and(|m| !m.is_empty()) {
+            self.model = v["model"].clone();
+        }
         Ok(false)
     }
 
@@ -194,8 +202,9 @@ impl Assembler {
                 json!([])
             };
             Some(
-                json!({"content": content, "stop_reason": self.stop, "usage": self.usage})
-                    .to_string(),
+                json!({"content": content, "stop_reason": self.stop, "usage": self.usage,
+                    "model": self.model})
+                .to_string(),
             )
         } else {
             if !self.done && self.stop.is_null() {
@@ -212,7 +221,7 @@ impl Assembler {
             }
             Some(
                 json!({"choices": [{"message": message, "finish_reason": self.stop}],
-                    "usage": self.usage})
+                    "usage": self.usage, "model": self.model})
                 .to_string(),
             )
         }
@@ -308,6 +317,21 @@ mod tests {
             Instant::now(),
         )
         .map(|b| serde_json::from_str(&b).unwrap())
+    }
+
+    #[test]
+    fn req278_ac1_assembled_body_keeps_the_model() {
+        let a = anthropic_stream("end_turn", true).replace(
+            r#""message":{"usage""#,
+            r#""message":{"model":"claude-x-1","usage""#,
+        );
+        assert_eq!(read(&a, "anthropic").unwrap()["model"], "claude-x-1");
+        let o = openai_stream("stop", true).replacen(
+            r#"{"choices":[{"delta":{"content":"ab"}}]}"#,
+            r#"{"model":"gpt-y-1","choices":[{"delta":{"content":"ab"}}]}"#,
+            1,
+        );
+        assert_eq!(read(&o, "openai").unwrap()["model"], "gpt-y-1");
     }
 
     #[test]

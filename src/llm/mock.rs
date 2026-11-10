@@ -173,7 +173,7 @@ impl MockLlm {
                 )));
             }
         }
-        stats.record_response(None);
+        stats.record_response(None, None);
         Ok(())
     }
 
@@ -327,7 +327,7 @@ impl MockLlm {
 
     fn ask_stats(&self, stats: &CallStats) -> Result<AskReply> {
         self.begin_call("_ask", 1, stats)?;
-        stats.record_response(None);
+        stats.record_response(None, None);
         self.check_malformed(&["_ask"])?;
         match self.read_fixture("_ask.json")? {
             Some(j) => AskReply::parse(&j),

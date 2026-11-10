@@ -20,7 +20,8 @@ mod usage;
 #[cfg(test)]
 pub(crate) use usage::recording_server;
 pub use usage::{
-    anthropic_usage, calls_line, openai_usage, tokens_segment, CallStats, LlmTotals, Usage,
+    anthropic_usage, calls_line, openai_usage, served_model, tokens_segment, CallStats, LlmTotals,
+    Usage,
 };
 
 use std::sync::atomic::AtomicBool;

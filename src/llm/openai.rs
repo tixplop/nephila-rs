@@ -2,7 +2,9 @@
 
 use super::batch::{Answer, BatchApi, BatchLink, Collector, CreateError, LotStatus, Pending};
 use super::schema::Reply;
-use super::{http, openai_usage, CallStats, Complete, Generation, Retry, Structured, Tls};
+use super::{
+    http, openai_usage, served_model, CallStats, Complete, Generation, Retry, Structured, Tls,
+};
 use crate::config::Effort;
 use crate::error::{Error, Result, BLOCKED, TRUNCATED};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -395,7 +397,7 @@ impl Complete for OpenAiLlm {
         }
         let raw = sent?;
         let v = http::parse_body("openai", &raw)?;
-        stats.record_response(openai_usage(&v));
+        stats.record_response(openai_usage(&v), served_model(&v));
         if v["choices"][0]["finish_reason"] == "content_filter"
             || v["choices"][0]["message"]["refusal"]
                 .as_str()
@@ -732,6 +734,64 @@ mod tests {
             None,
         );
         (r, stats)
+    }
+
+    #[test]
+    fn req278_ac1_openai_served_model_whole_body_and_stream() {
+        let served_of = |body: String| {
+            let l = OpenAiLlm::new(
+                Some(fake_server(vec![(200, body)])),
+                "m".into(),
+                None,
+                10,
+                &Tls::default(),
+                1,
+                gen(false, Effort::Low, false, 100),
+            );
+            let stats = CallStats::default();
+            let r = call(&l, &stats);
+            (r.unwrap(), stats.served())
+        };
+        let body = |model: Option<serde_json::Value>| {
+            let mut v = json!({"choices":[{"message":{"content":"x"},"finish_reason":"stop"}]});
+            if let Some(m) = model {
+                v["model"] = m;
+            }
+            v.to_string()
+        };
+        assert_eq!(
+            served_of(body(Some(json!("gpt-y-2025")))),
+            ("x".into(), Some("gpt-y-2025".into()))
+        );
+        for bad in [json!(""), json!(3), json!("a".repeat(257))] {
+            assert_eq!(
+                served_of(body(Some(bad.clone()))),
+                ("x".into(), None),
+                "{bad}"
+            );
+        }
+        assert_eq!(served_of(body(None)), ("x".into(), None));
+        let s = stream(Some("abc"), "stop")
+            .replacen(
+                r#"{"choices":[{"delta":{"role":"assistant"}}]}"#,
+                r#"{"model":"","choices":[{"delta":{"role":"assistant"}}]}"#,
+                1,
+            )
+            .replacen(
+                r#""choices":[{"delta":{"content":"a"}}]"#,
+                r#""model":"gpt-y-2025","choices":[{"delta":{"content":"a"}}]"#,
+                1,
+            )
+            .replacen(
+                r#""choices":[{"delta":{"content":"bc"}}]"#,
+                r#""model":"autre","choices":[{"delta":{"content":"bc"}}]"#,
+                1,
+            );
+        let (r, stats) = streamed(s);
+        assert_eq!(r.unwrap(), "abc");
+        assert_eq!(stats.served().as_deref(), Some("gpt-y-2025"));
+        let (_, stats) = streamed(stream(Some("abc"), "stop"));
+        assert_eq!(stats.served(), None);
     }
 
     #[test]

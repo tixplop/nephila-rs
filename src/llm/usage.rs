@@ -1,6 +1,6 @@
 //! Relevé d'un appel LLM : envois HTTP, réponse reçue et `usage` normalisé (REQ-165, DEC-134).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use serde_json::Value;
 
@@ -49,12 +49,21 @@ pub fn openai_usage(body: &Value) -> Option<Usage> {
     })
 }
 
+/// Nom du modèle qui a répondu : `body["model"]`, texte de 1 à 256 octets (REQ-278), sinon `None`.
+pub fn served_model(body: &Value) -> Option<String> {
+    body["model"]
+        .as_str()
+        .filter(|m| !m.is_empty() && m.len() <= 256)
+        .map(String::from)
+}
+
 /// Relevé d'un appel : le fil de l'appel l'écrit, l'appelant le lit après coup.
 #[derive(Debug)]
 pub struct CallStats {
     sends: Cell<u32>,
     responded: Cell<bool>,
     usage: Cell<Option<Usage>>,
+    served: RefCell<Option<String>>,
     /// Marque d'un sous-appel, ajoutée en fin de la ligne d'attente (REQ-231).
     mark: String,
     /// Début des traces d'attente et de pause : `llm enrich`, ou `llm sous-système` (REQ-261).
@@ -67,6 +76,7 @@ impl Default for CallStats {
             sends: Cell::new(0),
             responded: Cell::new(false),
             usage: Cell::new(None),
+            served: RefCell::new(None),
             mark: String::new(),
             word: "llm enrich",
         }
@@ -105,12 +115,17 @@ impl CallStats {
     pub fn usage(&self) -> Option<Usage> {
         self.usage.get()
     }
+    /// Nom du modèle lu dans la réponse (REQ-278), s'il y en a un.
+    pub fn served(&self) -> Option<String> {
+        self.served.borrow().clone()
+    }
     pub(crate) fn add_send(&self) {
         self.sends.set(self.sends.get().saturating_add(1));
     }
-    pub(crate) fn record_response(&self, usage: Option<Usage>) {
+    pub(crate) fn record_response(&self, usage: Option<Usage>, served: Option<String>) {
         self.responded.set(true);
         self.usage.set(usage);
+        *self.served.borrow_mut() = served;
     }
 }
 
@@ -302,7 +317,7 @@ mod tests {
         assert_eq!((s.sends(), s.responded(), s.usage()), (0, false, None));
         s.add_send();
         s.add_send();
-        s.record_response(Some(Usage::default()));
+        s.record_response(Some(Usage::default()), None);
         assert_eq!((s.sends(), s.responded()), (2, true));
         assert_eq!(s.usage(), Some(Usage::default()));
     }
@@ -313,7 +328,7 @@ mod tests {
             s.add_send();
         }
         if let Some(u) = usage {
-            s.record_response(u);
+            s.record_response(u, None);
         }
         s
     }

@@ -753,3 +753,107 @@ fn req147_ac9_without_verbose_no_stderr_line_mentions_communities() {
         assert!(!stderr(&o).contains("communautés"), "{}", stderr(&o));
     }
 }
+
+/// Réponse openai valide pour un fichier, portant `model` s'il est donné.
+fn served_reply(model: Option<&str>, content: &str) -> String {
+    let mut v = serde_json::json!({"choices":[{"message":{"role":"assistant","content":content},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}});
+    if let Some(m) = model {
+        v["model"] = serde_json::json!(m);
+    }
+    v.to_string()
+}
+
+const EMPTY_FILE: &str = r#"{"version":2,"summaries":[],"concepts":[]}"#;
+
+fn served_file_run(model: Option<&str>) -> (String, std::process::Output) {
+    let server = FakeServer::start(vec![(200, served_reply(model, EMPTY_FILE))]);
+    let env = openai_env(&server, 30, "class A {}\n");
+    let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-x")]);
+    (stderr(&o), o)
+}
+
+#[test]
+fn req278_ac8_served_model_segment_on_file_line() {
+    let (err, _) = served_file_run(Some("m-20250929"));
+    let ends: Vec<&str> = err
+        .lines()
+        .filter(|l| l.contains("llm enrich fin A.java [1/1] ok ("))
+        .collect();
+    assert_eq!(ends.len(), 1, "{err}");
+    assert_eq!(ends[0].matches("modèle servi").count(), 1, "{err}");
+    let at = ends[0]
+        .find(" ms (modèle servi : m-20250929)")
+        .expect(ends[0]);
+    let tokens = ends[0].find(" (jetons : ");
+    assert!(tokens.expect(ends[0]) > at, "{}", ends[0]);
+
+    // nom égal au nom demandé, ou absent : aucun segment
+    for model in [Some("m"), None] {
+        let (err, _) = served_file_run(model);
+        assert!(!err.contains("modèle servi"), "{model:?}: {err}");
+    }
+
+    // caractère de contrôle échappé
+    let (err, _) = served_file_run(Some("m-\u{1b}x"));
+    assert!(err.contains(" ms (modèle servi : m-\\u{001B}x)"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err:?}");
+
+    // fin en erreur : pas de segment
+    let server = FakeServer::start(vec![(
+        200,
+        serde_json::json!({"model":"autre","choices":[{"message":{"role":"assistant","content":"{"},"finish_reason":"length"}]}).to_string(),
+    )]);
+    let env = openai_env(&server, 30, "class A {}\n");
+    let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-x")]);
+    let err = stderr(&o);
+    assert!(err.contains("llm enrich fin"), "{err}");
+    assert!(!err.contains("modèle servi"), "{err}");
+
+    // sans --verbose : rien
+    let server = FakeServer::start(vec![(200, served_reply(Some("m-20250929"), EMPTY_FILE))]);
+    let env = openai_env(&server, 30, "class A {}\n");
+    let o = env.cmd_with(&["build"], &[("NEPHILA_T049_KEY", "sk-x")]);
+    assert!(!stderr(&o).contains("modèle servi"));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("modèle servi"));
+}
+
+#[test]
+fn req278_ac8_served_model_segment_on_lot_line_and_mock_unchanged() {
+    let lot = serde_json::json!({"version":3,"files":[
+        {"file":"A.java","summaries":[],"concepts":[]},
+        {"file":"B.java","summaries":[],"concepts":[]},
+        {"file":"C.java","summaries":[],"concepts":[]}]})
+    .to_string();
+    let server = FakeServer::start(vec![(200, served_reply(Some("m-20250929"), &lot))]);
+    let env = Env::new(&format!(
+        "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T049_KEY\"\n\
+         concurrency = 1\ntimeout_secs = 30\nbatch_files = 3\n",
+        server.base_url
+    ));
+    fs::remove_dir_all(&env.repo).unwrap();
+    fs::create_dir_all(&env.repo).unwrap();
+    for n in ["A", "B", "C"] {
+        fs::write(
+            env.repo.join(format!("{n}.java")),
+            format!("class {n} {{}}\n"),
+        )
+        .unwrap();
+    }
+    let o = env.cmd_with(&["build", "-v"], &[("NEPHILA_T049_KEY", "sk-x")]);
+    let err = stderr(&o);
+    let ends: Vec<&str> = err
+        .lines()
+        .filter(|l| l.contains("llm enrich fin lot A.java +2 [1/1] ok ("))
+        .collect();
+    assert_eq!(ends.len(), 1, "{err}");
+    assert_eq!(
+        ends[0].matches("modèle servi : m-20250929").count(),
+        1,
+        "{err}"
+    );
+    assert!(ends[0].contains(" ms (modèle servi : m-20250929)"), "{err}");
+
+    let env = Env::mock();
+    let o = env.cmd(&["build", "-v"]);
+    assert!(!stderr(&o).contains("modèle servi"));
+}
