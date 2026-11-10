@@ -789,24 +789,6 @@ fn suite_mock(sc: &Scenario, lines: &mut Vec<String>) -> Vec<String> {
     diffs
 }
 
-#[test]
-fn req066_ac5_update_egale_build_no_llm() {
-    let diffs: Vec<String> = SCENARIOS
-        .iter()
-        .flat_map(|sc| suite_no_llm(sc, &mut Vec::new()))
-        .collect();
-    assert!(diffs.is_empty(), "{}", diffs.join("\n"));
-}
-
-#[test]
-fn req066_ac5_update_egale_second_build_mock() {
-    let diffs: Vec<String> = SCENARIOS
-        .iter()
-        .flat_map(|sc| suite_mock(sc, &mut Vec::new()))
-        .collect();
-    assert!(diffs.is_empty(), "{}", diffs.join("\n"));
-}
-
 /// Les scénarios de REQ-065 : sorties de `build` et d'`update`.
 fn scenario_065(c: &support::Case, lines: &mut Vec<String>) {
     let env = Env::new(c.repo, c.mock);
@@ -830,10 +812,12 @@ fn req070_ac2_oracle_0_21_0() {
     for c in CASES {
         scenario_065(c, &mut lines);
     }
+    let mut diffs = Vec::new();
     for sc in SCENARIOS {
-        let _ = suite_no_llm(sc, &mut lines);
-        let _ = suite_mock(sc, &mut lines);
+        diffs.extend(suite_no_llm(sc, &mut lines));
+        diffs.extend(suite_mock(sc, &mut lines));
     }
+    assert!(diffs.is_empty(), "AC-066-5 :\n{}", diffs.join("\n"));
     lines.sort();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/oracle_0_21_0.txt");
     let actual = lines.join("\n") + "\n";
