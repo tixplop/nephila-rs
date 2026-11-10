@@ -308,6 +308,19 @@ api_key_env = "ANTHROPIC_API_KEY"
 # clé remplace cette liste ; un tableau vide retire toute exclusion.
 # enrich_exclude = ["**/test/**", "**/__tests__/**", "*.spec.*", "*.test.*", "**/generated/**", "**/migrations/**", "*.min.js", "*.d.ts"]
 
+# --- Noms de modèle équivalents ---
+# Section [model_aliases] : chaque ligne "<nom>" = "<nom>" dit que les deux noms désignent le
+# même modèle pour les enrichissements conservés : passer de l'un à l'autre dans model ne
+# réenrichit rien, comme entre un alias et sa version datée. Sans cette section, deux noms
+# différents restent deux modèles. Trop large, elle cache un vrai changement de modèle :
+# n'y écrivez que des noms d'un même modèle. Une valeur ne peut pas être aussi une clé.
+# Sans effet sur query ask. Lue ici seulement :
+# .nephila.toml la refuse.
+# Placez cette section juste avant [ask] : toute clé écrite après la ligne [model_aliases]
+# en fait partie.
+# [model_aliases]
+# "claude-sonnet-4-5" = "claude-sonnet-4-5-20250929"
+
 # --- Réglages de query ask ---
 # Section [ask] : elle ne vaut que pour nephila query ask. L'enrichissement (build, update)
 # n'en lit rien, et la changer ne réenrichit rien. Les quatre premières clés remplacent, pour

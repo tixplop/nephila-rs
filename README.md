@@ -367,6 +367,7 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 | `model` | Nom du modèle | obligatoire, sauf `mock` |
 | `summary_language` | Langue des résumés et des noms de concepts, en toutes lettres (`"anglais"`) ; aussi dans `.nephila.toml` | `"français"` |
 | `model_override` | Modèle imposé par `.nephila.toml` (`model`, `[ask].model`) : `"allow"` l'accepte, `"warn"` aussi mais avertit et refuse au-delà de 50 fichiers à réenrichir sans `--accept-project-model`, `"deny"` l'ignore ; configuration personnelle seulement | `"warn"` |
+| `model_aliases` | Table de noms tenus pour le même modèle, ex. `"claude-sonnet-4-5" = "claude-sonnet-4-5-20250929"` : passer de l'un à l'autre ne réenrichit rien ; trop large, elle cache un vrai changement de modèle ; configuration personnelle seulement | aucune |
 | `api_key_env` | **Nom** de la variable d'environnement qui contient la clé | obligatoire pour `anthropic` |
 | `base_url` | URL du serveur, **sans** `/v1` final | celle du fournisseur |
 | `max_chunk_chars` | Taille maximale d'un morceau envoyé au LLM | 60000 |
@@ -463,6 +464,8 @@ Les autorités publiques restent reconnues. En dernier recours, `tls_insecure = 
 Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, concepts des documents). `enrich_code = true` dans la configuration personnelle, ou `--enrich-code` pour une commande, enrichit aussi le code et les fichiers de build et de données ; sans lui, un fichier de code n'est ni envoyé ni compté « à enrichir ». Un fichier garde ses enrichissements tant que son contenu, le modèle, la langue des résumés et le prompt de la version de nephila ne changent pas : un second `build` sans changement ne fait aucun appel, et changer `model` ou `summary_language` réenrichit une fois chaque fichier de la portée.
 
 `enrich_include` et `enrich_exclude` réduisent cette portée par motifs (syntaxe d'`exclude`), sans toucher au graphe : un fichier hors portée garde ses nœuds et ses liens, n'est pas envoyé et ne compte pas « à enrichir » ; le bilan compte ces fichiers dans `fichiers hors portée d'enrichissement`. Changer ces motifs ne réenrichit rien. Exception à la priorité : ceux de `.nephila.toml` s'ajoutent à ceux de la configuration personnelle, liste par défaut comprise, si bien qu'un dépôt ne peut que réduire la portée ; pour enrichir vos tests, écrivez `enrich_exclude = []` dans la configuration personnelle.
+
+Chaque enrichissement garde aussi le nom du modèle qui a répondu (colonne `served_model` de `enrichments`, dans `.nephila/graph.db`) : un alias qui passe à une nouvelle version ne réenrichit rien, et `build --verbose` donne ce nom quand il diffère de `model`.
 
 ### Lots et gros fichiers
 
