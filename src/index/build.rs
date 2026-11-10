@@ -189,10 +189,22 @@ fn effective_config(
     if !from_project.is_empty() {
         tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
     }
+    let same_model = config
+        .model_names(&config.model)
+        .into_iter()
+        .filter(|n| *n != config.model)
+        .collect::<Vec<_>>()
+        .join(",");
+    let same_model = if same_model.is_empty() {
+        String::new()
+    } else {
+        format!(" (même modèle que {same_model})")
+    };
     trace!(
-        "config: llm={} model={} enrich_code={} summary_language=\"{}\" thinking={} effort={}{} max_output_tokens={} nodes_per_call={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}{}",
+        "config: llm={} model={}{} enrich_code={} summary_language=\"{}\" thinking={} effort={}{} max_output_tokens={} nodes_per_call={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}{}",
         config.provider.as_str(),
         config.model,
+        same_model,
         config.enrich_code,
         config.summary_language,
         config.thinking,

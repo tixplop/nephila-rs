@@ -1520,3 +1520,141 @@ fn REQ275_AC8_AC13_ligne_config_de_build_et_d_ask() {
     let mark = l.split("(.nephila.toml").nth(1).unwrap();
     assert!(!mark.contains("temperature"), "{l}");
 }
+
+// ---- T-375 : table `model_aliases` (REQ-277) ----
+
+#[test]
+fn REQ277_AC2_AC15_table_invalide_refusee_avant_tout_parcours() {
+    for (toml, key, expected, got) in [
+        (
+            "model_aliases = \"x\"\n",
+            "model_aliases",
+            "une table de noms de modèle",
+            "\"x\"",
+        ),
+        (
+            "[model_aliases]\n\"a\" = 1\n",
+            "model_aliases.a",
+            "un nom de modèle non vide",
+            "1",
+        ),
+        (
+            "[model_aliases]\n\"a\" = \"\"\n",
+            "model_aliases.a",
+            "un nom de modèle non vide",
+            "\"\"",
+        ),
+        (
+            "[model_aliases]\n\"\" = \"b\"\n",
+            "model_aliases.\"\"",
+            "un nom de modèle non vide",
+            "\"\"",
+        ),
+        (
+            "[model_aliases]\n\"a\" = \"a\"\n",
+            "model_aliases.a",
+            "un nom différent de la clé",
+            "\"a\"",
+        ),
+        (
+            "[model_aliases]\n\"a\" = \"b\"\n\"b\" = \"c\"\n",
+            "model_aliases.a",
+            "un nom qui n'est pas aussi une clé de model_aliases",
+            "\"b\"",
+        ),
+    ] {
+        let env = Env::new(&format!("{MOCK}{toml}"));
+        let want = format!(
+            "erreur: configuration invalide ({}) : clé « {key} » doit être {expected} (reçu : {got})\n",
+            env.config.display()
+        );
+        for args in [&["build"][..], &["update"][..], &["query", "ask", "x"][..]] {
+            let o = env.run(args);
+            assert!(!o.status.success(), "{toml} {args:?}");
+            assert!(o.stdout.is_empty(), "{toml} {args:?}");
+            assert_eq!(stderr(&o), want, "{toml} {args:?}");
+            assert!(!env.repo.join(".nephila").exists(), "{toml} {args:?}");
+        }
+        for sub in ["build", "update"] {
+            let o = env.run(&[sub, "--no-llm"]);
+            assert_eq!(o.status.code(), Some(0), "{toml} {sub}: {}", stderr(&o));
+        }
+    }
+}
+
+#[test]
+fn REQ277_AC12_cle_refusee_hors_de_la_configuration_personnelle_de_premier_niveau() {
+    let env = Env::new(MOCK);
+    fs::write(
+        env.repo.join(".nephila.toml"),
+        "[model_aliases]\n\"a\" = \"b\"\n",
+    )
+    .unwrap();
+    let o = env.run(&["build"]);
+    assert!(!o.status.success());
+    let e = stderr(&o);
+    assert!(e.contains("clé inconnue `model_aliases`"), "{e}");
+    assert!(
+        !e.split("clés permises")
+            .nth(1)
+            .unwrap()
+            .contains("model_aliases"),
+        "{e}"
+    );
+    fs::remove_file(env.repo.join(".nephila.toml")).unwrap();
+    env.write_config(&format!("{MOCK}[ask]\nmodel_aliases = \"x\"\n"));
+    let o = env.run(&["build"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("unknown field `model_aliases`"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn REQ277_AC14_segment_meme_modele_de_la_ligne_config() {
+    let env = Env::new(MOCK);
+    let table = "[model_aliases]\n\"m-b\" = \"m-a\"\n\"m-c\" = \"m-a\"\n";
+    let cmds: [&[&str]; 2] = [&["build", "--verbose"], &["update", "--verbose"]];
+    let without = |args: &[&str], env: &Env| config_line(&env.run(args));
+    let strip = |l: &str| l.split_once(' ').map(|(_, r)| r.to_string()).unwrap();
+    env.write_config(&format!("{MOCK}model = \"m-a\"\n"));
+    let base: Vec<String> = cmds.iter().map(|a| strip(&without(a, &env))).collect();
+    for b in &base {
+        assert!(!b.contains("même modèle que"), "{b}");
+    }
+    env.write_config(&format!("{MOCK}model = \"m-a\"\n{table}"));
+    for a in cmds {
+        let l = config_line(&env.run(a));
+        assert_eq!(
+            l.matches(" model=m-a (même modèle que m-b,m-c) enrich_code=")
+                .count(),
+            1,
+            "{l}"
+        );
+        assert_eq!(l.matches("même modèle que").count(), 1, "{l}");
+    }
+    // Un nom équivalent : les deux autres noms.
+    env.write_config(&format!("{MOCK}model = \"m-c\"\n{table}"));
+    let l = config_line(&env.run(&["build", "--verbose"]));
+    assert!(
+        l.contains(" model=m-c (même modèle que m-a,m-b) enrich_code="),
+        "{l}"
+    );
+    // Table qui ne nomme pas le modèle : ligne d'aujourd'hui.
+    env.write_config(&format!(
+        "{MOCK}model = \"m-z\"\n[model_aliases]\n\"m-b\" = \"m-a\"\n"
+    ));
+    let l = config_line(&env.run(&["build", "--verbose"]));
+    assert!(!l.contains("même modèle que"), "{l}");
+    env.write_config(&format!("{MOCK}model = \"m-z\"\n"));
+    let plain = config_line(&env.run(&["build", "--verbose"]));
+    assert_eq!(strip(&l), strip(&plain));
+    // `query ask` et `--no-llm` : jamais de segment.
+    env.write_config(&format!("{MOCK}model = \"m-a\"\n{table}"));
+    let o = env.run(&["query", "ask", "--verbose", "x"]);
+    assert!(!stderr(&o).contains("même modèle que"), "{}", stderr(&o));
+    let o = env.run(&["build", "--no-llm", "--verbose"]);
+    assert!(!stderr(&o).contains("même modèle que"), "{}", stderr(&o));
+}

@@ -1,5 +1,6 @@
 //! Configuration du fournisseur LLM (REQ-002).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rustls::pki_types::pem::PemObject;
@@ -473,6 +474,8 @@ pub struct Config {
     pub max_output_tokens: u32,
     /// Température des réponses, de 0 à 2 ; `None` = rien n'est envoyé (REQ-275).
     pub temperature: Option<f64>,
+    /// Noms de modèle tenus pour le même modèle : nom → nom canonique (REQ-277).
+    pub model_aliases: BTreeMap<String, String>,
     /// Schéma JSON imposé à la réponse (REQ-202 ; `query ask` : REQ-204).
     pub structured_output: StructuredOutput,
     /// Nom de la clé qui a donné `structured_output`, pour les traces (REQ-203).
@@ -513,6 +516,7 @@ struct RawConfig {
     effort: Option<toml::Value>,
     max_output_tokens: Option<toml::Value>,
     temperature: Option<toml::Value>,
+    model_aliases: Option<toml::Value>,
     structured_output: Option<toml::Value>,
     tls_ca_cert: Option<String>,
     tls_insecure: Option<bool>,
@@ -610,6 +614,22 @@ impl Config {
             from_project.retain(|k| *k != "format_retries");
         }
         (self, from_project)
+    }
+
+    /// Noms tenus pour le même modèle que `model` : lui-même, la valeur qu'il désigne et toutes
+    /// les clés qui y mènent, sans doublon, dans l'ordre des octets (REQ-277).
+    pub fn model_names(&self, model: &str) -> Vec<String> {
+        let canonical = self.model_aliases.get(model).map_or(model, String::as_str);
+        let mut names = vec![canonical.to_string(), model.to_string()];
+        names.extend(
+            self.model_aliases
+                .iter()
+                .filter(|(_, v)| v.as_str() == canonical)
+                .map(|(k, _)| k.clone()),
+        );
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Segment `temperature` de la ligne `config`, précédé d'une espace ; vide sans la clé
@@ -993,6 +1013,40 @@ impl Config {
             Some(toml::Value::Float(f)) if (0.0..=2.0).contains(f) => Some(*f),
             Some(v) => return Err(invalid("temperature", "un nombre de 0 à 2", v)),
         };
+        let model_aliases = match &raw.model_aliases {
+            None => BTreeMap::new(),
+            Some(toml::Value::Table(t)) => {
+                let mut map = BTreeMap::new();
+                for (k, v) in t {
+                    let name = format!("model_aliases.{}", crate::escape::path(k));
+                    let empty_key = toml::Value::String(String::new());
+                    let text = match v {
+                        toml::Value::String(s) if !k.is_empty() && !s.is_empty() => s,
+                        _ if k.is_empty() => {
+                            return Err(invalid(
+                                "model_aliases.\"\"",
+                                "un nom de modèle non vide",
+                                &empty_key,
+                            ))
+                        }
+                        _ => return Err(invalid(&name, "un nom de modèle non vide", v)),
+                    };
+                    if text == k {
+                        return Err(invalid(&name, "un nom différent de la clé", v));
+                    }
+                    if t.contains_key(text) {
+                        return Err(invalid(
+                            &name,
+                            "un nom qui n'est pas aussi une clé de model_aliases",
+                            v,
+                        ));
+                    }
+                    map.insert(k.clone(), text.clone());
+                }
+                map
+            }
+            Some(v) => return Err(invalid("model_aliases", "une table de noms de modèle", v)),
+        };
         let structured_output = match &raw.structured_output {
             None => StructuredOutput::Auto,
             Some(v) => match v.as_str().and_then(StructuredOutput::parse) {
@@ -1100,6 +1154,7 @@ impl Config {
             effort_explicit: raw.effort.is_some(),
             max_output_tokens,
             temperature,
+            model_aliases,
             structured_output,
             structured_key: "structured_output",
             tls_ca_cert,
@@ -1207,6 +1262,7 @@ mod project_tests {
             effort_explicit: false,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             temperature: None,
+            model_aliases: BTreeMap::new(),
             structured_output: StructuredOutput::Auto,
             structured_key: "structured_output",
             tls_ca_cert: None,
@@ -1547,6 +1603,89 @@ mod llm_options_tests {
         }
         assert!(!ASK_SETTINGS.contains(&"temperature"));
         assert_eq!(ASK_SETTINGS.len(), 7);
+    }
+
+    #[test]
+    fn req277_ac1_table_de_noms_equivalents() {
+        let none = parse("").unwrap();
+        assert!(none.model_aliases.is_empty());
+        assert_eq!(none.model_names("a"), vec!["a"]);
+        let empty = parse("[model_aliases]\n").unwrap();
+        assert!(empty.model_aliases.is_empty());
+        assert_eq!(empty.model_names("a"), vec!["a"]);
+        let c = parse("[model_aliases]\n\"a\" = \"b\"\n\"c\" = \"b\"\n").unwrap();
+        for m in ["a", "b", "c"] {
+            assert_eq!(c.model_names(m), vec!["a", "b", "c"], "{m}");
+        }
+        assert_eq!(c.model_names("d"), vec!["d"]);
+        assert!(!ASK_SETTINGS.contains(&"model_aliases"));
+        assert!(parse("[ask]\nmodel_aliases = 1\n").is_err());
+    }
+
+    #[test]
+    fn req277_ac15_table_invalide() {
+        let head = "configuration invalide (/x/config.toml) : clé « ";
+        for (toml, key, expected, got) in [
+            (
+                "model_aliases = \"x\"",
+                "model_aliases",
+                "une table de noms de modèle",
+                "\"x\"",
+            ),
+            (
+                "[model_aliases]\n\"a\" = 1",
+                "model_aliases.a",
+                "un nom de modèle non vide",
+                "1",
+            ),
+            (
+                "[model_aliases]\n\"a\" = \"\"",
+                "model_aliases.a",
+                "un nom de modèle non vide",
+                "\"\"",
+            ),
+            (
+                "[model_aliases]\n\"\" = \"b\"",
+                "model_aliases.\"\"",
+                "un nom de modèle non vide",
+                "\"\"",
+            ),
+            (
+                "[model_aliases]\n\"a\" = \"a\"",
+                "model_aliases.a",
+                "un nom différent de la clé",
+                "\"a\"",
+            ),
+            (
+                "[model_aliases]\n\"a\" = \"b\"\n\"b\" = \"c\"",
+                "model_aliases.a",
+                "un nom qui n'est pas aussi une clé de model_aliases",
+                "\"b\"",
+            ),
+            // Plusieurs fautes : ordre des octets des clés, puis ordre des contrôles.
+            (
+                "[model_aliases]\n\"z\" = 1\n\"b\" = \"b\"",
+                "model_aliases.b",
+                "un nom différent de la clé",
+                "\"b\"",
+            ),
+            (
+                "[model_aliases]\n\"b\" = \"b\"\n\"\" = \"q\"",
+                "model_aliases.\"\"",
+                "un nom de modèle non vide",
+                "\"\"",
+            ),
+        ] {
+            let msg = parse(toml).unwrap_err().to_string();
+            assert_eq!(
+                msg,
+                format!("{head}{key} » doit être {expected} (reçu : {got})"),
+                "{toml}"
+            );
+            for bad in ["invalid type", "TOML", "expected"] {
+                assert!(!msg.contains(bad), "{msg}");
+            }
+        }
     }
 
     #[test]
