@@ -545,7 +545,7 @@ fn req115_ac3_texte_exact_et_place() {
 }
 
 /// Vérifie le motif de AC-115-3 (pas de dépendance de test nouvelle) :
-/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 14 en [0-9]+ ms$`.
+/// `^trace: \[[0-9]+\.[0-9]{3}s\] schéma: migration 7 vers 15 en [0-9]+ ms$`.
 fn is_migration_trace_7(line: &str) -> bool {
     {
         let Some(rest) = line.strip_prefix("trace: [") else {
@@ -636,7 +636,7 @@ fn req147_ac4_update_migrates_schema8_to_current_and_traces_it() {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 8 vers 14 en ")),
+            .any(|l| l.starts_with("schéma: migration 8 vers 15 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -650,7 +650,7 @@ fn req147_ac4_update_migrates_schema8_to_current_and_traces_it() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v, "14");
+    assert_eq!(v, "15");
 }
 
 #[test]
@@ -663,7 +663,7 @@ fn req147_ac4_schema7_reaches_the_same_result_as_schema8() {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with("schéma: migration 7 vers 14 en ")),
+            .any(|l| l.starts_with("schéma: migration 7 vers 15 en ")),
         "{}",
         text(&o.stderr)
     );
@@ -728,7 +728,7 @@ fn assert_ac173_4_chain(env: &Env, from: i32) {
     assert!(
         trace_lines(&o.stderr)
             .iter()
-            .any(|l| l.starts_with(&format!("schéma: migration {from} vers 14 en "))),
+            .any(|l| l.starts_with(&format!("schéma: migration {from} vers 15 en "))),
         "{}",
         text(&o.stderr)
     );
@@ -794,14 +794,14 @@ fn req226_ac7_schema10_is_read_unchanged_then_migrated_by_update() {
 
     let o = env.ok(&["update", "--no-llm", "--verbose"]);
     assert_eq!(env.user_version(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 14);
+    assert_eq!(SCHEMA_VERSION, 15);
     let migration: Vec<_> = trace_lines(&o.stderr)
         .into_iter()
         .filter(|l| l.starts_with("schéma: migration"))
         .collect();
     assert_eq!(migration.len(), 1, "{migration:?}");
     assert!(
-        migration[0].starts_with("schéma: migration 10 vers 14 en ")
+        migration[0].starts_with("schéma: migration 10 vers 15 en ")
             && migration[0].ends_with(" ms"),
         "{migration:?}"
     );
@@ -815,15 +815,15 @@ fn req226_ac7_schema10_is_read_unchanged_then_migrated_by_update() {
 }
 
 #[test]
-fn req226_ac7_older_schemas_reach_schema_14() {
+fn req226_ac7_older_schemas_reach_schema_15() {
     for from in [5, 6, 7, 8] {
         let env = built_at(from);
         let o = env.ok(&["update", "--no-llm", "--verbose"]);
-        assert_eq!(env.user_version(), 14, "schéma {from}");
+        assert_eq!(env.user_version(), 15, "schéma {from}");
         assert!(
             trace_lines(&o.stderr)
                 .iter()
-                .any(|l| l.starts_with(&format!("schéma: migration {from} vers 14 en "))),
+                .any(|l| l.starts_with(&format!("schéma: migration {from} vers 15 en "))),
             "{}",
             text(&o.stderr)
         );
@@ -835,7 +835,7 @@ fn req226_ac7_older_schemas_reach_schema_14() {
     }
     let (env, _) = enriched_at(9);
     env.ok(&["update", "--no-llm"]);
-    assert_eq!(env.user_version(), 14);
+    assert_eq!(env.user_version(), 15);
 }
 
 // ---- REQ-245 : schéma 12, doc gardée par déclaration (DEC-180) ----
@@ -860,14 +860,14 @@ fn req245_ac1_schema11_is_read_unchanged_then_migrated_by_update() {
     let resolution_before = resolution(&env);
 
     let o = env.ok(&["update", "--no-llm", "--verbose"]);
-    assert_eq!(env.user_version(), 14);
+    assert_eq!(env.user_version(), 15);
     let migration: Vec<_> = trace_lines(&o.stderr)
         .into_iter()
         .filter(|l| l.starts_with("schéma: migration"))
         .collect();
     assert_eq!(migration.len(), 1, "{migration:?}");
     assert!(
-        migration[0].starts_with("schéma: migration 11 vers 14 en ")
+        migration[0].starts_with("schéma: migration 11 vers 15 en ")
             && migration[0].ends_with(" ms"),
         "{migration:?}"
     );
@@ -1016,7 +1016,7 @@ fn req258_ac6_schema12_is_read_unchanged_then_migrated_by_update() {
     }
     // `update` avec le LLM actif : migration sans aucun appel, entrées inchangées.
     env.ok(&["update"]);
-    assert_eq!(env.user_version(), 14);
+    assert_eq!(env.user_version(), 15);
     assert!(env.logged().is_empty(), "{:?}", env.logged());
     assert_eq!(env.enrichments(), initial);
     let used: Vec<i64> = env
@@ -1051,7 +1051,7 @@ fn req258_ac6_downgrade_keeps_the_entry_with_the_greatest_used_at() {
     assert_eq!(rows, applied);
     assert_eq!(rows.iter().find(|r| r.0 == "README.md").unwrap().2, "autre");
     env.ok(&["update", "--no-llm"]);
-    assert_eq!(env.user_version(), 14);
+    assert_eq!(env.user_version(), 15);
     assert_eq!(env.enrichments(), rows);
 }
 
@@ -1096,7 +1096,7 @@ fn req262_ac5_schema13_is_read_unchanged_then_migrated_by_update() {
     let json = text(&env.ok(&["query", "community", "--json"]).stdout);
     assert!(!json.contains("description"), "{json}");
     env.ok(&["update", "--no-llm"]);
-    assert_eq!(env.user_version(), 14);
+    assert_eq!(env.user_version(), 15);
     assert_eq!(communities_sql(&env), fresh_sql);
     assert_eq!(community_tables(&env), fresh_communities);
     let names: i64 = env
@@ -1104,4 +1104,51 @@ fn req262_ac5_schema13_is_read_unchanged_then_migrated_by_update() {
         .query_row("SELECT COUNT(*) FROM subsystem_names", [], |r| r.get(0))
         .unwrap();
     assert_eq!(names, 0);
+}
+
+// ---- REQ-278 : schéma 15, modèle servi enregistré avec l'enrichissement (DEC-208) ----
+
+#[test]
+fn req278_ac6_schema14_is_read_unchanged_then_migrated_by_update_without_any_call() {
+    let env = Env::new();
+    env.build_enriched();
+    let initial = env.enrichments();
+    schema6::schema7::schema8::schema9::schema10::schema11::schema12::schema13::schema14::downgrade_to_14(&env.db());
+    assert_eq!(env.user_version(), 14);
+    assert_eq!(env.enrichments(), initial);
+    // Lu seul : `status` et `query` répondent sans migrer.
+    for args in [
+        &["status"][..],
+        &["query", "neighbors", "OrderRepository.save"][..],
+    ] {
+        let o = env.run(args);
+        assert_eq!(o.status.code(), Some(0), "{args:?} : {}", text(&o.stderr));
+        assert_eq!(env.user_version(), 14, "{args:?}");
+    }
+    // `update` avec le LLM actif : migration sans aucun appel, colonnes d'avant identiques.
+    env.ok(&["update"]);
+    assert_eq!(env.user_version(), 15);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    assert_eq!(env.enrichments(), initial);
+    let served: Vec<Option<String>> = env
+        .db()
+        .prepare("SELECT served_model FROM enrichments")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        !served.is_empty() && served.iter().all(Option::is_none),
+        "{served:?}"
+    );
+    let version: String = env
+        .db()
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "15");
 }

@@ -982,7 +982,7 @@ fn traced_enrich(
             &label, path, index, excerpt, text, requested, known, stop, &stats, fault, cached,
         );
         add_totals(totals, &stats, attempt);
-        return result;
+        return with_served(result, &stats);
     }
     trace!(
         "llm enrich départ {path} [{index}/{total}] {} car.{}{mark}",
@@ -1019,7 +1019,28 @@ fn traced_enrich(
             trace::short(&trace_detail(e), trace::MAX_MESSAGE_CHARS)
         ),
     }
-    result
+    with_served(result, &stats)
+}
+
+/// Résultat d'un appel marqué du nom du modèle servi lu dans sa réponse (REQ-278).
+fn with_served(result: Result<Enrichment>, stats: &CallStats) -> Result<Enrichment> {
+    result.map(|mut x| {
+        x.served = stats.served().into_iter().collect();
+        x
+    })
+}
+
+/// Comme `with_served` pour chaque fichier réussi d'un lot : le nom de la réponse du lot.
+fn lot_with_served(
+    result: Result<Vec<(String, Result<Enrichment>)>>,
+    stats: &CallStats,
+) -> Result<Vec<(String, Result<Enrichment>)>> {
+    result.map(|files| {
+        files
+            .into_iter()
+            .map(|(path, r)| (path, with_served(r, stats)))
+            .collect()
+    })
 }
 
 /// Marque d'un sous-appel (REQ-231) : ` (sous-appel <rang>)`, rangs de `path` joints par `.` ;
@@ -1091,7 +1112,7 @@ fn traced_lot_once(
     if !trace::enabled() {
         let result = llm.enrich_lot_labeled(&format!("{label} [1/1]"), items, stop, &stats, fault);
         add_totals(totals, &stats, attempt);
-        return result;
+        return lot_with_served(result, &stats);
     }
     trace!(
         "llm enrich départ {label} [1/1] {} car.{}",
@@ -1126,7 +1147,7 @@ fn traced_lot_once(
             trace::short(&trace_detail(e), trace::MAX_MESSAGE_CHARS)
         ),
     }
-    result
+    lot_with_served(result, &stats)
 }
 
 /// Plan d'appels d'un fichier (DEC-059, DEC-061) : couples (indice du morceau, liste de nœuds
@@ -1948,6 +1969,7 @@ fn queue_done(
         summaries: x.summaries.clone(),
         concepts,
         refs,
+        served_model: (!x.served.is_empty()).then(|| x.served.join(", ")),
     });
 }
 
@@ -6524,6 +6546,7 @@ mod tests {
 
     fn kept_of(nodes: &[&str], concepts: usize) -> Enrichment {
         Enrichment {
+            served: Vec::new(),
             summaries: nodes
                 .iter()
                 .map(|n| (n.to_string(), format!("Résumé de {n}.")))

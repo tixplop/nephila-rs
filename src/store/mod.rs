@@ -29,7 +29,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -61,8 +61,14 @@ const SCHEMA_WITHOUT_ENRICH_CALLS: i32 = 10;
 /// Dernier schéma sans `declarations.doc`, migré sur place (DEC-180).
 const SCHEMA_WITHOUT_DECLARATION_DOC: i32 = 11;
 
-/// Déclaration de `enrichments`, identique au caractère près à celle de `schema.sql` (DEC-190).
-const ENRICHMENTS_DDL: &str = "CREATE TABLE enrichments (\n    path           TEXT NOT NULL,\n    content_hash   TEXT NOT NULL,\n    model          TEXT NOT NULL,\n    prompt_version INTEGER NOT NULL,\n    payload        TEXT NOT NULL,\n    language       TEXT NOT NULL,\n    used_at        INTEGER NOT NULL,\n    PRIMARY KEY (path, content_hash, model, prompt_version, language)\n);";
+/// Déclaration de `enrichments` au schéma 13 (sans `served_model`), pour la migration 12 -> 13
+/// (DEC-190) ; 14 -> 15 ajoute la colonne.
+const ENRICHMENTS_DDL_13: &str = "CREATE TABLE enrichments (\n    path           TEXT NOT NULL,\n    content_hash   TEXT NOT NULL,\n    model          TEXT NOT NULL,\n    prompt_version INTEGER NOT NULL,\n    payload        TEXT NOT NULL,\n    language       TEXT NOT NULL,\n    used_at        INTEGER NOT NULL,\n    PRIMARY KEY (path, content_hash, model, prompt_version, language)\n);";
+
+/// Déclaration de `enrichments` du schéma courant, identique au caractère près à celle de
+/// `schema.sql` (DEC-190, DEC-208).
+#[cfg(test)]
+const ENRICHMENTS_DDL: &str = "CREATE TABLE enrichments (\n    path           TEXT NOT NULL,\n    content_hash   TEXT NOT NULL,\n    model          TEXT NOT NULL,\n    prompt_version INTEGER NOT NULL,\n    payload        TEXT NOT NULL,\n    language       TEXT NOT NULL,\n    used_at        INTEGER NOT NULL, served_model TEXT,\n    PRIMARY KEY (path, content_hash, model, prompt_version, language)\n);";
 
 /// Dernier schéma sans `enrichments.used_at` (une seule entrée par chemin), migré sur place
 /// (DEC-190).
@@ -74,6 +80,9 @@ const SUBSYSTEM_NAMES_DDL: &str = "CREATE TABLE subsystem_names (\n    fingerpri
 /// Dernier schéma sans `communities.description` ni table `subsystem_names`, migré sur place
 /// (DEC-196).
 const SCHEMA_WITHOUT_SUBSYSTEMS: i32 = 13;
+
+/// Dernier schéma sans `enrichments.served_model`, migré sur place (DEC-208).
+const SCHEMA_WITHOUT_SERVED_MODEL: i32 = 14;
 
 /// Nombre de lignes gardées dans `subsystem_names` (AC-262-6).
 const SUBSYSTEM_NAMES_KEPT: i64 = 5000;
@@ -646,7 +655,8 @@ impl Store {
             | SCHEMA_WITHOUT_ENRICH_CALLS
             | SCHEMA_WITHOUT_DECLARATION_DOC
             | SCHEMA_WITHOUT_USED_AT
-            | SCHEMA_WITHOUT_SUBSYSTEMS => store.migrate_to_current()?,
+            | SCHEMA_WITHOUT_SUBSYSTEMS
+            | SCHEMA_WITHOUT_SERVED_MODEL => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -688,7 +698,8 @@ impl Store {
             | SCHEMA_WITHOUT_ENRICH_CALLS
             | SCHEMA_WITHOUT_DECLARATION_DOC
             | SCHEMA_WITHOUT_USED_AT
-            | SCHEMA_WITHOUT_SUBSYSTEMS => {
+            | SCHEMA_WITHOUT_SUBSYSTEMS
+            | SCHEMA_WITHOUT_SERVED_MODEL => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
                 store.load_enrich_redact()?;
@@ -746,7 +757,8 @@ impl Store {
                 || v == SCHEMA_WITHOUT_ENRICH_CALLS
                 || v == SCHEMA_WITHOUT_DECLARATION_DOC
                 || v == SCHEMA_WITHOUT_USED_AT
-                || v == SCHEMA_WITHOUT_SUBSYSTEMS =>
+                || v == SCHEMA_WITHOUT_SUBSYSTEMS
+                || v == SCHEMA_WITHOUT_SERVED_MODEL =>
             {
                 store.version = v
             }
@@ -762,13 +774,13 @@ impl Store {
         self.read_only && !self.conn.is_autocommit()
     }
 
-    /// Version du schéma du graphe ouvert (5 à 13 en lecture seule seulement : DEC-066, DEC-073,
+    /// Version du schéma du graphe ouvert (5 à 14 en lecture seule seulement : DEC-066, DEC-073,
     /// DEC-076).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
-    /// Migre un schéma 5 à 13 en schéma 14 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, 11 -> 12, 12 -> 13, puis 13 -> 14,
+    /// Migre un schéma 5 à 14 en schéma 15 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, 11 -> 12, 12 -> 13, 13 -> 14, puis 14 -> 15,
     /// chacune en une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         let from = self.user_version()?;
@@ -784,6 +796,7 @@ impl Store {
         self.migrate_11_to_12()?;
         self.migrate_12_to_13()?;
         self.migrate_13_to_14()?;
+        self.migrate_14_to_15()?;
         // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
         crate::trace!(
             "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
@@ -903,7 +916,7 @@ impl Store {
         }
         tx.execute_batch(&format!(
             "ALTER TABLE enrichments RENAME TO enrichments_old;
-             {ENRICHMENTS_DDL}
+             {ENRICHMENTS_DDL_13}
              INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at)
                  SELECT path, content_hash, model, prompt_version, payload, language, 0 FROM enrichments_old;
              DROP TABLE enrichments_old;
@@ -930,6 +943,27 @@ impl Store {
         tx.execute_batch(&format!(
             "ALTER TABLE communities ADD COLUMN description TEXT;
              {SUBSYSTEM_NAMES_DDL}
+             UPDATE meta SET value = '{SCHEMA_WITHOUT_SERVED_MODEL}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITHOUT_SERVED_MODEL};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
+    }
+
+    /// Migre un schéma 14 en schéma 15 en une transaction `IMMEDIATE` (DEC-208) : colonne
+    /// `enrichments.served_model` (vide pour les entrées existantes), versions.
+    fn migrate_14_to_15(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_SERVED_MODEL {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "ALTER TABLE enrichments ADD COLUMN served_model TEXT;
              UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
@@ -1352,6 +1386,7 @@ impl Store {
                 summaries: summaries.to_vec(),
                 concepts: concept_nodes.to_vec(),
                 refs: refs.to_vec(),
+                served_model: None,
             }],
         )
     }
@@ -2891,7 +2926,7 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare_cached(if self.version >= SCHEMA_VERSION {
+            .prepare_cached(if self.version >= SCHEMA_WITHOUT_SUBSYSTEMS + 1 {
                 "SELECT id, label, pivot, size, cohesion, description FROM communities ORDER BY id"
             } else {
                 "SELECT id, label, pivot, size, cohesion, NULL FROM communities ORDER BY id"
@@ -2908,7 +2943,7 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare_cached(if self.version >= SCHEMA_VERSION {
+            .prepare_cached(if self.version >= SCHEMA_WITHOUT_SUBSYSTEMS + 1 {
                 "SELECT id, label, pivot, size, cohesion, description FROM communities WHERE id = ?1"
             } else {
                 "SELECT id, label, pivot, size, cohesion, NULL FROM communities WHERE id = ?1"
@@ -2924,7 +2959,7 @@ impl Store {
     /// Vrai si le cache des noms de sous-systèmes est vide (DEC-196) ; un schéma < 14, lu sans
     /// migration, n'a pas la table.
     pub fn subsystem_names_empty(&self) -> Result<bool> {
-        if self.version < SCHEMA_VERSION {
+        if self.version < SCHEMA_WITHOUT_SUBSYSTEMS + 1 {
             return Ok(true);
         }
         Ok(self.count("subsystem_names")? == 0)
@@ -2932,7 +2967,7 @@ impl Store {
 
     /// Nom et description en cache pour l'empreinte `fingerprint` (REQ-262).
     pub fn subsystem_name(&self, fingerprint: &str) -> Result<Option<(String, String)>> {
-        if self.version < SCHEMA_VERSION {
+        if self.version < SCHEMA_WITHOUT_SUBSYSTEMS + 1 {
             return Ok(None);
         }
         let mut st = self
@@ -3425,6 +3460,8 @@ pub struct EnrichmentWrite {
     pub summaries: Vec<(String, String)>,
     pub concepts: Vec<Node>,
     pub refs: Vec<Ref>,
+    /// Nom du modèle servi, lu dans les réponses (REQ-278) ; `None` sans réponse du LLM.
+    pub served_model: Option<String>,
 }
 
 /// Résultat validé d'un appel d'un fichier envoyé seul, à conserver (REQ-226).
@@ -3474,6 +3511,7 @@ impl CallPayload {
 
     fn into_enrichment(self) -> Enrichment {
         Enrichment {
+            served: Vec::new(),
             summaries: self.summaries,
             concepts: self
                 .concepts
@@ -3557,6 +3595,7 @@ fn write_enrichment(
         summaries,
         concepts: concept_nodes,
         refs,
+        served_model,
     } = item;
     require_known(tx, path)?;
     tx.prepare_cached("DELETE FROM enrich_calls WHERE path = ?1")
@@ -3588,10 +3627,11 @@ fn write_enrichment(
     let json = serde_json::to_string(&payload)
         .map_err(|e| Error::Message(format!("enrichissement non sérialisable : {e}")))?;
     tx.prepare_cached(
-        "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at, served_model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(path, content_hash, model, prompt_version, language)
-         DO UPDATE SET payload = excluded.payload, used_at = excluded.used_at",
+         DO UPDATE SET payload = excluded.payload, used_at = excluded.used_at,
+                       served_model = excluded.served_model",
     )
     .map_err(db_err)?
     .execute(params![
@@ -3601,7 +3641,8 @@ fn write_enrichment(
         versions.of_path(path),
         json,
         language,
-        now_ms()
+        now_ms(),
+        served_model
     ])
     .map_err(db_err)?;
     Ok(touched.log)
@@ -4221,12 +4262,12 @@ fn adopt_orphan(
         let Some((rowid, json)) = pick_entry(tx, old, file_hash, versions)? else {
             continue;
         };
-        let (model, version, language): (String, i64, String) = tx
+        let (model, version, language, served): (String, i64, String, Option<String>) = tx
             .prepare_cached(
-                "SELECT model, prompt_version, language FROM enrichments WHERE rowid = ?1",
+                "SELECT model, prompt_version, language, served_model FROM enrichments WHERE rowid = ?1",
             )
             .map_err(db_err)?
-            .query_row([rowid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_row([rowid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .map_err(db_err)?;
         let Ok(payload) = serde_json::from_str::<Payload>(&json) else {
             continue;
@@ -4240,10 +4281,11 @@ fn adopt_orphan(
         let json = serde_json::to_string(&payload)
             .map_err(|e| Error::Message(format!("enrichissement repris non sérialisable : {e}")))?;
         tx.prepare_cached(
-            "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at, served_model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(path, content_hash, model, prompt_version, language)
-             DO UPDATE SET payload = excluded.payload, used_at = excluded.used_at",
+             DO UPDATE SET payload = excluded.payload, used_at = excluded.used_at,
+                           served_model = excluded.served_model",
         )
         .map_err(db_err)?
         .execute(params![
@@ -4253,7 +4295,8 @@ fn adopt_orphan(
             version,
             json,
             language,
-            now_ms()
+            now_ms(),
+            served
         ])
         .map_err(db_err)?;
         return Ok(KeptEnrichment::Readable(payload));
@@ -5092,19 +5135,38 @@ mod tests {
         PRAGMA user_version = 13;
         COMMIT;";
 
-    /// Ramène un graphe de schéma 14 au schéma 13 (DEC-196).
+    /// Assistant « schéma 14 » (DEC-208), en SQL écrit en dur : colonne `enrichments.served_model`
+    /// supprimée, versions 14.
+    const SCHEMA14_DOWNGRADE: &str = "BEGIN;
+        ALTER TABLE enrichments DROP COLUMN served_model;
+        UPDATE meta SET value = '14' WHERE key = 'schema_version';
+        PRAGMA user_version = 14;
+        COMMIT;";
+
+    /// Ramène un graphe de schéma 15 au schéma 14 (DEC-208).
+    fn downgrade_to_14(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA14_DOWNGRADE)
+            .unwrap();
+    }
+
+    /// Ramène un graphe de schéma 15 au schéma 13 (le 14 d'abord, DEC-196).
     fn downgrade_to_13(repo: &Path) {
+        downgrade_to_14(repo);
         Connection::open(db_path(repo))
             .unwrap()
             .execute_batch(SCHEMA13_DOWNGRADE)
             .unwrap();
     }
 
-    /// Ramène un graphe de schéma 14 au schéma 12 (le 13 d'abord, DEC-196, puis DEC-190).
+    /// Ramène un graphe de schéma 15 au schéma 12 (le 13 d'abord, DEC-196, puis DEC-190).
     fn downgrade_to_12(repo: &Path) {
-        let c = Connection::open(db_path(repo)).unwrap();
-        c.execute_batch(SCHEMA13_DOWNGRADE).unwrap();
-        c.execute_batch(SCHEMA12_DOWNGRADE).unwrap();
+        downgrade_to_13(repo);
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA12_DOWNGRADE)
+            .unwrap();
     }
 
     const SCHEMA11_DOWNGRADE: &str = "BEGIN;
@@ -5976,6 +6038,73 @@ mod tests {
         assert!(st.enrichment_entry("b.md").unwrap().is_some());
     }
 
+    fn served_of(st: &Store, path: &str) -> Option<String> {
+        st.conn
+            .query_row(
+                "SELECT served_model FROM enrichments WHERE path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn served_store(served: Option<&str>) -> (tempfile::TempDir, Store) {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        let item = EnrichmentWrite {
+            served_model: served.map(String::from),
+            path: "a.md".into(),
+            hash: "h".into(),
+            summaries: vec![("type:p.A".into(), "résumé".into())],
+            concepts: vec![],
+            refs: vec![],
+        };
+        st.apply_enrichments("m", "français", &[item]).unwrap();
+        (dir, st)
+    }
+
+    #[test]
+    fn req278_ac2_write_records_the_served_model_or_null() {
+        let (_d, st) = served_store(Some("m-20250929"));
+        assert_eq!(served_of(&st, "a.md").as_deref(), Some("m-20250929"));
+        let (_d, st) = served_store(None);
+        assert_eq!(served_of(&st, "a.md"), None);
+        // Une réécriture de la même clé remplace aussi le nom servi.
+        let (_d, mut st) = served_store(Some("s1"));
+        let item = EnrichmentWrite {
+            served_model: Some("s2".into()),
+            path: "a.md".into(),
+            hash: "h".into(),
+            summaries: vec![("type:p.A".into(), "résumé".into())],
+            concepts: vec![],
+            refs: vec![],
+        };
+        st.apply_enrichments("m", "français", &[item]).unwrap();
+        assert_eq!(served_of(&st, "a.md").as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn req278_adoption_and_reapplication_keep_the_served_model() {
+        let (_d, mut st) = served_store(Some("m-20250929"));
+        // Réapplication sans appel : la colonne n'est pas touchée.
+        st.reset_with_pending_files(&[file("a.md")]).unwrap();
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        assert_eq!(served_of(&st, "a.md").as_deref(), Some("m-20250929"));
+        // Reprise par un nouveau chemin (REQ-257) : la copie recopie la colonne.
+        st.remove_file("a.md").unwrap();
+        st.insert_pending_files(&[file("b.md")]).unwrap();
+        st.load_orphan_enrichments().unwrap();
+        let n = st
+            .replace_structures_counted(&[("b.md".to_string(), vec![ty("p.A", "b.md")], vec![])])
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(served_of(&st, "b.md").as_deref(), Some("m-20250929"));
+    }
+
     #[test]
     fn req257_ac5_no_adoption_when_a_cited_node_is_not_declared() {
         let (_d, mut st, n) = adoption(&["b.md"], "p.B");
@@ -6762,7 +6891,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(SCHEMA_VERSION, 15);
     }
 
     #[test]
@@ -6896,11 +7025,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_to_14_without_touching_the_file() {
-        for version in [14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_15_without_touching_the_file() {
+        for version in [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                14 => downgrade_to_14(dir.path()),
                 13 => downgrade_to_13(dir.path()),
                 12 => downgrade_to_12(dir.path()),
                 11 => downgrade_to_11(dir.path()),
@@ -7607,6 +7737,7 @@ mod tests {
 
     fn enrich_of(tag: &str) -> Enrichment {
         Enrichment {
+            served: Vec::new(),
             summaries: vec![("type:p.A".into(), format!("résumé {tag}"))],
             concepts: vec![
                 crate::llm::enrich::Concept {
@@ -7657,6 +7788,7 @@ mod tests {
 
     fn whole_item(path: &str, nodes: &[Node]) -> EnrichmentWrite {
         EnrichmentWrite {
+            served_model: None,
             path: path.into(),
             hash: "h".into(),
             summaries: vec![(nodes[0].id.clone(), "résumé".into())],
@@ -7814,6 +7946,7 @@ mod tests {
         .unwrap();
         // Groupe annulé par un fichier inconnu : lignes et nouveaux résultats comme avant.
         let unknown = EnrichmentWrite {
+            served_model: None,
             path: "inconnu.md".into(),
             ..whole_item("a.md", &nodes_a)
         };
@@ -7921,7 +8054,7 @@ mod tests {
         assert_eq!(st.opened_schema_version(), 10);
         drop(st);
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(st.schema_version().unwrap(), 14);
+        assert_eq!(st.schema_version().unwrap(), 15);
         assert!(st.call_results().unwrap().is_empty());
         drop(st);
         downgrade_to_10(dir.path());
@@ -7948,6 +8081,7 @@ mod tests {
             .map(|i| {
                 let (f, nodes, _) = item_of(i);
                 EnrichmentWrite {
+                    served_model: None,
                     path: f,
                     hash: "h".into(),
                     summaries: vec![(nodes[1].id.clone(), format!("résumé {i}"))],
@@ -7978,6 +8112,7 @@ mod tests {
         // Un fichier inconnu annule tout le groupe.
         let mut bad = writes.clone();
         bad.push(EnrichmentWrite {
+            served_model: None,
             path: "inconnu.md".into(),
             hash: "h".into(),
             summaries: vec![],
@@ -7987,6 +8122,7 @@ mod tests {
         let before = graph_dump(&grouped);
         let (f, nodes, _) = item_of(5);
         bad[0] = EnrichmentWrite {
+            served_model: None,
             path: f,
             hash: "h2".into(),
             summaries: vec![(nodes[0].id.clone(), "autre".into())],
@@ -8239,6 +8375,7 @@ mod tests {
             "m",
             "français",
             &[EnrichmentWrite {
+                served_model: None,
                 path: "b.md".into(),
                 hash: "h".into(),
                 summaries: vec![],
@@ -8418,6 +8555,7 @@ mod tests {
             "m",
             "français",
             &[EnrichmentWrite {
+                served_model: None,
                 path: "b.md".into(),
                 hash: "h".into(),
                 summaries: vec![],
@@ -8574,6 +8712,7 @@ mod tests {
                 "m",
                 "français",
                 &[EnrichmentWrite {
+                    served_model: None,
                     path: "a.java".into(),
                     hash: "h".into(),
                     summaries: vec![],
@@ -8794,6 +8933,7 @@ mod tests {
                 "m",
                 "français",
                 &[EnrichmentWrite {
+                    served_model: None,
                     path: "a.md".into(),
                     hash: "h".into(),
                     summaries: vec![],
@@ -8868,6 +9008,7 @@ mod tests {
             "m",
             "français",
             &[EnrichmentWrite {
+                served_model: None,
                 path: "a.java".into(),
                 hash: "h".into(),
                 summaries: vec![],
@@ -9754,23 +9895,23 @@ mod tests {
     }
 
     #[test]
-    fn req245_ac4_new_graph_is_schema_14_and_schema_15_is_refused() {
+    fn req245_ac4_new_graph_is_schema_15_and_schema_16_is_refused() {
         let dir = tempdir().unwrap();
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(SCHEMA_VERSION, 14);
-        assert_eq!(st.schema_version().unwrap(), 14);
+        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(st.schema_version().unwrap(), 15);
         drop(st);
         Connection::open(db_path(dir.path()))
             .unwrap()
-            .execute_batch("PRAGMA user_version = 15")
+            .execute_batch("PRAGMA user_version = 16")
             .unwrap();
         let e = Store::open_or_create(dir.path()).err().unwrap().to_string();
         assert!(
-            e.contains("version de schéma du graphe non prise en charge (15"),
+            e.contains("version de schéma du graphe non prise en charge (16"),
             "{e}"
         );
         assert!(Store::open_readonly(dir.path()).is_err());
-        assert_eq!(st_user_version(dir.path()), 15);
+        assert_eq!(st_user_version(dir.path()), 16);
     }
 
     // ---- REQ-258 : plusieurs enrichissements conservés par chemin (DEC-190) ----

@@ -2712,3 +2712,26 @@ fn req276_ac9_fichier_reecrit_pendant_que_le_lot_est_tenu_n_est_pas_enregistre()
         assert_eq!(fx.to_enrich(), [path("a")], "{provider}");
     }
 }
+
+// ---- REQ-278 : modèle servi lu dans le résultat de chaque requête du lot ----
+
+#[test]
+fn req278_ac4_chaque_entree_du_mode_lot_porte_le_nom_servi_de_son_resultat() {
+    for provider in PROVIDERS {
+        let fx = Fx::all_good(provider, &["a", "b"]);
+        fx.server.served_model("m-20250929");
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let conn = rusqlite::Connection::open(fx.env.repo.join(".nephila/graph.db")).unwrap();
+        let mut q = conn
+            .prepare("SELECT path, model, served_model FROM enrichments ORDER BY path")
+            .unwrap();
+        let rows: Vec<(String, String, Option<String>)> = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let want = |n: &str| (path(n), "m".to_string(), Some("m-20250929".to_string()));
+        assert_eq!(rows, vec![want("a"), want("b")], "{provider}");
+    }
+}

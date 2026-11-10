@@ -62,6 +62,8 @@ struct Sim {
     /// Requêtes faites que montre chaque sondage `en cours` (le dernier chiffre se répète) ;
     /// vide : zéro.
     progress: Vec<usize>,
+    /// Nom du modèle servi, ajouté au corps des réponses réussies (REQ-278).
+    model: Option<String>,
 }
 
 impl BatchServer {
@@ -107,7 +109,15 @@ impl BatchServer {
             create_failures: VecDeque::new(),
             hold: None,
             progress: Vec::new(),
+            model: None,
         });
+    }
+
+    /// Les réponses réussies portent `model` : le nom servi (REQ-278).
+    pub fn served_model(&self, name: &str) {
+        if let Some(sim) = self.sim.lock().unwrap().as_mut() {
+            sim.model = Some(name.into());
+        }
     }
 
     /// Requêtes faites que montrent les sondages `en cours`, dans l'ordre des sondages.
@@ -249,7 +259,15 @@ fn serve(
     let _ = out.flush();
 }
 
-fn text_body(provider: &str, text: &str, how: &str) -> Value {
+fn text_body(provider: &str, text: &str, how: &str, model: Option<&str>) -> Value {
+    let mut body = text_body_of(provider, text, how);
+    if let Some(m) = model {
+        body["model"] = json!(m);
+    }
+    body
+}
+
+fn text_body_of(provider: &str, text: &str, how: &str) -> Value {
     if provider == "anthropic" {
         let stop = match how {
             "truncated" => "max_tokens",
@@ -351,13 +369,13 @@ impl Sim {
                 .filter_map(|(id, o)| {
                     let result = match o {
                         Outcome::Text(t) => {
-                            json!({"type": "succeeded", "message": text_body("anthropic", &t, "ok")})
+                            json!({"type": "succeeded", "message": text_body("anthropic", &t, "ok", self.model.as_deref())})
                         }
                         Outcome::Truncated(t) => {
-                            json!({"type": "succeeded", "message": text_body("anthropic", &t, "truncated")})
+                            json!({"type": "succeeded", "message": text_body("anthropic", &t, "truncated", self.model.as_deref())})
                         }
                         Outcome::Blocked(t) => {
-                            json!({"type": "succeeded", "message": text_body("anthropic", &t, "blocked")})
+                            json!({"type": "succeeded", "message": text_body("anthropic", &t, "blocked", self.model.as_deref())})
                         }
                         Outcome::Errored(kind, message) => {
                             json!({"type": "errored",
@@ -428,11 +446,11 @@ impl Sim {
                 .into_iter()
                 .filter_map(|(id, o)| match (o, error_file) {
                     (Outcome::Text(t), false) => Some(json!({"custom_id": id,
-                        "response": {"status_code": 200, "body": text_body("openai", &t, "ok")}})),
+                        "response": {"status_code": 200, "body": text_body("openai", &t, "ok", self.model.as_deref())}})),
                     (Outcome::Truncated(t), false) => Some(json!({"custom_id": id,
-                        "response": {"status_code": 200, "body": text_body("openai", &t, "truncated")}})),
+                        "response": {"status_code": 200, "body": text_body("openai", &t, "truncated", self.model.as_deref())}})),
                     (Outcome::Blocked(t), false) => Some(json!({"custom_id": id,
-                        "response": {"status_code": 200, "body": text_body("openai", &t, "blocked")}})),
+                        "response": {"status_code": 200, "body": text_body("openai", &t, "blocked", self.model.as_deref())}})),
                     (Outcome::Http(code, message), false) => {
                         let error = if message.is_empty() {
                             json!({})

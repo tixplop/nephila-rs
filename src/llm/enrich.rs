@@ -203,6 +203,9 @@ pub struct Enrichment {
     pub concepts: Vec<Concept>,
     /// Éléments écartés (hors liste, concept hors Markdown…), décrits.
     pub rejected: Vec<String>,
+    /// Noms distincts du modèle servi par les réponses reçues, dans l'ordre des appels (REQ-278) ;
+    /// vide pour un résultat conservé ou sans réponse du LLM.
+    pub served: Vec<String>,
 }
 
 #[derive(Deserialize)]

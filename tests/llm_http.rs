@@ -834,3 +834,192 @@ fn req201_ac4_anthropic_reply_without_version_single_file_and_lot() {
     build_without_version("anthropic", 1);
     build_without_version("anthropic", 2);
 }
+
+// ---- REQ-278 : modèle servi enregistré avec l'enrichissement ----
+
+/// Réponse portant `model` (si donné) et `text`, au format du fournisseur.
+fn served_body(provider: &str, model: &str, text: &str) -> String {
+    let mut v: serde_json::Value = if provider == "openai" {
+        serde_json::from_str(&openai_reply(text)).unwrap()
+    } else {
+        serde_json::from_str(&anthropic_reply(text)).unwrap()
+    };
+    v["model"] = serde_json::json!(model);
+    v.to_string()
+}
+
+struct ServedEnv {
+    _tmp: tempfile::TempDir,
+    repo: std::path::PathBuf,
+    config: std::path::PathBuf,
+}
+
+impl ServedEnv {
+    /// Dépôt de documents `files` ; configuration vers `url` avec `model = "claude-x"`.
+    fn new(provider: &str, url: &str, extra: &str, files: &[(&str, String)]) -> ServedEnv {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for (n, text) in files {
+            std::fs::write(repo.join(n), text).unwrap();
+        }
+        let config = tmp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "provider = \"{provider}\"\nmodel = \"claude-x\"\nbase_url = \"{url}\"\napi_key_env = \"NEPHILA_T378_KEY\"\nconcurrency = 1\n{extra}"
+            ),
+        )
+        .unwrap();
+        ServedEnv {
+            _tmp: tmp,
+            repo,
+            config,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_T378_KEY", "sk-test")
+            .output()
+            .unwrap()
+    }
+
+    /// `(chemin, model, served_model)` de chaque entrée, par chemin.
+    fn entries(&self) -> Vec<(String, String, Option<String>)> {
+        let conn = rusqlite::Connection::open(self.repo.join(".nephila/graph.db")).unwrap();
+        let mut q = conn
+            .prepare("SELECT path, model, served_model FROM enrichments ORDER BY path")
+            .unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+}
+
+fn posts(s: &FakeServer) -> usize {
+    s.requests().iter().filter(|r| r.method == "POST").count()
+}
+
+const NO_SUMMARY: &str = r#"{"version":2,"summaries":[],"concepts":[]}"#;
+
+fn doc(n: &str) -> (&'static str, String) {
+    let name: &'static str = match n {
+        "a" => "a.md",
+        "b" => "b.md",
+        _ => "c.md",
+    };
+    (name, format!("# Document {n}\n\nTexte du document {n}.\n"))
+}
+
+fn lot_reply(names: &[&str]) -> String {
+    let files: Vec<_> = names
+        .iter()
+        .map(|n| serde_json::json!({"file": format!("{n}.md"), "summaries": [], "concepts": []}))
+        .collect();
+    serde_json::json!({"version": 3, "files": files}).to_string()
+}
+
+#[test]
+fn req278_ac2_ac5_entry_records_served_model_and_a_new_name_reenriches_nothing() {
+    for provider in ["anthropic", "openai"] {
+        let s = FakeServer::start(vec![
+            (200, served_body(provider, "claude-x-20250929", NO_SUMMARY)),
+            (200, served_body(provider, "claude-x-20260101", NO_SUMMARY)),
+        ]);
+        let env = ServedEnv::new(provider, &s.base_url, "", &[doc("a")]);
+        let o = env.run(&["build"]);
+        assert!(o.status.success(), "{provider}: {:?}", o);
+        assert_eq!(
+            env.entries(),
+            vec![(
+                "a.md".to_string(),
+                "claude-x".to_string(),
+                Some("claude-x-20250929".to_string())
+            )],
+            "{provider}"
+        );
+        // AC-278-5 : le nom servi change derrière l'alias, rien n'est renvoyé ni réécrit.
+        let before = posts(&s);
+        let o = env.run(&["update"]);
+        assert!(o.status.success(), "{provider}");
+        assert!(
+            String::from_utf8_lossy(&o.stdout).contains("graphe à jour"),
+            "{provider}: {}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        assert_eq!(posts(&s), before, "{provider}");
+        assert_eq!(
+            env.entries()[0].2.as_deref(),
+            Some("claude-x-20250929"),
+            "{provider}"
+        );
+    }
+}
+
+#[test]
+fn req278_ac3_lot_big_file_and_distinct_names_are_recorded() {
+    for provider in ["anthropic", "openai"] {
+        // Lot de 3 fichiers : le même nom pour chacun.
+        let s = FakeServer::start(vec![(
+            200,
+            served_body(provider, "s1", &lot_reply(&["a", "b", "c"])),
+        )]);
+        let env = ServedEnv::new(
+            provider,
+            &s.base_url,
+            "batch_files = 10\n",
+            &[doc("a"), doc("b"), doc("c")],
+        );
+        assert!(env.run(&["build"]).status.success(), "{provider}");
+        assert_eq!(posts(&s), 1, "{provider}");
+        let got: Vec<_> = env.entries().into_iter().map(|e| e.2).collect();
+        assert_eq!(got, vec![Some("s1".to_string()); 3], "{provider}");
+
+        // Gros fichier de 2 appels : noms distincts dans l'ordre des appels, sans doublon.
+        for (names, want) in [(["s1", "s2"], "s1, s2"), (["s1", "s1"], "s1")] {
+            let s = FakeServer::start(
+                names
+                    .iter()
+                    .map(|n| (200, served_body(provider, n, NO_SUMMARY)))
+                    .collect(),
+            );
+            let big = format!(
+                "# Section1\n\n{}\n\n# Section2\n\n{}\n\n",
+                "mot ".repeat(40),
+                "mot ".repeat(40)
+            );
+            let env = ServedEnv::new(
+                provider,
+                &s.base_url,
+                "max_chunk_chars = 200\n",
+                &[("a.md", big)],
+            );
+            assert!(env.run(&["build"]).status.success(), "{provider}");
+            assert_eq!(posts(&s), 2, "{provider} {names:?}");
+            assert_eq!(
+                env.entries()[0].2.as_deref(),
+                Some(want),
+                "{provider} {names:?}"
+            );
+        }
+
+        // Aucun nom dans la réponse : valeur vide.
+        let s = FakeServer::start(vec![(
+            200,
+            if provider == "openai" {
+                openai_reply(NO_SUMMARY)
+            } else {
+                anthropic_reply(NO_SUMMARY)
+            },
+        )]);
+        let env = ServedEnv::new(provider, &s.base_url, "", &[doc("a")]);
+        assert!(env.run(&["build"]).status.success(), "{provider}");
+        assert_eq!(env.entries()[0].2, None, "{provider}");
+    }
+}

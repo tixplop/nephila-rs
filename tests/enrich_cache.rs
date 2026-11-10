@@ -298,7 +298,7 @@ fn req049_ac8_schema4_graph_is_replaced_by_build_and_refused_elsewhere() {
         env.store().files().unwrap().len()
     };
     assert_eq!(env.store().schema_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 14);
+    assert_eq!(SCHEMA_VERSION, 15);
     assert_eq!(env.logged().len(), n_files, "{:?}", env.logged());
 }
 
@@ -1934,7 +1934,7 @@ fn req265_ac5_versions_and_old_graph_reenriches_data_and_build_families_once() {
     assert_eq!(BUILD_PROMPT_VERSION, 12);
     assert_eq!(CODE_PROMPT_VERSION, 11);
     assert_eq!(MARKDOWN_PROMPT_VERSION, 11);
-    assert_eq!(SCHEMA_VERSION, 14);
+    assert_eq!(SCHEMA_VERSION, 15);
     let env = redact_env();
     env.ok(&["build"]);
     set_prompt_version(&env, "app.yml", 11);

@@ -16,7 +16,9 @@ CREATE TABLE files (
 -- (contenu, modèle, version du prompt, langue). Survit à la réinitialisation du graphe ;
 -- `payload` = JSON des résumés, concepts et mentions ; `language` = langue des résumés demandée
 -- (DEC-138), comprise dans l'empreinte ; `used_at` = dernier usage (ms depuis l'epoch : écriture
--- ou réapplication ; 0 après migration).
+-- ou réapplication ; 0 après migration) ; `served_model` = nom du modèle servi, lu dans les
+-- réponses (DEC-208 ; NULL sans réponse du LLM, hors clé ; placée après `used_at` pour que le
+-- texte égale celui d'un graphe migré par `ALTER TABLE ... ADD COLUMN`).
 CREATE TABLE enrichments (
     path           TEXT NOT NULL,
     content_hash   TEXT NOT NULL,
@@ -24,7 +26,7 @@ CREATE TABLE enrichments (
     prompt_version INTEGER NOT NULL,
     payload        TEXT NOT NULL,
     language       TEXT NOT NULL,
-    used_at        INTEGER NOT NULL,
+    used_at        INTEGER NOT NULL, served_model TEXT,
     PRIMARY KEY (path, content_hash, model, prompt_version, language)
 );
 

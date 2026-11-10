@@ -204,6 +204,11 @@ pub fn merge_enrichments(parts: Vec<Enrichment>) -> Enrichment {
     let mut summarized: HashSet<String> = HashSet::new();
     let mut seen_rejected: HashSet<String> = HashSet::new();
     for p in parts {
+        for name in p.served {
+            if !out.served.contains(&name) {
+                out.served.push(name);
+            }
+        }
         for (node, summary) in p.summaries {
             if summary.trim().is_empty() {
                 continue;
@@ -247,6 +252,7 @@ mod tests {
 
     fn enr(sum: &[(&str, &str)], concepts: Vec<Concept>) -> Enrichment {
         Enrichment {
+            served: Vec::new(),
             summaries: sum
                 .iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
@@ -364,6 +370,7 @@ mod tests {
                     .collect();
                 let rejected = (0..next(5)).map(|_| format!("rej {}", next(4))).collect();
                 parts.push(Enrichment {
+                    served: Vec::new(),
                     summaries,
                     concepts,
                     rejected,
@@ -392,6 +399,7 @@ mod tests {
                     .collect();
                 summaries.extend((0..400).map(|i| (format!("type:P0N{i}"), "bis".to_string())));
                 Enrichment {
+                    served: Vec::new(),
                     summaries,
                     concepts: vec![],
                     rejected: vec![],
