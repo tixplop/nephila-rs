@@ -2660,3 +2660,27 @@ fn req241_ac2_json_de_500_ko_en_mode_lot_porte_la_marque() {
         .and_then(|n| n.summary);
     assert_eq!(summary.as_deref(), Some("Gros JSON."));
 }
+
+#[test]
+fn req275_ac5_chaque_requete_du_lot_porte_la_temperature() {
+    for provider in ["anthropic", "openai"] {
+        let fx = Fx::new(provider, "temperature = 0.2\n", &["a", "b"], 0, good);
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_eq!(code(&o), 0, "{provider} : {}", err(&o));
+        let hits = fx.server.hits("POST", fx.create_path());
+        assert_eq!(hits.len(), 1, "{provider}");
+        let text = if provider == "anthropic" {
+            hits[0].body.clone()
+        } else {
+            let all: Vec<String> = fx
+                .server
+                .hits("POST", "/v1/files")
+                .iter()
+                .map(|h| h.body.clone())
+                .collect();
+            all.join("\n")
+        };
+        let n = text.matches("\"temperature\":0.2").count();
+        assert_eq!(n, 2, "{provider} : {text}");
+    }
+}

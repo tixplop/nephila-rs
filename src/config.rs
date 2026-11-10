@@ -438,7 +438,7 @@ impl Effort {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub provider: Provider,
     pub model: String,
@@ -471,6 +471,8 @@ pub struct Config {
     pub effort_explicit: bool,
     /// Limite de jetons de la réponse, réflexion comprise (REQ-058).
     pub max_output_tokens: u32,
+    /// Température des réponses, de 0 à 2 ; `None` = rien n'est envoyé (REQ-275).
+    pub temperature: Option<f64>,
     /// Schéma JSON imposé à la réponse (REQ-202 ; `query ask` : REQ-204).
     pub structured_output: StructuredOutput,
     /// Nom de la clé qui a donné `structured_output`, pour les traces (REQ-203).
@@ -510,6 +512,7 @@ struct RawConfig {
     thinking: Option<toml::Value>,
     effort: Option<toml::Value>,
     max_output_tokens: Option<toml::Value>,
+    temperature: Option<toml::Value>,
     structured_output: Option<toml::Value>,
     tls_ca_cert: Option<String>,
     tls_insecure: Option<bool>,
@@ -607,6 +610,16 @@ impl Config {
             from_project.retain(|k| *k != "format_retries");
         }
         (self, from_project)
+    }
+
+    /// Segment `temperature` de la ligne `config`, précédé d'une espace ; vide sans la clé
+    /// (REQ-275).
+    pub fn temperature_trace(&self) -> String {
+        match (self.temperature, self.thinking) {
+            (None, _) => String::new(),
+            (Some(t), false) => format!(" temperature={t}"),
+            (Some(t), true) => format!(" temperature={t} (non envoyée avec thinking)"),
+        }
     }
 
     /// Segments TLS de la ligne `config` (REQ-036), chacun précédé d'une espace.
@@ -974,6 +987,12 @@ impl Config {
                 ))
             }
         };
+        let temperature = match &raw.temperature {
+            None => None,
+            Some(toml::Value::Integer(n)) if (0..=2).contains(n) => Some(*n as f64),
+            Some(toml::Value::Float(f)) if (0.0..=2.0).contains(f) => Some(*f),
+            Some(v) => return Err(invalid("temperature", "un nombre de 0 à 2", v)),
+        };
         let structured_output = match &raw.structured_output {
             None => StructuredOutput::Auto,
             Some(v) => match v.as_str().and_then(StructuredOutput::parse) {
@@ -1080,6 +1099,7 @@ impl Config {
             effort,
             effort_explicit: raw.effort.is_some(),
             max_output_tokens,
+            temperature,
             structured_output,
             structured_key: "structured_output",
             tls_ca_cert,
@@ -1186,6 +1206,7 @@ mod project_tests {
             effort: DEFAULT_EFFORT,
             effort_explicit: false,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            temperature: None,
             structured_output: StructuredOutput::Auto,
             structured_key: "structured_output",
             tls_ca_cert: None,
@@ -1508,6 +1529,45 @@ mod llm_options_tests {
         let permitted = e.split("clés permises").nth(1).unwrap_or("");
         assert!(!permitted.contains("enrich_redact"), "{e}");
         assert_eq!(PROJECT_SETTINGS.len(), 7);
+    }
+
+    #[test]
+    fn req275_ac1_temperature_lue() {
+        assert_eq!(parse("").unwrap().temperature, None);
+        for (v, want) in [
+            ("0", 0.0),
+            ("0.0", 0.0),
+            ("0.2", 0.2),
+            ("1", 1.0),
+            ("2", 2.0),
+            ("2.0", 2.0),
+        ] {
+            let c = parse(&format!("temperature = {v}")).unwrap();
+            assert_eq!(c.temperature, Some(want), "{v}");
+        }
+        assert!(!ASK_SETTINGS.contains(&"temperature"));
+        assert_eq!(ASK_SETTINGS.len(), 7);
+    }
+
+    #[test]
+    fn req275_ac9_temperature_invalide() {
+        for v in [
+            "-0.1", "2.1", "3", "\"0\"", "\"0.2\"", "true", "nan", "inf", "-inf",
+        ] {
+            let msg = parse(&format!("temperature = {v}"))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                msg,
+                format!(
+                    "configuration invalide (/x/config.toml) : clé « temperature » doit être un nombre de 0 à 2 (reçu : {v})"
+                ),
+                "{v}"
+            );
+            for bad in ["invalid type", "TOML", "expected"] {
+                assert!(!msg.contains(bad), "{msg}");
+            }
+        }
     }
 
     #[test]

@@ -790,11 +790,12 @@ pub fn run(
         format!(" (.nephila.toml : {})", marks.join(","))
     };
     crate::trace!(
-        "config: llm={} model={} thinking={} effort={} max_output_tokens={} max_context_chars={} max_seeds={} max_nodes={} timeout_secs={} format_retries={}{}{}",
+        "config: llm={} model={} thinking={} effort={}{} max_output_tokens={} max_context_chars={} max_seeds={} max_nodes={} timeout_secs={} format_retries={}{}{}",
         config.provider.as_str(),
         config.model,
         config.thinking,
         config.effort.as_str(),
+        config.temperature_trace(),
         config.max_output_tokens,
         limits.max_context_chars,
         limits.max_seeds,
@@ -2840,6 +2841,7 @@ mod structured_fallback_tests {
 
     fn adapter(provider: &str, base: String) -> Box<dyn Llm> {
         let gen = Generation {
+            temperature: None,
             effort: Effort::Low,
             effort_explicit: false,
             thinking: false,

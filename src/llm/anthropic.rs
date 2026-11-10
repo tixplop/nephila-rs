@@ -117,7 +117,7 @@ fn cached_content(user: &str, upto: usize) -> serde_json::Value {
 /// Corps de la requête `/v1/messages` (REQ-058, REQ-157, DEC-126) : jamais de `thinking`
 /// désactivé ; `thinking` adaptatif si demandé ; `output_config.effort` sauf `effort = "default"`
 /// ou ancien modèle Claude sans `thinking` ; `output_config.format` porte le schéma s'il est donné
-/// (REQ-202).
+/// (REQ-202). `temperature` part si elle est écrite et que `thinking` est faux (REQ-275).
 pub fn request_body(
     model: &str,
     gen: &Generation,
@@ -131,6 +131,9 @@ pub fn request_body(
         "system": system,
         "messages": [{"role": "user", "content": user}],
     });
+    if let (Some(t), false) = (gen.temperature, gen.thinking) {
+        body["temperature"] = t.into();
+    }
     if gen.thinking {
         body["thinking"] = serde_json::json!({"type": "adaptive"});
     }
@@ -475,6 +478,7 @@ mod tests {
 
     fn gen(thinking: bool, effort: Effort, max: u32) -> Generation {
         Generation {
+            temperature: None,
             effort,
             effort_explicit: false,
             thinking,
@@ -487,6 +491,33 @@ mod tests {
             "model": "claude-opus-5-5", "max_tokens": 1234, "system": "s",
             "messages": [{"role": "user", "content": "u"}],
         })
+    }
+
+    #[test]
+    fn req275_temperature_envoyee_sauf_avec_thinking() {
+        let none = request_body(
+            "claude-opus-5-5",
+            &gen(false, Effort::Low, 1234),
+            "s",
+            "u",
+            None,
+        );
+        assert!(none.get("temperature").is_none());
+        let mut g = gen(false, Effort::Low, 1234);
+        g.temperature = Some(0.2);
+        let mut want = none.clone();
+        want["temperature"] = 0.2.into();
+        assert_eq!(request_body("claude-opus-5-5", &g, "s", "u", None), want);
+        g.temperature = Some(0.0);
+        assert_eq!(
+            request_body("claude-opus-5-5", &g, "s", "u", None)["temperature"],
+            0.0
+        );
+        let mut g = gen(true, Effort::Low, 1234);
+        g.temperature = Some(0.2);
+        assert!(request_body("claude-opus-5-5", &g, "s", "u", None)
+            .get("temperature")
+            .is_none());
     }
 
     #[test]
@@ -1225,6 +1256,7 @@ mod cache_tests {
 
     fn gen() -> Generation {
         Generation {
+            temperature: None,
             effort: Effort::Low,
             effort_explicit: false,
             thinking: false,

@@ -12,6 +12,7 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
 /// Corps de la requête `/v1/chat/completions` (REQ-058, REQ-157, DEC-126) : `reasoning_effort`
 /// si l'effort n'est pas `"default"` et que la réflexion est demandée ou l'effort écrit ;
+/// `temperature` part si elle est écrite et que `thinking` est faux (REQ-275) ;
 /// `response_format` porte le schéma s'il est donné (REQ-202).
 pub fn request_body(
     model: &str,
@@ -28,6 +29,9 @@ pub fn request_body(
         ],
         "max_completion_tokens": gen.max_output_tokens,
     });
+    if let (Some(t), false) = (gen.temperature, gen.thinking) {
+        body["temperature"] = t.into();
+    }
     if gen.effort != Effort::ModelDefault && (gen.thinking || gen.effort_explicit) {
         body["reasoning_effort"] = gen.effort.as_str().into();
     }
@@ -419,6 +423,7 @@ mod tests {
 
     fn gen(thinking: bool, effort: Effort, explicit: bool, max: u32) -> Generation {
         Generation {
+            temperature: None,
             effort,
             effort_explicit: explicit,
             thinking,
@@ -453,6 +458,24 @@ mod tests {
                 "max_completion_tokens": 1234,
             })
         );
+    }
+
+    #[test]
+    fn req275_temperature_envoyee_sauf_avec_thinking() {
+        let none = request_body("m", &gen(false, Effort::Low, false, 1234), "s", "u", None);
+        assert!(none.get("temperature").is_none());
+        let mut g = gen(false, Effort::Low, false, 1234);
+        g.temperature = Some(0.2);
+        let mut want = none.clone();
+        want["temperature"] = 0.2.into();
+        assert_eq!(request_body("m", &g, "s", "u", None), want);
+        g.temperature = Some(0.0);
+        assert_eq!(request_body("m", &g, "s", "u", None)["temperature"], 0.0);
+        let mut g = gen(true, Effort::Low, false, 1234);
+        g.temperature = Some(0.2);
+        assert!(request_body("m", &g, "s", "u", None)
+            .get("temperature")
+            .is_none());
     }
 
     #[test]
@@ -1059,6 +1082,7 @@ mod cache_tests {
             &Tls::default(),
             1,
             Generation {
+                temperature: None,
                 effort: Effort::Low,
                 effort_explicit: false,
                 thinking: false,

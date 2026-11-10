@@ -21,6 +21,7 @@ const VERSION_1: &str =
 
 fn default_generation() -> Generation {
     Generation {
+        temperature: None,
         effort: nephila::config::DEFAULT_EFFORT,
         effort_explicit: false,
         thinking: false,

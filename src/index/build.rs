@@ -190,13 +190,14 @@ fn effective_config(
         tls_trace.push_str(&format!(" (.nephila.toml : {})", from_project.join(",")));
     }
     trace!(
-        "config: llm={} model={} enrich_code={} summary_language=\"{}\" thinking={} effort={} max_output_tokens={} nodes_per_call={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}{}",
+        "config: llm={} model={} enrich_code={} summary_language=\"{}\" thinking={} effort={}{} max_output_tokens={} nodes_per_call={} concurrency={} timeout_secs={} max_chunk_chars={} batch_files={} format_retries={}{}{}",
         config.provider.as_str(),
         config.model,
         config.enrich_code,
         config.summary_language,
         config.thinking,
         config.effort.as_str(),
+        config.temperature_trace(),
         config.max_output_tokens,
         enrich::nodes_per_call(config.max_output_tokens, config.thinking),
         config.concurrency,

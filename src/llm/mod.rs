@@ -62,13 +62,15 @@ fn poll_value(value: Option<&str>) -> Result<std::time::Duration> {
 }
 
 /// Options de génération communes aux fournisseurs HTTP (REQ-058, DEC-072).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Generation {
     pub effort: Effort,
     /// La clé `effort` est écrite dans la configuration (REQ-157).
     pub effort_explicit: bool,
     pub thinking: bool,
     pub max_output_tokens: u32,
+    /// Température envoyée sauf avec `thinking` (REQ-275).
+    pub temperature: Option<f64>,
 }
 
 /// Valeur effective de `structured_output` (REQ-202, DEC-163) : `On` et `Auto` envoient le
@@ -495,6 +497,7 @@ fn build_provider(config: &Config, batch: bool) -> Result<Box<dyn Llm>> {
         effort_explicit: config.effort_explicit,
         thinking: config.thinking,
         max_output_tokens: config.max_output_tokens,
+        temperature: config.temperature,
     };
     let structured = structured(config);
     match config.provider {

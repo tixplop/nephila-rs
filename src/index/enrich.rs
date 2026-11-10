@@ -7645,6 +7645,7 @@ mod structured_fallback_tests {
 
     fn adapter(provider: &str, base: String) -> Box<dyn Llm> {
         let gen = Generation {
+            temperature: None,
             effort: Effort::Low,
             effort_explicit: false,
             thinking: false,

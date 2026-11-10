@@ -1257,3 +1257,266 @@ fn req271_ac11_dry_run_et_build_meme_champ() {
     assert!(l.ends_with("config: llm inactif (--no-llm)"), "{l}");
     assert!(!stderr(&o).contains("nodes_per_call"), "{}", stderr(&o));
 }
+
+// ---- T-370 : clé `temperature` (REQ-275) ----
+
+const TEMP_INVALID: [&str; 9] = [
+    "-0.1", "2.1", "3", "\"0\"", "\"0.2\"", "true", "nan", "inf", "-inf",
+];
+
+#[test]
+fn REQ275_AC2_AC9_AC14_valeur_invalide_refusee_avant_tout_parcours_et_tout_appel() {
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", server.local_addr().unwrap());
+    for v in TEMP_INVALID {
+        for provider in [
+            "provider = \"mock\"\n".to_string(),
+            format!("provider = \"anthropic\"\nmodel = \"m\"\napi_key_env = \"{KEY_VAR}\"\n"),
+            format!("provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{url}\"\n"),
+        ] {
+            let env = Env::new(&format!("{provider}temperature = {v}\n"));
+            let want = format!(
+                "erreur: configuration invalide ({}) : clé « temperature » doit être un nombre de 0 à 2 (reçu : {v})\n",
+                env.config.display()
+            );
+            for args in [&["build"][..], &["update"][..], &["query", "ask", "x"][..]] {
+                let o = env.run(args);
+                assert!(!o.status.success(), "{v} {args:?}");
+                assert!(o.stdout.is_empty(), "{v} {args:?}");
+                assert_eq!(stderr(&o), want, "{v} {args:?}");
+                for bad in ["invalid type", "TOML", "expected"] {
+                    assert!(!stderr(&o).contains(bad), "{v}: {}", stderr(&o));
+                }
+                assert!(!env.repo.join(".nephila").exists(), "{v} {args:?}");
+            }
+            for sub in ["build", "update"] {
+                let o = env.run(&[sub, "--no-llm"]);
+                assert_eq!(o.status.code(), Some(0), "{v} {sub}: {}", stderr(&o));
+            }
+        }
+    }
+    assert!(
+        server.accept().is_err(),
+        "le faux serveur a reçu une connexion"
+    );
+}
+
+fn temperature_of(b: &serde_json::Value) -> Option<f64> {
+    b.get("temperature").map(|t| t.as_f64().unwrap())
+}
+
+#[test]
+fn REQ275_AC3_AC4_temperature_dans_le_corps_selon_thinking() {
+    // (extra de configuration, enrichissement, ask)
+    let cases: [(&str, Option<f64>, Option<f64>); 5] = [
+        ("", None, None),
+        ("temperature = 0.2\n", Some(0.2), Some(0.2)),
+        ("temperature = 0\n", Some(0.0), Some(0.0)),
+        ("temperature = 0.2\nthinking = true\n", None, None),
+        (
+            "temperature = 0.2\nthinking = false\n[ask]\nthinking = true\n",
+            Some(0.2),
+            None,
+        ),
+    ];
+    for provider in ["anthropic", "openai"] {
+        for (extra, enrich, ask) in cases {
+            assert_eq!(
+                temperature_of(&enrich_body(provider, "m", extra)),
+                enrich,
+                "{provider} enrichissement {extra:?}"
+            );
+            assert_eq!(
+                temperature_of(&ask_body(provider, "m", extra)),
+                ask,
+                "{provider} ask {extra:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn REQ275_AC5_nouvel_essai_http_et_de_format_renvoient_le_meme_corps() {
+    for provider in ["anthropic", "openai"] {
+        for replies in [
+            vec![
+                (503, "{}".to_string()),
+                (503, "{}".to_string()),
+                (200, reply(provider, &enrichment())),
+            ],
+            vec![
+                (200, reply(provider, "pas du JSON")),
+                (200, reply(provider, &enrichment())),
+            ],
+        ] {
+            let format_retry = replies[0].0 == 200;
+            let n = replies.len();
+            let server = FakeServer::start(replies);
+            let h = Http {
+                env: Env::new(&format!(
+                    "provider = \"{provider}\"\nmodel = \"m\"\napi_key_env = \"{KEY_VAR}\"\nbase_url = \"{}\"\nconcurrency = 1\nbatch_files = 1\ntemperature = 0.2\n",
+                    server.base_url
+                )),
+                server,
+                provider: provider.into(),
+            };
+            fs::remove_file(h.env.repo.join("README.md")).unwrap();
+            fs::create_dir_all(h.env.repo.join("docs")).unwrap();
+            fs::write(h.env.repo.join("docs/d.md"), "# D\n\nTexte.\n").unwrap();
+            let o = h.run(&["build"]);
+            assert!(o.status.success(), "{provider}: {}", stderr(&o));
+            let b = h.bodies();
+            assert_eq!(b.len(), n, "{provider}");
+            // Un nouvel essai de format ajoute une correction au message : le reste est égal.
+            let strip = |x: &serde_json::Value| {
+                let mut x = x.clone();
+                if format_retry {
+                    x.as_object_mut().unwrap().remove("messages");
+                }
+                x
+            };
+            assert!(b.iter().all(|x| strip(x) == strip(&b[0])), "{provider}");
+            assert!(
+                b.iter().all(|x| temperature_of(x) == Some(0.2)),
+                "{provider}"
+            );
+        }
+    }
+}
+
+#[test]
+fn REQ275_AC6_cle_refusee_hors_de_la_configuration_personnelle_de_premier_niveau() {
+    // `.nephila.toml` : E-2, liste des clés permises inchangée.
+    let env = Env::new(MOCK);
+    fs::write(env.repo.join(".nephila.toml"), "temperature = 0\n").unwrap();
+    let o = env.run(&["build"]);
+    assert!(!o.status.success());
+    let e = stderr(&o);
+    assert!(e.contains("clé inconnue `temperature`"), "{e}");
+    assert!(
+        !e.split("clés permises")
+            .nth(1)
+            .unwrap()
+            .contains("temperature"),
+        "{e}"
+    );
+    // `[ask]` de `.nephila.toml` : E-2 qui nomme `ask.temperature`.
+    fs::write(env.repo.join(".nephila.toml"), "[ask]\ntemperature = 0\n").unwrap();
+    let o = env.run(&["build"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("clé inconnue `ask.temperature`"),
+        "{}",
+        stderr(&o)
+    );
+    // `[ask]` de la configuration personnelle : message du lecteur TOML.
+    fs::remove_file(env.repo.join(".nephila.toml")).unwrap();
+    env.write_config(&format!("{MOCK}[ask]\ntemperature = 0\n"));
+    let o = env.run(&["build"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("unknown field `temperature`"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn REQ275_AC7_mock_sans_effet_et_aucun_reenrichissement() {
+    let env = Env::new(MOCK);
+    let log = env.repo.parent().unwrap().join("mock.log");
+    let mut seen = Vec::new();
+    for extra in ["", "temperature = 0.2\n"] {
+        env.write_config(&format!("{MOCK}{extra}"));
+        let _ = fs::remove_dir_all(env.repo.join(".nephila"));
+        let _ = fs::remove_file(&log);
+        let b = mock_run(&env, &log, &["build"]);
+        assert_eq!(b.status.code(), Some(0), "{}", stderr(&b));
+        let e = mock_run(&env, &log, &["export", "--output", "-"]);
+        assert_eq!(e.status.code(), Some(0));
+        seen.push((
+            fs::read_to_string(&log).unwrap_or_default(),
+            b.stdout,
+            support::normalized_export(&e.stdout),
+        ));
+    }
+    assert!(!seen[0].0.is_empty(), "le journal du mock est vide");
+    assert_eq!(seen[0], seen[1]);
+
+    env.write_config(MOCK);
+    let _ = fs::remove_dir_all(env.repo.join(".nephila"));
+    let b = mock_run(&env, &log, &["build"]);
+    assert_eq!(b.status.code(), Some(0), "{}", stderr(&b));
+    let before = fs::read_to_string(&log).unwrap();
+    env.write_config(&format!("{MOCK}temperature = 0\n"));
+    let u = mock_run(&env, &log, &["update"]);
+    assert_eq!(u.status.code(), Some(0), "{}", stderr(&u));
+    assert_eq!(String::from_utf8_lossy(&u.stdout).trim(), "graphe à jour");
+    assert_eq!(before, fs::read_to_string(&log).unwrap());
+}
+
+#[test]
+fn REQ275_AC8_AC13_ligne_config_de_build_et_d_ask() {
+    let env = Env::new(MOCK);
+    assert!(env.run(&["build", "--no-llm"]).status.success());
+    let build = |extra: &str| {
+        env.write_config(&format!("{MOCK}{extra}"));
+        let o = env.run(&["build", "--verbose"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        (config_line(&o), stderr(&o))
+    };
+    let ask = |extra: &str| {
+        env.write_config(&format!("{MOCK}{extra}"));
+        let o = env.run(&["query", "ask", "--verbose", "x"]);
+        (config_line(&o), stderr(&o))
+    };
+    // Sans la clé : aucune ligne ne parle de température.
+    let (l, all) = build("");
+    assert!(!all.contains("temperature"), "{all}");
+    assert!(
+        l.contains(" effort=low max_output_tokens=16384 nodes_per_call=150 "),
+        "{l}"
+    );
+    let (_, all) = ask("");
+    assert!(!all.contains("temperature"), "{all}");
+
+    let (l, all) = build("temperature = 0.2\n");
+    assert_eq!(
+        l.matches(" effort=low temperature=0.2 max_output_tokens=16384 nodes_per_call=150 ")
+            .count(),
+        1,
+        "{l}"
+    );
+    assert!(!all.contains("non envoyée"), "{all}");
+    let (l, _) = ask("temperature = 0.2\n");
+    assert_eq!(
+        l.matches(" effort=low temperature=0.2 max_output_tokens=16384 max_context_chars=")
+            .count(),
+        1,
+        "{l}"
+    );
+    assert!(!l.contains("non envoyée"), "{l}");
+
+    assert!(build("temperature = 0.0\n").0.contains(" temperature=0 "));
+    assert!(build("temperature = 2.0\n").0.contains(" temperature=2 "));
+
+    let (l, _) = build("temperature = 0.2\nthinking = true\n");
+    assert!(
+        l.contains(" thinking=true effort=low temperature=0.2 (non envoyée avec thinking) max_output_tokens="),
+        "{l}"
+    );
+    let (l, _) = build("temperature = 0.2\nthinking = false\n[ask]\nthinking = true\n");
+    assert!(!l.contains("non envoyée"), "{l}");
+    let (l, _) = ask("temperature = 0.2\nthinking = false\n[ask]\nthinking = true\n");
+    assert!(
+        l.contains(" temperature=0.2 (non envoyée avec thinking) max_output_tokens="),
+        "{l}"
+    );
+
+    // La marque de source ne nomme jamais la clé.
+    fs::write(env.repo.join(".nephila.toml"), "model = \"m-projet\"\n").unwrap();
+    let (l, _) = build("temperature = 0.2\n");
+    let mark = l.split("(.nephila.toml").nth(1).unwrap();
+    assert!(!mark.contains("temperature"), "{l}");
+}

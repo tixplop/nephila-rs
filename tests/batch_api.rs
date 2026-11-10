@@ -31,6 +31,7 @@ fn llm(server: &BatchServer) -> AnthropicLlm {
         &Tls::default(),
         1,
         Generation {
+            temperature: None,
             effort: Effort::ModelDefault,
             effort_explicit: false,
             thinking: false,
@@ -468,6 +469,7 @@ fn req214_batch_link_needs_a_collector_and_address_is_effective() {
         &Tls::default(),
         1,
         Generation {
+            temperature: None,
             effort: Effort::ModelDefault,
             effort_explicit: false,
             thinking: false,
@@ -488,6 +490,7 @@ fn oai_with(server: &BatchServer, key: Option<&str>) -> OpenAiLlm {
         &Tls::default(),
         1,
         Generation {
+            temperature: None,
             effort: Effort::ModelDefault,
             effort_explicit: false,
             thinking: false,
@@ -880,6 +883,7 @@ fn req213_batch_link_needs_a_collector_and_address_is_effective() {
         &Tls::default(),
         1,
         Generation {
+            temperature: None,
             effort: Effort::ModelDefault,
             effort_explicit: false,
             thinking: false,
