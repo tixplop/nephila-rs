@@ -199,6 +199,7 @@ pub fn update_with_dry_run(
     // changement » (REQ-049). Les statuts et commandes LLM inactif comparent à ce modèle.
     if let Some(llm) = llm {
         store.set_enrich_model(llm.model())?;
+        store.set_enrich_model_names(&opts.names_for(llm.model()))?;
         store.set_enrich_language(llm.summary_language())?;
         store.set_enrich_redact(opts.enrich_redact)?;
         store.set_enrich_code(opts.enrich_code)?;

@@ -1130,7 +1130,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_redact', 'enrich_scope', 'enrich_batches');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_model_aliases', 'enrich_language', 'enrich_code', 'enrich_redact', 'enrich_scope', 'enrich_batches');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -1148,7 +1148,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute_batch(
             "DELETE FROM edges; DELETE FROM file_contexts; DELETE FROM refs; DELETE FROM declarations; DELETE FROM nodes; DELETE FROM files;
-             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_language', 'enrich_code', 'enrich_redact', 'enrich_scope', 'enrich_batches');",
+             DELETE FROM node_communities; DELETE FROM communities; DELETE FROM summary; DELETE FROM meta WHERE key NOT IN ('schema_version', 'enrich_model', 'enrich_model_aliases', 'enrich_language', 'enrich_code', 'enrich_redact', 'enrich_scope', 'enrich_batches');",
         )
         .map_err(db_err)?;
         set_resolution_tx(&tx, RESOLUTION_PENDING)?;
@@ -1443,11 +1443,14 @@ impl Store {
     /// de `meta.enrich_model` (écrit par `build`/`update` LLM actif) ; absent, le modèle n'est
     /// pas comparé.
     pub fn files_to_enrich(&self) -> Result<Vec<FileRecord>> {
-        let model = self.enrich_model()?;
+        let names = match self.enrich_model()? {
+            Some(_) => Some(self.enrich_model_names()?),
+            None => None,
+        };
         let language = self.enrich_language()?;
         let code = self.enrich_code()?;
         let scope = self.enrich_scope()?;
-        self.files_to_enrich_with(model.as_deref(), language.as_deref(), code, &scope, false)
+        self.files_to_enrich_with(names.as_deref(), language.as_deref(), code, &scope, false)
     }
 
     /// Comme `files_to_enrich`, sur des réglages donnés au lieu de ceux de `meta` (REQ-184,
@@ -1455,7 +1458,7 @@ impl Store {
     /// rendus ; `language` absente n'est pas comparée ; `code` inclut les fichiers de code.
     pub fn files_to_enrich_for(
         &self,
-        model: Option<&str>,
+        model: Option<&[String]>,
         language: Option<&str>,
         code: bool,
         scope: &EnrichScope,
@@ -1467,7 +1470,7 @@ impl Store {
     /// donnés) ; sinon il n'est pas comparé (réglages de `meta`, AC-184-10).
     fn files_to_enrich_with(
         &self,
-        model: Option<&str>,
+        model: Option<&[String]>,
         language: Option<&str>,
         code: bool,
         scope: &EnrichScope,
@@ -1477,6 +1480,8 @@ impl Store {
         // Un graphe lu en schéma 5 à 9 n'a pas la colonne : condition d'avant, sans la langue.
         let with_language = self.version >= SCHEMA_WITHOUT_ENRICH_CALLS;
         let all = no_model_is_all && model.is_none();
+        // Noms équivalents du modèle effectif, en liste JSON (REQ-277) ; absente : non comparé.
+        let model: Option<String> = model.map(names_json);
         let language_cond = if with_language {
             " AND (?2 IS NULL OR e.language = ?2)"
         } else {
@@ -1487,7 +1492,7 @@ impl Store {
         } else {
             format!(
                 "SELECT f.path, e.prompt_version FROM files f LEFT JOIN enrichments e
-                 ON e.path = f.path AND e.content_hash = f.hash AND (?1 IS NULL OR e.model = ?1){language_cond}
+                 ON e.path = f.path AND e.content_hash = f.hash AND (?1 IS NULL OR e.model IN (SELECT value FROM json_each(?1))){language_cond}
                  WHERE f.state = 'indexed' ORDER BY f.path"
             )
         };
@@ -1523,10 +1528,11 @@ impl Store {
     }
 
     /// Nombre de fichiers de la portée déjà enrichis (contenu inchangé) avec un autre modèle que
-    /// `model` (REQ-196, DEC-159) ; la langue et la version du prompt ne sont pas comparées.
+    /// les noms `models` (équivalents, REQ-277) (REQ-196, DEC-159) ; la langue et la version du
+    /// prompt ne sont pas comparées.
     pub fn count_enriched_with_other_model(
         &self,
-        model: &str,
+        models: &[String],
         code: bool,
         scope: &EnrichScope,
     ) -> Result<usize> {
@@ -1539,11 +1545,12 @@ impl Store {
                  AND EXISTS (SELECT 1 FROM enrichments e
                              WHERE e.path = f.path AND e.content_hash = f.hash)
                  AND NOT EXISTS (SELECT 1 FROM enrichments e
-                                 WHERE e.path = f.path AND e.content_hash = f.hash AND e.model = ?1)",
+                                 WHERE e.path = f.path AND e.content_hash = f.hash
+                                   AND e.model IN (SELECT value FROM json_each(?1)))",
             )
             .map_err(db_err)?;
         let paths: Vec<String> = st
-            .query_map(params![model], |r| r.get::<_, String>(0))
+            .query_map(params![names_json(models)], |r| r.get::<_, String>(0))
             .map_err(db_err)?
             .collect::<std::result::Result<_, _>>()
             .map_err(db_err)?;
@@ -1713,6 +1720,50 @@ impl Store {
         }
     }
 
+    /// Noms tenus pour le même modèle que le modèle effectif (REQ-277) : la liste enregistrée,
+    /// sinon le seul modèle effectif ; vide sans modèle.
+    pub fn enrich_model_names(&self) -> Result<Vec<String>> {
+        let listed: Option<String> = match self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'enrich_model_aliases'")
+            .map_err(db_err)?
+            .query_row([], |r| r.get(0))
+        {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(db_err(e)),
+        };
+        if let Some(l) = listed {
+            if let Ok(names) = serde_json::from_str::<Vec<String>>(&l) {
+                return Ok(names);
+            }
+        }
+        Ok(self.enrich_model()?.into_iter().collect())
+    }
+
+    /// Enregistre les noms équivalents au modèle effectif : la liste triée s'il y en a plus d'un,
+    /// sinon la clé est retirée (REQ-277).
+    pub fn set_enrich_model_names(&mut self, names: &[String]) -> Result<()> {
+        self.ensure_writable()?;
+        if names.len() > 1 {
+            let mut sorted = names.to_vec();
+            sorted.sort();
+            self.conn
+                .prepare_cached(
+                    "INSERT INTO meta(key, value) VALUES ('enrich_model_aliases', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .map_err(db_err)?
+                .execute([names_json(&sorted)])
+                .map_err(db_err)?;
+        } else {
+            self.conn
+                .execute("DELETE FROM meta WHERE key = 'enrich_model_aliases'", [])
+                .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
     /// Langue des résumés du dernier `build`/`update` LLM actif (`None` : aucune depuis la
     /// réinitialisation ; elle n'est alors pas comparée, DEC-138).
     pub fn enrich_language(&self) -> Result<Option<String>> {
@@ -1800,18 +1851,18 @@ impl Store {
     pub fn paths_with_unapplied_current_entry(&self) -> Result<Vec<String>> {
         let mut st = self
             .conn
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT e.path, e.prompt_version FROM enrichments e
                  JOIN files f ON f.path = e.path AND f.hash = e.content_hash
                  WHERE f.state = 'indexed'
-                   AND e.model IS (SELECT value FROM meta WHERE key = 'enrich_model')
+                   AND e.model IN (SELECT value FROM json_each({NAMES_SQL}))
                    AND e.language IS (SELECT value FROM meta WHERE key = 'enrich_language')
                    AND EXISTS (SELECT 1 FROM enrichments o
                                WHERE o.path = e.path AND o.content_hash = e.content_hash
                                  AND (o.used_at > e.used_at
                                       OR (o.used_at = e.used_at AND o.rowid > e.rowid)))
-                 ORDER BY e.path",
-            )
+                 ORDER BY e.path"
+            ))
             .map_err(db_err)?;
         let rows: Vec<(String, u32)> = st
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -4014,6 +4065,16 @@ fn apply_enrichment_tx(
     insert_refs(tx, path, refs, "llm", touched)
 }
 
+/// Liste JSON de noms de modèle, pour `json_each` (REQ-277).
+fn names_json(names: &[String]) -> String {
+    serde_json::to_string(names).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Noms équivalents du modèle effectif lus dans `meta` : la liste enregistrée, sinon le modèle
+/// seul (REQ-277).
+const NAMES_SQL: &str = "COALESCE((SELECT value FROM meta WHERE key = 'enrich_model_aliases'),
+                json_array((SELECT value FROM meta WHERE key = 'enrich_model')))";
+
 /// Choisit parmi les entrées d'un chemin pour un contenu : celle de la clé actuelle
 /// (`meta.enrich_model`, `meta.enrich_language`, version du prompt du chemin), sinon la dernière
 /// utilisée (DEC-190). Rend le `rowid` et la charge utile.
@@ -4024,15 +4085,15 @@ fn pick_entry(
     versions: &PromptVersions,
 ) -> Result<Option<(i64, String)>> {
     match tx
-        .prepare_cached(
+        .prepare_cached(&format!(
             "SELECT e.rowid, e.payload FROM enrichments e
              WHERE e.path = ?1 AND e.content_hash = ?2
-             ORDER BY (e.model IS (SELECT value FROM meta WHERE key = 'enrich_model')
+             ORDER BY (e.model IN (SELECT value FROM json_each({NAMES_SQL}))
                        AND e.language IS (SELECT value FROM meta WHERE key = 'enrich_language')
                        AND e.prompt_version = ?3) DESC,
                       e.used_at DESC, e.rowid DESC
-             LIMIT 1",
-        )
+             LIMIT 1"
+        ))
         .map_err(db_err)?
         .query_row(params![path, hash, versions.of_path(path)], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -5421,13 +5482,18 @@ mod tests {
         let (_d, mut st) = enriched_store();
         let paths = |v: Vec<FileRecord>| -> Vec<String> { v.into_iter().map(|f| f.path).collect() };
         assert!(st
-            .files_to_enrich_for(Some("m"), Some("français"), false, &EnrichScope::default())
+            .files_to_enrich_for(
+                Some(&["m".into()]),
+                Some("français"),
+                false,
+                &EnrichScope::default()
+            )
             .unwrap()
             .is_empty());
         assert_eq!(
             paths(
                 st.files_to_enrich_for(
-                    Some("autre"),
+                    Some(&["autre".into()]),
                     Some("français"),
                     false,
                     &EnrichScope::default()
@@ -5438,8 +5504,13 @@ mod tests {
         );
         assert_eq!(
             paths(
-                st.files_to_enrich_for(Some("m"), Some("english"), false, &EnrichScope::default())
-                    .unwrap()
+                st.files_to_enrich_for(
+                    Some(&["m".into()]),
+                    Some("english"),
+                    false,
+                    &EnrichScope::default()
+                )
+                .unwrap()
             ),
             vec!["a.md"]
         );
@@ -5469,7 +5540,12 @@ mod tests {
         // Les réglages de `meta` ne changent pas le résultat des réglages donnés.
         st.set_enrich_model("autre").unwrap();
         assert!(st
-            .files_to_enrich_for(Some("m"), Some("français"), false, &EnrichScope::default())
+            .files_to_enrich_for(
+                Some(&["m".into()]),
+                Some("français"),
+                false,
+                &EnrichScope::default()
+            )
             .unwrap()
             .iter()
             .all(|f| f.path != "a.md"));
@@ -5544,18 +5620,18 @@ mod tests {
         let (_d, st) = req196_ac1_store(&["a.md", "b.md", "A.java", "pom.xml"]);
         // Portée : documents seuls, ou avec le code.
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", false, &EnrichScope::default())
+            st.count_enriched_with_other_model(&["m-new".into()], false, &EnrichScope::default())
                 .unwrap(),
             2
         );
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", true, &EnrichScope::default())
+            st.count_enriched_with_other_model(&["m-new".into()], true, &EnrichScope::default())
                 .unwrap(),
             4
         );
         // Le modèle déjà utilisé n'est pas compté.
         assert_eq!(
-            st.count_enriched_with_other_model("m-old", true, &EnrichScope::default())
+            st.count_enriched_with_other_model(&["m-old".into()], true, &EnrichScope::default())
                 .unwrap(),
             0
         );
@@ -5567,12 +5643,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", false, &EnrichScope::default())
+            st.count_enriched_with_other_model(&["m-new".into()], false, &EnrichScope::default())
                 .unwrap(),
             2
         );
         assert_eq!(
-            st.count_enriched_with_other_model("m-old", false, &EnrichScope::default())
+            st.count_enriched_with_other_model(&["m-old".into()], false, &EnrichScope::default())
                 .unwrap(),
             0
         );
@@ -5581,7 +5657,7 @@ mod tests {
             .execute("UPDATE files SET hash = 'h2' WHERE path = 'b.md'", [])
             .unwrap();
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", false, &EnrichScope::default())
+            st.count_enriched_with_other_model(&["m-new".into()], false, &EnrichScope::default())
                 .unwrap(),
             1
         );
@@ -5731,13 +5807,17 @@ mod tests {
     fn req207_ac8_count_enriched_with_other_model_ignores_out_of_scope_files() {
         let (_d, st) = req196_ac1_store(&["a.md", "docs/migrations/b.md"]);
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", false, &EnrichScope::default())
+            st.count_enriched_with_other_model(&["m-new".into()], false, &EnrichScope::default())
                 .unwrap(),
             1
         );
         assert_eq!(
-            st.count_enriched_with_other_model("m-new", false, &scope_exclude("nothing/"))
-                .unwrap(),
+            st.count_enriched_with_other_model(
+                &["m-new".into()],
+                false,
+                &scope_exclude("nothing/")
+            )
+            .unwrap(),
             2
         );
     }
@@ -5774,7 +5854,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let st = Store::open_or_create(dir.path()).unwrap();
         assert_eq!(
-            st.count_enriched_with_other_model("m", true, &EnrichScope::default())
+            st.count_enriched_with_other_model(&["m".into()], true, &EnrichScope::default())
                 .unwrap(),
             0
         );
@@ -6044,7 +6124,12 @@ mod tests {
         }
         assert!(to_enrich_paths(&st).is_empty());
         assert!(st
-            .files_to_enrich_for(Some("m"), Some("français"), true, &EnrichScope::default())
+            .files_to_enrich_for(
+                Some(&["m".into()]),
+                Some("français"),
+                true,
+                &EnrichScope::default()
+            )
             .unwrap()
             .is_empty());
         st.conn
@@ -6082,7 +6167,12 @@ mod tests {
             st.set_prompt_versions(changed);
             assert_eq!(to_enrich_paths(&st), [name], "{name}");
             let given = st
-                .files_to_enrich_for(Some("m"), Some("français"), true, &EnrichScope::default())
+                .files_to_enrich_for(
+                    Some(&["m".into()]),
+                    Some("français"),
+                    true,
+                    &EnrichScope::default(),
+                )
                 .unwrap();
             assert_eq!(
                 given.into_iter().map(|f| f.path).collect::<Vec<_>>(),
@@ -9888,15 +9978,100 @@ mod tests {
         let scope = EnrichScope::default();
         r258_write(&mut st, "h", "m-old", "français", "S");
         assert_eq!(
-            st.count_enriched_with_other_model("m-projet", true, &scope)
+            st.count_enriched_with_other_model(&["m-projet".into()], true, &scope)
                 .unwrap(),
             1
         );
         r258_write(&mut st, "h", "m-projet", "français", "S");
         assert_eq!(
-            st.count_enriched_with_other_model("m-projet", true, &scope)
+            st.count_enriched_with_other_model(&["m-projet".into()], true, &scope)
                 .unwrap(),
             0
         );
+    }
+    fn names(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn req277_ac7_count_enriched_with_other_model_accepts_equivalent_names() {
+        let (_d, mut st) = r258_store();
+        let scope = EnrichScope::default();
+        r258_write(&mut st, "h", "m-old", "français", "S");
+        let count = |n: &[&str]| {
+            st.count_enriched_with_other_model(&names(n), true, &scope)
+                .unwrap()
+        };
+        assert_eq!(count(&["m-old", "m-projet"]), 0);
+        assert_eq!(count(&["m-projet"]), 1);
+    }
+
+    #[test]
+    fn req277_ac3_files_to_enrich_compares_with_the_registered_names() {
+        let (_d, mut st) = r258_store();
+        r258_write(&mut st, "h", "m-a", "français", "S");
+        st.set_enrich_model("m-b").unwrap();
+        st.set_enrich_language("français").unwrap();
+        // Sans la clé : comparaison à la lettre.
+        assert_eq!(st.files_to_enrich().unwrap().len(), 1);
+        st.set_enrich_model_names(&names(&["m-b", "m-a"])).unwrap();
+        assert_eq!(
+            st.enrich_model_names().unwrap(),
+            names(&["m-a", "m-b"]),
+            "liste triée"
+        );
+        assert!(st.files_to_enrich().unwrap().is_empty());
+        // Un seul nom : la clé est retirée.
+        st.set_enrich_model_names(&names(&["m-b"])).unwrap();
+        assert_eq!(st.enrich_model_names().unwrap(), names(&["m-b"]));
+        let n: i64 = st
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM meta WHERE key = 'enrich_model_aliases'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(st.files_to_enrich().unwrap().len(), 1);
+        // Les réglages donnés portent leur liste.
+        let scope = EnrichScope::default();
+        assert!(st
+            .files_to_enrich_for(
+                Some(&names(&["m-a", "m-b"])),
+                Some("français"),
+                true,
+                &scope
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn req277_ac10_pick_entry_and_unapplied_entries_use_the_names() {
+        let (_d, mut st) = r258_store();
+        r258_write(&mut st, "h", "m-a", "français", "SA");
+        r258_pause(&st);
+        r258_write(&mut st, "h", "m-c", "français", "SC");
+        st.set_enrich_model("m-b").unwrap();
+        st.set_enrich_language("français").unwrap();
+        assert!(st.paths_with_unapplied_current_entry().unwrap().is_empty());
+        st.set_enrich_model_names(&names(&["m-a", "m-b"])).unwrap();
+        assert_eq!(
+            st.paths_with_unapplied_current_entry().unwrap(),
+            vec!["a.md".to_string()]
+        );
+        st.replace_structure("a.md", &[ty("p.A", "a.md")], &[])
+            .unwrap();
+        assert_eq!(r131_summary_of_node(&st, "p.A").as_deref(), Some("SA"));
+    }
+
+    #[test]
+    fn req277_ac3_reset_keeps_the_registered_names() {
+        let (_d, mut st) = r258_store();
+        st.set_enrich_model("m-b").unwrap();
+        st.set_enrich_model_names(&names(&["m-a", "m-b"])).unwrap();
+        st.reset_with_pending_files(&[file("a.md")]).unwrap();
+        assert_eq!(st.enrich_model_names().unwrap(), names(&["m-a", "m-b"]));
     }
 }

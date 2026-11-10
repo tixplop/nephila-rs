@@ -98,6 +98,9 @@ pub struct IndexOptions {
     pub batch: bool,
     /// `--subsystems` (REQ-261) : passe des noms de sous-systèmes à la fin de la commande.
     pub subsystems: bool,
+    /// Noms tenus pour le même modèle que le modèle effectif, lui compris (REQ-277) ; vide :
+    /// le modèle du client seul.
+    pub model_names: Vec<String>,
 }
 
 impl Default for IndexOptions {
@@ -115,7 +118,27 @@ impl Default for IndexOptions {
             enrich_scope: EnrichScope::default(),
             batch: false,
             subsystems: false,
+            model_names: Vec::new(),
         }
+    }
+}
+
+impl IndexOptions {
+    /// Noms équivalents à `model` (lui compris) ; le seul `model` sans table (REQ-277).
+    pub(crate) fn names_for(&self, model: &str) -> Vec<String> {
+        if self.model_names.iter().any(|n| n == model) {
+            self.model_names.clone()
+        } else {
+            vec![model.to_string()]
+        }
+    }
+
+    /// Noms équivalents à `model`, sans lui.
+    pub(crate) fn aliases_of(&self, model: &str) -> Vec<String> {
+        self.names_for(model)
+            .into_iter()
+            .filter(|n| n != model)
+            .collect()
     }
 }
 
@@ -134,6 +157,7 @@ impl From<&Config> for IndexOptions {
             enrich_scope: EnrichScope::default(),
             batch: false,
             subsystems: false,
+            model_names: c.model_names(&c.model),
         }
     }
 }
@@ -163,6 +187,8 @@ pub(crate) struct Setup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectModel {
     pub project: String,
+    /// Noms équivalents au modèle du dépôt, lui compris (REQ-277).
+    pub project_names: Vec<String>,
     pub personal: String,
 }
 
@@ -289,6 +315,7 @@ pub(crate) fn setup(
                 Some(m) if config.model_override == ModelOverride::Warn && *m != config.model => {
                     Some(ProjectModel {
                         project: m.clone(),
+                        project_names: config.model_names(m),
                         personal: config.model.clone(),
                     })
                 }
@@ -452,7 +479,7 @@ pub(crate) fn check_project_model(
     let n = {
         let counted = Store::open_readonly(repo).and_then(|st| {
             st.count_enriched_with_other_model(
-                &pm.project,
+                &pm.project_names,
                 setup.opts.enrich_code,
                 &setup.opts.enrich_scope,
             )
@@ -768,6 +795,7 @@ fn build_impl(
     store.load_orphan_enrichments()?;
     if let Some(llm) = llm {
         store.set_enrich_model(llm.model())?;
+        store.set_enrich_model_names(&opts.names_for(llm.model()))?;
         store.set_enrich_language(llm.summary_language())?;
         store.set_enrich_redact(opts.enrich_redact)?;
         store.set_enrich_code(opts.enrich_code)?;
@@ -880,8 +908,9 @@ pub(crate) fn estimate_enrichment(
     repo: &Path,
     abs: &HashMap<String, PathBuf>,
 ) -> Result<Estimate> {
+    let names = dry.model.as_deref().map(|m| opts.names_for(m));
     let files = store.files_to_enrich_for(
-        dry.model.as_deref(),
+        names.as_deref(),
         Some(&dry.language),
         opts.enrich_code,
         &opts.enrich_scope,
@@ -892,12 +921,14 @@ pub(crate) fn estimate_enrichment(
         Some(model) => enrich::KeptCalls {
             results: store.call_results()?,
             model: model.clone(),
+            aliases: opts.aliases_of(model),
             language: dry.language.clone(),
             versions: store.prompt_versions(),
         },
         None => enrich::KeptCalls {
             results: HashMap::new(),
             model: String::new(),
+            aliases: Vec::new(),
             language: dry.language.clone(),
             versions: store.prompt_versions(),
         },
@@ -954,6 +985,7 @@ mod tests {
             dry_run: None,
             project_model: project.map(|p| ProjectModel {
                 project: p.into(),
+                project_names: vec![p.into()],
                 personal: "m-perso".into(),
             }),
         }

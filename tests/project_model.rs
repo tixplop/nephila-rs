@@ -841,3 +841,22 @@ fn req196_ac10_echappement_de_l_avertissement_et_du_refus() {
     );
     assert!(!o.stderr.contains(&0x1B) && !o.stderr.contains(&0x07));
 }
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ277_AC7_equivalent_name_is_not_counted_and_does_not_refuse() {
+    let table = format!("{PERSO}[model_aliases]\n\"m-perso\" = \"m-projet\"\n");
+    // Sans la table : 51 fichiers à refaire, refus.
+    let e = imposed(51, PERSO, "\"m-projet\"");
+    assert_eq!(e.run(&["update"]).status.code(), Some(1));
+    // Avec la table, le modèle du dépôt équivaut à `m-perso` : aucun fichier à refaire.
+    let e = Env::new(51, &table);
+    assert!(e.run(&["build"]).status.success());
+    e.project("model = \"m-projet\"\n");
+    e.clear_log();
+    let o = e.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    assert!(!text(&o.stderr).contains("seraient réenrichis"));
+    assert_eq!(e.calls(), 0);
+    assert_eq!(e.models(), vec!["m-perso"]);
+}

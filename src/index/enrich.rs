@@ -559,6 +559,8 @@ type Take<'t> = &'t dyn Fn(usize, usize) -> bool;
 pub(crate) struct KeptCalls {
     pub(crate) results: HashMap<String, Enrichment>,
     pub(crate) model: String,
+    /// Les autres noms tenus pour le même modèle (REQ-277) ; un appel conservé sous l'un d'eux vaut.
+    pub(crate) aliases: Vec<String>,
     pub(crate) language: String,
     pub(crate) versions: PromptVersions,
 }
@@ -576,8 +578,33 @@ impl KeptCalls {
         requested: &[String],
         known: &[String],
     ) -> String {
+        self.key_as(
+            &self.model,
+            path,
+            index,
+            count,
+            excerpt,
+            part,
+            requested,
+            known,
+        )
+    }
+
+    /// Clé du même appel sous le nom de modèle `model`.
+    #[allow(clippy::too_many_arguments)]
+    fn key_as(
+        &self,
+        model: &str,
+        path: &str,
+        index: usize,
+        count: usize,
+        excerpt: Option<Excerpt>,
+        part: &str,
+        requested: &[String],
+        known: &[String],
+    ) -> String {
         call_key(&CallKeyParts {
-            model: &self.model,
+            model,
             language: &self.language,
             prompt_version: self.versions.of_path(path),
             path,
@@ -1414,9 +1441,14 @@ fn split_kept<'a>(
                 requested,
                 known,
                 ..
-            } => kept
-                .results
-                .get(&kept.key(&file.path, *index, *count, *excerpt, part, requested, known))
+            } => std::iter::once(&kept.model)
+                .chain(&kept.aliases)
+                .find_map(|m| {
+                    let key = kept.key_as(
+                        m, &file.path, *index, *count, *excerpt, part, requested, known,
+                    );
+                    kept.results.get(&key)
+                })
                 .map(|x| (*index, x.clone())),
             _ => None,
         };
@@ -2525,6 +2557,7 @@ pub(crate) fn enrich_pass(
     let kept = KeptCalls {
         results: store.call_results()?,
         model: llm.model().to_string(),
+        aliases: opts.aliases_of(llm.model()),
         language: llm.summary_language().to_string(),
         versions: store.prompt_versions(),
     };
@@ -7610,6 +7643,7 @@ mod estimate_tests {
         let kept = KeptCalls {
             results: HashMap::new(),
             model: "m".into(),
+            aliases: Vec::new(),
             language: LANG.into(),
             versions: PromptVersions::CURRENT,
         };
@@ -8246,6 +8280,7 @@ mod cache_tests {
         let mut kept = KeptCalls {
             results: HashMap::new(),
             model: "m".into(),
+            aliases: Vec::new(),
             language: "français".into(),
             versions: PromptVersions::CURRENT,
         };

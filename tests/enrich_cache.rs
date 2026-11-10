@@ -2457,3 +2457,156 @@ fn req272_ac11_compacted_text_does_not_change_the_batch_budget() {
         );
     }
 }
+
+// ---- REQ-277 : noms de modèle équivalents (T-376) ----
+
+/// Configuration personnelle `mock` avec `model` et la table `model_aliases` donnée (vide : aucune).
+fn set_model_and_table(env: &Env, model: &str, table: &str) {
+    let table = if table.is_empty() {
+        String::new()
+    } else {
+        format!("[model_aliases]\n{table}\n")
+    };
+    fs::write(
+        &env.config,
+        format!("provider = \"mock\"\nenrich_code = true\nmodel = \"{model}\"\nbatch_files = 1\nconcurrency = 1\n{table}"),
+    )
+    .unwrap();
+}
+
+/// Modèle de chaque entrée d'enrichissement, par chemin.
+fn entry_models(env: &Env) -> Vec<(String, String)> {
+    let conn = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    let mut st = conn
+        .prepare("SELECT path, model FROM enrichments ORDER BY used_at, rowid")
+        .unwrap();
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+const ALIAS: &str = "m-alias";
+const DATED: &str = "m-alias-20250929";
+const DATED_TABLE: &str = "\"m-alias\" = \"m-alias-20250929\"";
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ277_AC3_AC4_AC5_AC6_AC11_equivalent_names_keep_the_enrichments() {
+    for (first, second) in [(ALIAS, DATED), (DATED, ALIAS)] {
+        let env = Env::new();
+        set_model_and_table(&env, first, "");
+        env.ok(&["build"]);
+        let files = all_paths(&env);
+
+        // AC-277-4 : sans la table, deux modèles ; chaque fichier repart une fois.
+        set_model_and_table(&env, second, "");
+        env.ok(&["update"]);
+        assert_eq!(env.logged_paths(), files, "{first}->{second} sans table");
+        assert_eq!(env.logged().len(), files.len());
+
+        // AC-277-3 : avec la table, rien ne repart, dans les deux sens.
+        let env = Env::new();
+        set_model_and_table(&env, first, "");
+        env.ok(&["build"]);
+        let summaries = snapshot(&env.store());
+        set_model_and_table(&env, second, DATED_TABLE);
+        let o = env.ok(&["update"]);
+        assert!(env.logged().is_empty(), "{:?}", env.logged());
+        assert_eq!(text(&o.stdout), "graphe à jour\n");
+        assert_eq!(to_enrich(&env), 0);
+        env.ok(&["build"]);
+        assert!(env.logged().is_empty(), "{:?}", env.logged());
+        assert_eq!(snapshot(&env.store()), summaries);
+
+        // AC-277-11 : `status` sans fichier de configuration compte comme la dernière commande.
+        let o = env.run_plain(&["status", "--json"]);
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(v["to_enrich"].as_u64(), Some(0), "{}", text(&o.stdout));
+
+        // AC-277-5 : un fichier modifié, seul envoyé, sous le nom configuré.
+        env.write(
+            SVC,
+            &format!(
+                "{}\n// modif\n",
+                fs::read_to_string(env.repo.join(SVC)).unwrap()
+            ),
+        );
+        env.ok(&["update"]);
+        assert_eq!(env.logged_paths(), BTreeSet::from([SVC.to_string()]));
+        let svc_models: Vec<String> = entry_models(&env)
+            .into_iter()
+            .filter(|(p, _)| p == SVC)
+            .map(|(_, m)| m)
+            .collect();
+        assert!(svc_models.contains(&second.to_string()), "{svc_models:?}");
+        let others: BTreeSet<String> = entry_models(&env)
+            .into_iter()
+            .filter(|(p, _)| p != SVC)
+            .map(|(_, m)| m)
+            .collect();
+        assert_eq!(others, BTreeSet::from([first.to_string()]));
+
+        // AC-277-6 : table retirée, retour à la comparaison à la lettre.
+        let env = Env::new();
+        set_model_and_table(&env, first, "");
+        env.ok(&["build"]);
+        set_model_and_table(&env, second, DATED_TABLE);
+        env.ok(&["update"]);
+        assert!(env.logged().is_empty());
+        set_model_and_table(&env, second, "");
+        env.ok(&["update"]);
+        assert_eq!(env.logged_paths(), files, "table retirée");
+        assert_eq!(env.logged().len(), files.len());
+    }
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ277_AC10_applied_entry_is_the_one_of_an_equivalent_name() {
+    let env = Env::new();
+    set_model_and_table(&env, "m-a", "");
+    env.ok(&["build"]);
+    mark_payload(&env, SVC, "m-a");
+    set_model_and_table(&env, "m-c", "");
+    env.ok(&["update"]);
+    assert_ne!(summary_of(&env, SVC_TYPE).as_deref(), Some(MARK));
+    set_model_and_table(&env, "m-b", "\"m-a\" = \"m-b\"");
+    env.ok(&["update"]);
+    assert!(env.logged().is_empty(), "{:?}", env.logged());
+    assert_eq!(summary_of(&env, SVC_TYPE).as_deref(), Some(MARK));
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ277_AC9_kept_call_of_an_equivalent_name_is_not_sent_again() {
+    let (java, max, lists) = two_calls();
+    let good = openai_body(&summaries_text(&lists[0], None), "stop");
+    let bad = openai_body("pas du JSON", "stop");
+    let full2 = openai_body(&summaries_text(&lists[1], None), "stop");
+    let s = Served::new(&java, max, vec![good, bad, full2]);
+    let o = s.run("build");
+    assert!(!o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(s.posts(), 2);
+    assert_eq!(s.kept(), 1);
+    let conf = fs::read_to_string(&s.config).unwrap();
+    fs::write(
+        &s.config,
+        format!(
+            "{}\n[model_aliases]\n\"m\" = \"m-b\"\n",
+            conf.replace("model = \"m\"", "model = \"m-b\"")
+        ),
+    )
+    .unwrap();
+    let o = s.run("update");
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(s.posts(), 3, "seul l'appel 2 part");
+    assert_eq!(s.kept(), 0);
+    assert_eq!(
+        Store::open_readonly(&s.repo)
+            .unwrap()
+            .count_files_to_enrich()
+            .unwrap(),
+        0
+    );
+}

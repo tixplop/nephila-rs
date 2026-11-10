@@ -1184,3 +1184,25 @@ fn req271_ac6_estimation_egale_a_la_commande_reelle_avec_petite_limite() {
     let n = lines.lines().filter(|l| l.contains("src/Big.java")).count();
     assert_eq!(n, 6, "{lines}");
 }
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ277_AC8_equivalent_name_estimates_no_call() {
+    let env = built_with_mock();
+    env.config_text("provider = \"mock\"\nmodel = \"mock-daté\"\nenrich_code = true\n");
+    let o = env.run(&["update", "--dry-run"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(counts(&o), (6, 2, 1), "sans la table");
+
+    env.config_text(
+        "provider = \"mock\"\nmodel = \"mock-daté\"\nenrich_code = true\n[model_aliases]\n\"mock\" = \"mock-daté\"\n",
+    );
+    let o = env.run(&["update", "--dry-run"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(counts(&o), (0, 0, 0), "{}", out(&o));
+    assert!(
+        out(&o).contains("estimation minimale : 0 appels"),
+        "{}",
+        out(&o)
+    );
+}
