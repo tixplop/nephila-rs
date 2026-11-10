@@ -4,7 +4,7 @@ use super::batch::{Answer, BatchApi, BatchLink, Collector, CreateError, LotStatu
 use super::schema::Reply;
 use super::{http, openai_usage, CallStats, Complete, Generation, Retry, Structured, Tls};
 use crate::config::Effort;
-use crate::error::{Error, Result, TRUNCATED};
+use crate::error::{Error, Result, BLOCKED, TRUNCATED};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -392,6 +392,13 @@ impl Complete for OpenAiLlm {
         let raw = sent?;
         let v = http::parse_body("openai", &raw)?;
         stats.record_response(openai_usage(&v));
+        if v["choices"][0]["finish_reason"] == "content_filter"
+            || v["choices"][0]["message"]["refusal"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty())
+        {
+            return Err(Error::Refused(BLOCKED.into()));
+        }
         let text = v["choices"][0]["message"]["content"]
             .as_str()
             .map(String::from);
@@ -579,6 +586,89 @@ mod tests {
             assert_eq!(stats.usage(), Some(want));
             assert_eq!(stats.sends(), 1);
         }
+    }
+
+    #[test]
+    fn req274_ac2_content_filter_and_refusal_are_blocked() {
+        let usage = r#""usage":{"prompt_tokens":10,"completion_tokens":3}"#;
+        let blocked = [
+            format!(
+                r#"{{"choices":[{{"finish_reason":"content_filter","message":{{"content":"x"}}}}],{usage}}}"#
+            ),
+            format!(
+                r#"{{"choices":[{{"finish_reason":"content_filter","message":{{}}}}],{usage}}}"#
+            ),
+            format!(
+                r#"{{"choices":[{{"finish_reason":"stop","message":{{"content":null,"refusal":"I can't"}}}}],{usage}}}"#
+            ),
+        ];
+        let not_blocked = [
+            (
+                r#"{"choices":[{"finish_reason":"stop","message":{"content":"x","refusal":null}}]}"#,
+                true,
+            ),
+            (
+                r#"{"choices":[{"finish_reason":"stop","message":{"content":"x","refusal":""}}]}"#,
+                true,
+            ),
+            (
+                r#"{"choices":[{"finish_reason":"length","message":{"content":"x"}}]}"#,
+                false,
+            ),
+        ];
+        let run = |body: String| {
+            let l = OpenAiLlm::new(
+                Some(fake_server(vec![(200, body)])),
+                "m".into(),
+                None,
+                10,
+                &Tls::default(),
+                1,
+                gen(false, Effort::Low, false, 100),
+            );
+            let stats = CallStats::default();
+            let r = l.complete(
+                None,
+                None,
+                &stats,
+                "s".into(),
+                "u".into(),
+                Reply::File,
+                None,
+            );
+            (r, stats)
+        };
+        for body in blocked {
+            let (r, stats) = run(body);
+            assert!(
+                matches!(&r, Err(Error::Refused(m)) if m == BLOCKED),
+                "{r:?}"
+            );
+            assert_eq!(stats.usage().map(|u| (u.input, u.output)), Some((10, 3)));
+            assert_eq!(stats.sends(), 1);
+        }
+        for (body, ok) in not_blocked {
+            let (r, _) = run(body.to_string());
+            if ok {
+                assert_eq!(r.unwrap(), "x", "{body}");
+            } else {
+                assert!(matches!(&r, Err(Error::Truncated { .. })), "{body} {r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn req274_ac3_stream_refusal_deltas_are_blocked() {
+        let data = |v: serde_json::Value| format!("data: {v}\n\n");
+        let mut s = data(serde_json::json!({"choices":[{"delta":{"refusal":"I can"}}]}));
+        s += &data(serde_json::json!({"choices":[{"delta":{"refusal":"'t"}}]}));
+        s += &data(serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}));
+        s += "data: [DONE]\n\n";
+        let (r, _) = streamed(s);
+        assert!(
+            matches!(&r, Err(Error::Refused(m)) if m == BLOCKED),
+            "{r:?}"
+        );
     }
 
     /// Flux OpenAI : texte en deux morceaux (s'il y en a un), `finish_reason`, `usage`, `[DONE]`.

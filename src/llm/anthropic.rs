@@ -4,7 +4,7 @@ use super::batch::{Answer, BatchApi, BatchLink, Collector, CreateError, LotStatu
 use super::schema::Reply;
 use super::{anthropic_usage, http, CallStats, Complete, Generation, Retry, Structured, Tls};
 use crate::config::Effort;
-use crate::error::{Error, Result, TRUNCATED};
+use crate::error::{Error, Result, BLOCKED, TRUNCATED};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -450,6 +450,9 @@ impl Complete for AnthropicLlm {
         let raw = sent?;
         let v = http::parse_body("anthropic", &raw)?;
         stats.record_response(anthropic_usage(&v));
+        if v["stop_reason"] == "refusal" {
+            return Err(Error::Refused(BLOCKED.into()));
+        }
         let text = v["content"]
             .as_array()
             .and_then(|blocks| blocks.iter().find(|b| b["type"] == "text"))
@@ -720,6 +723,75 @@ mod tests {
             assert_eq!(stats.usage(), Some(want));
             assert_eq!(stats.sends(), 1);
         }
+    }
+
+    #[test]
+    fn req274_ac1_refusal_is_blocked_even_with_conforming_json_or_no_content() {
+        let usage = r#""usage":{"input_tokens":10,"output_tokens":3}"#;
+        let json_text = r#"{\"version\": 2}"#;
+        let cases = [
+            format!(
+                r#"{{"stop_reason":"refusal","content":[{{"type":"text","text":"{json_text}"}}],{usage}}}"#
+            ),
+            format!(r#"{{"stop_reason":"refusal","content":[],{usage}}}"#),
+        ];
+        for body in cases {
+            let l = llm(fake_server(vec![(200, body)]));
+            let stats = CallStats::default();
+            let e = l
+                .complete(
+                    None,
+                    None,
+                    &stats,
+                    "s".into(),
+                    "u".into(),
+                    Reply::File,
+                    None,
+                )
+                .unwrap_err();
+            assert!(matches!(&e, Error::Refused(m) if m == BLOCKED), "{e:?}");
+            assert_eq!(stats.usage().map(|u| (u.input, u.output)), Some((10, 3)));
+            assert_eq!(stats.sends(), 1);
+        }
+        for stop in ["end_turn", "max_tokens"] {
+            let body =
+                format!(r#"{{"stop_reason":"{stop}","content":[{{"type":"text","text":"x"}}]}}"#);
+            let l = llm(fake_server(vec![(200, body)]));
+            let r = l.complete(
+                None,
+                None,
+                &CallStats::default(),
+                "s".into(),
+                "u".into(),
+                Reply::File,
+                None,
+            );
+            if stop == "end_turn" {
+                assert_eq!(r.unwrap(), "x");
+            } else {
+                assert!(matches!(&r, Err(Error::Truncated { .. })), "{stop} {r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn req274_ac3_stream_refusal_is_blocked() {
+        let l = llm(crate::llm::usage::sse_server(stream(
+            Some("abc"),
+            "refusal",
+        )));
+        let e = l
+            .complete(
+                None,
+                None,
+                &CallStats::default(),
+                "s".into(),
+                "u".into(),
+                Reply::File,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(&e, Error::Refused(m) if m == BLOCKED), "{e:?}");
     }
 
     fn event(name: &str, data: serde_json::Value) -> String {

@@ -36,6 +36,9 @@ pub enum Error {
     /// comptée ni remise à zéro par la politique d'échec (REQ-046). S'affiche comme `Message`.
     /// `partial` est le texte reçu avant la coupe (vide s'il manque), jamais affiché (REQ-232).
     Truncated { message: String, partial: String },
+    /// Réponse que le fournisseur marque bloquée (refus, filtrage de contenu) ; jamais retentée, ni
+    /// comptée ni remise à zéro par la politique d'échec (REQ-274). S'affiche comme `Message`.
+    Refused(String),
     /// Plan d'appels d'un fichier envoyé seul au-delà du plafond : aucun appel n'est envoyé.
     /// Ni comptée ni remise à zéro par la politique d'échec, jamais retentée (REQ-048).
     TooManyCalls { calls: usize, max: usize },
@@ -66,6 +69,10 @@ pub enum Error {
 /// Libellé fixe d'une réponse tronquée (avertissement d'enrichissement, erreur de `query ask`,
 /// traces) : seule source du texte.
 pub const TRUNCATED: &str = "réponse tronquée par la limite de jetons";
+
+/// Libellé fixe d'une réponse bloquée par le modèle (A-24, E-37, cause d'A-23, traces) : seule
+/// source du texte.
+pub const BLOCKED: &str = "réponse bloquée par le modèle";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -110,6 +117,7 @@ impl fmt::Display for Error {
             | Error::Timeout(m)
             | Error::Message(m)
             | Error::Format(m)
+            | Error::Refused(m)
             | Error::Truncated { message: m, .. }
             | Error::Interrupted(m) => f.write_str(m),
             Error::TooManyCalls { calls, max } => write!(

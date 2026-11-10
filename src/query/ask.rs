@@ -15,7 +15,7 @@ use super::lookup::{self, Lookup};
 use super::search;
 use super::words;
 use crate::config::{Config, ModelOverride};
-use crate::error::{Error, Result, TRUNCATED};
+use crate::error::{Error, Result, BLOCKED, TRUNCATED};
 use crate::filter::ProjectFile;
 use crate::llm::{build_llm, calls_line, with_format_retries, AskReply, CallStats, Llm, LlmTotals};
 use crate::model::{Edge, EdgeKind, Node};
@@ -701,6 +701,7 @@ pub fn answer(
         Error::Truncated { .. } => Error::truncated(format!(
             "{TRUNCATED} ; posez une question plus ciblée ou augmentez max_output_tokens"
         )),
+        Error::Refused(_) => Error::Refused(format!("{BLOCKED} ; reformulez la question")),
         other => other,
     })?;
     match reply {

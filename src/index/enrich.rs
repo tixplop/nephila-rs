@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::chunk;
-use crate::error::{warn, Error, Result, TRUNCATED};
+use crate::error::{warn, Error, Result, BLOCKED, TRUNCATED};
 use crate::excerpt;
 use crate::index::build::{coverage_segment, BuildReport, IndexOptions};
 use crate::index::estimate::{AloneCase, AloneFile, Estimate};
@@ -720,10 +720,7 @@ fn run_unit<'a>(
                     }
                 }
                 Err(e) => {
-                    outcomes.push(Outcome::Failed(
-                        f.path.clone(),
-                        truncation_advice(e.clone()),
-                    ));
+                    outcomes.push(Outcome::Failed(f.path.clone(), failure_advice(e.clone())));
                     Step::Finished(outcomes, Some(Some(e)))
                 }
             }
@@ -806,7 +803,7 @@ fn run_unit<'a>(
                     Step::Finished(outcomes, None)
                 }
                 Err(e) => {
-                    let per_file = truncation_advice(e.clone());
+                    let per_file = failure_advice(e.clone());
                     for (f, _) in &readable {
                         outcomes.push(Outcome::Failed(f.path.clone(), per_file.clone()));
                     }
@@ -870,11 +867,15 @@ fn trace_detail(e: &Error) -> String {
     }
 }
 
-/// Erreur de chaque fichier dont l'appel a été tronqué : le libellé fixe et l'action (A-5).
-fn truncation_advice(e: Error) -> Error {
+/// Erreur de chaque fichier dont l'appel a été tronqué (A-5) ou bloqué (A-24) : le libellé fixe
+/// et l'action.
+fn failure_advice(e: Error) -> Error {
     match e {
         Error::Truncated { .. } => Error::truncated(format!(
             "{TRUNCATED} ; réduisez max_chunk_chars ou batch_files, ou augmentez max_output_tokens"
+        )),
+        Error::Refused(_) => Error::Refused(format!(
+            "{BLOCKED} ; excluez ce fichier avec enrich_exclude dans .nephila.toml"
         )),
         other => other,
     }
@@ -2226,7 +2227,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 }
                 let key = (result.is_ok() && count >= 2 && path.is_empty())
                     .then(|| kept.key(&file.path, index, count, excerpt, part, requested, known));
-                let result = result.map_err(truncation_advice);
+                let result = result.map_err(failure_advice);
                 (
                     (!recovered).then_some(err),
                     Some(Msg::Chunk {
@@ -3259,6 +3260,26 @@ mod tests {
         for _ in 0..5 {
             let t = p.dispatch();
             assert!(!p.record(t, Some(&trunc)));
+        }
+        assert!(p.stop_cause.is_none());
+    }
+
+    #[test]
+    fn req274_ac9_refused_neither_counts_nor_resets() {
+        let refused = Error::Refused("bloquée".into());
+        let mut p = Policy::default();
+        for r in [Some(&net()), Some(&net()), Some(&refused)] {
+            let t = p.dispatch();
+            assert!(!p.record(t, r));
+        }
+        assert_eq!((p.consecutive_network, p.network_total), (2, 2));
+        let t = p.dispatch();
+        assert!(p.record(t, Some(&net())));
+
+        let mut p = Policy::default();
+        for _ in 0..5 {
+            let t = p.dispatch();
+            assert!(!p.record(t, Some(&refused)));
         }
         assert!(p.stop_cause.is_none());
     }

@@ -183,6 +183,7 @@ pub fn classify(e: &crate::error::Error) -> String {
         Error::Rejected { .. } => "requête refusée",
         Error::Redirected { .. } => "requête redirigée",
         Error::Truncated { .. } => "tronquée",
+        Error::Refused(_) => "bloquée",
         Error::Message(_)
         | Error::Format(_)
         | Error::TooManyCalls { .. }

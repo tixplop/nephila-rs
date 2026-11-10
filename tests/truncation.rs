@@ -3017,3 +3017,220 @@ fn without_coverage(out: &str) -> String {
     assert!(tail.ends_with(" nœuds résumés"), "{out}");
     head.to_string()
 }
+
+// ---- T-368 : réponse bloquée par le modèle (REQ-274, DEC-203) ----
+
+const BLOCKED_LABEL: &str = "réponse bloquée par le modèle";
+const SECRET_REFUS: &str = "SECRET_REFUS_42";
+
+fn a24(path: &str) -> String {
+    format!("avertissement: {path} : {BLOCKED_LABEL} ; excluez ce fichier avec enrich_exclude dans .nephila.toml")
+}
+
+/// Réponse bloquée dont le texte est un JSON conforme portant le marqueur.
+fn blocked_with(provider: &str, text: &str) -> String {
+    match provider {
+        "anthropic" => anthropic_reply(text, Some("refusal")),
+        _ => openai_reply(text, Some("content_filter")),
+    }
+}
+
+fn blocked(provider: &str) -> String {
+    blocked_with(
+        provider,
+        &A_GOOD.replace("Classe A centrale.", SECRET_REFUS),
+    )
+}
+
+fn blocked_ask(provider: &str) -> String {
+    blocked_with(
+        provider,
+        &format!(r#"{{"found":true,"answer":"{SECRET_REFUS}","nodes":[]}}"#),
+    )
+}
+
+fn forbidden_blocked(stderr: &str) {
+    for bad in [
+        "non conforme",
+        "essai",
+        "tronquée",
+        "refus",
+        "content_filter",
+        SECRET_REFUS,
+    ] {
+        assert!(!stderr.contains(bad), "{bad} dans {stderr}");
+    }
+}
+
+fn check_blocked_single(provider: &str) {
+    let s = Setup::new(provider, vec![blocked(provider); 10], "");
+    s.write("A.java", A_JAVA);
+    let o = s.run(&["build"]);
+    assert!(!o.status.success(), "{provider}");
+    assert_eq!(s.posts().len(), 1, "{provider} {}", err(&o));
+    let e = err(&o);
+    assert_eq!(
+        e.lines()
+            .filter(|l| l.contains("A.java"))
+            .collect::<Vec<_>>(),
+        [a24("A.java").as_str()],
+        "{provider} {e}"
+    );
+    assert!(out(&o).contains("1 fichiers à enrichir"), "{}", out(&o));
+    forbidden_blocked(&e);
+    assert_eq!(s.to_enrich(), 1, "{provider}");
+    assert_eq!(s.summary_of("type:A"), None, "{provider}");
+    let o = s.run(&["update"]);
+    assert_eq!(s.posts().len(), 2, "{provider} {}", err(&o));
+    assert!(err(&o).contains(&a24("A.java")), "{provider} {}", err(&o));
+    forbidden_blocked(&err(&o));
+}
+
+#[test]
+fn req274_ac4_anthropic_bloquee_un_seul_envoi() {
+    check_blocked_single("anthropic");
+}
+
+#[test]
+fn req274_ac5_openai_bloquee_un_seul_envoi() {
+    check_blocked_single("openai");
+}
+
+#[test]
+fn req274_ac5_openai_message_refusal_un_seul_envoi() {
+    let body =
+        r#"{"choices":[{"message":{"content":null,"refusal":"I can't"},"finish_reason":"stop"}]}"#;
+    let s = Setup::new("openai", vec![body.to_string(); 10], "");
+    s.write("A.java", A_JAVA);
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 1, "{}", err(&o));
+    let e = err(&o);
+    assert!(e.contains(&a24("A.java")), "{e}");
+    assert!(!e.contains("I can't"), "{e}");
+    forbidden_blocked(&e);
+    let o = s.run(&["update"]);
+    assert_eq!(s.posts().len(), 2, "{}", err(&o));
+    assert!(!err(&o).contains("I can't"));
+
+    let s = Setup::new("openai", vec![body.to_string(); 10], "");
+    s.write("A.java", "public class Alpha {}\n");
+    assert!(s.run(&["build", "--no-llm"]).status.success());
+    let o = s.ask(&[]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 1);
+    assert_eq!(
+        err(&o),
+        format!("erreur: {BLOCKED_LABEL} ; reformulez la question\n")
+    );
+}
+
+#[test]
+fn req274_ac6_format_retries_sans_effet_sur_le_blocage() {
+    let cases = [
+        ("anthropic", "format_retries = 5\n", vec!["build"]),
+        ("anthropic", "", vec!["build", "--format-retries", "5"]),
+        ("openai", "format_retries = 0\n", vec!["build"]),
+        ("openai", "", vec!["build", "--format-retries", "5"]),
+    ];
+    for (p, extra, args) in cases {
+        let s = Setup::new(p, vec![blocked(p); 10], extra);
+        s.write("A.java", A_JAVA);
+        let o = s.run(&args);
+        assert_eq!(s.posts().len(), 1, "{p} {args:?}");
+        let e = err(&o);
+        assert_eq!(e.matches(&a24("A.java")).count(), 1, "{p} {e}");
+        forbidden_blocked(&e);
+    }
+}
+
+#[test]
+fn req274_ac9_huit_fichiers_bloques_pas_de_panne_reseau() {
+    let s = Setup::new(
+        "anthropic",
+        vec![blocked("anthropic"); 30],
+        "batch_files = 1\n",
+    );
+    for i in 0..8 {
+        s.write(&format!("F{i}.java"), &format!("public class F{i} {{}}\n"));
+    }
+    let o = s.run(&["build"]);
+    assert!(!o.status.success());
+    assert_eq!(s.posts().len(), 8, "{}", err(&o));
+    let e = err(&o);
+    let mut got: Vec<String> = e
+        .lines()
+        .filter(|l| l.starts_with("avertissement:"))
+        .map(String::from)
+        .collect();
+    got.sort();
+    let expected: Vec<String> = (0..8).map(|i| a24(&format!("F{i}.java"))).collect();
+    assert_eq!(got, expected, "{e}");
+    assert!(!e.contains("réseau"), "{e}");
+    assert_eq!(s.to_enrich(), 8);
+}
+
+#[test]
+fn req274_ac10_ask_bloquee_ligne_e37_exacte() {
+    for p in ["anthropic", "openai"] {
+        for extra in [
+            vec![],
+            vec!["--json"],
+            vec!["--format-retries", "0"],
+            vec!["--format-retries", "4"],
+        ] {
+            let s = Setup::new(p, vec![blocked_ask(p); 10], "");
+            s.write("A.java", "public class Alpha {}\n");
+            let o = s.run(&["build", "--no-llm"]);
+            assert!(o.status.success(), "{}", err(&o));
+            let o = s.ask(&extra);
+            assert!(!o.status.success(), "{p} {extra:?}");
+            assert!(out(&o).is_empty(), "{p} {extra:?} {}", out(&o));
+            assert_eq!(s.posts().len(), 1, "{p} {extra:?}");
+            assert!(!out(&o).contains(SECRET_REFUS));
+            assert_eq!(
+                err(&o),
+                format!("erreur: {BLOCKED_LABEL} ; reformulez la question\n"),
+                "{p} {extra:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn req274_ac11_trace_fin_bloquee() {
+    for p in ["anthropic", "openai"] {
+        let s = Setup::new(p, vec![blocked(p); 10], "");
+        s.write("A.java", A_JAVA);
+        let o = s.run(&["build", "--verbose"]);
+        let e = err(&o);
+        let lines = llm_enrich_for(&e, "A.java");
+        assert_eq!(lines.len(), 2, "{p} {e}");
+        let rest = lines[1]
+            .strip_prefix("trace: [")
+            .and_then(|r| r.split_once("s] "))
+            .map(|(_, r)| r)
+            .unwrap_or_default();
+        let rest = rest
+            .strip_prefix("llm enrich fin A.java [1/1] bloquée ")
+            .unwrap_or_else(|| panic!("{}", lines[1]));
+        let (ms, detail) = rest.split_once(" ms : ").unwrap();
+        assert!(
+            !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            detail == BLOCKED_LABEL
+                || (detail.starts_with(&format!("{BLOCKED_LABEL} (jetons : "))
+                    && detail.ends_with(')')),
+            "{}",
+            lines[1]
+        );
+        for l in trace_lines_of(&e) {
+            for bad in ["(essai", "politique:", SECRET_REFUS] {
+                assert!(!l.contains(bad), "{bad} dans {l}");
+            }
+        }
+    }
+}

@@ -93,6 +93,8 @@ struct Assembler {
     /// Anthropic : indice du premier bloc `text`.
     text_block: Option<i64>,
     has_content: bool,
+    /// OpenAI : `delta.refusal` mis bout à bout (absent si aucun morceau).
+    refusal: Option<String>,
     stop: Value,
     usage: Value,
     done: bool,
@@ -168,6 +170,9 @@ impl Assembler {
             self.text.push_str(t);
             self.has_content = true;
         }
+        if let Some(t) = choice["delta"]["refusal"].as_str() {
+            self.refusal.get_or_insert_with(String::new).push_str(t);
+        }
         if !choice["finish_reason"].is_null() {
             self.stop = choice["finish_reason"].clone();
         }
@@ -201,8 +206,12 @@ impl Assembler {
             } else {
                 Value::Null
             };
+            let mut message = json!({"content": content});
+            if let Some(r) = &self.refusal {
+                message["refusal"] = json!(r);
+            }
             Some(
-                json!({"choices": [{"message": {"content": content}, "finish_reason": self.stop}],
+                json!({"choices": [{"message": message, "finish_reason": self.stop}],
                     "usage": self.usage})
                 .to_string(),
             )
@@ -345,6 +354,19 @@ mod tests {
         let text = ev(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
         let v = read(&text, "openai").unwrap();
         assert!(v["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn req274_ac3_refusal_deltas_are_concatenated_and_absent_otherwise() {
+        let text = ev(r#"{"choices":[{"delta":{"refusal":"I can"}}]}"#)
+            + &ev(r#"{"choices":[{"delta":{"refusal":"'t"}}]}"#)
+            + &ev(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
+        let v = read(&text, "openai").unwrap();
+        assert_eq!(v["choices"][0]["message"]["refusal"], "I can't");
+        let v = read(&openai_stream("stop", true), "openai").unwrap();
+        assert!(v["choices"][0]["message"].get("refusal").is_none());
+        let v = read(&anthropic_stream("refusal", false), "anthropic").unwrap();
+        assert_eq!(v["stop_reason"], "refusal");
     }
 
     #[test]
