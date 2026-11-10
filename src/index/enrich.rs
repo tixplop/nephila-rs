@@ -610,22 +610,25 @@ pub(crate) struct Sources<'a> {
     pub(crate) abs: &'a HashMap<String, PathBuf>,
     /// Décompte du masquage (REQ-264, REQ-266) ; `None` : texte envoyé tel quel.
     pub(crate) redact: Option<&'a crate::llm::redact::RedactTally>,
+    /// Lecture pour le mode lot : le texte d'échec d'un fichier modifié le dit (A-25).
+    pub(crate) batch: bool,
 }
 
 impl Sources<'_> {
     /// Texte d'un fichier à envoyer au LLM : lu, masqué et compté si `redact` est présent, puis
-    /// compacté (REQ-272).
-    fn read_for_llm(&self, path: &str) -> std::io::Result<String> {
+    /// compacté (REQ-272). Rend aussi l'empreinte du texte brut, avant masquage et compactage.
+    fn read_for_llm(&self, path: &str) -> std::io::Result<(String, String)> {
         let text = std::fs::read_to_string(self.real_path(path))?;
+        let hash = crate::scan::content_hash(text.as_bytes());
         let Some(tally) = self.redact else {
-            return Ok(crate::llm::compact::compact(path, &text));
+            return Ok((crate::llm::compact::compact(path, &text), hash));
         };
         if !crate::filter::FileType::of(path).is_some_and(crate::llm::redact::is_targeted) {
-            return Ok(crate::llm::compact::compact(path, &text));
+            return Ok((crate::llm::compact::compact(path, &text), hash));
         }
         let (masked, n) = crate::llm::redact::redact(path, &text);
         tally.record(path, n);
-        Ok(crate::llm::compact::compact(path, &masked))
+        Ok((crate::llm::compact::compact(path, &masked), hash))
     }
 
     /// Chemin réel d'un fichier : l'entrée d'`abs`, sinon la racine jointe au chemin.
@@ -635,6 +638,23 @@ impl Sources<'_> {
             .cloned()
             .unwrap_or_else(|| self.repo.join(path))
     }
+}
+
+/// Pour les tests : copie des fichiers, l'empreinte vide devenant celle du contenu écrit sous `dir`.
+#[cfg(test)]
+fn stamped(dir: &Path, files: &[FileRecord]) -> Vec<FileRecord> {
+    files
+        .iter()
+        .map(|f| {
+            let mut f = f.clone();
+            if f.hash.is_empty() {
+                if let Ok(bytes) = std::fs::read(dir.join(&f.path)) {
+                    f.hash = crate::scan::content_hash(&bytes);
+                }
+            }
+            f
+        })
+        .collect()
 }
 
 /// Exécute une unité `Lot` ou `Big`. Un fichier illisible échoue seul et sort du lot.
@@ -666,7 +686,14 @@ fn run_unit<'a>(
     let mut readable: Vec<(&'a FileRecord, String)> = Vec::new();
     for f in files {
         match sources.read_for_llm(&f.path) {
-            Ok(t) => readable.push((f, t)),
+            Ok((_, h)) if h != f.hash => outcomes.push(Outcome::Failed(
+                f.path.clone(),
+                Error::Message(format!(
+                    "modifié pendant la commande ; relancez nephila update{}",
+                    if sources.batch { " --batch" } else { "" }
+                )),
+            )),
+            Ok((t, _)) => readable.push((f, t)),
             Err(e) => outcomes.push(Outcome::Failed(
                 f.path.clone(),
                 Error::Message(format!("lecture de {} impossible : {e}", f.path)),
@@ -1584,7 +1611,7 @@ fn estimate_alone(
         bytes: 0,
         case: AloneCase::Counted,
     };
-    let Ok(text) = sources.read_for_llm(&f.path) else {
+    let Ok((text, _)) = sources.read_for_llm(&f.path) else {
         out.case = AloneCase::Unreadable;
         return out;
     };
@@ -4160,8 +4187,9 @@ mod tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            &files,
+            &stamped(dir.path(), &files),
             &opts,
             &llm,
             &mut store,
@@ -4235,8 +4263,9 @@ mod tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            &files,
+            &stamped(dir.path(), &files),
             &opts,
             &Lots,
             &mut store,
@@ -4317,8 +4346,9 @@ mod tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            &files,
+            &stamped(dir.path(), &files),
             &opts,
             &llm,
             &mut store,
@@ -4452,8 +4482,9 @@ mod tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            &files,
+            &stamped(dir.path(), &files),
             &opts,
             llm,
             &mut store,
@@ -4565,8 +4596,9 @@ mod tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            &files,
+            &stamped(dir.path(), &files),
             &opts,
             llm,
             &mut store,
@@ -4727,13 +4759,17 @@ mod tests {
         for (name, lines) in big {
             // Une ligne de 10 octets par morceau (`max_chunk_chars = 10`), de mot unique `w<i>`.
             let text: String = (0..*lines).map(|i| format!("w{i} xxxxxxx\n")).collect();
-            std::fs::write(dir.path().join(name), text).unwrap();
-            files.push(rec(name, 10 * *lines as u64));
+            std::fs::write(dir.path().join(name), &text).unwrap();
+            let mut r = rec(name, 10 * *lines as u64);
+            r.hash = crate::scan::content_hash(text.as_bytes());
+            files.push(r);
         }
         for i in 0..small {
             let name = format!("S{i}.txt");
             std::fs::write(dir.path().join(&name), "x\n").unwrap();
-            files.push(rec(&name, 2));
+            let mut r = rec(&name, 2);
+            r.hash = crate::scan::content_hash(b"x\n");
+            files.push(r);
         }
         (dir, files)
     }
@@ -4807,6 +4843,38 @@ mod tests {
         mode: PassMode,
         extra: &[(&str, &str)],
     ) -> (Store, BuildReport, Vec<(String, Error)>) {
+        probe_run_full(
+            dir,
+            files,
+            llm,
+            concurrency,
+            batch_files,
+            max_calls,
+            format_retries,
+            mode,
+            extra,
+            false,
+            None,
+            10,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_run_full(
+        dir: &tempfile::TempDir,
+        files: &[FileRecord],
+        llm: &dyn Llm,
+        concurrency: usize,
+        batch_files: usize,
+        max_calls: Option<usize>,
+        format_retries: u32,
+        mode: PassMode,
+        extra: &[(&str, &str)],
+        batch: bool,
+        redact: Option<&crate::llm::redact::RedactTally>,
+        max_chunk_chars: usize,
+    ) -> (Store, BuildReport, Vec<(String, Error)>) {
+        let files = &stamped(dir.path(), files)[..];
         let mut store = Store::open_or_create(dir.path()).unwrap();
         store.insert_files(files).unwrap();
         // Les sections que citent les concepts du faux `Llm` sont déclarées par `Big.txt`.
@@ -4856,7 +4924,7 @@ mod tests {
         let opts = IndexOptions {
             jobs: 1,
             concurrency,
-            max_chunk_chars: 10,
+            max_chunk_chars,
             batch_files,
             format_retries,
             enrich_code: false,
@@ -4867,7 +4935,8 @@ mod tests {
             Sources {
                 repo: dir.path(),
                 abs: &HashMap::new(),
-                redact: None,
+                redact,
+                batch,
             },
             files,
             &opts,
@@ -4879,6 +4948,200 @@ mod tests {
         )
         .unwrap();
         (store, report, failures)
+    }
+
+    const MODIFIED: &str = "modifié pendant la commande ; relancez nephila update";
+
+    /// Fichiers `S0..S{n}` dont `S1` a une empreinte qui n'est pas celle du contenu écrit.
+    fn drifted_repo(n: usize) -> (tempfile::TempDir, Vec<FileRecord>) {
+        let (dir, mut files) = probe_repo(&[], n);
+        files[1].hash = "autre".into();
+        (dir, files)
+    }
+
+    #[test]
+    fn req276_ac1_drifted_file_is_not_sent_and_fails_with_the_cause() {
+        let (dir, files) = drifted_repo(3);
+        let llm = Probe::new(0, &[]);
+        let (store, report, failures) = probe_run(&dir, &files, &llm, 1, 1);
+        assert_eq!(llm.calls(), ["S0.txt#1", "S2.txt#1"]);
+        assert_eq!(names(&failures), ["S1.txt"]);
+        assert!(
+            matches!(&failures[0].1, Error::Message(m) if m == MODIFIED),
+            "{failures:?}"
+        );
+        assert_eq!(report.failed, 1);
+        assert!(store.enriched_hash("S1.txt").unwrap().is_none());
+        assert!(store.enriched_hash("S0.txt").unwrap().is_some());
+        assert!(store.enriched_hash("S2.txt").unwrap().is_some());
+        assert_eq!(left_paths(store), ["S1.txt"]);
+    }
+
+    #[test]
+    fn req276_ac2_drifted_file_leaves_the_lot_and_takes_nothing_from_the_cap() {
+        let (dir, files) = drifted_repo(3);
+        let llm = Probe::new(0, &[]);
+        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 10, Some(1), 0);
+        assert_eq!(llm.calls(), ["lot:S0.txt,S2.txt"]);
+        assert_eq!(names(&failures), ["S1.txt"]);
+        assert_eq!(
+            report.capped, None,
+            "le plafond d'un appel suffit aux 2 autres"
+        );
+        assert!(store.enriched_hash("S0.txt").unwrap().is_some());
+        assert!(store.enriched_hash("S2.txt").unwrap().is_some());
+        assert!(report.stop_cause.is_none(), "{:?}", report.stop_cause);
+    }
+
+    #[test]
+    fn req276_ac2_drifted_file_does_not_count_as_a_network_error() {
+        let (dir, mut files) = probe_repo(&[], 4);
+        files[1].hash = "autre".into();
+        let llm = Probe::new(0, &["S0.txt#1", "S2.txt#1"]);
+        let (_, report, failures) = probe_run(&dir, &files, &llm, 1, 1);
+        assert_eq!(llm.calls(), ["S0.txt#1", "S2.txt#1", "S3.txt#1"]);
+        assert!(report.stop_cause.is_none(), "{:?}", report.stop_cause);
+        assert_eq!(names(&failures), ["S0.txt", "S1.txt", "S2.txt"]);
+    }
+
+    #[test]
+    fn req276_ac3_drifted_multi_chunk_file_sends_no_call() {
+        let (dir, mut files) = probe_repo(&[("Big.txt", 4)], 0);
+        files[0].hash = "autre".into();
+        let llm = Probe::new(0, &[]);
+        let (_, _, failures) = probe_run(&dir, &files, &llm, 1, 1);
+        assert!(llm.calls().is_empty(), "{:?}", llm.calls());
+        assert_eq!(names(&failures), ["Big.txt"]);
+    }
+
+    /// Faux `Llm` qui garde le texte reçu de chaque fichier.
+    struct Texts(Mutex<Vec<(String, String)>>);
+
+    impl Llm for Texts {
+        fn enrich(
+            &self,
+            file: &str,
+            _: usize,
+            text: &str,
+            _: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.0.lock().unwrap().push((file.into(), text.into()));
+            Ok(Enrichment::default())
+        }
+        fn enrich_lot(&self, items: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            let mut v = self.0.lock().unwrap();
+            for i in items {
+                v.push((i.file.clone(), i.text.clone()));
+            }
+            Ok(items
+                .iter()
+                .map(|i| (i.file.clone(), Ok(Enrichment::default())))
+                .collect())
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    #[test]
+    fn req276_ac4_unchanged_files_are_sent_as_before_with_the_scan_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw: [(&str, &str); 3] = [
+            ("c.yaml", "db:\n  password: hunter2\n  user: bob\n"),
+            ("L.java", "/*\n * Copyright 2020 ACME\n */\n\npackage a;\n"),
+            ("u.txt", "café\r\nnaïve\r\n"),
+        ];
+        let mut files = Vec::new();
+        for (name, text) in raw {
+            std::fs::write(dir.path().join(name), text).unwrap();
+            let mut r = rec(name, text.len() as u64);
+            r.hash = crate::scan::content_hash(text.as_bytes());
+            files.push(r);
+        }
+        for batch_files in [1, 10] {
+            let llm = Texts(Mutex::new(Vec::new()));
+            let tally = crate::llm::redact::RedactTally::new();
+            let (store, report, failures) = probe_run_full(
+                &dir,
+                &files,
+                &llm,
+                1,
+                batch_files,
+                None,
+                0,
+                PassMode::Normal,
+                &[],
+                false,
+                Some(&tally),
+                1000,
+            );
+            assert!(failures.is_empty(), "{failures:?}");
+            assert_eq!(report.failed, 0);
+            let mut got = llm.0.lock().unwrap().clone();
+            got.sort();
+            let text = |n: &str| got.iter().find(|(f, _)| f == n).unwrap().1.clone();
+            assert!(
+                !text("c.yaml").contains("hunter2") && text("c.yaml").contains("bob"),
+                "{:?}",
+                text("c.yaml")
+            );
+            assert_eq!(text("L.java"), "package a;\n");
+            assert_eq!(
+                text("u.txt"),
+                crate::llm::compact::compact("u.txt", raw[2].1)
+            );
+            assert!(text("u.txt").contains("café"));
+            for (name, t) in raw {
+                assert_eq!(
+                    store.enriched_hash(name).unwrap(),
+                    Some(crate::scan::content_hash(t.as_bytes())),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn req276_ac9_collect_pass_sends_nothing_for_a_drifted_file_and_last_pass_names_batch() {
+        let (dir, files) = drifted_repo(3);
+        let llm = Probe::new(0, &[]);
+        let (_, _, failures) = probe_run_full(
+            &dir,
+            &files,
+            &llm,
+            1,
+            10,
+            None,
+            0,
+            PassMode::Collect,
+            &[],
+            true,
+            None,
+            10,
+        );
+        assert_eq!(llm.calls(), ["lot:S0.txt,S2.txt"]);
+        assert_eq!(names(&failures), ["S1.txt"]);
+        let llm = Probe::new(0, &[]);
+        let (_, _, failures) = probe_run_full(
+            &dir,
+            &files,
+            &llm,
+            1,
+            10,
+            None,
+            0,
+            PassMode::Last { capped: None },
+            &[],
+            true,
+            None,
+            10,
+        );
+        assert_eq!(llm.calls(), ["lot:S0.txt,S2.txt"]);
+        assert!(
+            matches!(&failures[0].1, Error::Message(m) if *m == format!("{MODIFIED} --batch")),
+            "{failures:?}"
+        );
     }
 
     #[test]
@@ -5012,7 +5275,7 @@ mod tests {
                 let name = format!("S{i}.txt");
                 assert_eq!(
                     store.enriched_hash(&name).unwrap(),
-                    Some(String::new()),
+                    Some(crate::scan::content_hash(b"x\n")),
                     "{name}"
                 );
             }
@@ -5029,7 +5292,10 @@ mod tests {
             sections.sort();
             let expected: Vec<String> = (1..=8).map(|k| format!("section:x#{k}")).collect();
             assert_eq!(sections, expected);
-            assert_eq!(store.enriched_hash("Big.txt").unwrap(), Some(String::new()));
+            assert_eq!(
+                store.enriched_hash("Big.txt").unwrap(),
+                Some(files[0].hash.clone())
+            );
         }
     }
 
@@ -5156,7 +5422,10 @@ mod tests {
         for f in ["A", "B", "C"] {
             assert_eq!(store.enriched_hash(f).unwrap(), None, "{f} à enrichir");
         }
-        assert_eq!(store.enriched_hash("D").unwrap(), Some(String::new()));
+        assert_eq!(
+            store.enriched_hash("D").unwrap(),
+            Some(files[3].hash.clone())
+        );
     }
 
     #[test]
@@ -5351,8 +5620,9 @@ mod tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            &files,
+            &stamped(dir.path(), &files),
             &interrupt_opts(1),
             &llm,
             &mut store,
@@ -5376,8 +5646,9 @@ mod tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            &files,
+            &stamped(dir.path(), &files),
             &interrupt_opts(1),
             &llm,
             &mut store,
@@ -5451,8 +5722,9 @@ mod tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            &files,
+            &stamped(dir.path(), &files),
             &interrupt_opts(1),
             &llm,
             &mut store,
@@ -7333,6 +7605,7 @@ mod estimate_tests {
             repo: dir,
             abs: &abs,
             redact: None,
+            batch: false,
         };
         let kept = KeptCalls {
             results: HashMap::new(),
@@ -7481,6 +7754,22 @@ mod estimate_tests {
             lines[3],
             "estimation au plafond : d.txt (51 appels prévus, au plus 50 par fichier, aucun compté)"
         );
+    }
+
+    #[test]
+    fn req276_ac10_estimate_ignores_the_fingerprint() {
+        let (dir, mut files) = (tempfile::tempdir().unwrap(), vec![rec("a.md", 3)]);
+        std::fs::write(dir.path().join("a.md"), "abc").unwrap();
+        files[0].hash = "autre".into();
+        let ids = ids_of(&[("a.md", &["n"])]);
+        let e = run(dir.path(), &files, &ids, 5, 10);
+        files[0].hash = crate::scan::content_hash(b"abc");
+        let same = run(dir.path(), &files, &ids, 5, 10);
+        assert_eq!(
+            (e.files, e.calls, e.bytes),
+            (same.files, same.calls, same.bytes)
+        );
+        assert!(e.calls > 0 && e.unreadable.is_empty());
     }
 
     #[test]
@@ -7698,7 +7987,7 @@ mod structured_fallback_tests {
             std::fs::write(dir.path().join(n), "texte\n").unwrap();
             files.push(FileRecord {
                 path: n.into(),
-                hash: String::new(),
+                hash: crate::scan::content_hash(b"texte\n"),
                 size: 6,
                 mtime: 0,
                 recorded_at: 0,
@@ -7735,6 +8024,7 @@ mod structured_fallback_tests {
             repo: dir.path(),
             abs: &HashMap::new(),
             redact: None,
+            batch: false,
         };
         let stop = AtomicBool::new(false);
         let mut go = |report: &mut BuildReport| {
@@ -8150,8 +8440,9 @@ mod cache_tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            &files,
+            &stamped(dir.path(), &files),
             &opts,
             &llm,
             &mut store,
@@ -8451,8 +8742,9 @@ mod first_call_tests {
                 repo: dir.path(),
                 abs: &HashMap::new(),
                 redact: None,
+                batch: false,
             },
-            files,
+            &stamped(dir.path(), files),
             &opts,
             llm,
             &mut store,

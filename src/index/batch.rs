@@ -94,7 +94,15 @@ pub(crate) fn enrich_batched(
             failures: 0,
             sent: 0,
         };
-        let result = driver.run(sources, files, opts, llm);
+        let result = driver.run(
+            Sources {
+                batch: true,
+                ..sources
+            },
+            files,
+            opts,
+            llm,
+        );
         done.store(true, Ordering::SeqCst);
         result
     });
@@ -558,6 +566,7 @@ mod tests {
                 repo: Path::new("."),
                 abs: &abs,
                 redact: None,
+                batch: false,
             },
             &[],
             &IndexOptions::default(),

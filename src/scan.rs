@@ -667,6 +667,11 @@ pub fn read_text(abs: &Path, rel: &str) -> std::result::Result<String, String> {
     read_text_as(abs, &crate::escape::path(rel))
 }
 
+/// Empreinte d'un contenu de fichier : la seule du parcours et de la relecture pour l'enrichissement.
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
 /// Comme `read_text`, `label` étant le texte déjà échappé de `<où>` : le chemin converti, ou le
 /// nom réel pour un fichier d'un groupe de collision (REQ-102, V-006).
 fn read_text_as(abs: &Path, label: &str) -> std::result::Result<String, String> {
@@ -713,7 +718,7 @@ fn hash_files(
             out.push((
                 k,
                 read_text_as(&f.abs, &label).map(|text| {
-                    let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+                    let hash = content_hash(text.as_bytes());
                     (hash, Retained::reserve(text, budget).ok())
                 }),
             ));
@@ -860,7 +865,7 @@ pub(crate) fn scan_with_budget(
                 count_read(&wf.path, ReadKind::Hash);
                 match read_text_as(&wf.abs, &escaped(real)) {
                     Ok(text) => {
-                        let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+                        let hash = content_hash(text.as_bytes());
                         fresh.insert(i, Ok((hash, Retained::reserve(text, budget).ok())));
                         *f = wf.clone();
                         kept_real = real.clone();
@@ -1110,6 +1115,21 @@ mod tests {
             if let (Err(a), Err(b)) = (got, want) {
                 assert_eq!(a, b);
             }
+        }
+    }
+
+    #[test]
+    fn req276_content_hash_equals_the_scan_hash() {
+        for (name, bytes) in [
+            ("a.java", "class A {}\n".as_bytes().to_vec()),
+            ("b.md", "café\r\nnaïve\r\n".as_bytes().to_vec()),
+            ("c.java", "\u{feff}class C {}\n".as_bytes().to_vec()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(name), &bytes).unwrap();
+            let r = scan(dir.path(), &[], &Matcher::none(), 1).unwrap();
+            let f = r.files.iter().find(|f| f.path == name).unwrap();
+            assert_eq!(f.hash, content_hash(&bytes), "{name}");
         }
     }
 
@@ -1642,7 +1662,7 @@ mod tests {
                             continue;
                         }
                     };
-                    (blake3::hash(&bytes).to_hex().to_string(), true)
+                    (content_hash(&bytes), true)
                 }
             };
             res.files.push(ScannedFile {

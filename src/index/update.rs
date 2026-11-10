@@ -481,6 +481,7 @@ mod tests {
                 repo,
                 abs: &abs,
                 redact: None,
+                batch: false,
             },
             &files,
             opts,

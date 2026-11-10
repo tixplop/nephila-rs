@@ -818,6 +818,7 @@ pub(crate) fn finalize(
                 repo,
                 abs,
                 redact: tally.as_ref(),
+                batch: false,
             };
             if opts.batch {
                 crate::index::batch::enrich_batched(sources, &files, opts, llm, store, report)?;
@@ -895,6 +896,7 @@ pub(crate) fn estimate_enrichment(
             repo,
             abs,
             redact: tally.as_ref(),
+            batch: false,
         },
         &files,
         &ids,
