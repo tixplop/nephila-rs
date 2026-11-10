@@ -962,6 +962,45 @@ fn req261_ac15_truncated_trace_has_no_action() {
 }
 
 #[test]
+fn req274_ac12_blocked_name_request_is_named_by_a23_and_others_are_named() {
+    let mut f = Vec::new();
+    group(&mut f, 0, 13, 5);
+    group(&mut f, 1, 12, 5);
+    let blocked = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": "{\"name\":\"SECRET\",\"description\":\"SECRET\"}"}, "finish_reason": "content_filter"}]
+    })
+    .to_string();
+    let server = FakeServer::start_replies(vec![
+        Reply::status(200, &blocked),
+        Reply::status(200, &valid_reply("Deux")),
+    ]);
+    let env = Env::server(&f, &server.base_url, "");
+    let o = env.run(&["build", "--subsystems", "--verbose"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert_eq!(last(&err), "erreur: 1 communauté(s) à nommer");
+    let warn = err
+        .lines()
+        .find(|l| l.starts_with("avertissement: communauté "))
+        .unwrap_or_else(|| panic!("{err}"));
+    let rest = warn.strip_prefix("avertissement: communauté ").unwrap();
+    let (n, rest) = rest.split_once(' ').unwrap();
+    assert!(rest.ends_with(" : réponse bloquée par le modèle"), "{warn}");
+    assert!(
+        !warn.contains("augmentez") && !warn.contains("tronquée"),
+        "{warn}"
+    );
+    let fin = err
+        .lines()
+        .find(|l| l.contains(&format!("] llm sous-système fin communauté {n} bloquée ")))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(fin.ends_with(" : réponse bloquée par le modèle"), "{fin}");
+    assert!(!err.contains("SECRET"), "{err}");
+    assert_eq!(server.requests().len(), 2, "{err}");
+    assert!(out.contains("1 communautés nommées"), "{out}");
+}
+
+#[test]
 fn req255_req261_ac15_wait_and_pause_traces_use_the_subsystem_words() {
     let mut f = Vec::new();
     group(&mut f, 0, 11, 5);

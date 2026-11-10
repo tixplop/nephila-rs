@@ -2507,7 +2507,7 @@ fn req200_ac9_readme_non_conforming_reply_bullet() {
         .collect();
     assert_eq!(
         bullets,
-        ["- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2) ; encore non conforme, un lot de 4 fichiers ou plus est découpé une fois en deux, chaque moitié avec ses propres essais ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`."]
+        ["- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2), jamais si le modèle la bloque ; encore non conforme, un lot de 4 fichiers ou plus est découpé une fois en deux, chaque moitié avec ses propres essais ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`."]
     );
     assert!(readme.len() <= 52_861, "README : {} octets", readme.len());
 }

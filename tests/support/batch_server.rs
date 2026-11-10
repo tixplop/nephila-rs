@@ -25,6 +25,8 @@ pub enum Outcome {
     Text(String),
     /// Réponse tronquée par la limite de jetons.
     Truncated(String),
+    /// Réponse bloquée par le modèle (`refusal` / `content_filter`).
+    Blocked(String),
     /// Requête en échec (`type`, `message`).
     Errored(String, String),
     /// Requête expirée (anthropic seulement).
@@ -247,12 +249,20 @@ fn serve(
     let _ = out.flush();
 }
 
-fn text_body(provider: &str, text: &str, truncated: bool) -> Value {
+fn text_body(provider: &str, text: &str, how: &str) -> Value {
     if provider == "anthropic" {
-        let stop = if truncated { "max_tokens" } else { "end_turn" };
+        let stop = match how {
+            "truncated" => "max_tokens",
+            "blocked" => "refusal",
+            _ => "end_turn",
+        };
         json!({"content": [{"type": "text", "text": text}], "stop_reason": stop})
     } else {
-        let stop = if truncated { "length" } else { "stop" };
+        let stop = match how {
+            "truncated" => "length",
+            "blocked" => "content_filter",
+            _ => "stop",
+        };
         json!({"choices": [{"message": {"role": "assistant", "content": text},
                             "finish_reason": stop}]})
     }
@@ -341,10 +351,13 @@ impl Sim {
                 .filter_map(|(id, o)| {
                     let result = match o {
                         Outcome::Text(t) => {
-                            json!({"type": "succeeded", "message": text_body("anthropic", &t, false)})
+                            json!({"type": "succeeded", "message": text_body("anthropic", &t, "ok")})
                         }
                         Outcome::Truncated(t) => {
-                            json!({"type": "succeeded", "message": text_body("anthropic", &t, true)})
+                            json!({"type": "succeeded", "message": text_body("anthropic", &t, "truncated")})
+                        }
+                        Outcome::Blocked(t) => {
+                            json!({"type": "succeeded", "message": text_body("anthropic", &t, "blocked")})
                         }
                         Outcome::Errored(kind, message) => {
                             json!({"type": "errored",
@@ -368,7 +381,7 @@ impl Sim {
         let n = |f: fn(&Outcome) -> bool| o.iter().filter(|(_, x)| f(x)).count();
         let counts = json!({
             "processing": 0,
-            "succeeded": n(|x| matches!(x, Outcome::Text(_) | Outcome::Truncated(_))),
+            "succeeded": n(|x| matches!(x, Outcome::Text(_) | Outcome::Truncated(_) | Outcome::Blocked(_))),
             "errored": n(|x| matches!(x, Outcome::Errored(..))),
             "canceled": 0,
             "expired": n(|x| matches!(x, Outcome::Expired)),
@@ -415,9 +428,11 @@ impl Sim {
                 .into_iter()
                 .filter_map(|(id, o)| match (o, error_file) {
                     (Outcome::Text(t), false) => Some(json!({"custom_id": id,
-                        "response": {"status_code": 200, "body": text_body("openai", &t, false)}})),
+                        "response": {"status_code": 200, "body": text_body("openai", &t, "ok")}})),
                     (Outcome::Truncated(t), false) => Some(json!({"custom_id": id,
-                        "response": {"status_code": 200, "body": text_body("openai", &t, true)}})),
+                        "response": {"status_code": 200, "body": text_body("openai", &t, "truncated")}})),
+                    (Outcome::Blocked(t), false) => Some(json!({"custom_id": id,
+                        "response": {"status_code": 200, "body": text_body("openai", &t, "blocked")}})),
                     (Outcome::Http(code, message), false) => {
                         let error = if message.is_empty() {
                             json!({})
@@ -453,7 +468,12 @@ impl Sim {
         let o = self.outcomes(k);
         let done = o
             .iter()
-            .filter(|(_, x)| matches!(x, Outcome::Text(_) | Outcome::Truncated(_)))
+            .filter(|(_, x)| {
+                matches!(
+                    x,
+                    Outcome::Text(_) | Outcome::Truncated(_) | Outcome::Blocked(_)
+                )
+            })
             .count();
         let failed = o
             .iter()
@@ -467,7 +487,7 @@ impl Sim {
         let has_output = o.iter().any(|(_, x)| {
             matches!(
                 x,
-                Outcome::Text(_) | Outcome::Truncated(_) | Outcome::Http(..)
+                Outcome::Text(_) | Outcome::Truncated(_) | Outcome::Blocked(_) | Outcome::Http(..)
             )
         });
         if has_output {

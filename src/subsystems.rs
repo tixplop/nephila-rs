@@ -1,7 +1,7 @@
 //! Noms de sous-systèmes (REQ-261, REQ-262, DEC-196) : sélection des lignes envoyées, empreinte
 //! d'une communauté et réapplication du cache à chaque passe qui recalcule les communautés.
 
-use crate::error::{warn, Error, Result, TRUNCATED};
+use crate::error::{warn, Error, Result, BLOCKED, TRUNCATED};
 use crate::index::build::{BuildReport, IndexOptions};
 use crate::index::enrich::{Policy, ANNOUNCE};
 use crate::llm::{with_format_retries, CallStats, Llm, LlmTotals, SubsystemName};
@@ -162,6 +162,7 @@ struct Todo {
 fn cause(e: &Error) -> String {
     match e {
         Error::Truncated { .. } => format!("{TRUNCATED} ; augmentez max_output_tokens"),
+        Error::Refused(_) => BLOCKED.to_string(),
         Error::Rejected { trace, .. } | Error::Redirected { trace, .. } => trace.clone(),
         other => other.to_string(),
     }
@@ -172,6 +173,7 @@ fn cause(e: &Error) -> String {
 fn trace_cause(e: &Error) -> String {
     match e {
         Error::Truncated { .. } => TRUNCATED.to_string(),
+        Error::Refused(_) => BLOCKED.to_string(),
         other => cause(other),
     }
 }

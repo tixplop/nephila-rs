@@ -319,14 +319,19 @@ fn names_in(body: &Value) -> Vec<&'static str> {
         .collect()
 }
 
-/// Réponse conforme à la requête.
-fn good(body: &Value) -> Outcome {
+/// Texte d'une réponse conforme à la requête.
+fn good_text(body: &Value) -> String {
     let names = names_in(body);
-    Outcome::Text(if names.len() == 1 {
+    if names.len() == 1 {
         single(names[0])
     } else {
         lot(&names)
-    })
+    }
+}
+
+/// Réponse conforme à la requête.
+fn good(body: &Value) -> Outcome {
+    Outcome::Text(good_text(body))
 }
 
 fn has_note(body: &Value) -> bool {
@@ -761,6 +766,24 @@ fn req213_ac4_lot_refuse_et_lot_expire() {
     assert_eq!(fx.env.to_enrich(), 2);
     assert!(fx.summary_of("a").is_some());
     assert!(err(&o).contains("docs/b.md : requête du lot du fournisseur en échec (expirée)"));
+}
+
+#[test]
+fn req274_ac13_resultat_bloque_ligne_a24_sans_a17_ni_nouvelle_requete() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &["a"], 0, |b| Outcome::Blocked(good_text(b)));
+        let o = fx.env.run(&["build", "--batch"]);
+        assert_ne!(code(&o), 0, "{provider} : {}", err(&o));
+        let e = err(&o);
+        assert_eq!(
+            lines_with(&e, "avertissement: docs/a.md"),
+            ["avertissement: docs/a.md : réponse bloquée par le modèle ; excluez ce fichier avec enrich_exclude dans .nephila.toml"],
+            "{provider} : {e}"
+        );
+        assert!(!e.contains("non conforme"), "{provider} : {e}");
+        assert_eq!(fx.server.lots().len(), 1, "{provider}");
+        assert_eq!(fx.env.to_enrich(), 1, "{provider}");
+    }
 }
 
 #[test]

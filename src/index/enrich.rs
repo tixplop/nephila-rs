@@ -770,14 +770,17 @@ fn run_unit<'a>(
                 // Lot tronqué (REQ-096, DEC-101), ou de 4 fichiers ou plus encore non conforme au
                 // premier passage (REQ-200, DEC-161 (4)) : deux moitiés remises en tête de file ;
                 // aucune issue pour le lot lui-même, ses fichiers en recevront par leurs moitiés.
-                // Les moitiés d'un lot non conforme sont de second passage.
+                // Les moitiés d'un lot non conforme sont de second passage. Un lot bloqué par le
+                // modèle (REQ-274) est coupé de la même façon, quelle que soit sa taille : seul le
+                // fichier fautif, envoyé seul, reste bloqué.
                 Err(e)
                     if matches!(e, Error::Truncated { .. })
+                        || (matches!(e, Error::Refused(_)) && readable.len() >= 2)
                         || (matches!(e, Error::Format(_))
                             && pass == Pass::First
                             && readable.len() >= 4) =>
                 {
-                    let next = if matches!(e, Error::Truncated { .. }) {
+                    let next = if matches!(e, Error::Truncated { .. } | Error::Refused(_)) {
                         pass
                     } else {
                         Pass::Second

@@ -3234,3 +3234,69 @@ fn req274_ac11_trace_fin_bloquee() {
         }
     }
 }
+
+// ---- T-369 : lot découpé, morceau bloqué (REQ-274, DEC-203) ----
+
+#[test]
+fn req274_ac7_lot_bloque_decoupe_en_deux_seul_b_signale() {
+    for p in ["anthropic", "openai"] {
+        let replies = vec![
+            blocked_with(p, &lot_reply(&["A", "B"])),
+            ok_text(p, A_GOOD),
+            blocked_with(p, &A_GOOD.replace("type:A", "type:B")),
+            ok_text(p, &lot_reply(&["C", "D"])),
+        ];
+        let s = Setup::new(p, replies, "batch_files = 2\n");
+        for n in ["A", "B", "C", "D"] {
+            s.write(&format!("{n}.java"), &format!("public class {n} {{}}\n"));
+        }
+        let o = s.run(&["build"]);
+        let e = err(&o);
+        assert!(!o.status.success(), "{p} {e}");
+        let posts = s.posts();
+        assert_eq!(posts.len(), 4, "{p} {e}");
+        assert_eq!(files_in(&posts[0]), ["A", "B"], "{p}");
+        assert_eq!(files_in(&posts[1]), ["A"], "{p}");
+        assert_eq!(files_in(&posts[2]), ["B"], "{p}");
+        assert_eq!(files_in(&posts[3]), ["C", "D"], "{p}");
+        let warns: Vec<&str> = e
+            .lines()
+            .filter(|l| l.starts_with("avertissement:"))
+            .collect();
+        assert_eq!(warns, [a24("B.java")], "{p} {e}");
+        assert_eq!(s.to_enrich_paths(), ["B.java"], "{p}");
+        for n in ["A", "C", "D"] {
+            assert!(s.summary_of(&format!("type:{n}")).is_some(), "{p} {n}");
+        }
+        assert_eq!(s.summary_of("type:B"), None, "{p}");
+    }
+}
+
+#[test]
+fn req274_ac8_gros_fichier_morceau_2_bloque_sans_decoupe_ni_recuperation() {
+    let text = big_text();
+    let cfg = format!("max_chunk_chars = {}\n", text.len() / 3 + 40);
+    let ok = r#"{"version": 2, "summaries": [], "concepts": []}"#;
+    let replies = vec![
+        openai_reply(ok, Some("stop")),
+        blocked_with("openai", ok),
+        openai_reply(ok, Some("stop")),
+        openai_reply(ok, Some("stop")),
+    ];
+    let s = Setup::new("openai", replies, &cfg);
+    s.write("A.java", &text);
+    let o = s.run(&["build", "--verbose"]);
+    let e = err(&o);
+    assert!(!o.status.success(), "{e}");
+    assert_eq!(s.posts().len(), 2, "{e}");
+    assert_eq!(e.matches(&a24("A.java")).count(), 1, "{e}");
+    for bad in ["[3/3]", "llm enrich découpe", "llm enrich récupération"] {
+        assert!(
+            !e.lines().any(|l| l.contains("A.java") && l.contains(bad)),
+            "{bad} dans {e}"
+        );
+    }
+    assert!(!e.contains("llm enrich découpe"), "{e}");
+    assert!(!e.contains("llm enrich récupération"), "{e}");
+    assert_eq!(s.to_enrich(), 1);
+}
