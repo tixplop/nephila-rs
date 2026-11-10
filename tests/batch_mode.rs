@@ -2684,3 +2684,31 @@ fn req275_ac5_chaque_requete_du_lot_porte_la_temperature() {
         assert_eq!(n, 2, "{provider} : {text}");
     }
 }
+
+#[test]
+fn req276_ac9_fichier_reecrit_pendant_que_le_lot_est_tenu_n_est_pas_enregistre() {
+    for provider in PROVIDERS {
+        let fx = Fx::new(provider, "", &["a", "b"], 0, good);
+        fx.server.hold(Some(1));
+        let run = fx.env.spawn(&["build", "--batch"]);
+        wait_until("sondage du lot", || fx.polls(1) >= 1);
+        fs::write(
+            fx.env.repo.join(path("a")),
+            "# Document a\n\nTexte du document a, réécrit pendant la commande.\n",
+        )
+        .unwrap();
+        fx.server.hold(None);
+        let d = run.finish();
+        let expected = format!(
+            "avertissement: {} : modifié pendant la commande ; relancez nephila update --batch",
+            path("a")
+        );
+        let lines: Vec<&str> = d.stderr.lines().filter(|l| *l == expected).collect();
+        assert_eq!(lines.len(), 1, "{provider} : {}", d.stderr);
+        assert_eq!(d.status.code(), Some(1), "{provider} : {}", d.stderr);
+        assert_eq!(d.last(), "erreur: 1 fichier(s) à enrichir", "{provider}");
+        assert_eq!(fx.summary_of("a"), None, "{provider}");
+        assert_eq!(fx.summary_of("b"), Some(summary_text("b")), "{provider}");
+        assert_eq!(fx.to_enrich(), [path("a")], "{provider}");
+    }
+}

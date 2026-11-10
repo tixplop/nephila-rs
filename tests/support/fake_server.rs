@@ -33,6 +33,12 @@ pub enum Reply {
         declared_len: usize,
         sent: usize,
     },
+    /// Réécrit `path` avec `content`, puis écrit `inner` (fichier modifié pendant la commande).
+    Rewriting {
+        inner: Box<Reply>,
+        path: std::path::PathBuf,
+        content: String,
+    },
 }
 
 impl Reply {
@@ -43,6 +49,16 @@ impl Reply {
             body: body.into(),
             headers: vec![],
             delay_ms: 0,
+        }
+    }
+
+    /// Réponse `inner`, précédée de la réécriture de `path` avec `content`.
+    #[allow(dead_code)]
+    pub fn rewriting(inner: Reply, path: &std::path::Path, content: &str) -> Reply {
+        Reply::Rewriting {
+            inner: Box::new(inner),
+            path: path.to_path_buf(),
+            content: content.into(),
         }
     }
 
@@ -374,12 +390,21 @@ fn serve<S: Read + Write + Send + 'static>(
     drop(reader);
     let index = record(rec, req);
     // File vide : 500.
-    let reply = queue.lock().unwrap().pop_front().unwrap_or(Reply::Http {
+    let mut reply = queue.lock().unwrap().pop_front().unwrap_or(Reply::Http {
         status: 500,
         body: "{}".into(),
         headers: vec![],
         delay_ms: 0,
     });
+    if let Reply::Rewriting {
+        inner,
+        path,
+        content,
+    } = reply
+    {
+        std::fs::write(path, content).unwrap();
+        reply = *inner;
+    }
     let (status, payload, extra, delay_ms) = match reply {
         Reply::Http {
             status,
@@ -403,6 +428,7 @@ fn serve<S: Read + Write + Send + 'static>(
             return; // fermeture avant la fin du corps
         }
         Reply::Close => return, // fermeture sans réponse
+        Reply::Rewriting { .. } => unreachable!("déballée plus haut"),
         Reply::Sse { chunks, cut } => {
             // Fil à part : un silence long ne bloque pas les connexions suivantes ; la connexion
             // est fermée à la fin de l'écriture (ou dès que le client est parti).

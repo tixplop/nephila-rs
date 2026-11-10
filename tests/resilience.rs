@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)]
+#[path = "support/fake_server.rs"]
+mod fake_server;
+use fake_server::{FakeServer, Reply};
+
 fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for e in fs::read_dir(from).unwrap() {
@@ -609,4 +614,196 @@ fn req024_ac9_structure_is_searchable_while_enrichment_is_running() {
     child.wait().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("OrderService"));
+}
+
+const A25: &str =
+    "avertissement: src/Panier.java : modifié pendant la commande ; relancez nephila update";
+
+fn java_single(n: &str) -> String {
+    let text = serde_json::json!({
+        "version": 2,
+        "summaries": [{"node": format!("type:src/{n}.java:{n}"), "summary": format!("Classe {n} centrale.")}],
+        "concepts": []
+    })
+    .to_string();
+    serde_json::json!({"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"})
+        .to_string()
+}
+
+fn java_lot(names: &[&str]) -> String {
+    let files: Vec<serde_json::Value> = names
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "file": format!("src/{n}.java"),
+                "summaries": [{"node": format!("type:src/{n}.java:{n}"), "summary": format!("Classe {n} centrale.")}],
+                "concepts": []
+            })
+        })
+        .collect();
+    let text = serde_json::json!({"version": 3, "files": files}).to_string();
+    serde_json::json!({"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"})
+        .to_string()
+}
+
+struct Rewrite {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    config: PathBuf,
+    server: FakeServer,
+}
+
+impl Rewrite {
+    /// Six classes ; premier lot A, B, C ; second lot D, Panier, Z ; la réponse au premier appel
+    /// réécrit `src/Panier.java`.
+    fn new() -> Rewrite {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        for n in ["A", "B", "C", "D", "Panier", "Z"] {
+            fs::write(
+                repo.join(format!("src/{n}.java")),
+                format!("public class {n} {{}}\n"),
+            )
+            .unwrap();
+        }
+        let server = FakeServer::start_replies(vec![
+            Reply::rewriting(
+                Reply::status(200, &java_lot(&["A", "B", "C"])),
+                &repo.join("src/Panier.java"),
+                "public class Panier { int prix; }\n",
+            ),
+            Reply::status(200, &java_lot(&["D", "Z"])),
+            Reply::status(200, &java_single("Panier")),
+        ]);
+        let config = tmp.path().join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "provider = \"anthropic\"\nenrich_code = true\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T373_KEY\"\nconcurrency = 1\nbatch_files = 3\n",
+                server.base_url
+            ),
+        )
+        .unwrap();
+        Rewrite {
+            _tmp: tmp,
+            repo,
+            config,
+            server,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_T373_KEY", "sk-test")
+            .env_remove("NO_COLOR")
+            .output()
+            .unwrap()
+    }
+
+    fn posts(&self) -> Vec<String> {
+        self.server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == "/v1/messages")
+            .map(|r| r.body)
+            .collect()
+    }
+}
+
+fn check_a25(o: &Output) {
+    let e = stderr(o);
+    assert_eq!(e.lines().filter(|l| *l == A25).count(), 1, "{e}");
+    assert_eq!(
+        e.lines().last(),
+        Some("erreur: 1 fichier(s) à enrichir"),
+        "{e}"
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("1 fichiers à enrichir"),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(o.status.code(), Some(1), "{e}");
+    for bad in [
+        "empreinte",
+        "lecture de",
+        "non conforme",
+        "essais sur",
+        "aucun envoyé",
+    ] {
+        assert!(!e.contains(bad), "{bad} dans {e}");
+    }
+}
+
+#[test]
+fn req276_ac6_ac7_build_puis_update_une_seule_ligne_a25_et_code_1() {
+    let r = Rewrite::new();
+    let o = r.run(&["build"]);
+    check_a25(&o);
+    let posts = r.posts();
+    assert_eq!(posts.len(), 2, "{}", stderr(&o));
+    assert!(!posts[1].contains("Panier.java"), "{}", posts[1]);
+    let pending: Vec<String> = Store::open_readonly(&r.repo)
+        .unwrap()
+        .files_to_enrich()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    assert_eq!(pending, ["src/Panier.java"]);
+}
+
+#[test]
+fn req276_ac7_update_ecrit_aussi_la_ligne_a25() {
+    let r = Rewrite::new();
+    let o = r.run(&["build", "--no-llm"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // Le fichier est réécrit entre le parcours et la lecture : la première réponse le fait.
+    let o = r.run(&["update"]);
+    check_a25(&o);
+}
+
+#[test]
+fn req276_ac8_verbose_aucune_ligne_llm_enrich_ne_nomme_le_fichier() {
+    let r = Rewrite::new();
+    let o = r.run(&["build", "--verbose"]);
+    let e = stderr(&o);
+    let llm: Vec<&str> = e.lines().filter(|l| l.contains("llm enrich")).collect();
+    assert!(!llm.is_empty(), "{e}");
+    assert!(llm.iter().all(|l| !l.contains("src/Panier.java")), "{e}");
+    let departs: Vec<&&str> = llm
+        .iter()
+        .filter(|l| l.contains("llm enrich départ lot"))
+        .collect();
+    assert_eq!(departs.len(), 2, "{e}");
+    assert!(
+        departs[1].contains("llm enrich départ lot src/D.java +1 "),
+        "{e}"
+    );
+}
+
+#[test]
+fn req276_ac5_update_enrichit_le_fichier_reecrit_puis_graphe_a_jour() {
+    let r = Rewrite::new();
+    let o = r.run(&["build"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let before = r.posts().len();
+    let o = r.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let posts = r.posts();
+    assert_eq!(posts.len(), before + 1, "{}", stderr(&o));
+    assert!(posts[before].contains("Panier.java"), "{}", posts[before]);
+    let o = r.run(&["update"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("graphe à jour"),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(r.posts().len(), before + 1);
 }
