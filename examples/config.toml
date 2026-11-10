@@ -151,6 +151,17 @@ api_key_env = "ANTHROPIC_API_KEY"
 # .nephila.toml la refuse.
 # effort = "low"
 
+# Température des réponses : plus elle est basse, moins les résumés et les réponses changent
+# d'un appel à l'autre (0 : les plus stables, utile pour comparer deux builds). Nombre de 0 à 2 ;
+# défaut : aucune, rien n'est envoyé et le modèle garde la sienne. Envoyée dans "temperature" à
+# « anthropic » (de 0 à 1 seulement, sinon HTTP 400) et à « openai », jamais quand thinking vaut
+# true ; avec [ask] thinking = true, seule la question de query ask part sans elle. Les modèles
+# de raisonnement d'OpenAI et les modèles Claude récents (Opus 4.7 et suivants) refusent le
+# champ (HTTP 400) : l'envoi s'arrête au premier appel ; retirez alors cette clé. Sans effet
+# avec « mock ». La changer ne réenrichit rien. Lue ici seulement :
+# .nephila.toml la refuse.
+# temperature = 0
+
 # Nombre maximal de jetons de la réponse du modèle, réflexion comprise. Entier > 0 ; défaut :
 # 16384. Envoyé à « anthropic » en max_tokens et à « openai » en max_completion_tokens ; sans
 # effet avec « mock ». Une réponse qui l'atteint est refusée (« réponse tronquée par la limite

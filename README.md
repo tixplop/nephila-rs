@@ -377,6 +377,7 @@ La configuration est facultative. Le LLM est actif quand un fichier de configura
 | `enrich_exclude` | Motifs des fichiers à ne pas enrichir, qui l'emportent sur `enrich_include` ; écrite, elle remplace la liste par défaut ; aussi dans `.nephila.toml` | `**/test/**`, `**/__tests__/**`, `*.spec.*`, `*.test.*`, `**/generated/**`, `**/migrations/**`, `*.min.js`, `*.d.ts` |
 | `thinking` | `true` demande au modèle de réfléchir ; configuration personnelle seulement ; chez anthropic, modèle Claude 4.6 ou suivant | `false` |
 | `effort` | Niveau d'effort, avec ou sans `thinking` : `"low"`, `"medium"`, `"high"`, ou `"default"` pour n'en envoyer aucun ; avec `openai`, à `"medium"` ou `"high"`, augmentez `timeout_secs` ; configuration personnelle seulement | `"low"` |
+| `temperature` | Température des réponses, de 0 à 2 : plus elle est basse, moins les résumés changent d'un build à l'autre ; jamais envoyée avec `thinking` ; configuration personnelle seulement | celle du modèle |
 | `max_output_tokens` | Limite de jetons de la réponse, entier > 0 ; configuration personnelle seulement | 16384 |
 | `structured_output` | Schéma JSON imposé aux réponses d'enrichissement : `"auto"` l'envoie sans `base_url` et, s'il est refusé (HTTP 400), s'en passe pour la commande ; `"on"` l'envoie toujours, et un refus arrête l'envoi ; `"off"` jamais ; configuration personnelle seulement | `"auto"` |
 | `batch_files` | Fichiers par appel d'enrichissement, entier > 0 | 10 |
@@ -392,6 +393,7 @@ Ce que chaque clé envoie à chaque fournisseur :
 | Clé | `anthropic` | `openai` | `mock` |
 |---|---|---|---|
 | `max_output_tokens` | `max_tokens` | `max_completion_tokens` | sans effet |
+| `temperature` | `temperature`, de 0 à 1 ; Claude Opus 4.7 et suivants le refusent (HTTP 400) : retirez la clé | `temperature` ; les modèles de raisonnement le refusent (HTTP 400) : retirez la clé | sans effet |
 | `thinking = true` | `"thinking": {"type": "adaptive"}` | `reasoning_effort`, même si `effort` n'est pas écrit | sans effet |
 | `effort` | `output_config.effort` ; sans `thinking`, rien pour un modèle sorti avant Claude Opus 4.5 (`claude-sonnet-4-5`, par exemple) | `reasoning_effort` ; sans `thinking`, seulement si `effort` est écrit | sans effet |
 | `structured_output` | `output_config.format` | `response_format` | sans effet |
