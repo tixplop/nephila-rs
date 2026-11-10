@@ -504,8 +504,8 @@ pub(crate) fn form_units(
 
 /// Forme les unités dans l'ordre des fichiers : un lot compte au plus `batch_files` fichiers, au
 /// plus `max_chunk_chars` octets et au plus `nodes_per_call` nœuds au total ; un fichier plus
-/// gros que `max_chunk_chars` ou de plus de `nodes_per_call` nœuds forme une unité `Big` et
-/// coupe le lot en cours.
+/// gros que `max_chunk_chars` ou de plus de `nodes_per_call` nœuds forme une unité `Big`. Un
+/// fichier envoyé seul ne ferme pas le lot en cours : il part juste après lui, quand il se ferme.
 pub(crate) fn form_units_by_nodes<'a>(
     files: &'a [FileRecord],
     nodes: impl Fn(&FileRecord) -> usize,
@@ -518,15 +518,15 @@ pub(crate) fn form_units_by_nodes<'a>(
     let mut current: Vec<&FileRecord> = Vec::new();
     let mut total = 0u64;
     let mut total_nodes = 0usize;
+    let mut pending: Vec<&FileRecord> = Vec::new();
     for f in files {
         let n = nodes(f);
         if f.size > max_chunk_chars as u64 || n > nodes_per_call {
-            if !current.is_empty() {
-                units.push(Unit::Lot(std::mem::take(&mut current), Pass::First));
-                total = 0;
-                total_nodes = 0;
+            if current.is_empty() {
+                units.push(Unit::Big(f));
+            } else {
+                pending.push(f);
             }
-            units.push(Unit::Big(f));
             continue;
         }
         if !current.is_empty()
@@ -535,6 +535,7 @@ pub(crate) fn form_units_by_nodes<'a>(
                 || total_nodes + n > nodes_per_call)
         {
             units.push(Unit::Lot(std::mem::take(&mut current), Pass::First));
+            units.extend(pending.drain(..).map(Unit::Big));
             total = 0;
             total_nodes = 0;
         }
@@ -545,6 +546,7 @@ pub(crate) fn form_units_by_nodes<'a>(
     if !current.is_empty() {
         units.push(Unit::Lot(current, Pass::First));
     }
+    units.extend(pending.drain(..).map(Unit::Big));
     units
 }
 
@@ -2801,7 +2803,14 @@ mod tests {
             rec("d", 5),
         ];
         let u = form_units(&files, 8, 100);
-        assert_eq!(shape(&u), ["a,b", "c", "BIG:big", "d"]);
+        assert_eq!(shape(&u), ["a,b", "c,d", "BIG:big"]);
+    }
+
+    #[test]
+    fn req273_ac1_big_file_does_not_close_the_open_lot() {
+        let files = vec![rec("a", 2_000), rec("b", 70_000), rec("c", 2_000)];
+        let u = form_units(&files, 10, 60_000);
+        assert_eq!(shape(&u), ["a,c", "BIG:b"]);
     }
 
     #[test]
@@ -3092,7 +3101,7 @@ mod tests {
         let files: Vec<_> = (0..5).map(|i| rec(&format!("f{i}"), 1)).collect();
         let nodes = |f: &FileRecord| counts[f.path[1..].parse::<usize>().unwrap()];
         let u = form_units_by_nodes(&files, nodes, 8, 1000, MAX_NODES_PER_CALL);
-        assert_eq!(shape(&u), ["f0", "f1,f2", "BIG:f3", "f4"]);
+        assert_eq!(shape(&u), ["f0", "f1,f2,f4", "BIG:f3"]);
         let files = vec![rec("a", 1)];
         let u = form_units_by_nodes(&files, |_| 150, 8, 1000, MAX_NODES_PER_CALL);
         assert_eq!(shape(&u), ["a"]);
@@ -3125,7 +3134,11 @@ mod tests {
                 for max in [100usize, 1_000, 60_000] {
                     let units = form_units_by_nodes(&files, nodes, batch, max, MAX_NODES_PER_CALL);
                     let ctx = format!("jeu {set}, batch {batch}, max {max}");
+                    let rank =
+                        |f: &FileRecord| files.iter().position(|g| g.path == f.path).unwrap();
                     let mut seen: Vec<&str> = Vec::new();
+                    let mut firsts: Vec<usize> = Vec::new();
+                    let mut lots: Vec<&Vec<&FileRecord>> = Vec::new();
                     for u in &units {
                         match u {
                             Unit::Lot(v, _) => {
@@ -3136,7 +3149,13 @@ mod tests {
                                     "{ctx}"
                                 );
                                 assert!(v.iter().map(|f| nodes(f)).sum::<usize>() <= 150, "{ctx}");
+                                assert!(
+                                    v.windows(2).all(|w| rank(w[0]) < rank(w[1])),
+                                    "{ctx} : ordre dans un lot"
+                                );
                                 seen.extend(v.iter().map(|f| f.path.as_str()));
+                                firsts.push(rank(v[0]));
+                                lots.push(v);
                             }
                             Unit::Big(f) => {
                                 assert!(
@@ -3145,12 +3164,30 @@ mod tests {
                                     f.path
                                 );
                                 seen.push(f.path.as_str());
+                                firsts.push(rank(f));
                             }
                             Unit::Call { .. } => unreachable!(),
                         }
                     }
+                    assert!(
+                        firsts.windows(2).all(|w| w[0] < w[1]),
+                        "{ctx} : unités hors de l'ordre de leur premier fichier"
+                    );
+                    for w in lots.windows(2) {
+                        let (prev, next) = (w[0], w[1][0]);
+                        let sum: u64 = prev.iter().map(|f| f.size).sum();
+                        let n: usize = prev.iter().map(|f| nodes(f)).sum();
+                        assert!(
+                            prev.len() >= batch
+                                || sum + next.size > max as u64
+                                || n + nodes(next) > 150,
+                            "{ctx} : lot fermé sans raison"
+                        );
+                    }
+                    let mut sorted = seen.clone();
+                    sorted.sort_unstable();
                     let expected: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-                    assert_eq!(seen, expected, "{ctx}");
+                    assert_eq!(sorted, expected, "{ctx} : chaque fichier une fois");
                 }
             }
         }
@@ -7305,7 +7342,7 @@ mod estimate_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("d.txt"), lines_text(3)).unwrap();
         // max_chunk_chars = 10, batch_files = 2. a.md (3 octets) et b.md (4) forment un lot de 2
-        // (7 ≤ 10) ; c.md (2) est seul, car d.txt (30 > 10) est un `Big` qui coupe le lot ; e.md
+        // (7 ≤ 10) ; c.md (2) est seul, car le lot de 2 est plein ; d.txt (30 > 10) est un `Big` ; e.md
         // n'a aucun nœud (sans appel).
         let files = vec![
             rec("a.md", 3),

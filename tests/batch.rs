@@ -887,3 +887,68 @@ fn req027_ac12_character_budget_bounds_lots_and_big_document_goes_alone() {
         .iter()
         .all(|l| !l.contains(';') || !l.contains("zbig.md")));
 }
+
+#[test]
+fn req273_ac4_big_file_does_not_close_the_open_lot() {
+    let env = Env::new(0, 1, 1);
+    let doc = |title: &str, size: usize| {
+        let mut t = String::new();
+        let mut k = 0;
+        while t.len() < size {
+            if k % 250 == 0 {
+                t.push_str(&format!("# {title} {k}\n\n"));
+            }
+            t.push_str(&format!("ligne {k:04} de remplissage du document\n"));
+            k += 1;
+        }
+        t.truncate(size);
+        t
+    };
+    fs::write(env.repo.join("a.md"), doc("Aa", 2_000)).unwrap();
+    fs::write(env.repo.join("b.md"), doc("Bb", 70_000)).unwrap();
+    fs::write(env.repo.join("c.md"), doc("Cc", 2_000)).unwrap();
+    config_defaults(&env);
+    for (f, id) in [("a", "aa-0"), ("b", "bb-0"), ("c", "cc-0")] {
+        fs::write(
+            env.mock.join(format!("{f}.md.json")),
+            format!(
+                r#"{{"version":2,"summaries":[{{"node":"section:{f}.md#{id}","summary":"résumé {f}"}}],"concepts":[]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    let o = env.run("build --dry-run", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    let min = out
+        .lines()
+        .find(|l| l.starts_with("estimation minimale : "))
+        .unwrap_or_else(|| panic!("{out}"));
+    let estimated: usize = min
+        .split("minimale : ")
+        .nth(1)
+        .unwrap()
+        .split(" appels")
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let o = env.run("build", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let log = env.log_lines();
+    assert!(log.len() >= 3, "{log:?}");
+    assert!(log[0].starts_with("a.md;c.md\t1"), "{log:?}");
+    assert!(log[1].starts_with("b.md\t1"), "{log:?}");
+    assert!(log[2].starts_with("b.md\t2"), "{log:?}");
+    assert!(log[2..].iter().all(|l| l.starts_with("b.md\t")), "{log:?}");
+    assert_eq!(estimated, log.len(), "{out}");
+    let sums = env.summaries();
+    for f in ["a.md", "b.md", "c.md"] {
+        assert!(
+            sums.iter().any(|(id, _)| id.contains(f)),
+            "résumé de {f} absent : {sums:?}"
+        );
+    }
+}
