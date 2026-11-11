@@ -399,6 +399,10 @@ fn find_seeds(
     )
 }
 
+/// Taille de tranche de la recherche des nœuds de départ : un fil par tranche de 20 000 nœuds
+/// entamée ; jusqu'à 20 000 nœuds inclus, un seul parcours sans fil.
+const PARALLEL_MIN_NODES: usize = 20_000;
+
 /// Nœuds de départ : les nœuds qui correspondent à au moins un terme (noms qualifiés cités puis
 /// mots-clés, ceux qui sont des identifiants cités avant les autres), triés par (classe, couverture
 /// décroissante, fréquence, rang, position) de leur meilleure clé, puis nom qualifié et identifiant
@@ -412,6 +416,33 @@ fn rank_seeds(
     qualified: &[String],
     words: &[Word],
     limits: &AskLimits,
+) -> Vec<Node> {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    rank_seeds_with(
+        nodes,
+        prepared,
+        qualified,
+        words,
+        limits,
+        PARALLEL_MIN_NODES,
+        cpus,
+    )
+}
+
+/// Nombre de fils de la recherche : une tranche entamée par fil, au plus `cpus`, au moins un.
+fn scan_threads(total: usize, slice: usize, cpus: usize) -> usize {
+    cpus.min(total.div_ceil(slice)).max(1)
+}
+
+/// `rank_seeds` avec la taille de tranche et le nombre de fils maximal en paramètres.
+fn rank_seeds_with(
+    nodes: &[Node],
+    prepared: &search::Prepared,
+    qualified: &[String],
+    words: &[Word],
+    limits: &AskLimits,
+    slice: usize,
+    cpus: usize,
 ) -> Vec<Node> {
     let mut best: Vec<Option<SeedKey>> = vec![None; nodes.len()];
     let mut cover: Vec<usize> = vec![0; nodes.len()];
@@ -428,8 +459,43 @@ fn rank_seeds(
             offer(i, (0, freq, 0, pos));
         }
     }
-    for (k, w) in words.iter().enumerate() {
-        let hits = prepared.ranks_with(&w.exact, &w.root, w.summary);
+    // Un seul parcours des nœuds pour tous les mots, par tranches de nœuds sur plusieurs fils ;
+    // les tranches sont réunies dans l'ordre des nœuds (DEC-215).
+    let total = prepared.len();
+    let threads = scan_threads(total, slice, cpus);
+    let step = total.div_ceil(threads).max(1);
+    let scan = |range: std::ops::Range<usize>| {
+        let mut hits: Vec<Vec<(usize, u8)>> = vec![Vec::new(); words.len()];
+        for i in range {
+            for (h, w) in hits.iter_mut().zip(words) {
+                if let Some(r) = prepared.rank_at(i, &w.exact, &w.root, w.summary) {
+                    h.push((i, r));
+                }
+            }
+        }
+        hits
+    };
+    let slices: Vec<Vec<Vec<(usize, u8)>>> = if threads == 1 {
+        vec![scan(0..total)]
+    } else {
+        std::thread::scope(|sc| {
+            let tasks: Vec<_> = (0..total)
+                .step_by(step)
+                .map(|from| sc.spawn(move || scan(from..(from + step).min(total))))
+                .collect();
+            tasks
+                .into_iter()
+                .map(|t| t.join().expect("recherche des nœuds de départ"))
+                .collect()
+        })
+    };
+    let mut all_hits: Vec<Vec<(usize, u8)>> = vec![Vec::new(); words.len()];
+    for slice in slices {
+        for (all, part) in all_hits.iter_mut().zip(slice) {
+            all.extend(part);
+        }
+    }
+    for (k, (w, hits)) in words.iter().zip(all_hits).enumerate() {
         let freq = hits.len();
         for (i, r) in hits {
             offer(i, (word_class(w.cited, r), freq, r, qualified.len() + k));
@@ -633,6 +699,33 @@ fn to_json(n: &Node) -> Value {
     })
 }
 
+/// Liens touchant les nœuds de départ, lus par `edges_at` sans parcourir toute la table
+/// (REQ-282, DEC-214) : triés par (source, cible, genre) en ordre d'octets, sans doublon.
+fn seed_edges(store: &Store, seeds: &[Node]) -> Result<Vec<Edge>> {
+    let mut edges = Vec::new();
+    for n in seeds {
+        for (other, kind) in store.edges_at(&n.id, true)? {
+            edges.push(Edge {
+                source: n.id.clone(),
+                target: other,
+                kind,
+            });
+        }
+        for (other, kind) in store.edges_at(&n.id, false)? {
+            edges.push(Edge {
+                source: other,
+                target: n.id.clone(),
+                kind,
+            });
+        }
+    }
+    edges.sort_by(|a, b| {
+        (&a.source, &a.target, a.kind.as_str()).cmp(&(&b.source, &b.target, b.kind.as_str()))
+    });
+    edges.dedup_by(|a, b| a.source == b.source && a.target == b.target && a.kind == b.kind);
+    Ok(edges)
+}
+
 /// Pose la question ; retourne la réponse et les nœuds cités retenus, éventuellement aucun
 /// (REQ-161, DEC-130). Chaque citation est résolue parmi les seuls nœuds montrés dans le
 /// contexte envoyé, sans requête à la base ; une citation introuvable ou ambiguë parmi eux est
@@ -667,7 +760,7 @@ pub fn answer(
     let edges = if seeds.is_empty() {
         Vec::new()
     } else {
-        store.edges()?
+        seed_edges(store, &seeds)?
     };
     let mut context = if seeds.is_empty() {
         Context {
@@ -1345,6 +1438,59 @@ mod tests {
         }
         assert!(capped, "le plafond de 20 nœuds n'est jamais atteint");
         assert!(roots && no_summary);
+    }
+
+    #[test]
+    fn req183_ac6_scan_threads_start_above_the_slice_size() {
+        let s = PARALLEL_MIN_NODES;
+        assert_eq!(scan_threads(0, s, 8), 1);
+        assert_eq!(scan_threads(s, s, 8), 1);
+        assert_eq!(scan_threads(s + 1, s, 8), 2);
+        assert_eq!(scan_threads(2 * s + 1, s, 8), 3);
+        assert_eq!(scan_threads(10 * s, s, 4), 4);
+        assert_eq!(scan_threads(10 * s, s, 1), 1);
+    }
+
+    #[test]
+    fn req183_ac6_threaded_scan_matches_naive_oracle() {
+        // 1 001 nœuds par tranches de 300 : 4 fils, tranches réunies dans l'ordre des nœuds.
+        let nodes: Vec<Node> = (0..1_001)
+            .map(|i| {
+                mk(
+                    NodeKind::Type,
+                    &format!("p.Item{}Café{}", i % 97, i % 13),
+                    None,
+                )
+            })
+            .collect();
+        let word = |e: &str, r: &str, cited| Word {
+            exact: e.into(),
+            root: r.into(),
+            cited,
+            summary: false,
+        };
+        let words = vec![
+            word("item5cafe3", "item5cafe3", true),
+            word("cafe", "caf", false),
+            word("item9", "item9", false),
+        ];
+        let want = naive_folded_seeds(&nodes, &[], &words);
+        for (slice, cpus) in [(300, 4), (300, 1), (5_000, 4)] {
+            let got: Vec<String> = rank_seeds_with(
+                &nodes,
+                &search::Prepared::folded(&nodes),
+                &[],
+                &words,
+                &AskLimits::default(),
+                slice,
+                cpus,
+            )
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+            assert!(!want.is_empty());
+            assert_eq!(want, got, "tranche {slice}, fils {cpus}");
+        }
     }
 
     fn seeds_of(nodes: &[Node], words: &[&str]) -> Vec<String> {
@@ -2899,6 +3045,155 @@ mod tests {
             *llm.seen.lock().unwrap(),
             vec![None, Some(crate::llm::FormatFault::Shape)]
         );
+    }
+
+    fn link(s: &str, t: &str, kind: EdgeKind) -> Edge {
+        Edge {
+            source: s.into(),
+            target: t.into(),
+            kind,
+        }
+    }
+
+    fn touching(all: &[Edge], seeds: &[Node]) -> Vec<Edge> {
+        let ids: HashSet<&str> = seeds.iter().map(|n| n.id.as_str()).collect();
+        all.iter()
+            .filter(|e| ids.contains(e.source.as_str()) || ids.contains(e.target.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    fn same_edges(a: &[Edge], b: &[Edge]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| x.source == y.source && x.target == y.target && x.kind == y.kind)
+    }
+
+    /// Graphe d'AC-282-1 : départs S1 (`Seedone`) et S2 (`Seedtwo`), 60 liens entre voisins hors
+    /// départ.
+    fn seed_graph(dir: &std::path::Path, summary: Option<&str>) -> (Store, Vec<Node>) {
+        let s1 = mk(NodeKind::Type, "p.Seedone", None);
+        let s2 = mk(NodeKind::Type, "p.Seedtwo", None);
+        let mut nodes = vec![s1, s2];
+        for i in 0..40 {
+            nodes.push(mk(NodeKind::Type, &format!("p.N{i}"), None));
+        }
+        let mut st = store_with_nodes(dir, summary, nodes.clone());
+        let id = |i: usize| format!("type:p.N{i}");
+        let mut edges = vec![
+            link("type:p.Seedone", "type:p.Seedtwo", EdgeKind::References),
+            link("type:p.Seedone", "type:p.Seedone", EdgeKind::References),
+            link("type:p.Seedone", &id(0), EdgeKind::Calls),
+            link("type:p.Seedone", &id(0), EdgeKind::References),
+            link("type:p.Seedone", &id(1), EdgeKind::Extends),
+            link(&id(2), "type:p.Seedone", EdgeKind::Calls),
+            link(&id(3), "type:p.Seedtwo", EdgeKind::References),
+            link("type:p.Seedtwo", &id(4), EdgeKind::Calls),
+        ];
+        for i in 0..60 {
+            let kind = EdgeKind::ALL[i % EdgeKind::ALL.len()];
+            edges.push(link(&id(5 + i % 30), &id(5 + (i * 7 + 1) % 30), kind));
+        }
+        st.replace_edges(&edges).unwrap();
+        (st, nodes[..2].to_vec())
+    }
+
+    #[test]
+    fn req282_ac1_seed_edges_are_those_touching_the_seeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, seeds) = seed_graph(dir.path(), None);
+        let all = st.edges().unwrap();
+        let want = touching(&all, &seeds);
+        let got = seed_edges(&st, &seeds).unwrap();
+        assert!(same_edges(&got, &want), "{got:?} != {want:?}");
+        assert_eq!(got.len(), 8, "{got:?}");
+        assert!(all.len() >= 58);
+    }
+
+    #[test]
+    fn req282_ac2_context_is_the_same_on_seed_edges_and_on_all_edges() {
+        let mut rng = Lcg(282);
+        let kinds = EdgeKind::ALL;
+        let (mut nonempty, mut shared, mut cut) = (false, false, false);
+        for _ in 0..100 {
+            let dir = tempfile::tempdir().unwrap();
+            let n = 5 + rng.next(36);
+            let nodes: Vec<Node> = (0..n)
+                .map(|i| mk(NodeKind::Type, &format!("p.N{i}"), None))
+                .collect();
+            let mut st = store_with_nodes(dir.path(), None, nodes.clone());
+            let mut edges = Vec::new();
+            for _ in 0..rng.next(151) {
+                edges.push(link(
+                    &nodes[rng.next(n)].id,
+                    &nodes[rng.next(n)].id,
+                    kinds[rng.next(kinds.len())],
+                ));
+            }
+            st.replace_edges(&edges).unwrap();
+            let mut seeds = nodes.clone();
+            let k = 1 + rng.next(20.min(n));
+            let mut chosen = Vec::new();
+            for _ in 0..k {
+                chosen.push(seeds.remove(rng.next(seeds.len())));
+            }
+            let intent: HashSet<EdgeKind> =
+                kinds.iter().copied().filter(|_| rng.next(3) == 0).collect();
+            let all = st.edges().unwrap();
+            let got = seed_edges(&st, &chosen).unwrap();
+            let ids: HashSet<&str> = chosen.iter().map(|n| n.id.as_str()).collect();
+            nonempty |= !got.is_empty();
+            shared |= got
+                .iter()
+                .any(|e| ids.contains(e.source.as_str()) && ids.contains(e.target.as_str()));
+            let stored = st.nodes().unwrap();
+            for limits in [AskLimits::default(), limits_chars(400)] {
+                let full = build_context(&stored, &all, &chosen, &intent, &limits);
+                let part = build_context(&stored, &got, &chosen, &intent, &limits);
+                cut |= limits.max_context_chars == 400 && full.text.chars().count() >= 300;
+                assert_eq!(part.text, full.text);
+                assert_eq!(part.shown, full.shown);
+            }
+        }
+        assert!(nonempty && shared && cut);
+    }
+
+    #[test]
+    fn req282_ac3_answer_reads_only_the_seed_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, seeds) = seed_graph(dir.path(), None);
+        let all = st.edges().unwrap();
+        let expected: u64 = seeds
+            .iter()
+            .map(|s| {
+                all.iter().filter(|e| e.source == s.id).count()
+                    + all.iter().filter(|e| e.target == s.id).count()
+            })
+            .sum::<usize>() as u64;
+        let total_nodes = st.count_nodes().unwrap() as u64;
+        let llm = keeper(&[]);
+        crate::store::reset_diagnostics();
+        answer(&st, &llm, "Seedone Seedtwo", 0, &AskLimits::default(), None).unwrap();
+        let d = crate::store::diagnostics();
+        assert_eq!(d.edge_rows_read(), expected);
+        assert!(expected < all.len() as u64);
+        assert_eq!(d.node_rows_read(), total_nodes);
+
+        // Sans nœud de départ, avec bloc de résumé : aucune ligne de `edges`.
+        let dir = tempfile::tempdir().unwrap();
+        let (st, _) = seed_graph(dir.path(), Some(&stored_summary()));
+        crate::store::reset_diagnostics();
+        answer(
+            &st,
+            &llm,
+            "zzzabsent qqqabsent ?",
+            0,
+            &AskLimits::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(crate::store::diagnostics().edge_rows_read(), 0);
     }
 }
 

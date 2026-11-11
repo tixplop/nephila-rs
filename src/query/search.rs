@@ -75,25 +75,35 @@ impl<'a> Prepared<'a> {
     /// qualifié égal à `exact` ; préfixe : commence par `root` ; contenu : contient `root`, résumé
     /// compris si `summary`. `ranks_with(t, t, true)` est la règle de `query search` (REQ-183).
     pub fn ranks_with(&self, exact: &str, root: &str, summary: bool) -> Vec<(usize, u8)> {
-        self.items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| {
-                let r = if f.short == exact || f.qualified == exact {
-                    0
-                } else if f.short.starts_with(root) || f.qualified.starts_with(root) {
-                    1
-                } else if f.short.contains(root)
-                    || f.qualified.contains(root)
-                    || (summary && f.summary.as_deref().is_some_and(|s| s.contains(root)))
-                {
-                    2
-                } else {
-                    return None;
-                };
-                Some((i, r))
-            })
+        (0..self.items.len())
+            .filter_map(|i| self.rank_at(i, exact, root, summary).map(|r| (i, r)))
             .collect()
+    }
+
+    /// Rang du nœud `i` pour un mot (règle de `ranks_with`), `None` s'il ne correspond pas.
+    pub fn rank_at(&self, i: usize, exact: &str, root: &str, summary: bool) -> Option<u8> {
+        let f = &self.items[i];
+        if f.short == exact || f.qualified == exact {
+            Some(0)
+        } else if f.short.starts_with(root) || f.qualified.starts_with(root) {
+            Some(1)
+        } else if f.short.contains(root)
+            || f.qualified.contains(root)
+            || (summary && f.summary.as_deref().is_some_and(|s| s.contains(root)))
+        {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    /// Nombre de nœuds préparés.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
     /// Positions des nœuds dont le nom qualifié en minuscules vaut `name` ou s'y termine à une
