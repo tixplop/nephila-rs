@@ -452,6 +452,11 @@ const GUARDED_PATHS: [&str; 6] = [
     ".nephila/graph.db-journal",
 ];
 
+/// Erreur E-23 pour un chemin relatif au dépôt qui est un lien symbolique.
+pub(crate) fn symlink_refusal(rel: &str) -> Error {
+    Error::Message(format!("{rel} est un lien symbolique ; supprimez-le"))
+}
+
 /// Refuse un `.nephila` ou un de ses fichiers qui est un lien symbolique (REQ-098, E-23), sans
 /// suivre aucun lien. Un chemin absent n'est pas une erreur. À appeler avant toute création ou
 /// ouverture du verrou et de la base.
@@ -461,11 +466,7 @@ pub fn ensure_no_symlink(repo: &Path) -> Result<()> {
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
     };
-    let fail = |rel: &str| {
-        Err(Error::Message(format!(
-            "{rel} est un lien symbolique ; supprimez-le"
-        )))
-    };
+    let fail = |rel: &str| Err(symlink_refusal(rel));
     if is_link(GUARDED_PATHS[0]) {
         return fail(GUARDED_PATHS[0]);
     }
