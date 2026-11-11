@@ -1969,7 +1969,7 @@ fn REQ164_AC1_section_ask_de_la_configuration_personnelle() {
     // `structured_output` : clé de la configuration personnelle seulement (REQ-204).
     let accepted: BTreeSet<String> = ASK_SETTINGS
         .iter()
-        .chain(["structured_output"].iter())
+        .chain(["structured_output", "cache"].iter())
         .map(|k| k.to_string())
         .collect();
     assert_eq!(written, accepted);
@@ -1988,7 +1988,7 @@ fn REQ164_AC1_section_ask_de_la_configuration_personnelle() {
             max_output_tokens: Some(4096),
             structured_output: Some(nephila::config::StructuredOutput::Off),
             max_context_chars: Some(30000),
-            cache: None,
+            cache: Some(true),
             max_seeds: Some(30),
             max_nodes: Some(120),
         }
@@ -2552,7 +2552,7 @@ fn req205_ac1_ac3_blocs_structured_output_de_l_exemple_personnel() {
         "# max_output_tokens = 16384\n\n{STRUCTURED_BLOCK}\n\n# Taille maximale, en caractères, d'un morceau"
     )));
     assert!(config.contains(&format!(
-        "# max_output_tokens = 4096\n\n{STRUCTURED_ASK_BLOCK}\n\n# Nombre maximal de caractères du contexte"
+        "# max_output_tokens = 4096\n\n{STRUCTURED_ASK_BLOCK}\n\n# Garde chaque réponse de query ask"
     )));
     assert_eq!(
         config
@@ -3558,4 +3558,56 @@ fn req277_ac16_req278_ac9_readme_ligne_et_paragraphe() {
     assert!(prev.starts_with("`enrich_include` et `enrich_exclude` réduisent"));
     assert!(before.ends_with("\n\n"));
     assert!(readme[at + SERVED_MODEL_PARA.len()..].starts_with("\n\n### Lots et gros fichiers"));
+}
+
+const CACHE_ASK_BLOCK: &str =
+    "# Garde chaque réponse de query ask pendant une heure, dans .nephila/ask-cache.db : la même
+# question, sur le même contexte envoyé et avec les mêmes réglages, est alors reprise sans appel
+# au LLM. Booléen, true ou false ; absente : false, et aucun fichier n'est écrit. Un changement
+# du graphe qui change le contexte repose la question. On peut supprimer le fichier à tout
+# moment. Remplacée, pour une question, par les options --cache et --no-cache. Lue ici seulement :
+# .nephila.toml la refuse.
+# Priorité : --cache ou --no-cache > ce fichier > défaut.
+# cache = true";
+
+/// AC-281-17 : bloc exact de `cache` dans la section `[ask]` de l'exemple personnel.
+#[test]
+fn req281_ac17_bloc_cache_de_l_exemple_personnel() {
+    let config = example("config.toml");
+    assert_eq!(CACHE_ASK_BLOCK.lines().count(), 8);
+    assert_eq!(config.matches(CACHE_ASK_BLOCK).count(), 1);
+    assert!(config.contains(&format!(
+        "# structured_output = \"off\"\n\n{CACHE_ASK_BLOCK}\n\n# Nombre maximal de caractères du contexte"
+    )));
+    assert_eq!(
+        config
+            .lines()
+            .filter(|l| l.starts_with("# cache ="))
+            .count(),
+        1
+    );
+    for l in CACHE_ASK_BLOCK.lines() {
+        assert!(l.chars().count() <= 100, "{l}");
+    }
+    assert!(keys_written(&config).contains("ask"));
+    assert!(ask_keys_written(&config).contains("cache"));
+    assert!(!example("nephila.toml").contains("cache ="));
+}
+
+/// AC-281-18 : phrases du README (V-012, items 82 et 83).
+#[test]
+fn req281_ac18_readme_phrases_du_cache() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
+    let section = readme_section(&readme, "## Configuration du LLM");
+    let sentence = "Au même endroit, `cache = true` (défaut `false`) garde chaque réponse une heure dans `.nephila/ask-cache.db` : la même question, sur le même contexte et avec les mêmes réglages, est reprise sans appel. `--cache` ou `--no-cache` en décide pour une question ; on peut supprimer le fichier à tout moment.";
+    assert_eq!(section.matches(sentence).count(), 1);
+    let at = section.find(sentence).unwrap();
+    assert!(
+        section[..at].ends_with("à la réponse de `query ask`. "),
+        "après la phrase de structured_output"
+    );
+    assert!(section[at + sentence.len()..].starts_with(" Priorité :"));
+    let late = "**Graphe en retard** : une requête ne lit que le graphe, sans l'écrire (le cache de `query ask` est un fichier à part), et ne dit pas s'il est en retard.";
+    assert_eq!(readme.matches(late).count(), 1);
 }

@@ -361,6 +361,15 @@ api_key_env = "ANTHROPIC_API_KEY"
 # .nephila.toml la refuse.
 # structured_output = "off"
 
+# Garde chaque réponse de query ask pendant une heure, dans .nephila/ask-cache.db : la même
+# question, sur le même contexte envoyé et avec les mêmes réglages, est alors reprise sans appel
+# au LLM. Booléen, true ou false ; absente : false, et aucun fichier n'est écrit. Un changement
+# du graphe qui change le contexte repose la question. On peut supprimer le fichier à tout
+# moment. Remplacée, pour une question, par les options --cache et --no-cache. Lue ici seulement :
+# .nephila.toml la refuse.
+# Priorité : --cache ou --no-cache > ce fichier > défaut.
+# cache = true
+
 # Nombre maximal de caractères du contexte envoyé au LLM (nœuds et liens trouvés pour la
 # question), en-têtes compris. Entier, au moins 1000 ; absente : 12000. Plus grand, la réponse
 # s'appuie sur une plus grande part du graphe, et chaque question coûte plus. Le nombre de nœuds
