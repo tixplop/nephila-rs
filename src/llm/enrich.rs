@@ -322,11 +322,33 @@ fn filter_raw(
     first: usize,
     node_ids: &[String],
 ) -> Enrichment {
+    filter_raw_misfiled(summaries, concepts, file, numbered, first, node_ids).0
+}
+
+/// Résumé par identifiant écarté `nœud hors liste` : candidat au report vers un autre fichier du
+/// lot (REQ-279). `index` est celui de son élément dans `rejected`.
+struct Misfiled {
+    node: String,
+    text: String,
+    index: usize,
+}
+
+/// Comme `filter_raw`, et rend aussi les résumés par identifiant hors de la liste du fichier.
+fn filter_raw_misfiled(
+    summaries: Vec<RawSummary>,
+    concepts: Vec<RawConcept>,
+    file: &str,
+    numbered: &[String],
+    first: usize,
+    node_ids: &[String],
+) -> (Enrichment, Vec<Misfiled>) {
+    let mut misfiled = Vec::new();
     let known: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
     let mut out = Enrichment::default();
     let mut kept: HashMap<String, usize> = HashMap::new();
 
     for s in summaries {
+        let by_id = matches!(s.target, Target::Id(_));
         let node = match s.target {
             Target::Number(k) => {
                 let line = k
@@ -352,6 +374,13 @@ fn filter_raw(
             continue;
         }
         if !known.contains(node.as_str()) {
+            if by_id {
+                misfiled.push(Misfiled {
+                    node: node.clone(),
+                    text: summary.clone(),
+                    index: out.rejected.len(),
+                });
+            }
             out.rejected
                 .push(format!("résumé pour {} (nœud hors liste)", node));
             continue;
@@ -441,7 +470,7 @@ fn filter_raw(
             });
         }
     }
-    out
+    (out, misfiled)
 }
 
 fn invalid(msg: impl std::fmt::Display) -> Error {
@@ -757,6 +786,7 @@ pub fn parse_lot(json: &str, items: &[LotItem]) -> Result<LotEnrichment> {
 fn attach_entries(entries: Vec<RawLotEntry>, items: &[LotItem]) -> LotEnrichment {
     let mut rejected = Vec::new();
     let mut found: Vec<Option<Enrichment>> = vec![None; items.len()];
+    let mut candidates: Vec<(usize, Misfiled)> = Vec::new();
     let firsts: Vec<usize> = items
         .iter()
         .scan(1, |next, it| {
@@ -808,14 +838,45 @@ fn attach_entries(entries: Vec<RawLotEntry>, items: &[LotItem]) -> LotEnrichment
             rejected.push(format!("entrée en double pour {name}"));
             continue;
         }
-        found[i] = Some(filter_raw(
+        let (filtered, misfiled) = filter_raw_misfiled(
             entry.summaries,
             entry.concepts,
             &items[i].file,
             &items[i].node_ids,
             firsts[i],
             &items[i].node_ids,
-        ));
+        );
+        found[i] = Some(filtered);
+        candidates.extend(misfiled.into_iter().map(|m| (i, m)));
+    }
+    // Résumés rangés sous un autre fichier du lot : reportés dans le premier fichier qui liste
+    // le nœud, s'il a son entrée et pas encore de résumé pour ce nœud (REQ-279).
+    for (i, m) in candidates {
+        let Some(j) = items
+            .iter()
+            .position(|it| it.node_ids.iter().any(|n| n == &m.node))
+        else {
+            continue;
+        };
+        let Some(target) = found[j].as_ref() else {
+            continue;
+        };
+        if j == i || target.summaries.iter().any(|(n, _)| n == &m.node) {
+            continue;
+        }
+        let Some((folded, _, text)) = fold_and_cap(&m.text) else {
+            continue;
+        };
+        if tidy::is_meaningless(&folded, tidy::node_name(&m.node)) {
+            continue;
+        }
+        let moved = format!("résumé pour {} (déplacé vers {})", m.node, items[j].file);
+        if let Some(t) = found[j].as_mut() {
+            t.summaries.push((m.node, text));
+        }
+        if let Some(e) = found[i].as_mut() {
+            e.rejected[m.index] = moved;
+        }
     }
     let files = items
         .iter()
@@ -2289,6 +2350,123 @@ pub(crate) mod tests {
         let b = l.files[1].1.as_ref().unwrap();
         assert_eq!(b.summaries, vec![("type:B".into(), "Rôle de b.".into())]);
         assert_eq!(b.rejected.len(), 1, "{:?}", b.rejected);
+    }
+
+    fn lot_ab() -> [LotItem; 2] {
+        [item("A.java", &["type:A"]), item("B.java", &["type:B"])]
+    }
+
+    const E_B: &str = r#"{"file":"B.java","summaries":[{"node":"type:B","summary":"Rôle de b."},{"node":"type:A","summary":"Rôle de a."}],"concepts":[]}"#;
+    const E_A_EMPTY: &str = r#"{"file":"A.java","summaries":[],"concepts":[]}"#;
+    const MOVED: &str = "résumé pour type:A (déplacé vers A.java)";
+    const STAYS: &str = "résumé pour type:A (nœud hors liste)";
+
+    fn lot_json(entries: &[&str]) -> String {
+        format!(r#"{{"version":3,"files":[{}]}}"#, entries.join(","))
+    }
+
+    #[test]
+    fn req279_ac1_misfiled_summary_moves_to_its_file_in_any_order() {
+        for order in [[E_B, E_A_EMPTY], [E_A_EMPTY, E_B]] {
+            let l = parse_lot(&lot_json(&order), &lot_ab()).unwrap();
+            assert!(l.rejected.is_empty());
+            let a = l.files[0].1.as_ref().unwrap();
+            assert_eq!(a.summaries, vec![("type:A".into(), "Rôle de a.".into())]);
+            assert!(a.rejected.is_empty(), "{:?}", a.rejected);
+            let b = l.files[1].1.as_ref().unwrap();
+            assert_eq!(b.summaries, vec![("type:B".into(), "Rôle de b.".into())]);
+            assert_eq!(b.rejected, vec![MOVED]);
+        }
+        // Ligne d'exemple de V-006 : `N/A` puis déplacé, dans l'ordre de la réponse.
+        let e = r#"{"file":"B.java","summaries":[{"node":"type:B","summary":"N/A"},{"node":"type:A","summary":"Rôle de a."}],"concepts":[]}"#;
+        let l = parse_lot(&lot_json(&[e, E_A_EMPTY]), &lot_ab()).unwrap();
+        let b = l.files[1].1.as_ref().unwrap();
+        assert_eq!(
+            b.rejected,
+            vec![
+                "résumé pour type:B (vide de sens)".to_string(),
+                MOVED.into()
+            ]
+        );
+    }
+
+    #[test]
+    fn req279_ac2_own_summary_of_the_target_comes_first() {
+        let a = r#"{"file":"A.java","summaries":[{"node":"type:A","summary":"Rôle propre."}],"concepts":[]}"#;
+        for order in [[E_B, a], [a, E_B]] {
+            let l = parse_lot(&lot_json(&order), &lot_ab()).unwrap();
+            let fa = l.files[0].1.as_ref().unwrap();
+            assert_eq!(fa.summaries, vec![("type:A".into(), "Rôle propre.".into())]);
+            let fb = l.files[1].1.as_ref().unwrap();
+            assert_eq!(fb.rejected, vec![STAYS]);
+        }
+    }
+
+    #[test]
+    fn req279_ac3_no_move_without_entry_or_with_empty_text_and_cap_and_first_wins() {
+        let items = lot_ab();
+        // entrée A absente
+        let l = parse_lot(&lot_json(&[E_B]), &items).unwrap();
+        assert_eq!(l.files[1].1.as_ref().unwrap().rejected, vec![STAYS]);
+        assert!(l.files[0]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("absent de la réponse du lot"));
+        // vide et N/A
+        for t in ["", "N/A"] {
+            let e = format!(
+                r#"{{"file":"B.java","summaries":[{{"node":"type:A","summary":"{t}"}}],"concepts":[]}}"#
+            );
+            let l = parse_lot(&lot_json(&[&e, E_A_EMPTY]), &items).unwrap();
+            assert_eq!(l.files[1].1.as_ref().unwrap().rejected, vec![STAYS], "{t}");
+            assert!(l.files[0].1.as_ref().unwrap().summaries.is_empty());
+        }
+        // plafond : reporté coupé, un seul élément
+        let long = "mot ".repeat(150);
+        let e = format!(
+            r#"{{"file":"B.java","summaries":[{{"node":"type:A","summary":"{long}"}}],"concepts":[]}}"#
+        );
+        let l = parse_lot(&lot_json(&[&e, E_A_EMPTY]), &items).unwrap();
+        assert_eq!(l.files[1].1.as_ref().unwrap().rejected, vec![MOVED]);
+        let a = l.files[0].1.as_ref().unwrap();
+        assert_eq!(a.summaries.len(), 1);
+        assert!(a.summaries[0].1.chars().count() <= tidy::SUMMARY_MAX_CHARS);
+        assert!(a.summaries[0].1.ends_with('…'));
+        // deux résumés mal rangés : le premier de la réponse est reporté
+        let items3 = [
+            item("A.java", &["type:A"]),
+            item("B.java", &["type:B"]),
+            item("C.java", &["type:C"]),
+        ];
+        let eb = r#"{"file":"B.java","summaries":[{"node":"type:A","summary":"Premier rôle."}],"concepts":[]}"#;
+        let ec = r#"{"file":"C.java","summaries":[{"node":"type:A","summary":"Second rôle."}],"concepts":[]}"#;
+        let ea = E_A_EMPTY;
+        let l = parse_lot(&lot_json(&[eb, ec, ea]), &items3).unwrap();
+        assert_eq!(
+            l.files[0].1.as_ref().unwrap().summaries,
+            vec![("type:A".into(), "Premier rôle.".into())]
+        );
+        assert_eq!(l.files[1].1.as_ref().unwrap().rejected, vec![MOVED]);
+        assert_eq!(l.files[2].1.as_ref().unwrap().rejected, vec![STAYS]);
+    }
+
+    #[test]
+    fn req279_ac4_number_of_another_file_is_never_moved() {
+        let items = [
+            item("a.md", &["document:a.md"]),
+            item("B.java", &["type:B"]),
+        ];
+        let json = r#"{"version":3,"files":[
+            {"f":1,"summaries":[],"concepts":[]},
+            {"f":2,"summaries":[{"n":1,"summary":"Rôle de a."}],"concepts":[]}]}"#;
+        let l = parse_lot(json, &items).unwrap();
+        assert!(l.files[0].1.as_ref().unwrap().summaries.is_empty());
+        assert_eq!(
+            l.files[1].1.as_ref().unwrap().rejected,
+            vec!["résumé pour le numéro 1 (hors liste)"]
+        );
     }
 
     #[test]

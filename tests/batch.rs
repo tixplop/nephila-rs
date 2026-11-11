@@ -952,3 +952,60 @@ fn req273_ac4_big_file_does_not_close_the_open_lot() {
         );
     }
 }
+
+/// REQ-279 : deux fichiers d'un lot, la fixture du second porte le résumé du type du premier.
+fn misfiled_env(batch: usize) -> Env {
+    let env = Env::new(2, batch, 1);
+    fs::write(
+        env.mock.join("src/F00.java.json"),
+        r#"{"version":2,"summaries":[],"concepts":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        env.mock.join("src/F01.java.json"),
+        r#"{"version":2,"summaries":[{"node":"type:p.F01","summary":"résumé 01"},{"node":"type:p.F00","summary":"Rôle de F00."}],"concepts":[]}"#,
+    )
+    .unwrap();
+    env
+}
+
+#[test]
+fn req279_ac6_ac8_misfiled_summary_is_moved_in_a_lot_only() {
+    let env = misfiled_env(2);
+    let o = env.run("build", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let err = stderr(&o);
+    let warns: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("avertissement:"))
+        .collect();
+    assert_eq!(
+        warns,
+        vec!["avertissement: src/F01.java : 1 élément(s) d'enrichissement écarté(s) : résumé pour type:p.F00 (déplacé vers src/F00.java)"]
+    );
+    let q = env.run("query search Rôle", &[]);
+    assert!(q.status.success(), "{}", stderr(&q));
+    let out = String::from_utf8_lossy(&q.stdout).into_owned();
+    assert!(
+        out.contains("p.F00") && out.contains("Rôle de F00."),
+        "{out}"
+    );
+    assert!(env
+        .summaries()
+        .contains(&("type:p.F00".into(), "Rôle de F00.".into())));
+    assert_eq!(to_enrich(&env), 0);
+    fs::write(&env.log, "").unwrap();
+    let o = env.run("update", &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(env.log_lines().is_empty());
+
+    let env = misfiled_env(1);
+    let o = env.run("build", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("résumé pour type:p.F00 (nœud hors liste)"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!env.summaries().iter().any(|(id, _)| id == "type:p.F00"));
+}
