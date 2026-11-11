@@ -136,6 +136,8 @@ pub struct AskOverrides {
     pub effort: Option<Effort>,
     pub max_output_tokens: Option<u32>,
     pub structured_output: Option<StructuredOutput>,
+    /// Cache des réponses de `query ask` (REQ-281) : configuration personnelle seulement.
+    pub cache: Option<bool>,
     pub max_context_chars: Option<usize>,
     pub max_seeds: Option<usize>,
     pub max_nodes: Option<usize>,
@@ -534,6 +536,7 @@ struct RawAsk {
     effort: Option<toml::Value>,
     max_output_tokens: Option<toml::Value>,
     structured_output: Option<toml::Value>,
+    cache: Option<toml::Value>,
     max_context_chars: Option<toml::Value>,
     max_seeds: Option<toml::Value>,
     max_nodes: Option<toml::Value>,
@@ -1112,6 +1115,13 @@ impl Config {
                                 ))
                             }
                         },
+                    },
+                    cache: match &a.cache {
+                        None => None,
+                        Some(toml::Value::Boolean(b)) => Some(*b),
+                        Some(v) => {
+                            return Err(invalid("ask.cache", "un booléen, true ou false", v))
+                        }
                     },
                     max_context_chars: int(
                         "max_context_chars",
@@ -2135,6 +2145,7 @@ mod ask_tests {
                 thinking: Some(true),
                 effort: Some(Effort::ModelDefault),
                 structured_output: None,
+                cache: None,
                 max_output_tokens: Some(2048),
                 max_context_chars: Some(30000),
                 max_seeds: Some(30),
@@ -2269,6 +2280,7 @@ mod ask_tests {
                 max_context_chars: Some(100_000),
                 max_seeds: Some(100),
                 structured_output: None,
+                cache: None,
                 max_nodes: Some(500),
             }
         );
@@ -2737,6 +2749,37 @@ mod structured_tests {
         assert_eq!(
             e,
             "./.nephila.toml : clé inconnue `ask.structured_output` (clés permises dans [ask] : \
+             model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes)"
+        );
+    }
+
+    #[test]
+    fn req281_ac1_cle_cache_de_la_section_ask() {
+        assert_eq!(
+            personal("[ask]\ncache = true").unwrap().ask.cache,
+            Some(true)
+        );
+        assert_eq!(
+            personal("[ask]\ncache = false").unwrap().ask.cache,
+            Some(false)
+        );
+        assert_eq!(personal("").unwrap().ask.cache, None);
+        let e = personal("[ask]\ncache = \"oui\"").unwrap_err().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "configuration invalide ({P}) : clé « ask.cache » doit être un booléen, true ou \
+                 false (reçu : \"oui\")"
+            )
+        );
+        assert!(!ASK_SETTINGS.contains(&"cache"));
+        let e =
+            ProjectSettings::from_table(&"[ask]\ncache = true".parse().unwrap(), "./.nephila.toml")
+                .unwrap_err()
+                .to_string();
+        assert_eq!(
+            e,
+            "./.nephila.toml : clé inconnue `ask.cache` (clés permises dans [ask] : \
              model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes)"
         );
     }

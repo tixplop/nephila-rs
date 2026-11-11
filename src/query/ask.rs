@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
+use super::ask_cache;
 use super::lookup::{self, Lookup};
 use super::search;
 use super::words;
@@ -643,6 +644,7 @@ pub fn answer(
     question: &str,
     format_retries: u32,
     limits: &AskLimits,
+    cache: Option<(&Path, &Config, i64)>,
 ) -> Result<(String, Vec<Node>)> {
     let nodes = store.nodes()?;
     let seeds = question_seeds(&nodes, question, limits);
@@ -692,18 +694,47 @@ pub fn answer(
             .collect();
         context.shown.extend(extra);
     }
-    let mut totals = LlmTotals::default();
-    let result = ask_with_retries(llm, question, &context.text, format_retries, &mut totals);
-    if totals.calls > 0 {
-        crate::trace!("{}", calls_line(&totals));
+    // Le cache est abandonné pour la commande à la première panne (A-26).
+    let mut cache = cache;
+    let mut key = None;
+    let mut cached = None;
+    if let Some((repo, cfg, now)) = cache {
+        let k = ask_cache::key(cfg, question, &context.text);
+        match ask_cache::lookup(repo, &k, now) {
+            Ok(hit) => {
+                key = Some(k);
+                cached = hit;
+            }
+            Err(cause) => {
+                warn_cache(&cause);
+                cache = None;
+            }
+        }
     }
-    let reply = result.map_err(|e| match e {
-        Error::Truncated { .. } => Error::truncated(format!(
-            "{TRUNCATED} ; posez une question plus ciblée ou augmentez max_output_tokens"
-        )),
-        Error::Refused(_) => Error::Refused(format!("{BLOCKED} ; reformulez la question")),
-        other => other,
-    })?;
+    let reply = if let Some((reply, age)) = cached {
+        crate::trace!("cache: réponse reprise (enregistrée il y a {age} s)");
+        reply
+    } else {
+        let mut totals = LlmTotals::default();
+        let result = ask_with_retries(llm, question, &context.text, format_retries, &mut totals);
+        if totals.calls > 0 {
+            crate::trace!("{}", calls_line(&totals));
+        }
+        let reply = result.map_err(|e| match e {
+            Error::Truncated { .. } => Error::truncated(format!(
+                "{TRUNCATED} ; posez une question plus ciblée ou augmentez max_output_tokens"
+            )),
+            Error::Refused(_) => Error::Refused(format!("{BLOCKED} ; reformulez la question")),
+            other => other,
+        })?;
+        if let (Some((repo, _, now)), Some(k)) = (cache, key) {
+            match ask_cache::store(repo, &k, &reply, now) {
+                Ok(()) => crate::trace!("cache: réponse enregistrée"),
+                Err(cause) => warn_cache(&cause),
+            }
+        }
+        reply
+    };
     match reply {
         AskReply::NotFound => Err(not_found()),
         AskReply::Found {
@@ -716,6 +747,22 @@ pub fn answer(
             Ok((answer, retained))
         }
     }
+}
+
+/// Avertissement A-26 : cache inutilisable, la question part sans cache (V-006).
+fn warn_cache(cause: &str) {
+    crate::error::warn(&format!(
+        "cache des réponses inutilisable, question posée sans cache : {}",
+        crate::escape::path(cause)
+    ));
+}
+
+/// Secondes écoulées depuis l'epoch Unix, 0 si l'horloge est avant.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Appels de `query ask` avec leurs nouveaux essais de format ; la catégorie de l'erreur
@@ -759,6 +806,8 @@ pub struct AskOptions {
     pub verbose: bool,
     pub format_retries: Option<u32>,
     pub context_chars: Option<usize>,
+    /// `--cache` (`Some(true)`) ou `--no-cache` (`Some(false)`) ; sinon `[ask].cache` (REQ-281).
+    pub cache: Option<bool>,
 }
 
 pub fn run(
@@ -773,6 +822,7 @@ pub fn run(
         verbose,
         format_retries,
         context_chars,
+        cache,
     } = opts;
     crate::trace::init(verbose);
     if question.trim().is_empty() {
@@ -781,8 +831,13 @@ pub fn run(
     let project = ProjectFile::load(repo)?;
     let config = Config::load()?;
     let deny = config.model_override == ModelOverride::Deny;
+    let cache_on = cache.or(config.ask.cache).unwrap_or(false);
     let (config, limits, marks) = config.for_ask(&project.settings, format_retries, context_chars);
     let llm = build_llm(&config)?;
+    if cache_on {
+        crate::store::ensure_no_symlink(repo)?;
+        ask_cache::ensure_no_symlink(repo)?;
+    }
     let store = super::open(repo, check_stale)?;
     let mark = if marks.is_empty() {
         String::new()
@@ -790,7 +845,7 @@ pub fn run(
         format!(" (.nephila.toml : {})", marks.join(","))
     };
     crate::trace!(
-        "config: llm={} model={} thinking={} effort={}{} max_output_tokens={} max_context_chars={} max_seeds={} max_nodes={} timeout_secs={} format_retries={}{}{}",
+        "config: llm={} model={} thinking={} effort={}{} max_output_tokens={} max_context_chars={} max_seeds={} max_nodes={} timeout_secs={} format_retries={}{}{}{}",
         config.provider.as_str(),
         config.model,
         config.thinking,
@@ -802,6 +857,7 @@ pub fn run(
         limits.max_nodes,
         config.timeout_secs,
         config.format_retries,
+        if cache_on { " cache=true" } else { "" },
         config.tls_trace(),
         mark
     );
@@ -825,6 +881,7 @@ pub fn run(
         question,
         config.format_retries,
         &limits,
+        cache_on.then(|| (repo, &config, now_secs())),
     )?;
     if cited.is_empty() {
         crate::error::warn(UNVERIFIABLE);
@@ -2644,8 +2701,15 @@ mod tests {
             "concept:paiement",
             "type:p.Order",
         ]);
-        let (_, nodes) =
-            answer(&st, &llm, "zzzabsent qqqabsent ?", 0, &AskLimits::default()).unwrap();
+        let (_, nodes) = answer(
+            &st,
+            &llm,
+            "zzzabsent qqqabsent ?",
+            0,
+            &AskLimits::default(),
+            None,
+        )
+        .unwrap();
         let ctx = llm.contexts.lock().unwrap().clone();
         assert_eq!(ctx.len(), 1);
         assert!(ctx[0].starts_with("Résumé du graphe :\n"), "{}", ctx[0]);
@@ -2659,8 +2723,15 @@ mod tests {
         );
         // Le libellé seul ne retient rien.
         let llm = keeper(&["Order"]);
-        let (_, nodes) =
-            answer(&st, &llm, "zzzabsent qqqabsent ?", 0, &AskLimits::default()).unwrap();
+        let (_, nodes) = answer(
+            &st,
+            &llm,
+            "zzzabsent qqqabsent ?",
+            0,
+            &AskLimits::default(),
+            None,
+        )
+        .unwrap();
         assert!(nodes.is_empty());
     }
 
@@ -2690,7 +2761,7 @@ mod tests {
         assert!(alone.text.chars().count() > 900, "{}", alone.text);
         for limits in [wide(12_000), wide(1000)] {
             let llm = keeper(&["type:p.Order"]);
-            let (_, nodes) = answer(&st, &llm, q, 0, &limits).unwrap();
+            let (_, nodes) = answer(&st, &llm, q, 0, &limits, None).unwrap();
             let ctx = llm.contexts.lock().unwrap()[0].clone();
             assert!(ctx.starts_with("Résumé du graphe :\n"), "{ctx}");
             assert!(ctx.contains("Nœuds :\n"), "{ctx}");
@@ -2706,7 +2777,15 @@ mod tests {
         let st = store_with_summary(dir.path(), Some(&stored_summary()));
         // Sans mot d'architecture : contexte de REQ-142 seul.
         let llm = keeper(&[]);
-        answer(&st, &llm, "Que fait Order ?", 0, &AskLimits::default()).unwrap();
+        answer(
+            &st,
+            &llm,
+            "Que fait Order ?",
+            0,
+            &AskLimits::default(),
+            None,
+        )
+        .unwrap();
         let ctx = llm.contexts.lock().unwrap()[0].clone();
         let nodes = st.nodes().unwrap();
         let seeds = question_seeds(&nodes, "Que fait Order ?", &AskLimits::default());
@@ -2732,7 +2811,14 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let st = store_with_summary(dir.path(), summary);
             let llm = keeper(&[]);
-            let r = answer(&st, &llm, "zzzabsent qqqabsent ?", 0, &AskLimits::default());
+            let r = answer(
+                &st,
+                &llm,
+                "zzzabsent qqqabsent ?",
+                0,
+                &AskLimits::default(),
+                None,
+            );
             assert_eq!(r.unwrap_err().to_string(), not_found().to_string());
             assert!(llm.contexts.lock().unwrap().is_empty());
             let r = answer(
@@ -2741,6 +2827,7 @@ mod tests {
                 "Quelle architecture pour Order ?",
                 0,
                 &AskLimits::default(),
+                None,
             );
             assert!(r.is_ok());
             let ctx = llm.contexts.lock().unwrap().clone();
@@ -2750,7 +2837,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let st = store_with_summary(dir.path(), Some(&stored_summary()));
         let llm = keeper(&[]);
-        let r = answer(&st, &llm, "?!", 0, &AskLimits::default());
+        let r = answer(&st, &llm, "?!", 0, &AskLimits::default(), None);
         assert_eq!(r.unwrap_err().to_string(), not_found().to_string());
         assert!(llm.contexts.lock().unwrap().is_empty());
     }
@@ -2901,7 +2988,14 @@ mod structured_fallback_tests {
         let (base, bodies) = recording_server(replies, 0);
         let llm = adapter(provider, base);
         let (r, events) = crate::trace::capture_all(verbose, || {
-            answer(&store, llm.as_ref(), "Alpha", 0, &AskLimits::default())
+            answer(
+                &store,
+                llm.as_ref(),
+                "Alpha",
+                0,
+                &AskLimits::default(),
+                None,
+            )
         });
         let (text, nodes) = r.unwrap();
         let mut events = events;

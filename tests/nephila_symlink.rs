@@ -316,3 +316,58 @@ fn REQ098_AC5_apres_suppression_du_lien_build_cree_le_graphe() {
     assert!(env.repo.join(".nephila/graph.db").is_file());
     assert_eq!(entries(&env.victim), Vec::<String>::new());
 }
+
+#[test]
+fn req281_ac9_ac16_fichiers_du_cache_liens_symboliques() {
+    let env = Env::new();
+    assert!(env.run(&["build", "--no-llm"]).status.success());
+    fs::write(
+        env.mock.join("_ask.json"),
+        r#"{"found":true,"answer":"ok","nodes":[]}"#,
+    )
+    .unwrap();
+    let log = env.mock.join("calls.log");
+    let ask = |extra: &[&str]| {
+        let _ = fs::remove_file(&log);
+        let mut a = vec!["query", "ask", "Que fait A ?"];
+        a.extend_from_slice(extra);
+        env.cmd(&env.repo, &a)
+            .env("NEPHILA_MOCK_LOG", &log)
+            .output()
+            .unwrap()
+    };
+    let calls = || fs::read_to_string(&log).unwrap_or_default().lines().count();
+    let target = env.victim_dir().join("cible.db");
+    fs::write(&target, b"intact").unwrap();
+    let cache = env.repo.join(".nephila/ask-cache.db");
+    symlink(&target, &cache).unwrap();
+    let o = ask(&["--cache"]);
+    assert_refused(&o, ".nephila/ask-cache.db");
+    assert_eq!(calls(), 0);
+    assert_eq!(fs::read(&target).unwrap(), b"intact");
+    // Sans --cache, le fichier n'est pas examiné.
+    let o = ask(&[]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(calls(), 1);
+    fs::remove_file(&cache).unwrap();
+
+    let journal = env.repo.join(".nephila/ask-cache.db-journal");
+    symlink(&target, &journal).unwrap();
+    assert_refused(&ask(&["--cache"]), ".nephila/ask-cache.db-journal");
+    assert_eq!(calls(), 0);
+    // Avec un graphe en retard, E-23 reste la seule ligne.
+    fs::write(env.repo.join("B.java"), "class B {}\n").unwrap();
+    assert_refused(
+        &ask(&["--cache", "--check-stale"]),
+        ".nephila/ask-cache.db-journal",
+    );
+    fs::remove_file(&journal).unwrap();
+
+    // graph.db est nommé avant le cache.
+    let db = env.repo.join(".nephila/graph.db");
+    let real = env.victim_dir().join("graph.real");
+    fs::rename(&db, &real).unwrap();
+    symlink(&real, &db).unwrap();
+    symlink(&target, &cache).unwrap();
+    assert_refused(&ask(&["--cache"]), ".nephila/graph.db");
+}

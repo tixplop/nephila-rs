@@ -166,6 +166,37 @@ fn req163_ac6_ac10_help_of_query_ask() {
     }
 }
 
+#[test]
+fn req281_ac12_aide_et_conflit_de_cache() {
+    let h = normalized_help(&["query", "ask"]);
+    let cache = "--cache Reprend la réponse gardée de la même question sur le même contexte, si elle a moins d'une heure ; sinon, garde la nouvelle réponse (remplace `cache` de la section [ask] ; défaut : sans cache)";
+    let no_cache = "--no-cache Pose la question au LLM sans lire ni garder de réponse (remplace `cache` de la section [ask])";
+    assert!(h.contains(cache), "{h}");
+    assert!(h.contains(no_cache), "{h}");
+    let pos = |s: &str| h.find(s).unwrap();
+    assert!(pos("--context-chars <N>") < pos(cache) && pos(cache) < pos(no_cache));
+    assert!(!cache.contains(" -") && !no_cache.contains(" -"));
+    for sub in ["search", "neighbors", "path", "community"] {
+        assert!(
+            !normalized_help(&["query", sub]).contains("--cache"),
+            "{sub}"
+        );
+    }
+    for sub in ["build", "update"] {
+        assert!(!normalized_help(&[sub]).contains("--cache"), "{sub}");
+    }
+    let o = nephila()
+        .args(["query", "ask", "x", "--cache", "--no-cache"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("error: the argument '--cache' cannot be used with '--no-cache'"),
+        "{err}"
+    );
+}
+
 // ---- REQ-184, REQ-185 : `--dry-run` de `build` et `update` ----
 
 #[test]

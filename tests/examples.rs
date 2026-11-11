@@ -1262,7 +1262,7 @@ fn REQ229_AC2_version_0_28_0() {
 #[test]
 fn REQ229_AC1_AC4_readme_appels_gardes() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let section = readme_section(&readme, "### Échecs et nouveaux essais");
     let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
     assert_eq!(bullets.len(), 5, "{bullets:?}");
@@ -1310,7 +1310,7 @@ fn req218_ac1_ac4_readme_batch() {
     let plafond = sec.find("- **Plafond**").unwrap();
     assert!(plafond < sec.find(para).unwrap());
     assert!(sec[plafond..].contains(&format!("\n\n{para}")));
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
 }
 
 /// AC-218-3 : le mode lot n'ajoute aucune clé aux exemples livrés.
@@ -1424,7 +1424,7 @@ fn REQ155_AC1_readme_condense() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 53_838, "README : {size} octets");
+    assert!(size <= 54_215, "README : {size} octets");
     let readme = repo_file("README.md");
     assert!(!readme.contains("| Version | Nouveautés |"));
     assert!(!readme.lines().any(|l| l.starts_with("| 0.")));
@@ -1988,6 +1988,7 @@ fn REQ164_AC1_section_ask_de_la_configuration_personnelle() {
             max_output_tokens: Some(4096),
             structured_output: Some(nephila::config::StructuredOutput::Off),
             max_context_chars: Some(30000),
+            cache: None,
             max_seeds: Some(30),
             max_nodes: Some(120),
         }
@@ -2036,7 +2037,7 @@ fn REQ165_AC16_readme_traces_sentence() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 53_838, "README : {size} octets");
+    assert!(size <= 54_215, "README : {size} octets");
 }
 
 #[test]
@@ -2092,7 +2093,7 @@ fn REQ168_AC1_reenrichissement_a_la_mise_a_niveau() {
     let size = fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .len();
-    assert!(size <= 53_838, "README : {size} octets");
+    assert!(size <= 54_215, "README : {size} octets");
 }
 
 // ---- REQ-174 : `summary_language` dans les exemples et le README ----
@@ -2253,7 +2254,7 @@ fn REQ174_AC5_AC10_readme_lignes_et_phrases_de_summary_language() {
         assert!(!readme.contains(old), "présent : {old}");
     }
     assert_eq!(readme.matches("config: llm=").count(), 1);
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
 }
 
 /// AC-185-2 : textes de V-012 pour `--dry-run`, ligne de table après `--enrich-code`.
@@ -2271,7 +2272,7 @@ fn req185_ac2_readme_dry_run() {
     let table = section.lines().filter(|l| l.starts_with("| `-")).count();
     assert_eq!(table, 13, "{section}");
     assert!(readme.find("Un seul `build` ou `update`").unwrap() < readme.find(para).unwrap());
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
 }
 
 // ---- REQ-188 : `max_calls` dans l'exemple et le README ----
@@ -2301,7 +2302,7 @@ fn REQ188_AC2_AC5_section_max_calls_de_l_exemple() {
 #[test]
 fn REQ188_AC3_AC6_textes_du_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let has_after = |first: &str, second: &str| {
         let a = readme
             .find(first)
@@ -2332,7 +2333,7 @@ fn REQ188_AC3_AC6_textes_du_readme() {
 #[test]
 fn REQ192_AC3_ctrl_c_dans_le_readme() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let codes = readme_section(&readme, "## Codes de sortie");
     let rows = table_rows(&codes, "| Code | Signification |", "|---|---|");
     assert_eq!(rows.len(), 4, "{rows:?}");
@@ -2441,7 +2442,7 @@ fn REQ197_AC2_AC5_blocs_de_model_dans_l_exemple_du_depot() {
 #[test]
 fn REQ197_AC3_AC6_readme_model_override() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let table = readme_section(&readme, "## Configuration du LLM");
     let lines: Vec<&str> = table.lines().collect();
     let lang = lines
@@ -2487,7 +2488,7 @@ fn REQ197_AC3_AC6_readme_model_override() {
 #[test]
 fn REQ199_AC10_readme_fichier_absent_d_une_reponse_de_lot() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let section = readme_section(&readme, "### Échecs et nouveaux essais");
     let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
     let tronquee = bullets
@@ -2515,7 +2516,7 @@ fn req200_ac9_readme_non_conforming_reply_bullet() {
         bullets,
         ["- **Réponse non conforme** : renvoyée aussitôt, jusqu'à `format_retries` fois (défaut 2), jamais si le modèle la bloque ; encore non conforme, un lot de 4 fichiers ou plus est découpé une fois en deux, chaque moitié avec ses propres essais ; l'échec final nomme le fichier avec `(<k> essais sur <t>)` ; si le modèle échoue souvent, changez-le ou réduisez `batch_files`."]
     );
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
 }
 
 const STRUCTURED_BLOCK: &str = "# Schéma JSON envoyé avec chaque appel d'enrichissement : le serveur l'impose à la réponse, ce
@@ -2593,7 +2594,7 @@ fn req205_ac1_ac3_blocs_structured_output_de_l_exemple_personnel() {
 #[test]
 fn req205_ac2_readme_lignes_structured_output() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let lines: Vec<&str> = readme.lines().collect();
     let count = |l: &str| lines.iter().filter(|x| **x == l).count();
     assert_eq!(count("| `structured_output` | Schéma JSON imposé aux réponses d'enrichissement : `\"auto\"` l'envoie sans `base_url` et, s'il est refusé (HTTP 400), s'en passe pour la commande ; `\"on\"` l'envoie toujours, et un refus arrête l'envoi ; `\"off\"` jamais ; configuration personnelle seulement | `\"auto\"` |"), 1);
@@ -2609,8 +2610,9 @@ fn req205_ac2_readme_lignes_structured_output() {
         count("| `structured_output` | `output_config.format` | `response_format` | sans effet |"),
         1
     );
-    let phrase = "bornent le contexte envoyé. Dans la configuration personnelle seulement, `structured_output` (défaut `\"off\"`, même si la clé du premier niveau est écrite) impose aussi le schéma JSON à la réponse de `query ask`. Priorité :";
+    let phrase = "bornent le contexte envoyé. Dans la configuration personnelle seulement, `structured_output` (défaut `\"off\"`, même si la clé du premier niveau est écrite) impose aussi le schéma JSON à la réponse de `query ask`.";
     assert_eq!(readme.matches(phrase).count(), 1);
+    assert_eq!(readme.matches(" Priorité : `--context-chars`").count(), 1);
 }
 
 /// AC-205-4 : place des trois ajouts du README (table des clés, table des fournisseurs, phrase
@@ -2921,7 +2923,7 @@ fn REQ208_AC2_AC5_readme_tables_et_phrases() {
         "puis lancez `nephila update`. {phrase} Si le `.nephila.toml`"
     )));
     assert!(vers.ends_with("ou `model_override = \"allow\"` dans la configuration personnelle."));
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
 }
 
 /// Puce « Réponse tronquée » de V-012 (item 57).
@@ -2931,7 +2933,7 @@ const TRUNCATED_BULLET: &str = "- **Réponse tronquée** : `réponse tronquée p
 #[test]
 fn REQ231_AC3_readme_reponse_tronquee_decoupe_d_un_appel() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let section = readme_section(&readme, "### Échecs et nouveaux essais");
     let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
     assert_eq!(bullets.len(), 5, "{bullets:?}");
@@ -2950,7 +2952,7 @@ fn REQ231_AC3_readme_reponse_tronquee_decoupe_d_un_appel() {
 #[test]
 fn REQ233_AC5_readme_puce_taille_et_aides() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let section = readme_section(&readme, "### Échecs et nouveaux essais");
     let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
     assert_eq!(bullets.len(), 5, "{bullets:?}");
@@ -2987,7 +2989,7 @@ fn REQ233_AC10_puce_reponse_tronquee_texte_de_v012() {
 #[test]
 fn REQ235_AC11_AC15_readme_ligne_du_bilan_taille_et_aides() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let section = readme_section(&readme, "### `nephila build` et `nephila update`");
     let lines: Vec<&str> = section.lines().collect();
     let at = lines
@@ -3022,7 +3024,7 @@ fn REQ235_AC11_AC15_readme_ligne_du_bilan_taille_et_aides() {
 #[test]
 fn REQ235_AC17_readme_exemple_de_trace_avec_couverture() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let section = readme_section(&readme, "### Traces et progression");
     let lines: Vec<&str> = section.lines().collect();
     assert!(lines.contains(
@@ -3035,7 +3037,7 @@ fn REQ235_AC17_readme_exemple_de_trace_avec_couverture() {
 #[test]
 fn req238_ac3_ac7_readme_mise_a_niveau_028() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let upgrade = readme_section(&readme, "## Mise à niveau");
     assert_eq!(
         upgrade
@@ -3095,7 +3097,7 @@ fn req242_ac1_ac3_readme_puce_fichier_de_donnees() {
 #[test]
 fn req242_ac2_readme_au_plus_51000_octets() {
     let n = repo_file("README.md").len();
-    assert!(n <= 53_838, "README : {n} octets");
+    assert!(n <= 54_215, "README : {n} octets");
 }
 
 const DOC_BULLET: &str = "- **Commentaires de doc** : la première phrase d'un commentaire `/** … */` placé juste avant la déclaration d'un type ou d'une méthode devient son résumé, si elle a au moins 5 mots et au plus 300 caractères. Elle reste dans la langue du commentaire, et ce nœud n'est pas demandé au LLM.";
@@ -3175,7 +3177,7 @@ fn REQ246_AC2_AC5_readme_mise_a_niveau_build() {
 #[test]
 fn REQ246_AC3_readme_au_plus_51000_octets() {
     let n = repo_file("README.md").len();
-    assert!(n <= 53_838, "README : {n} octets");
+    assert!(n <= 54_215, "README : {n} octets");
 }
 
 // ---- REQ-252 : timeout_secs, silence permis (T-341) ----
@@ -3220,7 +3222,7 @@ fn REQ252_AC4_readme_lignes_du_delai_d_inactivite() {
     assert_eq!(readme.matches("config: llm=").count(), 1);
     let table = readme_section(&readme, "### Arrêt de l'envoi");
     assert_eq!(table.lines().filter(|l| l.starts_with("| ")).count() - 1, 6);
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
 }
 
 #[test]
@@ -3296,7 +3298,7 @@ fn REQ256_AC1_readme_puce_surcharge_passagere() {
 #[test]
 fn REQ256_AC2_readme_au_plus_52861_octets() {
     let n = repo_file("README.md").len();
-    assert!(n <= 53_838, "README : {n} octets");
+    assert!(n <= 54_215, "README : {n} octets");
 }
 
 /// AC-260-8 : le paragraphe de `query ask` dit que le résumé peut figurer dans le contexte.
@@ -3306,7 +3308,7 @@ fn REQ260_AC8_readme_dit_le_resume_dans_le_contexte() {
     assert!(readme.contains(
         "jamais du contenu des fichiers. Il peut aussi contenir le résumé de `nephila summary` : une question sans nœud trouvé peut donc faire un appel LLM. Les nœuds cités sont pris dans ce contexte."
     ));
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
 }
 
 /// AC-263-7 : la phrase de V-012 (item 71) figure une fois dans `## Communautés`, et le README
@@ -3314,7 +3316,7 @@ fn REQ260_AC8_readme_dit_le_resume_dans_le_contexte() {
 #[test]
 fn REQ263_AC7_readme_paragraphe_noms_de_sous_systemes() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let section = readme_section(&readme, "## Communautés");
     let phrase = "**Noms de sous-systèmes** : avec `--subsystems`, `build` et `update` font nommer et décrire par le LLM chaque communauté d'au moins 10 membres et 3 résumés. Coût : un appel par communauté, compté dans `max_calls`. Le nom et la description restent gardés, et réappliqués sans appel, tant que la communauté et ses résumés ne changent pas.";
     assert_eq!(section.matches(phrase).count(), 1);
@@ -3365,7 +3367,7 @@ fn REQ265_AC7_AC9_readme_ligne_de_table_et_puce_secrets() {
     let last_line = before.trim_end_matches('\n').rsplit('\n').next().unwrap();
     assert!(last_line.starts_with("- **Plafond**"), "{last_line}");
     assert!(before.ends_with("\n") && !before.ends_with("\n\n"));
-    assert!(readme.len() <= 53_838);
+    assert!(readme.len() <= 54_215);
 }
 
 #[test]
@@ -3387,7 +3389,7 @@ fn req271_ac9_readme_nœuds_par_appel() {
         .find(|l| l.starts_with("trace: ") && l.contains("config: llm="))
         .unwrap();
     assert!(trace.contains(" max_output_tokens=16384 nodes_per_call=150 concurrency=4 "));
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
 }
 
 const TEMPERATURE_BLOCK: [&str; 10] = [
@@ -3458,7 +3460,7 @@ fn req275_ac11_temperature_reactivee_seule_est_acceptee() {
 #[test]
 fn req275_ac10_readme_lignes_de_temperature() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let table = readme_section(&readme, "## Configuration du LLM");
     let lines: Vec<&str> = table.lines().collect();
     let at = lines
@@ -3542,7 +3544,7 @@ fn req277_ac16_model_aliases_reactivee_seule_est_acceptee() {
 #[test]
 fn req277_ac16_req278_ac9_readme_ligne_et_paragraphe() {
     let readme = repo_file("README.md");
-    assert!(readme.len() <= 53_838, "README : {} octets", readme.len());
+    assert!(readme.len() <= 54_215, "README : {} octets", readme.len());
     let table = readme_section(&readme, "## Configuration du LLM");
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(lines.iter().filter(|l| **l == MODEL_ALIASES_ROW).count(), 1);

@@ -1,6 +1,4 @@
 //! Cache des réponses de `query ask` (REQ-281, DEC-212) : clé, durée, fichier SQLite à part.
-//! Module seul : rien ne l'appelle encore.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -159,7 +157,7 @@ pub fn store(
             .map_err(sql)?;
     }
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS answers (key BLOB PRIMARY KEY, created INTEGER NOT NULL, reply TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS answers (key BLOB PRIMARY KEY, reply TEXT NOT NULL, created INTEGER NOT NULL)",
     )
     .map_err(sql)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -170,8 +168,8 @@ pub fn store(
     )
     .map_err(sql)?;
     conn.execute(
-        "INSERT OR REPLACE INTO answers (key, created, reply) VALUES (?1, ?2, ?3)",
-        params![&key[..], now, serialize(reply)],
+        "INSERT OR REPLACE INTO answers (key, reply, created) VALUES (?1, ?2, ?3)",
+        params![&key[..], serialize(reply), now],
     )
     .map_err(sql)?;
     Ok(())
@@ -330,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn req281_ac6_fichier_corrompu_donne_une_erreur() {
+    fn req281_fichier_corrompu_donne_une_erreur() {
         let d = repo();
         std::fs::write(
             path(d.path()),
@@ -343,7 +341,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn req281_ac6_liens_symboliques_refuses() {
+    fn req281_liens_symboliques_refuses() {
         let d = repo();
         ensure_no_symlink(d.path()).unwrap();
         std::os::unix::fs::symlink("/nonexistent", d.path().join(JOURNAL_REL)).unwrap();

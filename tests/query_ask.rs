@@ -1106,3 +1106,224 @@ fn req195_ac8_trace_du_modele_du_depot_ignore_dans_ask() {
         assert!(!t.iter().any(|l| l.contains("ignoré")));
     }
 }
+
+// ---- REQ-281 : cache optionnel des réponses ----
+
+impl Env {
+    fn cache_db(&self) -> PathBuf {
+        self.repo.join(".nephila/ask-cache.db")
+    }
+
+    fn cache_entries(&self) -> i64 {
+        rusqlite::Connection::open(self.cache_db())
+            .unwrap()
+            .query_row("SELECT count(*) FROM answers", [], |r| r.get(0))
+            .unwrap()
+    }
+}
+
+#[test]
+fn req281_ac2_sans_cache_deux_appels_et_pas_de_fichier() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    assert!(env.ask(Q, &[]).status.success());
+    assert_eq!(env.llm_calls(), 1);
+    assert!(env.ask(Q, &[]).status.success());
+    assert_eq!(env.llm_calls(), 1);
+    assert!(!env.cache_db().exists());
+}
+
+#[test]
+fn req281_ac3_cache_un_seul_appel_meme_sortie_graphe_intact() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    let graph = env.repo.join(".nephila/graph.db");
+    let before = fs::read(&graph).unwrap();
+    for extra in [&["--cache"][..], &["--cache", "--json"][..]] {
+        let _ = fs::remove_file(env.cache_db());
+        let first = env.ask(Q, extra);
+        assert!(first.status.success(), "{}", text(&first.stderr));
+        assert_eq!(env.llm_calls(), 1);
+        let second = env.ask(Q, extra);
+        assert_eq!(env.llm_calls(), 0, "{extra:?}");
+        assert_eq!(first.stdout, second.stdout);
+        assert_eq!(first.status.code(), second.status.code());
+        assert!(env.cache_db().exists());
+    }
+    let third = env.ask("  Quel   module gère la facturation ? ", &["--cache"]);
+    assert!(third.status.success());
+    assert_eq!(env.llm_calls(), 0);
+    assert_eq!(fs::read(&graph).unwrap(), before);
+}
+
+#[test]
+fn req281_ac4_cle_personnelle_no_cache_et_conflit() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    let mut cfg = fs::read_to_string(&env.config).unwrap();
+    cfg.push_str("[ask]\ncache = true\n");
+    fs::write(&env.config, cfg).unwrap();
+    assert!(env.ask(Q, &[]).status.success());
+    assert_eq!(env.llm_calls(), 1);
+    assert!(env.ask(Q, &[]).status.success());
+    assert_eq!(env.llm_calls(), 0);
+    assert_eq!(env.cache_entries(), 1);
+    let o = env.ask(Q, &["--no-cache"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(env.llm_calls(), 1);
+    assert_eq!(env.cache_entries(), 1);
+    let o = env.ask(Q, &["--cache", "--no-cache"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(env.llm_calls(), 0);
+}
+
+#[test]
+fn req281_ac7_graphe_change_et_pas_trouve_gardes() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    assert!(env.ask(Q, &["--cache"]).status.success());
+    env.file(
+        "billing/Ledger.java",
+        "package com.acme.billing;\n\npublic class Ledger {\n    public void record() {}\n    public void facturation() {}\n}\n",
+    );
+    let u = env.cmd(&["update"]).output().unwrap();
+    assert!(u.status.success(), "{}", text(&u.stderr));
+    assert!(env.ask(Q, &["--cache"]).status.success());
+    assert_eq!(env.llm_calls(), 1);
+
+    env.fixture(r#"{"found": false}"#);
+    let q2 = "Quel module gère la comptabilité ?";
+    let a = env.ask(q2, &["--cache"]);
+    assert_eq!(env.llm_calls(), 1);
+    let b = env.ask(q2, &["--cache"]);
+    assert_eq!(env.llm_calls(), 0);
+    assert_not_found(&a);
+    assert_not_found(&b);
+    assert_eq!(a.status.code(), b.status.code());
+    assert_eq!(a.stderr, b.stderr);
+}
+
+#[test]
+fn req281_ac8_une_erreur_n_est_jamais_gardee() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    let o = env.ask_malformed(3, &["--cache"]);
+    assert!(!o.status.success());
+    assert_eq!(env.llm_calls(), 3);
+    let o = env.ask(Q, &["--cache"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(env.llm_calls(), 1);
+    let o = env.ask(Q, &["--cache"]);
+    assert!(o.status.success());
+    assert_eq!(env.llm_calls(), 0);
+}
+
+#[test]
+fn req281_ac10_ac14_cache_corrompu_un_avertissement() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    let junk = b"pas une base sqlite, du tout, vraiment pas, non non non";
+    fs::write(env.cache_db(), junk).unwrap();
+    let o = env.ask(Q, &["--cache"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(text(&o.stdout).contains("Le module billing gère la facturation."));
+    assert_eq!(env.llm_calls(), 1);
+    let err = text(&o.stderr);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(
+        err.starts_with(
+            "avertissement: cache des réponses inutilisable, question posée sans cache : "
+        ),
+        "{err}"
+    );
+    assert_eq!(fs::read(env.cache_db()).unwrap(), junk);
+
+    let o = env.ask(Q, &["--cache", "--verbose"]);
+    let lines: Vec<String> = text(&o.stderr).lines().map(String::from).collect();
+    let pos = |p: &str| lines.iter().position(|l| l.contains(p)).unwrap();
+    let warn = pos("cache des réponses inutilisable");
+    assert!(pos("config:") < warn && warn < pos("appels:"), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains(" cache: ")), "{lines:?}");
+    assert_eq!(fs::read(env.cache_db()).unwrap(), junk);
+}
+
+#[test]
+fn req281_ac13_traces_du_cache() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    let first = env.ask(Q, &["--cache", "--verbose"]);
+    let t1 = traces(&first);
+    assert!(t1[0].starts_with("config: "), "{t1:?}");
+    assert!(t1[0].ends_with(" format_retries=2 cache=true"), "{t1:?}");
+    assert!(t1[1].starts_with("appels: 1 appels, "), "{t1:?}");
+    assert_eq!(t1[2], "cache: réponse enregistrée");
+    assert_eq!(t1.len(), 3, "{t1:?}");
+    let second = env.ask(Q, &["--cache", "--verbose"]);
+    let t2 = traces(&second);
+    assert_eq!(t2[0], t1[0]);
+    let re = regex_lite_age(&t2[1]);
+    assert!(re, "{t2:?}");
+    assert_eq!(t2.len(), 2, "{t2:?}");
+    assert!(!text(&second.stderr).contains("appels:"));
+    // Sans cache actif, aucune trace de cache.
+    let mut cfg = fs::read_to_string(&env.config).unwrap();
+    cfg.push_str("[ask]\ncache = true\n");
+    fs::write(&env.config, cfg).unwrap();
+    let off = env.ask(Q, &["--no-cache", "--verbose"]);
+    let plain = text(&off.stderr);
+    assert!(
+        !plain.contains("cache=") && !plain.contains(" cache: "),
+        "{plain}"
+    );
+    // Sans --verbose, stderr identique pour les deux questions.
+    let a = env.ask(Q, &["--cache"]);
+    let b = env.ask(Q, &["--cache"]);
+    assert_eq!(a.stderr, b.stderr);
+    assert!(a.stderr.is_empty());
+}
+
+/// `cache: réponse reprise (enregistrée il y a <âge> s)` avec un âge de 0 à 3599.
+fn regex_lite_age(line: &str) -> bool {
+    let Some(rest) = line
+        .strip_prefix("cache: réponse reprise (enregistrée il y a ")
+        .and_then(|r| r.strip_suffix(" s)"))
+    else {
+        return false;
+    };
+    rest.parse::<u32>().is_ok_and(|n| n < 3600) && !(rest.len() > 1 && rest.starts_with('0'))
+}
+
+#[test]
+fn req281_ac15_cle_cache_invalide_et_refusee_dans_le_projet() {
+    let env = Env::new();
+    env.fixture(ASK_OK);
+    let good = fs::read_to_string(&env.config).unwrap();
+    fs::write(&env.config, format!("{good}[ask]\ncache = \"oui\"\n")).unwrap();
+    let o = env.ask(Q, &[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        text(&o.stderr),
+        format!(
+            "erreur: configuration invalide ({}) : clé « ask.cache » doit être un booléen, true ou false (reçu : \"oui\")\n",
+            env.config.display()
+        )
+    );
+    assert_eq!(env.llm_calls(), 0);
+    fs::write(&env.config, good).unwrap();
+    env.file(".nephila.toml", "[ask]\ncache = true\n");
+    fs::write(&env.log, "").unwrap();
+    let o = Command::new(cargo_bin("nephila"))
+        .current_dir(&env.repo)
+        .args(["query", "ask", Q])
+        .env("NEPHILA_CONFIG", &env.config)
+        .env("NEPHILA_MOCK_DIR", &env.mock)
+        .env("NEPHILA_MOCK_LOG", &env.log)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        text(&o.stderr),
+        "erreur: ./.nephila.toml : clé inconnue `ask.cache` (clés permises dans [ask] : model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes)\n"
+    );
+    assert_eq!(env.llm_calls(), 0);
+}

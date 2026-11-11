@@ -261,6 +261,12 @@ pub enum Query {
         /// Nombre maximal de caractères du contexte envoyé au LLM, au moins 1000 (remplace `max_context_chars` de la section [ask] ; défaut 12000)
         #[arg(long, value_name = "N", value_parser = parse_context_chars, allow_hyphen_values = true)]
         context_chars: Option<usize>,
+        /// Reprend la réponse gardée de la même question sur le même contexte, si elle a moins d'une heure ; sinon, garde la nouvelle réponse (remplace `cache` de la section [ask] ; défaut : sans cache)
+        #[arg(long, conflicts_with = "no_cache")]
+        cache: bool,
+        /// Pose la question au LLM sans lire ni garder de réponse (remplace `cache` de la section [ask])
+        #[arg(long)]
+        no_cache: bool,
     },
 }
 
@@ -374,6 +380,8 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
             verbose,
             format_retries,
             context_chars,
+            cache,
+            no_cache,
         }) => crate::query::ask::run(
             &cli.repo,
             question,
@@ -383,6 +391,13 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
                 verbose: *verbose,
                 format_retries: *format_retries,
                 context_chars: *context_chars,
+                cache: if *cache {
+                    Some(true)
+                } else if *no_cache {
+                    Some(false)
+                } else {
+                    None
+                },
             },
             out,
         ),
