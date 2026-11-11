@@ -333,7 +333,27 @@ struct Misfiled {
     index: usize,
 }
 
-/// Comme `filter_raw`, et rend aussi les résumés par identifiant hors de la liste du fichier.
+/// Concept dont des sections ne sont pas de ce fichier : candidat au report vers un autre fichier
+/// Markdown du lot (REQ-279). `index` est celui, dans `rejected`, de l'élément qu'aurait eu le
+/// concept (`fichier non Markdown`, `aucune section du fichier citée` ou `sections hors liste
+/// écartées`) ; `summary` est son résumé filtré.
+struct MisfiledConcept {
+    name: String,
+    summary: Option<String>,
+    sections: Vec<String>,
+    index: usize,
+}
+
+type Filtered = (Enrichment, Vec<Misfiled>, Vec<MisfiledConcept>);
+
+/// Résumé d'un concept replié et coupé, sans élément ni contrôle de sens (concepts écartés).
+fn quiet_summary(summary: Option<&str>, name: &str) -> Option<String> {
+    let (folded, _, text) = fold_and_cap(summary?)?;
+    (!tidy::is_meaningless(&folded, name)).then_some(text)
+}
+
+/// Comme `filter_raw`, et rend aussi les résumés par identifiant et les sections de concept hors
+/// de la liste du fichier.
 fn filter_raw_misfiled(
     summaries: Vec<RawSummary>,
     concepts: Vec<RawConcept>,
@@ -341,8 +361,9 @@ fn filter_raw_misfiled(
     numbered: &[String],
     first: usize,
     node_ids: &[String],
-) -> (Enrichment, Vec<Misfiled>) {
+) -> Filtered {
     let mut misfiled = Vec::new();
+    let mut misfiled_concepts = Vec::new();
     let known: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
     let mut out = Enrichment::default();
     let mut kept: HashMap<String, usize> = HashMap::new();
@@ -414,25 +435,40 @@ fn filter_raw_misfiled(
             out.rejected.push("concept sans nom".into());
             continue;
         }
-        if !markdown {
-            out.rejected
-                .push(format!("concept {name} (fichier non Markdown)"));
-            continue;
-        }
+        let mut foreign: Vec<String> = Vec::new();
         let mut sections: Vec<String> = Vec::new();
         let mut dropped = false;
         for s in c.sections {
-            if !(s.starts_with("section:") && known.contains(s.as_str())) {
+            if markdown && s.starts_with("section:") && known.contains(s.as_str()) {
+                if !sections.contains(&s) {
+                    sections.push(s);
+                }
+            } else {
                 dropped = true;
-            } else if !sections.contains(&s) {
-                sections.push(s);
+                if !foreign.contains(&s) {
+                    foreign.push(s);
+                }
             }
         }
-        if sections.is_empty() {
-            out.rejected
-                .push(format!("concept {name} (aucune section du fichier citée)"));
+        let movable = foreign.iter().any(|s| s.starts_with("section:"));
+        if !markdown || sections.is_empty() {
+            let reason = if markdown {
+                "aucune section du fichier citée"
+            } else {
+                "fichier non Markdown"
+            };
+            if movable {
+                misfiled_concepts.push(MisfiledConcept {
+                    summary: quiet_summary(c.summary.as_deref(), &name),
+                    name: name.clone(),
+                    sections: foreign,
+                    index: out.rejected.len(),
+                });
+            }
+            out.rejected.push(format!("concept {name} ({reason})"));
             continue;
         }
+        let drop_index = out.rejected.len();
         if dropped {
             out.rejected
                 .push(format!("concept {name} : sections hors liste écartées"));
@@ -451,6 +487,14 @@ fn filter_raw_misfiled(
                 }
             }
         };
+        if movable {
+            misfiled_concepts.push(MisfiledConcept {
+                name: name.clone(),
+                summary: summary.clone(),
+                sections: foreign,
+                index: drop_index,
+            });
+        }
         if let Some(&i) = by_name.get(&name) {
             let existing = &mut out.concepts[i];
             for s in sections {
@@ -470,7 +514,7 @@ fn filter_raw_misfiled(
             });
         }
     }
-    (out, misfiled)
+    (out, misfiled, misfiled_concepts)
 }
 
 fn invalid(msg: impl std::fmt::Display) -> Error {
@@ -787,6 +831,7 @@ fn attach_entries(entries: Vec<RawLotEntry>, items: &[LotItem]) -> LotEnrichment
     let mut rejected = Vec::new();
     let mut found: Vec<Option<Enrichment>> = vec![None; items.len()];
     let mut candidates: Vec<(usize, Misfiled)> = Vec::new();
+    let mut concept_candidates: Vec<(usize, MisfiledConcept)> = Vec::new();
     let firsts: Vec<usize> = items
         .iter()
         .scan(1, |next, it| {
@@ -838,7 +883,7 @@ fn attach_entries(entries: Vec<RawLotEntry>, items: &[LotItem]) -> LotEnrichment
             rejected.push(format!("entrée en double pour {name}"));
             continue;
         }
-        let (filtered, misfiled) = filter_raw_misfiled(
+        let (filtered, misfiled, misfiled_concepts) = filter_raw_misfiled(
             entry.summaries,
             entry.concepts,
             &items[i].file,
@@ -848,6 +893,7 @@ fn attach_entries(entries: Vec<RawLotEntry>, items: &[LotItem]) -> LotEnrichment
         );
         found[i] = Some(filtered);
         candidates.extend(misfiled.into_iter().map(|m| (i, m)));
+        concept_candidates.extend(misfiled_concepts.into_iter().map(|m| (i, m)));
     }
     // Résumés rangés sous un autre fichier du lot : reportés dans le premier fichier qui liste
     // le nœud, s'il a son entrée et pas encore de résumé pour ce nœud (REQ-279).
@@ -876,6 +922,78 @@ fn attach_entries(entries: Vec<RawLotEntry>, items: &[LotItem]) -> LotEnrichment
         }
         if let Some(e) = found[i].as_mut() {
             e.rejected[m.index] = moved;
+        }
+    }
+    // Sections de concept d'un autre fichier Markdown du lot : reportées dans le concept de même
+    // nom de ce fichier, s'il a son entrée. Les remplacements d'éléments s'appliquent du plus
+    // grand index au plus petit, pour ne pas décaler les suivants.
+    let mut replacements: Vec<(usize, usize, Vec<String>)> = Vec::new();
+    for (i, mut m) in concept_candidates {
+        let mut groups: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut unowned = false;
+        for s in &m.sections {
+            let owner = items.iter().enumerate().position(|(j, it)| {
+                j != i && is_markdown(&it.file) && found[j].is_some() && it.node_ids.contains(s)
+            });
+            match owner {
+                Some(j) if s.starts_with("section:") => {
+                    match groups.iter_mut().find(|g| g.0 == j) {
+                        Some(g) => g.1.push(s.clone()),
+                        None => groups.push((j, vec![s.clone()])),
+                    }
+                }
+                _ => {
+                    unowned |= !(s.starts_with("section:")
+                        && items.iter().any(|it| it.node_ids.contains(s)));
+                }
+            }
+        }
+        let mut elements = Vec::new();
+        for (j, secs) in groups {
+            let Some(target) = found[j].as_mut() else {
+                continue;
+            };
+            let at = target.concepts.iter().position(|c| c.name == m.name);
+            let concept = match at {
+                Some(k) => &mut target.concepts[k],
+                None => {
+                    target.concepts.push(Concept {
+                        name: m.name.clone(),
+                        summary: None,
+                        sections: Vec::new(),
+                    });
+                    target.concepts.last_mut().expect("concept ajouté")
+                }
+            };
+            let mut added = false;
+            for s in secs {
+                if !concept.sections.contains(&s) {
+                    concept.sections.push(s);
+                    added = true;
+                }
+            }
+            if added {
+                if concept.summary.is_none() {
+                    concept.summary = m.summary.take();
+                }
+                elements.push(format!(
+                    "concept {} : sections déplacées vers {}",
+                    m.name, items[j].file
+                ));
+            }
+        }
+        if elements.is_empty() {
+            continue;
+        }
+        if unowned {
+            elements.push(format!("concept {} : sections hors liste écartées", m.name));
+        }
+        replacements.push((i, m.index, elements));
+    }
+    replacements.sort_by_key(|r| std::cmp::Reverse(r.1));
+    for (i, index, elements) in replacements {
+        if let Some(e) = found[i].as_mut() {
+            e.rejected.splice(index..=index, elements);
         }
     }
     let files = items
@@ -2450,6 +2568,140 @@ pub(crate) mod tests {
         );
         assert_eq!(l.files[1].1.as_ref().unwrap().rejected, vec![MOVED]);
         assert_eq!(l.files[2].1.as_ref().unwrap().rejected, vec![STAYS]);
+    }
+
+    fn lot_md() -> [LotItem; 3] {
+        [
+            item(
+                "a.md",
+                &["document:a.md", "section:a.md#x", "section:a.md#z"],
+            ),
+            item("b.md", &["document:b.md", "section:b.md#y"]),
+            item("C.java", &["type:C"]),
+        ]
+    }
+
+    fn concept_entry(file: &str, name: &str, summary: &str, sections: &[&str]) -> String {
+        let secs: Vec<String> = sections.iter().map(|s| format!("\"{s}\"")).collect();
+        format!(
+            r#"{{"file":"{file}","summaries":[],"concepts":[{{"name":"{name}","summary":"{summary}","sections":[{}]}}]}}"#,
+            secs.join(",")
+        )
+    }
+
+    fn empty_entry(file: &str) -> String {
+        format!(r#"{{"file":"{file}","summaries":[],"concepts":[]}}"#)
+    }
+
+    #[test]
+    fn req279_ac5_ac9_section_of_another_markdown_file_moves_to_its_concept() {
+        let items = lot_md();
+        let run = |entries: &[String]| {
+            let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+            parse_lot(&lot_json(&refs), &items).unwrap()
+        };
+        // 1. concept d'un fichier Java sur une section de a.md
+        let l = run(&[
+            empty_entry("a.md"),
+            empty_entry("b.md"),
+            concept_entry(
+                "C.java",
+                "Facturation",
+                "Émission des factures.",
+                &["section:a.md#x"],
+            ),
+        ]);
+        let a = l.files[0].1.as_ref().unwrap();
+        assert_eq!(
+            a.concepts,
+            vec![Concept {
+                name: "facturation".into(),
+                summary: Some("Émission des factures.".into()),
+                sections: vec!["section:a.md#x".into()],
+            }]
+        );
+        let c = l.files[2].1.as_ref().unwrap();
+        assert!(c.concepts.is_empty());
+        assert_eq!(
+            c.rejected,
+            vec!["concept facturation : sections déplacées vers a.md"]
+        );
+        // 2. concept de b.md à cheval sur b.md et a.md
+        let l = run(&[
+            empty_entry("a.md"),
+            concept_entry("b.md", "x", "", &["section:b.md#y", "section:a.md#x"]),
+            empty_entry("C.java"),
+        ]);
+        let b = l.files[1].1.as_ref().unwrap();
+        assert_eq!(b.concepts[0].name, "x");
+        assert_eq!(b.concepts[0].sections, vec!["section:b.md#y"]);
+        assert_eq!(b.rejected, vec!["concept x : sections déplacées vers a.md"]);
+        let a = l.files[0].1.as_ref().unwrap();
+        assert_eq!(a.concepts[0].name, "x");
+        assert_eq!(a.concepts[0].sections, vec!["section:a.md#x"]);
+        // 3. la section est déjà dans la cible : rien d'ajouté
+        let l = run(&[
+            concept_entry("a.md", "facturation", "", &["section:a.md#x"]),
+            empty_entry("b.md"),
+            concept_entry("C.java", "Facturation", "Autre.", &["section:a.md#x"]),
+        ]);
+        assert_eq!(
+            l.files[2].1.as_ref().unwrap().rejected,
+            vec!["concept facturation (fichier non Markdown)"]
+        );
+        assert_eq!(
+            l.files[0].1.as_ref().unwrap().concepts[0].sections,
+            vec!["section:a.md#x"]
+        );
+        // 4. la cible a le concept sur une autre section et un résumé
+        let l = run(&[
+            concept_entry("a.md", "facturation", "Factures.", &["section:a.md#z"]),
+            empty_entry("b.md"),
+            concept_entry("C.java", "Facturation", "Autre.", &["section:a.md#x"]),
+        ]);
+        let a = l.files[0].1.as_ref().unwrap();
+        assert_eq!(a.concepts.len(), 1);
+        assert_eq!(
+            a.concepts[0].sections,
+            vec!["section:a.md#z", "section:a.md#x"]
+        );
+        assert_eq!(a.concepts[0].summary.as_deref(), Some("Factures."));
+        assert_eq!(
+            l.files[2].1.as_ref().unwrap().rejected,
+            vec!["concept facturation : sections déplacées vers a.md"]
+        );
+        // 5. fichier cible sans entrée : rien déplacé
+        let l = run(&[
+            empty_entry("b.md"),
+            concept_entry("C.java", "Facturation", "", &["section:a.md#x"]),
+        ]);
+        assert_eq!(
+            l.files[2].1.as_ref().unwrap().rejected,
+            vec!["concept facturation (fichier non Markdown)"]
+        );
+        // AC-279-9 : deux cibles puis une section d'aucun fichier du lot
+        let l = run(&[
+            empty_entry("a.md"),
+            empty_entry("b.md"),
+            concept_entry(
+                "C.java",
+                "x",
+                "",
+                &["section:a.md#x", "section:b.md#y", "section:z.md#q"],
+            ),
+        ]);
+        assert_eq!(
+            l.files[2].1.as_ref().unwrap().rejected,
+            vec![
+                "concept x : sections déplacées vers a.md",
+                "concept x : sections déplacées vers b.md",
+                "concept x : sections hors liste écartées",
+            ]
+        );
+        assert_eq!(
+            l.files[1].1.as_ref().unwrap().concepts[0].sections,
+            vec!["section:b.md#y"]
+        );
     }
 
     #[test]

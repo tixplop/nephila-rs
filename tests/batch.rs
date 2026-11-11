@@ -1,6 +1,7 @@
 //! Enrichissement en lots avec le fournisseur simulé (REQ-027, REQ-003, REQ-024).
 
 use assert_cmd::cargo::cargo_bin;
+use nephila::model::{EdgeKind, NodeKind};
 use nephila::store::Store;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1008,4 +1009,45 @@ fn req279_ac6_ac8_misfiled_summary_is_moved_in_a_lot_only() {
         stderr(&o)
     );
     assert!(!env.summaries().iter().any(|(id, _)| id == "type:p.F00"));
+}
+
+#[test]
+fn req279_ac8_concept_of_a_lot_is_moved_to_its_markdown_file() {
+    let env = Env::new(0, 2, 1);
+    fs::write(env.repo.join("a.md"), "# A\n\n## Facturation\n\nTexte.\n").unwrap();
+    fs::write(env.repo.join("C.java"), "class C {}\n").unwrap();
+    fs::write(
+        env.mock.join("a.md.json"),
+        r#"{"version":2,"summaries":[],"concepts":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        env.mock.join("C.java.json"),
+        r#"{"version":2,"summaries":[],"concepts":[{"name":"Facturation","summary":"Émission des factures.","sections":["section:a.md#facturation"]}]}"#,
+    )
+    .unwrap();
+    let o = env.run("build", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let err = stderr(&o);
+    let warns: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("avertissement:"))
+        .collect();
+    assert_eq!(
+        warns,
+        vec!["avertissement: C.java : 1 élément(s) d'enrichissement écarté(s) : concept facturation : sections déplacées vers a.md"]
+    );
+    let store = Store::open_readonly(&env.repo).unwrap();
+    let concept = store
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.id == "concept:facturation")
+        .expect("nœud concept:facturation");
+    assert_eq!(concept.kind, NodeKind::Concept);
+    assert!(store.edges().unwrap().iter().any(|e| {
+        e.source == "section:a.md#facturation"
+            && e.kind == EdgeKind::Mentions
+            && e.target == "concept:facturation"
+    }));
 }
