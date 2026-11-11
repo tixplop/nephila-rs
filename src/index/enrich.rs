@@ -1,6 +1,7 @@
 //! Phase enrichissement (DEC-019, REQ-024) : résumés et concepts demandés au LLM pour les
 //! fichiers « à enrichir », avec la politique d'échec de DEC-015 / DEC-022.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2565,6 +2566,55 @@ pub(crate) enum PassMode {
     Last { capped: Option<usize> },
 }
 
+/// Classe de priorité d'un fichier (REQ-280) : 0 `README` à la racine, 1 autre Markdown à la
+/// racine, 3 fichier de test, 2 le reste.
+fn file_class(path: &str) -> u8 {
+    if !path.contains('/') {
+        let lower = path.to_lowercase();
+        if lower.starts_with("readme") {
+            return 0;
+        }
+        if lower.ends_with(".md") || lower.ends_with(".markdown") {
+            return 1;
+        }
+    }
+    let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    let in_test_dir = dirs
+        .split('/')
+        .any(|d| matches!(d, "test" | "tests" | "__tests__"));
+    let test_name = ["Test", "Tests", "Spec", "_test", ".test", ".spec"]
+        .iter()
+        .any(|s| stem.ends_with(s))
+        || stem.starts_with("test_");
+    if in_test_dir || test_name {
+        3
+    } else {
+        2
+    }
+}
+
+fn file_key<'a>(path: &'a str, degrees: &HashMap<String, u64>) -> (u8, Reverse<u64>, &'a str) {
+    (
+        file_class(path),
+        Reverse(degrees.get(path).copied().unwrap_or(0)),
+        path,
+    )
+}
+
+/// Range les unités par la plus petite clé de leurs fichiers, de façon stable (REQ-280).
+fn order_units(units: &mut [Unit], degrees: &HashMap<String, u64>) {
+    units.sort_by_cached_key(|u| match u {
+        Unit::Lot(files, _) => files
+            .iter()
+            .map(|f| file_key(&f.path, degrees))
+            .min()
+            .unwrap_or((u8::MAX, Reverse(0), "")),
+        Unit::Big(f) => file_key(&f.path, degrees),
+        _ => (u8::MAX, Reverse(0), ""),
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn enrich_pass(
     sources: Sources<'_>,
@@ -2601,13 +2651,14 @@ pub(crate) fn enrich_pass(
     let mut succeeded = 0usize;
     // REQ-159 : un fichier sans nœud à demander est enregistré vide, sans lecture ni appel.
     let (with_nodes, without_nodes) = partition_by_nodes(files, &ids);
-    let units = form_units_by_nodes(
+    let mut units = form_units_by_nodes(
         &with_nodes,
         |f| ids.get(&f.path).map_or(0, Vec::len),
         batch_files,
         max_chunk_chars,
         opts.nodes_per_call,
     );
+    order_units(&mut units, &store.file_degrees()?);
     // Un gros fichier peut donner jusqu'à `MAX_CALLS_PER_FILE` appels : autant de fils utiles.
     let useful: usize = units
         .iter()
@@ -3192,6 +3243,74 @@ mod tests {
             .sum();
         assert_eq!(plan.len(), expected);
         assert!(plan.len() <= 10_001usize.div_ceil(150) + 5);
+    }
+
+    #[test]
+    fn req280_ac1_file_class() {
+        for p in [
+            "src/test/java/a/FooTest.java",
+            "web/a.test.ts",
+            "web/a.spec.js",
+            "py/test_x.py",
+            "go/x_test.go",
+            "s/FooSpec.scala",
+            "ui/__tests__/x.js",
+            "tests/guide.md",
+        ] {
+            assert_eq!(file_class(p), 3, "{p}");
+        }
+        for p in [
+            "src/Latest.java",
+            "src/Contest.java",
+            "testing/x.md",
+            "src/attestation.rs",
+            "docs/README.md",
+        ] {
+            assert_eq!(file_class(p), 2, "{p}");
+        }
+        assert_eq!(file_class("README.md"), 0);
+        assert_eq!(file_class("readme.markdown"), 0);
+        assert_eq!(file_class("guide.md"), 1);
+    }
+
+    #[test]
+    fn req280_ac3_order_units() {
+        let degrees: HashMap<String, u64> = [("src/X.java", 5), ("tests/BigTest.java", 9)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let (a, b, x, y) = (
+            rec("docs/a.md", 1),
+            rec("docs/b.md", 1),
+            rec("src/X.java", 1),
+            rec("src/Y.java", 1),
+        );
+        let (r, t) = (rec("README.md", 1), rec("tests/BigTest.java", 1));
+        let mut units = vec![
+            Unit::Lot(vec![&a, &b], Pass::First),
+            Unit::Lot(vec![&x, &y], Pass::First),
+            Unit::Big(&r),
+            Unit::Big(&t),
+        ];
+        order_units(&mut units, &degrees);
+        assert_eq!(
+            shape(&units),
+            [
+                "BIG:README.md",
+                "src/X.java,src/Y.java",
+                "docs/a.md,docs/b.md",
+                "BIG:tests/BigTest.java"
+            ]
+        );
+        let (p, q, s) = (rec("a.rs", 1), rec("m.rs", 1), rec("z.rs", 1));
+        let mut same = vec![
+            Unit::Lot(vec![&p], Pass::First),
+            Unit::Lot(vec![&q], Pass::First),
+            Unit::Lot(vec![&s], Pass::First),
+        ];
+        order_units(&mut same, &HashMap::new());
+        // Même classe, même degré : ordre de formation (celui des chemins) inchangé.
+        assert_eq!(shape(&same), ["a.rs", "m.rs", "z.rs"]);
     }
 
     #[test]
@@ -6037,14 +6156,13 @@ mod tests {
     }
 
     fn two_small_then_big(lines: usize) -> (tempfile::TempDir, Vec<FileRecord>) {
-        let (dir, mut files) = probe_repo(&[("Big.txt", lines)], 2);
-        files.rotate_left(1);
-        (dir, files)
+        // `T.txt` se range après `S0.txt` et `S1.txt` (REQ-280).
+        probe_repo(&[("T.txt", lines)], 2)
     }
 
     #[test]
     fn req186_ac6_big_file_reservation_refused_then_accepted() {
-        // 3 appels pour Big.txt, placé après deux petits fichiers.
+        // 3 appels pour T.txt, placé après deux petits fichiers.
         let (dir, files) = two_small_then_big(3);
         let llm = Probe::new(0, &[]);
         let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 1, Some(4), 0);

@@ -2783,6 +2783,28 @@ impl Store {
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
+    /// Degré de chaque fichier (REQ-280) : liens du graphe, hors `contains`, dont un nœud déclaré
+    /// par le fichier (hors `package:`) est la source ou la cible. Fichier absent = 0.
+    pub fn file_degrees(&self) -> Result<HashMap<String, u64>> {
+        let mut out: HashMap<String, u64> = HashMap::new();
+        for sql in [
+            "SELECT d.file, COUNT(*) FROM declarations d JOIN edges e ON e.source = d.node
+             WHERE e.kind <> 'contains' AND d.node NOT LIKE 'package:%' GROUP BY d.file",
+            "SELECT d.file, COUNT(*) FROM declarations d JOIN edges e ON e.target = d.node
+             WHERE e.kind <> 'contains' AND d.node NOT LIKE 'package:%' GROUP BY d.file",
+        ] {
+            let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(db_err)?;
+            for row in rows {
+                let (file, n) = row.map_err(db_err)?;
+                *out.entry(file).or_insert(0) += u64::try_from(n).unwrap_or(0);
+            }
+        }
+        Ok(out)
+    }
+
     /// Couples (fichier, identifiant de nœud) des déclarations.
     pub fn declarations(&self) -> Result<Vec<(String, String)>> {
         let mut st = self
@@ -4526,6 +4548,74 @@ mod tests {
             Some(SubKind::Class),
             None,
         )
+    }
+
+    #[test]
+    fn req280_ac2_file_degrees() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let core = ty("Core", "src/Core.java");
+        let m1 = Node::new(
+            NodeKind::Method,
+            "Core.a",
+            "a",
+            Some("src/Core.java"),
+            None,
+            None,
+        );
+        let m2 = Node::new(
+            NodeKind::Method,
+            "Core.b",
+            "b",
+            Some("src/Core.java"),
+            None,
+            None,
+        );
+        let b = ty("Beta", "src/Beta.java");
+        let g = ty("Gamma", "src/Gamma.java");
+        let o = ty("Other", "src/Other.java");
+        let alpha = ty("Alpha", "src/Alpha.java");
+        let pkg = Node::new(NodeKind::Package, "p", "p", None, None, None);
+        let paths = ["Core", "Beta", "Gamma", "Other", "Alpha", "P"]
+            .map(|n| file(&format!("src/{n}.java")));
+        st.insert_pending_files(&paths).unwrap();
+        st.replace_file(
+            "src/Core.java",
+            &[core.clone(), m1.clone(), m2.clone()],
+            &[],
+        )
+        .unwrap();
+        st.replace_file("src/Beta.java", std::slice::from_ref(&b), &[])
+            .unwrap();
+        st.replace_file("src/Gamma.java", std::slice::from_ref(&g), &[])
+            .unwrap();
+        st.replace_file("src/Other.java", std::slice::from_ref(&o), &[])
+            .unwrap();
+        st.replace_file("src/Alpha.java", std::slice::from_ref(&alpha), &[])
+            .unwrap();
+        st.replace_file("src/P.java", std::slice::from_ref(&pkg), &[])
+            .unwrap();
+        let e = |s: &Node, t: &Node, kind| Edge {
+            source: s.id.clone(),
+            target: t.id.clone(),
+            kind,
+        };
+        st.replace_edges(&[
+            e(&b, &core, EdgeKind::Extends),
+            e(&g, &core, EdgeKind::Extends),
+            e(&core, &o, EdgeKind::Calls),
+            e(&core, &m1, EdgeKind::Contains),
+            e(&core, &m2, EdgeKind::Contains),
+            e(&pkg, &core, EdgeKind::Contains),
+            e(&pkg, &o, EdgeKind::Imports),
+        ])
+        .unwrap();
+        let d = st.file_degrees().unwrap();
+        assert_eq!(d.get("src/Core.java"), Some(&3));
+        assert_eq!(d.get("src/Alpha.java").copied().unwrap_or(0), 0);
+        assert_eq!(d.get("src/Beta.java"), Some(&1));
+        assert_eq!(d.get("src/Other.java"), Some(&2));
+        assert_eq!(d.get("src/P.java").copied().unwrap_or(0), 0);
     }
 
     #[test]

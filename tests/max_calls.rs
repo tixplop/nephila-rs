@@ -977,3 +977,65 @@ fn req233_ac8_appel_recupere_plafond_deux_ligne_et_un_aucune() {
         "{err}"
     );
 }
+
+// ---- AC-280-4, AC-280-5 : ordre d'envoi par priorité ----
+
+fn priority_repo() -> Vec<(String, String)> {
+    let java = |n: &str, ext: &str| {
+        if ext.is_empty() {
+            format!("public class {n} {{}}\n")
+        } else {
+            format!("public class {n} extends {ext} {{}}\n")
+        }
+    };
+    vec![
+        ("README.md".into(), "# Projet\n\nTexte.\n".into()),
+        ("notes.md".into(), "# Notes\n\nTexte.\n".into()),
+        ("docs/a.md".into(), "# A\n\nTexte.\n".into()),
+        ("src/Alpha.java".into(), java("Alpha", "")),
+        ("src/Core.java".into(), java("Core", "")),
+        ("src/Beta.java".into(), java("Beta", "Core")),
+        ("src/Gamma.java".into(), java("Gamma", "Core")),
+        ("tests/CoreTest.java".into(), java("CoreTest", "Core")),
+    ]
+}
+
+const PRIORITY_ORDER: [&str; 8] = [
+    "README.md",
+    "notes.md",
+    "src/Core.java",
+    "src/Beta.java",
+    "src/Gamma.java",
+    "docs/a.md",
+    "src/Alpha.java",
+    "tests/CoreTest.java",
+];
+
+fn paths_called(env: &Env) -> Vec<String> {
+    env.calls()
+        .iter()
+        .map(|l| l.split('\t').next().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn req280_ac4_ordre_d_envoi_par_priorite() {
+    let env = Env::mock(&priority_repo(), "enrich_code = true\n");
+    let o = env.run(&["build"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    assert_eq!(paths_called(&env), PRIORITY_ORDER);
+}
+
+#[test]
+fn req280_ac5_plafond_prend_les_plus_utiles() {
+    let env = Env::mock(&priority_repo(), "enrich_code = true\nmax_calls = 3\n");
+    let o = env.run(&["build", "--max-calls", "3"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    assert_eq!(paths_called(&env), &PRIORITY_ORDER[..3]);
+    let all: Vec<String> = PRIORITY_ORDER.iter().map(|s| s.to_string()).collect();
+    assert_eq!(env.enriched(&all), &all[..3]);
+    let o = env.run(&["update", "--max-calls", "3"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    assert_eq!(paths_called(&env)[3..], PRIORITY_ORDER[3..6]);
+    assert_eq!(env.enriched(&all), &all[..6]);
+}
