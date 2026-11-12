@@ -534,10 +534,15 @@ pub struct Store {
     log: Option<ChangeLog>,
     /// Versions du prompt d'enrichissement par famille (REQ-193) ; remplaçables par les tests.
     prompt_versions: PromptVersions,
-    /// Entrées d'enrichissement orphelines (chemin absent de `files`) : empreinte de contenu →
-    /// chemins triés (REQ-257, DEC-188). Vide tant que `load_orphan_enrichments` n'est pas appelée.
-    orphans: HashMap<String, Vec<String>>,
+    /// Entrées d'enrichissement orphelines (chemin absent de `files`) puis sources indexées de même
+    /// contenu qu'un autre fichier : empreinte de contenu → chemins triés (REQ-257, REQ-292,
+    /// DEC-188, DEC-224). Vide tant que `load_orphan_enrichments` n'est pas appelée.
+    orphans: Orphans,
 }
+
+/// Candidats à la reprise ou à la copie d'un enrichissement, par empreinte de contenu : chemin et
+/// `true` pour une source indexée (REQ-292), `false` pour une orpheline (REQ-257).
+type Orphans = HashMap<String, Vec<(String, bool)>>;
 
 /// Ce que le stockage retient des écritures faites depuis la dernière passe terminée (DEC-077,
 /// point 1). Les ensembles se cumulent d'une transaction validée à l'autre, sans annulation
@@ -2028,22 +2033,30 @@ impl Store {
     /// Garde en mémoire les entrées d'enrichissement orphelines (chemin absent de `files`) :
     /// empreinte de contenu → chemins triés (REQ-257). À appeler juste avant l'analyse des fichiers.
     pub fn load_orphan_enrichments(&mut self) -> Result<()> {
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        {
-            let mut st = self
-                .conn
-                .prepare_cached(
-                    "SELECT DISTINCT path, content_hash FROM enrichments
-                     WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = enrichments.path)
-                     ORDER BY path",
-                )
-                .map_err(db_err)?;
+        let mut map: Orphans = HashMap::new();
+        let queries = [
+            (
+                "SELECT DISTINCT path, content_hash FROM enrichments
+                 WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = enrichments.path)
+                 ORDER BY path",
+                false,
+            ),
+            (
+                "SELECT DISTINCT e.path, e.content_hash FROM enrichments e
+                 JOIN files f ON f.path = e.path AND f.hash = e.content_hash
+                 WHERE e.content_hash IN (SELECT hash FROM files GROUP BY hash HAVING COUNT(*) > 1)
+                 ORDER BY e.path",
+                true,
+            ),
+        ];
+        for (sql, indexed) in queries {
+            let mut st = self.conn.prepare_cached(sql).map_err(db_err)?;
             let rows = st
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .map_err(db_err)?;
             for row in rows {
                 let (path, hash) = row.map_err(db_err)?;
-                map.entry(hash).or_default().push(path);
+                map.entry(hash).or_default().push((path, indexed));
             }
         }
         self.orphans = map;
@@ -4430,6 +4443,34 @@ fn pick_entry(
     }
 }
 
+/// Entrée d'un fichier indexé source d'une copie (REQ-292) : seule celle de la clé actuelle (modèle
+/// par `NAMES_SQL`, langue de `meta`, version du prompt) et non marquée compte.
+fn pick_current_entry(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    hash: &str,
+    version: u32,
+) -> Result<Option<(i64, String)>> {
+    match tx
+        .prepare_cached(&format!(
+            "SELECT e.rowid, e.payload FROM enrichments e
+             WHERE e.path = ?1 AND e.content_hash = ?2 AND e.prompt_version = ?3
+               AND e.model IN (SELECT value FROM json_each({NAMES_SQL}))
+               AND ((SELECT value FROM meta WHERE key = 'enrich_language') IS NULL
+                    OR e.language = (SELECT value FROM meta WHERE key = 'enrich_language'))
+               AND e.nodes_hash IS NOT NULL
+             ORDER BY e.used_at DESC, e.rowid DESC
+             LIMIT 1"
+        ))
+        .map_err(db_err)?
+        .query_row(params![path, hash, version], |r| Ok((r.get(0)?, r.get(1)?)))
+    {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(db_err(e)),
+    }
+}
+
 /// Lit l'enrichissement conservé d'un fichier dont la structure vient d'être écrite : parmi les
 /// entrées de son contenu, celle de la clé actuelle, sinon la dernière utilisée. Lisible, elle est
 /// réappliquée et marquée utilisée ; illisible, elle seule est supprimée et signalée (DEC-114).
@@ -4437,7 +4478,7 @@ fn pick_entry(
 fn load_kept_enrichment(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
-    orphans: &HashMap<String, Vec<String>>,
+    orphans: &Orphans,
     versions: &PromptVersions,
     declared: impl FnOnce() -> Result<FileNodes>,
 ) -> Result<KeptEnrichment> {
@@ -4528,13 +4569,14 @@ fn rewritten_payload(
 }
 
 /// Reprise (REQ-257) : un fichier sans entrée pour son chemin reprend l'entrée orpheline de même
-/// empreinte et de même type, la première par ordre des chemins qui convient. L'entrée du
+/// empreinte et de même type, la première par ordre des chemins qui convient ; sans orpheline, copie
+/// l'entrée courante d'un fichier indexé de même contenu (REQ-292). L'entrée du
 /// nouveau chemin est insérée ; l'appelant la traite ensuite comme un enrichissement conservé.
 fn adopt_orphan(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
     file_hash: &str,
-    orphans: &HashMap<String, Vec<String>>,
+    orphans: &Orphans,
     versions: &PromptVersions,
     declared: impl FnOnce() -> Result<FileNodes>,
 ) -> Result<KeptEnrichment> {
@@ -4552,12 +4594,17 @@ fn adopt_orphan(
         enrichable,
     } = declared()?;
     let current_hash = nodes_hash_of(&enrichable);
-    for old in candidates {
-        if FileType::of(old) != Some(file_type) {
+    for (old, indexed) in candidates {
+        if old == path || FileType::of(old) != Some(file_type) {
             continue;
         }
-        // Mêmes règles de choix que pour un chemin indexé, parmi les entrées de l'orpheline.
-        let Some((rowid, json)) = pick_entry(tx, old, file_hash, versions)? else {
+        let picked = if *indexed {
+            pick_current_entry(tx, old, file_hash, versions.of_path(path))?
+        } else {
+            // Mêmes règles de choix que pour un chemin indexé, parmi les entrées de l'orpheline.
+            pick_entry(tx, old, file_hash, versions)?
+        };
+        let Some((rowid, json)) = picked else {
             continue;
         };
         let (model, version, language, served): (String, i64, String, Option<String>) = tx
@@ -4669,7 +4716,7 @@ type FilteredPayload = (Vec<(String, String)>, Vec<Node>, Vec<Ref>, usize);
 fn reapply_enrichment(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
-    orphans: &HashMap<String, Vec<String>>,
+    orphans: &Orphans,
     versions: &PromptVersions,
     touched: &mut Touched,
 ) -> Result<Kept> {
@@ -4737,7 +4784,7 @@ fn mark_if_missing(
 fn write_structure_fresh(
     tx: &rusqlite::Transaction<'_>,
     p: &PreparedStructure,
-    orphans: &HashMap<String, Vec<String>>,
+    orphans: &Orphans,
     versions: &PromptVersions,
 ) -> Result<Kept> {
     let path = p.path.as_str();
@@ -6592,6 +6639,153 @@ mod tests {
         assert_eq!(st.count_files_to_enrich().unwrap(), 0);
         assert_eq!(st.prune_enrichments().unwrap(), 1);
         assert!(st.enrichment_entry("b.md").unwrap().is_some());
+    }
+
+    /// Source indexée `a.md` (résumé sur `type:p.A`, clé `m` / `français`), nouveau fichier `b.md`
+    /// de même empreinte déclarant `declared`. `tweak` agit sur le magasin avant l'analyse.
+    fn copy_from_indexed(
+        b: &str,
+        declared: &str,
+        tweak: impl FnOnce(&mut Store),
+    ) -> (tempfile::TempDir, Store, usize) {
+        let (d, mut st) = enriched_store();
+        st.set_enrich_model("m").unwrap();
+        st.set_enrich_language("français").unwrap();
+        tweak(&mut st);
+        st.insert_pending_files(&[file(b)]).unwrap();
+        st.load_orphan_enrichments().unwrap();
+        let n = st
+            .replace_structures_counted(&[(b.to_string(), vec![ty(declared, b)], vec![])])
+            .unwrap();
+        (d, st, n)
+    }
+
+    #[test]
+    fn req292_ac2_a_indexed_source_is_copied() {
+        let row = |st: &Store, path: &str| -> (String, Option<String>, i64) {
+            st.conn
+                .query_row(
+                    "SELECT payload, nodes_hash, prompt_version FROM enrichments WHERE path = ?1",
+                    [path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        let (_d0, st0) = enriched_store();
+        let a_before = row(&st0, "a.md");
+        let (_d, st, n) = copy_from_indexed("b.md", "p.A", |_| {});
+        assert_eq!(n, 1);
+        assert_eq!(row(&st, "a.md"), a_before);
+        let b = row(&st, "b.md");
+        assert_eq!(b.2, a_before.2);
+        assert_eq!(b.1, Some(nodes_hash_of(&["type:p.A".to_string()])));
+        let e = st.enrichment_entry("b.md").unwrap().unwrap();
+        assert_eq!((e.content_hash.as_str(), e.model.as_str()), ("h", "m"));
+        assert_eq!(e.language, "français");
+        let marked: i64 = st
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM enrichments WHERE path = 'b.md' AND nodes_hash IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, 0);
+        let nodes = st.nodes().unwrap();
+        let summary = nodes
+            .iter()
+            .find(|n| n.id == "type:p.A")
+            .and_then(|n| n.summary.clone());
+        assert_eq!(summary.as_deref(), Some("résumé"));
+        assert!(st.enrichment_entry("a.md").unwrap().is_some());
+        assert_eq!(st.count_files_to_enrich().unwrap(), 0);
+    }
+
+    #[test]
+    fn req292_ac2_b_source_of_another_model_is_not_copied() {
+        let (_d, st, n) =
+            copy_from_indexed("b.md", "p.A", |st| st.set_enrich_model("autre").unwrap());
+        assert_eq!(n, 0);
+        assert_eq!(st.enrichment_entry("b.md").unwrap(), None);
+        let todo = st.files_to_enrich().unwrap();
+        assert!(todo.iter().any(|f| f.path == "b.md"));
+    }
+
+    #[test]
+    fn req292_ac2_c_marked_source_is_not_copied() {
+        let (_d, st, n) = copy_from_indexed("b.md", "p.A", |st| {
+            st.conn
+                .execute("UPDATE enrichments SET nodes_hash = NULL", [])
+                .unwrap();
+        });
+        assert_eq!(n, 0);
+        assert_eq!(st.enrichment_entry("b.md").unwrap(), None);
+    }
+
+    #[test]
+    fn req292_ac2_d_no_copy_across_file_types() {
+        let (_d, st, n) = copy_from_indexed("b.json", "p.A", |_| {});
+        assert_eq!(n, 0);
+        assert_eq!(st.enrichment_entry("b.json").unwrap(), None);
+    }
+
+    #[test]
+    fn req292_ac2_e_no_copy_when_a_cited_node_is_not_declared() {
+        let (_d, st, n) = copy_from_indexed("b.md", "p.B", |_| {});
+        assert_eq!(n, 0);
+        assert_eq!(st.enrichment_entry("b.md").unwrap(), None);
+    }
+
+    #[test]
+    fn req292_ac2_f_an_orphan_is_taken_before_an_indexed_source() {
+        let (_d, mut st) = enriched_store();
+        st.set_enrich_model("m").unwrap();
+        st.set_enrich_language("français").unwrap();
+        // Orpheline `0.md` : copie de l'entrée de `a.md` avec un résumé distinct.
+        st.conn
+            .execute(
+                "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at, nodes_hash)
+                 SELECT '0.md', content_hash, model, prompt_version,
+                        REPLACE(payload, 'résumé', 'orphelin'), language, used_at, nodes_hash
+                 FROM enrichments WHERE path = 'a.md'",
+                [],
+            )
+            .unwrap();
+        st.conn
+            .execute(
+                "UPDATE enrichments SET payload = REPLACE(payload, 'a.md', '0.md') WHERE path = '0.md'",
+                [],
+            )
+            .unwrap();
+        st.insert_pending_files(&[file("b.md")]).unwrap();
+        st.load_orphan_enrichments().unwrap();
+        let n = st
+            .replace_structures_counted(&[("b.md".to_string(), vec![ty("p.A", "b.md")], vec![])])
+            .unwrap();
+        assert_eq!(n, 1);
+        let payload: String = st
+            .conn
+            .query_row(
+                "SELECT payload FROM enrichments WHERE path = 'b.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(payload.contains("orphelin"), "{payload}");
+    }
+
+    #[test]
+    fn req292_ac2_g_source_whose_content_changed_is_not_copied() {
+        // `c.md` d'empreinte `h` : l'empreinte reste partagée, seule la jointure sur `files.hash`
+        // écarte la source.
+        let (_d, st, n) = copy_from_indexed("b.md", "p.A", |st| {
+            st.conn
+                .execute("UPDATE files SET hash = 'h2' WHERE path = 'a.md'", [])
+                .unwrap();
+            st.insert_pending_files(&[file("c.md")]).unwrap();
+        });
+        assert_eq!(n, 0);
+        assert_eq!(st.enrichment_entry("b.md").unwrap(), None);
     }
 
     fn served_of(st: &Store, path: &str) -> Option<String> {

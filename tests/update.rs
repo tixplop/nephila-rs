@@ -422,6 +422,44 @@ fn req257_ac3_moved_json_and_typescript_keep_summaries() {
 }
 
 #[test]
+fn req292_ac1_copied_file_takes_the_enrichment_of_the_kept_original() {
+    let env = doc_env();
+    env.ok("build");
+    env.write("docs/b.md", "# Intro\n\nTexte.\n\n## Détails\n\nSuite.\n");
+    env.clear_log();
+    let out = env
+        .command("update", &[])
+        .arg("--verbose")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.log_lines().is_empty(), "{:?}", env.log_lines());
+    let line = stderr(&out)
+        .lines()
+        .find(|l| l.contains("structure: fin"))
+        .unwrap_or_default()
+        .to_string();
+    assert!(line.ends_with(", 1 enrichissements conservés"), "{line}");
+    let s = summaries(&env);
+    assert_eq!(s["document:docs/b.md"], "Le document.");
+    assert_eq!(s["section:docs/b.md#intro"], "L'intro.");
+    assert_eq!(s["section:docs/b.md#détails"], "Les détails.");
+    assert_eq!(s["document:docs/a.md"], "Le document.");
+    assert_eq!(s["section:docs/a.md#intro"], "L'intro.");
+    for sec in ["intro", "détails"] {
+        assert!(env.has_edge(
+            &format!("section:docs/b.md#{sec}"),
+            EdgeKind::Mentions,
+            "concept:idée"
+        ));
+    }
+    assert_eq!(to_enrich(&env), 0);
+    env.clear_log();
+    env.ok("build");
+    assert!(env.log_lines().is_empty(), "{:?}", env.log_lines());
+}
+
+#[test]
 fn req257_ac4_no_adoption_when_content_or_type_differs() {
     // (a) renommé et modifié dans le même update : envoyé.
     let env = doc_env();
@@ -436,18 +474,7 @@ fn req257_ac4_no_adoption_when_content_or_type_differs() {
         BTreeSet::from(["guide/a.md".to_string()])
     );
 
-    // (b) copié, l'original gardé : la copie est envoyée.
-    let env = doc_env();
-    env.ok("build");
-    env.write("docs/b.md", "# Intro\n\nTexte.\n\n## Détails\n\nSuite.\n");
-    env.clear_log();
-    env.ok("update");
-    assert_eq!(
-        env.logged_paths(),
-        BTreeSet::from(["docs/b.md".to_string()])
-    );
-
-    // (c) autre type de fichier, même contenu : envoyé.
+    // (b) autre type de fichier, même contenu : envoyé.
     let env = Env::empty();
     env.write("conf/x.json", "{\"a\":1}\n");
     env.fixture(
@@ -463,7 +490,7 @@ fn req257_ac4_no_adoption_when_content_or_type_differs() {
         BTreeSet::from(["conf/x.yaml".to_string()])
     );
 
-    // (d) renommage avec un autre modèle : envoyé une seule fois.
+    // (c) renommage avec un autre modèle : envoyé une seule fois.
     let env = doc_env();
     env.ok("build");
     fs::write(&env.config, "provider = \"mock\"\nmodel = \"autre\"\n").unwrap();
