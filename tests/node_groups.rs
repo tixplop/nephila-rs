@@ -973,3 +973,61 @@ fn req271_ac5_lots_bornes_par_la_limite_de_sortie() {
         assert_eq!(l.split('\t').next().unwrap().split(';').count(), 2, "{l}");
     }
 }
+
+/// Classe Java dont `late` est appelée au début et déclarée à la fin, bourrée de méthodes.
+fn late_java() -> String {
+    let mut s = String::from("public class Big {\n    void run() { late(); }\n");
+    for i in 0..30 {
+        s.push_str(&format!("    void pad{i}() {{}}\n"));
+    }
+    s.push_str("    void late() {}\n}\n");
+    s
+}
+
+#[test]
+fn req283_ac5_methode_demandee_au_morceau_de_sa_declaration() {
+    let extra = "max_chunk_chars = 400\n";
+    let src = late_java();
+    let responses = (0..2)
+        .map(|_| reply("openai", &summary_json(&[])))
+        .collect();
+    let env = Env::http(
+        "openai",
+        &[(BIG, src.clone())],
+        extra,
+        FakeServer::start(responses),
+    );
+
+    // `build --dry-run` sur une copie du dépôt (aucun graphe) : nombre d'appels annoncé.
+    let copy = Env::http("openai", &[(BIG, src)], extra, FakeServer::start(vec![]));
+    let o = copy.run(&["build", "--dry-run", "--enrich-code"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    let out = text(&o).0;
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("estimation minimale : "))
+        .unwrap_or_else(|| panic!("{out}"));
+    let planned: usize = line
+        .strip_prefix("estimation minimale : ")
+        .and_then(|r| r.split(" appels").next())
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let o = env.run(&["build"], &[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out} {err}");
+    assert!(out.contains("0 fichiers à enrichir"), "{out}");
+    let prompts: Vec<String> = env
+        .enrich_posts("openai")
+        .iter()
+        .map(|b| user_prompt(b))
+        .collect();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    let lists: Vec<Vec<String>> = prompts.iter().map(|p| listed_ids(p)).collect();
+    let late = "method:Big.late".to_string();
+    assert!(!lists[0].contains(&late), "{:?}", lists[0]);
+    assert!(lists[1].contains(&late), "{:?}", lists[1]);
+    assert!(content_of(&prompts[1]).contains("void late() {}"));
+    assert_eq!(planned, prompts.len());
+}

@@ -1153,8 +1153,8 @@ fn traced_lot_once(
 
 /// Plan d'appels d'un fichier (DEC-059, DEC-061) : couples (indice du morceau, liste de nœuds
 /// demandée), dans l'ordre d'envoi (DEC-118 : un nœud n'est demandé qu'une fois). Un seul morceau : la liste complète, découpée par
-/// `node_groups`. Sinon, un nœud présent dans `homes` (identifiant → morceau de son titre, pour
-/// les sections Markdown) va dans la seule liste de ce morceau ; tout autre nœud est demandé au
+/// `node_groups`. Sinon, un nœud présent dans `homes` (identifiant → morceau, sections Markdown par
+/// leur titre et nœuds de code par le nom de leur déclaration, REQ-283) va dans la seule liste de ce morceau ; tout autre nœud est demandé au
 /// premier morceau où son nom court figure (mot entier, ou, pour un nom qui n'est pas un mot,
 /// occurrence aux bords contrôlés ; sans casse pour un nœud `table:`, le SQL ne distinguant pas
 /// les majuscules) ; un nœud de nom vide ou absent de tous les morceaux va dans le morceau 1. Au
@@ -1337,6 +1337,62 @@ fn section_homes(
     homes
 }
 
+/// Morceau de la déclaration de chaque nœud de code (REQ-283, DEC-216) : identifiant → morceau
+/// qui contient l'octet du nom de la déclaration, d'après une réanalyse du texte découpé. Vide
+/// pour un seul morceau, un autre type de fichier, une erreur d'analyse ou un fil refusé.
+fn code_homes(
+    path: &str,
+    text: &str,
+    spans: &[(String, usize)],
+    nodes: &[(String, String)],
+) -> HashMap<String, usize> {
+    use crate::parse::lang::Lang;
+    let mut homes = HashMap::new();
+    if spans.len() < 2
+        || !matches!(
+            Lang::from_path(Path::new(path)),
+            Some(
+                Lang::Java
+                    | Lang::Kotlin
+                    | Lang::Scala
+                    | Lang::Groovy
+                    | Lang::JavaScript
+                    | Lang::TypeScript
+                    | Lang::Tsx
+            )
+        )
+    {
+        return homes;
+    }
+    let structure = std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .stack_size(crate::index::structure::EXTRACT_STACK)
+            .spawn_scoped(scope, || {
+                crate::parse::extract(Path::new(path), text, &crate::parse::ParseCtx::default())
+            });
+        match spawned {
+            Ok(handle) => match handle.join() {
+                Ok(result) => result.ok(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
+            Err(_) => None,
+        }
+    });
+    let Some(structure) = structure else {
+        return homes;
+    };
+    let wanted: HashSet<&str> = nodes.iter().map(|(id, _)| id.as_str()).collect();
+    for declared in &structure.declares {
+        let Some(at) = declared.at else { continue };
+        let id = declared.id();
+        if wanted.contains(id.as_str()) {
+            let k = spans.partition_point(|(_, s)| *s <= at).saturating_sub(1);
+            homes.insert(id, k);
+        }
+    }
+    homes
+}
+
 /// Extrait de chaque morceau (REQ-169) : `None` pour un seul morceau, sinon rang, nombre de
 /// morceaux et lignes du corps (numérotées à partir de 1), d'après les débuts de corps de
 /// `spans`. Un seul passage sur le texte : les sauts de ligne sont comptés de façon cumulative.
@@ -1396,7 +1452,8 @@ fn plan_calls<'a>(
     } else {
         chunk::split_spans_for(&file.path, text, max_chunk_chars)
     };
-    let homes = section_homes(text, &spans, nodes);
+    let mut homes = section_homes(text, &spans, nodes);
+    homes.extend(code_homes(&file.path, text, &spans, nodes));
     let excerpts = excerpts_of(text, &spans);
     let parts: Vec<String> = spans.into_iter().map(|(part, _)| part).collect();
     let mut plan = call_plan(&parts, nodes, &homes, nodes_per_call);
@@ -3695,6 +3752,119 @@ mod tests {
         let calls = planned("pom.xml", &text, 60_000, &nodes_of("pom.xml"));
         assert_eq!(calls.len(), 1);
         assert!(calls[0].2.len() <= 60_000 && !calls[0].2.starts_with("[extrait"));
+    }
+
+    /// Fichier de 3 morceaux (limite 60) : `late` appelée au morceau 1, déclarée au 3 ; `early`
+    /// déclarée au morceau 1, appelée au 2.
+    const HOMES_JAVA: &str = "package p;\nclass A {\n  void run() { late(); }\n  void early() {}\n  int f1 = 1;\n  int f2 = 2;\n  void mid() { early(); }\n  int f3 = 3;\n  int f4 = 4;\n  void late() {}\n}\n";
+    const HOMES_TS: &str = "class A {\n  run() { this.late(); }\n  early() {}\n  f1 = 1;\n  f2 = 2;\n  mid() { this.early(); }\n  f3 = 3;\n  f4 = 4;\n  late() {}\n}\n";
+
+    fn homes_nodes(prefix: &str) -> Vec<(String, String)> {
+        vec![
+            node(&format!("type:{prefix}A"), "A"),
+            node(&format!("method:{prefix}A.early"), "early"),
+            node(&format!("method:{prefix}A.mid"), "mid"),
+            node(&format!("method:{prefix}A.late"), "late"),
+        ]
+    }
+
+    fn lists(calls: &[PlannedCall]) -> Vec<(usize, Vec<String>)> {
+        calls.iter().map(|c| (c.0, c.3.clone())).collect()
+    }
+
+    #[test]
+    fn req283_ac2_nœud_de_code_au_morceau_de_sa_déclaration() {
+        let calls = planned("src/A.java", HOMES_JAVA, 76, &homes_nodes("p."));
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(
+            lists(&calls),
+            vec![
+                (
+                    1,
+                    vec!["type:p.A".to_string(), "method:p.A.early".to_string()]
+                ),
+                (2, vec!["method:p.A.mid".to_string()]),
+                (3, vec!["method:p.A.late".to_string()]),
+            ]
+        );
+        let calls = planned("src/A.ts", HOMES_TS, 60, &homes_nodes("src/A."));
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(
+            lists(&calls),
+            vec![
+                (
+                    1,
+                    vec![
+                        "type:src/A.A".to_string(),
+                        "method:src/A.A.early".to_string()
+                    ]
+                ),
+                (2, vec!["method:src/A.A.mid".to_string()]),
+                (3, vec!["method:src/A.A.late".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn req283_ac3_secours_sans_position() {
+        // `ghost` : nœud que la réanalyse ne déclare pas, cité au morceau 2 seulement (4 morceaux).
+        let text = HOMES_JAVA.replace("int f2 = 2;", "int f2 = 2; // ghost");
+        let mut nodes = homes_nodes("p.");
+        nodes.push(node("method:p.A.ghost", "ghost"));
+        let calls = planned("src/A.java", &text, 76, &nodes);
+        assert_eq!(
+            lists(&calls),
+            vec![
+                (
+                    1,
+                    vec!["type:p.A".to_string(), "method:p.A.early".to_string()]
+                ),
+                (2, vec!["method:p.A.ghost".to_string()]),
+                (3, vec!["method:p.A.mid".to_string()]),
+                (4, vec!["method:p.A.late".to_string()]),
+            ]
+        );
+        // SQL : `orders` citée au morceau 1, créée au morceau 2 : règle (2), pas de réanalyse.
+        let sql = "-- orders\nselect 1;\nselect 2;\ncreate table orders (id int);\n";
+        let calls = planned("db/a.sql", sql, 30, &[node("table:orders", "orders")]);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].2.starts_with("-- orders"), "{calls:?}");
+        assert_eq!(calls[0].3, vec!["table:orders".to_string()]);
+        // Un seul morceau : un seul appel, liste complète du fichier.
+        let calls = planned("src/A.java", HOMES_JAVA, 10_000, &homes_nodes("p."));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].3.len(), 4);
+    }
+
+    #[test]
+    fn req283_ac4_imbrication_profonde_sur_petite_pile() {
+        use crate::parse::nesting_support::{qualified, source};
+        let src = source(
+            1000,
+            &|i| {
+                if i == 1 {
+                    "class C1 {\n  Object a = new C1000();\n".to_string()
+                } else {
+                    format!("class C{i} {{\n")
+                }
+            },
+            "}\n",
+            "",
+        );
+        let deepest = format!("type:{}", qualified(1000));
+        let nodes = vec![(deepest.clone(), "C1000".to_string())];
+        let calls = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || planned("src/C1.java", &src, 4000, &nodes))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(calls.len(), 1, "{}", calls.len());
+        let (index, count, part, list, _) = &calls[0];
+        assert!(*count == 1 && *index == 1 && list == &vec![deepest]);
+        // Le type est demandé au morceau de sa déclaration, pas à celui qui le cite (morceau 1).
+        assert!(part.contains("class C1000 {\n"), "{part:.200}");
+        assert!(!part.contains("new C1000()"), "{part:.200}");
     }
 
     #[test]
