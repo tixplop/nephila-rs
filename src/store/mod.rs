@@ -29,7 +29,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 16;
+pub const SCHEMA_VERSION: i32 = 17;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -68,7 +68,7 @@ const ENRICHMENTS_DDL_13: &str = "CREATE TABLE enrichments (\n    path          
 /// Déclaration de `enrichments` du schéma courant, identique au caractère près à celle de
 /// `schema.sql` (DEC-190, DEC-208).
 #[cfg(test)]
-const ENRICHMENTS_DDL: &str = "CREATE TABLE enrichments (\n    path           TEXT NOT NULL,\n    content_hash   TEXT NOT NULL,\n    model          TEXT NOT NULL,\n    prompt_version INTEGER NOT NULL,\n    payload        TEXT NOT NULL,\n    language       TEXT NOT NULL,\n    used_at        INTEGER NOT NULL, served_model TEXT,\n    PRIMARY KEY (path, content_hash, model, prompt_version, language)\n);";
+const ENRICHMENTS_DDL: &str = "CREATE TABLE enrichments (\n    path           TEXT NOT NULL,\n    content_hash   TEXT NOT NULL,\n    model          TEXT NOT NULL,\n    prompt_version INTEGER NOT NULL,\n    payload        TEXT NOT NULL,\n    language       TEXT NOT NULL,\n    used_at        INTEGER NOT NULL, served_model TEXT, nodes_hash TEXT,\n    PRIMARY KEY (path, content_hash, model, prompt_version, language)\n);";
 
 /// Dernier schéma sans `enrichments.used_at` (une seule entrée par chemin), migré sur place
 /// (DEC-190).
@@ -100,6 +100,9 @@ END;";
 
 /// Dernier schéma sans l'index plein texte `nodes_fts`, migré sur place (DEC-217).
 const SCHEMA_WITHOUT_TEXT_INDEX: i32 = 15;
+
+/// Dernier schéma sans `enrichments.nodes_hash`, migré sur place (DEC-222).
+const SCHEMA_WITHOUT_NODES_HASH: i32 = 16;
 
 /// Nombre de lignes gardées dans `subsystem_names` (AC-262-6).
 const SUBSYSTEM_NAMES_KEPT: i64 = 5000;
@@ -675,7 +678,8 @@ impl Store {
             | SCHEMA_WITHOUT_USED_AT
             | SCHEMA_WITHOUT_SUBSYSTEMS
             | SCHEMA_WITHOUT_SERVED_MODEL
-            | SCHEMA_WITHOUT_TEXT_INDEX => store.migrate_to_current()?,
+            | SCHEMA_WITHOUT_TEXT_INDEX
+            | SCHEMA_WITHOUT_NODES_HASH => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -719,7 +723,8 @@ impl Store {
             | SCHEMA_WITHOUT_USED_AT
             | SCHEMA_WITHOUT_SUBSYSTEMS
             | SCHEMA_WITHOUT_SERVED_MODEL
-            | SCHEMA_WITHOUT_TEXT_INDEX => {
+            | SCHEMA_WITHOUT_TEXT_INDEX
+            | SCHEMA_WITHOUT_NODES_HASH => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
                 store.load_enrich_redact()?;
@@ -779,7 +784,8 @@ impl Store {
                 || v == SCHEMA_WITHOUT_USED_AT
                 || v == SCHEMA_WITHOUT_SUBSYSTEMS
                 || v == SCHEMA_WITHOUT_SERVED_MODEL
-                || v == SCHEMA_WITHOUT_TEXT_INDEX =>
+                || v == SCHEMA_WITHOUT_TEXT_INDEX
+                || v == SCHEMA_WITHOUT_NODES_HASH =>
             {
                 store.version = v
             }
@@ -801,7 +807,7 @@ impl Store {
         self.version
     }
 
-    /// Migre un schéma 5 à 15 en schéma 16 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, 11 -> 12, 12 -> 13, 13 -> 14, 14 -> 15, puis 15 -> 16,
+    /// Migre un schéma 5 à 16 en schéma 17 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, 11 -> 12, 12 -> 13, 13 -> 14, 14 -> 15, 15 -> 16, puis 16 -> 17,
     /// chacune en une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         let from = self.user_version()?;
@@ -819,6 +825,7 @@ impl Store {
         self.migrate_13_to_14()?;
         self.migrate_14_to_15()?;
         self.migrate_15_to_16()?;
+        self.migrate_16_to_17()?;
         // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
         crate::trace!(
             "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
@@ -1009,7 +1016,56 @@ impl Store {
         tx.execute_batch(&format!(
             "{NODES_FTS_DDL}
              INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');
-             UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
+             UPDATE meta SET value = '{SCHEMA_WITHOUT_NODES_HASH}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITHOUT_NODES_HASH};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
+    }
+
+    /// Migre un schéma 16 en schéma 17 en une transaction `IMMEDIATE` (DEC-222) : colonne
+    /// `enrichments.nodes_hash`, puis, pour chaque entrée, l'empreinte de la liste triée des
+    /// identifiants de ses résumés (charge illisible ou trop récente : liste vide). Sans appel LLM.
+    fn migrate_16_to_17(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_NODES_HASH {
+            return Ok(());
+        }
+        tx.execute_batch("ALTER TABLE enrichments ADD COLUMN nodes_hash TEXT;")
+            .map_err(db_err)?;
+        let entries: Vec<(i64, String)> = {
+            let mut st = tx
+                .prepare("SELECT rowid, payload FROM enrichments")
+                .map_err(db_err)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(db_err)?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?
+        };
+        {
+            let mut up = tx
+                .prepare("UPDATE enrichments SET nodes_hash = ?2 WHERE rowid = ?1")
+                .map_err(db_err)?;
+            for (rowid, json) in entries {
+                let mut ids: Vec<String> = match serde_json::from_str::<Payload>(&json) {
+                    Ok(p) if p.v <= PAYLOAD_VERSION => {
+                        p.summaries.into_iter().map(|(id, _)| id).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                ids.sort();
+                up.execute(params![rowid, nodes_hash_of(&ids)])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.execute_batch(&format!(
+            "UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
         .map_err(db_err)?;
@@ -1572,12 +1628,18 @@ impl Store {
         } else {
             ""
         };
+        // Schéma 17 : une entrée marquée (`nodes_hash` NULL, DEC-222) ne rend pas le fichier à jour.
+        let marked_cond = if self.version >= SCHEMA_VERSION {
+            " AND e.nodes_hash IS NOT NULL"
+        } else {
+            ""
+        };
         let sql = if all {
             "SELECT f.path, NULL FROM files f WHERE f.state = 'indexed' ORDER BY f.path".to_string()
         } else {
             format!(
                 "SELECT f.path, e.prompt_version FROM files f LEFT JOIN enrichments e
-                 ON e.path = f.path AND e.content_hash = f.hash AND (?1 IS NULL OR e.model IN (SELECT value FROM json_each(?1))){language_cond}
+                 ON e.path = f.path AND e.content_hash = f.hash AND (?1 IS NULL OR e.model IN (SELECT value FROM json_each(?1))){language_cond}{marked_cond}
                  WHERE f.state = 'indexed' ORDER BY f.path"
             )
         };
@@ -3726,12 +3788,13 @@ fn write_enrichment(
     };
     let json = serde_json::to_string(&payload)
         .map_err(|e| Error::Message(format!("enrichissement non sérialisable : {e}")))?;
+    let nodes_hash = nodes_hash_of(&enrichable_ids(tx, path)?);
     tx.prepare_cached(
-        "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at, served_model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at, served_model, nodes_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(path, content_hash, model, prompt_version, language)
          DO UPDATE SET payload = excluded.payload, used_at = excluded.used_at,
-                       served_model = excluded.served_model",
+                       served_model = excluded.served_model, nodes_hash = excluded.nodes_hash",
     )
     .map_err(db_err)?
     .execute(params![
@@ -3742,7 +3805,8 @@ fn write_enrichment(
         json,
         language,
         now_ms(),
-        served_model
+        served_model,
+        nodes_hash
     ])
     .map_err(db_err)?;
     Ok(touched.log)
@@ -4132,19 +4196,27 @@ const PAYLOAD_VERSION: u32 = 1;
 pub struct WrittenStructures {
     pub reapplied: usize,
     pub unreadable: usize,
+    /// Résumés conservés écartés faute de nœud déclaré (REQ-289).
+    pub discarded: usize,
 }
 
 impl WrittenStructures {
     fn add(&mut self, other: Kept) {
         self.reapplied += usize::from(other.reapplied);
         self.unreadable += usize::from(other.unreadable);
+        self.discarded += other.discarded;
     }
 }
 
 /// Issue de la relecture de l'enrichissement conservé d'un fichier.
 enum KeptEnrichment {
     Absent,
-    Readable(Payload),
+    Readable {
+        payload: Payload,
+        /// Ligne de l'entrée et empreinte de ses nœuds (`None` : entrée marquée).
+        rowid: i64,
+        nodes_hash: Option<String>,
+    },
     /// Entrée de même empreinte qui ne se lit plus : supprimée et comptée.
     Unreadable,
 }
@@ -4154,6 +4226,34 @@ enum KeptEnrichment {
 struct Kept {
     reapplied: bool,
     unreadable: bool,
+    discarded: usize,
+}
+
+/// Nœuds déclarés par un fichier : tous les identifiants, et ceux que l'enrichissement demanderait.
+struct FileNodes {
+    declared: std::collections::HashSet<String>,
+    enrichable: Vec<String>,
+}
+
+/// Identifiants enrichissables d'un fichier écrit en base : déclarations d'analyse sans doc,
+/// hors `package:` et `key:` (règle de `nodes_by_file`), triés (DEC-222).
+fn enrichable_ids(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Vec<String>> {
+    let mut st = tx
+        .prepare_cached(
+            "SELECT node FROM declarations WHERE file = ?1 AND origin = 'parse' AND doc IS NULL
+             AND node NOT LIKE 'package:%' AND node NOT LIKE 'key:%' ORDER BY node",
+        )
+        .map_err(db_err)?;
+    let rows = st
+        .query_map([path], |r| r.get::<_, String>(0))
+        .map_err(db_err)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(db_err)
+}
+
+/// Empreinte (blake3, hexadécimale) d'une liste triée d'identifiants, un par ligne (DEC-222).
+fn nodes_hash_of(ids: &[String]) -> String {
+    blake3::hash(ids.join("\n").as_bytes()).to_hex().to_string()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -4254,7 +4354,7 @@ fn load_kept_enrichment(
     path: &str,
     orphans: &HashMap<String, Vec<String>>,
     versions: &PromptVersions,
-    declared: impl FnOnce() -> Result<std::collections::HashSet<String>>,
+    declared: impl FnOnce() -> Result<FileNodes>,
 ) -> Result<KeptEnrichment> {
     let file_hash: String = tx
         .prepare_cached("SELECT hash FROM files WHERE path = ?1")
@@ -4270,7 +4370,16 @@ fn load_kept_enrichment(
                 .map_err(db_err)?
                 .execute(params![rowid, now_ms()])
                 .map_err(db_err)?;
-            Ok(KeptEnrichment::Readable(p))
+            let nodes_hash: Option<String> = tx
+                .prepare_cached("SELECT nodes_hash FROM enrichments WHERE rowid = ?1")
+                .map_err(db_err)?
+                .query_row([rowid], |r| r.get(0))
+                .map_err(db_err)?;
+            Ok(KeptEnrichment::Readable {
+                payload: p,
+                rowid,
+                nodes_hash,
+            })
         }
         _ => {
             tx.prepare_cached("DELETE FROM enrichments WHERE rowid = ?1")
@@ -4342,7 +4451,7 @@ fn adopt_orphan(
     file_hash: &str,
     orphans: &HashMap<String, Vec<String>>,
     versions: &PromptVersions,
-    declared: impl FnOnce() -> Result<std::collections::HashSet<String>>,
+    declared: impl FnOnce() -> Result<FileNodes>,
 ) -> Result<KeptEnrichment> {
     if orphans.is_empty() {
         return Ok(KeptEnrichment::Absent);
@@ -4353,7 +4462,11 @@ fn adopt_orphan(
     let Some(candidates) = orphans.get(file_hash) else {
         return Ok(KeptEnrichment::Absent);
     };
-    let declared = declared()?;
+    let FileNodes {
+        declared,
+        enrichable,
+    } = declared()?;
+    let current_hash = nodes_hash_of(&enrichable);
     for old in candidates {
         if FileType::of(old) != Some(file_type) {
             continue;
@@ -4380,12 +4493,13 @@ fn adopt_orphan(
         };
         let json = serde_json::to_string(&payload)
             .map_err(|e| Error::Message(format!("enrichissement repris non sérialisable : {e}")))?;
+        let nodes_hash = &current_hash;
         tx.prepare_cached(
-            "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at, served_model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO enrichments(path, content_hash, model, prompt_version, payload, language, used_at, served_model, nodes_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(path, content_hash, model, prompt_version, language)
              DO UPDATE SET payload = excluded.payload, used_at = excluded.used_at,
-                           served_model = excluded.served_model",
+                           served_model = excluded.served_model, nodes_hash = excluded.nodes_hash",
         )
         .map_err(db_err)?
         .execute(params![
@@ -4396,25 +4510,32 @@ fn adopt_orphan(
             json,
             language,
             now_ms(),
-            served
+            served,
+            nodes_hash
         ])
         .map_err(db_err)?;
-        return Ok(KeptEnrichment::Readable(payload));
+        return Ok(KeptEnrichment::Readable {
+            payload,
+            rowid: 0,
+            nodes_hash: Some(current_hash),
+        });
     }
     Ok(KeptEnrichment::Absent)
 }
 
-/// Éléments de l'enrichissement conservé qui ont un nœud correspondant (les autres sont écartés
-/// en silence) : résumés, concepts, références.
+/// Éléments de l'enrichissement conservé qui ont un nœud correspondant : résumés, concepts,
+/// références, et nombre de résumés écartés (REQ-289 ; concepts et références écartés non comptés).
 fn filter_payload(
     payload: Payload,
     declared: &std::collections::HashSet<String>,
-) -> (Vec<(String, String)>, Vec<Node>, Vec<Ref>) {
+) -> FilteredPayload {
+    let total = payload.summaries.len();
     let summaries: Vec<(String, String)> = payload
         .summaries
         .into_iter()
         .filter(|(id, _)| declared.contains(id))
         .collect();
+    let discarded = total - summaries.len();
     let mut refs = Vec::new();
     let mut kept: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut with_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4452,8 +4573,11 @@ fn filter_payload(
             )
         })
         .collect();
-    (summaries, concepts, refs)
+    (summaries, concepts, refs, discarded)
 }
+
+/// Résumés, concepts, références gardés, et nombre de résumés écartés.
+type FilteredPayload = (Vec<(String, String)>, Vec<Node>, Vec<Ref>, usize);
 
 /// Réapplique l'enrichissement conservé d'un fichier dont la structure vient d'être écrite si
 /// une entrée a l'empreinte de contenu du fichier. Les éléments sans nœud correspondant sont écartés en silence.
@@ -4464,23 +4588,30 @@ fn reapply_enrichment(
     versions: &PromptVersions,
     touched: &mut Touched,
 ) -> Result<Kept> {
-    let declared_set = || {
-        Ok::<_, Error>(
-            declared_by(tx, path)?
-                .into_iter()
-                .collect::<std::collections::HashSet<String>>(),
-        )
+    let nodes = || {
+        Ok::<_, Error>(FileNodes {
+            declared: declared_by(tx, path)?.into_iter().collect(),
+            enrichable: enrichable_ids(tx, path)?,
+        })
     };
-    let payload = match load_kept_enrichment(tx, path, orphans, versions, declared_set)? {
-        KeptEnrichment::Readable(p) => p,
-        other => return Ok(Kept::without_payload(&other)),
-    };
+    let (payload, rowid, stored_hash) =
+        match load_kept_enrichment(tx, path, orphans, versions, nodes)? {
+            KeptEnrichment::Readable {
+                payload,
+                rowid,
+                nodes_hash,
+            } => (payload, rowid, nodes_hash),
+            other => return Ok(Kept::without_payload(&other)),
+        };
     let declared: std::collections::HashSet<String> = declared_by(tx, path)?.into_iter().collect();
-    let (summaries, concepts, refs) = filter_payload(payload, &declared);
+    let enrichable = enrichable_ids(tx, path)?;
+    let (summaries, concepts, refs, discarded) = filter_payload(payload, &declared);
+    mark_if_missing(tx, rowid, stored_hash.as_deref(), &enrichable, &summaries)?;
     apply_enrichment_tx(tx, path, &summaries, &concepts, &refs, touched)?;
     Ok(Kept {
         reapplied: true,
         unreadable: false,
+        discarded,
     })
 }
 
@@ -4489,8 +4620,30 @@ impl Kept {
         Kept {
             reapplied: false,
             unreadable: matches!(outcome, KeptEnrichment::Unreadable),
+            discarded: 0,
         }
     }
+}
+
+/// Marque l'entrée réappliquée « delta à faire » (`nodes_hash` NULL, DEC-222) si un nœud
+/// enrichissable n'a pas de résumé gardé et que la liste des nœuds a changé depuis l'essai.
+fn mark_if_missing(
+    tx: &rusqlite::Transaction<'_>,
+    rowid: i64,
+    stored_hash: Option<&str>,
+    enrichable: &[String],
+    kept: &[(String, String)],
+) -> Result<()> {
+    let missing = enrichable
+        .iter()
+        .any(|id| !kept.iter().any(|(k, _)| k == id));
+    if missing && stored_hash != Some(nodes_hash_of(enrichable).as_str()) {
+        tx.prepare_cached("UPDATE enrichments SET nodes_hash = NULL WHERE rowid = ?1")
+            .map_err(db_err)?
+            .execute([rowid])
+            .map_err(db_err)?;
+    }
+    Ok(())
 }
 
 /// Écriture de la structure d'un fichier pas encore écrit sur une base fraîche (DEC-075) : rien
@@ -4507,14 +4660,36 @@ fn write_structure_fresh(
     let mut touched = Touched::new(false);
     let mut merged: Option<Vec<Node>> = None;
     let mut kept: Option<(Vec<Node>, Vec<Ref>)> = None;
+    let declared: std::collections::HashSet<String> =
+        p.nodes.iter().map(|n| n.id.clone()).collect();
+    // Nœuds enrichissables : sans doc, hors `package:` et `key:`, triés, sans doublon.
+    let mut enrichable: Vec<String> = p
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.summary.is_none() && !n.id.starts_with("package:") && !n.id.starts_with("key:")
+        })
+        .map(|n| n.id.clone())
+        .collect();
+    enrichable.sort();
+    enrichable.dedup();
     let loaded = load_kept_enrichment(tx, path, orphans, versions, || {
-        Ok(p.nodes.iter().map(|n| n.id.clone()).collect())
+        Ok(FileNodes {
+            declared: declared.clone(),
+            enrichable: enrichable.clone(),
+        })
     })?;
     let unreadable = matches!(loaded, KeptEnrichment::Unreadable);
-    if let KeptEnrichment::Readable(payload) = loaded {
-        let declared: std::collections::HashSet<String> =
-            p.nodes.iter().map(|n| n.id.clone()).collect();
-        let (summaries, concepts, llm_refs) = filter_payload(payload, &declared);
+    let mut discarded = 0;
+    if let KeptEnrichment::Readable {
+        payload,
+        rowid,
+        nodes_hash,
+    } = loaded
+    {
+        let (summaries, concepts, llm_refs, dropped) = filter_payload(payload, &declared);
+        discarded = dropped;
+        mark_if_missing(tx, rowid, nodes_hash.as_deref(), &enrichable, &summaries)?;
         // Les résumés du fichier sont effacés puis remplacés par ceux de l'enrichissement.
         let mut parse_nodes = p.nodes.clone();
         // Un nœud sans résumé dans l'enrichissement garde sa doc (DEC-180).
@@ -4549,6 +4724,7 @@ fn write_structure_fresh(
     Ok(Kept {
         reapplied,
         unreadable,
+        discarded,
     })
 }
 
@@ -5406,6 +5582,7 @@ mod tests {
 
     /// Assistant « schéma 15 » (DEC-217), en SQL écrit en dur : index plein texte supprimé.
     const SCHEMA15_DOWNGRADE: &str = "BEGIN;
+        ALTER TABLE enrichments DROP COLUMN nodes_hash;
         DROP TRIGGER nodes_fts_ai;
         DROP TRIGGER nodes_fts_ad;
         DROP TRIGGER nodes_fts_au;
@@ -5414,7 +5591,21 @@ mod tests {
         PRAGMA user_version = 15;
         COMMIT;";
 
-    /// Ramène un graphe de schéma 16 au schéma 15 (DEC-217).
+    /// Ramène un graphe de schéma 17 au schéma 16 (DEC-222) : colonne `nodes_hash` supprimée.
+    fn downgrade_to_16(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(
+                "BEGIN;
+                 ALTER TABLE enrichments DROP COLUMN nodes_hash;
+                 UPDATE meta SET value = '16' WHERE key = 'schema_version';
+                 PRAGMA user_version = 16;
+                 COMMIT;",
+            )
+            .unwrap();
+    }
+
+    /// Ramène un graphe de schéma 17 au schéma 15 (DEC-217).
     fn downgrade_to_15(repo: &Path) {
         Connection::open(db_path(repo))
             .unwrap()
@@ -7171,7 +7362,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        assert_eq!(SCHEMA_VERSION, 16);
+        assert_eq!(SCHEMA_VERSION, 17);
     }
 
     #[test]
@@ -7305,11 +7496,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_to_16_without_touching_the_file() {
-        for version in [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_17_without_touching_the_file() {
+        for version in [17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                16 => downgrade_to_16(dir.path()),
                 15 => downgrade_to_15(dir.path()),
                 14 => downgrade_to_14(dir.path()),
                 13 => downgrade_to_13(dir.path()),
@@ -8335,7 +8527,7 @@ mod tests {
         assert_eq!(st.opened_schema_version(), 10);
         drop(st);
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(st.schema_version().unwrap(), 16);
+        assert_eq!(st.schema_version().unwrap(), 17);
         assert!(st.call_results().unwrap().is_empty());
         drop(st);
         downgrade_to_10(dir.path());
@@ -10176,23 +10368,23 @@ mod tests {
     }
 
     #[test]
-    fn req245_ac4_new_graph_is_schema_16_and_schema_17_is_refused() {
+    fn req245_ac4_new_graph_is_schema_17_and_schema_18_is_refused() {
         let dir = tempdir().unwrap();
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(SCHEMA_VERSION, 16);
-        assert_eq!(st.schema_version().unwrap(), 16);
+        assert_eq!(SCHEMA_VERSION, 17);
+        assert_eq!(st.schema_version().unwrap(), 17);
         drop(st);
         Connection::open(db_path(dir.path()))
             .unwrap()
-            .execute_batch("PRAGMA user_version = 17")
+            .execute_batch("PRAGMA user_version = 18")
             .unwrap();
         let e = Store::open_or_create(dir.path()).err().unwrap().to_string();
         assert!(
-            e.contains("version de schéma du graphe non prise en charge (17"),
+            e.contains("version de schéma du graphe non prise en charge (18"),
             "{e}"
         );
         assert!(Store::open_readonly(dir.path()).is_err());
-        assert_eq!(st_user_version(dir.path()), 17);
+        assert_eq!(st_user_version(dir.path()), 18);
     }
 
     // ---- REQ-258 : plusieurs enrichissements conservés par chemin (DEC-190) ----
@@ -10495,5 +10687,350 @@ mod tests {
         st.set_enrich_model_names(&names(&["m-a", "m-b"])).unwrap();
         st.reset_with_pending_files(&[file("a.md")]).unwrap();
         assert_eq!(st.enrich_model_names().unwrap(), names(&["m-a", "m-b"]));
+    }
+    // ---- REQ-289 / REQ-290 : résumés écartés, `nodes_hash`, marque « à enrichir » (DEC-222) ----
+
+    fn r290_prepared(path: &str, nodes: Vec<Node>) -> PreparedStructure {
+        PreparedStructure {
+            path: path.to_string(),
+            nodes,
+            refs: vec![],
+            context: None,
+            dropped: 0,
+        }
+    }
+
+    fn r290_types(names: &[&str]) -> Vec<Node> {
+        names
+            .iter()
+            .map(|q| ty(&format!("p.{q}"), "a.md"))
+            .collect()
+    }
+
+    fn r290_id(q: &str) -> String {
+        format!("type:p.{q}")
+    }
+
+    /// Base avec `a.md` (hash `h`) de nœuds `names`, enrichi des seuls résumés `summarized`.
+    fn r290_store(names: &[&str], summarized: &[&str]) -> (tempfile::TempDir, Store) {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        st.insert_pending_files(&[file("a.md")]).unwrap();
+        st.replace_structure("a.md", &r290_types(names), &[])
+            .unwrap();
+        let sums: Vec<(String, String)> = summarized
+            .iter()
+            .map(|q| (r290_id(q), format!("résumé {q}")))
+            .collect();
+        st.apply_enrichment("a.md", "h", "m", "français", &sums, &[], &[])
+            .unwrap();
+        (dir, st)
+    }
+
+    /// Réécrit la structure de `a.md`, sur base générale ou fraîche.
+    fn r290_rewrite(st: &mut Store, nodes: Vec<Node>, fresh: bool) -> WrittenStructures {
+        if fresh {
+            st.reset_with_pending_files(&[file("a.md")]).unwrap();
+        }
+        st.write_prepared(&[r290_prepared("a.md", nodes)]).unwrap()
+    }
+
+    fn r290_hash(st: &Store) -> Option<String> {
+        st.conn
+            .query_row(
+                "SELECT nodes_hash FROM enrichments WHERE path = 'a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Empreinte attendue, écrite à la main : blake3 de la liste jointe par des sauts de ligne.
+    fn r290_expected(joined: &str) -> String {
+        blake3::hash(joined.as_bytes()).to_hex().to_string()
+    }
+
+    fn r290_summary(st: &Store, q: &str) -> Option<String> {
+        st.node_by_id(&r290_id(q)).unwrap().and_then(|n| n.summary)
+    }
+
+    #[test]
+    fn req289_ac1_discarded_summaries_are_counted_on_both_paths() {
+        for fresh in [false, true] {
+            let (_d, mut st) = r290_store(&["a", "b", "c"], &["a", "b", "c"]);
+            let w = r290_rewrite(&mut st, r290_types(&["a", "b2", "c2"]), fresh);
+            assert_eq!((w.reapplied, w.discarded), (1, 2), "fresh={fresh}");
+            assert_eq!(r290_summary(&st, "a").as_deref(), Some("résumé a"));
+            assert_eq!(r290_summary(&st, "b2"), None);
+            let (_d, mut st) = r290_store(&["a", "b", "c"], &["a", "b", "c"]);
+            let w = r290_rewrite(&mut st, r290_types(&["a", "b", "c"]), fresh);
+            assert_eq!((w.reapplied, w.discarded), (1, 0), "fresh={fresh}");
+        }
+    }
+
+    #[test]
+    fn req290_ac1_entry_is_marked_when_a_node_is_missing_and_the_list_changed() {
+        for fresh in [false, true] {
+            let (_d, mut st) = r290_store(&["a", "b"], &["a", "b"]);
+            let a = r290_id("a");
+            let b = r290_id("b");
+            assert_eq!(
+                r290_hash(&st).as_deref(),
+                Some(r290_expected(&format!("{a}\n{b}")).as_str())
+            );
+            assert!(st.files_to_enrich().unwrap().is_empty());
+            let w = r290_rewrite(&mut st, r290_types(&["a", "b2"]), fresh);
+            assert_eq!(w.reapplied, 1);
+            assert_eq!(r290_hash(&st), None, "fresh={fresh}");
+            let todo: Vec<String> = st
+                .files_to_enrich()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect();
+            assert_eq!(todo, vec!["a.md".to_string()], "fresh={fresh}");
+            assert_eq!(st.count_files_to_enrich().unwrap(), 1);
+            assert_eq!(r290_summary(&st, "b2"), None);
+            assert_eq!(r290_summary(&st, "a").as_deref(), Some("résumé a"));
+        }
+    }
+
+    #[test]
+    fn req290_ac2_omitted_node_documented_node_package_and_key_do_not_mark() {
+        for fresh in [false, true] {
+            // Nœud omis par le modèle à l'essai : même liste, aucune marque.
+            let (_d, mut st) = r290_store(&["a", "b"], &["a"]);
+            r290_rewrite(&mut st, r290_types(&["a", "b"]), fresh);
+            assert!(r290_hash(&st).is_some(), "fresh={fresh}");
+            assert!(st.files_to_enrich().unwrap().is_empty());
+            // Nœud documenté sans résumé : non manquant, la liste a pourtant changé.
+            let (_d, mut st) = r290_store(&["a"], &["a"]);
+            let mut nodes = r290_types(&["a"]);
+            nodes.push(Node::new(
+                NodeKind::Type,
+                "p.b",
+                "b",
+                Some("a.md"),
+                Some(SubKind::Class),
+                Some("Doc de b."),
+            ));
+            r290_rewrite(&mut st, nodes, fresh);
+            assert!(r290_hash(&st).is_some(), "documenté, fresh={fresh}");
+            // Packages et clés sans résumé : non enrichissables.
+            let (_d, mut st) = r290_store(&["a"], &["a"]);
+            let mut nodes = r290_types(&["a"]);
+            nodes.push(Node::new(NodeKind::Package, "p", "p", None, None, None));
+            nodes.push(Node::new(NodeKind::Key, "k.x", "x", None, None, None));
+            r290_rewrite(&mut st, nodes, fresh);
+            assert!(r290_hash(&st).is_some(), "package et clé, fresh={fresh}");
+            assert!(st.files_to_enrich().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn req290_ac3_only_the_last_tried_list_is_kept() {
+        for fresh in [false, true] {
+            let (_d, mut st) = r290_store(&["a", "b"], &["a", "b"]);
+            r290_rewrite(&mut st, r290_types(&["a", "b2"]), fresh);
+            assert_eq!(r290_hash(&st), None);
+            // Enrichissement delta réussi simulé : seuls les résumés reçus, `b2` omis.
+            let kept: Vec<(String, String)> = vec![(r290_id("a"), "résumé a".into())];
+            st.apply_enrichment("a.md", "h", "m", "français", &kept, &[], &[])
+                .unwrap();
+            assert_eq!(
+                r290_hash(&st).as_deref(),
+                Some(r290_expected(&format!("{}\n{}", r290_id("a"), r290_id("b2"))).as_str()),
+                "fresh={fresh}"
+            );
+            assert!(st.files_to_enrich().unwrap().is_empty());
+            r290_rewrite(&mut st, r290_types(&["a", "b2"]), fresh);
+            assert!(r290_hash(&st).is_some(), "même liste, fresh={fresh}");
+            assert!(st.files_to_enrich().unwrap().is_empty());
+            r290_rewrite(&mut st, r290_types(&["a", "b3"]), fresh);
+            assert_eq!(r290_hash(&st), None, "autre liste, fresh={fresh}");
+            assert_eq!(st.files_to_enrich().unwrap().len(), 1);
+        }
+    }
+
+    /// Instantané complet d'une base : toutes les lignes de toutes les tables, colonne
+    /// `nodes_hash` exclue, ligne `schema_version` de `meta` exclue.
+    fn r290_full_dump(db: &Connection) -> Vec<String> {
+        let tables: Vec<String> = {
+            let mut q = db
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+                .unwrap();
+            q.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let mut out = Vec::new();
+        for t in tables {
+            let cols: Vec<String> = {
+                let mut q = db
+                    .prepare(&format!("SELECT name FROM pragma_table_info('{t}')"))
+                    .unwrap();
+                q.query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .filter(|c| c != "nodes_hash")
+                    .collect()
+            };
+            let filter = if t == "meta" {
+                " WHERE key <> 'schema_version'"
+            } else {
+                ""
+            };
+            let sql = format!("SELECT {} FROM {t}{filter} ORDER BY 1, 2", cols.join(", "));
+            let mut q = db.prepare(&sql).unwrap();
+            let n = cols.len();
+            let rows: Vec<String> = q
+                .query_map([], |r| {
+                    let vals: Vec<rusqlite::types::Value> = (0..n)
+                        .map(|i| r.get(i))
+                        .collect::<std::result::Result<_, _>>(
+                    )?;
+                    Ok(format!("{vals:?}"))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            out.push(format!("{t}: {rows:?}"));
+        }
+        out
+    }
+
+    #[test]
+    fn req290_ac4_migration_16_to_17_hashes_the_summary_ids() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let sums = |ids: &[&str]| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|i| ((*i).to_string(), "s".to_string()))
+                .collect()
+        };
+        st.insert_pending_files(&[file("a.md"), file("b.md"), file("c.md")])
+            .unwrap();
+        for (path, q) in [("a.md", "x"), ("b.md", "z"), ("c.md", "w")] {
+            st.replace_structure(path, &[ty(&format!("p.{q}"), path)], &[])
+                .unwrap();
+        }
+        st.replace_structure("a.md", &[ty("p.x", "a.md"), ty("p.y", "a.md")], &[])
+            .unwrap();
+        st.apply_enrichment(
+            "a.md",
+            "h",
+            "m",
+            "français",
+            &sums(&["type:p.y", "type:p.x"]),
+            &[],
+            &[],
+        )
+        .unwrap();
+        st.apply_enrichment("b.md", "h", "m", "français", &[], &[], &[])
+            .unwrap();
+        st.apply_enrichment("c.md", "h", "m", "français", &[], &[], &[])
+            .unwrap();
+        drop(st);
+        let db = Connection::open(db_path(dir.path())).unwrap();
+        db.execute(
+            "UPDATE enrichments SET payload = '{' WHERE path = 'c.md'",
+            [],
+        )
+        .unwrap();
+        let before = r290_full_dump(&db);
+        db.execute_batch(
+            "ALTER TABLE enrichments DROP COLUMN nodes_hash;
+             UPDATE meta SET value = '16' WHERE key = 'schema_version';
+             PRAGMA user_version = 16;",
+        )
+        .unwrap();
+        drop(db);
+        let _st = Store::open_or_create(dir.path()).unwrap();
+        assert_eq!(st_user_version(dir.path()), 17);
+        let db = Connection::open(db_path(dir.path())).unwrap();
+        let rows: Vec<(String, String, i64, Option<String>)> = {
+            let mut q = db
+                .prepare("SELECT path, payload, used_at, nodes_hash FROM enrichments ORDER BY path")
+                .unwrap();
+            q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let empty = r290_expected("");
+        assert_eq!(
+            rows.iter().map(|r| r.3.clone()).collect::<Vec<_>>(),
+            vec![
+                Some(r290_expected("type:p.x\ntype:p.y")),
+                Some(empty.clone()),
+                Some(empty)
+            ]
+        );
+        assert_eq!(r290_full_dump(&db), before);
+        // Seconde ouverture : rien n'est refait.
+        db.execute(
+            "UPDATE enrichments SET nodes_hash = 'x' WHERE path = 'a.md'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        drop(Store::open_or_create(dir.path()).unwrap());
+        let db = Connection::open(db_path(dir.path())).unwrap();
+        let kept: String = db
+            .query_row(
+                "SELECT nodes_hash FROM enrichments WHERE path = 'a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, "x");
+    }
+
+    #[test]
+    fn req290_ac4_schema_16_read_only_keeps_todays_rule() {
+        let (dir, mut st) = r290_store(&["a", "b"], &["a", "b"]);
+        r290_rewrite(&mut st, r290_types(&["a", "b2"]), false);
+        assert_eq!(r290_hash(&st), None);
+        drop(st);
+        let db = Connection::open(db_path(dir.path())).unwrap();
+        db.execute_batch(
+            "ALTER TABLE enrichments DROP COLUMN nodes_hash;
+             UPDATE meta SET value = '16' WHERE key = 'schema_version';
+             PRAGMA user_version = 16;",
+        )
+        .unwrap();
+        drop(db);
+        let ro = Store::open_readonly(dir.path()).unwrap();
+        assert_eq!(ro.opened_schema_version(), 16);
+        assert!(ro.files_to_enrich().unwrap().is_empty());
+        assert_eq!(st_user_version(dir.path()), 16);
+    }
+
+    #[test]
+    fn req290_ac5_adopted_orphan_gets_the_hash_of_the_new_nodes_and_is_not_marked() {
+        for fresh in [false, true] {
+            let (_d, mut st) = enriched_store();
+            if fresh {
+                st.reset_with_pending_files(&[file("b.md")]).unwrap();
+            } else {
+                st.remove_file("a.md").unwrap();
+                st.insert_pending_files(&[file("b.md")]).unwrap();
+            }
+            st.load_orphan_enrichments().unwrap();
+            let w = st
+                .write_prepared(&[r290_prepared("b.md", vec![ty("p.A", "b.md")])])
+                .unwrap();
+            assert_eq!(w.reapplied, 1, "fresh={fresh}");
+            let hash: Option<String> = st
+                .conn
+                .query_row(
+                    "SELECT nodes_hash FROM enrichments WHERE path = 'b.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(hash, Some(r290_expected("type:p.A")), "fresh={fresh}");
+        }
     }
 }

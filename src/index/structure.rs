@@ -72,6 +72,8 @@ pub(crate) fn analyze_with<L: crate::workers::Launcher>(
     let failed_before = report.failed;
     let retained_before = report.retained;
     let unreadable_before = report.unreadable;
+    // Résumés conservés écartés par les écritures de la phase (REQ-289).
+    let mut discarded = 0usize;
     trace!("structure: début {total} fichiers, {workers} fils");
     let mut batch: Vec<PreparedStructure> = Vec::new();
     // Avertissements de la phase, rangés par chemin converti et écrits triés (REQ-104, AC-104-5).
@@ -174,13 +176,27 @@ pub(crate) fn analyze_with<L: crate::workers::Launcher>(
                     }
                     batch.push(p);
                     if batch.len() >= BATCH {
-                        flush(store, &mut batch, queue, report, &mut write_error);
+                        flush(
+                            store,
+                            &mut batch,
+                            queue,
+                            report,
+                            &mut discarded,
+                            &mut write_error,
+                        );
                     }
                 }
             }
         }
         if write_error.is_none() {
-            flush(store, &mut batch, queue, report, &mut write_error);
+            flush(
+                store,
+                &mut batch,
+                queue,
+                report,
+                &mut discarded,
+                &mut write_error,
+            );
         }
     });
     // Ordre des octets du chemin ; le tri est stable, l'ordre interne d'un fichier est gardé.
@@ -194,12 +210,18 @@ pub(crate) fn analyze_with<L: crate::workers::Launcher>(
     } else {
         String::new()
     };
+    let discarded_note = if discarded > 0 {
+        format!(", {discarded} résumés écartés")
+    } else {
+        String::new()
+    };
     trace!(
-        "structure: fin {} ms, {} en attente, {} enrichissements conservés{}",
+        "structure: fin {} ms, {} en attente, {} enrichissements conservés{}{}",
         started.elapsed().as_millis(),
         report.failed - failed_before,
         report.retained - retained_before,
-        unreadable_note
+        unreadable_note,
+        discarded_note
     );
     match spawn_error.or(write_error) {
         Some(e) => Err(e),
@@ -226,6 +248,7 @@ fn flush(
     batch: &mut Vec<PreparedStructure>,
     queue: &Mutex<VecDeque<ScannedFile>>,
     report: &mut BuildReport,
+    discarded: &mut usize,
     write_error: &mut Option<Error>,
 ) {
     if batch.is_empty() {
@@ -236,6 +259,7 @@ fn flush(
             report.processed += batch.len();
             report.retained += written.reapplied;
             report.unreadable += written.unreadable;
+            *discarded += written.discarded;
         }
         Err(e) => {
             queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
@@ -796,5 +820,137 @@ mod tests {
         r.unwrap();
         assert!(started_traces(&events).is_empty());
         assert_eq!(l.calls.load(Ordering::SeqCst), 4);
+    }
+    // ---- REQ-289 : résumés conservés écartés comptés dans `structure: fin` ----
+
+    /// Dépôt de `n` classes `C<i>.java`, analysé puis enrichi (un résumé par classe) ; `stale[i]`
+    /// résumés d'identifiants disparus sont ajoutés à la charge utile de `C<i>`, `"{"` rend
+    /// illisible celle des indices de `broken`. Rend le dépôt, le magasin et les fichiers scannés.
+    fn r289_repo(stale: &[usize], broken: &[usize]) -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for i in 0..stale.len() {
+            std::fs::write(
+                repo.join(format!("C{i}.java")),
+                format!("package p;\npublic class C{i} {{}}\n"),
+            )
+            .unwrap();
+        }
+        let scanned = crate::scan::scan(repo, &[], &crate::filter::Matcher::none(), 1).unwrap();
+        let mut store = Store::open_or_create(repo).unwrap();
+        store
+            .reset_with_pending_files(&pending_records(&scanned.files))
+            .unwrap();
+        let mut report = BuildReport::default();
+        analyze(
+            repo,
+            crate::scan::scan(repo, &[], &crate::filter::Matcher::none(), 1)
+                .unwrap()
+                .files,
+            1,
+            &scanned.gradle_settings,
+            &mut store,
+            &mut report,
+        )
+        .unwrap();
+        let db = rusqlite::Connection::open(repo.join(".nephila/graph.db")).unwrap();
+        for f in &scanned.files {
+            let i: usize = f.path[1..f.path.find('.').unwrap()].parse().unwrap();
+            let id = format!("type:p.C{i}");
+            store
+                .apply_enrichment(
+                    &f.path,
+                    &f.hash,
+                    "m",
+                    "français",
+                    &[(id.clone(), "s".into())],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            let mut summaries = vec![serde_json::json!([id, "s"])];
+            for k in 0..stale[i] {
+                summaries.push(serde_json::json!([format!("type:old{k}.C{i}"), "perdu"]));
+            }
+            let payload = if broken.contains(&i) {
+                "{".to_string()
+            } else {
+                serde_json::json!({"v": 1, "summaries": summaries, "concepts": [], "refs": []})
+                    .to_string()
+            };
+            db.execute(
+                "UPDATE enrichments SET payload = ?2 WHERE path = ?1",
+                rusqlite::params![f.path, payload],
+            )
+            .unwrap();
+        }
+        (dir, store)
+    }
+
+    /// Réanalyse les fichiers (base fraîche ou non) et rend les traces `structure: fin`.
+    fn r289_rerun(dir: &tempfile::TempDir, store: &mut Store, fresh: bool) -> Vec<String> {
+        let scanned =
+            crate::scan::scan(dir.path(), &[], &crate::filter::Matcher::none(), 1).unwrap();
+        if fresh {
+            store
+                .reset_with_pending_files(&pending_records(&scanned.files))
+                .unwrap();
+        }
+        let mut report = BuildReport::default();
+        let (r, events) = crate::trace::capture(|| {
+            analyze(
+                dir.path(),
+                scanned.files,
+                1,
+                &scanned.gradle_settings,
+                store,
+                &mut report,
+            )
+        });
+        r.unwrap();
+        events
+            .into_iter()
+            .filter(|e| e.starts_with("structure: fin "))
+            .collect()
+    }
+
+    #[test]
+    fn req289_ac2_trace_fin_compte_les_resumes_ecartes() {
+        for fresh in [false, true] {
+            let (dir, mut store) = r289_repo(&[2, 1, 0], &[]);
+            let fin = r289_rerun(&dir, &mut store, fresh);
+            assert_eq!(fin.len(), 1);
+            assert!(
+                fin[0].ends_with(", 3 enrichissements conservés, 3 résumés écartés"),
+                "fresh={fresh} : {}",
+                fin[0]
+            );
+            // Sans résumé écarté : aucun segment.
+            let (dir, mut store) = r289_repo(&[0, 0, 0], &[]);
+            let fin = r289_rerun(&dir, &mut store, fresh);
+            assert!(
+                fin.iter().all(|l| !l.contains("résumés écartés")),
+                "{fin:?}"
+            );
+            // Avec une entrée illisible en plus : son segment précède.
+            let (dir, mut store) = r289_repo(&[2, 1, 0, 0], &[3]);
+            let fin = r289_rerun(&dir, &mut store, fresh);
+            assert!(
+                fin[0].ends_with(", 1 enrichissements illisibles écartés, 3 résumés écartés"),
+                "fresh={fresh} : {}",
+                fin[0]
+            );
+        }
+    }
+
+    #[test]
+    fn req289_ac5_un_seul_resume_ecarte_pluriel_fige_sans_llm() {
+        let (dir, mut store) = r289_repo(&[1], &[]);
+        let fin = r289_rerun(&dir, &mut store, false);
+        assert!(
+            fin[0].ends_with(", 1 enrichissements conservés, 1 résumés écartés"),
+            "{}",
+            fin[0]
+        );
     }
 }

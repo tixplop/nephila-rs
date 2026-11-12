@@ -19,6 +19,8 @@ CREATE TABLE files (
 -- ou réapplication ; 0 après migration) ; `served_model` = nom du modèle servi, lu dans les
 -- réponses (DEC-208 ; NULL sans réponse du LLM, hors clé ; placée après `used_at` pour que le
 -- texte égale celui d'un graphe migré par `ALTER TABLE ... ADD COLUMN`).
+-- `nodes_hash` : empreinte des nœuds enrichissables essayés ; NULL = nœuds manquants à demander
+-- (DEC-222) ; placée en dernier, sur la même ligne, pour égaler le texte d'un graphe migré.
 CREATE TABLE enrichments (
     path           TEXT NOT NULL,
     content_hash   TEXT NOT NULL,
@@ -26,7 +28,7 @@ CREATE TABLE enrichments (
     prompt_version INTEGER NOT NULL,
     payload        TEXT NOT NULL,
     language       TEXT NOT NULL,
-    used_at        INTEGER NOT NULL, served_model TEXT,
+    used_at        INTEGER NOT NULL, served_model TEXT, nodes_hash TEXT,
     PRIMARY KEY (path, content_hash, model, prompt_version, language)
 );
 
