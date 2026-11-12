@@ -1164,16 +1164,20 @@ pub fn lot_user_prompt(items: &[LotItem]) -> String {
     let mut out = String::new();
     let mut next = 1;
     for (k, it) in items.iter().enumerate() {
-        let list = list_lines(&it.node_ids, next);
+        out.push_str(&lot_entry(k + 1, it, next));
         next += it.node_ids.len();
-        out.push_str(&format!(
-            "=== FICHIER [{k}] : {f} ===\nNœuds du fichier :\n{list}\n{block}\n\n",
-            k = k + 1,
-            f = it.file,
-            block = file_block(&it.file, &it.text)
-        ));
     }
     out
+}
+
+/// Entrée `k` (à partir de 1) d'un lot : numéros de nœuds à partir de `first` (REQ-287).
+pub(crate) fn lot_entry(k: usize, item: &LotItem, first: usize) -> String {
+    let list = list_lines(&item.node_ids, first);
+    format!(
+        "=== FICHIER [{k}] : {f} ===\nNœuds du fichier :\n{list}\n{block}\n\n",
+        f = item.file,
+        block = file_block(&item.file, &item.text)
+    )
 }
 
 #[cfg(test)]

@@ -494,7 +494,7 @@ pub(crate) fn form_units(
     batch_files: usize,
     max_chunk_chars: usize,
 ) -> Vec<Unit<'_>> {
-    form_units_by_nodes(
+    form_units_sized(
         files,
         |_| 0,
         batch_files,
@@ -503,13 +503,49 @@ pub(crate) fn form_units(
     )
 }
 
-/// Forme les unités dans l'ordre des fichiers : un lot compte au plus `batch_files` fichiers, au
-/// plus `max_chunk_chars` octets et au plus `nodes_per_call` nœuds au total ; un fichier plus
-/// gros que `max_chunk_chars` ou de plus de `nodes_per_call` nœuds forme une unité `Big`. Un
+/// Aide des tests : caractères = `size`, entrées comptées par `lot_entry` sur des identifiants
+/// courts générés.
+#[cfg(test)]
+pub(crate) fn form_units_sized<'a>(
+    files: &'a [FileRecord],
+    nodes: impl Fn(&FileRecord) -> usize,
+    batch_files: usize,
+    max_chunk_chars: usize,
+    nodes_per_call: usize,
+) -> Vec<Unit<'a>> {
+    let entry = |f: &FileRecord, k: usize, first: usize| {
+        let item = LotItem {
+            file: f.path.clone(),
+            text: String::new(),
+            node_ids: (0..nodes(f)).map(|i| format!("n:{}:{i}", f.path)).collect(),
+        };
+        crate::llm::enrich::lot_entry(k, &item, first)
+            .chars()
+            .count()
+    };
+    form_units_by_nodes(
+        files,
+        &nodes,
+        |f| f.size as usize,
+        entry,
+        batch_files,
+        max_chunk_chars,
+        nodes_per_call,
+    )
+}
+
+/// Forme les unités dans l'ordre des fichiers, en caractères (REQ-287, DEC-220). `chars` donne
+/// les caractères d'un fichier, `entry(f, k, first)` ceux de son entrée de lot à texte vide au
+/// rang `k` et au premier numéro `first`. Un lot compte au plus `batch_files` fichiers et
+/// `nodes_per_call` nœuds ; dès 2 fichiers, ses caractères plus ceux de ses entrées restent
+/// ≤ `max_chunk_chars` (un lot d'un fichier ne compte pas son entrée). Un fichier de plus de
+/// `max_chunk_chars` caractères ou de plus de `nodes_per_call` nœuds forme une unité `Big`. Un
 /// fichier envoyé seul ne ferme pas le lot en cours : il part juste après lui, quand il se ferme.
 pub(crate) fn form_units_by_nodes<'a>(
     files: &'a [FileRecord],
     nodes: impl Fn(&FileRecord) -> usize,
+    chars: impl Fn(&FileRecord) -> usize,
+    entry: impl Fn(&FileRecord, usize, usize) -> usize,
     batch_files: usize,
     max_chunk_chars: usize,
     nodes_per_call: usize,
@@ -517,12 +553,15 @@ pub(crate) fn form_units_by_nodes<'a>(
     let batch_files = batch_files.max(1);
     let mut units = Vec::new();
     let mut current: Vec<&FileRecord> = Vec::new();
-    let mut total = 0u64;
+    // Σ caractères et Σ entrées du lot en cours (la première entrée y est déjà).
+    let mut total = 0usize;
+    let mut entries = 0usize;
     let mut total_nodes = 0usize;
     let mut pending: Vec<&FileRecord> = Vec::new();
     for f in files {
         let n = nodes(f);
-        if f.size > max_chunk_chars as u64 || n > nodes_per_call {
+        let c = chars(f);
+        if c > max_chunk_chars || n > nodes_per_call {
             if current.is_empty() {
                 units.push(Unit::Big(f));
             } else {
@@ -530,17 +569,23 @@ pub(crate) fn form_units_by_nodes<'a>(
             }
             continue;
         }
+        // Entrée au rang et au numéro qu'aurait le fichier dans le lot en cours (1 et 1 si vide).
+        let mut e = entry(f, current.len() + 1, total_nodes + 1);
         if !current.is_empty()
             && (current.len() >= batch_files
-                || total + f.size > max_chunk_chars as u64
+                || total + c + entries + e > max_chunk_chars
                 || total_nodes + n > nodes_per_call)
         {
             units.push(Unit::Lot(std::mem::take(&mut current), Pass::First));
             units.extend(pending.drain(..).map(Unit::Big));
             total = 0;
+            entries = 0;
             total_nodes = 0;
+            // Premier d'un nouveau lot : rang 1, premier numéro 1.
+            e = entry(f, 1, 1);
         }
-        total += f.size;
+        total += c;
+        entries += e;
         total_nodes += n;
         current.push(f);
     }
@@ -549,6 +594,31 @@ pub(crate) fn form_units_by_nodes<'a>(
     }
     units.extend(pending.drain(..).map(Unit::Big));
     units
+}
+
+/// Nombre de caractères du texte entier d'un fichier, tel que sur le disque (REQ-287).
+fn count_chars(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|b| **b & 0xC0 != 0x80).count()
+}
+
+/// Entrée de lot à texte vide d'un fichier, comptée en caractères (REQ-287).
+fn entry_chars(
+    ids: &HashMap<String, Vec<(String, String)>>,
+    f: &FileRecord,
+    k: usize,
+    first: usize,
+) -> usize {
+    let item = LotItem {
+        file: f.path.clone(),
+        text: String::new(),
+        node_ids: ids
+            .get(&f.path)
+            .map(|v| v.iter().map(|(id, _)| id.clone()).collect())
+            .unwrap_or_default(),
+    };
+    crate::llm::enrich::lot_entry(k, &item, first)
+        .chars()
+        .count()
 }
 
 /// Prise sur le plafond d'appels : `take(n, files)` réserve `n` appels ; `files` est le nombre de
@@ -657,6 +727,12 @@ impl Sources<'_> {
         let (masked, n) = crate::llm::redact::redact(path, &text);
         tally.record(path, n);
         Ok((crate::llm::compact::compact(path, &masked), hash))
+    }
+
+    /// Caractères du texte entier d'un fichier, sans compaction ni masquage ; illisible : sa
+    /// taille enregistrée (REQ-287).
+    fn char_count(&self, f: &FileRecord) -> usize {
+        std::fs::read(self.real_path(&f.path)).map_or(f.size as usize, |b| count_chars(&b))
     }
 
     /// Chemin réel d'un fichier : l'entrée d'`abs`, sinon la racine jointe au chemin.
@@ -1635,9 +1711,15 @@ pub(crate) fn estimate(
     nodes_per_call: usize,
 ) -> Estimate {
     let (with_nodes, without_nodes) = partition_by_nodes(files, ids);
+    let chars: HashMap<&str, usize> = with_nodes
+        .iter()
+        .map(|f| (f.path.as_str(), sources.char_count(f)))
+        .collect();
     let units = form_units_by_nodes(
         &with_nodes,
         |f| ids.get(&f.path).map_or(0, Vec::len),
+        |f| chars[f.path.as_str()],
+        |f, k, first| entry_chars(ids, f, k, first),
         batch_files,
         max_chunk_chars,
         nodes_per_call,
@@ -2708,9 +2790,15 @@ pub(crate) fn enrich_pass(
     let mut succeeded = 0usize;
     // REQ-159 : un fichier sans nœud à demander est enregistré vide, sans lecture ni appel.
     let (with_nodes, without_nodes) = partition_by_nodes(files, &ids);
+    let chars: HashMap<&str, usize> = with_nodes
+        .iter()
+        .map(|f| (f.path.as_str(), sources.char_count(f)))
+        .collect();
     let mut units = form_units_by_nodes(
         &with_nodes,
         |f| ids.get(&f.path).map_or(0, Vec::len),
+        |f| chars[f.path.as_str()],
+        |f, k, first| entry_chars(&ids, f, k, first),
         batch_files,
         max_chunk_chars,
         opts.nodes_per_call,
@@ -3003,13 +3091,13 @@ mod tests {
     #[test]
     fn req027_form_units_size_bound_and_big_isolated() {
         let files = vec![
-            rec("a", 40),
-            rec("b", 40),
-            rec("c", 40),
-            rec("big", 500),
-            rec("d", 5),
+            rec("a", 400),
+            rec("b", 400),
+            rec("c", 400),
+            rec("big", 5000),
+            rec("d", 50),
         ];
-        let u = form_units(&files, 8, 100);
+        let u = form_units(&files, 8, 1000);
         assert_eq!(shape(&u), ["a,b", "c,d", "BIG:big"]);
     }
 
@@ -3029,8 +3117,11 @@ mod tests {
 
     #[test]
     fn req027_form_units_exact_fit() {
+        // Ajustement exact : le total compté de [a, b] (entrées comprises) égale `max`.
         let files = vec![rec("a", 50), rec("b", 50), rec("c", 100)];
-        assert_eq!(shape(&form_units(&files, 4, 100)), ["a,b", "c"]);
+        let exact = counted_total(&[&files[0], &files[1]], |_| 0);
+        assert_eq!(shape(&form_units(&files, 4, exact)), ["a,b", "c"]);
+        assert_eq!(shape(&form_units(&files, 4, exact - 1)), ["a", "b", "c"]);
     }
 
     fn ids(n: usize) -> Vec<String> {
@@ -3375,11 +3466,26 @@ mod tests {
         let counts = [100usize, 60, 40, 200, 10];
         let files: Vec<_> = (0..5).map(|i| rec(&format!("f{i}"), 1)).collect();
         let nodes = |f: &FileRecord| counts[f.path[1..].parse::<usize>().unwrap()];
-        let u = form_units_by_nodes(&files, nodes, 8, 1000, MAX_NODES_PER_CALL);
+        let u = form_units_sized(&files, nodes, 8, 60_000, MAX_NODES_PER_CALL);
         assert_eq!(shape(&u), ["f0", "f1,f2,f4", "BIG:f3"]);
         let files = vec![rec("a", 1)];
-        let u = form_units_by_nodes(&files, |_| 150, 8, 1000, MAX_NODES_PER_CALL);
+        let u = form_units_sized(&files, |_| 150, 8, 60_000, MAX_NODES_PER_CALL);
         assert_eq!(shape(&u), ["a"]);
+    }
+
+    /// Total compté d'un lot : caractères des fichiers plus ceux de `lot_user_prompt` à textes
+    /// vides (identifiants courts de `form_units_sized`).
+    fn counted_total(v: &[&FileRecord], nodes: impl Fn(&FileRecord) -> usize) -> usize {
+        let items: Vec<LotItem> = v
+            .iter()
+            .map(|f| LotItem {
+                file: f.path.clone(),
+                text: String::new(),
+                node_ids: (0..nodes(f)).map(|i| format!("n:{}:{i}", f.path)).collect(),
+            })
+            .collect();
+        v.iter().map(|f| f.size as usize).sum::<usize>()
+            + crate::llm::enrich::lot_user_prompt(&items).chars().count()
     }
 
     #[test]
@@ -3407,7 +3513,7 @@ mod tests {
             let nodes = |f: &FileRecord| node_counts[f.path[1..].parse::<usize>().unwrap()];
             for batch in [1usize, 10, 100] {
                 for max in [100usize, 1_000, 60_000] {
-                    let units = form_units_by_nodes(&files, nodes, batch, max, MAX_NODES_PER_CALL);
+                    let units = form_units_sized(&files, nodes, batch, max, MAX_NODES_PER_CALL);
                     let ctx = format!("jeu {set}, batch {batch}, max {max}");
                     let rank =
                         |f: &FileRecord| files.iter().position(|g| g.path == f.path).unwrap();
@@ -3423,6 +3529,9 @@ mod tests {
                                     v.iter().map(|f| f.size).sum::<u64>() <= max as u64,
                                     "{ctx}"
                                 );
+                                if v.len() >= 2 {
+                                    assert!(counted_total(v, nodes) <= max, "{ctx} : total compté");
+                                }
                                 assert!(v.iter().map(|f| nodes(f)).sum::<usize>() <= 150, "{ctx}");
                                 assert!(
                                     v.windows(2).all(|w| rank(w[0]) < rank(w[1])),
@@ -3450,11 +3559,12 @@ mod tests {
                     );
                     for w in lots.windows(2) {
                         let (prev, next) = (w[0], w[1][0]);
-                        let sum: u64 = prev.iter().map(|f| f.size).sum();
                         let n: usize = prev.iter().map(|f| nodes(f)).sum();
+                        let mut with_next = prev.to_vec();
+                        with_next.push(next);
                         assert!(
                             prev.len() >= batch
-                                || sum + next.size > max as u64
+                                || counted_total(&with_next, nodes) > max
                                 || n + nodes(next) > 150,
                             "{ctx} : lot fermé sans raison"
                         );
@@ -4015,12 +4125,125 @@ mod tests {
         }
     }
 
+    fn chinese_file(name: &str, chars: usize) -> FileRecord {
+        rec(name, 3 * chars as u64)
+    }
+
+    /// Unités avec compte réel des caractères (un caractère chinois = 3 octets).
+    fn form_chars<'a>(
+        files: &'a [FileRecord],
+        chars: &HashMap<String, usize>,
+        nodes: usize,
+        id_len: usize,
+        max: usize,
+    ) -> Vec<Unit<'a>> {
+        form_units_by_nodes(
+            files,
+            |_| nodes,
+            |f| chars[&f.path],
+            |f, k, first| {
+                let item = LotItem {
+                    file: f.path.clone(),
+                    text: String::new(),
+                    node_ids: (0..nodes).map(|i| format!("{i:0>id_len$}")).collect(),
+                };
+                crate::llm::enrich::lot_entry(k, &item, first)
+                    .chars()
+                    .count()
+            },
+            10,
+            max,
+            MAX_NODES_PER_CALL,
+        )
+    }
+
+    #[test]
+    fn req287_ac1_chinese_files_counted_in_characters() {
+        let files: Vec<_> = (0..6)
+            .map(|i| chinese_file(&format!("f{i}"), 1000))
+            .collect();
+        let chars: HashMap<String, usize> = files.iter().map(|f| (f.path.clone(), 1000)).collect();
+        let u = form_chars(&files, &chars, 2, 10, 4000);
+        assert_eq!(shape(&u), ["f0,f1,f2", "f3,f4,f5"]);
+        let files = vec![chinese_file("a", 2000), chinese_file("b", 100)];
+        let chars: HashMap<String, usize> =
+            [("a".to_string(), 2000), ("b".to_string(), 100)].into();
+        assert_eq!(shape(&form_chars(&files, &chars, 2, 10, 4000)), ["a,b"]);
+        let files = vec![rec("x", 4001)];
+        let chars: HashMap<String, usize> = [("x".to_string(), 4001)].into();
+        assert_eq!(shape(&form_chars(&files, &chars, 2, 10, 4000)), ["BIG:x"]);
+    }
+
+    #[test]
+    fn req287_ac2_node_lists_are_counted() {
+        let files = vec![rec("a.md", 1000), rec("b.md", 1000)];
+        let chars: HashMap<String, usize> = files.iter().map(|f| (f.path.clone(), 1000)).collect();
+        let u = form_chars(&files, &chars, 60, 40, 3000);
+        assert_eq!(shape(&u), ["a.md", "b.md"]);
+        let u = form_chars(&files, &chars, 1, 40, 3000);
+        assert_eq!(shape(&u), ["a.md,b.md"]);
+        // Le total compté d'un lot égale caractères + `lot_user_prompt` à textes vides.
+        let v: Vec<&FileRecord> = files.iter().collect();
+        let items: Vec<LotItem> = v
+            .iter()
+            .map(|f| LotItem {
+                file: f.path.clone(),
+                text: String::new(),
+                node_ids: (0..1).map(|i| format!("{i:0>40}")).collect(),
+            })
+            .collect();
+        let empty = crate::llm::enrich::lot_user_prompt(&items).chars().count();
+        let sum: usize = (1..=2)
+            .map(|k| {
+                crate::llm::enrich::lot_entry(k, &items[k - 1], k)
+                    .chars()
+                    .count()
+            })
+            .sum();
+        assert_eq!(empty, sum);
+        assert!(2000 + empty <= 3000);
+    }
+
+    #[test]
+    fn req287_ac3_char_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let ascii = "abcdef";
+        let mixed = "é€😀x"; // 2, 3, 4 octets et 1 octet
+        std::fs::write(dir.path().join("a.txt"), ascii).unwrap();
+        std::fs::write(dir.path().join("m.txt"), mixed).unwrap();
+        let abs = HashMap::new();
+        let sources = Sources {
+            repo: dir.path(),
+            abs: &abs,
+            redact: None,
+            batch: false,
+        };
+        assert_eq!(sources.char_count(&rec("a.txt", 6)), 6);
+        assert_eq!(sources.char_count(&rec("m.txt", 10)), 4);
+        assert_eq!(sources.char_count(&rec("absent.txt", 77)), 77);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let weird = dir.path().join(std::ffi::OsStr::from_bytes(b"w\xff.txt"));
+            std::fs::write(&weird, "日本語").unwrap();
+            let mut abs = HashMap::new();
+            abs.insert("w_.txt".to_string(), weird);
+            let sources = Sources {
+                repo: dir.path(),
+                abs: &abs,
+                redact: None,
+                batch: false,
+            };
+            assert_eq!(sources.char_count(&rec("w_.txt", 9)), 3);
+        }
+    }
+
     #[test]
     fn req271_ac2_form_units_borne_40() {
         let counts = [30usize, 30, 10, 41];
         let files: Vec<_> = (0..4).map(|i| rec(&format!("f{i}"), 1)).collect();
         let nodes = |f: &FileRecord| counts[f.path[1..].parse::<usize>().unwrap()];
-        let u = form_units_by_nodes(&files, nodes, 8, 1000, 40);
+        let u = form_units_sized(&files, nodes, 8, 1000, 40);
         assert_eq!(shape(&u), ["f0", "f1,f2", "BIG:f3"]);
     }
 
@@ -5131,6 +5354,34 @@ mod tests {
         (dir, files)
     }
 
+    /// `max_chunk_chars` des essais dont les petits fichiers forment des lots : assez grand pour
+    /// que leurs entrées tiennent (REQ-287) ; les morceaux de `probe_repo` valent 10.
+    const PROBE_LOTS: usize = 1000;
+
+    /// Comme `probe_run_capped`, avec `max_chunk_chars` = `PROBE_LOTS` (lots de petits fichiers).
+    fn probe_run_lots(
+        dir: &tempfile::TempDir,
+        files: &[FileRecord],
+        llm: &dyn Llm,
+        batch_files: usize,
+        max_calls: Option<usize>,
+    ) -> (Store, BuildReport, Vec<(String, Error)>) {
+        probe_run_full(
+            dir,
+            files,
+            llm,
+            1,
+            batch_files,
+            max_calls,
+            0,
+            PassMode::Normal,
+            &[],
+            false,
+            None,
+            PROBE_LOTS,
+        )
+    }
+
     fn probe_run(
         dir: &tempfile::TempDir,
         files: &[FileRecord],
@@ -5338,7 +5589,7 @@ mod tests {
     fn req276_ac2_drifted_file_leaves_the_lot_and_takes_nothing_from_the_cap() {
         let (dir, files) = drifted_repo(3);
         let llm = Probe::new(0, &[]);
-        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 10, Some(1), 0);
+        let (store, report, failures) = probe_run_lots(&dir, &files, &llm, 10, Some(1));
         assert_eq!(llm.calls(), ["lot:S0.txt,S2.txt"]);
         assert_eq!(names(&failures), ["S1.txt"]);
         assert_eq!(
@@ -5475,7 +5726,7 @@ mod tests {
             &[],
             true,
             None,
-            10,
+            PROBE_LOTS,
         );
         assert_eq!(llm.calls(), ["lot:S0.txt,S2.txt"]);
         assert_eq!(names(&failures), ["S1.txt"]);
@@ -5492,7 +5743,7 @@ mod tests {
             &[],
             true,
             None,
-            10,
+            PROBE_LOTS,
         );
         assert_eq!(llm.calls(), ["lot:S0.txt,S2.txt"]);
         assert!(
@@ -5600,9 +5851,31 @@ mod tests {
     #[test]
     fn req051_ac3_appels_simultanes_bornes_par_concurrency() {
         for concurrency in [3usize, 1] {
-            let (dir, files) = probe_repo(&[("Big.txt", 8)], 4);
+            // Big.txt : 8 lignes de PROBE_LOTS caractères, un morceau chacune (REQ-287 : les
+            // petits fichiers ne forment des lots que si leurs entrées tiennent).
+            let (dir, mut files) = probe_repo(&[], 4);
+            let text: String = (0..8)
+                .map(|i| format!("w{i} {}\n", "x".repeat(PROBE_LOTS - 4)))
+                .collect();
+            std::fs::write(dir.path().join("Big.txt"), &text).unwrap();
+            let mut big = rec("Big.txt", text.len() as u64);
+            big.hash = crate::scan::content_hash(text.as_bytes());
+            files.insert(0, big);
             let llm = Probe::new(concurrency, &[]);
-            let (store, report, failures) = probe_run(&dir, &files, &llm, concurrency, 2);
+            let (store, report, failures) = probe_run_full(
+                &dir,
+                &files,
+                &llm,
+                concurrency,
+                2,
+                None,
+                0,
+                PassMode::Normal,
+                &[],
+                false,
+                None,
+                PROBE_LOTS,
+            );
             assert!(failures.is_empty(), "{failures:?}");
             assert_eq!(report.failed, 0);
             assert_eq!(
@@ -6397,7 +6670,7 @@ mod tests {
     fn req186_lot_attempt_is_taken_once_for_the_whole_lot() {
         let (dir, files) = probe_repo(&[], 6);
         let llm = Probe::new(0, &[]);
-        let (store, report, failures) = probe_run_capped(&dir, &files, &llm, 1, 3, Some(1), 0);
+        let (store, report, failures) = probe_run_lots(&dir, &files, &llm, 3, Some(1));
         assert!(failures.is_empty());
         assert_eq!(llm.calls(), ["lot:S0.txt,S1.txt,S2.txt"]);
         assert_eq!((report.capped, report.left_by_cap), (Some(1), 3));
@@ -6747,8 +7020,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             all: false,
         };
-        let (store, report, failures) =
-            probe_run_extra(&dir, &files, &llm, 1, 2, None, 0, PassMode::Normal, &[]);
+        let (store, report, failures) = probe_run_lots(&dir, &files, &llm, 2, None);
         // Deux lots en erreur réseau, le lot tronqué récupéré (E gardé, F repart seul), puis
         // l'erreur réseau de F : la troisième arrête l'envoi, G et H ne partent pas.
         assert_eq!(*llm.calls.lock().unwrap(), ["A+B", "C+D", "E+F", "F"]);
@@ -6772,8 +7044,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             all: true,
         };
-        let (store, report, failures) =
-            probe_run_extra(&dir, &files, &llm, 1, 2, None, 0, PassMode::Normal, &[]);
+        let (store, report, failures) = probe_run_lots(&dir, &files, &llm, 2, None);
         // Deux lots en erreur réseau, le lot tronqué dont tout est reçu (rien ne repart), puis
         // l'erreur réseau de G+H : la troisième arrête l'envoi, I et J ne partent pas.
         assert_eq!(*llm.calls.lock().unwrap(), ["A+B", "C+D", "E+F", "G+H"]);
@@ -7988,6 +8259,13 @@ mod estimate_tests {
         (0..n).map(|i| format!("n{i:02} xxxxx\n")).collect()
     }
 
+    /// Lignes de `width` octets `nNN xxxx…` : une par morceau pour `max_chunk_chars` = `width`.
+    fn wide_lines_text(n: usize, width: usize) -> String {
+        (0..n)
+            .map(|i| format!("n{i:02} {}\n", "x".repeat(width - 5)))
+            .collect()
+    }
+
     fn ids_for_lines(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("n{i:02}")).collect()
     }
@@ -7995,15 +8273,16 @@ mod estimate_tests {
     #[test]
     fn req184_ac5_lots_and_big_with_three_calls() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("d.txt"), lines_text(3)).unwrap();
-        // max_chunk_chars = 10, batch_files = 2. a.md (3 octets) et b.md (4) forment un lot de 2
-        // (7 ≤ 10) ; c.md (2) est seul, car le lot de 2 est plein ; d.txt (30 > 10) est un `Big` ; e.md
+        std::fs::write(dir.path().join("d.txt"), wide_lines_text(3, 400)).unwrap();
+        // max_chunk_chars = 400, batch_files = 2. a.md (3 octets) et b.md (4) forment un lot de 2
+        // (7 plus leurs entrées ≤ 400, REQ-287) ; c.md (2) est seul, car le lot de 2 est plein ;
+        // d.txt (1 200 > 400, trois lignes de 400) est un `Big` ; e.md
         // n'a aucun nœud (sans appel).
         let files = vec![
             rec("a.md", 3),
             rec("b.md", 4),
             rec("c.md", 2),
-            rec("d.txt", 30),
+            rec("d.txt", 1200),
             rec("e.md", 1),
         ];
         let ids = ids_of(&[
@@ -8012,7 +8291,7 @@ mod estimate_tests {
             ("c.md", &["id5"]),
             ("d.txt", &["n00", "n01", "n02"]),
         ]);
-        let e = run(dir.path(), &files, &ids, 2, 10);
+        let e = run(dir.path(), &files, &ids, 2, 400);
         assert_eq!((e.files, e.sent_alone, e.without_call), (5, 1, 1));
         assert_eq!(e.calls, 1 + 1 + 3);
         assert_eq!(e.nodes, 3 + 1 + 3);
@@ -8028,9 +8307,9 @@ mod estimate_tests {
         let lot2 = lot_system_prompt(LANG).len() + 211;
         let lot1 = enrichment_system_prompt(LANG).len() + 140;
         // Big de 3 appels : par appel, système + `Fichier : d.txt` (15) + `\n\nContenu :\n` (12) +
-        // morceau de 10 + `\n\nNœuds du fichier :\n` (22) + liste `[1] n0k — n0k\n` (16) + `\n` (1) +
+        // morceau de 400 + `\n\nNœuds du fichier :\n` (22) + liste `[1] n0k — n0k\n` (16) + `\n` (1) +
         // ligne d'extrait `(extrait k/3, lignes k–k)\n` (28, le tiret demi-cadratin fait 3 octets) + consigne (72) = 177 (bloc `<file path="d.txt">\n…\n</file>` depuis REQ-270).
-        let big = 3 * (enrichment_system_prompt(LANG).len() + 177);
+        let big = 3 * (enrichment_system_prompt(LANG).len() + 177 + 390);
         assert_eq!(e.bytes, lot2 + lot1 + big);
         assert_eq!(e.alone.len(), 1);
         assert_eq!(e.alone[0].path, "d.txt");

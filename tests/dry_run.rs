@@ -563,6 +563,32 @@ fn req184_ac4_estimation_egale_a_la_commande_reelle() {
     );
 }
 
+// ---- AC-287-5 : lots comptés en caractères, estimation et commande réelle ----
+
+#[test]
+fn req287_ac5_documents_chinois_un_appel_estime_egal_aux_requetes_reelles() {
+    let env = Env::new();
+    for i in 0..3 {
+        let text = format!("# Doc {i}\n\n{}\n", "字".repeat(1500));
+        fs::write(env.repo.join(format!("d{i}.md")), text).unwrap();
+    }
+    env.config_text(
+        "provider = \"mock\"\nmodel = \"mock\"\nenrich_code = true\nbatch_files = 10\nconcurrency = 1\nmax_chunk_chars = 6000\n",
+    );
+    let o = env.command(&["build", "--dry-run"]).output().unwrap();
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let lines = estimation_lines(&o);
+    assert_eq!(number(&lines[1], "minimale : ", " appels"), 1, "{lines:?}");
+
+    let log = env._tmp.path().join("mock.log");
+    let mut real = env.command(&["build"]);
+    real.env("NEPHILA_MOCK_LOG", &log);
+    let r = real.output().unwrap();
+    assert_eq!(code(&r), 0, "{}", err(&r));
+    let requests = fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(requests, 1);
+}
+
 // ---- AC-184-6 : fichiers estimés par update --dry-run ----
 
 /// Premier nombre de la ligne `estimation : <f> fichiers à enrichir dont <s> envoyés seuls et

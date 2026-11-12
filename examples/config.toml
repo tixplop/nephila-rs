@@ -187,7 +187,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 # structured_output = "auto"
 
 # Taille maximale, en caractères, d'un morceau de fichier envoyé au LLM. Entier > 0.
-# Défaut : 60000. Un lot de fichiers (voir batch_files) ne dépasse jamais cette taille.
+# Défaut : 60000. Un lot de fichiers (voir batch_files) ne dépasse jamais cette taille, listes de nœuds comprises.
 # Un dépôt peut le remplacer par son .nephila.toml.
 # Priorité : .nephila.toml du dépôt > ce fichier > défaut.
 # max_chunk_chars = 60000

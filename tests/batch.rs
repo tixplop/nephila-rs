@@ -180,13 +180,13 @@ fn req027_ac3_ten_files_batch_four_gives_4_4_2() {
 }
 
 #[test]
-fn req027_ac3_oversized_file_is_isolated_and_lots_respect_byte_bound() {
+fn req027_ac3_oversized_file_is_isolated_and_lots_respect_character_bound() {
     let env = Env::new(6, 4, 1);
     // F02 est gros : plusieurs morceaux ; les autres font ~40 octets, deux ne tiennent pas ensemble.
     // Chaque morceau porte une méthode : aucun appel à liste vide (REQ-159).
     let big = format!(
         "package p;\npublic class F02 {{\n{}}}\n",
-        (0..20)
+        (0..30)
             .map(|i| format!("void m{i}() {{}}\n"))
             .collect::<String>()
     );
@@ -198,7 +198,7 @@ fn req027_ac3_oversized_file_is_isolated_and_lots_respect_byte_bound() {
         )
         .unwrap();
     }
-    env.set_config(4, 1, 60);
+    env.set_config(4, 1, 300);
     let o = env.run("build", &[]);
     assert!(o.status.success(), "{}", stderr(&o));
     let log = env.log_lines();
@@ -213,12 +213,8 @@ fn req027_ac3_oversized_file_is_isolated_and_lots_respect_byte_bound() {
     assert!(log.iter().any(|l| l.contains(';')), "aucun lot : {log:?}");
     for l in &log {
         let fs_: Vec<String> = files_of(l);
-        let total: u64 = fs_
-            .iter()
-            .map(|f| fs::metadata(env.repo.join(f)).unwrap().len())
-            .sum();
         if fs_.len() > 1 {
-            assert!(total <= 60, "{l} : {total}");
+            assert_eq!(fs_.len(), 2, "{l}");
             assert!(!fs_.contains(&"src/F02.java".to_string()));
         }
     }
@@ -230,6 +226,42 @@ fn req027_ac3_oversized_file_is_isolated_and_lots_respect_byte_bound() {
             "{name}"
         );
     }
+    // Total compté (REQ-287) de chaque lot de 2 fichiers : caractères des fichiers plus
+    // `lot_user_prompt` à textes vides, ≤ 300 ; chaque fichier compte un nœud `type:p.F<nn>`.
+    let mut pairs = 0;
+    for l in &log {
+        let fs_ = files_of(l);
+        if fs_.len() < 2 {
+            continue;
+        }
+        pairs += 1;
+        let items: Vec<nephila::llm::enrich::LotItem> = fs_
+            .iter()
+            .map(|f| nephila::llm::enrich::LotItem {
+                file: f.clone(),
+                text: String::new(),
+                node_ids: vec![format!(
+                    "type:p.{}",
+                    f.trim_start_matches("src/").trim_end_matches(".java")
+                )],
+            })
+            .collect();
+        let chars: usize = fs_
+            .iter()
+            .map(|f| {
+                fs::read_to_string(env.repo.join(f))
+                    .unwrap()
+                    .chars()
+                    .count()
+            })
+            .sum();
+        let total = chars
+            + nephila::llm::enrich::lot_user_prompt(&items)
+                .chars()
+                .count();
+        assert!(total <= 300, "{l} : {total}");
+    }
+    assert_eq!(pairs, 2, "{log:?}");
 }
 
 fn graph_and_warnings(batch: usize, concurrency: usize) -> (String, Vec<String>) {
@@ -843,7 +875,7 @@ fn req027_ac12_character_budget_bounds_lots_and_big_document_goes_alone() {
     write_docs(&env, 100, |_| 1000);
     fs::write(
         &env.config,
-        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\nmax_chunk_chars = 3500\n",
+        "provider = \"mock\"\nmodel = \"mock\"\nconcurrency = 1\nmax_chunk_chars = 4000\n",
     )
     .unwrap();
     let o = env.run("build -v", &[]);
@@ -865,7 +897,7 @@ fn req027_ac12_character_budget_bounds_lots_and_big_document_goes_alone() {
             .unwrap()
             .parse()
             .unwrap();
-        assert!(c <= 3500, "{l}");
+        assert!(c <= 4000, "{l}");
     }
     assert_eq!(lots, 33);
 
@@ -1050,4 +1082,64 @@ fn req279_ac8_concept_of_a_lot_is_moved_to_its_markdown_file() {
             && e.kind == EdgeKind::Mentions
             && e.target == "concept:facturation"
     }));
+}
+
+/// Trois documents de 1 500 caractères chinois (4 500 octets), `max_chunk_chars` = 6 000.
+fn chinese_docs_env() -> Env {
+    let env = Env::new(0, 1, 1);
+    for i in 0..3 {
+        let text = format!("# Doc {i}\n\n{}\n", "字".repeat(1500));
+        fs::write(env.repo.join(format!("d{i}.md")), text).unwrap();
+    }
+    env
+}
+
+#[test]
+fn req287_ac4_chinese_documents_share_one_request() {
+    let entries: Vec<String> = (0..3)
+        .map(|i| {
+            format!(
+                r#"{{"file":"d{i}.md","summaries":[{{"node":"section:d{i}.md#doc-{i}","summary":"résumé {i}"}}],"concepts":[]}}"#
+            )
+        })
+        .collect();
+    let reply = format!(r#"{{"version":3,"files":[{}]}}"#, entries.join(","));
+    let server = FakeServer::start(vec![(200, openai_reply(&reply))]);
+    let env = chinese_docs_env();
+    fs::write(
+        &env.config,
+        format!(
+            "provider = \"openai\"\nmodel = \"m\"\nbase_url = \"{}\"\napi_key_env = \"NEPHILA_T053_KEY\"\nconcurrency = 1\nbatch_files = 10\nmax_chunk_chars = 6000\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let o = run_server(&env, "build");
+    assert!(o.status.success(), "{}", stderr(&o));
+    let reqs: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    assert_eq!(reqs.len(), 1, "une seule requête");
+    let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    let user = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_else(|| panic!("{body}"));
+    assert!(user.chars().count() <= 6000, "{}", user.chars().count());
+    for i in 0..3 {
+        assert!(user.contains(&format!("d{i}.md")), "d{i}.md absent");
+    }
+    let summaries = env.summaries();
+    for i in 0..3 {
+        assert!(
+            summaries.contains(&(format!("section:d{i}.md#doc-{i}"), format!("résumé {i}"))),
+            "{summaries:?}"
+        );
+    }
 }
