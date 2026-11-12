@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+#[path = "support/big_java.rs"]
+mod big_java;
 #[path = "support/delta_java.rs"]
 mod delta_java;
 #[path = "support/fake_server.rs"]
@@ -1325,4 +1327,53 @@ fn req293_ac2_dry_run_counts_the_copy_without_call() {
     let r = real.output().unwrap();
     assert_eq!(code(&r), 0, "{}", err(&r));
     assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), calls);
+}
+
+/// AC-294-4 : l'estimation d'un `update` après la modification d'un morceau d'un gros fichier
+/// compte un appel, comme la commande réelle, et n'envoie rien.
+#[test]
+#[allow(non_snake_case)]
+fn REQ294_AC4_dry_run_counts_only_the_changed_chunk() {
+    let server = FakeServer::start((1..=8).map(big_java::reply).collect());
+    let env = Env::new();
+    big_java::write_repo(&env.repo, &big_java::text("", "", None));
+    env.config_text(&format!(
+        "provider = \"openai\"\nmodel = \"m\"\nenrich_code = true\nconcurrency = 1\nbase_url = \"{}\"\napi_key_env = \"{KEY_VAR}\"\n",
+        server.base_url
+    ));
+    let real = |env: &Env, args: &[&str]| {
+        let mut c = env.command(args);
+        c.env(KEY_VAR, "sk-test");
+        c.output().unwrap()
+    };
+    let o = real(&env, &["build"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(server.requests().len(), 4, "4 requêtes au build");
+    let rows = env.store().call_results().unwrap();
+    assert_eq!(rows.len(), 4);
+
+    let target = big_java::method(big_java::TARGET);
+    let base = big_java::text("", "", None);
+    fs::write(
+        env.repo.join(big_java::BIG),
+        base.replace(&target, &target.replace("{ }", "{;}")),
+    )
+    .unwrap();
+    let o = real(&env, &["update", "--dry-run"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let lines = estimation_lines(&o);
+    assert!(
+        lines[1].starts_with("estimation minimale : 1 appels, "),
+        "{lines:?}"
+    );
+    assert_eq!(server.requests().len(), 4, "aucune requête envoyée");
+    assert_eq!(env.store().call_results().unwrap(), rows);
+
+    let o = real(&env, &["update"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        server.requests().len() - 4,
+        1,
+        "autant de requêtes que d'appels annoncés"
+    );
 }

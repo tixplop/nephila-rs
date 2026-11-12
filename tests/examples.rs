@@ -1272,7 +1272,7 @@ fn REQ229_AC1_AC4_readme_appels_gardes() {
         .expect("puce Ce qui reste");
     assert_eq!(
         *rest,
-        "- **Ce qui reste** : un fichier en échec reste « à enrichir », et `nephila update` ne renvoie que ceux-là. Un fichier envoyé seul n'est écrit qu'une fois complet, mais ses réponses valides sont gardées : seuls ses appels manquants repartent, et `max_calls` comme `--dry-run` ne comptent qu'eux. Une réponse gardée ne sert plus si son morceau change ou se déplace, si les nœuds du fichier changent, ou si `model` ou `summary_language` change. Aucune de ces causes n'arrête l'envoi tant qu'elle reste isolée."
+        "- **Ce qui reste** : un fichier en échec reste « à enrichir », et `nephila update` ne renvoie que ceux-là. Un fichier envoyé seul n'est écrit qu'une fois complet, mais ses réponses valides sont gardées : seuls ses appels manquants repartent, et `max_calls` comme `--dry-run` ne comptent qu'eux. Elles restent une fois le fichier écrit : seuls repartent les appels dont le morceau, les nœuds demandés, `model` ou `summary_language` changent. Aucune de ces causes n'arrête l'envoi tant qu'elle reste isolée."
     );
     let upgrade = readme_section(&readme, "## Mise à niveau");
     let bullets: Vec<&str> = upgrade.lines().filter(|l| l.starts_with("- ")).collect();
@@ -1289,6 +1289,37 @@ fn REQ229_AC1_AC4_readme_appels_gardes() {
     );
     for banned in ["repart en entier", "repris en entier", "renvoyé en entier"] {
         assert!(!readme.contains(banned), "{banned}");
+    }
+}
+
+/// AC-294-6 : puce `Ce qui reste` à jour (V-012, items 53 et 86), phrases fausses absentes, aide
+/// de `build` et `update` inchangée.
+#[test]
+fn REQ294_AC6_readme_reponses_gardees_apres_ecriture() {
+    let readme = repo_file("README.md");
+    assert!(readme.len() <= 54_536, "README : {} octets", readme.len());
+    let section = readme_section(&readme, "### Échecs et nouveaux essais");
+    let bullets: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(bullets.len(), 5, "{bullets:?}");
+    let rest = bullets
+        .iter()
+        .find(|l| l.starts_with("- **Ce qui reste**"))
+        .expect("puce Ce qui reste");
+    assert!(rest.contains(
+        "ne comptent qu'eux. Elles restent une fois le fichier écrit : seuls repartent les appels dont le morceau, les nœuds demandés, `model` ou `summary_language` changent. Aucune de ces causes"
+    ));
+    for banned in [
+        "si son morceau change ou se déplace",
+        "si les nœuds du fichier changent",
+        "repart en entier",
+    ] {
+        assert!(!readme.contains(banned), "{banned}");
+    }
+    for (cmd, reference) in [
+        ("build", include_str!("fixtures/help/build-f629db2.txt")),
+        ("update", include_str!("fixtures/help/update-f629db2.txt")),
+    ] {
+        assert_eq!(help_of(&[cmd, "--help"]), reference, "{cmd} --help");
     }
 }
 

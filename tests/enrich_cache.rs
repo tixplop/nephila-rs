@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 #[allow(dead_code)]
+#[path = "support/big_java.rs"]
+mod big_java;
+#[allow(dead_code)]
 #[path = "support/fake_server.rs"]
 mod fake_server;
 
@@ -2605,4 +2608,258 @@ fn REQ277_AC9_kept_call_of_an_equivalent_name_is_not_sent_again() {
             .unwrap(),
         0
     );
+}
+
+// ---- Gros fichier modifié : seuls les morceaux changés repartent (REQ-294, DEC-225) ----
+
+const DELTA_KEY: &str = "NEPHILA_T401_KEY";
+
+/// Dépôt d'un gros fichier et faux serveur `openai` qui répond `R<k>` (`k` = rang de la requête,
+/// à partir de 1) pour chaque numéro de nœud demandé.
+struct Delta {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    config: PathBuf,
+    server: fake_server::FakeServer,
+}
+
+impl Delta {
+    /// `files` : fichiers écrits dans le dépôt ; `limit` : `max_chunk_chars` ; `code` : `enrich_code`.
+    fn new(files: &[(&str, String)], limit: usize, code: bool) -> Delta {
+        let server = fake_server::FakeServer::start((1..=16).map(big_java::reply).collect());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        for (rel, content) in files {
+            let p = repo.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, content).unwrap();
+        }
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join(".nephila.toml"),
+            format!("max_chunk_chars = {limit}\n"),
+        )
+        .unwrap();
+        let config = tmp.path().join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "provider = \"openai\"\nmodel = \"m\"\nenrich_code = {code}\nconcurrency = 1\nbase_url = \"{}\"\napi_key_env = \"{DELTA_KEY}\"\n",
+                server.base_url
+            ),
+        )
+        .unwrap();
+        Delta {
+            _tmp: tmp,
+            repo,
+            config,
+            server,
+        }
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::cargo_bin("nephila").unwrap();
+        c.arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env(DELTA_KEY, "sk-test")
+            .env_remove("NEPHILA_MOCK_DIR")
+            .env_remove("NEPHILA_MOCK_LOG")
+            .env_remove("NO_COLOR");
+        c
+    }
+
+    fn ok(&self, args: &[&str]) -> Output {
+        let o = self.command(args).output().unwrap();
+        assert!(o.status.success(), "{}", text(&o.stderr));
+        o
+    }
+
+    /// Message utilisateur de chaque requête reçue, dans l'ordre.
+    fn prompts(&self) -> Vec<String> {
+        self.server
+            .requests()
+            .into_iter()
+            .map(|r| {
+                let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+                v["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["role"] == "user")
+                    .unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Résumé de chaque nœud résumé, lu dans la base.
+    fn summaries(&self) -> std::collections::BTreeMap<String, String> {
+        Store::open_readonly(&self.repo)
+            .unwrap()
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .filter_map(|n| n.summary.map(|s| (n.id, s)))
+            .collect()
+    }
+
+    fn call_rows(&self) -> usize {
+        Store::open_readonly(&self.repo)
+            .unwrap()
+            .call_results()
+            .unwrap()
+            .len()
+    }
+
+    fn write(&self, rel: &str, content: &str) {
+        fs::write(self.repo.join(rel), content).unwrap();
+    }
+}
+
+/// Gros fichier Java enrichi par un `build` de 4 requêtes (précondition vérifiée).
+fn enriched_java() -> Delta {
+    let d = Delta::new(
+        &[(big_java::BIG, big_java::text("", "", None))],
+        big_java::LIMIT,
+        true,
+    );
+    d.ok(&["build"]);
+    assert_eq!(d.prompts().len(), 4, "4 requêtes au build");
+    assert_eq!(d.call_rows(), 4);
+    d
+}
+
+/// Rangs (à partir de 1) des requêtes dont le message contient `line`.
+fn asking(prompts: &[String], line: &str) -> Vec<usize> {
+    (0..prompts.len())
+        .filter(|&i| prompts[i].contains(line))
+        .map(|i| i + 1)
+        .collect()
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ294_AC1_one_changed_chunk_sends_one_request_and_keeps_the_other_summaries() {
+    let d = enriched_java();
+    let before = d.summaries();
+    let sent = d.prompts();
+    let target = big_java::method(big_java::TARGET);
+    assert_eq!(
+        asking(&sent, target.trim()),
+        [big_java::TARGET_CHUNK],
+        "précondition"
+    );
+    let changed = big_java::text("", "", None).replace(&target, &target.replace("{ }", "{;}"));
+    d.write(big_java::BIG, &changed);
+    d.ok(&["update"]);
+    let prompts = d.prompts();
+    assert_eq!(prompts.len(), 5, "exactement 1 requête de plus");
+    assert!(prompts[4].contains("{;}"));
+    let after = d.summaries();
+    let kept: Vec<_> = before.iter().filter(|(_, s)| *s != "R3").collect();
+    assert!(!kept.is_empty());
+    for (id, s) in &kept {
+        assert_eq!(after.get(*id), Some(*s), "{id}");
+    }
+    let resent: Vec<_> = before.iter().filter(|(_, s)| *s == "R3").collect();
+    assert!(!resent.is_empty());
+    for (id, _) in &resent {
+        assert_eq!(after.get(*id).map(String::as_str), Some("R5"), "{id}");
+    }
+    assert_eq!(d.call_rows(), 4);
+}
+
+/// Modifie le fichier de l'état enrichi, lance `update` et rend les messages des requêtes qui
+/// sont parties (après celles du `build`).
+fn update_after(d: &Delta, content: &str) -> Vec<String> {
+    d.write(big_java::BIG, content);
+    d.ok(&["update"]);
+    d.prompts().split_off(4)
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ294_AC2_a_comment_lines_in_head_resend_only_chunk_1() {
+    let d = enriched_java();
+    let sent = update_after(&d, &big_java::text("// a\n// b\n// c\n", "", None));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains(big_java::method(1).trim()));
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ294_AC2_b_added_import_resends_only_chunk_1() {
+    let d = enriched_java();
+    let sent = update_after(&d, &big_java::text("", "import java.util.List;\n", None));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains(big_java::method(1).trim()));
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ294_AC2_c_method_added_in_chunk_2_resends_only_chunk_2() {
+    let d = enriched_java();
+    let build = d.prompts();
+    let added = "    void added() { }\n\n";
+    let at = big_java::CHUNK_2_METHOD;
+    assert_eq!(
+        asking(&build, big_java::method(at).trim()),
+        [2],
+        "précondition"
+    );
+    let sent = update_after(&d, &big_java::text("", "", Some((at, added))));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("void added()"));
+    assert!(sent[0].contains(big_java::method(at).trim()));
+    let summaries = d.summaries();
+    let new: Vec<_> = summaries
+        .iter()
+        .filter(|(id, _)| id.contains("added"))
+        .collect();
+    assert_eq!(new.len(), 1, "{summaries:?}");
+    assert_eq!(new[0].1, "R5");
+}
+
+/// Document Markdown de 80 sections `##` courtes (`extra` : texte ajouté sous le premier titre).
+fn markdown_doc(extra: &str) -> String {
+    (1..=80)
+        .map(|i| {
+            let more = if i == 1 { extra } else { "" };
+            format!("## T{i:03}\n\n{more}{}\n\n", "mot ".repeat(10))
+        })
+        .collect()
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn REQ294_AC3_markdown_paragraph_in_first_section_resends_only_chunk_1() {
+    let doc = "docs/guide.md";
+    let d = Delta::new(&[(doc, markdown_doc(""))], 1500, false);
+    d.ok(&["build"]);
+    let build = d.prompts();
+    assert_eq!(build.len(), 3, "3 requêtes au build");
+    let first = "## T001";
+    assert_eq!(asking(&build, first), [1], "précondition");
+    let before = d.summaries();
+    let added = "Un paragraphe ajouté.\n\n";
+    d.write(doc, &markdown_doc(added));
+    d.ok(&["update"]);
+    let sent = d.prompts().split_off(3);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains(first) && sent[0].contains("Un paragraphe ajouté."));
+    let after = d.summaries();
+    let kept: Vec<_> = before.iter().filter(|(_, s)| *s != "R1").collect();
+    assert!(!kept.is_empty());
+    for (id, s) in &kept {
+        assert_eq!(after.get(*id), Some(*s), "{id}");
+    }
+    let resent: Vec<_> = before.iter().filter(|(_, s)| *s == "R1").collect();
+    assert!(!resent.is_empty());
+    for (id, _) in &resent {
+        assert_eq!(after.get(*id).map(String::as_str), Some("R4"), "{id}");
+    }
 }
