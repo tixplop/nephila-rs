@@ -974,3 +974,434 @@ fn req008_ac6_removed_dependency_node_disappears_after_update() {
     let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert!(!v["unresolved"].to_string().contains("slf4j"));
 }
+
+// ---- REQ-289 / REQ-291 : enrichissement des seuls nœuds manquants (DEC-223) ----
+
+#[allow(dead_code)]
+#[path = "support/delta_java.rs"]
+mod delta_java;
+#[allow(dead_code)]
+#[path = "support/fake_server.rs"]
+mod fake_server;
+
+/// Dépôt Gradle (`settings.gradle` à la racine, `a/b/build.gradle`) enrichi par un faux serveur
+/// `openai` ; les réponses désignent les nœuds par leur numéro dans la liste demandée.
+struct GradleEnv {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    config: PathBuf,
+    server: fake_server::FakeServer,
+}
+
+const SCRIPT: &str = "a/b/build.gradle";
+
+fn numbered_reply(summaries: &[(usize, &str)]) -> (u16, String) {
+    let items: Vec<serde_json::Value> = summaries
+        .iter()
+        .map(|(n, s)| serde_json::json!({"n": n, "summary": s}))
+        .collect();
+    let text = serde_json::json!({"summaries": items, "concepts": []}).to_string();
+    let body = serde_json::json!({"choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}]});
+    (200, body.to_string())
+}
+
+impl GradleEnv {
+    fn new(replies: Vec<(u16, String)>) -> GradleEnv {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("a/b")).unwrap();
+        fs::write(
+            repo.join("settings.gradle"),
+            "rootProject.name = 'shop'\ninclude 'a:b'\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join(SCRIPT),
+            "dependencies {\n    implementation 'org.slf4j:slf4j-api:2.0.9'\n}\n",
+        )
+        .unwrap();
+        let server = fake_server::FakeServer::start(replies);
+        let config = tmp.path().join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\napi_key_env = \"NEPHILA_T396_KEY\"\nconcurrency = 1\nbase_url = \"{}\"\n",
+                server.base_url
+            ),
+        )
+        .unwrap();
+        GradleEnv {
+            _tmp: tmp,
+            repo,
+            config,
+            server,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_T396_KEY", "sk-test")
+            .env_remove("NO_COLOR")
+            .output()
+            .unwrap()
+    }
+
+    fn ok(&self, args: &[&str]) -> (String, String) {
+        let o = self.run(args);
+        let (out, err) = (
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        );
+        assert!(o.status.success(), "{args:?} : {err}");
+        (out, err)
+    }
+
+    /// Enrichissement initial, avant l'ajout de `a/settings.gradle` ; rend les nœuds enrichissables
+    /// de `SCRIPT` avec leur résumé, lus dans la base.
+    fn first_build(&self) -> Vec<(String, Option<String>)> {
+        self.ok(&["build", "--enrich-code", "--batch-files", "1"]);
+        assert_eq!(self.posts().len(), 1);
+        self.enrichable(SCRIPT)
+    }
+
+    /// Ajoute `a/settings.gradle` : mêmes octets pour `SCRIPT`, autres identifiants.
+    fn add_nested_settings(&self) {
+        fs::write(
+            self.repo.join("a/settings.gradle"),
+            "rootProject.name = 'a'\n",
+        )
+        .unwrap();
+    }
+
+    fn posts(&self) -> Vec<String> {
+        self.server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == "/v1/chat/completions")
+            .map(|r| r.body)
+            .collect()
+    }
+
+    /// Nœuds enrichissables d'un fichier (hors `package:` et `key:`) et leur résumé, lus dans
+    /// la base, triés.
+    fn enrichable(&self, path: &str) -> Vec<(String, Option<String>)> {
+        let mut v: Vec<(String, Option<String>)> = Store::open_readonly(&self.repo)
+            .unwrap()
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.file.as_deref() == Some(path))
+            .filter(|n| !n.id.starts_with("package:") && !n.id.starts_with("key:"))
+            .map(|n| (n.id, n.summary))
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+/// Identifiants listés (`[<n> — <id>]`) dans le prompt d'une requête d'enrichissement.
+fn requested_ids(body: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    let prompt = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.contains("Nœuds du fichier :"))
+        .unwrap_or_else(|| panic!("aucun prompt d'enrichissement dans {body}"));
+    let list = prompt.split("Nœuds du fichier :\n").nth(1).unwrap();
+    list.lines()
+        .map_while(|l| l.strip_prefix('[').and_then(|r| r.split_once(" — ")))
+        .map(|(_, id)| id.to_string())
+        .collect()
+}
+
+fn structure_end(err: &str) -> &str {
+    err.lines()
+        .find(|l| l.contains("structure: fin"))
+        .unwrap_or_else(|| panic!("aucune ligne structure: fin : {err}"))
+}
+
+#[test]
+fn req289_ac3_req290_ac7_gradle_nested_settings_counts_discarded_and_leaves_the_script_to_enrich() {
+    let env = GradleEnv::new(vec![numbered_reply(&[(1, "premier")])]);
+    let before = env.first_build();
+    assert!(before.iter().all(|(_, s)| s.is_some()), "{before:?}");
+    env.add_nested_settings();
+    let (out, err) = env.ok(&["update", "--no-llm", "--verbose"]);
+    let after = env.enrichable(SCRIPT);
+    // Précondition : l'ajout change les identifiants du script à contenu égal.
+    let ids = |v: &[(String, Option<String>)]| v.iter().map(|(i, _)| i.clone()).collect::<Vec<_>>();
+    assert_ne!(
+        ids(&before),
+        ids(&after),
+        "l'ajout de a/settings.gradle doit changer des identifiants de {SCRIPT} : choisir un autre script"
+    );
+    // AC-289-3 : résumés de l'entrée dont le nœud a disparu, lus dans la base.
+    let discarded = before
+        .iter()
+        .filter(|(id, s)| s.is_some() && !after.iter().any(|(a, _)| a == id))
+        .count();
+    assert!(discarded > 0, "{before:?} -> {after:?}");
+    assert!(
+        structure_end(&err).ends_with(&format!(", {discarded} résumés écartés")),
+        "{err}"
+    );
+    // AC-289-3 : stdout identique à celui d'un `update` sans `--verbose`.
+    let plain = GradleEnv::new(vec![numbered_reply(&[(1, "premier")])]);
+    plain.first_build();
+    plain.add_nested_settings();
+    let (plain_out, plain_err) = plain.ok(&["update", "--no-llm"]);
+    assert_eq!(plain_out, out);
+    assert!(!plain_err.contains("résumés écartés"), "{plain_err}");
+    // AC-290-7 : aucune requête ; `status` compte le script et `a/settings.gradle`, nouveau
+    // fichier sans entrée d'enrichissement.
+    assert_eq!(env.posts().len(), 1, "aucune requête de l'update");
+    let n = 2;
+    let (status, _) = env.ok(&["status"]);
+    let lines: Vec<&str> = status.lines().collect();
+    assert_eq!(lines[0], "graphe à jour", "{status}");
+    assert!(
+        !lines.iter().any(|l| l.contains(&format!("\t{SCRIPT}"))),
+        "{status}"
+    );
+    assert_eq!(
+        *lines.last().unwrap(),
+        format!("{n} fichiers à enrichir (résumés et concepts)"),
+        "{status}"
+    );
+    let (json, _) = env.ok(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["to_enrich"], n, "{json}");
+}
+
+// ---- REQ-291 : scénario Java, montée de version simulée (seule une partie des identifiants change) ----
+
+/// `p/A.java` et `p/B.java` enrichis par `build` ; `max_chunk_chars` = 200 : `m4` et `m5` seules
+/// dans le morceau 2 de `p/A.java`.
+struct JavaEnv {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    config: PathBuf,
+    server: fake_server::FakeServer,
+}
+
+impl JavaEnv {
+    /// `delta` : réponses de la requête de rattrapage (`answered` résumés numérotés de 1).
+    fn new(answered: usize) -> JavaEnv {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        delta_java::write_repo(&repo, 200);
+        let mut replies: Vec<(u16, String)> = (1..=3).map(|k| delta_java::reply(k, 8)).collect();
+        replies.push(delta_java::reply(4, answered));
+        let server = fake_server::FakeServer::start(replies);
+        let config = tmp.path().join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "provider = \"openai\"\nenrich_code = true\nmodel = \"m\"\napi_key_env = \"NEPHILA_T396_KEY\"\nconcurrency = 1\nbase_url = \"{}\"\n",
+                server.base_url
+            ),
+        )
+        .unwrap();
+        JavaEnv {
+            _tmp: tmp,
+            repo,
+            config,
+            server,
+        }
+    }
+
+    fn ok(&self, args: &[&str]) -> (String, String) {
+        let o = Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("NEPHILA_CONFIG", &self.config)
+            .env("NEPHILA_T396_KEY", "sk-test")
+            .output()
+            .unwrap();
+        let (out, err) = (
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        );
+        assert!(o.status.success(), "{args:?} : {err}");
+        (out, err)
+    }
+
+    fn posts(&self) -> Vec<String> {
+        self.server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == "/v1/chat/completions")
+            .map(|r| r.body)
+            .collect()
+    }
+
+    fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.repo.join(".nephila/graph.db")).unwrap()
+    }
+
+    /// Nœuds enrichissables de `p/A.java` (déclarations d'analyse sans doc, hors `package:` et
+    /// `key:`), triés, lus dans la base.
+    fn enrichable(&self) -> Vec<String> {
+        let mut st = self
+            .db()
+            .prepare(
+                "SELECT node FROM declarations WHERE file = ?1 AND origin = 'parse' AND doc IS NULL
+                 AND node NOT LIKE 'package:%' AND node NOT LIKE 'key:%' ORDER BY node",
+            )
+            .unwrap()
+            .query_map([delta_java::A], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        st.sort();
+        st
+    }
+
+    /// Résumés de l'entrée de `p/A.java` : (identifiant, texte) et `nodes_hash`.
+    fn entry(&self) -> (Vec<(String, String)>, Option<String>) {
+        let (payload, hash): (String, Option<String>) = self
+            .db()
+            .query_row(
+                "SELECT payload, nodes_hash FROM enrichments WHERE path = ?1",
+                [delta_java::A],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let sums = v["summaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p[0].as_str().unwrap().into(), p[1].as_str().unwrap().into()))
+            .collect();
+        (sums, hash)
+    }
+
+    fn node_summary(&self, id: &str) -> Option<String> {
+        self.db()
+            .query_row("SELECT summary FROM nodes WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// Premier `build` (précondition : 2 requêtes pour `p/A.java`), puis montée de version
+    /// simulée. Rend les textes des résumés de l'entrée avant et les nœuds manquants après.
+    fn prepared(&self) -> (Vec<(String, String)>, Vec<String>) {
+        self.ok(&["build", "--enrich-code", "--batch-files", "1"]);
+        let posts = self.posts();
+        assert_eq!(posts.len(), 3, "{posts:?}");
+        assert_eq!(
+            posts
+                .iter()
+                .filter(|b| requested_ids(b).iter().any(|i| i.contains("p.A")))
+                .count(),
+            2,
+            "précondition : p/A.java part en 2 requêtes"
+        );
+        let first = self.entry().0;
+        delta_java::simulate_upgrade(&self.repo);
+        let kept: Vec<String> = self.entry().0.into_iter().map(|(i, _)| i).collect();
+        let missing: Vec<String> = self
+            .enrichable()
+            .into_iter()
+            .filter(|i| !kept.contains(i))
+            .collect();
+        (first, missing)
+    }
+}
+
+#[test]
+fn req291_ac1_ac7_java_delta_asks_only_missing_nodes_and_reports_the_whole_file() {
+    let env = JavaEnv::new(8);
+    let (first, missing) = env.prepared();
+    let t = env.enrichable().len();
+    assert_eq!(missing.len(), 2, "{missing:?}");
+    assert!(missing.len() < t, "{t}");
+    let (out, err) = env.ok(&["build", "--verbose", "--enrich-code", "--batch-files", "1"]);
+    // AC-291-1 : une seule requête de plus, pour le morceau 2 de `p/A.java`, liste = nœuds manquants.
+    let posts = env.posts();
+    assert_eq!(posts.len(), 4, "{err}");
+    assert_eq!(requested_ids(&posts[3]), missing);
+    assert!(
+        !posts[3].contains("p/B.java") && !posts[3].contains("p.B"),
+        "{}",
+        posts[3]
+    );
+    // Résumés : `m4` et `m5` de la nouvelle requête, les autres ceux du premier `build`.
+    let (sums, hash) = env.entry();
+    for id in env.enrichable() {
+        let text = env
+            .node_summary(&id)
+            .unwrap_or_else(|| panic!("{id} sans résumé"));
+        if missing.contains(&id) {
+            assert_eq!(text, "R4", "{id}");
+        } else {
+            let old = first.iter().find(|(i, _)| *i == id).unwrap();
+            assert_eq!(text, old.1, "{id}");
+        }
+    }
+    assert!(sums.iter().all(|(i, _)| !i.ends_with("(int)")), "{sums:?}");
+    let expected = blake3::hash(env.enrichable().join("\n").as_bytes())
+        .to_hex()
+        .to_string();
+    assert_eq!(hash, Some(expected));
+    let (status, _) = env.ok(&["status"]);
+    assert!(!status.contains("fichiers à enrichir"), "{status}");
+    env.ok(&["update", "--enrich-code", "--batch-files", "1"]);
+    env.ok(&["build", "--enrich-code", "--batch-files", "1"]);
+    assert_eq!(env.posts().len(), 4, "aucune requête de plus");
+    // AC-291-7 : bilan du fichier entier, trace des résumés écartés, lignes d'appel.
+    assert!(
+        out.contains(&format!(", 0 fichiers à enrichir, {t}/{t} nœuds résumés")),
+        "{out}"
+    );
+    assert!(
+        structure_end(&err).ends_with(", 2 résumés écartés"),
+        "{err}"
+    );
+    let ks: Vec<usize> = err
+        .lines()
+        .filter(|l| l.contains(&format!("llm enrich fin {} ", delta_java::A)))
+        .map(|l| {
+            let tail = l.split(" nœuds résumés)").next().unwrap();
+            let seg = tail.rsplit(", ").next().unwrap();
+            let (k, m) = seg.split_once('/').unwrap();
+            assert_eq!(k, m, "{l}");
+            k.parse().unwrap()
+        })
+        .collect();
+    assert_eq!(ks.iter().sum::<usize>(), 2, "{err}");
+    assert!(
+        !err.contains("delta") && !out.contains("delta"),
+        "{err}{out}"
+    );
+}
+
+#[test]
+fn req291_ac7_java_omitted_node_counts_as_tried_and_is_not_asked_again() {
+    let env = JavaEnv::new(1);
+    let (_, missing) = env.prepared();
+    let t = env.enrichable().len();
+    let (out, _) = env.ok(&["build", "--enrich-code", "--batch-files", "1"]);
+    assert_eq!(env.posts().len(), 4);
+    assert!(
+        out.contains(&format!(
+            ", 0 fichiers à enrichir, {}/{t} nœuds résumés",
+            t - 1
+        )),
+        "{out}"
+    );
+    assert!(env.node_summary(&missing[1]).is_none(), "m5 omis");
+    let (status, _) = env.ok(&["status"]);
+    assert!(!status.contains("fichiers à enrichir"), "{status}");
+    env.ok(&["build", "--enrich-code", "--batch-files", "1"]);
+    assert_eq!(env.posts().len(), 4, "aucune requête de plus");
+}

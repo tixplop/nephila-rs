@@ -1848,9 +1848,9 @@ fn estimate_alone(
     out
 }
 
-/// Nœuds à demander pour chaque fichier (identifiant, nom court) : déclarés sans doc (DEC-180),
+/// Nœuds enrichissables de chaque fichier (identifiant, nom court) : déclarés sans doc (DEC-180),
 /// hors packages et clés de configuration (REQ-024).
-pub(crate) fn nodes_by_file(store: &Store) -> Result<HashMap<String, Vec<(String, String)>>> {
+pub(crate) fn all_nodes_by_file(store: &Store) -> Result<HashMap<String, Vec<(String, String)>>> {
     let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for (file, node, short) in store.undocumented_short_names()? {
         if !node.starts_with("package:") && !node.starts_with("key:") {
@@ -1858,6 +1858,36 @@ pub(crate) fn nodes_by_file(store: &Store) -> Result<HashMap<String, Vec<(String
         }
     }
     Ok(map)
+}
+
+/// Nœuds à demander : pour un fichier qui a une base (REQ-291), les seuls nœuds sans résumé dans
+/// la base ; pour les autres, la liste complète.
+fn missing_nodes(
+    full: &HashMap<String, Vec<(String, String)>>,
+    bases: &HashMap<String, Enrichment>,
+) -> HashMap<String, Vec<(String, String)>> {
+    full.iter()
+        .filter_map(|(file, nodes)| match bases.get(file) {
+            None => Some((file.clone(), nodes.clone())),
+            Some(base) => {
+                let missing: Vec<(String, String)> = nodes
+                    .iter()
+                    .filter(|(id, _)| !base.summaries.iter().any(|(s, _)| s == id))
+                    .cloned()
+                    .collect();
+                (!missing.is_empty()).then(|| (file.clone(), missing))
+            }
+        })
+        .collect()
+}
+
+/// Nœuds à demander pour chaque fichier, réduits aux nœuds manquants pour les fichiers qui ont
+/// une base (REQ-291).
+pub(crate) fn nodes_by_file(
+    store: &Store,
+    bases: &HashMap<String, Enrichment>,
+) -> Result<HashMap<String, Vec<(String, String)>>> {
+    Ok(missing_nodes(&all_nodes_by_file(store)?, bases))
 }
 
 /// Nœuds concept et références `mentions` (section → concept) d'un enrichissement.
@@ -2085,6 +2115,7 @@ impl Drop for ExpandGuard<'_, '_> {
 fn queue_done(
     file: &FileRecord,
     x: &Enrichment,
+    bases: &HashMap<String, Enrichment>,
     succeeded: &mut usize,
     write_error: &Option<Error>,
     pending: &mut Vec<EnrichmentWrite>,
@@ -2102,6 +2133,15 @@ fn queue_done(
             x.rejected.join(" ; ")
         ));
     }
+    // Fichier delta : l'entrée conservée d'abord, puis ce qui a été reçu (REQ-291).
+    let merged;
+    let x = match bases.get(&file.path) {
+        Some(base) => {
+            merged = chunk::merge_enrichments(vec![base.clone(), x.clone()]);
+            &merged
+        }
+        None => x,
+    };
     let (concepts, refs) = concept_records(x);
     pending.push(EnrichmentWrite {
         path: file.path.clone(),
@@ -2157,6 +2197,7 @@ fn partial_of<'p>(
 fn complete_file(
     entry: &mut Partial,
     file: &FileRecord,
+    bases: &HashMap<String, Enrichment>,
     succeeded: &mut usize,
     write_error: &Option<Error>,
     pending: &mut Vec<EnrichmentWrite>,
@@ -2172,7 +2213,7 @@ fn complete_file(
     } else {
         chunk::merge_enrichments(parts)
     };
-    queue_done(file, &merged, succeeded, write_error, pending, notes);
+    queue_done(file, &merged, bases, succeeded, write_error, pending, notes);
     1
 }
 
@@ -2777,7 +2818,11 @@ pub(crate) fn enrich_pass(
         opts.batch_files,
         opts.format_retries,
     );
-    let ids = nodes_by_file(store)?;
+    // Fichiers à enrichir en delta (REQ-291) : seuls leurs nœuds manquants sont demandés.
+    let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    let bases = store.delta_bases(&paths)?;
+    let all_ids = all_nodes_by_file(store)?;
+    let ids = missing_nodes(&all_ids, &bases);
     let kept = KeptCalls {
         results: store.call_results()?,
         model: llm.model().to_string(),
@@ -2897,6 +2942,7 @@ pub(crate) fn enrich_pass(
                                     queue_done(
                                         &file,
                                         &x,
+                                        &bases,
                                         &mut succeeded,
                                         &write_error,
                                         &mut pending,
@@ -2934,6 +2980,7 @@ pub(crate) fn enrich_pass(
                                     adv = complete_file(
                                         entry,
                                         file,
+                                        &bases,
                                         &mut succeeded,
                                         &write_error,
                                         &mut pending,
@@ -2973,6 +3020,7 @@ pub(crate) fn enrich_pass(
                             adv = complete_file(
                                 entry,
                                 file,
+                                &bases,
                                 &mut succeeded,
                                 &write_error,
                                 &mut pending,
@@ -2991,7 +3039,7 @@ pub(crate) fn enrich_pass(
             }
             for w in &pending {
                 report.summarized += w.summaries.len();
-                report.requested += ids.get(&w.path).map_or(0, Vec::len);
+                report.requested += all_ids.get(&w.path).map_or(0, Vec::len);
             }
             flush_group(
                 store,
@@ -8845,7 +8893,7 @@ mod doc_tests {
         store
             .replace_structure("B.java", &[dep(None)], &[])
             .unwrap();
-        let map = nodes_by_file(&store).unwrap();
+        let map = nodes_by_file(&store, &HashMap::new()).unwrap();
         let ids = |f: &str| -> Vec<&str> { map[f].iter().map(|(id, _)| id.as_str()).collect() };
         assert_eq!(ids("A.java"), ["method:p.A.prix"]);
         assert_eq!(ids("B.java"), ["dependency:x:y"]);
@@ -9569,5 +9617,265 @@ mod first_call_tests {
             assert_eq!(report.capped, None);
             assert_eq!(llm.st.lock().unwrap().started.len(), 3);
         });
+    }
+}
+
+/// REQ-291 : enrichissement delta (seuls les nœuds manquants sont demandés, résultat fusionné).
+#[cfg(test)]
+mod delta_tests {
+    use super::*;
+    use crate::llm::enrich::Concept;
+
+    const TEXT: &str = "w0 xxxxxxx\nw1 xxxxxxx\n";
+
+    /// Genre des nœuds du fichier : des méthodes ; des sections pour les références `mentions`
+    /// (seules les sections peuvent citer un concept), ce qui garde les appels sans nœud d'un
+    /// Markdown à sections (REQ-159).
+    #[derive(Clone, Copy)]
+    struct Kind(NodeKind);
+
+    impl Kind {
+        fn id(self, short: &str) -> String {
+            format!("{}:D.md.{short}", self.0.as_str())
+        }
+
+        fn node(self, short: &str) -> Node {
+            Node::new(
+                self.0,
+                &format!("D.md.{short}"),
+                short,
+                Some("D.md"),
+                None,
+                None,
+            )
+        }
+    }
+
+    const METHODS: Kind = Kind(NodeKind::Method);
+    const SECTIONS: Kind = Kind(NodeKind::Section);
+
+    fn concept(name: &str, summary: &str) -> Node {
+        Node::new(NodeKind::Concept, name, name, None, None, Some(summary))
+    }
+
+    fn mention(kind: Kind, source: &str, target: &str) -> Ref {
+        Ref {
+            source: kind.id(source),
+            kind: EdgeKind::Mentions,
+            target_name: target.into(),
+            context: None,
+        }
+    }
+
+    /// Rend, pour chaque nœud demandé, un résumé `reçu <nœud>`, plus les concepts `commande` (autre
+    /// résumé) et `paiement` ; garde la liste demandée de chaque appel.
+    struct DeltaLlm {
+        kind: Kind,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Llm for DeltaLlm {
+        fn model(&self) -> &str {
+            "m"
+        }
+        fn enrich(
+            &self,
+            _: &str,
+            _: usize,
+            _: &str,
+            requested: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls.lock().unwrap().push(requested.to_vec());
+            let sections = if self.kind.0 == NodeKind::Section {
+                vec![self.kind.id("w1")]
+            } else {
+                vec![]
+            };
+            Ok(Enrichment {
+                summaries: requested
+                    .iter()
+                    .map(|n| (n.clone(), format!("reçu {n}")))
+                    .collect(),
+                concepts: vec![
+                    Concept {
+                        name: "commande".into(),
+                        summary: Some("autre".into()),
+                        sections: sections.clone(),
+                    },
+                    Concept {
+                        name: "paiement".into(),
+                        summary: Some("p".into()),
+                        sections,
+                    },
+                ],
+                ..Enrichment::default()
+            })
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    /// `D.md` de 2 morceaux (un nœud chacun : `w0`, `w1`), enrichi avec le modèle `entry_model`
+    /// pour les nœuds `w0` et `zz` (concepts `commande`, mentionné par `w0` et `zz`, et `oubli`,
+    /// mentionné par `zz` seul, avec des sections) ; puis la structure devient `w0`, `w1` : `w1`
+    /// manque, `zz` est écarté, l'entrée est marquée.
+    fn marked(entry_model: &str, kind: Kind) -> (tempfile::TempDir, Store, FileRecord) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("D.md"), TEXT).unwrap();
+        let file = FileRecord {
+            path: "D.md".into(),
+            hash: crate::scan::content_hash(TEXT.as_bytes()),
+            size: TEXT.len() as u64,
+            mtime: 0,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        };
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(std::slice::from_ref(&file)).unwrap();
+        store.set_enrich_model("m").unwrap();
+        store
+            .set_enrich_language(crate::config::DEFAULT_SUMMARY_LANGUAGE)
+            .unwrap();
+        store
+            .replace_structure("D.md", &[kind.node("w0"), kind.node("zz")], &[])
+            .unwrap();
+        let (concepts, refs) = if kind.0 == NodeKind::Section {
+            (
+                vec![concept("commande", "base"), concept("oubli", "o")],
+                vec![
+                    mention(kind, "w0", "commande"),
+                    mention(kind, "zz", "commande"),
+                    mention(kind, "zz", "oubli"),
+                ],
+            )
+        } else {
+            (vec![], vec![])
+        };
+        store
+            .apply_enrichment(
+                "D.md",
+                &file.hash,
+                entry_model,
+                crate::config::DEFAULT_SUMMARY_LANGUAGE,
+                &[
+                    (kind.id("w0"), "repris w0".into()),
+                    (kind.id("zz"), "repris zz".into()),
+                ],
+                &concepts,
+                &refs,
+            )
+            .unwrap();
+        store
+            .replace_structure("D.md", &[kind.node("w0"), kind.node("w1")], &[])
+            .unwrap();
+        (dir, store, file)
+    }
+
+    fn run(
+        dir: &tempfile::TempDir,
+        store: &mut Store,
+        file: &FileRecord,
+        kind: Kind,
+    ) -> (DeltaLlm, BuildReport) {
+        let llm = DeltaLlm {
+            kind,
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut report = BuildReport::default();
+        let opts = IndexOptions {
+            jobs: 1,
+            concurrency: 1,
+            max_chunk_chars: 10,
+            batch_files: 1,
+            enrich_code: false,
+            ..IndexOptions::default()
+        };
+        let failures = enrich_pass(
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+                redact: None,
+                batch: false,
+            },
+            std::slice::from_ref(file),
+            &opts,
+            &llm,
+            store,
+            &mut report,
+            &AtomicBool::new(false),
+            PassMode::Normal,
+        )
+        .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        (llm, report)
+    }
+
+    fn summary(store: &Store, id: &str) -> Option<String> {
+        store.node_by_id(id).unwrap().and_then(|n| n.summary)
+    }
+
+    #[test]
+    fn req291_ac2_only_the_chunk_with_a_missing_node_is_sent_and_the_entry_is_merged() {
+        let k = METHODS;
+        let (dir, mut store, file) = marked("m", k);
+        assert_eq!(store.files_to_enrich().unwrap().len(), 1);
+        let (llm, report) = run(&dir, &mut store, &file, k);
+        assert_eq!(*llm.calls.lock().unwrap(), [vec![k.id("w1")]]);
+        assert_eq!(summary(&store, &k.id("w0")).as_deref(), Some("repris w0"));
+        assert_eq!(
+            summary(&store, &k.id("w1")),
+            Some(format!("reçu {}", k.id("w1")))
+        );
+        assert!(store.node_by_id(&k.id("zz")).unwrap().is_none());
+        // Bilan : liste complète du fichier (2), résumés après fusion (2).
+        assert_eq!((report.requested, report.summarized), (2, 2));
+        // Entrée écrite : plus marquée, empreinte actuelle ; une réanalyse n'écarte rien.
+        let expected = blake3::hash(format!("{}\n{}", k.id("w0"), k.id("w1")).as_bytes())
+            .to_hex()
+            .to_string();
+        assert_eq!(store.entry_nodes_hash("D.md"), Some(expected));
+        assert!(store.files_to_enrich().unwrap().is_empty());
+        store
+            .replace_structure("D.md", &[k.node("w0"), k.node("w1")], &[])
+            .unwrap();
+        assert_eq!(summary(&store, &k.id("w0")).as_deref(), Some("repris w0"));
+        assert!(summary(&store, &k.id("w1")).is_some());
+    }
+
+    #[test]
+    fn req291_ac3_concepts_and_refs_are_merged_with_the_kept_entry_first() {
+        let k = SECTIONS;
+        let (dir, mut store, file) = marked("m", k);
+        run(&dir, &mut store, &file, k);
+        let commande = store.node_by_id("concept:commande").unwrap().unwrap();
+        assert_eq!(commande.summary.as_deref(), Some("base"));
+        assert!(store.node_by_id("concept:paiement").unwrap().is_some());
+        let mut sources: Vec<String> = store
+            .refs()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == EdgeKind::Mentions && r.target_name == "commande")
+            .map(|r| r.source)
+            .collect();
+        sources.sort();
+        assert_eq!(sources, [k.id("w0"), k.id("w1")], "zz retiré, w0 gardé");
+        assert!(store.node_by_id("concept:oubli").unwrap().is_none());
+    }
+
+    #[test]
+    fn req291_ac5_entry_of_another_model_is_not_a_base() {
+        let k = METHODS;
+        let (dir, mut store, file) = marked("autre", k);
+        assert!(store.delta_bases(&["D.md".to_string()]).unwrap().is_empty());
+        let (llm, report) = run(&dir, &mut store, &file, k);
+        let mut asked: Vec<String> = llm.calls.lock().unwrap().concat();
+        asked.sort();
+        assert_eq!(asked, [k.id("w0"), k.id("w1")]);
+        assert_eq!((report.requested, report.summarized), (2, 2));
     }
 }

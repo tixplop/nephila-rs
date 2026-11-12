@@ -2934,7 +2934,7 @@ impl Store {
     /// lecture seule n'a pas de colonne `doc` : toutes ses déclarations sont rendues.
     pub fn undocumented_short_names(&self) -> Result<Vec<(String, String, String)>> {
         let sql = if self.version >= SCHEMA_WITHOUT_USED_AT {
-            "SELECT file, node, short FROM declarations WHERE doc IS NULL ORDER BY file, node"
+            "SELECT file, node, short FROM declarations WHERE doc IS NULL AND origin = 'parse' ORDER BY file, node"
         } else {
             "SELECT file, node, short FROM declarations ORDER BY file, node"
         };
@@ -2949,6 +2949,91 @@ impl Store {
             })
             .map_err(db_err)?;
         rows.map(|r| r.map_err(db_err)).collect()
+    }
+
+    /// Empreinte des nœuds de l'entrée d'un chemin (tests).
+    #[cfg(test)]
+    pub(crate) fn entry_nodes_hash(&self, path: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT nodes_hash FROM enrichments WHERE path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Bases des enrichissements delta (REQ-291, DEC-223) : pour chaque chemin donné dont l'entrée
+    /// de la clé actuelle (modèle, langue, version du prompt du chemin) est marquée (`nodes_hash`
+    /// NULL), sa charge utile réduite aux nœuds encore déclarés (`filter_payload`). Une entrée
+    /// d'une autre clé, ou illisible, n'est pas une base (AC-291-5).
+    pub fn delta_bases(&self, paths: &[String]) -> Result<HashMap<String, Enrichment>> {
+        let mut out = HashMap::new();
+        if self.version < SCHEMA_VERSION || paths.is_empty() {
+            return Ok(out);
+        }
+        let wanted: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        let mut st = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT e.path, e.prompt_version, e.payload FROM enrichments e
+                 JOIN files f ON f.path = e.path AND f.hash = e.content_hash
+                 WHERE f.state = 'indexed' AND e.nodes_hash IS NULL
+                   AND e.model IN (SELECT value FROM json_each({NAMES_SQL}))
+                   AND e.language IS (SELECT value FROM meta WHERE key = 'enrich_language')
+                 ORDER BY e.used_at DESC, e.rowid DESC"
+            ))
+            .map_err(db_err)?;
+        let rows: Vec<(String, u32, String)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(db_err)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        let mut decl = self
+            .conn
+            .prepare_cached("SELECT node FROM declarations WHERE file = ?1")
+            .map_err(db_err)?;
+        for (path, version, json) in rows {
+            if !wanted.contains(path.as_str())
+                || out.contains_key(&path)
+                || version != self.prompt_versions.of_path(&path)
+            {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<Payload>(&json) else {
+                continue;
+            };
+            if payload.v > PAYLOAD_VERSION {
+                continue;
+            }
+            let declared: std::collections::HashSet<String> = decl
+                .query_map([&path], |r| r.get::<_, String>(0))
+                .map_err(db_err)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?;
+            let (summaries, concepts, refs, _) = filter_payload(payload, &declared);
+            let concepts = concepts
+                .into_iter()
+                .map(|n| crate::llm::enrich::Concept {
+                    sections: refs
+                        .iter()
+                        .filter(|r| r.kind == EdgeKind::Mentions && r.target_name == n.qualified)
+                        .map(|r| r.source.clone())
+                        .collect(),
+                    name: n.qualified,
+                    summary: n.summary,
+                })
+                .collect();
+            out.insert(
+                path,
+                Enrichment {
+                    summaries,
+                    concepts,
+                    ..Enrichment::default()
+                },
+            );
+        }
+        Ok(out)
     }
 
     /// Parmi `files`, ceux qui déclarent encore le nœud `document:<chemin>` (requête ciblée

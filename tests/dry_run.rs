@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+#[path = "support/delta_java.rs"]
+mod delta_java;
 #[path = "support/fake_server.rs"]
 mod fake_server;
 
@@ -1230,5 +1232,64 @@ fn REQ277_AC8_equivalent_name_estimates_no_call() {
         out(&o).contains("estimation minimale : 0 appels"),
         "{}",
         out(&o)
+    );
+}
+
+// ---- AC-291-4 : un fichier marqué est estimé sur ses seuls nœuds manquants ----
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            fs::copy(e.path(), dest).unwrap();
+        }
+    }
+}
+
+#[test]
+fn req291_ac4_build_dry_run_annonce_les_appels_du_delta() {
+    let mut replies: Vec<(u16, String)> = (1..=3).map(|k| delta_java::reply(k, 8)).collect();
+    replies.push(delta_java::reply(4, 8));
+    let server = FakeServer::start(replies);
+    let env = Env::new();
+    delta_java::write_repo(&env.repo, 200);
+    env.config_text(&format!(
+        "provider = \"openai\"\nmodel = \"m\"\nenrich_code = true\nconcurrency = 1\nbase_url = \"{}\"\napi_key_env = \"{KEY_VAR}\"\n",
+        server.base_url
+    ));
+    let build = |env: &Env| {
+        let mut c = env.command(&["build", "--enrich-code", "--batch-files", "1"]);
+        c.env(KEY_VAR, "sk-test");
+        c.output().unwrap()
+    };
+    let o = build(&env);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(server.requests().len(), 3);
+    delta_java::simulate_upgrade(&env.repo);
+
+    // Copie du dépôt avec `.nephila/`, juste après la modification de la base.
+    let copy = Env::new();
+    fs::remove_dir_all(&copy.repo).unwrap();
+    copy_tree(&env.repo, &copy.repo);
+    copy.config_text(&fs::read_to_string(&env.config).unwrap());
+    let o = copy.run(&["build", "--dry-run", "--enrich-code", "--batch-files", "1"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let lines = estimation_lines(&o);
+    assert!(
+        lines[1].starts_with("estimation minimale : 1 appels, "),
+        "{lines:?}"
+    );
+    assert_eq!(server.requests().len(), 3, "aucune requête envoyée");
+
+    let o = build(&env);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        server.requests().len() - 3,
+        1,
+        "autant de requêtes que d'appels annoncés"
     );
 }

@@ -915,7 +915,8 @@ pub(crate) fn estimate_enrichment(
         opts.enrich_code,
         &opts.enrich_scope,
     )?;
-    let ids = enrich::nodes_by_file(store)?;
+    let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    let ids = enrich::nodes_by_file(store, &store.delta_bases(&paths)?)?;
     // Sans modèle, rien n'est réutilisé (REQ-228).
     let kept = match &dry.model {
         Some(model) => enrich::KeptCalls {
