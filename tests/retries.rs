@@ -1047,3 +1047,26 @@ fn req177_ac8_openai_ask_invalid_type_then_note_shape() {
     assert_eq!(u2, format!("{u1}\n\n{}", nephila::llm::retry::NOTE_SHAPE));
     assert!(u2.starts_with("Contexte :\n"), "{u2}");
 }
+
+#[test]
+fn req285_ac6_search_help_summary_and_term_text() {
+    let q = help_of(&["query", "--help"]);
+    assert!(
+        q.lines().any(|l| l.trim_start().starts_with("search")
+            && l.contains("Recherche de nœuds par nom ou par résumé")),
+        "{q}"
+    );
+    let norm = help_of(&["query", "search", "--help"])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let term = "Texte cherché dans le nom et le résumé des nœuds, sans tenir compte de la casse ni des accents ; avec plusieurs mots, chacun doit y figurer au début d'un mot, dans n'importe quel ordre (résultats : nom égal au terme, puis nom qui commence par lui, puis les autres, du plus pertinent au moins pertinent)";
+    assert!(norm.contains(&format!("<TERME> {term}")), "{norm}");
+    for banned in [" -", "score", "FTS", "index"] {
+        assert!(!term.contains(banned), "{banned}");
+    }
+    for sub in ["neighbors", "path", "community", "ask"] {
+        let h = help_of(&["query", sub, "--help"]);
+        assert!(!h.contains("Texte cherché dans le nom"), "{sub}");
+    }
+}

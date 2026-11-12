@@ -332,6 +332,19 @@ fn req062_ac5_old_schemas_are_read_unchanged_then_migrated_by_update_or_build() 
                     n["community"] = serde_json::Value::Null;
                 }
                 serde_json::to_string(&doc).unwrap() + "\n"
+            } else if args[0] == "query" && args[1] == "search" {
+                // REQ-285 : sans index, `query search` garde l'ordre d'avant (par nom qualifié) ;
+                // avec l'index, le document dont le résumé contient le mot vient après les noms.
+                let (doc, rest): (Vec<&str>, Vec<&str>) = expected
+                    .lines()
+                    .partition(|l| l.starts_with("README.md (document"));
+                let at = rest
+                    .iter()
+                    .position(|l| l.starts_with("README.md#acme-orders"))
+                    .unwrap();
+                let mut all = rest;
+                all.splice(at..at, doc);
+                all.into_iter().map(|l| format!("{l}\n")).collect()
             } else {
                 expected.clone()
             };

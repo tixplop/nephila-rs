@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/schema15.rs"]
+mod schema15;
+
 const SERVICE: &str = "core/OrderService.java";
 const REPO_JAVA: &str = "core/OrderRepository.java";
 const OTHER: &str = "other/Other.java";
@@ -87,6 +90,39 @@ impl Env {
         let m = self.mock.join(format!("{path}.json"));
         fs::create_dir_all(m.parent().unwrap()).unwrap();
         fs::write(m, json).unwrap();
+    }
+
+    /// Ajoute une classe `pkg.Class` (fichier `<pkg>/<Class>.java`) dont le résumé simulé est `summary`.
+    fn class(&self, pkg: &str, class: &str, summary: &str) {
+        let path = format!("{pkg}/{class}.java");
+        self.file(&path, &format!("package {pkg};\n\nclass {class} {{}}\n"));
+        self.fixture(
+            &path,
+            &format!(
+                r#"{{"version":2,"summaries":[{{"node":"type:{pkg}.{class}","summary":"{summary}"}}],"concepts":[]}}"#
+            ),
+        );
+    }
+
+    fn build(&self) {
+        let out = self.cmd(&["build"], &[]).output().unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+    }
+
+    /// Graphe d'AC-285-3 : `payment` à plusieurs rangs.
+    fn payments() -> Env {
+        let env = Env::new();
+        env.class("p", "Payment", "Encaisse");
+        env.class("p", "PaymentService", "Orchestre");
+        env.class("z", "Billing", "payment payment");
+        env.class(
+            "a",
+            "Ledger",
+            "Tient les comptes de la maison, les écritures, les soldes, les rapprochements et le payment",
+        );
+        env.class("m", "Repayment", "Rembourse");
+        env.build();
+        env
     }
 
     fn built() -> Env {
@@ -492,4 +528,139 @@ fn req013_ac3_single_remaining_result_is_singular() {
     let l = lines(&env.q(&["topic", "--limit", "59"]));
     assert_eq!(l.len(), 60, "{l:?}");
     assert_eq!(l[59], "1 résultat supplémentaire");
+}
+
+fn names(o: &Output) -> Vec<String> {
+    lines(o)
+        .iter()
+        .map(|l| l.split(" (").next().unwrap().to_string())
+        .collect()
+}
+
+fn names_json(o: &Output) -> Vec<String> {
+    json(o)["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["qualified"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn with_total_node() -> Env {
+    let env = Env::new();
+    env.class("t", "Calc", "Calcule le total de la commande");
+    env.build();
+    env
+}
+
+#[test]
+fn req285_ac1_words_in_any_order_are_all_required() {
+    let env = with_total_node();
+    for term in ["total commande", "commande total"] {
+        let o = env.q(&[term]);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+        assert_eq!(names(&o), ["t.Calc"], "{term}");
+    }
+    let o = env.q(&["total zzz"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        text(&o.stderr).contains("aucun résultat"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+#[test]
+fn req285_ac2_accents_are_ignored() {
+    let env = Env::new();
+    env.class("p", "ÉcoleService", "Sert");
+    env.class("q", "Clients", "École des clients");
+    env.build();
+    for term in ["ecole", "école"] {
+        let mut got = names(&env.q(&[term]));
+        got.sort();
+        assert_eq!(got, ["p.ÉcoleService", "q.Clients"], "{term}");
+    }
+}
+
+#[test]
+fn req285_ac3_content_rank_is_ordered_by_relevance_then_substring_only() {
+    let env = Env::payments();
+    let want = [
+        "p.Payment",
+        "p.PaymentService",
+        "z.Billing",
+        "a.Ledger",
+        "m.Repayment",
+    ];
+    assert_eq!(names(&env.q(&["payment"])), want);
+    assert_eq!(names_json(&env.q(&["--json", "payment"])), want);
+    let o = env.q(&["payment", "--limit", "3"]);
+    assert_eq!(names(&o)[..3], want[..3]);
+    assert_eq!(lines(&o).len(), 4);
+    assert_eq!(lines(&o)[3], "2 résultats supplémentaires");
+}
+
+#[test]
+fn req285_ac4_graph_without_index_answers_as_before() {
+    let env = with_total_node();
+    env.class("p", "Payment", "Encaisse");
+    env.class("p", "PaymentService", "Orchestre");
+    env.class("z", "Billing", "payment payment");
+    env.class(
+        "a",
+        "Ledger",
+        "Tient les comptes, les écritures, les soldes, les rapprochements et le payment",
+    );
+    env.class("m", "Repayment", "Rembourse");
+    env.build();
+    let db = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    schema15::downgrade_to_15(&db);
+    drop(db);
+    let o = env.q(&["total commande"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o.stderr).contains("aucun résultat"));
+    assert_eq!(
+        names(&env.q(&["payment"])),
+        [
+            "p.Payment",
+            "p.PaymentService",
+            "a.Ledger",
+            "m.Repayment",
+            "z.Billing"
+        ]
+    );
+    let v: i32 = rusqlite::Connection::open(env.repo.join(".nephila/graph.db"))
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 15);
+}
+
+#[test]
+fn req285_ac7_outputs_carry_no_score() {
+    let env = Env::payments();
+    let o = env.q(&["payment"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(o.stderr.is_empty(), "{}", text(&o.stderr));
+    for l in lines(&o) {
+        check_line(&l);
+    }
+    let j = json(&env.q(&["--json", "payment"]));
+    for r in j["results"].as_array().unwrap() {
+        let mut keys: Vec<&String> = r.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["file", "kind", "qualified", "subkind", "summary"]);
+    }
+}
+
+/// `<nom> (<genre>, <fichier>)` puis éventuellement ` - <résumé>`.
+fn check_line(l: &str) {
+    let (name, rest) = l.split_once(" (").expect(l);
+    assert!(!name.contains(' '), "{l}");
+    let (place, tail) = rest.split_once(')').expect(l);
+    let (kind, file) = place.split_once(", ").expect(l);
+    assert_eq!(kind, "class", "{l}");
+    assert!(file.ends_with(".java"), "{l}");
+    assert!(tail.is_empty() || tail.starts_with(" - "), "{l}");
 }

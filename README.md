@@ -100,7 +100,7 @@ Option globale : `-C, --repo <dossier>`, la racine du dépôt (défaut : dossier
 | `nephila build` | Reconstruit entièrement le graphe | facultatif |
 | `nephila update` | Retraite les fichiers ajoutés, modifiés, supprimés, en attente ou à enrichir | facultatif |
 | `nephila status [--json]` | Compare le dépôt au graphe | non |
-| `nephila query search <terme>` | Cherche des nœuds par nom | non |
+| `nephila query search <terme>` | Cherche des nœuds par nom ou par résumé | non |
 | `nephila query neighbors <nœud>` | Voisins d'un nœud | non |
 | `nephila query path <source> <cible>` | Plus court chemin entre deux nœuds | non |
 | `nephila query community [<numéro>]` | Communautés du graphe : liste, ou membres d'une communauté | non |
@@ -189,7 +189,7 @@ com.acme.core.OrderService.place calls com.acme.core.OrderRepository.save
 ...
 ```
 
-`--depth` vaut 1 par défaut. Une recherche sans résultat sort avec le code 1 (`erreur: aucun résultat pour « zzz »`). La liste des communautés, ou celle d'un nœud et ses membres : [`nephila query community`](#communautés).
+`--depth` vaut 1 par défaut. `query search` cherche dans les noms et les résumés, sans tenir compte de la casse ni des accents ; avec plusieurs mots, chacun doit y figurer, dans n'importe quel ordre. Les noms égaux au terme viennent d'abord, puis ceux qui commencent par lui, puis les autres, du plus pertinent au moins pertinent. Une recherche sans résultat sort avec le code 1 (`erreur: aucun résultat pour « zzz »`). La liste des communautés, ou celle d'un nœud et ses membres : [`nephila query community`](#communautés).
 
 `query ask` est la seule requête qui appelle le LLM. Son contexte est fait des nœuds du graphe trouvés par les mots de la question et de leurs voisins, jamais du contenu des fichiers. Il peut aussi contenir le résumé de `nephila summary` : une question sans nœud trouvé peut donc faire un appel LLM. Les nœuds cités sont pris dans ce contexte. Sans nœud cité, la réponse s'affiche seule (`"nodes":[]` en `--json`), précédée sur stderr de `avertissement: réponse non vérifiable`, avec le code 0 : vérifiez-la avec `nephila query search`.
 

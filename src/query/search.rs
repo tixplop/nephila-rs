@@ -1,6 +1,7 @@
 //! `query search` (REQ-013) : recherche insensible à la casse sur le nom court, le nom
 //! qualifié et le résumé ; tri exact, puis préfixe, puis contenu.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::out::Out;
@@ -132,6 +133,90 @@ impl<'a> Prepared<'a> {
         });
         hits.into_iter().map(|(_, n)| n).collect()
     }
+
+    fn position(&self, id: &str) -> Option<usize> {
+        match self.items.binary_search_by(|f| f.node.id.as_str().cmp(id)) {
+            Ok(i) => Some(i),
+            Err(_) => self.items.iter().position(|f| f.node.id == id),
+        }
+    }
+
+    /// Comme `matches`, plus les nœuds de `scores` (identifiant -> score plein texte, plus petit
+    /// = plus pertinent). Rang contenu : nœuds avec score d'abord, par score, puis les autres.
+    pub fn matches_scored(&self, term: &str, scores: &HashMap<String, f64>) -> Vec<&'a Node> {
+        let term = term.trim().to_lowercase();
+        // Position de chaque nœud scoré : dichotomie (les nœuds de `query search` sont triés par
+        // identifiant), avec repli linéaire si le tableau ne l'est pas ; bien moins cher qu'un
+        // hachage par nœud sur un grand graphe.
+        let mut pending: HashMap<usize, f64> = scores
+            .iter()
+            .filter_map(|(id, sc)| self.position(id).map(|i| (i, *sc)))
+            .collect();
+        let mut hits: Vec<(Rank, Option<f64>, &'a Node)> = Vec::new();
+        for (i, f) in self.items.iter().enumerate() {
+            match rank(f, &term) {
+                Some(Rank::Content) => hits.push((Rank::Content, pending.remove(&i), f.node)),
+                Some(r) => hits.push((r, None, f.node)),
+                None => {}
+            }
+        }
+        // Restes : nœuds trouvés par le seul plein texte.
+        for (i, sc) in pending {
+            if rank(&self.items[i], &term).is_none() {
+                hits.push((Rank::Content, Some(sc), self.items[i].node));
+            }
+        }
+        hits.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| match (a.1, b.1) {
+                    (Some(x), Some(y)) => x.total_cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
+                .then_with(|| a.2.qualified.cmp(&b.2.qualified))
+                .then_with(|| a.2.id.cmp(&b.2.id))
+        });
+        hits.into_iter().map(|(_, _, n)| n).collect()
+    }
+}
+
+/// Mots d'un terme : suites maximales de caractères alphanumériques (REQ-285).
+pub(crate) fn text_words(term: &str) -> Vec<String> {
+    term.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn quoted(word: &str) -> String {
+    format!("\"{}\"", word.replace('"', "\"\""))
+}
+
+/// Requête FTS5 : chaque mot entre guillemets, en début de mot, tous exigés. Vide sans mot.
+pub(crate) fn all_words_query(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|w| format!("{}*", quoted(w)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Requête FTS5 : chaque terme entre guillemets (suivi de `*` si son booléen est vrai), reliés
+/// par OU. Vide sans terme.
+#[allow(dead_code)] // utilisée par `query ask` (T-392)
+pub(crate) fn any_terms_query(terms: &[(String, bool)]) -> String {
+    terms
+        .iter()
+        .map(|(t, prefix)| {
+            if *prefix {
+                format!("{}*", quoted(t))
+            } else {
+                quoted(t)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 fn rank(f: &Folded, term: &str) -> Option<Rank> {
@@ -191,7 +276,8 @@ pub fn run(
     }
     let store = super::open(repo, check_stale)?;
     let nodes = store.nodes()?;
-    let hits = Prepared::new(&nodes).matches(term);
+    let scores = store.text_scores(&all_words_query(&text_words(term)))?;
+    let hits = Prepared::new(&nodes).matches_scored(term, &scores);
     if hits.is_empty() {
         return Err(Error::Message(format!("aucun résultat pour « {term} »")));
     }
@@ -350,5 +436,49 @@ mod tests {
                 assert_eq!(old, new, "terme {term:?}");
             }
         }
+    }
+
+    #[test]
+    fn req285_ac5_matches_scored_without_scores_equals_matches() {
+        let mut rng = Lcg(285);
+        let none = HashMap::new();
+        for _ in 0..100 {
+            let nodes = random_nodes(&mut rng);
+            let p = Prepared::new(&nodes);
+            for term in random_words(&mut rng) {
+                let a: Vec<&str> = p.matches(&term).iter().map(|n| n.id.as_str()).collect();
+                let b: Vec<&str> = p
+                    .matches_scored(&term, &none)
+                    .iter()
+                    .map(|n| n.id.as_str())
+                    .collect();
+                assert_eq!(a, b, "terme {term:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn req285_ac3_scored_nodes_are_found_in_unsorted_nodes() {
+        use crate::model::NodeKind;
+        let mk = |q: &str, sum: &str| {
+            Node::new(
+                NodeKind::Type,
+                q,
+                q.rsplit('.').next().unwrap(),
+                None,
+                None,
+                Some(sum),
+            )
+        };
+        let nodes = vec![mk("z.B", "zzz"), mk("a.A", "yyy"), mk("m.C", "xxx")];
+        let mut scores = HashMap::new();
+        scores.insert(nodes[0].id.clone(), -1.0);
+        scores.insert(nodes[2].id.clone(), -2.0);
+        let got: Vec<&str> = Prepared::new(&nodes)
+            .matches_scored("qqq", &scores)
+            .iter()
+            .map(|n| n.qualified.as_str())
+            .collect();
+        assert_eq!(got, ["m.C", "z.B"]);
     }
 }

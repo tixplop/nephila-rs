@@ -209,8 +209,9 @@ pub enum ExportFormat {
 
 #[derive(Debug, Subcommand)]
 pub enum Query {
-    /// Recherche de nœuds par nom
+    /// Recherche de nœuds par nom ou par résumé
     Search {
+        /// Texte cherché dans le nom et le résumé des nœuds, sans tenir compte de la casse ni des accents ; avec plusieurs mots, chacun doit y figurer au début d'un mot, dans n'importe quel ordre (résultats : nom égal au terme, puis nom qui commence par lui, puis les autres, du plus pertinent au moins pertinent)
         terme: String,
         #[arg(long)]
         limit: Option<usize>,
