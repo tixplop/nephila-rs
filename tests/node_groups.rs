@@ -1031,3 +1031,70 @@ fn req283_ac5_methode_demandee_au_morceau_de_sa_declaration() {
     assert!(content_of(&prompts[1]).contains("void late() {}"));
     assert_eq!(planned, prompts.len());
 }
+
+/// Classe Java de 2 morceaux à `max_chunk_chars = 400` : sans REQ-288, la coupe tomberait dans le
+/// corps de `big` (juste après sa déclaration), qui commence 18 caractères avant elle.
+fn big_java() -> String {
+    let mut s = String::from("public class Big {\n    void first() {\n        a();\n    }\n");
+    for i in 0..16 {
+        s.push_str(&format!("    void p{i:02}() {{}}\n"));
+    }
+    s.push_str("    void last() {\n        b();\n    }\n");
+    s.push_str("    void big() {\n        step1();\n\n        step2();\n    }\n");
+    s.push_str("    void tail() {}\n}\n");
+    s
+}
+
+#[test]
+fn req288_ac5_methode_coupee_part_en_entier_au_morceau_suivant() {
+    let extra = "max_chunk_chars = 400\n";
+    let src = big_java();
+    // Sans recul, la coupe (limite 400) tomberait après `void big() {` : dans son corps.
+    let decl = src.find("    void big() {\n").unwrap();
+    assert!(decl + 18 <= 400 && decl + 18 + 17 > 400, "{decl}");
+    let responses = (0..2)
+        .map(|_| reply("openai", &summary_json(&[])))
+        .collect();
+    let env = Env::http(
+        "openai",
+        &[(BIG, src.clone())],
+        extra,
+        FakeServer::start(responses),
+    );
+    let copy = Env::http("openai", &[(BIG, src)], extra, FakeServer::start(vec![]));
+    let o = copy.run(&["build", "--dry-run", "--enrich-code"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    let out = text(&o).0;
+    let planned: usize = out
+        .lines()
+        .find_map(|l| l.strip_prefix("estimation minimale : "))
+        .and_then(|r| r.split(" appels").next())
+        .unwrap_or_else(|| panic!("{out}"))
+        .parse()
+        .unwrap();
+
+    let o = env.run(&["build"], &[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out} {err}");
+    assert!(out.contains("0 fichiers à enrichir"), "{out}");
+    let prompts: Vec<String> = env
+        .enrich_posts("openai")
+        .iter()
+        .map(|b| user_prompt(b))
+        .collect();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    let big = "method:Big.big".to_string();
+    let lists: Vec<Vec<String>> = prompts.iter().map(|p| listed_ids(p)).collect();
+    assert!(!lists[0].contains(&big), "{:?}", lists[0]);
+    assert!(lists[1].contains(&big), "{:?}", lists[1]);
+    for l in [
+        "    void big() {",
+        "        step1();",
+        "        step2();",
+        "    }\n    void tail",
+    ] {
+        assert!(!content_of(&prompts[0]).contains(l.trim()), "{l}");
+        assert!(content_of(&prompts[1]).contains(l), "{l}");
+    }
+    assert_eq!(planned, prompts.len());
+}

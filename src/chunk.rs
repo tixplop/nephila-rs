@@ -1,4 +1,5 @@
-//! Découpage des gros fichiers (REQ-007) : coupes sur fins de ligne, en-tête répété et fusion.
+//! Découpage des gros fichiers (REQ-007) : coupes sur fins de ligne, reculées à une ligne sûre
+//! (REQ-288), en-tête répété et fusion.
 
 use std::collections::HashSet;
 
@@ -78,8 +79,8 @@ pub fn header(text: &str) -> String {
     out
 }
 
-/// Découpe `text` en morceaux d'au plus `max_chars` caractères (coupes sur fins de ligne). Les
-/// morceaux suivant le premier sont précédés de l'en-tête. Une ligne plus longue que la limite
+/// Découpe `text` en morceaux d'au plus `max_chars` caractères (coupes sur fins de ligne, reculées
+/// à une ligne sûre, REQ-288). Les morceaux suivant le premier sont précédés de l'en-tête. Une ligne plus longue que la limite
 /// forme un morceau à elle seule. Un texte sous la limite est renvoyé tel quel.
 pub fn split(text: &str, max_chars: usize) -> Vec<String> {
     split_spans(text, max_chars)
@@ -90,7 +91,7 @@ pub fn split(text: &str, max_chars: usize) -> Vec<String> {
 
 /// Comme `split`, avec pour chaque morceau l'octet de début de son corps dans `text` (0 pour le
 /// premier ; l'en-tête répété n'en fait pas partie). Le corps du morceau k s'étend jusqu'au début
-/// du corps du suivant (DEC-061).
+/// du corps du suivant (DEC-061). Coupes sur fins de ligne, reculées à une ligne sûre (REQ-288).
 pub fn split_spans(text: &str, max_chars: usize) -> Vec<(String, usize)> {
     let max = max_chars.max(1);
     if text.chars().count() <= max {
@@ -100,7 +101,9 @@ pub fn split_spans(text: &str, max_chars: usize) -> Vec<(String, usize)> {
     let head_len = head.chars().count();
     // L'en-tête ne doit pas manger tout le budget : au moins la moitié reste pour le corps.
     let later_budget = max.saturating_sub(head_len).max(max / 2).max(1);
-    split_with(text, max, |_| (head.clone(), later_budget))
+    split_with(text, max, &safe_starts_code(text), |_| {
+        (head.clone(), later_budget)
+    })
 }
 
 /// Comme `split_spans`, avec l'en-tête Markdown (REQ-170) pour un fichier Markdown : chaîne des
@@ -118,7 +121,12 @@ pub fn split_spans_for(path: &str, text: &str, max_chars: usize) -> Vec<(String,
     let mut next = 0usize;
     // Pile des titres englobants : (niveau, ligne d'en-tête terminée par `\n`).
     let mut stack: Vec<(u8, String)> = Vec::new();
-    split_with(text, max, |pos| {
+    let safe: Vec<usize> = titles
+        .iter()
+        .filter(|(level, _, _)| *level <= 2)
+        .map(|&(_, start, _)| start)
+        .collect();
+    split_with(text, max, &safe, |pos| {
         let mut pending = None;
         while let Some(&(level, start, setext)) = titles.get(next) {
             if start > pos {
@@ -160,38 +168,85 @@ fn heading_header_line(text: &str, level: u8, start: usize, setext: bool) -> Str
     }
 }
 
+/// Vrai si la ligne ne contient que des blancs (espace, tabulation, fin de ligne).
+fn is_blank(line: &str) -> bool {
+    line.trim_matches([' ', '\t', '\r', '\n']).is_empty()
+}
+
+/// Nombre de blancs (espace ou tabulation) en tête de ligne.
+fn indentation(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+}
+
+/// Débuts de ligne sûrs d'un fichier non Markdown (REQ-288) : m = indentation des membres, celle
+/// de la première ligne non vide qui suit la déclaration de type de `header` (0 sinon). Une ligne i
+/// est sûre si la ligne i - 1 est vide et la ligne i non vide d'indentation <= m, ou si la ligne
+/// i - 1 commence par `}` (blancs de tête exceptés) avec une indentation <= m.
+fn safe_starts_code(text: &str) -> Vec<usize> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let decl = lines.iter().take(HEADER_SCAN_LINES).position(|l| {
+        let t = l.trim();
+        !t.starts_with("package ") && !t.starts_with("import ") && is_type_declaration(t)
+    });
+    let m = decl
+        .and_then(|d| lines[d + 1..].iter().find(|l| !is_blank(l)))
+        .map_or(0, |l| indentation(l));
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            let prev = lines[i - 1];
+            let blank_then_member = is_blank(prev) && !is_blank(line) && indentation(line) <= m;
+            let closing = prev.trim_start().starts_with('}') && indentation(prev) <= m;
+            if blank_then_member || closing {
+                out.push(pos);
+            }
+        }
+        pos += line.len();
+    }
+    out
+}
+
 /// Boucle de coupe commune : `head_at(pos)` donne l'en-tête et le budget du corps du morceau
 /// (k >= 2) dont le corps commence à l'octet `pos` ; le premier morceau a `max` et pas d'en-tête.
-fn split_with<F>(text: &str, max: usize, mut head_at: F) -> Vec<(String, usize)>
+/// `safe` (croissant) liste les débuts de ligne sûrs : au dépassement, la coupe recule à la
+/// dernière position sûre qui reporte au plus 15 % du budget au morceau suivant (REQ-288).
+fn split_with<F>(text: &str, max: usize, safe: &[usize], mut head_at: F) -> Vec<(String, usize)>
 where
     F: FnMut(usize) -> (String, usize),
 {
     let mut parts: Vec<(String, usize)> = Vec::new();
-    let mut cur = String::new();
+    let mut head = String::new();
     let mut cur_start = 0usize;
     let mut cur_len = 0usize;
     let mut budget = max;
     let mut pos = 0usize;
     for line in text.split_inclusive('\n') {
         let n = line.chars().count();
-        if cur_len > 0 && cur_len + n > budget {
-            parts.push((std::mem::take(&mut cur), cur_start));
-            cur_len = 0;
+        while cur_len > 0 && cur_len + n > budget {
+            let window = budget * 15 / 100;
+            let cut = match safe.partition_point(|&p| p <= pos).checked_sub(1) {
+                Some(i)
+                    if safe[i] > cur_start
+                        && text[safe[i]..pos].chars().take(window + 1).count() <= window =>
+                {
+                    safe[i]
+                }
+                _ => pos,
+            };
+            parts.push((format!("{head}{}", &text[cur_start..cut]), cur_start));
+            (head, budget) = head_at(cut);
+            cur_start = cut;
+            cur_len = text[cut..pos].chars().count();
         }
-        if cur.is_empty() {
+        if cur_len == 0 {
             cur_start = pos;
-            if !parts.is_empty() {
-                let (head, b) = head_at(pos);
-                cur.push_str(&head);
-                budget = b;
-            }
         }
-        cur.push_str(line);
         cur_len += n;
         pos += line.len();
     }
     if cur_len > 0 {
-        parts.push((cur, cur_start));
+        parts.push((format!("{head}{}", &text[cur_start..]), cur_start));
     }
     parts
 }
@@ -654,5 +709,388 @@ mod tests {
         let spans = split_spans_for("g.md", &t, 40);
         let second = &spans[1].0;
         assert!(second.starts_with("## Deux\n### Trois\n"), "{second:?}");
+    }
+
+    // ---- REQ-288 : coupe reculée à une ligne sûre ----
+
+    /// Boucle de coupe de la 0.28.0 recopiée telle quelle (oracle d'AC-288-3).
+    fn split_oracle<F>(text: &str, max: usize, mut head_at: F) -> Vec<(String, usize)>
+    where
+        F: FnMut(usize) -> (String, usize),
+    {
+        let mut parts: Vec<(String, usize)> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_start = 0usize;
+        let mut cur_len = 0usize;
+        let mut budget = max;
+        let mut pos = 0usize;
+        for line in text.split_inclusive('\n') {
+            let n = line.chars().count();
+            if cur_len > 0 && cur_len + n > budget {
+                parts.push((std::mem::take(&mut cur), cur_start));
+                cur_len = 0;
+            }
+            if cur.is_empty() {
+                cur_start = pos;
+                if !parts.is_empty() {
+                    let (head, b) = head_at(pos);
+                    cur.push_str(&head);
+                    budget = b;
+                }
+            }
+            cur.push_str(line);
+            cur_len += n;
+            pos += line.len();
+        }
+        if cur_len > 0 {
+            parts.push((cur, cur_start));
+        }
+        parts
+    }
+
+    fn oracle_spans(text: &str, max_chars: usize) -> Vec<(String, usize)> {
+        let max = max_chars.max(1);
+        if text.chars().count() <= max {
+            return vec![(text.to_string(), 0)];
+        }
+        let head = header(text);
+        let head_len = head.chars().count();
+        let later = max.saturating_sub(head_len).max(max / 2).max(1);
+        split_oracle(text, max, |_| (head.clone(), later))
+    }
+
+    /// Limite telle que la ligne commençant à `at` dépasse le budget du premier morceau.
+    fn limit_before(text: &str, at: usize) -> usize {
+        text[..at].chars().count() + 1
+    }
+
+    #[test]
+    fn req288_ac1_methode_commencee_dans_la_fenetre_part_en_entier() {
+        let mut t = String::from("public class A {\n    int pad0;\n");
+        for i in 1..9 {
+            t.push_str(&format!("    void p{i}() {{ a(); }}\n"));
+        }
+        t.push_str("    void m1() {\n        a();\n    }\n");
+        t.push_str("    void m2() {\n        x();\n\n        if (y) {\n            z();\n        }\n        w();\n    }\n}\n");
+        let m2 = t.find("    void m2").unwrap();
+        let x = t.find("        x();").unwrap();
+        let end_m2 = t.find("    }\n}\n").unwrap() + "    }\n".len();
+        let spans = split_spans(&t, limit_before(&t, x));
+        // La coupe d'aujourd'hui tombe avant `x();`, dans m2.
+        assert!(oracle_spans(&t, limit_before(&t, x))
+            .iter()
+            .any(|(_, s)| *s == x));
+        assert_eq!(spans[1].1, m2, "{spans:?}");
+        assert!(spans[1].1 <= m2 && spans.get(2).is_none_or(|(_, s)| *s >= end_m2));
+        let blank = t.find("\n\n").unwrap() + 1;
+        let brace8 = t.find("        }\n").unwrap();
+        for (_, s) in &spans {
+            assert!(*s != blank && *s != brace8 && *s != x);
+        }
+        // Sans le `}` de m1, mais avec une ligne vide avant m2 : le morceau commence à m2.
+        let mut u = String::from("public class A {\n");
+        for i in 0..9 {
+            u.push_str(&format!("    int f{i} = 1;\n"));
+        }
+        u.push_str("\n    void m2() {\n        x();\n        y();\n    }\n}\n");
+        let m2 = u.find("    void m2").unwrap();
+        let x = u.find("        x();").unwrap();
+        let spans = split_spans(&u, limit_before(&u, x));
+        assert_eq!(spans[1].1, m2, "{spans:?}");
+    }
+
+    #[test]
+    fn req288_ac2_markdown_coupe_sur_titre_de_niveau_1_ou_2() {
+        let para = |n: usize, c: &str| {
+            (0..n)
+                .map(|_| format!("{}\n", c.repeat(16)))
+                .collect::<String>()
+        };
+        let mut t = String::from("# Guide\n## A\n");
+        t += &para(20, "a");
+        let b = t.len();
+        t += "## B\n```\n# pas un titre\n```\n";
+        t += &para(1, "p");
+        let cut = t.len();
+        t += &para(10, "q");
+        let spans = split_spans_for("d.md", &t, limit_before(&t, cut) + 4);
+        assert_eq!(spans[1].1, b, "{spans:?}");
+        assert!(
+            spans[1].0.starts_with("# Guide\n## B\n"),
+            "{:?}",
+            spans[1].0
+        );
+
+        // Seuls `### C` ou `# pas un titre` dans la fenêtre : coupe d'aujourd'hui.
+        let mut u = para(24, "a");
+        u += "### C\n";
+        u += &para(12, "p");
+        let title = u.find("### C").unwrap();
+        let cut = title + 6 + 17 * 2;
+        let lim = limit_before(&u, cut) + 4;
+        assert!(u[title..cut].chars().count() <= lim * 15 / 100);
+        assert_eq!(split_oracle(&u, lim, |_| (String::new(), lim))[1].1, cut);
+        assert_eq!(
+            split_spans_for("d.md", &u, lim)[1].1,
+            split_oracle(&u, lim, |_| (String::new(), lim))[1].1
+        );
+        let mut v = para(24, "a");
+        v += "```\n# pas un titre\n```\n";
+        v += &para(12, "p");
+        let title = v.find("# pas un titre").unwrap();
+        let cut = title + 15 + 4 + 17;
+        let lim = limit_before(&v, cut) + 4;
+        assert!(v[title..cut].chars().count() <= lim * 15 / 100);
+        assert_eq!(split_oracle(&v, lim, |_| (String::new(), lim))[1].1, cut);
+        assert_eq!(
+            split_spans_for("d.md", &v, lim)[1].1,
+            split_oracle(&v, lim, |_| (String::new(), lim))[1].1
+        );
+
+        // Titre souligné de `-` : le morceau commence à sa ligne de texte.
+        let mut w = String::from("# Guide\n");
+        w += &para(24, "a");
+        w += "\n";
+        let sub = w.len();
+        w += "Sous titre\n----------\n";
+        w += &para(1, "p");
+        let cut = w.len();
+        w += &para(10, "q");
+        let spans = split_spans_for("d.md", &w, limit_before(&w, cut) + 4);
+        assert_eq!(spans[1].1, sub, "{spans:?}");
+    }
+
+    #[test]
+    fn req288_ac3_repli_identique_a_la_boucle_de_la_0_28_0() {
+        // Aucune ligne sûre : méthodes d'une ligne.
+        let mut a = String::from("public class A {\n");
+        for i in 0..40 {
+            a.push_str(&format!("    void m{i}() {{}}\n"));
+        }
+        a.push_str("}\n");
+        // Membre plus long que la fenêtre.
+        let mut b = String::from("public class B {\n    void a() {}\n    }\n");
+        b.push_str("    void long() {\n");
+        for i in 0..30 {
+            b.push_str(&format!("        s{i}();\n"));
+        }
+        b.push_str("    }\n}\n");
+        // Lignes vides et accolades partout, petits budgets.
+        let c = "class C {\n    int a;\n\n    int b;\n    }\n    int c;\n\n    int d;\n}\n";
+        for (t, limits) in [
+            (&a, vec![60usize, 200, 1000]),
+            (&b, vec![120, 200, 300]),
+            (&(c.to_string()), vec![1, 2, 3, 4, 5, 6]),
+        ] {
+            for lim in limits {
+                assert_eq!(split_spans(t, lim), oracle_spans(t, lim), "{lim}");
+                assert_eq!(split_spans_for("x.java", t, lim), oracle_spans(t, lim));
+            }
+        }
+        let short = "court\n";
+        assert_eq!(split_spans(short, 100), oracle_spans(short, 100));
+        assert_eq!(
+            split_spans_for("x.md", short, 100),
+            oracle_spans(short, 100)
+        );
+        // Markdown sans titre de niveau 1 ou 2 ni en-tête.
+        let mut m = String::new();
+        for i in 0..30 {
+            m.push_str(&format!("ligne {i} de texte\n"));
+        }
+        m.push('\n');
+        for i in 0..30 {
+            m.push_str(&format!("suite {i} de texte\n"));
+        }
+        for lim in [3usize, 6, 50, 200] {
+            assert_eq!(
+                split_spans_for("x.md", &m, lim),
+                split_oracle(&m, lim, |_| (String::new(), lim)),
+                "{lim}"
+            );
+        }
+    }
+
+    fn indent(line: &str) -> usize {
+        line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+    }
+
+    /// Positions sûres (code), recalculées ligne par ligne, `m` = indentation des membres.
+    fn naive_safe_code(text: &str, m: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        let mut prev: Option<&str> = None;
+        for line in text.split_inclusive('\n') {
+            if let Some(p) = prev {
+                let blank = |l: &str| l.trim().is_empty();
+                let a = blank(p) && !blank(line) && indent(line) <= m;
+                let b = p.trim_start().starts_with('}') && indent(p) <= m;
+                if a || b {
+                    out.push(pos);
+                }
+            }
+            prev = Some(line);
+            pos += line.len();
+        }
+        out
+    }
+
+    #[test]
+    fn req288_ac4_proprietes_et_regle_naive() {
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for case in 0..300 {
+            let md = case % 2 == 1;
+            let max = 20 + next(381) as usize;
+            let mut t = String::new();
+            // (niveau, début, ligne d'en-tête)
+            let mut titles: Vec<(usize, usize, String)> = Vec::new();
+            if md {
+                for _ in 0..(8 + next(40)) {
+                    match next(6) {
+                        0 | 1 => {
+                            let lvl = 1 + next(6) as usize;
+                            let line = format!("{} T{}\n", "#".repeat(lvl), next(100));
+                            titles.push((lvl, t.len(), line.clone()));
+                            t.push_str(&line);
+                        }
+                        2 => {
+                            let lvl = 1 + next(2) as usize;
+                            let text = format!("S{}", next(100));
+                            titles.push((
+                                lvl,
+                                t.len() + 1,
+                                format!("{} {text}\n", "#".repeat(lvl)),
+                            ));
+                            t.push_str(&format!(
+                                "\n{text}\n{}\n",
+                                if lvl == 1 { "====" } else { "----" }
+                            ));
+                            // la ligne vide ajoutée avant est hors titre
+                            let last = titles.last_mut().unwrap();
+                            last.1 = t.len() - text.len() - 1 - 5;
+                        }
+                        3 => t.push_str("```\n# faux\n```\n"),
+                        _ => {
+                            let len = 1 + next((max / 2 - 1) as u64) as usize;
+                            t.push_str(&"x".repeat(len));
+                            t.push('\n');
+                        }
+                    }
+                }
+            } else {
+                t.push_str("class A {\n    int a;\n");
+                for _ in 0..(8 + next(60)) {
+                    match next(6) {
+                        0 => t.push('\n'),
+                        1 => t.push_str(&format!("{}}}\n", " ".repeat(4 * next(3) as usize))),
+                        _ => {
+                            let len = 1 + next(max as u64 * 3 / 2) as usize;
+                            t.push_str(&" ".repeat(4 * (1 + next(2) as usize)));
+                            t.push_str(&"y".repeat(len));
+                            t.push('\n');
+                        }
+                    }
+                }
+            }
+            let spans = if md {
+                split_spans_for("g.md", &t, max)
+            } else {
+                split_spans(&t, max)
+            };
+            assert_eq!(spans[0].1, 0);
+            let head_code = header(&t);
+            let m = if md { 0 } else { 4 };
+            let safe: Vec<usize> = if md {
+                titles
+                    .iter()
+                    .filter(|(l, _, _)| *l <= 2)
+                    .map(|(_, s, _)| *s)
+                    .collect()
+            } else {
+                naive_safe_code(&t, m)
+            };
+            let mut rebuilt = String::new();
+            for (k, (part, start)) in spans.iter().enumerate() {
+                let end = spans.get(k + 1).map_or(t.len(), |(_, s)| *s);
+                let body = &t[*start..end];
+                assert!(!body.is_empty());
+                assert!(part.ends_with(body));
+                let head = &part[..part.len() - body.len()];
+                if k > 0 {
+                    assert!(*start > spans[k - 1].1);
+                }
+                assert!(
+                    part.chars().count() <= max || body.split_inclusive('\n').count() == 1,
+                    "case {case} part {part:?} max {max}"
+                );
+                if md {
+                    let mut naive: Vec<(usize, &str)> = Vec::new();
+                    for (lvl, at, line) in &titles {
+                        if *at > *start {
+                            break;
+                        }
+                        while naive.last().is_some_and(|(l, _)| l >= lvl) {
+                            naive.pop();
+                        }
+                        if *at < *start || k == 0 {
+                            naive.push((*lvl, line));
+                        }
+                    }
+                    if k > 0 {
+                        let want = (0..=naive.len())
+                            .map(|i| naive[i..].iter().map(|(_, l)| *l).collect::<String>())
+                            .find(|c| c.chars().count() <= max / 2)
+                            .unwrap();
+                        assert_eq!(head, want, "case {case}");
+                    }
+                } else if k > 0 {
+                    assert_eq!(head, head_code);
+                }
+                // Règle naïve : coupe du morceau k à partir du corps du morceau k - 1 (k >= 1).
+                if k > 0 {
+                    let ps = spans[k - 1].1;
+                    let pk = &spans[k - 1].0;
+                    let pbody_len = spans[k].1 - ps;
+                    let phead = &pk[..pk.len() - pbody_len];
+                    let budget = if md {
+                        max.saturating_sub(phead.chars().count()).max(1)
+                    } else if k - 1 == 0 {
+                        max
+                    } else {
+                        let hl = head_code.chars().count();
+                        max.saturating_sub(hl).max(max / 2).max(1)
+                    };
+                    let mut len = 0usize;
+                    let mut pos = ps;
+                    let mut over = None;
+                    for line in t[ps..].split_inclusive('\n') {
+                        let n = line.chars().count();
+                        if len > 0 && len + n > budget {
+                            over = Some(pos);
+                            break;
+                        }
+                        len += n;
+                        pos += line.len();
+                    }
+                    let pos = over.expect("une coupe suppose un dépassement");
+                    let w = budget * 15 / 100;
+                    let want = safe
+                        .iter()
+                        .rev()
+                        .find(|&&p| p > ps && p <= pos && t[p..pos].chars().count() <= w)
+                        .copied()
+                        .unwrap_or(pos);
+                    assert_eq!(*start, want, "case {case} k {k} max {max}");
+                }
+                rebuilt.push_str(body);
+            }
+            assert_eq!(rebuilt, t);
+        }
     }
 }
