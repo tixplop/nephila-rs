@@ -786,7 +786,7 @@ fn build_without_version(provider: &str, docs: usize) {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     for n in &names[..docs] {
-        std::fs::write(repo.join(n), "# Titre\n\nTexte.\n").unwrap();
+        std::fs::write(repo.join(n), format!("# Titre\n\nTexte de {n}.\n")).unwrap();
     }
     let config = tmp.path().join("config.toml");
     std::fs::write(

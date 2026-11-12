@@ -1672,6 +1672,89 @@ fn run_call(
     })
 }
 
+/// Copies de contenu (REQ-293) : parmi les fichiers à liste non vide et sans base, ceux de même
+/// empreinte et de même type forment un groupe ; le premier dans l'ordre d'envoi est le
+/// représentant, et un autre fichier est sa copie si l'ensemble de ses identifiants est égal à
+/// celui du représentant réécrit pour son chemin. Rend les fichiers à envoyer et, par chemin de
+/// représentant, ses copies.
+fn copy_groups(
+    files: &[FileRecord],
+    ids: &HashMap<String, Vec<(String, String)>>,
+    bases: &HashMap<String, Enrichment>,
+    degrees: &HashMap<String, u64>,
+) -> (Vec<FileRecord>, HashMap<String, Vec<FileRecord>>) {
+    type Group<'a> = Vec<(&'a FileRecord, crate::filter::FileType)>;
+    let mut groups: HashMap<(&str, crate::filter::FileType), Group<'_>> = HashMap::new();
+    for f in files {
+        let wanted = ids.get(&f.path).is_some_and(|v| !v.is_empty());
+        if let (true, false, false, Some(t)) = (
+            wanted,
+            f.hash.is_empty(),
+            bases.contains_key(&f.path),
+            crate::filter::FileType::of(&f.path),
+        ) {
+            groups.entry((f.hash.as_str(), t)).or_default().push((f, t));
+        }
+    }
+    let mut copies: HashMap<String, Vec<FileRecord>> = HashMap::new();
+    let mut is_copy: HashSet<&str> = HashSet::new();
+    for group in groups.values_mut() {
+        if group.len() < 2 {
+            continue;
+        }
+        group.sort_by(|a, b| file_key(&a.0.path, degrees).cmp(&file_key(&b.0.path, degrees)));
+        let (rep, file_type) = group[0];
+        for (f, _) in &group[1..] {
+            let rewritten: HashSet<String> = ids[&rep.path]
+                .iter()
+                .map(|(id, _)| crate::store::rewrite_node_id(&rep.path, &f.path, file_type, id))
+                .collect();
+            let own: HashSet<String> = ids[&f.path].iter().map(|(id, _)| id.clone()).collect();
+            if rewritten == own {
+                is_copy.insert(f.path.as_str());
+                copies
+                    .entry(rep.path.clone())
+                    .or_default()
+                    .push((*f).clone());
+            }
+        }
+    }
+    let send = files
+        .iter()
+        .filter(|f| !is_copy.contains(f.path.as_str()))
+        .cloned()
+        .collect();
+    (send, copies)
+}
+
+/// Résultat du représentant réécrit pour le chemin d'une copie : identifiants des résumés et
+/// sections des concepts ; concepts et modèle servi gardés, éléments écartés non repris.
+fn rewrite_enrichment(x: &Enrichment, from: &str, to: &str) -> Enrichment {
+    let file_type = crate::filter::FileType::of(from);
+    let rw = |id: &str| match file_type {
+        Some(t) => crate::store::rewrite_node_id(from, to, t, id),
+        None => id.to_string(),
+    };
+    Enrichment {
+        summaries: x
+            .summaries
+            .iter()
+            .map(|(id, s)| (rw(id), s.clone()))
+            .collect(),
+        concepts: x
+            .concepts
+            .iter()
+            .map(|c| crate::llm::enrich::Concept {
+                name: c.name.clone(),
+                summary: c.summary.clone(),
+                sections: c.sections.iter().map(|s| rw(s)).collect(),
+            })
+            .collect(),
+        rejected: Vec::new(),
+        served: x.served.clone(),
+    }
+}
+
 /// Sépare les fichiers ayant des nœuds à demander de ceux qui n'en ont aucun (REQ-159).
 fn partition_by_nodes(
     files: &[FileRecord],
@@ -1709,8 +1792,11 @@ pub(crate) fn estimate(
     max_chunk_chars: usize,
     kept: &KeptCalls,
     nodes_per_call: usize,
+    bases: &HashMap<String, Enrichment>,
+    degrees: &HashMap<String, u64>,
 ) -> Estimate {
-    let (with_nodes, without_nodes) = partition_by_nodes(files, ids);
+    let (send, copies) = copy_groups(files, ids, bases, degrees);
+    let (with_nodes, without_nodes) = partition_by_nodes(&send, ids);
     let chars: HashMap<&str, usize> = with_nodes
         .iter()
         .map(|f| (f.path.as_str(), sources.char_count(f)))
@@ -1726,7 +1812,7 @@ pub(crate) fn estimate(
     );
     let mut est = Estimate {
         files: files.len(),
-        without_call: without_nodes.len(),
+        without_call: without_nodes.len() + copies.values().map(Vec::len).sum::<usize>(),
         ..Estimate::default()
     };
     let node_ids = |f: &FileRecord| -> Vec<String> {
@@ -2112,6 +2198,7 @@ impl Drop for ExpandGuard<'_, '_> {
 /// Prépare l'écriture de l'enrichissement complet d'un fichier : avertissement des éléments
 /// écartés (texte rangé dans `notes`, émis avec la progression du message), puis ajout au groupe
 /// `pending` (écrit en une transaction par `flush_group`).
+#[allow(clippy::too_many_arguments)]
 fn queue_done(
     file: &FileRecord,
     x: &Enrichment,
@@ -2120,11 +2207,13 @@ fn queue_done(
     write_error: &Option<Error>,
     pending: &mut Vec<EnrichmentWrite>,
     notes: &mut Vec<String>,
+    copies: &HashMap<String, Vec<FileRecord>>,
 ) {
     if write_error.is_some() {
         return;
     }
     *succeeded += 1;
+    let orig = x;
     if !x.rejected.is_empty() {
         notes.push(format!(
             "{} : {} élément(s) d'enrichissement écarté(s) : {}",
@@ -2151,6 +2240,21 @@ fn queue_done(
         refs,
         served_model: (!x.served.is_empty()).then(|| x.served.join(", ")),
     });
+    // Copies de contenu (REQ-293) : le même résultat, réécrit pour leur chemin.
+    let none = HashMap::new();
+    for copy in copies.get(&file.path).into_iter().flatten() {
+        let rewritten = rewrite_enrichment(orig, &file.path, &copy.path);
+        queue_done(
+            copy,
+            &rewritten,
+            bases,
+            succeeded,
+            write_error,
+            pending,
+            notes,
+            &none,
+        );
+    }
 }
 
 /// Écrit le groupe de fichiers enrichis en une seule transaction (DEC-074) ; une erreur annule le
@@ -2194,6 +2298,7 @@ fn partial_of<'p>(
 /// Fin commune des messages d'un fichier envoyé seul : quand tous les appels ont rendu, fusion
 /// dans l'ordre du plan et mise en file de l'écriture. Rend l'avance de la progression (1 si le
 /// fichier est complet).
+#[allow(clippy::too_many_arguments)]
 fn complete_file(
     entry: &mut Partial,
     file: &FileRecord,
@@ -2202,6 +2307,7 @@ fn complete_file(
     write_error: &Option<Error>,
     pending: &mut Vec<EnrichmentWrite>,
     notes: &mut Vec<String>,
+    copies: &HashMap<String, Vec<FileRecord>>,
 ) -> usize {
     if entry.done != entry.expected {
         return 0;
@@ -2213,8 +2319,17 @@ fn complete_file(
     } else {
         chunk::merge_enrichments(parts)
     };
-    queue_done(file, &merged, bases, succeeded, write_error, pending, notes);
-    1
+    queue_done(
+        file,
+        &merged,
+        bases,
+        succeeded,
+        write_error,
+        pending,
+        notes,
+        copies,
+    );
+    1 + copies.get(&file.path).map_or(0, Vec::len)
 }
 
 /// Références partagées par les fils d'enrichissement.
@@ -2834,7 +2949,9 @@ pub(crate) fn enrich_pass(
     let failed_before = report.failed;
     let mut succeeded = 0usize;
     // REQ-159 : un fichier sans nœud à demander est enregistré vide, sans lecture ni appel.
-    let (with_nodes, without_nodes) = partition_by_nodes(files, &ids);
+    let degrees = store.file_degrees()?;
+    let (send, copies) = copy_groups(files, &ids, &bases, &degrees);
+    let (with_nodes, without_nodes) = partition_by_nodes(&send, &ids);
     let chars: HashMap<&str, usize> = with_nodes
         .iter()
         .map(|f| (f.path.as_str(), sources.char_count(f)))
@@ -2848,7 +2965,7 @@ pub(crate) fn enrich_pass(
         max_chunk_chars,
         opts.nodes_per_call,
     );
-    order_units(&mut units, &store.file_degrees()?);
+    order_units(&mut units, &degrees);
     // Un gros fichier peut donner jusqu'à `MAX_CALLS_PER_FILE` appels : autant de fils utiles.
     let useful: usize = units
         .iter()
@@ -2934,6 +3051,11 @@ pub(crate) fn enrich_pass(
                     Msg::Outcomes(batch) => {
                         adv = batch.len();
                         for outcome in batch {
+                            adv += match &outcome {
+                                Outcome::Failed(path, _) => copies.get(path),
+                                Outcome::Done(file, _) => copies.get(&file.path),
+                            }
+                            .map_or(0, Vec::len);
                             match outcome {
                                 Outcome::Failed(path, e) => {
                                     record_failure(report, &mut failures, &mut notes, path, e);
@@ -2947,6 +3069,7 @@ pub(crate) fn enrich_pass(
                                         &write_error,
                                         &mut pending,
                                         &mut notes,
+                                        &copies,
                                     );
                                 }
                             }
@@ -2985,6 +3108,7 @@ pub(crate) fn enrich_pass(
                                         &write_error,
                                         &mut pending,
                                         &mut notes,
+                                        &copies,
                                     );
                                 }
                             }
@@ -2998,7 +3122,7 @@ pub(crate) fn enrich_pass(
                                     file.path.clone(),
                                     e,
                                 );
-                                adv = 1;
+                                adv = 1 + copies.get(&file.path).map_or(0, Vec::len);
                             }
                             Err(_) => {}
                         }
@@ -3025,6 +3149,7 @@ pub(crate) fn enrich_pass(
                                 &write_error,
                                 &mut pending,
                                 &mut notes,
+                                &copies,
                             );
                         }
                     }
@@ -8299,6 +8424,8 @@ mod estimate_tests {
             max,
             &kept,
             MAX_NODES_PER_CALL,
+            &HashMap::new(),
+            &HashMap::new(),
         )
     }
 
@@ -9877,5 +10004,302 @@ mod delta_tests {
         asked.sort();
         assert_eq!(asked, [k.id("w0"), k.id("w1")]);
         assert_eq!((report.requested, report.summarized), (2, 2));
+    }
+}
+
+/// Fichiers de même contenu dans la même passe (REQ-293).
+#[cfg(test)]
+mod copies_tests {
+    use super::*;
+    use crate::llm::enrich::Concept;
+
+    /// Faux `Llm` : un résumé et un concept par nœud demandé ; ses appels sont notés ; les
+    /// fichiers de `fail` échouent.
+    struct Dup {
+        calls: Mutex<Vec<String>>,
+        fail: Vec<String>,
+    }
+    impl Llm for Dup {
+        fn enrich(
+            &self,
+            file: &str,
+            _: usize,
+            _: &str,
+            requested: &[String],
+            _: &[String],
+        ) -> Result<Enrichment> {
+            self.calls.lock().unwrap().push(file.to_string());
+            if self.fail.iter().any(|f| f == file) {
+                return Err(Error::Message("panne".into()));
+            }
+            Ok(Enrichment {
+                summaries: requested
+                    .iter()
+                    .map(|i| (i.clone(), format!("r {i}")))
+                    .collect(),
+                concepts: vec![Concept {
+                    name: "idée".into(),
+                    summary: None,
+                    sections: requested.to_vec(),
+                }],
+                rejected: Vec::new(),
+                served: vec!["m-servi".into()],
+            })
+        }
+        fn enrich_lot(&self, _: &[LotItem]) -> Result<Vec<(String, Result<Enrichment>)>> {
+            Err(Error::Message("inutilisé".into()))
+        }
+        fn ask(&self, _: &str, _: &str) -> Result<crate::llm::AskReply> {
+            Err(Error::Message("inutilisé".into()))
+        }
+    }
+
+    struct Run {
+        calls: Vec<String>,
+        store: Store,
+        report: BuildReport,
+        lines: Vec<String>,
+        files: Vec<FileRecord>,
+        _dir: tempfile::TempDir,
+    }
+
+    /// `docs` : (chemin, contenu, sections déclarées) ; une section `<chemin>#<nom>` par nom.
+    fn run(docs: &[(&str, &str, &[&str])], fail: &[&str], max_calls: Option<usize>) -> Run {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for (path, text, _) in docs {
+            let abs = dir.path().join(path);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(abs, text).unwrap();
+            files.push(FileRecord {
+                path: (*path).into(),
+                hash: String::new(),
+                size: text.len() as u64,
+                mtime: 0,
+                recorded_at: 0,
+                state: crate::model::FileState::Indexed,
+            });
+        }
+        let files = stamped(dir.path(), &files);
+        let mut store = Store::open_or_create(dir.path()).unwrap();
+        store.insert_files(&files).unwrap();
+        for (path, _, sections) in docs {
+            let nodes: Vec<Node> = sections
+                .iter()
+                .map(|s| {
+                    Node::new(
+                        NodeKind::Section,
+                        &format!("{path}#{s}"),
+                        s,
+                        Some(path),
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+            store.replace_structure(path, &nodes, &[]).unwrap();
+        }
+        let llm = Dup {
+            calls: Mutex::new(Vec::new()),
+            fail: fail.iter().map(|s| s.to_string()).collect(),
+        };
+        let opts = IndexOptions {
+            jobs: 1,
+            concurrency: 1,
+            max_chunk_chars: 1000,
+            batch_files: 1,
+            format_retries: 0,
+            enrich_code: false,
+            max_calls,
+            ..IndexOptions::default()
+        };
+        let mut report = BuildReport::default();
+        progress::init(true);
+        progress::take_captured();
+        enrich_with_stop(
+            Sources {
+                repo: dir.path(),
+                abs: &HashMap::new(),
+                redact: None,
+                batch: false,
+            },
+            &files,
+            &opts,
+            &llm,
+            &mut store,
+            &mut report,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let lines = progress::take_captured();
+        progress::init(false);
+        let calls = llm.calls.lock().unwrap().clone();
+        Run {
+            calls,
+            store,
+            report,
+            lines,
+            files,
+            _dir: dir,
+        }
+    }
+
+    const SAME: &str = "# Titre\n\ntexte\n";
+    const INTRO: &[&str] = &["intro"];
+
+    #[test]
+    fn req293_ac3_a_copy_written_with_the_representative() {
+        let r = run(
+            &[("x/a.md", SAME, INTRO), ("y/a.md", SAME, INTRO)],
+            &[],
+            None,
+        );
+        assert_eq!(r.calls, ["x/a.md"]);
+        assert!(r.store.enrichment_entry("x/a.md").unwrap().is_some());
+        assert!(r.store.enrichment_entry("y/a.md").unwrap().is_some());
+        // L'empreinte des nœuds de la copie est celle de ses propres nœuds.
+        let hashes = [
+            r.store.entry_nodes_hash("x/a.md").unwrap(),
+            r.store.entry_nodes_hash("y/a.md").unwrap(),
+        ];
+        assert_ne!(hashes[0], hashes[1]);
+        assert_eq!((r.report.requested, r.report.summarized), (2, 2));
+        assert!(r.store.files_to_enrich().unwrap().is_empty());
+        // Le résumé de la copie porte l'identifiant réécrit et le texte du représentant.
+        let summary = |id: &str| {
+            r.store
+                .nodes()
+                .unwrap()
+                .into_iter()
+                .find(|n| n.id == id)
+                .and_then(|n| n.summary)
+        };
+        assert_eq!(
+            summary("section:y/a.md#intro").as_deref(),
+            Some("r section:x/a.md#intro")
+        );
+        assert_eq!(
+            summary("section:x/a.md#intro").as_deref(),
+            Some("r section:x/a.md#intro")
+        );
+        assert_eq!(
+            r.lines.last().unwrap(),
+            "progression: enrichissement 100 % (2/2 fichiers)"
+        );
+        assert_eq!(r.files.len(), 2);
+    }
+
+    #[test]
+    fn req293_ac3_b_other_type_is_sent() {
+        let r = run(
+            &[("a.json", SAME, INTRO), ("b.yaml", SAME, INTRO)],
+            &[],
+            None,
+        );
+        assert_eq!(r.calls.len(), 2, "{:?}", r.calls);
+    }
+
+    #[test]
+    fn req293_ac3_c_different_node_sets_are_sent() {
+        let r = run(
+            &[
+                ("x/a.md", SAME, INTRO),
+                ("y/a.md", SAME, &["intro", "suite"]),
+            ],
+            &[],
+            None,
+        );
+        assert_eq!(r.calls.len(), 2, "{:?}", r.calls);
+    }
+
+    #[test]
+    fn req293_ac3_d_failed_representative_leaves_the_copy() {
+        let r = run(
+            &[("x/a.md", SAME, INTRO), ("y/a.md", SAME, INTRO)],
+            &["x/a.md"],
+            None,
+        );
+        assert_eq!(r.calls, ["x/a.md"]);
+        assert_eq!(r.report.failed, 1);
+        assert!(r.store.enrichment_entry("y/a.md").unwrap().is_none());
+        let left: Vec<String> = r
+            .store
+            .files_to_enrich()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(left, ["x/a.md", "y/a.md"]);
+        // Aucune ligne de progression ni aucun appel ne nomme la copie.
+        assert!(
+            r.lines.iter().all(|l| !l.contains("y/a.md")),
+            "{:?}",
+            r.lines
+        );
+        assert!(r.calls.iter().all(|c| c != "y/a.md"));
+        assert_eq!(
+            r.lines.last().unwrap(),
+            "progression: enrichissement 100 % (2/2 fichiers)"
+        );
+    }
+
+    #[test]
+    fn req293_ac3_e_delta_file_forms_no_group() {
+        // Un fichier à base (delta) n'entre dans aucun groupe : on le prépare par une entrée
+        // partielle (résumé de `intro` déjà connu) pour x/a.md seulement.
+        let mut ids = HashMap::new();
+        ids.insert(
+            "x/a.md".to_string(),
+            vec![("section:x/a.md#intro".to_string(), "intro".to_string())],
+        );
+        ids.insert(
+            "y/a.md".to_string(),
+            vec![("section:y/a.md#intro".to_string(), "intro".to_string())],
+        );
+        let mk = |p: &str| FileRecord {
+            path: p.into(),
+            hash: "h".into(),
+            size: 1,
+            mtime: 0,
+            recorded_at: 0,
+            state: crate::model::FileState::Indexed,
+        };
+        let files = [mk("x/a.md"), mk("y/a.md")];
+        let mut bases = HashMap::new();
+        bases.insert("x/a.md".to_string(), Enrichment::default());
+        let (send, copies) = copy_groups(&files, &ids, &bases, &HashMap::new());
+        assert_eq!(send.len(), 2);
+        assert!(copies.is_empty());
+        let (send, copies) = copy_groups(&files, &ids, &HashMap::new(), &HashMap::new());
+        assert_eq!(send.len(), 1);
+        assert_eq!(copies["x/a.md"][0].path, "y/a.md");
+    }
+
+    #[test]
+    fn req293_ac3_f_root_readme_is_the_representative() {
+        let r = run(
+            &[("docs/README.md", SAME, INTRO), ("README.md", SAME, INTRO)],
+            &[],
+            None,
+        );
+        assert_eq!(r.calls, ["README.md"]);
+        assert!(r
+            .store
+            .enrichment_entry("docs/README.md")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn req293_ac3_g_cap_of_one_call_covers_representative_and_copy() {
+        let r = run(
+            &[("x/a.md", SAME, INTRO), ("y/a.md", SAME, INTRO)],
+            &[],
+            Some(1),
+        );
+        assert_eq!(r.calls.len(), 1);
+        assert!(r.store.enrichment_entry("x/a.md").unwrap().is_some());
+        assert!(r.store.enrichment_entry("y/a.md").unwrap().is_some());
+        assert_eq!(r.report.left_by_cap, 0);
     }
 }

@@ -4519,7 +4519,7 @@ fn load_kept_enrichment(
 
 /// Identifiant de nœud d'un fichier renommé : réécrit ce qui dérive de l'ancien chemin, par les
 /// fonctions des analyseurs (REQ-257). Les types sans identifiant tiré du chemin sont inchangés.
-fn rewrite_node_id(old: &str, new: &str, file_type: FileType, id: &str) -> String {
+pub(crate) fn rewrite_node_id(old: &str, new: &str, file_type: FileType, id: &str) -> String {
     let Some((kind, qualified)) = id.split_once(':') else {
         return id.to_string();
     };

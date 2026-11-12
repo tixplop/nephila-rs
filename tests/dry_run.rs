@@ -959,8 +959,8 @@ fn req184_ac9_show_progress_sans_enrichissement() {
 fn req184_ac9_chemin_a_caractere_de_controle_echappe() {
     let env = Env::new();
     for (rel, content) in [
-        ("a/\u{1b}Big.java", java("Big", 800)),
-        ("b/Big.java", java("Big", 800)),
+        ("a/\u{1b}Big.java", java("Big", 800) + "// a\n"),
+        ("b/Big.java", java("Big", 800) + "// b\n"),
         (
             ".nephila.toml",
             "max_chunk_chars = 200\nconcurrency = 1\n".into(),
@@ -1292,4 +1292,37 @@ fn req291_ac4_build_dry_run_annonce_les_appels_du_delta() {
         1,
         "autant de requêtes que d'appels annoncés"
     );
+}
+
+#[test]
+fn req293_ac2_dry_run_counts_the_copy_without_call() {
+    let env = Env::new();
+    env.config_text("provider = \"mock\"\nmodel = \"mock\"\nbatch_files = 1\nconcurrency = 1\n");
+    let same = "# Un\n\nTexte.\n\n# Deux\n\nSuite.\n";
+    fs::create_dir_all(env.repo.join("a")).unwrap();
+    fs::create_dir_all(env.repo.join("b")).unwrap();
+    fs::write(env.repo.join("a/guide.md"), same).unwrap();
+    fs::write(env.repo.join("b/guide.md"), same).unwrap();
+    fs::write(env.repo.join("c.md"), "# Autre\n\nContenu différent.\n").unwrap();
+    let log = env._tmp.path().join("mock.log");
+    let mut dry = env.command(&["build", "--dry-run"]);
+    dry.env("NEPHILA_MOCK_LOG", &log);
+    let o = dry.output().unwrap();
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(fs::read_to_string(&log).unwrap_or_default().is_empty());
+    let lines = estimation_lines(&o);
+    assert_eq!(
+        number(&lines[0], "estimation : ", " fichiers"),
+        3,
+        "{lines:?}"
+    );
+    assert!(lines[0].ends_with(" et 1 sans appel"), "{lines:?}");
+    let calls = number(&lines[1], "minimale : ", " appels");
+    assert_eq!(calls, 2, "{lines:?}");
+
+    let mut real = env.command(&["build"]);
+    real.env("NEPHILA_MOCK_LOG", &log);
+    let r = real.output().unwrap();
+    assert_eq!(code(&r), 0, "{}", err(&r));
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), calls);
 }

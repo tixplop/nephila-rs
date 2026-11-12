@@ -1432,3 +1432,96 @@ fn req291_ac7_java_omitted_node_counts_as_tried_and_is_not_asked_again() {
     env.ok(&["build", "--enrich-code", "--batch-files", "1"]);
     assert_eq!(env.posts().len(), 4, "aucune requête de plus");
 }
+
+const GUIDE: &str = "# Un\n\nTexte.\n\n# Deux\n\nSuite.\n";
+
+#[test]
+fn req293_ac1_same_content_files_are_sent_once_and_copied() {
+    // Faux serveur openai qui numérote ses résumés par requête : `r<requête>-<n>`.
+    let server = fake_server::FakeServer::start(vec![
+        numbered_reply(&[(1, "r1-1"), (2, "r1-2")]),
+        numbered_reply(&[(1, "r2-1"), (2, "r2-2"), (3, "r2-3")]),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    for (p, text) in [
+        ("a/guide.md", GUIDE),
+        ("b/guide.md", GUIDE),
+        ("c.md", "# Autre\n\nContenu différent.\n"),
+    ] {
+        let abs = repo.join(p);
+        fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        fs::write(abs, text).unwrap();
+    }
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "provider = \"openai\"\nmodel = \"m\"\napi_key_env = \"NEPHILA_T398_KEY\"\nconcurrency = 1\nbatch_files = 1\nbase_url = \"{}\"\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    let run = |sub: &str| {
+        let o = Command::new(cargo_bin("nephila"))
+            .arg("-C")
+            .arg(&repo)
+            .arg(sub)
+            .env("NEPHILA_CONFIG", &config)
+            .env("NEPHILA_T398_KEY", "sk-test")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{sub} : {}", stderr(&o));
+        o
+    };
+    let posts = |server: &fake_server::FakeServer| -> Vec<String> {
+        server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == "/v1/chat/completions")
+            .map(|r| r.body)
+            .collect()
+    };
+    let out = run("build");
+    let bodies = posts(&server);
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    // Un Markdown à la racine part avant les autres (REQ-280).
+    assert!(bodies[0].contains("— document:c.md"), "{}", bodies[0]);
+    assert!(bodies[1].contains("— document:a/guide.md"), "{}", bodies[1]);
+    assert!(bodies.iter().all(|b| !b.contains("b/guide.md")));
+    // Chaque nœud de b/guide.md porte le résumé du nœud de a/guide.md de même ancre.
+    let asked = requested_ids(&bodies[1]);
+    assert_eq!(asked.len(), 3, "{asked:?}");
+    let s = Store::open_readonly(&repo).unwrap().nodes().unwrap();
+    let summary = |id: &str| {
+        s.iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.summary.clone())
+    };
+    for (k, id) in asked.iter().enumerate() {
+        let text = format!("r2-{}", k + 1);
+        assert_eq!(summary(id).as_deref(), Some(text.as_str()), "{id}");
+        let copy = id.replace("a/guide.md", "b/guide.md");
+        assert_eq!(summary(&copy).as_deref(), Some(text.as_str()), "{copy}");
+    }
+    let t: usize = Store::open_readonly(&repo)
+        .unwrap()
+        .undocumented_short_names()
+        .unwrap()
+        .iter()
+        .filter(|(f, n, _)| {
+            ["a/guide.md", "b/guide.md", "c.md"].contains(&f.as_str())
+                && !n.starts_with("package:")
+                && !n.starts_with("key:")
+        })
+        .count();
+    assert_eq!(t, 8);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stdout.contains(&format!(", 0 fichiers à enrichir, {t}/{t} nœuds résumés")),
+        "{stdout}"
+    );
+    run("update");
+    run("build");
+    assert_eq!(posts(&server).len(), 2);
+}
