@@ -11,6 +11,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/schema15.rs"]
+mod schema15;
+
 const BILLING_SRC: &str = "package com.acme.billing;\n\npublic class BillingService {\n    String SECRET_SOURCE_BODY = \"x\";\n    private Ledger ledger;\n\n    public void charge() {\n        ledger.record();\n    }\n}\n";
 
 struct Env {
@@ -1325,5 +1328,57 @@ fn req281_ac15_cle_cache_invalide_et_refusee_dans_le_projet() {
         text(&o.stderr),
         "erreur: ./.nephila.toml : clé inconnue `ask.cache` (clés permises dans [ask] : model, thinking, effort, max_output_tokens, max_context_chars, max_seeds, max_nodes)\n"
     );
+    assert_eq!(env.llm_calls(), 0);
+}
+
+/// AC-286-3 : un mot court qui ne figure que dans un résumé trouve un nœud de départ ; sans
+/// index (schéma 15), « pas trouvé dans le graphe ».
+#[test]
+fn req286_ac3_short_word_in_a_summary_reaches_the_context() {
+    let env = Env::new();
+    env.file(
+        "net/Transport.java",
+        "package com.acme.net;\n\npublic class Transport {\n}\n",
+    );
+    env.enrichment(
+        "net/Transport.java",
+        r#"{"version":2,"summaries":[{"node":"type:com.acme.net.Transport","summary":"Ouvre la connexion TLS"}],"concepts":[]}"#,
+    );
+    let o = env.cmd(&["update"]).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    // Question distincte de celle d'AC-286-2 : « géré » trouverait aussi « Gère la facturation »
+    // par l'ancienne règle. Le bloc de résumé du graphe est retiré : sans lui, seul le plein
+    // texte peut amener le nœud dans le contexte (le bloc le nommerait sans la fonctionnalité).
+    let question = "Quel est le rôle du TLS ?";
+    let db = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    db.execute("DELETE FROM summary", []).unwrap();
+    drop(db);
+    let reply = r#"{"found":true,"answer":"transport","nodes":["com.acme.net.Transport"]}"#;
+    let server = FakeServer::start(vec![(
+        200,
+        serde_json::json!({"content":[{"type":"text","text":reply}]}).to_string(),
+    )]);
+    let mock_config = fs::read_to_string(&env.config).unwrap();
+    http_env(&env, &server);
+    let o = env
+        .cmd(&["query", "ask", question])
+        .env("NEPHILA_TEST_ASK_KEY", "sk-test")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let reqs = server.requests();
+    let post = reqs.iter().find(|r| r.method == "POST").unwrap();
+    assert!(
+        post.body.contains("com.acme.net.Transport"),
+        "{}",
+        post.body
+    );
+    fs::write(&env.config, mock_config).unwrap();
+    let db = rusqlite::Connection::open(env.repo.join(".nephila/graph.db")).unwrap();
+    schema15::downgrade_to_15(&db);
+    drop(db);
+    let o = env.ask(question, &[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_not_found(&o);
     assert_eq!(env.llm_calls(), 0);
 }

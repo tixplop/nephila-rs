@@ -204,7 +204,6 @@ pub(crate) fn all_words_query(words: &[String]) -> String {
 
 /// Requête FTS5 : chaque terme entre guillemets (suivi de `*` si son booléen est vrai), reliés
 /// par OU. Vide sans terme.
-#[allow(dead_code)] // utilisée par `query ask` (T-392)
 pub(crate) fn any_terms_query(terms: &[(String, bool)]) -> String {
     terms
         .iter()

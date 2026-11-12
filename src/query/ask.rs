@@ -357,15 +357,38 @@ fn summary_block(summary: &Value, max_chars: usize) -> Option<SummaryBlock> {
 /// Nœuds de départ d'une question, chemin de production : graphe, noms qualifiés cités et mots
 /// repliés, mots ordinaires filtrés et racinisés, puis le classement de `rank_seeds` (REQ-183,
 /// DEC-147).
-fn question_seeds(nodes: &[Node], question: &str, limits: &AskLimits) -> Vec<Node> {
+fn question_seeds(
+    nodes: &[Node],
+    question: &str,
+    scores: &[Option<f64>],
+    limits: &AskLimits,
+) -> Vec<Node> {
     let prepared = search::Prepared::folded(nodes);
     rank_seeds(
         nodes,
         &prepared,
         &folded_qualified_terms(question),
         &question_words(question),
+        scores,
         limits,
     )
+}
+
+/// Requête FTS5 de la question (REQ-286) : identifiant cité → mot entier ; mot ordinaire d'au
+/// moins 4 caractères → sa racine en début de mot ; mot ordinaire plus court → mot entier. Termes
+/// reliés par OU ; vide sans mot.
+fn question_query(words: &[Word]) -> String {
+    let terms: Vec<(String, bool)> = words
+        .iter()
+        .map(|w| {
+            if !w.cited && w.exact.chars().count() >= 4 {
+                (w.root.clone(), true)
+            } else {
+                (w.exact.clone(), false)
+            }
+        })
+        .collect();
+    search::any_terms_query(&terms)
 }
 
 /// Nœuds de départ à partir de termes bruts, sans repli, racine ni mot vide : la règle de
@@ -395,6 +418,7 @@ fn find_seeds(
         &search::Prepared::new(nodes),
         qualified,
         &words,
+        &[],
         limits,
     )
 }
@@ -415,6 +439,7 @@ fn rank_seeds(
     prepared: &search::Prepared,
     qualified: &[String],
     words: &[Word],
+    scores: &[Option<f64>],
     limits: &AskLimits,
 ) -> Vec<Node> {
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -423,6 +448,7 @@ fn rank_seeds(
         prepared,
         qualified,
         words,
+        scores,
         limits,
         PARALLEL_MIN_NODES,
         cpus,
@@ -435,11 +461,13 @@ fn scan_threads(total: usize, slice: usize, cpus: usize) -> usize {
 }
 
 /// `rank_seeds` avec la taille de tranche et le nombre de fils maximal en paramètres.
+#[allow(clippy::too_many_arguments)]
 fn rank_seeds_with(
     nodes: &[Node],
     prepared: &search::Prepared,
     qualified: &[String],
     words: &[Word],
+    scores: &[Option<f64>],
     limits: &AskLimits,
     slice: usize,
     cpus: usize,
@@ -501,15 +529,36 @@ fn rank_seeds_with(
             offer(i, (word_class(w.cited, r), freq, r, qualified.len() + k));
         }
     }
+    // Un nœud trouvé par le seul plein texte entre en classe 4 avec une couverture 0 (REQ-286).
+    for (i, b) in best.iter_mut().enumerate() {
+        if b.is_none() && scores.get(i).is_some_and(Option::is_some) {
+            *b = Some((4, usize::MAX, 2, usize::MAX));
+        }
+    }
+    let score = |i: usize| scores.get(i).copied().flatten();
     let mut hit: Vec<(SeedKey, usize)> = best
         .iter()
         .enumerate()
         .filter_map(|(i, k)| k.map(|k| (k, i)))
         .collect();
     let order = |k: SeedKey, i: usize| (k.0, std::cmp::Reverse(cover[i]), k.1, k.2, k.3);
+    // Classe 4 seulement : sans score après, puis score croissant (plus petit = plus pertinent).
+    let by_score = |a: (SeedKey, usize), b: (SeedKey, usize)| {
+        if a.0 .0 != 4 {
+            return std::cmp::Ordering::Equal;
+        }
+        match (score(a.1), score(b.1)) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    };
     hit.sort_by(|a, b| {
-        order(a.0, a.1)
-            .cmp(&order(b.0, b.1))
+        (a.0 .0, std::cmp::Reverse(cover[a.1]))
+            .cmp(&(b.0 .0, std::cmp::Reverse(cover[b.1])))
+            .then_with(|| by_score(*a, *b))
+            .then_with(|| order(a.0, a.1).cmp(&order(b.0, b.1)))
             .then_with(|| nodes[a.1].qualified.cmp(&nodes[b.1].qualified))
             .then_with(|| nodes[a.1].id.cmp(&nodes[b.1].id))
     });
@@ -740,7 +789,15 @@ pub fn answer(
     cache: Option<(&Path, &Config, i64)>,
 ) -> Result<(String, Vec<Node>)> {
     let nodes = store.nodes()?;
-    let seeds = question_seeds(&nodes, question, limits);
+    let scores = {
+        let found = store.text_scores(&question_query(&question_words(question)))?;
+        if found.is_empty() {
+            Vec::new()
+        } else {
+            nodes.iter().map(|n| found.get(&n.id).copied()).collect()
+        }
+    };
+    let seeds = question_seeds(&nodes, question, &scores, limits);
     let wants_block = if seeds.is_empty() {
         !keywords(question).is_empty()
     } else {
@@ -1049,7 +1106,7 @@ mod tests {
     }
 
     fn seed_ids(nodes: &[Node], question: &str) -> Vec<String> {
-        question_seeds(nodes, question, &AskLimits::default())
+        question_seeds(nodes, question, &[], &AskLimits::default())
             .into_iter()
             .map(|n| n.id)
             .collect()
@@ -1204,7 +1261,7 @@ mod tests {
     }
 
     fn seed_quals(nodes: &[Node], question: &str) -> Vec<String> {
-        question_seeds(nodes, question, &AskLimits::default())
+        question_seeds(nodes, question, &[], &AskLimits::default())
             .into_iter()
             .map(|n| n.qualified)
             .collect()
@@ -1425,6 +1482,7 @@ mod tests {
                 &search::Prepared::folded(&nodes),
                 &quals,
                 &words,
+                &[],
                 &AskLimits::default(),
             )
             .into_iter()
@@ -1481,6 +1539,7 @@ mod tests {
                 &search::Prepared::folded(&nodes),
                 &[],
                 &words,
+                &[],
                 &AskLimits::default(),
                 slice,
                 cpus,
@@ -1499,6 +1558,93 @@ mod tests {
             .into_iter()
             .map(|n| n.qualified)
             .collect()
+    }
+
+    fn plain_word(w: &str) -> Word {
+        Word {
+            exact: w.into(),
+            root: w.into(),
+            cited: false,
+            summary: false,
+        }
+    }
+
+    fn ranked(nodes: &[Node], words: &[&str], scores: &[Option<f64>]) -> Vec<String> {
+        let words: Vec<Word> = words.iter().map(|w| plain_word(w)).collect();
+        rank_seeds_with(
+            nodes,
+            &search::Prepared::folded(nodes),
+            &[],
+            &words,
+            scores,
+            &AskLimits::default(),
+            PARALLEL_MIN_NODES,
+            1,
+        )
+        .into_iter()
+        .map(|n| n.qualified)
+        .collect()
+    }
+
+    #[test]
+    fn req286_ac1_class_4_ties_are_broken_by_score() {
+        // alpha : 3 nœuds ; beta : 1 nœud. Sans score, le terme le moins fréquent passe d'abord.
+        let nodes = vec![
+            mk(NodeKind::Type, "p.Bbeta", None),
+            mk(NodeKind::Type, "p.Aalpha", None),
+            mk(NodeKind::Type, "p.Xalpha", None),
+            mk(NodeKind::Type, "p.Yalpha", None),
+        ];
+        let none: Vec<Option<f64>> = vec![None; 4];
+        let q = ["alpha", "beta"];
+        assert_eq!(
+            ranked(&nodes, &q, &none),
+            ["p.Bbeta", "p.Aalpha", "p.Xalpha", "p.Yalpha"]
+        );
+        assert_eq!(ranked(&nodes, &q, &[]), ranked(&nodes, &q, &none));
+        let scores = [Some(-1.0), Some(-3.0), None, None];
+        assert_eq!(
+            ranked(&nodes, &q, &scores),
+            ["p.Aalpha", "p.Bbeta", "p.Xalpha", "p.Yalpha"]
+        );
+        // Couverture 2 sans score avant couverture 1 au meilleur score ; plein texte seul après.
+        let nodes = vec![
+            mk(NodeKind::Type, "p.Dbeta", None),
+            mk(NodeKind::Type, "p.Calphabeta", None),
+            mk(NodeKind::Type, "p.Epsilon", None),
+        ];
+        let scores = [Some(-9.0), None, Some(-1.0)];
+        assert_eq!(
+            ranked(&nodes, &q, &scores),
+            ["p.Calphabeta", "p.Dbeta", "p.Epsilon"]
+        );
+    }
+
+    #[test]
+    fn req286_ac2_short_word_found_in_a_summary_by_full_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let nodes = vec![
+            mk(
+                NodeKind::Type,
+                "x.Transport",
+                Some("Ouvre la connexion TLS"),
+            ),
+            mk(NodeKind::Type, "x.Other", None),
+        ];
+        let st = store_with_nodes(dir.path(), None, nodes);
+        let llm = keeper(&[]);
+        answer(
+            &st,
+            &llm,
+            "Comment est géré le TLS ?",
+            0,
+            &AskLimits::default(),
+            None,
+        )
+        .expect("nœud de départ trouvé par le plein texte");
+        let ctx = llm.contexts.lock().unwrap().clone();
+        assert_eq!(ctx.len(), 1);
+        assert!(ctx[0].contains("x.Transport"), "{}", ctx[0]);
     }
 
     #[test]
@@ -1938,7 +2084,7 @@ mod tests {
     fn req259_context(question: &str) -> (Vec<String>, Vec<String>) {
         let (nodes, edges) = req259_graph();
         let limits = AskLimits::default();
-        let seeds = question_seeds(&nodes, question, &limits);
+        let seeds = question_seeds(&nodes, question, &[], &limits);
         assert_eq!(
             seeds.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
             ["type:p.Alpha"]
@@ -2901,7 +3047,7 @@ mod tests {
         };
         let q = "Quelle architecture pour Order ?";
         let all = st.nodes().unwrap();
-        let seeds = question_seeds(&all, q, &wide(1000));
+        let seeds = question_seeds(&all, q, &[], &wide(1000));
         let edges = st.edges().unwrap();
         let alone = build_context(&all, &edges, &seeds, &link_intent(q), &wide(1000));
         assert!(alone.text.chars().count() > 900, "{}", alone.text);
@@ -2934,7 +3080,7 @@ mod tests {
         .unwrap();
         let ctx = llm.contexts.lock().unwrap()[0].clone();
         let nodes = st.nodes().unwrap();
-        let seeds = question_seeds(&nodes, "Que fait Order ?", &AskLimits::default());
+        let seeds = question_seeds(&nodes, "Que fait Order ?", &[], &AskLimits::default());
         let edges = st.edges().unwrap();
         let expected = build_context(
             &nodes,
