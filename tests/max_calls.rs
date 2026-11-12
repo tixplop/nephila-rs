@@ -728,7 +728,7 @@ fn req227_ac5_reservation_et_plafond_comptent_les_appels_a_envoyer() {
         !err.contains("plafond") && !err.contains("trop d'appels"),
         "{err}"
     );
-    assert_eq!(kept_rows(&env), 0);
+    assert_eq!(kept_rows(&env), 5);
 
     // --max-calls 1 : aucun appel, A-11 sur les 2 appels à envoyer, lignes gardées.
     let env = three_kept_of_five();

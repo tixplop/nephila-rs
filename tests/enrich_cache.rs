@@ -1182,7 +1182,8 @@ fn req227_ac1_reprise_n_envoie_que_les_appels_manquants() {
     let o = env.run(&["update"]);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
     assert_eq!(env.logged(), calls(&[3, 4]));
-    assert_eq!(kept_rows(&env), 0);
+    // Une ligne par appel du plan, conservée après la réussite (REQ-226).
+    assert_eq!(kept_rows(&env), 4);
     assert_eq!(to_enrich(&env), 0);
 
     let clean = big_env(4);
@@ -1202,17 +1203,12 @@ fn req227_ac3_morceau_modifie_ou_nouveau_nom_renvoient_ce_qui_change() {
     env.ok(&["update"]);
     assert_eq!(env.logged(), calls(&[2, 3, 4]));
 
-    // Ligne insérée en tête : tous les appels partent.
+    // Commentaire inséré en tête, sans déplacer de coupe : seul le morceau 1 change, l'appel 2
+    // ne repart pas (REQ-294).
     let env = failed_after_three();
-    env.write(BIG, &format!("intro\n\n{}", big_doc(4)));
+    env.write(BIG, &format!("<!-- intro -->\n{}", big_doc(4)));
     env.ok(&["update"]);
-    assert_eq!(env.logged(), calls(&[1, 2, 3, 4]));
-
-    // Nœud ajouté dans le dernier morceau : la liste des nœuds connus change, tout repart.
-    let env = failed_after_three();
-    env.write(BIG, &format!("{}# Extra\n\nx\n", big_doc(4)));
-    env.ok(&["update"]);
-    assert_eq!(env.logged(), calls(&[1, 2, 3, 4]));
+    assert_eq!(env.logged(), calls(&[1, 3, 4]));
 }
 
 #[test]
@@ -1326,7 +1322,7 @@ fn req227_ac6_tous_les_appels_conserves_aucun_appel_fichier_enrichi() {
     let o = env.ok(&["update"]);
     assert!(env.logged().is_empty(), "{:?}", env.logged());
     assert_eq!(to_enrich(&env), 0);
-    assert_eq!(kept_rows(&env), 0);
+    assert_eq!(kept_rows(&env), 4);
     // Les appels conservés sont écrits par cette commande : le segment suit (REQ-235).
     assert!(without_coverage(&text(&o.stdout)).ends_with(", 0 fichiers à enrichir"));
 }
@@ -1632,7 +1628,7 @@ fn req232_ac13_sous_appel_non_conforme_ne_garde_que_l_appel_un() {
     let o = s.run("update");
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert_eq!(s.posts(), 4);
-    assert_eq!(s.kept(), 0);
+    assert_eq!(s.kept(), 2);
 }
 
 #[test]
@@ -1690,7 +1686,7 @@ fn REQ237_AC8_resumes_retraduits_d_un_appel_conserve_restent_sur_leurs_noeuds() 
     assert!(o.status.success(), "{}", text(&o.stderr));
     // L'appel 1 n'est pas renvoyé : une seule requête de plus, pour l'appel 2.
     assert_eq!(s.posts(), 3);
-    assert_eq!(s.kept(), 0);
+    assert_eq!(s.kept(), 2);
     let nodes = Store::open_readonly(&s.repo).unwrap().nodes().unwrap();
     for id in lists[0].iter().chain(&lists[1]) {
         let n = nodes.iter().find(|n| &n.id == id).expect(id);
@@ -2601,7 +2597,7 @@ fn REQ277_AC9_kept_call_of_an_equivalent_name_is_not_sent_again() {
     let o = s.run("update");
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert_eq!(s.posts(), 3, "seul l'appel 2 part");
-    assert_eq!(s.kept(), 0);
+    assert_eq!(s.kept(), 2);
     assert_eq!(
         Store::open_readonly(&s.repo)
             .unwrap()

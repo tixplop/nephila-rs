@@ -2365,7 +2365,7 @@ fn req228_ac3_derniere_passe_conserve_les_reponses_puis_reprise_des_appels_manqu
         assert_eq!(lots[1].len(), 1, "{provider}");
         assert!(lots[1][0].to_string().contains("(extrait 2/3"));
         assert_eq!(fx.to_enrich().len(), 0, "{provider}");
-        assert_eq!(kept_rows(&fx), 0, "{provider}");
+        assert_eq!(kept_rows(&fx), 3, "{provider}");
 
         // Sans --batch : un seul appel.
         let (fx, healthy) = three_calls(provider, &[2]);

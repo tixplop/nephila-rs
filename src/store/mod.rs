@@ -1498,6 +1498,7 @@ impl Store {
                 concepts: concept_nodes.to_vec(),
                 refs: refs.to_vec(),
                 served_model: None,
+                call_keys: Vec::new(),
             }],
         )
     }
@@ -3722,6 +3723,9 @@ pub struct EnrichmentWrite {
     pub refs: Vec<Ref>,
     /// Nom du modèle servi, lu dans les réponses (REQ-278) ; `None` sans réponse du LLM.
     pub served_model: Option<String>,
+    /// Clés des appels conservables du plan du fichier : ses seules lignes de `enrich_calls`
+    /// restent (REQ-226) ; vide pour un lot, un appel unique, une copie ou un fichier sans appel.
+    pub call_keys: Vec<String>,
 }
 
 /// Résultat validé d'un appel d'un fichier envoyé seul, à conserver (REQ-226).
@@ -3787,8 +3791,8 @@ impl CallPayload {
     }
 }
 
-/// Ce qui fait la requête d'un appel et son filtrage : la clé d'un appel conservé en est
-/// l'empreinte (REQ-226).
+/// Ce qui fait la requête d'un appel : la clé d'un appel conservé en est l'empreinte (REQ-226,
+/// DEC-225). Ni le rang, ni le total, ni l'extrait, ni l'en-tête répété, ni `known` n'y entrent.
 #[derive(Debug, Clone, Copy)]
 pub struct CallKeyParts<'a> {
     pub model: &'a str,
@@ -3796,14 +3800,9 @@ pub struct CallKeyParts<'a> {
     /// Version du prompt de la famille du chemin.
     pub prompt_version: u32,
     pub path: &'a str,
-    /// Rang de l'appel (à partir de 1) sur `total`.
-    pub rank: usize,
-    pub total: usize,
-    /// Première et dernière ligne de l'extrait ; `None` sans extrait.
-    pub lines: Option<(usize, usize)>,
-    pub text: &'a str,
+    /// Corps du morceau : son texte sans l'en-tête répété.
+    pub body: &'a str,
     pub requested: &'a [String],
-    pub known: &'a [String],
 }
 
 /// BLAKE3 hexadécimal du tableau JSON des éléments de `CallKeyParts` (REQ-226).
@@ -3813,13 +3812,8 @@ pub fn call_key(p: &CallKeyParts<'_>) -> String {
         p.language,
         p.prompt_version,
         p.path,
-        p.rank,
-        p.total,
-        p.lines.map(|l| l.0),
-        p.lines.map(|l| l.1),
-        p.text,
+        p.body,
         p.requested,
-        p.known,
     ]);
     blake3::hash(json.to_string().as_bytes())
         .to_hex()
@@ -3856,12 +3850,19 @@ fn write_enrichment(
         concepts: concept_nodes,
         refs,
         served_model,
+        call_keys,
     } = item;
     require_known(tx, path)?;
-    tx.prepare_cached("DELETE FROM enrich_calls WHERE path = ?1")
-        .map_err(db_err)?
-        .execute([path])
-        .map_err(db_err)?;
+    // Les lignes du chemin dont la clé n'est pas dans le plan disparaissent (REQ-226).
+    let keys = serde_json::to_string(call_keys)
+        .map_err(|e| Error::Message(format!("clés d'appels non sérialisables : {e}")))?;
+    tx.prepare_cached(
+        "DELETE FROM enrich_calls WHERE path = ?1
+         AND call_key NOT IN (SELECT value FROM json_each(?2))",
+    )
+    .map_err(db_err)?
+    .execute(params![path, keys])
+    .map_err(db_err)?;
     let mut touched = Touched::new(track);
     apply_enrichment_tx(tx, path, summaries, concept_nodes, refs, &mut touched)?;
     finish_file(tx, path, &mut touched)?;
@@ -6806,6 +6807,7 @@ mod tests {
             .unwrap();
         let item = EnrichmentWrite {
             served_model: served.map(String::from),
+            call_keys: Vec::new(),
             path: "a.md".into(),
             hash: "h".into(),
             summaries: vec![("type:p.A".into(), "résumé".into())],
@@ -6826,6 +6828,7 @@ mod tests {
         let (_d, mut st) = served_store(Some("s1"));
         let item = EnrichmentWrite {
             served_model: Some("s2".into()),
+            call_keys: Vec::new(),
             path: "a.md".into(),
             hash: "h".into(),
             summaries: vec![("type:p.A".into(), "résumé".into())],
@@ -8541,6 +8544,7 @@ mod tests {
     fn whole_item(path: &str, nodes: &[Node]) -> EnrichmentWrite {
         EnrichmentWrite {
             served_model: None,
+            call_keys: Vec::new(),
             path: path.into(),
             hash: "h".into(),
             summaries: vec![(nodes[0].id.clone(), "résumé".into())],
@@ -8570,30 +8574,23 @@ mod tests {
         assert!(payload.contains("\"v\":1"), "{payload}");
     }
 
-    fn parts<'a>(requested: &'a [String], known: &'a [String]) -> CallKeyParts<'a> {
+    fn parts(requested: &[String]) -> CallKeyParts<'_> {
         CallKeyParts {
             model: "m",
             language: "français",
             prompt_version: 7,
             path: "a.md",
-            rank: 2,
-            total: 5,
-            lines: Some((10, 20)),
-            text: "texte",
+            body: "texte",
             requested,
-            known,
         }
     }
 
     #[test]
     fn req226_ac2_key_changes_with_each_element_only() {
-        let (req, known) = (
-            vec!["x".to_string()],
-            vec!["x".to_string(), "y".to_string()],
-        );
-        let base = parts(&req, &known);
+        let req = vec!["x".to_string()];
+        let base = parts(&req);
         let key = call_key(&base);
-        assert_eq!(key, call_key(&parts(&req, &known)));
+        assert_eq!(key, call_key(&parts(&req)));
         assert_eq!(key.len(), 64);
         let other = vec!["z".to_string()];
         let variants = [
@@ -8613,30 +8610,12 @@ mod tests {
                 path: "b.md",
                 ..base
             },
-            CallKeyParts { rank: 3, ..base },
-            CallKeyParts { total: 6, ..base },
             CallKeyParts {
-                lines: Some((11, 20)),
-                ..base
-            },
-            CallKeyParts {
-                lines: Some((10, 21)),
-                ..base
-            },
-            CallKeyParts {
-                lines: None,
-                ..base
-            },
-            CallKeyParts {
-                text: "texte2",
+                body: "texte2",
                 ..base
             },
             CallKeyParts {
                 requested: &other,
-                ..base
-            },
-            CallKeyParts {
-                known: &other,
                 ..base
             },
         ];
@@ -8649,7 +8628,7 @@ mod tests {
             vec!["ab".to_string(), "c".to_string()],
             vec!["a".to_string(), "bc".to_string()],
         );
-        assert_ne!(call_key(&parts(&r1, &known)), call_key(&parts(&r2, &known)));
+        assert_ne!(call_key(&parts(&r1)), call_key(&parts(&r2)));
     }
 
     #[test]
@@ -8682,7 +8661,7 @@ mod tests {
     }
 
     #[test]
-    fn req226_ac4_file_write_deletes_its_rows_only_and_rollback_restores() {
+    fn req226_ac4_file_write_keeps_its_plan_rows_only_and_rollback_restores() {
         let (_d, mut st) = calls_store();
         let nodes_a = [ty("p.a.md", "a.md")];
         st.apply_group(
@@ -8691,32 +8670,53 @@ mod tests {
             &[
                 call("a.md", "k1", "1"),
                 call("a.md", "k2", "2"),
-                call("b.md", "k3", "3"),
+                call("a.md", "k3", "3"),
+                call("b.md", "k9", "9"),
             ],
             &[],
         )
         .unwrap();
+        let plan = |keys: &[&str]| EnrichmentWrite {
+            call_keys: keys.iter().map(|k| k.to_string()).collect(),
+            ..whole_item("a.md", &nodes_a)
+        };
         // Groupe annulé par un fichier inconnu : lignes et nouveaux résultats comme avant.
         let unknown = EnrichmentWrite {
-            served_model: None,
             path: "inconnu.md".into(),
-            ..whole_item("a.md", &nodes_a)
+            ..plan(&["k1"])
         };
         let before = call_rows(&st);
         assert!(st
             .apply_group(
                 "m",
                 "français",
-                &[call("b.md", "k4", "4")],
-                &[whole_item("a.md", &nodes_a), unknown],
+                &[call("a.md", "k4", "4")],
+                &[plan(&["k1", "k2", "k4"]), unknown],
             )
             .is_err());
         assert_eq!(call_rows(&st), before);
-        // Écriture réussie du fichier a.md : ses lignes disparaissent, celles de b.md restent.
-        st.apply_enrichments("m", "français", &[whole_item("a.md", &nodes_a)])
+        // Plan k1, k2, k4 et réponse de k4 : exactement ces lignes, celles de b.md inchangées.
+        st.apply_group(
+            "m",
+            "français",
+            &[call("a.md", "k4", "4")],
+            &[plan(&["k1", "k2", "k4"])],
+        )
+        .unwrap();
+        let rows = |p: &str, ks: &[&str]| -> Vec<(String, String)> {
+            ks.iter().map(|k| (p.to_string(), k.to_string())).collect()
+        };
+        let mut expected = rows("a.md", &["k1", "k2", "k4"]);
+        expected.extend(rows("b.md", &["k9"]));
+        assert_eq!(call_rows(&st), expected);
+        // Même plan réécrit : inchangé (annulation du suivant sans effet sur les lignes).
+        st.apply_enrichments("m", "français", &[plan(&["k1", "k2", "k4"])])
             .unwrap();
-        assert_eq!(call_rows(&st), vec![("b.md".to_string(), "k3".to_string())]);
-        // apply_enrichment (un fichier) fait de même.
+        assert_eq!(call_rows(&st), expected);
+        // Fichier d'un seul appel (aucune clé de plan) : aucune ligne pour lui.
+        st.apply_enrichments("m", "français", &[plan(&[])]).unwrap();
+        assert_eq!(call_rows(&st), rows("b.md", &["k9"]));
+        // apply_enrichment (un fichier) n'a aucun plan : aucune ligne.
         st.apply_enrichment("b.md", "h", "m", "français", &[], &[], &[])
             .unwrap();
         assert!(call_rows(&st).is_empty());
@@ -8834,6 +8834,7 @@ mod tests {
                 let (f, nodes, _) = item_of(i);
                 EnrichmentWrite {
                     served_model: None,
+                    call_keys: Vec::new(),
                     path: f,
                     hash: "h".into(),
                     summaries: vec![(nodes[1].id.clone(), format!("résumé {i}"))],
@@ -8865,6 +8866,7 @@ mod tests {
         let mut bad = writes.clone();
         bad.push(EnrichmentWrite {
             served_model: None,
+            call_keys: Vec::new(),
             path: "inconnu.md".into(),
             hash: "h".into(),
             summaries: vec![],
@@ -8875,6 +8877,7 @@ mod tests {
         let (f, nodes, _) = item_of(5);
         bad[0] = EnrichmentWrite {
             served_model: None,
+            call_keys: Vec::new(),
             path: f,
             hash: "h2".into(),
             summaries: vec![(nodes[0].id.clone(), "autre".into())],
@@ -9128,6 +9131,7 @@ mod tests {
             "français",
             &[EnrichmentWrite {
                 served_model: None,
+                call_keys: Vec::new(),
                 path: "b.md".into(),
                 hash: "h".into(),
                 summaries: vec![],
@@ -9308,6 +9312,7 @@ mod tests {
             "français",
             &[EnrichmentWrite {
                 served_model: None,
+                call_keys: Vec::new(),
                 path: "b.md".into(),
                 hash: "h".into(),
                 summaries: vec![],
@@ -9465,6 +9470,7 @@ mod tests {
                 "français",
                 &[EnrichmentWrite {
                     served_model: None,
+                    call_keys: Vec::new(),
                     path: "a.java".into(),
                     hash: "h".into(),
                     summaries: vec![],
@@ -9686,6 +9692,7 @@ mod tests {
                 "français",
                 &[EnrichmentWrite {
                     served_model: None,
+                    call_keys: Vec::new(),
                     path: "a.md".into(),
                     hash: "h".into(),
                     summaries: vec![],
@@ -9761,6 +9768,7 @@ mod tests {
             "français",
             &[EnrichmentWrite {
                 served_model: None,
+                call_keys: Vec::new(),
                 path: "a.java".into(),
                 hash: "h".into(),
                 summaries: vec![],

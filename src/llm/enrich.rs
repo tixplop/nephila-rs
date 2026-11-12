@@ -1752,12 +1752,8 @@ pub(crate) mod tests {
                 language: "français",
                 prompt_version: v.of_path("app.yml"),
                 path: "app.yml",
-                rank: 1,
-                total: 1,
-                lines: None,
-                text: "a: 1",
+                body: "a: 1",
                 requested: &[],
-                known: &[],
             })
         };
         let off = PromptVersions {

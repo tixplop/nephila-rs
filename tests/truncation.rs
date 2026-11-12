@@ -1349,7 +1349,7 @@ fn req230_ac8_sous_appel_en_echec_ne_garde_pas_les_appels_du_sous_plan() {
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(s.posts().len(), 5, "{}", err(&o));
     assert_eq!(s.to_enrich(), 0);
-    assert_eq!(kept_calls(&s), 0);
+    assert_eq!(kept_calls(&s), 2);
 
     // Plan d'un seul appel : même échec, table vide.
     let s = Setup::new(p, vec![trunc(p), good(), bad()], "format_retries = 0\n");

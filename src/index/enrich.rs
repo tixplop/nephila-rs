@@ -227,6 +227,8 @@ pub(crate) enum Unit<'a> {
         /// Morceau envoyé : `None` quand le fichier tient en un seul morceau (REQ-169).
         excerpt: Option<Excerpt>,
         part: Arc<str>,
+        /// Corps du morceau, sans l'en-tête répété : ce qui entre dans la clé (REQ-226).
+        body: Arc<str>,
         requested: Vec<String>,
         /// Liste complète des nœuds du fichier, qui filtre la réponse.
         known: Arc<[String]>,
@@ -306,6 +308,7 @@ fn recover_call<'a>(unit: &Unit<'a>, kept: Enrichment) -> Recovery<'a> {
         count,
         excerpt,
         part,
+        body,
         requested,
         known,
         path,
@@ -342,6 +345,7 @@ fn recover_call<'a>(unit: &Unit<'a>, kept: Enrichment) -> Recovery<'a> {
         count: *count,
         excerpt: *excerpt,
         part: Arc::clone(part),
+        body: Arc::clone(body),
         requested: rest,
         known: Arc::clone(known),
         path,
@@ -366,6 +370,7 @@ fn split_call<'a>(
         count,
         excerpt,
         part,
+        body,
         requested,
         known,
         path,
@@ -391,6 +396,7 @@ fn split_call<'a>(
             count: *count,
             excerpt,
             part,
+            body: Arc::clone(body),
             requested,
             known: Arc::clone(known),
             path,
@@ -637,56 +643,35 @@ pub(crate) struct KeptCalls {
 }
 
 impl KeptCalls {
-    /// Clé d'un appel du plan d'un fichier envoyé seul.
-    #[allow(clippy::too_many_arguments)]
-    fn key(
-        &self,
-        path: &str,
-        index: usize,
-        count: usize,
-        excerpt: Option<Excerpt>,
-        part: &str,
-        requested: &[String],
-        known: &[String],
-    ) -> String {
-        self.key_as(
-            &self.model,
-            path,
-            index,
-            count,
-            excerpt,
-            part,
-            requested,
-            known,
-        )
+    /// Clé d'un appel du plan d'un fichier envoyé seul : `body` est le corps de son morceau.
+    fn key(&self, path: &str, body: &str, requested: &[String]) -> String {
+        self.key_as(&self.model, path, body, requested)
     }
 
     /// Clé du même appel sous le nom de modèle `model`.
-    #[allow(clippy::too_many_arguments)]
-    fn key_as(
-        &self,
-        model: &str,
-        path: &str,
-        index: usize,
-        count: usize,
-        excerpt: Option<Excerpt>,
-        part: &str,
-        requested: &[String],
-        known: &[String],
-    ) -> String {
+    fn key_as(&self, model: &str, path: &str, body: &str, requested: &[String]) -> String {
         call_key(&CallKeyParts {
             model,
             language: &self.language,
             prompt_version: self.versions.of_path(path),
             path,
-            rank: index,
-            total: count,
-            lines: excerpt.map(|e| (e.first_line, e.last_line)),
-            text: part,
+            body,
             requested,
-            known,
         })
     }
+}
+
+/// Réduit un résultat repris à la liste `known` actuelle du fichier : un résumé d'un nœud qui n'y
+/// est plus et une section de concept qui n'y est plus sont retirés ; un concept sans section
+/// restante l'est aussi. Les éléments écartés restent tels quels (REQ-226).
+fn retain_known(mut x: Enrichment, known: &[String]) -> Enrichment {
+    let known: HashSet<&str> = known.iter().map(String::as_str).collect();
+    x.summaries.retain(|(id, _)| known.contains(id.as_str()));
+    for c in &mut x.concepts {
+        c.sections.retain(|s| known.contains(s.as_str()));
+    }
+    x.concepts.retain(|c| !c.sections.is_empty());
+    x
 }
 
 /// Suite d'une unité qui n'est pas un appel.
@@ -1531,6 +1516,12 @@ fn plan_calls<'a>(
     let mut homes = section_homes(text, &spans, nodes);
     homes.extend(code_homes(&file.path, text, &spans, nodes));
     let excerpts = excerpts_of(text, &spans);
+    let bodies: Vec<Arc<str>> = (0..spans.len())
+        .map(|k| {
+            let end = spans.get(k + 1).map_or(text.len(), |(_, s)| *s);
+            Arc::from(&text[spans[k].1.min(end)..end])
+        })
+        .collect();
     let parts: Vec<String> = spans.into_iter().map(|(part, _)| part).collect();
     let mut plan = call_plan(&parts, nodes, &homes, nodes_per_call);
     retain_calls(&mut plan, &file.path, &known);
@@ -1551,6 +1542,7 @@ fn plan_calls<'a>(
             count,
             excerpt: excerpts[k],
             part: Arc::clone(&shared[k]),
+            body: Arc::clone(&bodies[k]),
             requested,
             known: Arc::clone(&known),
             path: Vec::new(),
@@ -1587,13 +1579,14 @@ fn mark_rereads(calls: &mut [Unit<'_>], floor: Option<usize>) {
     }
 }
 
-/// Sépare les appels du plan dont la réponse est conservée (rang à partir de 1 et réponse) des
+/// Sépare les appels du plan dont la réponse est conservée (rang à partir de 1, clé et réponse) des
 /// appels à envoyer, dans l'ordre du plan (REQ-227).
 fn split_kept<'a>(
     calls: Vec<Unit<'a>>,
     kept: &KeptCalls,
-) -> (Vec<Unit<'a>>, Vec<(usize, Enrichment)>) {
-    if kept.results.is_empty() {
+) -> (Vec<Unit<'a>>, Vec<(usize, String, Enrichment)>) {
+    // Un plan de moins de 2 appels ne conserve rien (REQ-226).
+    if kept.results.is_empty() || calls.len() < 2 {
         return (calls, Vec::new());
     }
     let mut send = Vec::new();
@@ -1603,21 +1596,17 @@ fn split_kept<'a>(
             Unit::Call {
                 file,
                 index,
-                count,
-                excerpt,
-                part,
+                body,
                 requested,
                 known,
                 ..
             } => std::iter::once(&kept.model)
                 .chain(&kept.aliases)
                 .find_map(|m| {
-                    let key = kept.key_as(
-                        m, &file.path, *index, *count, *excerpt, part, requested, known,
-                    );
-                    kept.results.get(&key)
+                    let key = kept.key_as(m, &file.path, body, requested);
+                    kept.results.get(&key).map(|x| (key, x))
                 })
-                .map(|x| (*index, x.clone())),
+                .map(|(key, x)| (*index, key, retain_known(x.clone(), known))),
             _ => None,
         };
         match found {
@@ -2027,7 +2016,7 @@ enum Msg<'a> {
     Kept {
         file: &'a FileRecord,
         count: usize,
-        results: Vec<(usize, Enrichment)>,
+        results: Vec<(usize, String, Enrichment)>,
     },
 }
 
@@ -2039,6 +2028,8 @@ struct Partial {
     expected: usize,
     done: usize,
     failed: bool,
+    /// Clés des appels conservables du plan reçus ou repris (REQ-226).
+    keys: Vec<String>,
 }
 
 /// File commune des fils (DEC-063), sous un seul verrou.
@@ -2239,6 +2230,7 @@ fn queue_done(
         concepts,
         refs,
         served_model: (!x.served.is_empty()).then(|| x.served.join(", ")),
+        call_keys: Vec::new(),
     });
     // Copies de contenu (REQ-293) : le même résultat, réécrit pour leur chemin.
     let none = HashMap::new();
@@ -2292,6 +2284,7 @@ fn partial_of<'p>(
             expected: count,
             done: 0,
             failed: false,
+            keys: Vec::new(),
         })
 }
 
@@ -2319,6 +2312,7 @@ fn complete_file(
     } else {
         chunk::merge_enrichments(parts)
     };
+    let first = pending.len();
     queue_done(
         file,
         &merged,
@@ -2329,6 +2323,10 @@ fn complete_file(
         notes,
         copies,
     );
+    // Les lignes du dernier plan restent : seul le fichier lui-même les porte (REQ-226).
+    if let Some(w) = pending.get_mut(first) {
+        w.call_keys = std::mem::take(&mut entry.keys);
+    }
     1 + copies.get(&file.path).map_or(0, Vec::len)
 }
 
@@ -2444,6 +2442,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                 count,
                 excerpt,
                 part,
+                body,
                 requested,
                 known,
                 path,
@@ -2619,7 +2618,7 @@ fn worker<'a>(ctx: Ctx<'_, 'a>, tx: mpsc::Sender<Msg<'a>>) {
                         .insert(file.path.clone());
                 }
                 let key = (result.is_ok() && count >= 2 && path.is_empty())
-                    .then(|| kept.key(&file.path, index, count, excerpt, part, requested, known));
+                    .then(|| kept.key(&file.path, body, requested));
                 let result = result.map_err(failure_advice);
                 (
                     (!recovered).then_some(err),
@@ -3089,6 +3088,9 @@ pub(crate) fn enrich_pass(
                                 // Un résultat valide est conservé même si le fichier est déjà en
                                 // échec (REQ-227), sauf erreur d'écriture.
                                 if let (Some(key), None) = (key, &write_error) {
+                                    if !entry.failed {
+                                        entry.keys.push(key.clone());
+                                    }
                                     pending_calls.push(CallWrite {
                                         path: file.path.clone(),
                                         key,
@@ -3137,7 +3139,8 @@ pub(crate) fn enrich_pass(
                     } => {
                         let entry = partial_of(&mut partials, file, count);
                         if !entry.failed {
-                            for (index, x) in results {
+                            for (index, key, x) in results {
+                                entry.keys.push(key);
                                 entry.results.insert(vec![index], x);
                                 entry.done += 1;
                             }
@@ -6164,6 +6167,36 @@ mod tests {
     }
 
     #[test]
+    fn req226_ac2_resumed_result_is_filtered_on_the_current_known_list() {
+        let concept = |name: &str, sections: &[&str]| crate::llm::enrich::Concept {
+            name: name.into(),
+            summary: Some("c".into()),
+            sections: sections.iter().map(|s| s.to_string()).collect(),
+        };
+        let x = Enrichment {
+            summaries: vec![("a".into(), "ra".into()), ("gone".into(), "rg".into())],
+            concepts: vec![
+                concept("deux", &["section:x#a", "section:x#gone"]),
+                concept("perdu", &["section:x#gone"]),
+                concept("intact", &["section:x#a"]),
+            ],
+            rejected: vec!["écarté tel quel".into()],
+            served: Vec::new(),
+        };
+        let known = vec!["a".to_string(), "section:x#a".to_string()];
+        let y = retain_known(x, &known);
+        assert_eq!(y.summaries, vec![("a".to_string(), "ra".to_string())]);
+        assert_eq!(
+            y.concepts,
+            vec![
+                concept("deux", &["section:x#a"]),
+                concept("intact", &["section:x#a"])
+            ]
+        );
+        assert_eq!(y.rejected, vec!["écarté tel quel".to_string()]);
+    }
+
+    #[test]
     fn req227_ac2_appels_en_vol_apres_l_echec_conserves_les_suivants_ne_partent_pas() {
         let (dir, files) = probe_repo(&[("Big.txt", 6)], 0);
         let llm = FailFirstWhileOthersFly {
@@ -6193,7 +6226,8 @@ mod tests {
         calls.sort_unstable();
         assert_eq!(calls, ["Big.txt#1", "Big.txt#4", "Big.txt#5", "Big.txt#6"]);
         assert!(store.enriched_hash("Big.txt").unwrap().is_some());
-        assert!(store.call_results().unwrap().is_empty());
+        // Les lignes du plan réussi restent : une par appel (REQ-226).
+        assert_eq!(store.call_results().unwrap().len(), 6);
     }
 
     #[test]
@@ -6650,6 +6684,7 @@ mod tests {
             count: 1,
             excerpt: None,
             part: Arc::from("t"),
+            body: Arc::from("t"),
             requested: Vec::new(),
             known: Arc::from(Vec::<String>::new()),
             path: Vec::new(),
@@ -7268,6 +7303,7 @@ mod tests {
                 last_line: 9,
             }),
             part: Arc::from("texte"),
+            body: Arc::from("texte"),
             requested: requested.iter().map(|s| s.to_string()).collect(),
             known: Arc::from(vec!["x".to_string()]),
             path: path.to_vec(),
@@ -7671,6 +7707,7 @@ mod tests {
             count: 1,
             excerpt,
             part: Arc::from(part),
+            body: Arc::from(part),
             requested: requested.iter().map(|s| s.to_string()).collect(),
             known: known.iter().map(|s| s.to_string()).collect(),
             path: vec![],
@@ -9065,18 +9102,14 @@ mod cache_tests {
         for call in calls.iter().take(held) {
             let Unit::Call {
                 file,
-                index,
-                count,
-                excerpt,
-                part,
+                body,
                 requested,
-                known,
                 ..
             } = call
             else {
                 unreachable!()
             };
-            let key = kept.key(&file.path, *index, *count, *excerpt, part, requested, known);
+            let key = kept.key(&file.path, body, requested);
             kept.results.insert(key, Enrichment::default());
         }
         let (mut send, _) = split_kept(calls, &kept);
@@ -9087,6 +9120,59 @@ mod cache_tests {
                 _ => unreachable!(),
             })
             .collect()
+    }
+
+    #[test]
+    fn req226_ac2_same_body_requested_and_path_share_the_key_whatever_the_rest() {
+        let f = file("A.java");
+        let unit = |index: usize, count: usize, header: &str, known: &[&str]| Unit::Call {
+            file: f,
+            index,
+            count,
+            excerpt: Some(Excerpt {
+                rank: index,
+                total: count,
+                first_line: index * 10,
+                last_line: index * 10 + 5,
+            }),
+            part: Arc::from(format!("{header}corps\n")),
+            body: Arc::from("corps\n"),
+            requested: vec!["method:A.m0".to_string()],
+            known: known.iter().map(|k| k.to_string()).collect(),
+            path: Vec::new(),
+            cache: false,
+            followers: Vec::new(),
+        };
+        let calls = vec![
+            unit(1, 2, "", &["method:A.m0"]),
+            unit(
+                4,
+                7,
+                "import a;\n",
+                &["method:A.m0", "method:A.m9", "type:A"],
+            ),
+        ];
+        let mut kept = KeptCalls {
+            results: HashMap::new(),
+            model: "m".into(),
+            aliases: Vec::new(),
+            language: "français".into(),
+            versions: PromptVersions::CURRENT,
+        };
+        let key = kept.key("A.java", "corps\n", &["method:A.m0".to_string()]);
+        let answer = Enrichment {
+            summaries: vec![("method:A.m0".into(), "résumé".into())],
+            ..Enrichment::default()
+        };
+        kept.results.insert(key.clone(), answer.clone());
+        let (send, held) = split_kept(calls, &kept);
+        assert!(send.is_empty());
+        assert_eq!(held.len(), 2);
+        for (i, (index, k, x)) in held.iter().enumerate() {
+            assert_eq!(*index, [1, 4][i]);
+            assert_eq!(k, &key);
+            assert_eq!(x, &answer);
+        }
     }
 
     #[test]
@@ -9132,6 +9218,7 @@ mod cache_tests {
             count: 2,
             excerpt: None,
             part: Arc::from(part),
+            body: Arc::from(part),
             requested: vec![],
             known: Arc::from(Vec::<String>::new()),
             path: vec![],
@@ -9153,6 +9240,7 @@ mod cache_tests {
             count: 2,
             excerpt: None,
             part: Arc::from(text),
+            body: Arc::from(text),
             requested: requested.iter().map(|s| s.to_string()).collect(),
             known: requested.iter().map(|s| s.to_string()).collect(),
             path: vec![],
@@ -9708,6 +9796,7 @@ mod first_call_tests {
             count: 2,
             excerpt: None,
             part: Arc::from("x"),
+            body: Arc::from("x"),
             requested: vec![],
             known: Arc::from(Vec::<String>::new()),
             path: vec![],
