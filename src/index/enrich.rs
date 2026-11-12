@@ -3543,7 +3543,7 @@ mod tests {
             ));
         }
         let spans = chunk::split_spans(&text, text.chars().count() / 5 + 100);
-        assert_eq!(spans.len(), 5);
+        assert_eq!(spans.len(), 6);
         let homes = section_homes(&text, &spans, &nodes);
         assert_eq!(homes.len(), 10_000);
         let parts: Vec<String> = spans.iter().map(|(p, _)| p.clone()).collect();
@@ -3552,7 +3552,7 @@ mod tests {
         assert_eq!(total, 10_000);
         let mut seen = HashSet::new();
         assert!(plan.iter().flat_map(|(_, l)| l).all(|id| seen.insert(id)));
-        let expected: usize = (0..5)
+        let expected: usize = (0..6)
             .map(|k| {
                 let n: usize = plan
                     .iter()

@@ -207,10 +207,23 @@ fn safe_starts_code(text: &str) -> Vec<usize> {
     out
 }
 
+/// Empreinte d'une position de coupe : BLAKE3 du texte de `p` à la fin de la deuxième ligne
+/// (ou du texte), 8 premiers octets lus petit-boutiste. Elle ne dépend que des deux lignes.
+fn anchor_weight(text: &str, p: usize) -> u64 {
+    let rest = &text[p..];
+    let end = rest
+        .match_indices('\n')
+        .nth(1)
+        .map_or(rest.len(), |(i, _)| i + 1);
+    let h = blake3::hash(&rest.as_bytes()[..end]);
+    u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 octets"))
+}
+
 /// Boucle de coupe commune : `head_at(pos)` donne l'en-tête et le budget du corps du morceau
 /// (k >= 2) dont le corps commence à l'octet `pos` ; le premier morceau a `max` et pas d'en-tête.
 /// `safe` (croissant) liste les débuts de ligne sûrs : au dépassement, la coupe recule à la
-/// dernière position sûre qui reporte au plus 15 % du budget au morceau suivant (REQ-288).
+/// position sûre de plus petite empreinte (`anchor_weight`, la première à égalité) qui reporte
+/// au plus 15 % du budget au morceau suivant (REQ-288, REQ-294).
 fn split_with<F>(text: &str, max: usize, safe: &[usize], mut head_at: F) -> Vec<(String, usize)>
 where
     F: FnMut(usize) -> (String, usize),
@@ -225,15 +238,21 @@ where
         let n = line.chars().count();
         while cur_len > 0 && cur_len + n > budget {
             let window = budget * 15 / 100;
-            let cut = match safe.partition_point(|&p| p <= pos).checked_sub(1) {
-                Some(i)
-                    if safe[i] > cur_start
-                        && text[safe[i]..pos].chars().take(window + 1).count() <= window =>
-                {
-                    safe[i]
-                }
-                _ => pos,
-            };
+            let hi = safe.partition_point(|&p| p <= pos);
+            let lo = safe.partition_point(|&p| p <= cur_start);
+            // Début d'octet de la fenêtre : les `window` derniers caractères avant `pos`.
+            let from = text[..pos]
+                .char_indices()
+                .rev()
+                .nth(window.saturating_sub(1))
+                .map_or(0, |(i, _)| i);
+            let from = if window == 0 { pos } else { from };
+            let lo = lo + safe[lo..hi].partition_point(|&p| p < from);
+            let cut = safe[lo..hi]
+                .iter()
+                .min_by_key(|&&p| anchor_weight(text, p))
+                .copied()
+                .unwrap_or(pos);
             parts.push((format!("{head}{}", &text[cur_start..cut]), cur_start));
             (head, budget) = head_at(cut);
             cur_start = cut;
@@ -935,6 +954,18 @@ mod tests {
         out
     }
 
+    /// Empreinte d'une position : BLAKE3 des deux lignes qui commencent là, 8 premiers octets
+    /// petit-boutistes (règle naïve du test, indépendante du code).
+    fn naive_weight(text: &str, p: usize) -> u64 {
+        let rest = &text[p..];
+        let end = rest
+            .match_indices('\n')
+            .nth(1)
+            .map_or(rest.len(), |(i, _)| i + 1);
+        let h = blake3::hash(&rest.as_bytes()[..end]);
+        u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap())
+    }
+
     #[test]
     fn req288_ac4_proprietes_et_regle_naive() {
         let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
@@ -1082,8 +1113,8 @@ mod tests {
                     let w = budget * 15 / 100;
                     let want = safe
                         .iter()
-                        .rev()
-                        .find(|&&p| p > ps && p <= pos && t[p..pos].chars().count() <= w)
+                        .filter(|&&p| p > ps && p <= pos && t[p..pos].chars().count() <= w)
+                        .min_by_key(|&&p| naive_weight(&t, p))
                         .copied()
                         .unwrap_or(pos);
                     assert_eq!(*start, want, "case {case} k {k} max {max}");
@@ -1092,5 +1123,127 @@ mod tests {
             }
             assert_eq!(rebuilt, t);
         }
+    }
+
+    /// Texte Java : en-tête, remplissage sans position sûre, blocs (ligne vide puis deux
+    /// lignes), puis une ligne qui dépasse. Rend le texte, la limite et les débuts des blocs.
+    fn java_with_blocks(blocks: &[String]) -> (String, usize, Vec<usize>) {
+        let mut t = String::from("public class A {\n    int pad;\n");
+        for i in 0..50 {
+            t.push_str(&format!("    int p{i:02};\n"));
+        }
+        let mut starts = Vec::new();
+        for b in blocks {
+            t.push('\n');
+            starts.push(t.len());
+            t.push_str(b);
+        }
+        let at = t.len();
+        t.push_str("    int overflow;\n");
+        let limit = limit_before(&t, at);
+        (t, limit, starts)
+    }
+
+    fn block(tag: &str) -> String {
+        format!("    int a{tag};\n    int b{tag};\n")
+    }
+
+    #[test]
+    fn req288_ac7_plus_petite_empreinte_dans_la_fenetre() {
+        // Trois positions sûres, la dernière n'a pas la plus petite empreinte.
+        let w = |tag: &str| naive_weight(&block(tag), 0);
+        let (a, b, c) = (0..200)
+            .flat_map(|i| (0..200).map(move |j| (i, j)))
+            .find_map(|(i, j)| {
+                let (x, y, z) = (format!("x{i}"), format!("y{j}"), "z".to_string());
+                (w(&y) < w(&x) && w(&y) < w(&z)).then_some((x, y, z))
+            })
+            .unwrap();
+        let (t, limit, starts) = java_with_blocks(&[block(&a), block(&b), block(&c)]);
+        let spans = split_spans(&t, limit);
+        assert_eq!(spans[1].1, starts[1], "{spans:?}");
+        assert_ne!(spans[1].1, starts[2]);
+        // Deux positions de mêmes deux lignes, d'empreinte la plus petite : la première.
+        let a = "k".to_string();
+        let c = (0..500)
+            .map(|j| format!("c{j}"))
+            .find(|c| w(c) > w(&a))
+            .unwrap();
+        let (t, limit, starts) = java_with_blocks(&[block(&a), block(&c), block(&a)]);
+        let spans = split_spans(&t, limit);
+        assert_eq!(spans[1].1, starts[0], "{spans:?}");
+    }
+
+    #[test]
+    fn req294_ac5_corps_suivants_stables_apres_insertion_en_tete() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let bodies = |spans: &[(String, usize)], t: &str| -> Vec<String> {
+            (1..spans.len())
+                .map(|k| {
+                    let end = spans.get(k + 1).map_or(t.len(), |(_, s)| *s);
+                    t[spans[k].1..end].to_string()
+                })
+                .collect()
+        };
+        let (mut same, total) = (0usize, 300usize);
+        for case in 0..total {
+            let md = case >= 200;
+            let limit = 5000 + next(55_001) as usize;
+            let target = limit * (3 + next(4) as usize) + limit / 2;
+            let mut t = String::new();
+            if md {
+                t.push_str("# Guide\n");
+                while t.len() < target {
+                    if next(8) == 0 {
+                        t.push_str(&format!("\n## S{}\n", next(1000)));
+                    }
+                    t.push_str(&"m".repeat(20 + next(60) as usize));
+                    t.push('\n');
+                }
+            } else {
+                t.push_str("class A {\n    int a;\n");
+                while t.len() < target {
+                    for _ in 0..(1 + next(5)) {
+                        t.push_str("    ");
+                        t.push_str(&"y".repeat(15 + next(60) as usize));
+                        t.push_str(";\n");
+                    }
+                    t.push_str(if next(2) == 0 { "\n" } else { "    }\n" });
+                }
+            }
+            let mut ins = String::new();
+            for _ in 0..(1 + next(3)) {
+                ins.push_str(&"i".repeat(1 + next(30) as usize));
+                ins.push('\n');
+            }
+            let split = |s: &str| {
+                if md {
+                    split_spans_for("g.md", s, limit)
+                } else {
+                    split_spans(s, limit)
+                }
+            };
+            let before = split(&t);
+            let t2 = format!("{ins}{t}");
+            let after = split(&t2);
+            assert!(
+                (4..=8).contains(&before.len()),
+                "case {case}: {} morceaux",
+                before.len()
+            );
+            if bodies(&before, &t) == bodies(&after, &t2) {
+                same += 1;
+            }
+        }
+        assert!(
+            same * 100 >= total * 90,
+            "taux de corps stables : {same}/{total}"
+        );
     }
 }
