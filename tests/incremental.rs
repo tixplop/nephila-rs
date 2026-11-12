@@ -1037,6 +1037,19 @@ fn req069_ac5_schema_7_graph_is_read_unchanged_then_migrated_by_update() {
         } else if a[0] == "export" {
             // REQ-149 : un graphe lu sans migration n'a ni numéro ni liste de communautés.
             without_communities(expected)
+        } else if a[0] == "query" && a[1] == "search" {
+            // REQ-285 : sans index, `query search` garde l'ordre d'avant (par nom qualifié) ;
+            // avec l'index, le document dont le résumé contient le mot vient après les noms.
+            let (doc, rest): (Vec<&str>, Vec<&str>) = expected
+                .lines()
+                .partition(|l| l.starts_with("README.md (document"));
+            let at = rest
+                .iter()
+                .position(|l| l.starts_with("README.md#acme-orders"))
+                .unwrap();
+            let mut all = rest;
+            all.splice(at..at, doc);
+            all.into_iter().map(|l| format!("{l}\n")).collect()
         } else {
             expected.clone()
         };
