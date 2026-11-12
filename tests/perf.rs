@@ -667,7 +667,7 @@ const C0_JS: i64 = 84_904_838;
 const U0_JVM: i64 = 153_509_888;
 const C0_JVM: i64 = 3_199_600;
 
-/// Place utilisée `(page_count − freelist_count) × page_size` et Σ `length(context)` de `file_contexts` (schéma 7).
+/// Place utilisée `(page_count − freelist_count) × page_size` moins l'index plein texte, et Σ `length(context)` de `file_contexts` (schéma 7).
 fn graph_size(f: &Fixture) -> (i64, i64) {
     let conn = rusqlite::Connection::open(f.repo.join(".nephila/graph.db")).unwrap();
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
@@ -676,7 +676,15 @@ fn graph_size(f: &Fixture) -> (i64, i64) {
         conn.query_row(&format!("PRAGMA {p}"), [], |r| r.get(0))
             .unwrap()
     };
-    let used = (pragma("page_count") - pragma("freelist_count")) * pragma("page_size");
+    // Hors index plein texte (REQ-284) : pages des tables `nodes_fts` et `nodes_fts_*`.
+    let fts: i64 = conn
+        .query_row(
+            "SELECT coalesce(sum(pgsize), 0) FROM dbstat WHERE name = 'nodes_fts' OR name LIKE 'nodes_fts\\_%' ESCAPE '\\'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let used = (pragma("page_count") - pragma("freelist_count")) * pragma("page_size") - fts;
     let ctx: i64 = conn
         .query_row(
             "SELECT coalesce(sum(length(context)), 0) FROM file_contexts",

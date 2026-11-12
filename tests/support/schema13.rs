@@ -1,4 +1,4 @@
-//! Assistant de test « schéma 13 » (DEC-196), en SQL écrit en dur : ramène un graphe de schéma 15
+//! Assistant de test « schéma 13 » (DEC-196), en SQL écrit en dur : ramène un graphe de schéma 16
 //! au schéma 14 (assistant `schema14`) puis au schéma 13 (table `subsystem_names` et colonne `communities.description` supprimées,
 //! versions 13).
 
@@ -16,7 +16,7 @@ pub const SCHEMA13_DOWNGRADE: &str = "BEGIN;
     PRAGMA user_version = 13;
     COMMIT;";
 
-/// Ramène le graphe ouvert de schéma 15 au schéma 13 (le schéma 14 d'abord).
+/// Ramène le graphe ouvert de schéma 16 au schéma 13 (le schéma 14 d'abord).
 pub fn downgrade_to_13(db: &Connection) {
     schema14::downgrade_to_14(db);
     db.execute_batch(SCHEMA13_DOWNGRADE).unwrap();

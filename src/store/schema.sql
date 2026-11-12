@@ -49,6 +49,20 @@ CREATE INDEX idx_nodes_qualified ON nodes(qualified);
 CREATE INDEX idx_nodes_qualified_rev ON nodes(qualified_rev);
 CREATE INDEX idx_nodes_file ON nodes(file);
 
+-- Index plein texte des nœuds (DEC-217) : contenu externe, tenu à jour par trois déclencheurs
+-- dans la transaction qui écrit `nodes`. Texte identique à `NODES_FTS_DDL` (src/store/mod.rs).
+CREATE VIRTUAL TABLE nodes_fts USING fts5(short, qualified, summary, content='nodes', tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER nodes_fts_ai AFTER INSERT ON nodes BEGIN
+    INSERT INTO nodes_fts(rowid, short, qualified, summary) VALUES (new.rowid, new.short, new.qualified, new.summary);
+END;
+CREATE TRIGGER nodes_fts_ad AFTER DELETE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, short, qualified, summary) VALUES ('delete', old.rowid, old.short, old.qualified, old.summary);
+END;
+CREATE TRIGGER nodes_fts_au AFTER UPDATE OF short, qualified, summary ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, short, qualified, summary) VALUES ('delete', old.rowid, old.short, old.qualified, old.summary);
+    INSERT INTO nodes_fts(rowid, short, qualified, summary) VALUES (new.rowid, new.short, new.qualified, new.summary);
+END;
+
 -- Déclarations (fichier, nœud) : un nœud existe tant qu'au moins un fichier le déclare (DEC-014).
 CREATE TABLE declarations (
     file TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,

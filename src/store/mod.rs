@@ -29,7 +29,7 @@ fn now_ms() -> i64 {
 }
 
 /// Version du schéma, stockée dans `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 15;
+pub const SCHEMA_VERSION: i32 = 16;
 
 /// Dernier schéma sans `qualified_rev`, migré sur place (DEC-066).
 const SCHEMA_WITHOUT_REV: i32 = 5;
@@ -83,6 +83,23 @@ const SCHEMA_WITHOUT_SUBSYSTEMS: i32 = 13;
 
 /// Dernier schéma sans `enrichments.served_model`, migré sur place (DEC-208).
 const SCHEMA_WITHOUT_SERVED_MODEL: i32 = 14;
+
+/// Table plein texte `nodes_fts` et ses trois déclencheurs, identiques au caractère près à ceux de
+/// `schema.sql` (DEC-217).
+const NODES_FTS_DDL: &str = "CREATE VIRTUAL TABLE nodes_fts USING fts5(short, qualified, summary, content='nodes', tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER nodes_fts_ai AFTER INSERT ON nodes BEGIN
+    INSERT INTO nodes_fts(rowid, short, qualified, summary) VALUES (new.rowid, new.short, new.qualified, new.summary);
+END;
+CREATE TRIGGER nodes_fts_ad AFTER DELETE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, short, qualified, summary) VALUES ('delete', old.rowid, old.short, old.qualified, old.summary);
+END;
+CREATE TRIGGER nodes_fts_au AFTER UPDATE OF short, qualified, summary ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, short, qualified, summary) VALUES ('delete', old.rowid, old.short, old.qualified, old.summary);
+    INSERT INTO nodes_fts(rowid, short, qualified, summary) VALUES (new.rowid, new.short, new.qualified, new.summary);
+END;";
+
+/// Dernier schéma sans l'index plein texte `nodes_fts`, migré sur place (DEC-217).
+const SCHEMA_WITHOUT_TEXT_INDEX: i32 = 15;
 
 /// Nombre de lignes gardées dans `subsystem_names` (AC-262-6).
 const SUBSYSTEM_NAMES_KEPT: i64 = 5000;
@@ -657,7 +674,8 @@ impl Store {
             | SCHEMA_WITHOUT_DECLARATION_DOC
             | SCHEMA_WITHOUT_USED_AT
             | SCHEMA_WITHOUT_SUBSYSTEMS
-            | SCHEMA_WITHOUT_SERVED_MODEL => store.migrate_to_current()?,
+            | SCHEMA_WITHOUT_SERVED_MODEL
+            | SCHEMA_WITHOUT_TEXT_INDEX => store.migrate_to_current()?,
             // Schéma plus ancien : build repart de zéro, on le recrée.
             v if v > 0 && v < SCHEMA_VERSION => store.recreate_schema()?,
             v => return Err(version_error(v)),
@@ -700,7 +718,8 @@ impl Store {
             | SCHEMA_WITHOUT_DECLARATION_DOC
             | SCHEMA_WITHOUT_USED_AT
             | SCHEMA_WITHOUT_SUBSYSTEMS
-            | SCHEMA_WITHOUT_SERVED_MODEL => {
+            | SCHEMA_WITHOUT_SERVED_MODEL
+            | SCHEMA_WITHOUT_TEXT_INDEX => {
                 store.migrate_to_current()?;
                 store.load_resolution_marker()?;
                 store.load_enrich_redact()?;
@@ -759,7 +778,8 @@ impl Store {
                 || v == SCHEMA_WITHOUT_DECLARATION_DOC
                 || v == SCHEMA_WITHOUT_USED_AT
                 || v == SCHEMA_WITHOUT_SUBSYSTEMS
-                || v == SCHEMA_WITHOUT_SERVED_MODEL =>
+                || v == SCHEMA_WITHOUT_SERVED_MODEL
+                || v == SCHEMA_WITHOUT_TEXT_INDEX =>
             {
                 store.version = v
             }
@@ -775,13 +795,13 @@ impl Store {
         self.read_only && !self.conn.is_autocommit()
     }
 
-    /// Version du schéma du graphe ouvert (5 à 14 en lecture seule seulement : DEC-066, DEC-073,
+    /// Version du schéma du graphe ouvert (5 à 15 en lecture seule seulement : DEC-066, DEC-073,
     /// DEC-076).
     pub fn opened_schema_version(&self) -> i32 {
         self.version
     }
 
-    /// Migre un schéma 5 à 14 en schéma 15 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, 11 -> 12, 12 -> 13, 13 -> 14, puis 14 -> 15,
+    /// Migre un schéma 5 à 15 en schéma 16 sur place : 5 -> 6, 6 -> 7, 7 -> 8, 8 -> 9, 9 -> 10, 10 -> 11, 11 -> 12, 12 -> 13, 13 -> 14, 14 -> 15, puis 15 -> 16,
     /// chacune en une seule transaction. Rien n'est perdu.
     fn migrate_to_current(&self) -> Result<()> {
         let from = self.user_version()?;
@@ -798,6 +818,7 @@ impl Store {
         self.migrate_12_to_13()?;
         self.migrate_13_to_14()?;
         self.migrate_14_to_15()?;
+        self.migrate_15_to_16()?;
         // REQ-115 : écrite après la réussite, avec la version lue à l'ouverture.
         crate::trace!(
             "schéma: migration {from} vers {SCHEMA_VERSION} en {} ms",
@@ -965,6 +986,29 @@ impl Store {
         }
         tx.execute_batch(&format!(
             "ALTER TABLE enrichments ADD COLUMN served_model TEXT;
+             UPDATE meta SET value = '{SCHEMA_WITHOUT_TEXT_INDEX}' WHERE key = 'schema_version';
+             PRAGMA user_version = {SCHEMA_WITHOUT_TEXT_INDEX};"
+        ))
+        .map_err(db_err)?;
+        commit_counted(tx)
+    }
+
+    /// Migre un schéma 15 en schéma 16 en une transaction `IMMEDIATE` (DEC-217) : table plein
+    /// texte et déclencheurs, `rebuild` depuis les nœuds existants, versions. Sans marqueur
+    /// `à résoudre` ni appel LLM.
+    fn migrate_15_to_16(&self) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_err)?;
+        // Un autre processus a pu migrer entre la lecture de la version et le verrou.
+        if self.user_version()? != SCHEMA_WITHOUT_TEXT_INDEX {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "{NODES_FTS_DDL}
+             INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');
              UPDATE meta SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
@@ -1131,7 +1175,12 @@ impl Store {
                 .map_err(db_err)?
         };
         let mut sql = String::from("PRAGMA foreign_keys = OFF;\nBEGIN;\n");
-        for n in names {
+        // Les tables `nodes_fts_*` partent avec la table virtuelle `nodes_fts`, qui se supprime
+        // la première (DEC-217).
+        if names.iter().any(|n| n == "nodes_fts") {
+            sql.push_str("DROP TABLE nodes_fts;\n");
+        }
+        for n in names.into_iter().filter(|n| !n.starts_with("nodes_fts")) {
             sql.push_str(&format!(
                 "DROP TABLE IF EXISTS \"{}\";\n",
                 n.replace('"', "\"\"")
@@ -2907,6 +2956,34 @@ impl Store {
         self.user_version()
     }
 
+    /// Vrai si le graphe ouvert a l'index plein texte `nodes_fts` (schéma 16 ou plus).
+    pub fn has_text_index(&self) -> bool {
+        self.version >= SCHEMA_VERSION
+    }
+
+    /// Score `bm25(nodes_fts, 3.0, 2.0, 1.0)` de chaque nœud trouvé par la requête FTS5 `query`
+    /// (plus petit = plus pertinent) : identifiant -> score. Vide sans index ou pour une requête
+    /// vide. La requête est construite par nephila (mots entre guillemets), jamais un texte de
+    /// l'utilisateur.
+    pub fn text_scores(&self, query: &str) -> Result<HashMap<String, f64>> {
+        if !self.has_text_index() || query.trim().is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT n.id, bm25(nodes_fts, 3.0, 2.0, 1.0) FROM nodes_fts \
+                 JOIN nodes n ON n.rowid = nodes_fts.rowid WHERE nodes_fts MATCH ?1",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([query], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            })
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(db_err)
+    }
+
     /// Résumé global du dépôt et son horodatage (millisecondes Unix), s'il existe.
     pub fn summary(&self) -> Result<Option<(String, i64)>> {
         match self
@@ -4551,6 +4628,99 @@ mod tests {
         )
     }
 
+    /// Identifiants des nœuds que `MATCH` rend pour un mot, triés ; vérifie d'abord l'intégrité.
+    fn fts_ids(st: &Store, word: &str) -> Vec<String> {
+        st.conn
+            .execute(
+                "INSERT INTO nodes_fts(nodes_fts, rank) VALUES('integrity-check', 1)",
+                [],
+            )
+            .unwrap();
+        let mut q = st
+            .conn
+            .prepare("SELECT n.id FROM nodes_fts JOIN nodes n ON n.rowid = nodes_fts.rowid WHERE nodes_fts MATCH ?1 ORDER BY n.id")
+            .unwrap();
+        let ids = q
+            .query_map([format!("\"{word}\"")], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        ids
+    }
+
+    #[test]
+    fn req284_ac1_text_index_follows_every_write_path() {
+        let dir = tempdir().unwrap();
+        let mut st = Store::open_or_create(dir.path()).unwrap();
+        let sql: String = st
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'nodes_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("content='nodes'"), "{sql}");
+        assert!(sql.contains("unicode61 remove_diacritics 2"), "{sql}");
+        assert!(st.has_text_index());
+        // Nœuds écrits.
+        st.insert_pending_files(&[file("A.java"), file("B.java")])
+            .unwrap();
+        let a = ty("com.acme.OrderService", "A.java");
+        let b = ty("com.acme.École", "B.java");
+        st.replace_structure("A.java", std::slice::from_ref(&a), &[])
+            .unwrap();
+        st.replace_structure("B.java", std::slice::from_ref(&b), &[])
+            .unwrap();
+        assert_eq!(fts_ids(&st, "orderservice"), std::slice::from_ref(&a.id));
+        assert_eq!(fts_ids(&st, "ecole"), std::slice::from_ref(&b.id));
+        assert_eq!(fts_ids(&st, "acme").len(), 2);
+        // Résumé posé par un enrichissement.
+        let apply = |st: &mut Store, id: &str, text: &str| {
+            st.apply_enrichment(
+                "A.java",
+                "h",
+                "m",
+                "français",
+                &[(id.to_string(), text.to_string())],
+                &[],
+                &[],
+            )
+            .unwrap()
+        };
+        apply(&mut st, &a.id, "Calcule le total");
+        assert_eq!(fts_ids(&st, "total"), std::slice::from_ref(&a.id));
+        assert_eq!(st.text_scores("total").unwrap().len(), 1);
+        // Résumé changé : l'ancien mot ne rend plus le nœud.
+        apply(&mut st, &a.id, "Valide la remise");
+        assert!(fts_ids(&st, "total").is_empty());
+        assert_eq!(fts_ids(&st, "remise"), std::slice::from_ref(&a.id));
+        // Résumé effacé.
+        apply(&mut st, &a.id, "");
+        assert!(fts_ids(&st, "remise").is_empty());
+        apply(&mut st, &a.id, "Valide la remise");
+        // Fichier supprimé (nœuds retirés).
+        assert!(st.remove_file("A.java").unwrap());
+        assert!(fts_ids(&st, "remise").is_empty());
+        assert!(fts_ids(&st, "orderservice").is_empty());
+        assert_eq!(fts_ids(&st, "ecole"), std::slice::from_ref(&b.id));
+        // Nœud supprimé directement.
+        st.conn
+            .execute("DELETE FROM nodes WHERE id = ?1", [&b.id])
+            .unwrap();
+        assert!(fts_ids(&st, "ecole").is_empty());
+        // Réinitialisation de `build`.
+        st.insert_pending_files(&[file("C.java")]).unwrap();
+        let c = ty("Zed", "C.java");
+        st.replace_structure("C.java", std::slice::from_ref(&c), &[])
+            .unwrap();
+        assert_eq!(fts_ids(&st, "zed"), std::slice::from_ref(&c.id));
+        st.reset().unwrap();
+        assert!(fts_ids(&st, "zed").is_empty());
+        // Requête vide : aucune erreur, aucun score.
+        assert!(st.text_scores("").unwrap().is_empty());
+    }
+
     #[test]
     fn req280_ac2_file_degrees() {
         let dir = tempdir().unwrap();
@@ -5234,15 +5404,34 @@ mod tests {
         PRAGMA user_version = 14;
         COMMIT;";
 
-    /// Ramène un graphe de schéma 15 au schéma 14 (DEC-208).
+    /// Assistant « schéma 15 » (DEC-217), en SQL écrit en dur : index plein texte supprimé.
+    const SCHEMA15_DOWNGRADE: &str = "BEGIN;
+        DROP TRIGGER nodes_fts_ai;
+        DROP TRIGGER nodes_fts_ad;
+        DROP TRIGGER nodes_fts_au;
+        DROP TABLE nodes_fts;
+        UPDATE meta SET value = '15' WHERE key = 'schema_version';
+        PRAGMA user_version = 15;
+        COMMIT;";
+
+    /// Ramène un graphe de schéma 16 au schéma 15 (DEC-217).
+    fn downgrade_to_15(repo: &Path) {
+        Connection::open(db_path(repo))
+            .unwrap()
+            .execute_batch(SCHEMA15_DOWNGRADE)
+            .unwrap();
+    }
+
+    /// Ramène un graphe de schéma 16 au schéma 14 (le 15 d'abord, DEC-208).
     fn downgrade_to_14(repo: &Path) {
+        downgrade_to_15(repo);
         Connection::open(db_path(repo))
             .unwrap()
             .execute_batch(SCHEMA14_DOWNGRADE)
             .unwrap();
     }
 
-    /// Ramène un graphe de schéma 15 au schéma 13 (le 14 d'abord, DEC-196).
+    /// Ramène un graphe de schéma 16 au schéma 13 (le 14 d'abord, DEC-196).
     fn downgrade_to_13(repo: &Path) {
         downgrade_to_14(repo);
         Connection::open(db_path(repo))
@@ -6982,7 +7171,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 16);
     }
 
     #[test]
@@ -7116,11 +7305,12 @@ mod tests {
     }
 
     #[test]
-    fn req062_open_readonly_accepts_schemas_5_to_15_without_touching_the_file() {
-        for version in [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
+    fn req062_open_readonly_accepts_schemas_5_to_16_without_touching_the_file() {
+        for version in [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5] {
             let dir = tempdir().unwrap();
             let before = snapshot7(&rich(dir.path()));
             match version {
+                15 => downgrade_to_15(dir.path()),
                 14 => downgrade_to_14(dir.path()),
                 13 => downgrade_to_13(dir.path()),
                 12 => downgrade_to_12(dir.path()),
@@ -8145,7 +8335,7 @@ mod tests {
         assert_eq!(st.opened_schema_version(), 10);
         drop(st);
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(st.schema_version().unwrap(), 15);
+        assert_eq!(st.schema_version().unwrap(), 16);
         assert!(st.call_results().unwrap().is_empty());
         drop(st);
         downgrade_to_10(dir.path());
@@ -9986,23 +10176,23 @@ mod tests {
     }
 
     #[test]
-    fn req245_ac4_new_graph_is_schema_15_and_schema_16_is_refused() {
+    fn req245_ac4_new_graph_is_schema_16_and_schema_17_is_refused() {
         let dir = tempdir().unwrap();
         let st = Store::open_or_create(dir.path()).unwrap();
-        assert_eq!(SCHEMA_VERSION, 15);
-        assert_eq!(st.schema_version().unwrap(), 15);
+        assert_eq!(SCHEMA_VERSION, 16);
+        assert_eq!(st.schema_version().unwrap(), 16);
         drop(st);
         Connection::open(db_path(dir.path()))
             .unwrap()
-            .execute_batch("PRAGMA user_version = 16")
+            .execute_batch("PRAGMA user_version = 17")
             .unwrap();
         let e = Store::open_or_create(dir.path()).err().unwrap().to_string();
         assert!(
-            e.contains("version de schéma du graphe non prise en charge (16"),
+            e.contains("version de schéma du graphe non prise en charge (17"),
             "{e}"
         );
         assert!(Store::open_readonly(dir.path()).is_err());
-        assert_eq!(st_user_version(dir.path()), 16);
+        assert_eq!(st_user_version(dir.path()), 17);
     }
 
     // ---- REQ-258 : plusieurs enrichissements conservés par chemin (DEC-190) ----
