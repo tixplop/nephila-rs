@@ -68,6 +68,7 @@ pub fn extract(path: &Path, text: &str, ctx: &ParseCtx) -> FileStructure {
         subkind: None,
         summary: None,
         short: Some(short),
+        at: None,
     });
     let mut refs = OrderedSet::new();
     for section in SECTIONS {

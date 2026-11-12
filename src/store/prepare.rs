@@ -295,6 +295,7 @@ mod tests {
             subkind: None,
             summary: summary.map(str::to_string),
             short: short.map(str::to_string),
+            at: None,
         }
     }
 

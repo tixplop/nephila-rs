@@ -80,7 +80,7 @@ impl Builder {
             return;
         }
         self.package = Some(name.to_string());
-        self.push_declared(NodeKind::Package, name.to_string(), None, None);
+        self.push_declared(NodeKind::Package, name.to_string(), None, None, None);
     }
 
     /// Rétablit le package courant à la sortie d'un `package p { … }` (sans rien déclarer).
@@ -120,7 +120,7 @@ impl Builder {
     /// l'appelant ne descend alors ni dans le corps ni dans les clauses du type, et n'appelle pas
     /// `exit_type`.
     pub fn enter_type(&mut self, name: &str, subkind: SubKind) -> Option<String> {
-        self.enter_type_doc(name, subkind, None)
+        self.enter_type_doc(name, subkind, None, None)
     }
 
     /// Comme `enter_type`, avec la doc de la déclaration (REQ-243).
@@ -129,6 +129,7 @@ impl Builder {
         name: &str,
         subkind: SubKind,
         doc: Option<String>,
+        at: Option<usize>,
     ) -> Option<String> {
         if self.stack.len() >= MAX_NESTING {
             self.nesting_cut = true;
@@ -138,7 +139,7 @@ impl Builder {
         if self.stack.is_empty() {
             self.top_level.push(node_id(NodeKind::Type, &q));
         }
-        self.push_declared(NodeKind::Type, q.clone(), Some(subkind), doc);
+        self.push_declared(NodeKind::Type, q.clone(), Some(subkind), doc, at);
         self.stack.push(q.clone());
         Some(q)
     }
@@ -160,13 +161,18 @@ impl Builder {
     /// Déclare (une seule fois : surcharges fusionnées) la méthode `name` du type courant.
     /// Renvoie son nom qualifié, ou `None` hors de tout type.
     pub fn declare_method(&mut self, name: &str) -> Option<String> {
-        self.declare_method_doc(name, None)
+        self.declare_method_doc(name, None, None)
     }
 
     /// Comme `declare_method`, avec la doc de la déclaration (REQ-243).
-    pub fn declare_method_doc(&mut self, name: &str, doc: Option<String>) -> Option<String> {
+    pub fn declare_method_doc(
+        &mut self,
+        name: &str,
+        doc: Option<String>,
+        at: Option<usize>,
+    ) -> Option<String> {
         let q = format!("{}.{}", self.stack.last()?, name);
-        self.push_declared(NodeKind::Method, q.clone(), None, doc);
+        self.push_declared(NodeKind::Method, q.clone(), None, doc, at);
         Some(q)
     }
 
@@ -176,7 +182,7 @@ impl Builder {
         if self.stack.is_empty() {
             self.top_level.push(node_id(NodeKind::Type, &q));
         }
-        self.push_declared(NodeKind::Type, q.clone(), Some(subkind), None);
+        self.push_declared(NodeKind::Type, q.clone(), Some(subkind), None, None);
         q
     }
 
@@ -205,6 +211,7 @@ impl Builder {
         qualified: String,
         subkind: Option<SubKind>,
         doc: Option<String>,
+        at: Option<usize>,
     ) {
         if self.seen.insert(node_id(kind, &qualified)) {
             self.declares.push(Declared {
@@ -213,6 +220,7 @@ impl Builder {
                 subkind,
                 summary: doc,
                 short: None,
+                at,
             });
         } else if doc.is_some() {
             // Surcharge : la première doc retenue remplit le résumé encore vide.

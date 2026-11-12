@@ -476,6 +476,7 @@ mod tests {
                 subkind: None,
                 summary: None,
                 short: short.map(str::to_string),
+                at: None,
             }],
             ..Default::default()
         }

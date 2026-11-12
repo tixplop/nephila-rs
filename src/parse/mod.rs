@@ -92,6 +92,9 @@ pub struct Declared {
     pub summary: Option<String>,
     /// Nom court fixé par l'extracteur (DEC-024) ; `None` = dérivé du nom qualifié.
     pub short: Option<String>,
+    /// Octet du nom de la déclaration dans le texte analysé ; `None` sans nom écrit ou hors JVM et
+    /// JS/TS. Non stocké (DEC-216).
+    pub at: Option<usize>,
 }
 
 impl Declared {
@@ -530,6 +533,101 @@ pub(crate) mod nesting_support {
                 f.declares.iter().any(|d| d.qualified.ends_with("getX")),
                 "{path}"
             );
+        }
+    }
+
+    fn short_of(d: &Declared) -> String {
+        d.short
+            .clone()
+            .unwrap_or_else(|| d.qualified.rsplit('.').next().unwrap().to_string())
+    }
+
+    #[test]
+    fn req283_ac1_position_du_nom_des_declarations() {
+        // (chemin, texte) : un type, `early` appelant `late` avant sa déclaration, `dup` surchargée.
+        let cases: [(&str, &str); 6] = [
+            (
+                "Foo.java",
+                "class Foo {\n  Foo() {}\n  void early() { late(); }\n  void late() {}\n  void dup(int a) {}\n  void dup(String a) {}\n}\n",
+            ),
+            (
+                "Foo.kt",
+                "class Foo {\n  fun early() { late() }\n  fun late() {}\n  fun dup(a: Int) {}\n  fun dup(a: String) {}\n}\nfun top() {}\n",
+            ),
+            (
+                "Foo.scala",
+                "class Foo {\n  def early() = { late() }\n  def late() = 1\n  def dup(a: Int) = 1\n  def dup(a: String) = 2\n}\n",
+            ),
+            (
+                "Foo.groovy",
+                "class Foo {\n  void early() { late() }\n  void late() {}\n  void dup(int a) {}\n  void dup(String a) {}\n}\n",
+            ),
+            (
+                "foo.js",
+                "class Foo {\n  early() { this.late(); }\n  late() {}\n  #p() {}\n  'q'() {}\n  dup(a) {}\n  dup(a, b) {}\n}\n",
+            ),
+            (
+                "foo.ts",
+                "class Foo {\n  early(): void { this.late(); }\n  late(): void {}\n  dup(a: number): void;\n  dup(a: string): void {}\n}\n",
+            ),
+        ];
+        for (name, text) in cases {
+            let f = extract(Path::new(name), text, &ParseCtx::default()).unwrap();
+            let at_of = |short: &str| -> Option<usize> {
+                f.declares
+                    .iter()
+                    .find(|d| short_of(d) == short && d.kind != NodeKind::Package)
+                    .unwrap_or_else(|| panic!("{name} : {short} non déclaré"))
+                    .at
+            };
+            for d in &f.declares {
+                if let Some(p) = d.at {
+                    assert!(
+                        text[p..].starts_with(&short_of(d)),
+                        "{name} : {} à {p}",
+                        d.qualified
+                    );
+                }
+            }
+            assert_eq!(at_of("Foo"), text.find("Foo"), "{name} : type");
+            let mut late = text.match_indices("late").map(|(i, _)| i);
+            let (call, decl) = (late.next().unwrap(), late.next().unwrap());
+            assert_eq!(at_of("late"), Some(decl), "{name} : late");
+            assert!(at_of("late").unwrap() > call, "{name} : après l'appel");
+            assert_eq!(at_of("dup"), text.find("dup"), "{name} : surcharge");
+            assert!(at_of("early").is_some(), "{name} : early");
+        }
+        let java = extract(
+            Path::new("Foo.java"),
+            "class Foo {\n  Foo() {}\n}\n",
+            &ParseCtx::default(),
+        )
+        .unwrap();
+        let init = java
+            .declares
+            .iter()
+            .find(|d| d.qualified.ends_with("<init>"))
+            .expect("constructeur");
+        assert_eq!(init.at, None);
+        let kt = extract(
+            Path::new("Foo.kt"),
+            "class Foo {}\nfun top() {}\n",
+            &ParseCtx::default(),
+        )
+        .unwrap();
+        let file_type = kt
+            .declares
+            .iter()
+            .find(|d| d.qualified.ends_with("FooKt"))
+            .expect("type de fichier");
+        assert_eq!(file_type.at, None);
+        for (name, text) in [
+            ("a.md", "# Titre\n\ntexte\n\n## Suite\n"),
+            ("a.sql", "CREATE TABLE orders (id INT);\n"),
+        ] {
+            let f = extract(Path::new(name), text, &ParseCtx::default()).unwrap();
+            assert!(!f.declares.is_empty(), "{name}");
+            assert!(f.declares.iter().all(|d| d.at.is_none()), "{name}");
         }
     }
 }

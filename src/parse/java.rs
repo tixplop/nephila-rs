@@ -86,7 +86,12 @@ fn type_declaration(b: &mut Builder, calls: &mut Calls, n: Node, src: &[u8]) {
     let Some(name) = n.child_by_field_name("name") else {
         return;
     };
-    let Some(q) = b.enter_type_doc(&text_of(name, src), sub, doc_before(n, src)) else {
+    let Some(q) = b.enter_type_doc(
+        &text_of(name, src),
+        sub,
+        doc_before(n, src),
+        Some(name.start_byte()),
+    ) else {
         return;
     };
 
@@ -253,8 +258,8 @@ fn trivial_accessor(m: Node, src: &[u8]) -> Option<String> {
 fn member(b: &mut Builder, calls: &mut Calls, m: Node, src: &[u8], overloaded: &HashSet<String>) {
     match m.kind() {
         "method_declaration" | "annotation_type_element_declaration" => {
-            if let Some(name) = m.child_by_field_name("name") {
-                let name = text_of(name, src);
+            if let Some(name_node) = m.child_by_field_name("name") {
+                let name = text_of(name_node, src);
                 let doc = doc_before(m, src).or_else(|| {
                     if m.kind() == "method_declaration" && !overloaded.contains(name.as_str()) {
                         trivial_accessor(m, src)
@@ -262,7 +267,7 @@ fn member(b: &mut Builder, calls: &mut Calls, m: Node, src: &[u8], overloaded: &
                         None
                     }
                 });
-                if let Some(q) = b.declare_method_doc(&name, doc) {
+                if let Some(q) = b.declare_method_doc(&name, doc, Some(name_node.start_byte())) {
                     if let Some(t) = b.current_type() {
                         calls.declare_method(t, &name);
                     }

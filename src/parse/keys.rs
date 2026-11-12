@@ -66,6 +66,7 @@ impl KeySet {
                     subkind: None,
                     summary: None,
                     short: Some(key),
+                    at: None,
                 });
                 for n in names {
                     cands.add_name(&id, n);

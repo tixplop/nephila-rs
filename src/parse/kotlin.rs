@@ -154,7 +154,7 @@ fn has_keyword(n: Node, kw: &str) -> bool {
 
 /// Traite `n` s'il déclare un type ; sinon l'ignore.
 fn declaration(b: &mut Builder, calls: &mut Calls, al: &Aliases, n: Node, src: &[u8]) {
-    let (sub, name) = match n.kind() {
+    let (sub, name, at) = match n.kind() {
         "class_declaration" => {
             let mods = modifiers_text(n, src);
             let words: Vec<&str> = mods.split_whitespace().collect();
@@ -167,11 +167,13 @@ fn declaration(b: &mut Builder, calls: &mut Calls, al: &Aliases, n: Node, src: &
             } else {
                 SubKind::Class
             };
-            (sub, n.child_by_field_name("name").map(|x| text_of(x, src)))
+            let id = n.child_by_field_name("name");
+            (sub, id.map(|x| text_of(x, src)), id.map(|x| x.start_byte()))
         }
         "object_declaration" => (
             SubKind::Object,
             n.child_by_field_name("name").map(|x| text_of(x, src)),
+            n.child_by_field_name("name").map(|x| x.start_byte()),
         ),
         "companion_object" => (
             SubKind::Object,
@@ -180,13 +182,14 @@ fn declaration(b: &mut Builder, calls: &mut Calls, al: &Aliases, n: Node, src: &
                     .map(|x| text_of(x, src))
                     .unwrap_or_else(|| "Companion".to_string()),
             ),
+            n.child_by_field_name("name").map(|x| x.start_byte()),
         ),
         _ => return,
     };
     let Some(name) = name.filter(|s| !s.is_empty()) else {
         return;
     };
-    let Some(q) = b.enter_type_doc(&name, sub, doc_before(n, src)) else {
+    let Some(q) = b.enter_type_doc(&name, sub, doc_before(n, src), at) else {
         return;
     };
 
@@ -288,8 +291,9 @@ fn function(b: &mut Builder, calls: &mut Calls, al: &Aliases, f: Node, src: &[u8
     let Some(name) = f.child_by_field_name("name") else {
         return;
     };
+    let at = name.start_byte();
     let name = text_of(name, src);
-    if let Some(q) = b.declare_method_doc(&name, doc_before(f, src)) {
+    if let Some(q) = b.declare_method_doc(&name, doc_before(f, src), Some(at)) {
         if let Some(t) = b.current_type() {
             calls.declare_method(t, &name);
         }

@@ -150,14 +150,17 @@ impl Ctx<'_> {
             "enum_definition" => SubKind::Enum,
             _ => return,
         };
-        let Some(name) = n.child_by_field_name("name") else {
+        let Some(id) = n.child_by_field_name("name") else {
             return;
         };
-        let name = self.text(name);
+        let name = self.text(id);
         if name.is_empty() {
             return;
         }
-        let Some(q) = self.b.enter_type_doc(&name, sub, doc_before(n, self.src)) else {
+        let Some(q) =
+            self.b
+                .enter_type_doc(&name, sub, doc_before(n, self.src), Some(id.start_byte()))
+        else {
             return;
         };
 
@@ -200,10 +203,10 @@ impl Ctx<'_> {
     fn member(&mut self, m: Node) {
         match m.kind() {
             "function_definition" | "function_declaration" => {
-                let Some(name) = m.child_by_field_name("name") else {
+                let Some(id) = m.child_by_field_name("name") else {
                     return;
                 };
-                let name = self.text(name);
+                let name = self.text(id);
                 // `def this(…)` : constructeur auxiliaire.
                 let name = if name == "this" {
                     INIT.to_string()
@@ -211,7 +214,10 @@ impl Ctx<'_> {
                     name
                 };
                 let doc = (name != INIT).then(|| doc_before(m, self.src)).flatten();
-                if let Some(q) = self.b.declare_method_doc(&name, doc) {
+                if let Some(q) =
+                    self.b
+                        .declare_method_doc(&name, doc, (name != INIT).then(|| id.start_byte()))
+                {
                     if let Some(t) = self.b.current_type() {
                         self.calls.declare_method(t, &name);
                     }

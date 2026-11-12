@@ -56,6 +56,7 @@ pub fn document(path: &Path, format: Format) -> Declared {
         subkind: Some(format.subkind()),
         summary: None,
         short: None,
+        at: None,
     }
 }
 

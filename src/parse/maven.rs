@@ -184,6 +184,7 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
         subkind: None,
         summary: None,
         short: Some(short),
+        at: None,
     });
     let mut refs = OrderedSet::new();
     for d in &deps {
@@ -491,6 +492,7 @@ mod tests {
                 subkind: None,
                 summary: None,
                 short: Some(short),
+                at: None,
             });
             let mut refs = OrderedSet::new();
             for d in &deps {
@@ -554,6 +556,7 @@ mod tests {
                 subkind: None,
                 summary: None,
                 short: Some(module),
+                at: None,
             });
             let mut refs = OrderedSet::new();
             for (o, name) in deps {

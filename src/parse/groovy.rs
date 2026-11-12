@@ -117,14 +117,16 @@ impl Ctx<'_> {
 
     /// Méthode `def f() { … }` hors classe : méthode du type de script.
     fn script_function(&mut self, f: Node) {
-        let (Some(st), Some(name)) = (self.script_type.clone(), f.child_by_field_name("name"))
-        else {
+        let (Some(st), Some(id)) = (self.script_type.clone(), f.child_by_field_name("name")) else {
             return;
         };
-        let name = self.text(name);
+        let name = self.text(id);
         // Premier niveau : la pile est vide, `enter_type` ne refuse jamais ; résultat ignoré à dessein.
         let _ = self.b.enter_type(&st, SubKind::Class);
-        if let Some(q) = self.b.declare_method_doc(&name, doc_before(f, self.src)) {
+        if let Some(q) =
+            self.b
+                .declare_method_doc(&name, doc_before(f, self.src), Some(id.start_byte()))
+        {
             self.calls.declare_method(&st_q(&self.b), &name);
             self.method_calls(&q, f);
         }
@@ -157,10 +159,12 @@ impl Ctx<'_> {
             return;
         };
         let type_name = self.text(name);
-        let Some(q) = self
-            .b
-            .enter_type_doc(&type_name, sub, doc_before(n, self.src))
-        else {
+        let Some(q) = self.b.enter_type_doc(
+            &type_name,
+            sub,
+            doc_before(n, self.src),
+            Some(name.start_byte()),
+        ) else {
             return;
         };
 
@@ -200,9 +204,13 @@ impl Ctx<'_> {
     fn member(&mut self, m: Node) {
         match m.kind() {
             "method_declaration" => {
-                if let Some(name) = m.child_by_field_name("name") {
-                    let name = self.text(name);
-                    if let Some(q) = self.b.declare_method_doc(&name, doc_before(m, self.src)) {
+                if let Some(id) = m.child_by_field_name("name") {
+                    let name = self.text(id);
+                    if let Some(q) = self.b.declare_method_doc(
+                        &name,
+                        doc_before(m, self.src),
+                        Some(id.start_byte()),
+                    ) {
                         if let Some(t) = self.b.current_type() {
                             self.calls.declare_method(t, &name);
                         }

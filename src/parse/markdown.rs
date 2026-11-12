@@ -138,6 +138,7 @@ impl State {
             subkind: None,
             summary: None,
             short: None,
+            at: None,
         });
         self.current = Some(node_id(NodeKind::Section, &qualified));
     }
@@ -187,6 +188,7 @@ fn scan(doc: String, text: &str) -> State {
         subkind: None,
         summary: None,
         short: None,
+        at: None,
     });
     // Titre en cours de lecture : texte et spans de code rencontrés.
     let mut heading: Option<(String, Vec<String>, usize)> = None;

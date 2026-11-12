@@ -59,6 +59,7 @@ pub fn extract(lang: Lang, path: &Path, text: &str) -> Result<FileStructure> {
             subkind: None,
             summary: None,
             short: Some(short),
+            at: None,
         }],
         references: OrderedSet::new(),
         seen: HashSet::new(),
@@ -115,6 +116,7 @@ impl Extractor<'_> {
         qualified: String,
         subkind: Option<SubKind>,
         doc: Option<String>,
+        at: Option<usize>,
     ) {
         if self.seen.insert(node_id(kind, &qualified)) {
             self.declares.push(Declared {
@@ -123,6 +125,7 @@ impl Extractor<'_> {
                 subkind,
                 summary: doc,
                 short: None,
+                at,
             });
         } else if doc.is_some() {
             // Surcharge : la première doc retenue remplit le résumé encore vide.
@@ -229,14 +232,23 @@ impl Extractor<'_> {
             "function_declaration" | "generator_function_declaration" | "function_signature" => {
                 if let Some(name) = self.name_of(n) {
                     let doc = doc_before(n, self.src);
-                    self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc);
+                    let at = n.child_by_field_name("name").map(|x| x.start_byte());
+                    self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc, at);
                 }
             }
             // `export default function () {}` : fonction anonyme.
             "function_expression" | "function" | "generator_function" => {
-                let name = self.name_of(n).unwrap_or_else(|| "default".to_string());
+                let named = self.name_of(n);
+                let at = named.as_ref().and_then(|_| n.child_by_field_name("name"));
+                let name = named.unwrap_or_else(|| "default".to_string());
                 let doc = doc_before(n, self.src);
-                self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc);
+                self.declare(
+                    NodeKind::Method,
+                    format!("{owner}.{name}"),
+                    None,
+                    doc,
+                    at.map(|x| x.start_byte()),
+                );
             }
             "lexical_declaration" | "variable_declaration" => {
                 let mut cur = n.walk();
@@ -251,9 +263,10 @@ impl Extractor<'_> {
                         continue;
                     };
                     if name.kind() == "identifier" && is_function_value(value) {
+                        let at = Some(name.start_byte());
                         let name = self.text(name);
                         let doc = doc_before(n, self.src);
-                        self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc);
+                        self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc, at);
                     }
                 }
             }
@@ -285,7 +298,13 @@ impl Extractor<'_> {
         }
         let q = format!("{owner}.{}", self.text(name));
         let doc = doc_before(n, self.src);
-        self.declare(NodeKind::Type, q.clone(), Some(SubKind::Object), doc);
+        self.declare(
+            NodeKind::Type,
+            q.clone(),
+            Some(SubKind::Object),
+            doc,
+            Some(name.start_byte()),
+        );
         if let Some(body) = n.child_by_field_name("body") {
             self.level += 1;
             self.statements(body, &q);
@@ -300,7 +319,8 @@ impl Extractor<'_> {
         }
         let q = format!("{owner}.{name}");
         let doc = doc_before(n, self.src);
-        self.declare(NodeKind::Type, q.clone(), Some(sub), doc);
+        let at = n.child_by_field_name("name").map(|x| x.start_byte());
+        self.declare(NodeKind::Type, q.clone(), Some(sub), doc, at);
         let id = node_id(NodeKind::Type, &q);
         let mut cur = n.walk();
         for c in n.named_children(&mut cur) {
@@ -385,11 +405,21 @@ impl Extractor<'_> {
                 }
                 _ => continue,
             };
+            // Nom écrit `#m` ou `'m'` : la position est celle de `m`, sans le préfixe.
+            let at = name.map(|x| {
+                let t = &self.src[x.byte_range()];
+                let skip = t
+                    .iter()
+                    .take_while(|c| matches!(c, b'#' | b'"' | b'\'' | b'`'))
+                    .count();
+                x.start_byte() + skip
+            });
             let Some(name) = name.and_then(|n| self.member_name(n)) else {
                 continue;
             };
             let doc = (name != INIT).then(|| doc_before(m, self.src)).flatten();
-            self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc);
+            let at = (name != INIT).then_some(at).flatten();
+            self.declare(NodeKind::Method, format!("{owner}.{name}"), None, doc, at);
         }
     }
 

@@ -376,6 +376,7 @@ fn module_structure(path: &Path, ctx: &ParseCtx) -> FileStructure {
             subkind: None,
             summary: None,
             short: Some(short),
+            at: None,
         }],
         ..FileStructure::default()
     }

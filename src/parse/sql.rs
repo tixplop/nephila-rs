@@ -645,6 +645,7 @@ pub fn extract(path: &Path, text: &str) -> FileStructure {
                     Kind::View => SubKind::View,
                 }),
                 summary: None,
+                at: None,
             });
         }
         let targets = match kind {
