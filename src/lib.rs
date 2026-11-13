@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod chunk;
 pub mod cli;
 pub(crate) mod community;

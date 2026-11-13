@@ -107,6 +107,8 @@ Option globale : `-C, --repo <dossier>`, la racine du dépôt (défaut : dossier
 | `nephila query ask "<question>"` | Question en langage naturel | requis |
 | `nephila summary [--json]` | Modules, nœuds les plus reliés, thèmes, communautés | non |
 | `nephila export` | Export JSON ou page HTML | non |
+| `nephila cache export <fichier>` | Copie les enrichissements du graphe dans un fichier | non |
+| `nephila cache import <fichier>` | Ajoute au graphe les enrichissements d'un fichier | non |
 
 Les commandes sans LLM ne lisent aucune configuration. Les requêtes (`query`) ne parcourent pas le dépôt : elles répondent d'après le graphe, même s'il est en retard sur les fichiers. Avec `--check-stale`, elles le vérifient d'abord et le signalent sur stderr (`avertissement: graphe pas à jour : 1 fichier modifié`).
 
@@ -466,6 +468,8 @@ Par défaut, seuls les documents Markdown sont enrichis (résumés des nœuds, c
 `enrich_include` et `enrich_exclude` réduisent cette portée par motifs (syntaxe d'`exclude`), sans toucher au graphe : un fichier hors portée garde ses nœuds et ses liens, n'est pas envoyé et ne compte pas « à enrichir » ; le bilan compte ces fichiers dans `fichiers hors portée d'enrichissement`. Changer ces motifs ne réenrichit rien. Exception à la priorité : ceux de `.nephila.toml` s'ajoutent à ceux de la configuration personnelle, liste par défaut comprise, si bien qu'un dépôt ne peut que réduire la portée ; pour enrichir vos tests, écrivez `enrich_exclude = []` dans la configuration personnelle.
 
 Chaque enrichissement garde aussi le nom du modèle qui a répondu (colonne `served_model` de `enrichments`, dans `.nephila/graph.db`) : un alias qui passe à une nouvelle version ne réenrichit rien, et `build --verbose` donne ce nom quand il diffère de `model`.
+
+**Clone, worktree ou CI** : `nephila cache export <fichier>` copie dans un fichier les enrichissements du graphe, et `nephila cache import <fichier>` les ajoute au graphe d'un autre clone du même dépôt, en le créant s'il n'existe pas. L'import n'appelle pas le LLM et n'applique rien : le `build` suivant reprend sans appel, même avec `--no-llm`, chaque enrichissement dont le contenu, le modèle, la langue et le prompt n'ont pas changé. Un enrichissement déjà présent est gardé. Le fichier contient les résumés du projet, mais ni code ni clé d'API.
 
 ### Lots et gros fichiers
 

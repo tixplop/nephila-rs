@@ -198,6 +198,26 @@ pub enum Command {
     },
     /// Résumé du dépôt
     Summary(JsonOpt),
+    /// Exporte ou importe les enrichissements du LLM, pour ne pas les repayer dans un clone, un worktree ou une CI
+    #[command(subcommand)]
+    Cache(Cache),
+}
+
+/// Sous-commandes de `cache` (REQ-295).
+#[derive(Debug, Subcommand)]
+pub enum Cache {
+    /// Écrit dans un fichier les enrichissements du graphe de ce dépôt, sans le modifier
+    Export {
+        /// Fichier à écrire, relatif au dossier courant ; remplacé s'il existe. Il contient les résumés et concepts du projet, sans code ni clé d'API
+        #[arg(value_name = "FICHIER")]
+        fichier: PathBuf,
+    },
+    /// Ajoute au graphe de ce dépôt les enrichissements d'un fichier écrit par cache export
+    Import {
+        /// Fichier écrit par nephila cache export, relatif au dossier courant. Le graphe est créé s'il n'existe pas ; un enrichissement déjà présent est gardé tel quel. Rien n'est appliqué tout de suite : le prochain nephila build reprend, sans appel au LLM, ceux qui correspondent au contenu et aux réglages actuels
+        #[arg(value_name = "FICHIER")]
+        fichier: PathBuf,
+    },
 }
 
 /// Format de `export`.
@@ -324,6 +344,8 @@ fn dispatch(cli: &Cli, out: &mut Out) -> Result<()> {
         }
         Command::Status(j) => crate::status::run(&cli.repo, j.json, out),
         Command::Summary(j) => crate::summary::run(&cli.repo, j.json, out),
+        Command::Cache(Cache::Export { fichier }) => crate::cache::export(&cli.repo, fichier, out),
+        Command::Cache(Cache::Import { fichier }) => crate::cache::import(&cli.repo, fichier, out),
         Command::Export { output, format } => {
             crate::export::run(&cli.repo, output.as_deref(), *format, out)
         }

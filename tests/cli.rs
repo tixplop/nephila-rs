@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 use assert_cmd::Command;
 
 fn nephila() -> Command {
@@ -570,4 +571,66 @@ fn req218_ac2_aide_de_batch() {
         );
         assert!(h.contains("--batch-files <N> Nombre maximal de fichiers par appel d'enrichissement (remplace `batch_files` de la configuration)"), "{cmd}");
     }
+}
+
+// ---- Commande cache (REQ-295, V-014) ----
+
+const CACHE_SUMMARY: &str = "Exporte ou importe les enrichissements du LLM, pour ne pas les repayer dans un clone, un worktree ou une CI";
+const CACHE_EXPORT_SUMMARY: &str =
+    "Écrit dans un fichier les enrichissements du graphe de ce dépôt, sans le modifier";
+const CACHE_IMPORT_SUMMARY: &str =
+    "Ajoute au graphe de ce dépôt les enrichissements d'un fichier écrit par cache export";
+const CACHE_EXPORT_FILE: &str = "Fichier à écrire, relatif au dossier courant ; remplacé s'il existe. Il contient les résumés et concepts du projet, sans code ni clé d'API";
+const CACHE_IMPORT_FILE: &str = "Fichier écrit par nephila cache export, relatif au dossier courant. Le graphe est créé s'il n'existe pas ; un enrichissement déjà présent est gardé tel quel. Rien n'est appliqué tout de suite : le prochain nephila build reprend, sans appel au LLM, ceux qui correspondent au contenu et aux réglages actuels";
+
+#[test]
+fn REQ295_AC5_AC7_aides_de_cache() {
+    let top = normalized_help(&[]);
+    let after_summary = top.split("summary").last().unwrap();
+    assert!(
+        after_summary.contains(&format!("cache {CACHE_SUMMARY}")),
+        "{top}"
+    );
+    assert!(top.find("summary").unwrap() < top.rfind("cache ").unwrap());
+    assert!(top.rfind("cache ").unwrap() < top.rfind("help").unwrap());
+
+    let h = normalized_help(&["cache"]);
+    assert!(h.starts_with(CACHE_SUMMARY), "{h}");
+    assert!(h.contains("Usage: nephila cache [OPTIONS] <COMMAND>"));
+    let export = format!("export {CACHE_EXPORT_SUMMARY}");
+    let import = format!("import {CACHE_IMPORT_SUMMARY}");
+    assert!(h.find(&export).unwrap() < h.find(&import).unwrap(), "{h}");
+
+    let h = normalized_help(&["cache", "export"]);
+    assert!(h.starts_with(CACHE_EXPORT_SUMMARY), "{h}");
+    assert!(h.contains("Usage: nephila cache export [OPTIONS] <FICHIER>"));
+    assert!(
+        h.contains(&format!("Arguments: <FICHIER> {CACHE_EXPORT_FILE}")),
+        "{h}"
+    );
+
+    let h = normalized_help(&["cache", "import"]);
+    assert!(h.starts_with(CACHE_IMPORT_SUMMARY), "{h}");
+    assert!(h.contains("Usage: nephila cache import [OPTIONS] <FICHIER>"));
+    assert!(
+        h.contains(&format!("Arguments: <FICHIER> {CACHE_IMPORT_FILE}")),
+        "{h}"
+    );
+
+    for t in [
+        CACHE_SUMMARY,
+        CACHE_EXPORT_SUMMARY,
+        CACHE_IMPORT_SUMMARY,
+        CACHE_EXPORT_FILE,
+        CACHE_IMPORT_FILE,
+    ] {
+        assert!(!t.contains(" -"), "{t}");
+    }
+}
+
+#[test]
+fn REQ295_AC5_cache_sans_argument_est_un_usage() {
+    nephila().arg("cache").assert().code(2);
+    nephila().args(["cache", "import"]).assert().code(2);
+    nephila().args(["cache", "export"]).assert().code(2);
 }
