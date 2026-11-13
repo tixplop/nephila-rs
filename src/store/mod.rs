@@ -12,6 +12,7 @@ use crate::llm::enrich::{Concept, Enrichment, PromptVersions};
 
 use crate::error::{Error, Result};
 
+mod cache;
 pub(crate) mod prepare;
 use crate::model::{
     Edge, EdgeKind, FileRecord, FileState, Node, NodeKind, Ref, RefOrigin, SubKind,
@@ -67,7 +68,6 @@ const ENRICHMENTS_DDL_13: &str = "CREATE TABLE enrichments (\n    path          
 
 /// Déclaration de `enrichments` du schéma courant, identique au caractère près à celle de
 /// `schema.sql` (DEC-190, DEC-208).
-#[cfg(test)]
 const ENRICHMENTS_DDL: &str = "CREATE TABLE enrichments (\n    path           TEXT NOT NULL,\n    content_hash   TEXT NOT NULL,\n    model          TEXT NOT NULL,\n    prompt_version INTEGER NOT NULL,\n    payload        TEXT NOT NULL,\n    language       TEXT NOT NULL,\n    used_at        INTEGER NOT NULL, served_model TEXT, nodes_hash TEXT,\n    PRIMARY KEY (path, content_hash, model, prompt_version, language)\n);";
 
 /// Dernier schéma sans `enrichments.used_at` (une seule entrée par chemin), migré sur place
