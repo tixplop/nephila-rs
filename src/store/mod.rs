@@ -4915,6 +4915,11 @@ mod tests {
     use crate::model::{node_id, parse_node_id};
     use tempfile::tempdir;
 
+    #[test]
+    fn req296_ac2_sqlite_embarque_corrige() {
+        assert!(rusqlite::version_number() >= 3_054_000);
+    }
+
     fn file(path: &str) -> FileRecord {
         FileRecord {
             path: path.into(),

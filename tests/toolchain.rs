@@ -682,13 +682,13 @@ fn REQ111_AC8_rlimit_nproc_reserve_a_linux() {
     assert!(defauts.is_empty(), "{}", defauts.join("\n"));
 }
 
-#[test]
-fn REQ209_AC1_pulldown_cmark_corrige_rustsec_2026_0433() {
+/// Contrôle que chaque bloc `name` de `Cargo.lock` a une version au moins égale à `min`.
+fn verifie_version_lock(nom: &str, min: (u64, u64, u64), avis: &str) {
     let text =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock")).unwrap();
     let mut trouves = 0;
     for bloc in text.split("[[package]]") {
-        if !bloc.lines().any(|l| l == "name = \"pulldown-cmark\"") {
+        if !bloc.lines().any(|l| l == format!("name = \"{nom}\"")) {
             continue;
         }
         trouves += 1;
@@ -698,13 +698,40 @@ fn REQ209_AC1_pulldown_cmark_corrige_rustsec_2026_0433() {
             .and_then(|l| l.strip_suffix('"'))
             .expect("version");
         let n: Vec<u64> = v.split('.').map(|x| x.parse().unwrap()).collect();
-        let version = (n[0], n[1], n[2]);
         assert!(
-            version >= (0, 13, 6),
-            "pulldown-cmark {v} < 0.13.6 (RUSTSEC-2026-0433)"
+            (n[0], n[1], n[2]) >= min,
+            "{nom} {v} < {}.{}.{} ({avis})",
+            min.0,
+            min.1,
+            min.2
         );
     }
-    assert!(trouves >= 1, "aucun bloc pulldown-cmark dans Cargo.lock");
+    assert!(trouves >= 1, "aucun bloc {nom} dans Cargo.lock");
+}
+
+#[test]
+fn REQ209_AC1_pulldown_cmark_corrige_rustsec_2026_0433() {
+    verifie_version_lock("pulldown-cmark", (0, 13, 6), "RUSTSEC-2026-0433");
+}
+
+#[test]
+fn REQ296_AC1_AC3_AC4_rusqlite_corrige_rustsec_2026_0459() {
+    verifie_version_lock("rusqlite", (0, 41, 0), "RUSTSEC-2026-0459");
+    verifie_version_lock("libsqlite3-sys", (0, 39, 0), "RUSTSEC-2026-0459");
+    // AC-296-3 : cargo deny ne s'exécute qu'en CI ; hors réseau, seule preuve : le job lance `check advisories`.
+    let ci = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"),
+    )
+    .unwrap();
+    assert!(
+        ci.contains("cargo-deny-action"),
+        "job deny absent de ci.yml"
+    );
+    assert!(
+        ci.contains("command: check advisories"),
+        "le job deny ne lance pas `check advisories`"
+    );
+    // AC-296-4 : non-régression, portée par la suite complète avec rusqlite 0.41.
 }
 
 fn cherche_options(dir: &Path, found: &mut Vec<String>) {

@@ -72,7 +72,7 @@ Format : `chemin — rôle — points d'entrée (3 au plus)`. Crate `nephila-rs`
 - Estimation / dry-run : REQ-184 → src/index/estimate.rs, src/index/enrich.rs
 - Stockage SQLite, réglages d'ouverture : REQ-059 → src/store/mod.rs
 - Index plein texte FTS5, schéma 16 : REQ-284 → src/store/mod.rs, src/query/search.rs, tests/schema_upgrade.rs
-- Dépendance rusqlite, audit des avis : REQ-296 → Cargo.toml, Cargo.lock, .github/workflows/ci.yml
+- Dépendance rusqlite, audit des avis : REQ-296 → Cargo.toml, Cargo.lock, tests/toolchain.rs, .github/workflows/ci.yml
 - Chaîne d'outils Rust 1.99 : REQ-076, REQ-123 → Cargo.toml, rust-toolchain.toml, .github/workflows/ci.yml, .github/workflows/release.yml, tests/toolchain.rs
 - CI, job `deny` : REQ-117 → .github/workflows/ci.yml, tests/workflows.rs
 - Analyse des langages : REQ-006, REQ-034 → src/parse/

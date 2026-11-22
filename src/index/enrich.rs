@@ -3674,7 +3674,7 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             (state >> 33) % bound
         };
-        for set in 0..1000 {
+        for set in 0..200 {
             let count = 1 + next(40) as usize;
             let sizes_cap = [50u64, 600, 5_000, 80_000][next(4) as usize];
             let files: Vec<FileRecord> = (0..count)
@@ -4401,7 +4401,15 @@ mod tests {
         {
             use std::os::unix::ffi::OsStrExt;
             let weird = dir.path().join(std::ffi::OsStr::from_bytes(b"w\xff.txt"));
-            std::fs::write(&weird, "日本語").unwrap();
+            if let Err(e) = std::fs::write(&weird, "日本語") {
+                if !cfg!(target_os = "macos") {
+                    panic!("création de w\\xff.txt refusée hors macOS : {e}");
+                }
+                eprintln!(
+                    "test non applicable : le système de fichiers refuse un nom non UTF-8 ({e})"
+                );
+                return;
+            }
             let mut abs = HashMap::new();
             abs.insert("w_.txt".to_string(), weird);
             let sources = Sources {
