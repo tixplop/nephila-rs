@@ -1248,12 +1248,20 @@ fn REQ134_AC2_ligne_config_d_exemple_du_readme_est_la_sortie_reelle() {
 fn REQ229_AC2_version_0_28_0() {
     assert_eq!(cargo_minor(), "0.28");
     let toml = repo_file("Cargo.toml");
-    assert!(toml.lines().any(|l| l == "version = \"0.28.0\""));
+    let v = toml
+        .lines()
+        .find_map(|l| l.strip_prefix("version = \""))
+        .and_then(|l| l.strip_suffix('"'))
+        .expect("version de Cargo.toml");
+    assert!(toml.lines().any(|l| l == format!("version = \"{v}\"")));
     let lock = repo_file("Cargo.lock");
-    assert!(lock.contains("name = \"nephila-rs\"\nversion = \"0.28.0\""));
+    assert!(lock.contains(&format!("name = \"nephila-rs\"\nversion = \"{v}\"")));
     let readme = repo_file("README.md");
-    for needle in ["V=v0.28.0", "git tag v0.28.0 && git push origin v0.28.0"] {
-        assert!(readme.contains(needle), "absent : {needle}");
+    for needle in [
+        format!("V=v{v}"),
+        format!("git tag v{v} && git push origin v{v}"),
+    ] {
+        assert!(readme.contains(&needle), "absent : {needle}");
     }
     assert!(!readme.contains("v0.27.1"));
 }
