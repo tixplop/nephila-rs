@@ -715,6 +715,21 @@ fn REQ209_AC1_pulldown_cmark_corrige_rustsec_2026_0433() {
 }
 
 #[test]
+fn REQ297_AC1_AC2_AC3_url_corrige_rustsec_2026_0592() {
+    verifie_version_lock("url", (2, 5, 9), "RUSTSEC-2026-0592");
+    // AC-297-2 : cargo deny ne s'exécute qu'en CI ; hors réseau, seule preuve : le job lance `check advisories`.
+    let ci = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"),
+    )
+    .unwrap();
+    assert!(
+        ci.contains("command: check advisories"),
+        "le job deny ne lance pas `check advisories`"
+    );
+    // AC-297-3 : non-régression, portée par la suite complète avec url 2.5.9.
+}
+
+#[test]
 fn REQ296_AC1_AC3_AC4_rusqlite_corrige_rustsec_2026_0459() {
     verifie_version_lock("rusqlite", (0, 41, 0), "RUSTSEC-2026-0459");
     verifie_version_lock("libsqlite3-sys", (0, 39, 0), "RUSTSEC-2026-0459");
